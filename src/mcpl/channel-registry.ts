@@ -469,7 +469,12 @@ export interface PublishOutcome {
  * a failed request this way.
  */
 function publishErrorOutcome(err: unknown, destination: PublishDestination, at: number): PublishOutcome {
-  const message = connectorText(err instanceof Error ? err.message : String(err));
+  // This host's own words for a request that wasn't sent or wasn't answered
+  // are sentences, and every composition of the reason adds its own ending,
+  // so one final period comes off them. A server's error answer keeps its
+  // words as they came.
+  const text = connectorText(err instanceof Error ? err.message : String(err));
+  const message = err instanceof McplRequestError && err.outcome !== 'error-response' ? text.replace(/(?<!\.)\.$/, '') : text;
   const notSent = err instanceof McplRequestError && err.outcome === 'not-sent';
   const detail = err instanceof McplRequestError ? err.data : undefined;
   return {

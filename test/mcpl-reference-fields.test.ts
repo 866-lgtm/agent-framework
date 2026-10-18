@@ -118,8 +118,8 @@ test('the stub leaves out a type, or a provenance, that sanitizes to nothing', (
 
 test("an expired reference's stub says why, where a live one's advises fetch_reference", () => {
   // Each bound to its server, as a tool result's references are, so the expiry is what's left to say.
-  const cases = [['2001-01-01T00:00:00Z', /expired: its expiresAt has passed/], ['not-a-date', /treated as expired: its expiresAt does not parse/],
-    ['x'.repeat(REFERENCE_LIMITS.expiresAt + 1), /treated as expired: its expiresAt was rejected as a field/]] as const;
+  const cases = [['2001-01-01T00:00:00Z', /[\]—] expired$/], ['not-a-date', /[\]—] treated as expired, since its expiry time can't be read$/],
+    ['x'.repeat(REFERENCE_LIMITS.expiresAt + 1), /[\]—] treated as expired, since its expiry time isn't in a form this host accepts$/]] as const;
   for (const [i, [expiresAt, why]] of cases.entries()) {
     const { testimony } = reference('resource', { uri: `https://example.test/stub-expired-${i}`, expiresAt });
     const stub = buildReferenceStub(testimony, undefined, 'srv');

@@ -339,7 +339,7 @@ test('a server that closes its stdin is ended: a request fails with the disconne
   const answer = connection.sendManifestRequest(30_000).then(() => 'answered', (error: Error) => error.message);
   assert.match(
     await within(answer, 'still waiting after 15 s', 15_000),
-    /^MCPL server "deaf-after-initialize" disconnected unexpectedly \(code=n\/a, signal=SIGTERM, reason=child process exited, and its pipe failed with write EPIPE\) while awaiting mcpl\/manifest/,
+    /^The connection to the "deaf-after-initialize" server closed before it answered, so whether the request took effect is unknown\. Check its effect before trying again; this host is reconnecting to it\.$/,
   );
   assert.equal((await within(closed, null, 15_000))?.reason, 'child process exited, and its pipe failed with write EPIPE');
   assert.equal(await within(reconnected.then(() => 'reconnected'), 'no reconnect within 15 s', 15_000), 'reconnected');
@@ -409,7 +409,7 @@ test("a server that stops reading its stdin without closing it stays connected, 
 
   // Nothing fails the write, so only the request's own 500 ms timeout ends it.
   const answer = connection.sendManifestRequest(500).then(() => 'answered', (error: Error) => error.message);
-  assert.match(await within(answer, 'still waiting after 5 s'), /^MCPL server "stops-reading" did not respond to mcpl\/manifest \(id=\d+\) within 500ms/);
+  assert.match(await within(answer, 'still waiting after 5 s'), /^The "stops-reading" server didn't answer within 0\.5 seconds, so whether the request took effect is unknown/);
   assert.equal(closed, false, 'nothing closed the connection');
   assert.equal(connection.isConnected, true, 'the connection is still up');
 });

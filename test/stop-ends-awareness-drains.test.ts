@@ -143,7 +143,7 @@ describe('stop() and Discord awareness drains', () => {
     assert.ok(writes.every((at) => at < stopped), 'no ledger write after stop() returned');
     const entries = ledger(dir);
     assert.equal(entries.m1.attempts, 1, 'the call in flight is recorded');
-    assert.match(entries.m1.lastError ?? '', /closed while awaiting response/);
+    assert.match(entries.m1.lastError ?? '', /didn't answer before this host closed its connection/);
     assert.deepEqual([entries.m2, entries.m3], [{ attempts: 0 }, { attempts: 0 }], 'what the drain had not sent stays pending, unrecorded');
     assert.ok(log.some((line) => line.startsWith(
       '[discord-awareness] discord: 2 mark(s) not sent: the framework is stopping; the next start delivers them')), log.join('\n'));

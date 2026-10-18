@@ -770,7 +770,7 @@ describe('held prose drafts, end to end', () => {
       await h.until(() => h.texts().some((t) => t.startsWith('[discord-send-failed]')), 'the marker');
       assert.equal(h.publishes().length, 0);
       const marker = h.texts().find((t) => t.startsWith('[discord-send-failed]'))!;
-      assert.match(marker, /was not confirmed \(MCPL server "discord" did not respond to channels\/publish .*within 1000ms.*\(delivery uncertain\)\)\. It may or may not have been posted/);
+      assert.match(marker, /was not confirmed \(The "discord" server didn't answer within 1 second, so whether the request took effect is unknown: .*may do it twice \(delivery uncertain\)\)\. It may or may not have been posted/);
     } finally {
       await h.close();
     }

@@ -11,7 +11,7 @@ import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, Yie
 import { MembraneError } from '@animalabs/membrane';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
-import type { SilentHeartbeatStamp } from './silent-heartbeat.js';
+import { SILENT_HEARTBEAT_SEPARATOR, type RequestOnlyPrompt, type RequestOnlyStamps } from './silent-heartbeat.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
 import { TuneOutCoordinator, TUNE_OUT_DEFAULTS } from './tune-out/coordinator.js';
 import type {
@@ -142,6 +142,43 @@ import {
 import { splitProseRuns, withoutRoundsProse } from './prose-segments.js';
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
+
+/** An MCPL tool call refused because its server isn't in the registry: one
+ *  closed for good, one removed, or one whose connect failed without
+ *  reconnect, which this host doesn't bring back on its own. A server that's
+ *  reconnecting stays registered, as does the stub a failed connect with
+ *  reconnect leaves, and its closed connection answers the call instead. One
+ *  this host is connecting to isn't registered yet, and
+ *  mcplServerConnectingText answers for it. */
+function mcplServerGoneText(serverId: string, toolName: string): string {
+  return `The "${serverId}" server that provides ${toolName} isn't connected, and this host won't reconnect to it on its own, ` +
+    "so the call didn't run. If you need it, ask whoever runs this host.";
+}
+
+/** An MCPL tool call refused while this host connects to its server, in a
+ *  runtime connect or a restart's: the server's prefix routes calls to it
+ *  before the registry holds it, which it does once the handshake is done. */
+function mcplServerConnectingText(serverId: string, toolName: string): string {
+  return `This host is connecting to the "${serverId}" server that provides ${toolName}, so the call didn't run. ` +
+    'Try again in a moment.';
+}
+
+/** An MCPL tool call its server's tool policy denies. The policy hides the
+ *  tool from the list it's offered in, so this is a call to a tool the agent
+ *  wasn't offered. */
+function mcplToolDeniedText(serverId: string, toolName: string): string {
+  return `${toolName} isn't allowed by this host's policy for the "${serverId}" server, so the call didn't run, ` +
+    "and calling it again won't change that. If you need it, ask whoever runs this host.";
+}
+
+/** A runtime connect, restart or disconnect refused because a connect of the
+ *  server is in flight (mcplConnecting). The registry takes a server only once
+ *  its handshake is done, and nothing can stop that connect meanwhile, so it
+ *  would register the server after whatever ran beside it. Whoever asked reads
+ *  it: an operator, or an agent through a host's tool that passes it on. */
+function mcplConnectInFlightError(serverId: string): Error {
+  return new Error(`MCPL server "${serverId}" has a connect in flight; try again once it settles`);
+}
 
 /** Detect a supported image media type from magic bytes (the model API
  *  rejects mislabeled media types, so trust bytes over extensions).
@@ -341,13 +378,23 @@ function mcplResultText(content: McpToolResultContent[] | undefined): string {
 
 /**
  * An MCPL tools/call result the server marked `isError`, as a failure: its
- * text is the error, or `Tool call failed` when it has none, and its other
- * blocks aren't kept. The model's dispatch and an in-process caller
- * (`executeToolCall`, `ModuleContext.callTool`) both take a server's error
- * from here, so it reads the same on each path.
+ * text is the error, and with none, or only whitespace, as a server's error
+ * answer reads it, the error says the server gave no words and that whether
+ * the call did anything is unknown. Its other blocks aren't kept. The model's
+ * dispatch and an in-process caller (`executeToolCall`,
+ * `ModuleContext.callTool`) both take a server's error from here, so it reads
+ * the same on each path. `callName` is the tool's name as it was called.
  */
-function mcplToolFailure(content: McpToolResultContent[] | undefined): ToolResult {
-  return { success: false, error: mcplResultText(content) || 'Tool call failed', isError: true };
+function mcplToolFailure(content: McpToolResultContent[] | undefined, serverId: string, callName: string): ToolResult {
+  const said = mcplResultText(content);
+  return {
+    success: false,
+    error: said.trim()
+      ? said
+      : `The "${serverId}" server reported an error for ${callName} without saying what went wrong. ` +
+        'Whether it did anything is unknown: check before calling it again.',
+    isError: true,
+  };
 }
 
 /**
@@ -583,6 +630,8 @@ interface DeferredWrite {
   participant: string;
   content: ContentBlock[];
   metadata?: MessageMetadata;
+  /** The agent the entry is for. Absent means the primary: addMessage
+   *  records any other agent it defers a write for. */
   forAgent?: string;
   /** When the framework first held the write, in ms since the epoch: a
    *  module reads it as the held row's timestamp (heldRows). */
@@ -599,10 +648,12 @@ type InboundResponder = {
 
 /** A drained entry as writeDrainedInOrder wrote it: the id its store gave it
  *  (empty when addMessage deferred it again; a sharded body's first shard)
- *  and what the store holds of it. For an entry whose write threw after
- *  storing it, found in the store and counted as written, the content is
- *  what landed, as later compiles render it, which for a sharded body can be
- *  its first shards alone. */
+ *  and the content to carry for it: as given, or for a sharded body read
+ *  back from its store, its shards joined as later compiles render them.
+ *  For an entry whose write threw after storing it, found in the store and
+ *  counted as written, it is what landed, joined the same way, which for a
+ *  sharded body can be its first shards alone. A store that can't be read
+ *  back (storedCopiesOf logs it) leaves a sharded body as given. */
 interface DrainedWrite {
   id: MessageId;
   content: ContentBlock[];
@@ -2171,7 +2222,9 @@ export class AgentFramework {
   private unackedDeferredWrites: DeferredWrite[] = [];
   /** Monotonic order stamp for deferred writes: the durable queue is always
    *  written, restored, drained and flushed in `seq` order, whatever the
-   *  pending/un-acked split — a re-deferred entry keeps its place. */
+   *  pending/un-acked split — a re-deferred entry keeps its place. Boot
+   *  recovery numbers the restored queue 1..N in that order, and the stamp
+   *  goes on from N (restorePersistedDeferredWrites). */
   private deferredSeq = 0;
   /**
    * Per target agent: the store's message count when the OLDEST currently
@@ -2181,8 +2234,9 @@ export class AgentFramework {
    */
   private deferredScanFrom = new Map<string, number>();
   private deferredMessages: Array<{
-    /** Durable identity for per-message flush acknowledgement: a flush
-     *  interrupted by a crash replays only the messages not yet acked. */
+    /** Durable identity, stamped on the stored message as its
+     *  deferredWriteId: a flush interrupted by a crash replays its batch at
+     *  the next boot, which skips each entry that already landed by it. */
     id: string;
     /** Order stamp (see deferredSeq). */
     seq: number;
@@ -2221,6 +2275,16 @@ export class AgentFramework {
    * guessing from the newest message in the window.
    */
   private activeTurnTriggers: Map<string, InferenceRequest | undefined> = new Map();
+
+  /**
+   * The `[Continue]` prompt the current round of each turn follows, keyed by
+   * the turn's trigger. Each stream start sets it from what the Agent read in
+   * its request (`StartStreamResult.continuePrompt`), and a tool boundary
+   * that hands the live stream messages after the results clears it, since
+   * the next round follows those messages. `silentTurnRowMetadata` stamps the
+   * round's rows with it.
+   */
+  private readonly turnPrompts = new WeakMap<InferenceRequest, RequestOnlyPrompt>();
 
   /** The trigger of `agentName`'s turn in progress, if a turn is running. */
   getActiveTurnTrigger(agentName: string): InferenceRequest | undefined {
@@ -2364,6 +2428,13 @@ export class AgentFramework {
   private toolPatternKnownPrefixes: Map<string, string> = new Map();
   /** Maps serverId → McplServerConfig for prefix lookup. */
   private mcplServerConfigs: Map<string, import('./mcpl/types.js').McplServerConfig> = new Map();
+  /** Servers whose connect is in flight (connectMcplServerInternal), from the
+   *  registry's handshake until it settles: a call their prefix routes then
+   *  finds no server registered, and is told this host is connecting to it.
+   *  One mark per id: the registry holds one connection per id, and a
+   *  second connect, a restart or a disconnect of an id whose connect is in
+   *  flight is refused (refuseMcplConnect, runDisconnectMcplServer). */
+  private mcplConnecting: Set<string> = new Set();
   /** Host capabilities advertised during the MCP handshake — stored so servers
    *  can be connected at runtime (connectMcplServer) after initialization. */
   private mcplHostCapabilities: McplHostCapabilities | null = null;
@@ -2850,9 +2921,11 @@ export class AgentFramework {
       const hostMode = framework.readHostMode();
       // Deferred writes are recovered REGARDLESS of the mode flag: a crash
       // between a resume's flag clear and the end of its flush must not
-      // strand accepted messages. Per-message acks mean only the remainder
-      // replays. Serving boot with a remainder → flush it right now (no turn
-      // is alive yet, so this is a safe boundary).
+      // strand accepted messages. A flush acknowledges its batch once, after
+      // the chronicle syncs, and boot skips each entry that already landed
+      // (by its deferredWriteId), so only the remainder replays (see
+      // flushDeferredWrites). Serving boot with a remainder → flush it right
+      // now (no turn is alive yet, so this is a safe boundary).
       const restoredWrites = framework.restorePersistedDeferredWrites();
       if (!hostMode?.quiesced && restoredWrites > 0) {
         console.error(
@@ -5806,11 +5879,11 @@ export class AgentFramework {
       // The windows of forks and runs deregistered during the window are
       // released first, each landing its queued writes and passing on its
       // unread failed replies, as at any release. Then flush context writes
-      // deferred by the quiesce window
-      // (module events, api message.send) — with no turn alive there is no
-      // other flush point. Per-message try/catch and per-message durable ack
-      // (see flushDeferredWrites); nothing here may reach the plane reopen
-      // below.
+      // deferred by the quiesce window (module events, api message.send) —
+      // with no turn alive there is no other flush point. The batch is
+      // stored in queue order and acknowledged once, after the chronicle
+      // syncs (see flushDeferredWrites); nothing here may reach the plane
+      // reopen below.
       this.runReleasesAfterResume();
       await this.flushDeferredWrites('resume');
       this.persistHostMode(null);
@@ -6464,33 +6537,27 @@ export class AgentFramework {
       seen.add(id);
       kept.push({ ...m, id, heldAt: heldAt(m.heldAt) });
     }
-    // A seq is a positive whole number no larger than
-    // Number.MAX_SAFE_INTEGER, the entry's place in arrival order.
-    // An entry without one (a file that predates seq, which is in write
-    // order already) or with any other value (damage or a hand edit:
-    // JSON's 1e400 reads as Infinity) is numbered after every valid seq, in
-    // file order, so the counter stays finite and the rest keep their order.
+    // A seq says only where its entry came in arrival order. The queue is
+    // restored in the order the file gives: entries whose seq is a positive
+    // whole number up to Number.MAX_SAFE_INTEGER by seq, then, in file
+    // order, any without one (a file that predates seq, which is in write
+    // order already) or with another value (damage or a hand edit: JSON's
+    // 1e400 reads as Infinity). Then it is numbered 1..N in that order, so
+    // the counter starts again from N at every boot, wherever the file's
+    // seqs had got to.
     const validSeq = (seq: unknown): seq is number => Number.isSafeInteger(seq) && (seq as number) > 0;
-    let lastSeq = 0;
-    for (const m of kept) if (validSeq(m.seq)) lastSeq = Math.max(lastSeq, m.seq);
-    let renumbered = 0;
-    const candidates: DeferredWrite[] = kept
-      .map((m) => {
-        if (validSeq(m.seq)) return { ...m, seq: m.seq };
-        renumbered++;
-        if (m.seq !== undefined) {
-          // A value that isn't a number is named by its type: it could be
-          // any size.
-          const seq = typeof m.seq === 'number' ? String(m.seq) : m.seq === null ? 'null' : `of type ${typeof m.seq}`;
-          console.error(
-            `[host-mode] a recovered deferred context write (${m.id}) has seq ${seq}, not a positive ` +
-            `whole number up to Number.MAX_SAFE_INTEGER; it is queued after the others`,
-          );
-        }
-        return { ...m, seq: ++lastSeq };
-      })
-      .sort(bySeq);
-    this.deferredSeq = Math.max(this.deferredSeq, lastSeq);
+    const unnumbered = kept.filter((m) => !validSeq(m.seq));
+    for (const m of unnumbered) {
+      if (m.seq === undefined) continue;
+      // A value that isn't a number is named by its type: it could be
+      // any size.
+      const seq = typeof m.seq === 'number' ? String(m.seq) : m.seq === null ? 'null' : `of type ${typeof m.seq}`;
+      console.error(
+        `[host-mode] a recovered deferred context write (${m.id}) has seq ${seq}, not a positive ` +
+        `whole number up to Number.MAX_SAFE_INTEGER; it is queued after the others`,
+      );
+    }
+    const ordered = [...kept.filter((m) => validSeq(m.seq)).sort((a, b) => (a.seq as number) - (b.seq as number)), ...unnumbered];
     // Exactly-once: a message that landed before its ack was written is
     // already in the store under its deferredWriteId — do not replay it.
     // The scan covers every slot the interrupted batch could occupy (from
@@ -6498,7 +6565,7 @@ export class AgentFramework {
     // receipt predates the position field.
     let landed: Set<string>;
     try {
-      landed = this.landedDeferredWriteIds(new Set(candidates.map((m) => m.id)), scanFrom);
+      landed = this.landedDeferredWriteIds(new Set(ordered.map((m) => m.id)), scanFrom);
     } catch (error) {
       throw new Error(
         `the deferred context writes (${file ?? DEFERRED_WRITES_ID}) can't be checked for writes that already landed: ` +
@@ -6508,7 +6575,8 @@ export class AgentFramework {
         { cause: error },
       );
     }
-    const restored = candidates.filter((m) => !landed.has(m.id));
+    const restored: DeferredWrite[] = ordered.filter((m) => !landed.has(m.id)).map((m, i) => ({ ...m, seq: i + 1 }));
+    this.deferredSeq = Math.max(this.deferredSeq, restored.length);
     if (landed.size > 0) {
       console.error(
         `[host-mode] ${landed.size} deferred context write(s) had already landed before their ack ` +
@@ -6519,8 +6587,12 @@ export class AgentFramework {
     this.deferredWritesPersisted = true;
     // Rewrite the durable queue without the already-landed entries so a
     // second interrupted boot does not re-scan them, without the malformed
-    // and repeated ones, and with the seqs given here.
-    if (landed.size > 0 || malformed.length > 0 || duplicates > 0 || renumbered > 0) this.persistDeferredWrites();
+    // and repeated ones, and with a seq for each entry that came without a
+    // valid one, so the next boot doesn't name it again. The numbers given
+    // here aren't a reason to rewrite it: every write of the queue writes
+    // it whole, with them, and a boot before that numbers the same entries
+    // the same way.
+    if (landed.size > 0 || malformed.length > 0 || duplicates > 0 || unnumbered.length > 0) this.persistDeferredWrites();
     return restored.length;
   }
 
@@ -10602,9 +10674,10 @@ export class AgentFramework {
             // Stored in queue order, cut at the first that can't be stored: it
             // and what follows wait for the turn's end, and only what was
             // stored is injected (the round's results go on either way). A
-            // write that threw after storing counts as stored, and what landed
-            // of it is what's injected, so the request carries what the store
-            // holds (writeDrainedInOrder).
+            // sharded body read back from its store is injected as later
+            // compiles render it, its shards joined, and a write that threw
+            // after storing, which counts as stored, as what landed of it
+            // (writeDrainedInOrder).
             const stored = this.writeDrainedInOrder(deferred, `tool boundary for ${agent.name}`, (msg) =>
               agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id)));
             for (const [msg, { id, content }] of stored) {
@@ -10636,6 +10709,20 @@ export class AgentFramework {
           // the send suppression: nothing new was said to the agent.
           if (midTurnInjections.some((inj) => isConversationalInjection(inj.metadata))) {
             this.midTurnInputSignals.add(agent.name);
+          }
+
+          // A live stream handed these messages after the results follows
+          // them in its next round, not the tool loop of a reply to
+          // [Continue]: that round's rows carry no prompt. One that doesn't
+          // say whether it carries them (membrane 0.5.87) counts as carrying
+          // them here, as at the drain above. A boundary that ends the turn,
+          // restarts the stream or falls back to a new start below hands
+          // them to no live stream, and a new start reads its own prompt from
+          // what it sends. (The routing notice below rides only an injection
+          // already here.)
+          if (midTurnInjections.length > 0) {
+            const turnTrigger = this.activeTurnTriggers.get(agent.name);
+            if (turnTrigger) this.turnPrompts.delete(turnTrigger);
           }
 
           // Check if any tool result requested endTurn
@@ -10793,7 +10880,6 @@ export class AgentFramework {
               source: 'framework',
               timestamp: Date.now(),
               suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
-              ephemeralSystemPrompt: this.activeTurnTriggers.get(agent.name)?.ephemeralSystemPrompt,
               silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
             });
           } else if (currentState.stream) {
@@ -10842,12 +10928,15 @@ export class AgentFramework {
             });
           } else {
             // Non-streaming fallback: schedule re-inference, which continues
-            // this stream's logical turn (openLogical).
+            // this stream's logical turn (openLogical), so it carries the
+            // turn's properties, as the budget restart does.
             this.pendingRequests.push({
               agentName: agent.name,
               reason: 'tool_results_ready',
               source: 'framework',
               timestamp: Date.now(),
+              suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
+              silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
             });
           }
         }
@@ -11948,6 +12037,7 @@ export class AgentFramework {
       remove: (p) => this.removePlacement(p),
       deliver: (occ, materialized, assemblingFor) => this.deliverCoalesced(occ, materialized, assemblingFor),
       wakeForBatch: (occ) => this.wakeForCoalescedBatch(occ),
+      wakeToRead: (occ, agentName) => this.queueCoalescedWakes({ ...occ, deliverTo: agentName }, true),
       cancelWake: (subject) => this.cancelCoalescedWakes(subject),
       authorized: (occ) => this.coalescedAuthorized(occ),
       audience: (occ) => this.coalescedAudience(occ),
@@ -12335,8 +12425,16 @@ export class AgentFramework {
   }
 
   private async wakeForCoalescedBatch(occ: CoalescedOccurrence<CoalescedDelivery>): Promise<void> {
+    this.cancelCoalescedWakes(coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key));
+    await this.queueCoalescedWakes(occ);
+  }
+
+  /** Queue a wake for each agent of the batch's audience, when its latest
+   *  occurrence triggers inference. `plain`: an ordinary push wake, without
+   *  the subject a withdrawal of the batch's wakes goes by, for a render
+   *  placed in its agent's deferred queue (wakeToRead). */
+  private async queueCoalescedWakes(occ: CoalescedOccurrence<CoalescedDelivery>, plain = false): Promise<void> {
     const subject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
-    this.cancelCoalescedWakes(subject);
     if (occ.event.lane !== 'push' || !occ.event.event.triggerInference) return;
     const origin = occ.event.event.origin;
     // The wake carries the batch's channel so the turn freezes its reply
@@ -12352,8 +12450,7 @@ export class AgentFramework {
         channelId,
         counterparty: authorId ? `${occ.serverId}:user:${authorId}` : undefined,
         addressed: isAddressedMessage(occ.tags, origin),
-        coalescingSubject: subject,
-        coalescingBatch: true,
+        ...(plain ? {} : { coalescingSubject: subject, coalescingBatch: true }),
       });
     }
   }
@@ -12570,9 +12667,11 @@ export class AgentFramework {
           addressed: isAddressedMessage(event.tags, event.origin),
           ...(silentHeartbeat ? {
             suppressProse: true,
-            ephemeralSystemPrompt:
-              '[silent heartbeat] Scheduled private self-check. Review pending matters privately. ' +
-              'Do not narrate or publish plain prose; use an explicit send tool only if you deliberately choose to contact someone.',
+            // The tick's instruction rides its request-only separator
+            // (SILENT_HEARTBEAT_SEPARATOR), never the system prompt: a
+            // per-turn system change would cost the heartbeat's request
+            // its prompt cache from the system on, and fail the binding of
+            // every retained thinking block (context-manager #155).
             silentHeartbeat: { eventId: event.eventId, serverId: event.serverId },
           } : {}),
           ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
@@ -12917,8 +13016,14 @@ export class AgentFramework {
         coalescingBatchSubjects: batchOnly
           ? [...new Set(requests.flatMap((r) => r.coalescingBatchSubjects ?? [r.coalescingSubject!]))]
           : undefined,
+        // A withdrawal of a subject's wakes takes a wake whose sole cause is
+        // that subject (§4.2), so the merged trigger carries a subject only
+        // when it is every merged request's: withdrawing it then never takes
+        // the merge's other causes, such as an ordinary wake, another
+        // subject's batch, or a retry past its gate.
+        coalescingSubject: requests.every((r) => r.coalescingSubject === trigger?.coalescingSubject)
+          ? trigger?.coalescingSubject : undefined,
         suppressProse: silentOnly ? trigger?.suppressProse : undefined,
-        ephemeralSystemPrompt: silentOnly ? trigger?.ephemeralSystemPrompt : undefined,
         silentHeartbeat: silentOnly ? trigger?.silentHeartbeat : undefined,
         channelId: channelReq?.channelId,
         addressed: addressedReq !== undefined,
@@ -12934,20 +13039,40 @@ export class AgentFramework {
   }
 
   /**
-   * Metadata for rows the agent's current turn stores: a silent heartbeat
-   * tick stamps each of them (assistant responses, tool_result rows) so they
-   * stay identifiable after the turn — request builds key the tick separator
-   * on it, and a later retention policy can find or collapse them. The stamp
-   * names the agent: residents share one message slot and a broadcast tick
-   * reaches each of them with the same eventId. Undefined for ordinary
-   * turns, whose rows are stored exactly as before.
+   * Stamps for the rows the agent's reply stores in its current turn: its
+   * assistant responses, its tool_result rows (through `storeResults`), and
+   * the contained-wrapper row that stands in for a response. The turn's other
+   * stores (a delivery receipt, a routing notice, a deferred flush) aren't the
+   * reply's, and carry none.
+   * - A silent heartbeat tick stamps each of them for the whole turn, with the
+   *   separator text its request rendered. The stamps keep every row of the
+   *   tick identifiable after the turn, for a later retention policy to find
+   *   or collapse. The stamp names the agent: residents share one message
+   *   slot, and a broadcast tick reaches each of them with the same eventId.
+   * - A `[Continue]` prompt stamps the rows of each round that follows it
+   *   (`turnPrompts`).
+   * Request builds render each turn before the first surviving assistant row
+   * that carries its stamp and that they can recognise: one with a tool call,
+   * or with signed or redacted thinking (see silent-heartbeat.ts). The
+   * tool_result rows and the wrapper row are stored as `user`, so their
+   * stamps place nothing: they mark each row as the reply's.
+   * Undefined for ordinary turns, whose rows are stored exactly as before.
+   * (Named for its first use, the silent tick.)
    */
-  private silentTurnRowMetadata(agentName: string): MessageMetadata | undefined {
-    const tick = this.activeTurnTriggers.get(agentName)?.silentHeartbeat;
-    const stamp: SilentHeartbeatStamp | undefined = tick
-      ? { eventId: tick.eventId, serverId: tick.serverId, agentName }
-      : undefined;
-    return stamp ? { silentHeartbeat: stamp } : undefined;
+  private silentTurnRowMetadata(agentName: string): RequestOnlyStamps | undefined {
+    const trigger = this.activeTurnTriggers.get(agentName);
+    if (!trigger) return undefined;
+    const tick = trigger.silentHeartbeat;
+    const prompt = this.turnPrompts.get(trigger);
+    if (!tick && !prompt) return undefined;
+    const stamps: RequestOnlyStamps = {};
+    if (tick) {
+      stamps.silentHeartbeat = {
+        eventId: tick.eventId, serverId: tick.serverId, agentName, separator: SILENT_HEARTBEAT_SEPARATOR,
+      };
+    }
+    if (prompt) stamps.promptedBy = prompt;
+    return stamps;
   }
 
   /** Record plain-prose segments this turn suppressed without drafts (proseRouting=disabled). */
@@ -15027,10 +15152,16 @@ export class AgentFramework {
     // boundary — after the deferred flush (same window: turn alive, compile
     // not yet run) and before the checkpoint (they are the turn's inputs).
     // Not on a context-budget restart: that continues the same logical turn.
+    // A turn whose only causes are deferred batches assembles even when no
+    // batch is pending: its batch may have been withdrawn after its wake was
+    // dispatched or be rendering for another agent's assembly, and only the
+    // assembly can say whether the turn has anything to read.
+    const batchSubjects = trigger?.coalescingBatchSubjects;
     let assembly: AssemblyResult | undefined;
-    if (attempt === 0 && !resumesTurn && this.pushCoalescer?.pendingBatches()) {
+    if (attempt === 0 && !resumesTurn && this.pushCoalescer
+      && (batchSubjects?.length || this.pushCoalescer.pendingBatches())) {
       try {
-        assembly = await this.pushCoalescer.assemble(agent.name);
+        assembly = await this.pushCoalescer.assemble(agent.name, batchSubjects);
       } catch (err) {
         console.error(`[coalescing] assembly for ${agent.name} failed:`, err);
       }
@@ -15039,15 +15170,16 @@ export class AgentFramework {
     // A turn whose only causes were deferred batches, none of which gave it
     // anything to read (an empty or blank render, §5.2; cancelled; revoked; a
     // render-start that could not be made durable, whose batch then waits for
-    // its recovery wake; a batch whose audience doesn't include the agent),
-    // has nothing new to show: running it would wake the model to
-    // `[Continue]` or an older message, an uncaused wake. Stop before the
-    // checkpoint, locus, typing and compile. Any batch this assembly
-    // materialized keeps the turn, including one that was not among its
-    // causes (a batch whose wake the freeze withdrew, or one that never
-    // qualified for a wake). A cause this assembly did not settle (rendered
-    // elsewhere, not yet frozen) keeps the turn, as before.
-    const batchSubjects = trigger?.coalescingBatchSubjects;
+    // its recovery wake; a batch whose audience doesn't include the agent; a
+    // render placed in another agent's deferred queue; a batch another
+    // assembly froze, or one withdrawn, displaced or consumed by another
+    // request before this assembly), has nothing new to show: running it would
+    // wake the model to `[Continue]` or an older message, an uncaused wake.
+    // Stop before the checkpoint, locus, typing and compile. Any batch this
+    // assembly materialized keeps the turn, including one that was not among
+    // its causes (a batch whose wake the freeze withdrew, or one that never
+    // qualified for a wake). A cause this assembly did not settle (the host
+    // stopping) keeps the turn, as before.
     if (assembly && batchSubjects?.length && assembly.materialized.size === 0
       && batchSubjects.every((s) => assembly.settled.has(s))) {
       console.error(`[coalescing] ${agent.name}: its deferred batches gave this turn nothing to read; turn not started (no wake cause left)`);
@@ -15064,6 +15196,20 @@ export class AgentFramework {
         this.ackDeferredWrites();
       }
       return false;
+    }
+    // The turn has passed its gate, so from here it goes on with a copy of
+    // its trigger without a batch wake's marks. A retry of it then comes back
+    // as an ordinary wake by whatever door it takes (a provider hold's
+    // release, the auxiliary park's requeue, the tool-result guard's
+    // restart): this gate doesn't withdraw it for finding its batches
+    // consumed, and no withdrawal of the subject's wakes reaches it (§4.2
+    // withdraws a wake whose sole cause is the subject, and a merge carries
+    // a subject only when it is every merged request's). This frame's
+    // activeTurnTriggers entry keeps the trigger as it came; a retry's frame
+    // records the copy it carries.
+    if (trigger?.coalescingSubject !== undefined || trigger?.coalescingBatch) {
+      const { coalescingSubject: _subject, coalescingBatch: _batch, coalescingBatchSubjects: _subjects, ...retry } = trigger;
+      trigger = retry;
     }
 
     // Record turn checkpoint before inference (only on first attempt, not retries)
@@ -15260,15 +15406,6 @@ export class AgentFramework {
         }
       }
 
-      if (trigger?.ephemeralSystemPrompt) {
-        const silentInjection: ContextInjection = {
-          namespace: 'framework:silent-heartbeat',
-          position: 'system',
-          content: [{ type: 'text', text: trigger.ephemeralSystemPrompt }],
-        };
-        injections = injections ? [...injections, silentInjection] : [silentInjection];
-      }
-
       // An ephemeral watchdog may dispose this Agent while hooks/compile await,
       // and stop() may close provider admission. Do not create a provider
       // stream after its generation lost ownership, or once admission closed.
@@ -15299,6 +15436,7 @@ export class AgentFramework {
         request: compiledRequest,
         takeKvSubmission,
         drainKvSubmissionIds,
+        continuePrompt,
       } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
         silentHeartbeat: trigger?.silentHeartbeat,
       });
@@ -15353,6 +15491,14 @@ export class AgentFramework {
           this.eventGate?.onInferenceEnded(agent.name);
           return false;
         }
+      }
+      // The [Continue] prompt this stream's first round follows, if any, as
+      // the Agent read it from the request: the round's rows carry it
+      // (silentTurnRowMetadata), and so do later rounds' until a tool
+      // boundary hands the stream messages after the results.
+      if (trigger) {
+        if (continuePrompt) this.turnPrompts.set(trigger, continuePrompt);
+        else this.turnPrompts.delete(trigger);
       }
 
       const handle = this.driveStream(
@@ -17692,22 +17838,18 @@ export class AgentFramework {
     }
     const server = this.mcplServerRegistry.getServer(serverId);
     if (!server) {
-      return { success: false, error: `MCPL server ${serverId} not found`, isError: true };
+      return { success: false, error: this.mcplServerAbsentText(serverId, call.name), isError: true };
     }
     const toolName = call.name.slice(prefix.length + 2); // Strip prefix + '--'
     if (!isToolAllowed(toolName, this.mcplServerConfigs.get(serverId))) {
-      return {
-        success: false,
-        error: `Tool '${call.name}' is not permitted by this server's tool policy.`,
-        isError: true,
-      };
+      return { success: false, error: mcplToolDeniedText(serverId, call.name), isError: true };
     }
     try {
       const result = await server.sendToolsCall(toolName, call.input as Record<string, unknown>);
       // A server's error is a failure here too, as the model's dispatch
       // reads it. A success is the server's own blocks, for the caller to
       // use in process.
-      if (result.isError) return mcplToolFailure(result.content);
+      if (result.isError) return mcplToolFailure(result.content, serverId, call.name);
       // RFC-005 §6.2: register the result's references with this server, so
       // a stub later made of them is bound and fetch_reference can fetch
       // them through this server's address, where it has one. Nothing is
@@ -19387,8 +19529,14 @@ export class AgentFramework {
       if (opts?.fromQueue) {
         this.unackedDeferredWrites = this.unackedDeferredWrites.filter((m) => m.id !== id);
       }
+      // An entry with no target is the primary's. A write with no target that
+      // went to another agent (on a host with no primary, the first one
+      // registered, such as an ephemeral run) names that agent, so the
+      // agent's flushes and its window's release take the entry as they take
+      // a targeted one.
+      const forAgent = opts?.forAgent ?? (agent.name === this.primaryAgentName ? undefined : agent.name);
       this.deferredMessages.push({
-        id, seq: opts?.fromQueue?.seq ?? ++this.deferredSeq, participant, content, metadata, forAgent: opts?.forAgent,
+        id, seq: opts?.fromQueue?.seq ?? ++this.deferredSeq, participant, content, metadata, forAgent,
         heldAt: opts?.fromQueue?.heldAt ?? Date.now(),
       });
       if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
@@ -19511,13 +19659,20 @@ export class AgentFramework {
    * of the body isn't stored. (Requeued, the
    * landed shards would be stored twice, and only the rest could not be
    * appended later without splitting the body.) Boot's scan for landed
-   * writes counts a landed shard the same way.
+   * writes counts a landed shard the same way. When the store can't be read
+   * back (storedCopiesOf logs it), nothing is found, and the entry is put
+   * back as one that couldn't be stored: if it had landed, a later flush
+   * stores it again.
    *
    * Returns what was written (stored, or deferred again by addMessage, whose
    * id is then empty), in queue order: for one target, a prefix of its
-   * entries. `onLanded` hears an entry whose write threw after storing it,
-   * with the id it landed under, as soon as it's found: before the writes
-   * after it, so whatever it records keeps their order.
+   * entries. Each comes with its content: as given, unless the store took it
+   * as more than one message (a sharded body) and can be read back, when its
+   * copies are returned joined, as later compiles render them (asCompiled),
+   * or its write threw after storing it (above). `onLanded` hears an entry
+   * whose write threw after storing it, with the id it landed under, as soon
+   * as it's found: before the writes after it, so whatever it records keeps
+   * their order.
    */
   private writeDrainedInOrder(
     entries: DeferredWrite[],
@@ -19537,7 +19692,15 @@ export class AgentFramework {
       const agent = this.deliveryAgent(msg.forAgent);
       const before = agent ? this.storedCountOf(agent) : undefined;
       try {
-        written.set(msg, { id: write(msg), content: msg.content });
+        const id = write(msg);
+        // A body the store took as more than one message (a sharded body) is
+        // returned as later compiles render it: its copies, joined
+        // (asCompiled). The store is read for them only when it grew by more
+        // than one message.
+        const copies = agent && before !== undefined && (this.storedCountOf(agent) ?? before) - before > 1
+          ? this.storedCopiesOf(agent, before, msg.id)
+          : [];
+        written.set(msg, { id, content: copies.length > 1 ? asCompiled(copies) : msg.content });
       } catch (error) {
         const landed = agent && before !== undefined ? this.storedCopiesOf(agent, before, msg.id) : [];
         if (landed.length > 0) {
@@ -19575,7 +19738,7 @@ export class AgentFramework {
         .filter((m) => m.metadata?.deferredWriteId === deferredWriteId)
         .map((m) => ({ id: m.id, content: m.content, ...(m.bodyGroupId !== undefined ? { bodyGroupId: m.bodyGroupId } : {}) }));
     } catch (error) {
-      console.error(`[deferral] could not read ${agent.name}'s store for a deferred write that threw:`, error);
+      console.error(`[deferral] could not read back what deferred write ${deferredWriteId} stored in ${agent.name}'s store:`, error);
       return [];
     }
   }
@@ -21415,7 +21578,18 @@ export class AgentFramework {
         }),
       });
     }
-    const connection = await this.mcplServerRegistry.addServer(connectionConfig, this.mcplHostCapabilities);
+    // The prefix above routes this server's tool calls already, and addServer
+    // registers the server only once its handshake is done, so until it
+    // settles a call is told this host is connecting to it. A connect that
+    // fails without reconnect leaves it unregistered, and a call is told it's
+    // gone; with reconnect, the stub it leaves is registered and answers.
+    this.mcplConnecting.add(config.id);
+    let connection: McplServerConnection;
+    try {
+      connection = await this.mcplServerRegistry.addServer(connectionConfig, this.mcplHostCapabilities);
+    } finally {
+      this.mcplConnecting.delete(config.id);
+    }
 
     // Wire listeners before either startup staging or the runtime global gate
     // releases control traffic needed for registration and marker service.
@@ -21959,16 +22133,22 @@ export class AgentFramework {
 
   /**
    * Refuse a runtime connect, or a restart, before it writes anything: an id
-   * already registered, or a tool prefix that equals a module name or another
-   * server's prefix, or meets another server's (prefixesMeet, #265). create()
-   * applies the same prefix rules at startup. The connecting id's own entries
-   * don't count, nor, for a restart, those of the server it replaces
-   * (`replacing`), which it disconnects first.
+   * whose connect is in flight or that's already registered, or a tool prefix
+   * that equals a module name or another server's prefix, or meets another
+   * server's (prefixesMeet, #265). create() applies the same prefix rules at
+   * startup. The connecting id's own entries don't count, nor, for a restart,
+   * those of the server it replaces (`replacing`), which it disconnects first.
    */
   private refuseMcplConnect(
     config: import('./mcpl/types.js').McplServerConfig,
     replacing?: string,
   ): void {
+    // A connect in flight isn't registered until its handshake is done, so
+    // the registry's check below misses it. Its id is taken whether this
+    // connects it or a restart replaces it: the restart's disconnect can't
+    // stop a connect in flight, which would register the server after it.
+    const inFlight = [config.id, replacing].find((id) => id !== undefined && this.mcplConnecting.has(id));
+    if (inFlight !== undefined) throw mcplConnectInFlightError(inFlight);
     // The registry refuses a second server under one id too, but only once
     // the connect has written its config and prefix over the live server's.
     if (config.id !== replacing && this.mcplServerRegistry?.getServer(config.id)) {
@@ -22008,6 +22188,10 @@ export class AgentFramework {
     if (!this.mcplServerRegistry) {
       throw new Error('MCPL subsystem is not initialized');
     }
+    // A connect in flight would register the server after this disconnect,
+    // with its config and prefix gone, where only another disconnect reaches
+    // it; refused as a second connect of it is (refuseMcplConnect).
+    if (this.mcplConnecting.has(id)) throw mcplConnectInFlightError(id);
     const config = this.mcplServerConfigs.get(id);
     const oldToolNames = new Set(this.mcplTools.map(t => t.name));
 
@@ -22974,6 +23158,14 @@ export class AgentFramework {
     }
   }
 
+  /** The refusal of an MCPL tool call whose server isn't in the registry, for
+   *  the model's call and a script's alike. */
+  private mcplServerAbsentText(serverId: string, toolName: string): string {
+    return this.mcplConnecting.has(serverId)
+      ? mcplServerConnectingText(serverId, toolName)
+      : mcplServerGoneText(serverId, toolName);
+  }
+
   /**
    * Dispatch a tool call to an MCPL server.
    * Strips the configured toolPrefix and routes to the server.
@@ -22991,7 +23183,7 @@ export class AgentFramework {
         toolName: call.name,
         agentName,
         moduleName: `mcpl:${serverId}`,
-        result: { success: false, error: `MCPL server not found: ${serverId}`, isError: true },
+        result: { success: false, error: this.mcplServerAbsentText(serverId, call.name), isError: true },
       });
       return;
     }
@@ -23006,11 +23198,7 @@ export class AgentFramework {
         toolName: call.name,
         agentName,
         moduleName: `mcpl:${serverId}`,
-        result: {
-          success: false,
-          error: `Tool '${call.name}' is not permitted by this server's tool policy.`,
-          isError: true,
-        },
+        result: { success: false, error: mcplToolDeniedText(serverId, call.name), isError: true },
       });
       return;
     }
@@ -23088,7 +23276,7 @@ export class AgentFramework {
         // string for backward compatibility with callers that expect data to
         // be string-ish.
         const converted: ToolResult = result.isError
-          ? mcplToolFailure(result.content)
+          ? mcplToolFailure(result.content, serverId, call.name)
           : {
               success: true,
               data: result.content?.some((c) => c.type !== 'text')
@@ -23221,7 +23409,7 @@ export class AgentFramework {
       };
 
       if (call.name === 'channel_open') {
-        reject(`This conversation is bound to channel ${home}; conversation agents cannot open channels.`);
+        reject(`This conversation is bound to channel "${home}", so it can't open other channels, and nothing was opened. Reply in "${home}".`);
         return;
       }
       if (call.name === 'channel_publish' || call.name === 'channel_close') {
