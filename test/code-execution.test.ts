@@ -1132,18 +1132,30 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
     }
   });
 
-  it("a process the script forks that runs off the script's end leaves without ending the exec", async () => {
+  it("a process the script forks that runs off the script's end leaves with its script's return code, without ending the exec", async () => {
     const runner = new PyRunner({ onToolCall: async () => '' });
     try {
       // Python 3.12 on warns that the runtime's reader thread makes fork() risky.
       const result = await within(
         runner.exec(
-          'import os, warnings\nwarnings.simplefilter("ignore", DeprecationWarning)\npid = os.fork()\nif pid == 0:\n    print("child")\nelse:\n    os.waitpid(pid, 0)\n    print("parent")',
+          [
+            'import os, warnings',
+            'warnings.simplefilter("ignore", DeprecationWarning)',
+            'pid = os.fork()',
+            'if pid == 0:',
+            '    print("child")',
+            '    raise RuntimeError("raised in the child")',
+            '_, status = os.waitpid(pid, 0)',
+            'print("parent saw", os.WEXITSTATUS(status))',
+          ].join('\n'),
           [],
         ),
         'the exec to settle',
       );
-      assert.deepStrictEqual(result, { stdout: 'child\nparent\n', stderr: '', returnCode: 0 });
+      // The child's traceback is its own, and its exit says it raised, as Python's does.
+      assert.strictEqual(result.stdout, 'child\nparent saw 1\n');
+      assert.match(result.stderr, /^Traceback \(most recent call last\):\n[\s\S]*RuntimeError: raised in the child\n$/);
+      assert.strictEqual(result.returnCode, 0);
       assert.strictEqual((await runner.exec('print("next")', [])).stdout, 'next\n');
     } finally {
       runner.dispose();

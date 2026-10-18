@@ -560,8 +560,10 @@ async def _run_script(exec_id, code, mark, st):
 
     if os.getpid() != _RUNTIME_PID:
         # A process the script forked ran off the script's end: the exec, its
-        # result and its marks are the runtime's, so it leaves, sending none.
-        os._exit(0)
+        # result and its marks are the runtime's, so it leaves, sending none,
+        # with the status Python gives a script that ended so. Its writers hold
+        # a copy of what the parent's held at the fork, so it doesn't flush them.
+        os._exit(return_code)
     # What the script left in its writers, then the runtime's own fds, then
     # the result, then the marks: should the fds be gone, the runtime's word
     # on why still lands in this exec's share of stderr.
