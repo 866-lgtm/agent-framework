@@ -12544,8 +12544,10 @@ export class AgentFramework {
         const newestByKey = new Map<string, InferenceRequest>();
         for (const request of parked) {
           // A coalesced wake is withdrawable by its subject (RFC-006 §4.2); it
-          // must not absorb an unrelated wake that would vanish with it.
-          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${request.coalescingSubject ?? ''}`;
+          // must not absorb an unrelated wake that would vanish with it. A wake
+          // to read a queued render outlives the subject's other wakes, so it
+          // keeps its own key too.
+          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${request.coalescingSubject ?? ''}|${request.coalescingRead ? 'r' : ''}`;
           const prev = newestByKey.get(key);
           if (!prev || request.timestamp >= prev.timestamp) {
             newestByKey.set(key, request);
