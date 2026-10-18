@@ -14336,13 +14336,15 @@ export class AgentFramework {
   }
 
   /**
-   * Durable window notice for a channel the agent did not ask to open —
-   * subscription-policy admission, or an open forced by the agent's own
-   * delivery into a closed channel. The agent must always learn that the
-   * channel opened, and that `channel_close` opts out (their decision
-   * outranks policy). What an open channel delivers is its server's to say
-   * (#406), so the notice doesn't promise its traffic. System message: never
-   * triggers inference, never conversational, never locus-eligible.
+   * Durable window notice for a channel the agent did not ask to open: a
+   * subscription-policy admission, announced as the decision before its
+   * transport RPC (a failed open keeps the decision, and channel_list shows
+   * transport state), or an open that the agent's own delivery or reply
+   * caused (`opened-by-delivery`, `opened-by-reply`), once its transport is
+   * confirmed. Either way it names `channel_close` as the opt-out (their
+   * decision outranks policy). What an open channel delivers is its server's
+   * to say (#406), so the notice doesn't promise its traffic. System message:
+   * never triggers inference, never conversational, never locus-eligible.
    */
   private recordChannelAutoOpenNotice(
     agentName: string | undefined,
@@ -14355,8 +14357,7 @@ export class AgentFramework {
       .join(', ');
     const plural = channels.length > 1;
     const optOut = ' What an open channel delivers to you depends on its server. ' +
-      `If you don't want ${plural ? 'one of them' : 'it'}, use channel_close — ` +
-      'your choice sticks; neither policy nor a later send will silently reopen it.';
+      `If you don't want ${plural ? 'one of them' : 'it'}, use channel_close; your choice outranks policy.`;
     // An open caused by an agent's own send is that agent's to hear about, in
     // the window it reads; a policy admission with no agent behind it goes to
     // the primary. An agent that has ended (a run whose final reply is routed
@@ -14373,15 +14374,14 @@ export class AgentFramework {
         console.error(`[channel] ${agentName} has ended, and there is no primary to tell that ${shown} opened`);
         return;
       }
-      text = `[channels] Now open: ${shown} — opened by ${agentName}'s reply; ${agentName} has ended.` + optOut;
+      text = `[channels] Now open: ${shown}: opened by ${agentName}'s reply; ${agentName} has ended.` + optOut;
       metadata = { system: true, kind: 'channel-notice', speaker: agentName } as MessageMetadata;
       told = `the primary, by name (${agentName} has ended)`;
     } else {
-      const causeText =
-        cause === 'subscription-policy'
-          ? 'your subscription policy just admitted ' + (plural ? 'them' : 'it')
-          : 'your own message into the closed channel engaged it';
-      text = `[channels] Now open: ${shown} — ${causeText}.` + optOut;
+      text = (cause === 'subscription-policy'
+        ? `[channels] Selected for opening by subscription policy: ${shown}. ` +
+          'This records the admission decision; channel_list shows current transport state.'
+        : `[channels] Now open: ${shown}: your own message into the closed channel opened it.`) + optOut;
       if (agentName) target = { forAgent: agentName };
       told = agentName ?? 'primary';
     }
@@ -22979,19 +22979,21 @@ export class AgentFramework {
   }
 
   /**
-   * Disconnect an MCPL server at runtime: close the connection, destroy its
-   * feature-set and checkpoint state (permanent removal — unlike a transient
-   * transport close, which preserves checkpoints for the reconnect), remove
-   * its channels from the registry, drop routing entries, and refresh tools.
+   * Disconnect an MCPL server at runtime: remove its channels from the
+   * registry (first, cancelling their queued lifecycle work), close the
+   * connection, destroy its feature-set and checkpoint state (permanent
+   * removal — unlike a transient transport close, which preserves checkpoints
+   * for the reconnect), drop routing entries, and refresh tools.
    * No-op-ish if the server is not connected (still clears routing state).
    *
    * It holds the id throughout (holdMcpServerId): a connect for it is
    * refused meanwhile, and a connect already in flight is ended (closed, or
    * displaced when its legacy handshake finishes) and settles before
-   * anything is removed. A close that can't confirm a child exited fails the
-   * disconnect before anything is removed: the server stays registered,
-   * closed, so nothing launches beside a child that may still be running,
-   * and disconnecting again retries the reap.
+   * anything but the channel entries the disconnect found when it began is
+   * removed. A close that can't confirm a child exited fails the disconnect
+   * before anything but those entries is removed: the server stays
+   * registered, closed, so nothing launches beside a child that may still be
+   * running, and disconnecting again retries the reap.
    */
   async disconnectMcplServer(id: string): Promise<void> {
     this.refuseOperatorAfterStop('disconnect MCPL server');
@@ -23009,6 +23011,9 @@ export class AgentFramework {
     const registry = this.mcplServerRegistry;
     const hold = this.holdMcpServerId(id, 'disconnect');
     try {
+      // Channel entries go first: removing them cancels the server's queued
+      // lifecycle work, which must not run against the closing connection.
+      this.channelRegistry?.removeServer(id);
       // Close what the id has now, so a connect in flight ends rather than
       // being waited out: a modern connect is ended by its close, a legacy
       // one still in its handshake (or a WebSocket dial waiting for its
@@ -23042,6 +23047,8 @@ export class AgentFramework {
         );
       }
       if (modern && this.modernServers().get(id) === modern) this.modernServers().delete(id);
+      // Again, for the channels a connect that was still running registered
+      // after the first removal, and any lifecycle work they queued.
       this.channelRegistry?.removeServer(id);
 
       // Permanent removal: also destroy feature-set and checkpoint state
@@ -24629,9 +24636,11 @@ export class AgentFramework {
                 // Recorded here — not eagerly — because injection metadata
                 // carries the CANONICAL channel id (descriptor form), while
                 // send args often carry the raw provider id; this callback
-                // has the resolved form. The already-open path resolves on
+                // has the resolved form. A channel confirmed open resolves on
                 // the microtask queue, i.e. before the tool-result event
-                // that evaluates injections.
+                // that evaluates injections. One decided open whose transport
+                // is unconfirmed is opened again first, so its engagement is
+                // recorded when that open returns.
                 if (status !== 'unknown-channel' && status !== 'ambiguous') {
                   sendingTurn?.engaged.add(channelId ?? target);
                 }
@@ -24646,7 +24655,8 @@ export class AgentFramework {
                   );
                 } else if (status === 'open-failed') {
                   console.error(
-                    `[channel] ${agentName}: ${toolName} delivered to ${target} but the open-on-send failed — channel remains half-alive, will reconcile`,
+                    `[channel] ${agentName}: ${toolName} delivered to ${target} but the open-on-send failed; ` +
+                      'a later registration or delivery tries the open again',
                   );
                 }
               })
