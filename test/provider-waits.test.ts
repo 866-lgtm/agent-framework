@@ -18,6 +18,7 @@ import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, 
 import { AgentFramework, ApiServer, ProviderWaitNotSleptError } from '../src/index.js';
 import { ProviderWaits, waitDeadline, PROVIDER_WAIT_RECORD_TYPE } from '../src/provider-waits.js';
 import { HeldStream, MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
+import { forkAgentName } from '../src/mcpl/conversation-router.js';
 
 function withStoreDir<T>(fn: (path: string) => Promise<T> | T): Promise<T> {
   const dir = mkdtempSync(join(tmpdir(), 'provider-waits-'));
@@ -1944,7 +1945,7 @@ test("a conversation agent's compression is refused by its own recorded wait, an
     try {
       fw.pushEvent(directMessage('zz:D1', 'zz-hello'));
       await fw.runUntilIdle();
-      const fork = 'conversation-zz-D1-g1';
+      const fork = forkAgentName('conversation', 'zz-server', 'zz:D1', 1);
       const agent = fw.getAgent(fork);
       assert.ok(agent, 'the direct message spawned a conversation agent');
       const compression = (agent.getContextManager() as unknown as {

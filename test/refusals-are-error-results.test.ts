@@ -1,7 +1,7 @@
 /**
  * A refusal is an error result. tune_out's refusals, channel_open on a
  * tuned-out channel, the subconscious's refusals and the api module's
- * "Unknown tool" reach the model flagged as errors, with the refusal's text,
+ * unknown-tool answer reach the model flagged as errors, with the refusal's text,
  * so it can tell a refusal from a success. Before, only deliver_summary's
  * "subconscious not configured" was flagged: the model read each of the
  * others as a tool that ran and answered (in XML tool mode, as the tool's
@@ -23,6 +23,8 @@ import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 const FIXTURE = join(import.meta.dirname, 'fixtures/tune-out-mcpl-server.mjs');
 const CHANNEL = 'disc:guild:noisy';
+/** The api module's answer for a tool it doesn't have: it has none. */
+const API_UNKNOWN = 'There\'s no tool "api--lookup", so nothing ran. The api module has no tools of its own: every tool you can call is in your tool list.';
 const TUNED_OUT = `Channel ${CHANNEL} is tuned out. Cancel the tune-out (tune_out with mode: 'cancel') ` +
   'to resume normal attention — cancelling delivers the diverted backlog.';
 
@@ -123,7 +125,7 @@ test("the resident's refusals reach the model as error results, and a tune-out i
       + 'duration runs out, or at the first wake past its wake budget, and its backlog goes to you then.',
     isError: true,
   });
-  assert.deepEqual(first!.get('api'), { content: 'Unknown tool', isError: true });
+  assert.deepEqual(first!.get('api'), { content: API_UNKNOWN, isError: true });
   // A control: the same tool's success still reads as one.
   const { cadenceSeconds, backlogCap, maxWakes } = TUNE_OUT_DEFAULTS;
   assert.deepEqual(second!.get('enter'), {
@@ -190,7 +192,7 @@ test('a script, and a module calling in process, get the refusals as errors too'
     handleScriptToolCall(agent: string, tool: string, args: Record<string, unknown>): Promise<string>;
   }).handleScriptToolCall('scout', tool, input);
   assert.equal(await script('tune_out', { channelId: 'disc:guild:none' }), 'Error: unknown channel: disc:guild:none');
-  assert.equal(await script('api--lookup', {}), 'Error: Unknown tool');
+  assert.equal(await script('api--lookup', {}), `Error: ${API_UNKNOWN}`);
   // A control: the same tool's success still reads as one.
   const { cadenceSeconds, backlogCap, maxWakes } = TUNE_OUT_DEFAULTS;
   assert.equal(
@@ -208,6 +210,6 @@ test('a script, and a module calling in process, get the refusals as errors too'
   });
   assert.deepEqual(
     await keeper.ctx!.callTool({ id: 'ctx-api', name: 'api--lookup', input: {} }),
-    { success: false, error: 'Unknown tool', isError: true },
+    { success: false, error: API_UNKNOWN, isError: true },
   );
 });

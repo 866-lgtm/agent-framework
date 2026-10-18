@@ -14,6 +14,7 @@
 import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
+import { safeSlice } from '../safe-slice.js';
 
 import type { ToolDefinition } from '../types/events.js';
 import type {
@@ -1484,7 +1485,7 @@ export class EventGate {
     const event: PendingEvent = {
       policyName: policy.name,
       content: info.content.length > MAX_CONTENT_SNIPPET
-        ? info.content.slice(0, MAX_CONTENT_SNIPPET) + '...'
+        ? safeSlice(info.content, 0, MAX_CONTENT_SNIPPET) + '...'
         : info.content,
       eventType: info.eventType,
       timestamp: Date.now(),
@@ -2002,10 +2003,9 @@ export class EventGate {
     // a turn whose exit didn't end it (a retry stop() cancelled, a successor
     // stop() refused) would make every debounced batch buffer until that
     // agent's next turn ended. A turn that continues after the start() takes
-    // its entry again (onInferenceResumed). A turn that a start() during the
-    // stop() began before this ran loses its entry too, and runs on without
-    // it, so debounced batches are delivered while it runs: nothing refuses
-    // a start() during a stop() yet.
+    // its entry again (onInferenceResumed). A start() made during the stop()
+    // is refused, so no turn of a new lifecycle can have begun before this
+    // runs.
     this.inferring.clear();
   }
 }
