@@ -605,16 +605,51 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(forkCm.mock.callCount(), 1);
     });
 
-    it('drops, logged once, an auto-open notice for an agent no longer registered', async (t) => {
-      const primary = t.mock.method(framework.getAgent('primary')!.getContextManager(), 'addMessage');
+    it('tells the primary, by name, of a channel an ended agent\'s send opened, and the primary\'s channel_close closes it', async (t) => {
+      const state = internals(framework);
+      const channels = (state.channelRegistry as unknown as { channels: Map<string, { open: boolean }> }).channels;
+      // The channel the ended run's reply opened, on a server that lets it close.
+      channels.set('srv:opened-1', { serverId: 'srv', descriptor: { id: 'opened-1', type: 'srv', label: '#opened' }, open: true } as never);
+      const closed: unknown[] = [];
+      const server = {
+        grant: new CapabilityGrant(new Set(['channels.publish', 'channels.lifecycle']), []),
+        sendChannelsTyping() {},
+        async sendChannelsClose(params: unknown) { closed.push(params); },
+      };
+      t.mock.method(state.mcplServerRegistry, 'getServer', () => server as never);
+
+      state.recordChannelAutoOpenNotice('released-run', [{ channelId: 'opened-1', label: '#opened' }], 'opened-by-delivery');
+
+      const told = framework.getAgent('primary')!.getContextManager().getAllMessages()
+        .filter((m) => JSON.stringify(m.content).includes('Now open: #opened (opened-1)'));
+      assert.equal(told.length, 1, 'the primary is told once');
+      assert.match(JSON.stringify(told[0]!.content), /opened by released-run's reply; released-run has ended\. .*use channel_close/);
+      assert.equal((told[0]!.metadata as { speaker?: unknown } | undefined)?.speaker, 'released-run');
+      assert.equal(state.deferredMessages.length, 0);
+
+      // The remedy it names is the primary's to use.
+      (framework as unknown as { dispatchChannelToolCall(agent: string, call: { id: string; name: string; input: Record<string, unknown> }): void })
+        .dispatchChannelToolCall('primary', { id: 'close-1', name: 'channel_close', input: { channelId: 'opened-1' } });
+      for (let i = 0; i < 50 && channels.get('srv:opened-1')!.open; i++) await new Promise((resolve) => setImmediate(resolve));
+      assert.deepEqual(closed, [{ channelId: 'opened-1' }]);
+      assert.equal(channels.get('srv:opened-1')!.open, false, 'the channel the reply opened is closed');
+    });
+
+    it('tells no one, logged, of a channel an ended agent\'s send opened when there is no primary', async (t) => {
       const errors: string[] = [];
       t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
-
-      internals(framework).recordChannelAutoOpenNotice('released-conversation', [{ channelId: 'c-1' }], 'opened-by-delivery');
-
+      const primary = t.mock.method(framework.getAgent('primary')!.getContextManager(), 'addMessage');
+      const state = internals(framework) as unknown as ReturnType<typeof internals> & { primaryAgentName: string | null };
+      const name = state.primaryAgentName;
+      state.primaryAgentName = null;
+      try {
+        state.recordChannelAutoOpenNotice('released-run', [{ channelId: 'opened-2' }], 'opened-by-delivery');
+      } finally {
+        state.primaryAgentName = name;
+      }
       assert.equal(primary.mock.callCount(), 0);
-      assert.equal(internals(framework).deferredMessages.length, 0);
-      assert.deepEqual(errors, ['[notice] released-conversation is no longer registered, so its channel auto-open notice is dropped']);
+      assert.equal(state.deferredMessages.length, 0);
+      assert.deepEqual(errors, ['[channel] released-run has ended, and there is no primary to tell that opened-2 opened']);
     });
 
     it('passes a restored failure notice whose agent is gone to the primary, by name, and drops its other writes, logged', async (t) => {

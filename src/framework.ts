@@ -13732,30 +13732,44 @@ export class AgentFramework {
       .map((c) => (c.label && c.label !== c.channelId ? `${c.label} (${c.channelId})` : c.channelId))
       .join(', ');
     const plural = channels.length > 1;
-    const causeText =
-      cause === 'subscription-policy'
-        ? 'your subscription policy just admitted ' + (plural ? 'them' : 'it')
-        : 'your own message into the closed channel engaged it';
-    const text =
-      `[channels] Now open: ${shown} — ${causeText}. What an open channel delivers to you depends on its server. ` +
+    const optOut = ' What an open channel delivers to you depends on its server. ' +
       `If you don't want ${plural ? 'one of them' : 'it'}, use channel_close — ` +
       'your choice sticks; neither policy nor a later send will silently reopen it.';
     // An open caused by an agent's own send is that agent's to hear about, in
     // the window it reads; a policy admission with no agent behind it goes to
-    // the primary.
+    // the primary. An agent that has ended (a run whose final reply is routed
+    // after its release) can close nothing, and no channel opens without
+    // someone being told who can close it: the primary, the one left, is told
+    // by name, as for a failed reply. The default path would fall back to the
+    // first registered agent when there is no primary.
+    let text: string;
+    let metadata = { system: true, kind: 'channel-notice' } as MessageMetadata;
     let target: { forAgent: string } | undefined;
-    if (agentName) {
-      const addressed = this.noticeTargetFor(agentName, 'channel auto-open');
-      if (!addressed) return;
-      target = addressed;
+    let told: string;
+    if (agentName && !this.agents.has(agentName)) {
+      if (!this.primaryAgentName || !this.agents.has(this.primaryAgentName)) {
+        console.error(`[channel] ${agentName} has ended, and there is no primary to tell that ${shown} opened`);
+        return;
+      }
+      text = `[channels] Now open: ${shown} — opened by ${agentName}'s reply; ${agentName} has ended.` + optOut;
+      metadata = { system: true, kind: 'channel-notice', speaker: agentName } as MessageMetadata;
+      told = `the primary, by name (${agentName} has ended)`;
+    } else {
+      const causeText =
+        cause === 'subscription-policy'
+          ? 'your subscription policy just admitted ' + (plural ? 'them' : 'it')
+          : 'your own message into the closed channel engaged it';
+      text = `[channels] Now open: ${shown} — ${causeText}.` + optOut;
+      if (agentName) target = { forAgent: agentName };
+      told = agentName ?? 'primary';
     }
     try {
       // Through framework.addMessage for mid-turn safety (deferral +
       // hear-while-acting injection) — a delivery-forced open happens inside
       // a live turn, and a direct context-manager append there would store
       // the notice out of order.
-      this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'channel-notice' }, target);
-      console.error(`[channel] auto-open notice (${cause}) -> ${agentName ?? 'primary'}: ${shown}`);
+      this.addMessage('user', [{ type: 'text', text }], metadata, target);
+      console.error(`[channel] auto-open notice (${cause}) -> ${told}: ${shown}`);
     } catch (err) {
       console.error('recordChannelAutoOpenNotice failed:', err);
     }
@@ -19205,7 +19219,7 @@ export class AgentFramework {
   /**
    * Where a notice about an agent's own action belongs: its failed reply, its
    * bounced prose (beside its `{{unsent}}` clipboard), its background script's
-   * wake, a channel its own send opened. Every registered agent's notice is
+   * wake, the notices about its drafts. Every registered agent's notice is
    * addressed to that agent, so it lands in the window that agent reads and
    * waits on that agent's own turn, stream and tool cycle: a conversation
    * fork or an ephemeral run reads only its isolated slot, and a resident's
@@ -19216,7 +19230,9 @@ export class AgentFramework {
    * null when the agent is no longer registered (a fork or a run already
    * released): there is no window to write, so the caller writes nothing,
    * traces nothing and requests no wake. The drop is logged here, once. A
-   * failed reply is passed on by name instead (passFailedReplyToPrimary).
+   * failed reply is passed on by name instead (passFailedReplyToPrimary). The
+   * notice of a channel an agent's own send opened follows the same rule in
+   * recordChannelAutoOpenNotice, which passes it on by name too.
    */
   private noticeTargetFor(agentName: string, notice: string): { forAgent: string } | null {
     if (this.agents.has(agentName)) return { forAgent: agentName };
