@@ -454,6 +454,11 @@ import {
 const FRAMEWORK_STATE_ID = 'framework/state';
 /** Snapshot slot mirroring context writes deferred while quiesced (#122). */
 const DEFERRED_WRITES_ID = 'framework/deferred-writes';
+/** What a write of the deferred-write queue did: wrote the record (the
+ *  queue, or an empty one over a record that held one), had nothing to
+ *  write, or wrote nothing for a queue over the cap
+ *  (DEFERRED_WRITES_PERSIST_CAP_BYTES). */
+type DeferredWritesOutcome = 'written' | 'nothing' | 'over-cap';
 /** The event a coalesced occurrence delivers through — one per lane. */
 interface CoalescedChannelEvent {
   type: 'mcpl:channel-incoming';
@@ -483,8 +488,10 @@ type CoalescedDelivery =
 const COALESCING_STATE_ID = 'mcpl/coalescing';
 /** Receipts written since the last snapshot flush (bridges the throttle window). */
 const COALESCING_RECENT_ID = 'mcpl/coalescing-recent';
-/** Above this serialized size the deferred-write mirror is skipped (kept in
- *  memory only) rather than rewriting a multi-MB snapshot per deferral. */
+/** When the deferred-write queue's JSON is longer than this, counted as the
+ *  string's length, its record isn't written at all and keeps what it last
+ *  held, rather than rewriting a multi-MB snapshot per deferral. quiesce()
+ *  refuses a queue over it (writeDeferredWritesForQuiesce). */
 const DEFERRED_WRITES_PERSIST_CAP_BYTES = 4 * 1024 * 1024;
 
 /** Requests that CONTINUE a turn whose token is already held — a context-
@@ -1952,9 +1959,15 @@ export class AgentFramework {
   /** Agents an abandon could not cancel (token held, no stream) — surfaced
    *  in HostModeStatus until the next quiesce/resume. */
   private lastUnabandonable: string[] = [];
-  /** True while the deferred-write queue has a persisted mirror (quiesced). */
+  /** True while the deferred-write queue is mirrored to its record, so each
+   *  change of it writes it: from a write of it, one that failed or met the
+   *  cap outside quiesce(), or a boot that restored it, until a write clears
+   *  the record once the queue drains. */
   private deferredWritesPersisted = false;
-  private deferredWritesCapWarned = false;
+  /** True from a write of the queue that failed or met the cap, outside
+   *  quiesce(), until one succeeds: the record keeps what it last held
+   *  meanwhile (deferredWritesFellBehind). */
+  private deferredWritesBehind = false;
   /** Branch-independent recovery files (see FrameworkConfig.hostModePath /
    *  deferredWritesPath). Undefined → branch-local slot fallback. */
   private hostModePath: string | undefined;
@@ -4882,9 +4895,12 @@ export class AgentFramework {
   static readonly QUIESCE_TIMEOUT_DEFAULT_MS = 120_000;
 
   /**
-   * Enter quiesce mode: persist the flag, suppress gate deliveries, pause all
-   * MCPL data planes, and wait for in-flight turns to settle (turn-alive is
-   * `activeTurnTokens`, which spans dequeue → settled teardown). Idempotent.
+   * Enter quiesce mode: write the deferred-write queue, persist the flag,
+   * suppress gate deliveries, pause all MCPL data planes, and wait for
+   * in-flight turns to settle (turn-alive is `activeTurnTokens`, which spans
+   * dequeue → settled teardown). Idempotent, but for the queue's write, which
+   * every call makes first: a write that fails, or a queue over the cap,
+   * rejects before the call changes anything (writeDeferredWritesForQuiesce).
    *
    * On drain timeout the host STAYS quiesced (`drained: false` in the
    * result); with `abandon: true` the undrained streams are cancelled via a
@@ -4905,6 +4921,11 @@ export class AgentFramework {
     timeoutMs?: number;
     abandon?: boolean;
   }): Promise<HostModeStatus> {
+    // The deferred-write queue first, as a quiesced host keeps it, on a first
+    // call and a repeat alike: what it holds is on disk before the record says
+    // quiesced, including a write held only in memory, such as one deferred
+    // behind a turn still alive.
+    this.writeDeferredWritesForQuiesce();
     if (this.quiesced) {
       // Idempotent — EXCEPT abandon escalation: a first quiesce that timed
       // out undrained must be escalatable with a second quiesce({abandon})
@@ -4927,7 +4948,8 @@ export class AgentFramework {
     // host still serving, and a retry isn't taken by the check above for a
     // quiesce already done, so it writes the record. A write that fails
     // partway, such as a store write whose sync fails, may still reach the
-    // record, so a later resume() clears it.
+    // record, so a later resume() clears it. The queue written above stays
+    // mirrored then, as on a serving host after a resume, until it drains.
     const since = Date.now();
     this.hostModeRecordMayBeQuiesced = true;
     this.persistHostMode({
@@ -5202,7 +5224,9 @@ export class AgentFramework {
       // NOTE: parked wakes and gate buffers are in-memory only — a restart
       // mid-quiesce boots quiesced but with these queues empty (sources like
       // heartbeats re-deliver on their own cadence; one-shot wakes are lost).
-      // Deferred context WRITES are persisted while quiesced and survive.
+      // Deferred context WRITES are persisted while quiesced and survive,
+      // apart from any whose write failed or met the cap and that no later
+      // write carried (persistDeferredWrites).
       console.error(this.queue?.isClosed
         ? `[host-mode] resumed — ${releasedRequests} parked wake(s) won't run because the framework is stopping`
         : `[host-mode] resumed — ${releasedRequests} parked wake(s) released`);
@@ -5391,46 +5415,152 @@ export class AgentFramework {
    * end for a message held there and what is queued behind it, and, on a
    * stream that can't carry injected messages, for every message deferred
    * during the turn.
+   *
+   * A write that fails, or a queue over the cap, which writes nothing,
+   * leaves the record as it last held it. The queue stays in memory and
+   * mirrored, so its next change writes it again. Until a write succeeds, a
+   * crash restores what the record holds: it loses writes queued since, and
+   * brings back an entry withdrawn since (removePlacement, RFC-006's removal
+   * of an unread deferred write) that it still lists. The callers go on: a
+   * deferral's caller has already answered its source, so failing it would
+   * lose a write that can still land at resume. The first such write after
+   * one that succeeded raises an ops alert, and a line says when a write
+   * succeeds again (deferredWritesFellBehind). quiesce() writes the queue
+   * itself before it changes anything, and rejects instead
+   * (writeDeferredWritesForQuiesce).
    */
   private persistDeferredWrites(): void {
+    let outcome: DeferredWritesOutcome;
     try {
-      // The durable queue is everything not yet acked: writes still pending
-      // AND writes handed to a context manager whose sync has not happened.
-      // Always in original deferral order, whatever the pending/un-acked
-      // split: a re-deferred entry must not jump the queue.
-      const durable = [...this.unackedDeferredWrites, ...this.deferredMessages].sort(bySeq);
-      const scanFrom = Object.fromEntries(this.deferredScanFrom);
-      if ((this.quiesced || this.deferredWritesPersisted) && durable.length > 0) {
-        const payload = JSON.stringify(durable);
-        if (payload.length > DEFERRED_WRITES_PERSIST_CAP_BYTES) {
-          if (!this.deferredWritesCapWarned) {
-            this.deferredWritesCapWarned = true;
-            console.error(
-              `[host-mode] deferred context writes exceed ${DEFERRED_WRITES_PERSIST_CAP_BYTES} bytes ` +
-              `serialized (${durable.length} message(s)) — kept in memory only; ` +
-              `a crash before resume loses them`,
-            );
-          }
-          return;
-        }
-        if (this.deferredWritesPath) {
-          this.writeRecoveryFile(this.deferredWritesPath, { version: 2, pending: durable, scanFrom });
-        } else {
-          this.warnRecoveryFallbackOnce();
-          this.store.setStateJson(DEFERRED_WRITES_ID, { version: 2, pending: durable, scanFrom });
-        }
-        this.deferredWritesPersisted = true;
-      } else if (this.deferredWritesPersisted) {
-        if (this.deferredWritesPath) {
-          this.writeRecoveryFile(this.deferredWritesPath, { version: 1, pending: [] });
-        } else {
-          this.store.setStateJson(DEFERRED_WRITES_ID, []);
-        }
-        this.deferredWritesPersisted = false;
-      }
+      outcome = this.writeDeferredWrites(this.quiesced);
     } catch (err) {
       console.error('[host-mode] failed to persist deferred context writes:', err);
+      this.deferredWritesPersisted = true;
+      this.deferredWritesFellBehind(err);
+      return;
     }
+    if (outcome === 'over-cap') {
+      this.deferredWritesPersisted = true;
+      this.deferredWritesFellBehind();
+    } else if (outcome !== 'nothing') {
+      this.deferredWritesCaughtUp();
+    }
+  }
+
+  /**
+   * Write the queue to its record as it stands, when the host is quiesced
+   * (`quiesced`, which quiesce() passes before it sets the flag) or the
+   * queue is mirrored: the queue when it holds anything, and an empty one
+   * over a record that held one. What the write throws is thrown. A queue
+   * whose JSON is longer than the cap writes nothing.
+   */
+  private writeDeferredWrites(quiesced: boolean): DeferredWritesOutcome {
+    // The durable queue is everything not yet acked: writes still pending
+    // AND writes handed to a context manager whose sync has not happened.
+    // Always in original deferral order, whatever the pending/un-acked
+    // split: a re-deferred entry must not jump the queue.
+    const durable = this.durableDeferredWrites();
+    if ((quiesced || this.deferredWritesPersisted) && durable.length > 0) {
+      if (JSON.stringify(durable).length > DEFERRED_WRITES_PERSIST_CAP_BYTES) return 'over-cap';
+      const queue = { version: 2, pending: durable, scanFrom: Object.fromEntries(this.deferredScanFrom) };
+      if (this.deferredWritesPath) {
+        this.writeRecoveryFile(this.deferredWritesPath, queue);
+      } else {
+        this.warnRecoveryFallbackOnce();
+        this.writeDeferredWritesSlot(queue);
+      }
+      this.deferredWritesPersisted = true;
+      return 'written';
+    }
+    if (!this.deferredWritesPersisted) return 'nothing';
+    if (this.deferredWritesPath) {
+      this.writeRecoveryFile(this.deferredWritesPath, { version: 1, pending: [] });
+    } else {
+      this.writeDeferredWritesSlot([]);
+    }
+    this.deferredWritesPersisted = false;
+    return 'written';
+  }
+
+  /** Store only, the slot is the record, and a write isn't on disk until the
+   *  store syncs, so a sync that fails is the write's failure, as in
+   *  persistHostMode. The slot's write can still reach disk at a later sync,
+   *  and a boot that restores it skips each entry that already landed. */
+  private writeDeferredWritesSlot(value: unknown): void {
+    this.store.setStateJson(DEFERRED_WRITES_ID, value);
+    this.store.sync();
+  }
+
+  /** The durable queue: every deferred write not yet acked, pending and
+   *  un-acked, in deferral order. */
+  private durableDeferredWrites(): DeferredWrite[] {
+    return [...this.unackedDeferredWrites, ...this.deferredMessages].sort(bySeq);
+  }
+
+  /** Where the queue is recorded, as an operator would look for it. */
+  private deferredWritesRecord(): string {
+    return this.deferredWritesPath ?? `the store's ${DEFERRED_WRITES_ID} slot`;
+  }
+
+  /**
+   * quiesce()'s write of the queue, before it changes anything, as a
+   * quiesced host keeps it: a write held only in memory, such as one
+   * deferred behind a turn still alive, is on disk before quiesce() goes on,
+   * as its record is. What the write throws is thrown, so quiesce() rejects
+   * with the host as it was. A queue over the cap writes nothing and throws
+   * an error naming the cap and the way out.
+   */
+  private writeDeferredWritesForQuiesce(): void {
+    const outcome = this.writeDeferredWrites(true);
+    if (outcome === 'over-cap') {
+      throw new Error(
+        `quiesce refused: the queue's ${this.durableDeferredWrites().length} deferred context write(s) come to ` +
+        `more than ${DEFERRED_WRITES_PERSIST_CAP_BYTES} characters of JSON, the cap, so ` +
+        `${this.deferredWritesRecord()} can't hold them, and a restart would lose them. ` +
+        (this.quiesced ? 'Resume so they land, then quiesce again.' : 'Quiesce again once they have landed.'),
+      );
+    }
+    if (outcome !== 'nothing') this.deferredWritesCaughtUp();
+  }
+
+  /**
+   * A write of the queue failed, or met the cap, outside quiesce(). The
+   * first such write since one that succeeded raises an ops alert naming the
+   * record, and the rest of the run raises none. A failed write's own line
+   * is logged each time (persistDeferredWrites); the cap's line is logged
+   * with the alert, once a run.
+   */
+  private deferredWritesFellBehind(error?: unknown): void {
+    if (this.deferredWritesBehind) return;
+    this.deferredWritesBehind = true;
+    const record = this.deferredWritesRecord();
+    const queued = this.durableDeferredWrites().length;
+    if (error === undefined) {
+      const message = `the queue's ${queued} deferred context write(s) come to more than ` +
+        `${DEFERRED_WRITES_PERSIST_CAP_BYTES} characters of JSON, the cap, so ${record} isn't written, ` +
+        `and a crash before the queue is under the cap and written restores what it last held`;
+      console.error(`[host-mode] ${message}`);
+      this.opsAlert('deferred-writes', 'framework', message,
+        { data: { record, queued, cap: DEFERRED_WRITES_PERSIST_CAP_BYTES } });
+      return;
+    }
+    const reason = error instanceof Error ? error.message : String(error);
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    this.opsAlert('deferred-writes', 'framework',
+      `writing ${record} failed, so a crash before a write of it succeeds restores what it last held, ` +
+      `not the queue's ${queued} deferred context write(s): ${reason}`,
+      { data: { record, queued, ...(code ? { code } : {}) } });
+  }
+
+  /** A write of the queue succeeded after a run of failures: say that the
+   *  record has caught up. */
+  private deferredWritesCaughtUp(): void {
+    if (!this.deferredWritesBehind) return;
+    this.deferredWritesBehind = false;
+    console.error(
+      `[host-mode] ${this.deferredWritesRecord()} written again: it holds the queue's ` +
+      `${this.durableDeferredWrites().length} deferred context write(s)`,
+    );
   }
 
   private restorePersistedDeferredWrites(): number {
