@@ -671,6 +671,67 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     assert.deepStrictEqual(admitted.map((event) => event.messageId), ['kept-1']);
   });
 
+  // #387's budget of 10,000 held requests counts what a transport boundary
+  // leaves held: a request it keeps still holds its responder, and one it
+  // drops leaves the count.
+  const incoming = (id: number) => ({ messages: [{ channelId: 'room', messageId: `m${id}`, content: [] }] });
+  async function heldAcrossBoundary(method: string, params: (id: number) => unknown) {
+    writeFileSync(FLAG_FILE, '');
+    connection = await McplServerConnection.connect(makeConfig(), HOST_CAPS);
+    let reconnected = 0;
+    connection.on('reconnect', () => { reconnected++; });
+    const serverSends = (message: Record<string, unknown>) =>
+      (connection as unknown as { transport: { emit(event: string, line: string): void } }).transport
+        .emit('line', JSON.stringify({ jsonrpc: '2.0', ...message }));
+    const logged: string[] = [];
+    const consoleError = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      // Held while both planes are closed, as after connect.
+      for (let id = 1; id <= 10_000; id++) serverSends({ id, method, params: params(id) });
+      connection.sendToolsList().catch(() => {});
+      await waitFor(() => reconnected === 1, 5000, 'reconnect after crash');
+    } finally {
+      console.error = consoleError;
+    }
+    const written: string[] = [];
+    const transport = (connection as unknown as { transport: { writeLine(line: string): void } }).transport;
+    const writeLine = transport.writeLine.bind(transport);
+    transport.writeLine = (line: string) => { written.push(line); writeLine(line); };
+    const held = () => (connection as unknown as { bufferedEvents: Array<{ event: string }> }).bufferedEvents.map((item) => item.event);
+    return { serverSends, logged, written, held };
+  }
+
+  it('counts the incoming messages a transport boundary keeps against the next transport\'s budget: past 10,000 held, its request is refused at once', async () => {
+    const { serverSends, written, held } = await heldAcrossBoundary('channels/incoming', incoming);
+    assert.equal(held().length, 10_000, 'every incoming message is kept');
+    const consoleError = console.error;
+    console.error = () => {};
+    try {
+      serverSends({ id: 10_001, method: 'channels/incoming', params: incoming(10_001) });
+    } finally {
+      console.error = consoleError;
+    }
+    assert.deepStrictEqual(written.map((line) => JSON.parse(line)), [{
+      jsonrpc: '2.0',
+      id: 10_001,
+      error: { code: -32000, message: 'the host is busy: 10000 of this server\'s requests are already waiting; send this one again later' },
+    }]);
+    assert.equal(held().length, 10_000);
+  });
+
+  it('frees the budget of the requests a transport boundary drops: after 10,000 held inference requests, the next transport\'s request is held', async () => {
+    const { serverSends, logged, written, held } = await heldAcrossBoundary('inference/request', (id) => ({ n: id }));
+    assert.ok(
+      logged.some((line) => line.includes('dropped 10000 held message(s) from a transport that closed: 10000 inference-request')),
+      logged.join('\n'),
+    );
+    assert.deepStrictEqual(held(), []);
+    serverSends({ id: 10_001, method: 'channels/incoming', params: incoming(10_001) });
+    assert.deepStrictEqual(written, [], 'nothing refused');
+    assert.deepStrictEqual(held(), ['channels-incoming']);
+  });
+
   it('a transport boundary crossed during a flush holds the rest of the snapshot to the boundary rule', async () => {
     writeFileSync(FLAG_FILE, '');
     connection = await McplServerConnection.connect(makeConfig(), HOST_CAPS);

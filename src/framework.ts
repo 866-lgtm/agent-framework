@@ -21254,8 +21254,8 @@ export class AgentFramework {
     // an unreadable journal refuses that connect explicitly, rather than
     // spawning a child with a partial default, and before anything is
     // registered under its id or spawned (a reconnecting server would
-    // otherwise be left registered as a closed stub). No other connect reads
-    // the journal: awareness never gates MCPL.
+    // otherwise be left registered as a closed stub). No other connect is
+    // refused over the journal: awareness never gates MCPL.
     if (this.derivesReactionBaseline(config)) this.getPlacedReactionBaseline();
 
     // Register prefix + config for tool dispatch routing (idempotent with

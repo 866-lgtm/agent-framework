@@ -24,17 +24,18 @@
   `undo` records after its change) is now written only after that change is
   synced to the store. Previously a crash could keep marks active for a
   rollback the store had lost.
-- Awareness delivery no longer holds MCPL traffic. Previously every MCPL data
-  plane waited at startup, at reconnect, at a runtime `connectMcplServer` or
-  `restartMcplServer`, at a tools list change, at `resume()` and after each
-  surgery until every queued mark had been attempted, which at Discord's pace
-  could leave the resident deaf for minutes. When that accounting failed,
-  every running server was recycled, one without `reconnect: true` closing
-  for good, and a runtime connect or restart failed. Delivery now runs in the
-  background, and a route that is not connected keeps its work queued until
-  it connects. A journal that cannot be read still stops startup, as does a
-  pre-journal ledger that can't be imported: either can hold a suppression
-  whose removals a start must finish before the agent's context is served. A
-  runtime connect reads the journal only for a stdio server with no reaction
-  baseline of its own, whose default is derived from it, and is refused when
-  the journal can't be read.
+- Awareness delivery no longer holds MCPL traffic. Previously every MCPL
+  data plane waited at startup, at reconnect, at a runtime
+  `connectMcplServer` or `restartMcplServer`, at a tools list change, at
+  `resume()`, after each surgery and in `syncDiscordAwarenessMarkers()`
+  until every queued mark had been attempted, which at Discord's pace could
+  leave the resident deaf for minutes. When that accounting failed, a
+  runtime connect or restart failed, and every running server was recycled,
+  one without `reconnect: true` closing for good, except while the host was
+  stopping. Delivery now runs in the background, and a route that is not
+  connected keeps its work queued until it connects. A journal that cannot
+  be read still stops startup, as does a pre-journal ledger that can't be
+  imported: either can hold a suppression whose removals a start must finish
+  before the agent's context is served. A runtime connect or restart is
+  refused over a journal that can't be read only for a stdio server with no
+  reaction baseline of its own, whose default is derived from the journal.
