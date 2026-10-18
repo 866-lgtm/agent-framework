@@ -17546,7 +17546,9 @@ export class AgentFramework {
                 const stop = this.agents.get(agent.name) === agent && agent.streamId === myStreamId
                   ? this.takeStartStop(agent, retryWindow) : undefined;
                 if (stop) {
-                  lifecyclePhase = 'aborted';
+                  // The stop cancels the retry and ends the turn; the failed
+                  // inference's phase stays `failed`, as when stop() cancels
+                  // the retry.
                   if (stop.kind === 'quiesce_abandoned') {
                     this.settleFrameworkCancel({
                       agent, myStreamId, startTime, compiledRequest, kind: 'quiesce_abandoned', closes: streamRouting, log: logStream,
