@@ -132,7 +132,7 @@ import {
   type ShownRanges,
 } from './tool-image-ledger.js';
 import { randomUUID, createHash } from 'node:crypto';
-import { PyRunner, buildInjectedTools, formatLimit } from './code-execution/py-runner.js';
+import { PyRunner, buildInjectedTools, formatLimit, type ScriptToolResult } from './code-execution/py-runner.js';
 import {
   buildCodeExecutionToolDefinition,
   CODE_EXECUTION_TOOL_NAME,
@@ -18824,8 +18824,10 @@ export class AgentFramework {
 
   /**
    * Resolve one script-inner tool call to the string the script's tool
-   * function returns. Never rejects: errors become "Error: ..." strings,
-   * matching the managed PTC runtime ("Claude's code receives this error").
+   * function returns, and whether that result is an error (the script's
+   * `.is_error`). Never rejects: a failure without structured content becomes
+   * an "Error: ..." string, matching the managed PTC runtime ("Claude's code
+   * receives this error"), and a structured one its JSON object.
    *
    * A result without structured content is serialized with the HISTORY
    * serializer: images become placeholders, since a script variable holding
@@ -18844,9 +18846,9 @@ export class AgentFramework {
     origin?: ScriptCallOrigin,
     /** The foreground script that made the call; none for a background script. */
     script?: { endTurn: boolean; turnId?: number },
-  ): Promise<string> {
+  ): Promise<ScriptToolResult> {
     if (toolName === CODE_EXECUTION_TOOL_NAME) {
-      return 'Error: code_execution cannot be called from within a script';
+      return { text: 'Error: code_execution cannot be called from within a script', isError: true };
     }
     // A foreground script's call was made in the turn of the code_execution
     // call whose script is running when it arrives. A background script runs
@@ -18863,10 +18865,10 @@ export class AgentFramework {
     // it back out of text.
     const structured = Object.prototype.hasOwnProperty.call(result, 'structured');
     if (result.isError && !structured) {
-      return `Error: ${result.error ?? 'tool call failed'}`;
+      return { text: `Error: ${result.error ?? 'tool call failed'}`, isError: true };
     }
     if ((result.data === undefined || result.data === null) && !structured) {
-      return nonErrorResultText(result, AgentFramework.SCRIPT_RESULT_MAX_CHARS);
+      return { text: nonErrorResultText(result, AgentFramework.SCRIPT_RESULT_MAX_CHARS), isError: false };
     }
     // RFC-005 "eagerly lazy": a script receiving a result is the strongest
     // available signal that the bytes are wanted (scripts process, they do
@@ -18898,9 +18900,9 @@ export class AgentFramework {
     // context-cap truncation, no file spill.
     if (structured) return this.scriptStructuredResult(result, toolName);
     try {
-      return toolResultDataToHistoryString(result.data, AgentFramework.SCRIPT_RESULT_MAX_CHARS);
+      return { text: toolResultDataToHistoryString(result.data, AgentFramework.SCRIPT_RESULT_MAX_CHARS), isError: false };
     } catch (err) {
-      return `Error: ${unconvertibleScriptResult(toolName, err)}`;
+      return { text: `Error: ${unconvertibleScriptResult(toolName, err)}`, isError: true };
     }
   }
 
@@ -18923,9 +18925,13 @@ export class AgentFramework {
    * that can't be converted to JSON (a cyclic object, a BigInt), which the
    * dispatch's own check makes unlikely here, gets the same object empty,
    * `{ content: [], structuredContent: null, isError: true, error }`, the
-   * error naming the tool.
+   * error naming the tool. In every form, the script's `.is_error` is the
+   * `isError` of the object its string holds, and its `.structured` is read
+   * from that string.
    */
-  private async scriptStructuredResult(result: ToolResult, toolName: string): Promise<string> {
+  private async scriptStructuredResult(result: ToolResult, toolName: string): Promise<ScriptToolResult> {
+    const asSent = <T extends { isError: boolean }>(value: T, json: string = JSON.stringify(value)): ScriptToolResult =>
+      ({ text: json, isError: value.isError, structuredJson: true });
     const object = {
       content: Array.isArray(result.data) ? result.data : [],
       structuredContent: result.structured,
@@ -18937,19 +18943,19 @@ export class AgentFramework {
       json = JSON.stringify(object);
     } catch (err) {
       const error = unconvertibleScriptResult(toolName, err, result.isError ? result.error : undefined);
-      return JSON.stringify({ content: [], structuredContent: null, isError: true, error });
+      return asSent({ content: [], structuredContent: null, isError: true, error });
     }
-    if (json.length <= AgentFramework.SCRIPT_RESULT_MAX_CHARS) return json;
+    if (json.length <= AgentFramework.SCRIPT_RESULT_MAX_CHARS) return asSent(object, json);
     const workspace = this.getWorkspaceModule();
     const mount = workspace ? this.firstWritableMountName(workspace) : null;
     if (workspace && mount) {
       const path = `${mount}/tool-results/${new Date().toISOString().slice(0, 10)}-script-${randomUUID()}.json`;
       const written = await workspace.writeBinary(path, Buffer.from(json, 'utf8'), 'application/json').catch(() => null);
       if (written?.success) {
-        return JSON.stringify({ isError: object.isError, oversized: { chars: json.length, savedTo: path } });
+        return asSent({ isError: object.isError, oversized: { chars: json.length, savedTo: path } });
       }
     }
-    return JSON.stringify({
+    return asSent({
       isError: true,
       error: `the result (${json.length} chars) exceeds the ${AgentFramework.SCRIPT_RESULT_MAX_CHARS}-char script result cap ` +
         `and could not be saved to the workspace, so it could not be delivered; the tool may already have completed`,
