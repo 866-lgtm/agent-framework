@@ -587,8 +587,7 @@ type JournalRecord =
   | { t: 'request-cancelled'; at: number; requestId: string; by?: string }
   | { t: 'suppression-complete'; at: number; batchId: string }
   | { t: 'suppression-abandoned'; at: number; batchId: string }
-  | { t: 'legacy-evidence'; at: number; evidence: DiscordAwarenessLegacyEvidence }
-  | { t: 'import-complete'; at: number; source: 'v1' | 'v2'; sha256: string };
+  | { t: 'legacy-evidence'; at: number; evidence: DiscordAwarenessLegacyEvidence };
 
 /**
  * One journal entry (one Chronicle record): records that apply together, in
@@ -639,7 +638,6 @@ interface JournalState {
   legacy: Map<string, DiscordAwarenessLegacyEvidence[]>;
   /** Retract requests, by request id. */
   retracts: Map<string, RetractRequest>;
-  importedSources: Set<string>;
   /** Records applied so far: each record's journal position. */
   position: number;
 }
@@ -1596,10 +1594,10 @@ export class DiscordAwarenessOutbox {
   }
 
   /**
-   * Import a pre-journal ledger beside the store, then rename it. A file
-   * whose hash was imported before is only renamed, and a batch the journal
-   * already holds is never imported again, so a restored or re-saved copy of
-   * an imported ledger changes nothing (see importLegacy).
+   * Import a pre-journal ledger beside the store, then rename it. A batch the
+   * journal already holds is never imported again, so a restored or re-saved
+   * copy of an imported ledger, or one a failed rename left, imports nothing
+   * (see importLegacy).
    */
   private importLegacyLedger(state: JournalState): void {
     if (!this.legacyPath) return;
@@ -1612,38 +1610,36 @@ export class DiscordAwarenessOutbox {
         `Could not read Discord awareness ledger ${this.legacyPath}: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
-    const sha256 = createHash('sha256').update(raw).digest('hex');
-    if (!state.importedSources.has(sha256)) {
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(raw);
-      } catch {
-        throw new Error(`Invalid Discord awareness ledger ${this.legacyPath}`);
-      }
-      const imported = importLegacy(parsed, this.legacyPath, sha256, state.batches);
-      // Said before it's recorded: an import is recorded once, so a notice
-      // given after the record would be lost for good if the record landed
-      // and the process ended, or the record's sync failed, before the
-      // notice. If the record doesn't land, the next import says it again.
-      if (imported.unsent.length > 0) {
-        console.error(
-          `[discord-awareness] importing ${basename(this.legacyPath)}: ${imported.unsent.length} batch(es) had marks ` +
-            'agent-framework 0.22.x had still to add or remove, and none of them will be sent, since nobody chose them: ' +
-            imported.unsent.map((batch) => `batch ${batch.batchId} (${batch.agentName}, ${batch.sourceBranch} to ` +
-              `${batch.targetBranch}): ${batch.adds} to add, ${batch.removals} to remove`).join('; ') +
-            '. A batch 0.22.x never activated placed no marks; retracting a batch takes off the mark of its emoji ' +
-            'from each of its messages, whichever batch placed it',
-        );
-        this.announceImport?.(imported.unsent);
-      }
-      this.append(imported.records, { durable: true });
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error(`Invalid Discord awareness ledger ${this.legacyPath}`);
     }
+    const imported = importLegacy(parsed, this.legacyPath, state.batches);
+    // Said before it's recorded: an import is recorded once, so a notice
+    // given after the record would be lost for good if the record landed
+    // and the process ended, or the record's sync failed, before the
+    // notice. If the record doesn't land, the next import says it again.
+    if (imported.unsent.length > 0) {
+      console.error(
+        `[discord-awareness] importing ${basename(this.legacyPath)}: ${imported.unsent.length} batch(es) had marks ` +
+          'agent-framework 0.22.x had still to add or remove, and none of them will be sent, since nobody chose them: ' +
+          imported.unsent.map((batch) => `batch ${batch.batchId} (${batch.agentName}, ${batch.sourceBranch} to ` +
+            `${batch.targetBranch}): ${batch.adds} to add, ${batch.removals} to remove`).join('; ') +
+          '. A batch 0.22.x never activated placed no marks; retracting a batch takes off the mark of its emoji ' +
+          'from each of its messages, whichever batch placed it',
+      );
+      this.announceImport?.(imported.unsent);
+    }
+    this.append(imported.records, { durable: true });
     // Imported (now or by an earlier process that stopped before renaming):
     // the file is inert; move it out of the way. A copy retired earlier stays
     // as it is: a later one is kept beside it under its own hash.
     if (!existsSync(this.legacyPath)) return;
     const retired = `${this.legacyPath}.migrated-v2`;
     try {
+      const sha256 = createHash('sha256').update(raw).digest('hex');
       renameSync(this.legacyPath, existsSync(retired) ? `${retired}.${sha256.slice(0, 12)}` : retired);
     } catch (error) {
       console.error(
@@ -1685,7 +1681,6 @@ function emptyState(): JournalState {
     liveKeys: new Set(),
     legacy: new Map(),
     retracts: new Map(),
-    importedSources: new Set(),
     position: 0,
   };
 }
@@ -1827,9 +1822,6 @@ function applyRecords(state: JournalState, records: JournalRecord[]): void {
         }
         break;
       }
-      case 'import-complete':
-        state.importedSources.add(record.sha256);
-        break;
       default:
         break;
     }
@@ -1948,8 +1940,7 @@ function isLegacyEntry(value: unknown): boolean {
 }
 
 /**
- * Translate a version 1 or 2 ledger into journal records, ending with an
- * `import-complete` record carrying the file's hash. Batches keep their ids.
+ * Translate a version 1 or 2 ledger into journal records. Batches keep their ids.
  * What the old ledger recorded about each ref is kept as legacy evidence:
  * facts (attempt count, last action, status and error), never synthesized
  * attempts and never a judgment about what is on Discord. The work it had
@@ -1970,7 +1961,6 @@ function isLegacyEntry(value: unknown): boolean {
 function importLegacy(
   parsed: unknown,
   path: string,
-  sha256: string,
   journalBatches: ReadonlyMap<string, unknown>,
 ): { records: JournalRecord[]; unsent: DiscordAwarenessImportedUnsent[] } {
   // A ledger the released readers would have refused is refused here too,
@@ -2048,7 +2038,6 @@ function importLegacy(
       });
     }
   }
-  records.push({ t: 'import-complete', at, source: document.version === 1 ? 'v1' : 'v2', sha256 });
   return { records, unsent };
 }
 

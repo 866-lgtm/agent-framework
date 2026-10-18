@@ -987,8 +987,8 @@ test('v2 import keeps what the old ledger recorded as evidence, retires pending 
   assert.equal(probe.keysWithLegacyUncertainty, 1);
   assert.equal(outbox.cancel('pending-batch').legacyOutcomesUnrecorded, 1);
 
-  // A crash between the import and the rename: the hash is recorded, so the
-  // file is only renamed, never imported twice.
+  // A crash between the import and the rename: every batch in the file is
+  // in the journal, so it imports nothing again, and is renamed.
   writeFileSync(h.legacyPath, JSON.stringify(legacy));
   const again = h.reopen();
   assert.equal(again.batches().filter((b) => b.id === 'dd34b043').length, 1);
@@ -2543,16 +2543,12 @@ test('an operator\'s request the journal won\'t carry out is a refusal; a journa
   assert.throws(() => outbox.cancel(batch.id), (error) => !(error instanceof DiscordAwarenessRefusal) && /injected sync failure/.test((error as Error).message));
 }));
 
-test('a version 1 ledger\'s import is recorded as v1, and its pending batch, the active one, is imported active with nothing due', withJournal((_outbox, h) => {
+test('a version 1 ledger\'s pending batch, the active one, is imported active with nothing due', withJournal((_outbox, h) => {
   mkdirSync(join(h.dir, 'recovery'), { recursive: true });
   writeFileSync(h.legacyPath, JSON.stringify({
     version: 1,
     batches: [{ id: 'v1-batch', status: 'pending', agentName: 'resident', sourceBranch: 'main', targetBranch: 'rollback/resident/1', emoji: '💤', createdAt: 1, refs: [ref('a1')] }],
   }));
-  h.reopen().batches();
-  const records = h.store.getRecordIdsByType(DISCORD_AWARENESS_RECORD_TYPE)
-    .flatMap((id) => (JSON.parse(Buffer.from(h.store.getRecord(id)!.payload).toString('utf-8')) as { records: Array<{ t: string; source?: string }> }).records);
-  assert.deepEqual(records.filter((record) => record.t === 'import-complete').map((record) => record.source), ['v1']);
   // v1's `pending` was its active status: the batch stays active, and the
   // add it had still to send is dropped, never sent.
   const outbox = h.reopen();
