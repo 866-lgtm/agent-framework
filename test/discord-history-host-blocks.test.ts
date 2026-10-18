@@ -286,7 +286,7 @@ test('a message the live path stored is neither rebuilt nor fetched again by a h
   for (const message of messages) await harness.handleDiscordMessage(message);
   for (const event of events) await apply(event as unknown as Record<string, unknown>);
   assert.deepEqual(rows.map((r) => r.content), [
-    [text('all of them'), imageBlock, fileBlock, text('[Attachment: gone.txt (failed to fetch)]'), text('[Attachment: x.pdf (application/pdf)]')],
+    [text('all of them'), imageBlock, fileBlock, text('[Attachment: gone.txt couldn\'t be fetched, so its text isn\'t in your context. If you need it, ask the sender in the channel to paste it.]'), text('[Attachment: x.pdf (application/pdf): this host didn\'t read its contents in, so they aren\'t in your context. If you need them, ask the sender for them in a form you can read, such as pasted text.]')],
     [text(''), fileBlock],
     [text('plain')],
     [text(''), text('[Empty message]')],
@@ -299,7 +299,9 @@ test('a message the live path stored is neither rebuilt nor fetched again by a h
 test('a history sync rebuilds a row that doesn\'t hold what the live path would store, blanked or stripped before the mark, still holding a removed attachment or text its message lost, or a caption its message lost, and a row whose text changed keeps its file', async (t) => {
   t.mock.method(globalThis, 'fetch', async () => new Response('file body', { status: 200 }));
   const pdf: DiscordAttachment = { id: 'a3', filename: 'x.pdf', url: 'https://cdn.example/x.pdf', contentType: 'application/pdf', size: 50 };
+  // The note as the live path wrote it before this wording, and as it writes it now.
   const pdfNote = text('[Attachment: x.pdf (application/pdf)]');
+  const pdfNoteNow = text('[Attachment: x.pdf (application/pdf): this host didn\'t read its contents in, so they aren\'t in your context. If you need them, ask the sender for them in a form you can read, such as pasted text.]');
   const { module, state, harness, edits, added } = setup([
     row('b1', [text('')], false, 1_000),
     row('b2', [text('own')], false, 2_000),
@@ -314,8 +316,11 @@ test('a history sync rebuilds a row that doesn\'t hold what the live path would 
     row('b9', [text('old caption')], false, 9_000),
     // b10's own text reads as the marker.
     row('b10', [text('[Empty message]'), fileBlock], false, 10_000),
+    // b11 holds its note in the words the live path wrote before this change.
+    row('b11', [text('own'), pdfNote], false, 11_000),
   ], {
     fetchHistory: async () => [
+      history('b11', 'own', 11_000, [pdf]),
       history('b10', '[Empty message]', 10_000, [notes]),
       history('b9', '', 9_000, [notes]),
       history('b8', '', 8_000, []),
@@ -333,13 +338,13 @@ test('a history sync rebuilds a row that doesn\'t hold what the live path would 
     // An attachment-only message an earlier sync blanked.
     { id: 'stored-b1', content: [text(''), fileBlock] },
     // One an earlier sync stripped of its note.
-    { id: 'stored-b2', content: [text('own'), pdfNote] },
+    { id: 'stored-b2', content: [text('own'), pdfNoteNow] },
     // One whose text changed while the client was away keeps its file.
     { id: 'stored-b3', content: [text('new'), fileBlock] },
     // b4 holds what the live path stored before the mark, but its message has
     // no text, so its first block can't be told from a caption it lost, and
     // it's stored again, once.
-    { id: 'stored-b4', content: [text(''), pdfNote] },
+    { id: 'stored-b4', content: [text(''), pdfNoteNow] },
     // A marked row whose image was removed from the message loses it.
     { id: 'stored-b5', content: [text('keep')] },
     // So does an image-only message stored before the mark.
@@ -351,7 +356,8 @@ test('a history sync rebuilds a row that doesn\'t hold what the live path would 
     { id: 'stored-b8', content: [text(''), text('[Empty message]')] },
     // The caption its message lost goes, and its file comes back.
     { id: 'stored-b9', content: [text(''), fileBlock] },
-    // b10's text and file are both there, so it's left alone.
+    // b10's text and file are both there, so it's left alone, and so is b11,
+    // whose note in the earlier words still counts as its note.
   ]);
   assert.deepEqual(added, []);
   // Each row it rebuilt holds what the next sync expects, so that sync
@@ -360,7 +366,7 @@ test('a history sync rebuilds a row that doesn\'t hold what the live path would 
   // The sync can't mark what it rebuilt, since an edit keeps metadata, and a
   // live edit of it keeps the note the sync gave back.
   assert.deepEqual(await module.onProcess({ type: 'discord:edit', discordMessageId: 'b2', newContent: 'newer' } as unknown as ProcessEvent, state),
-    { editMessages: [{ messageId: 'stored-b2', content: [text('newer'), pdfNote] }] });
+    { editMessages: [{ messageId: 'stored-b2', content: [text('newer'), pdfNoteNow] }] });
 });
 
 test('a rebuild whose file wasn\'t fetched writes nothing over a row holding text besides its message\'s own, which a later sync rebuilds once the file is fetched, and gives a row missing its file the notice', async (t) => {
@@ -368,7 +374,7 @@ test('a rebuild whose file wasn\'t fetched writes nothing over a row holding tex
   t.mock.method(globalThis, 'fetch', async () => reachable ? new Response('file body', { status: 200 }) : new Response('', { status: 503 }));
   t.mock.method(console, 'warn', () => {});
   const more = text('\n--- File: more.txt ---\nmore\n--- End of more.txt ---\n');
-  const notFetched = text('[Attachment: notes.txt (failed to fetch)]');
+  const notFetched = text('[Attachment: notes.txt couldn\'t be fetched, so its text isn\'t in your context. If you need it, ask the sender in the channel to paste it.]');
   const rows: Row[] = [
     // A message without text whose row begins with its file's text.
     row('p1', [fileBlock], false, 1_000),
@@ -459,7 +465,7 @@ test('a history sync leaves what the live path wrote while it fetched, stores a 
   };
   assert.deepEqual(await harness.syncChannelHistory('c1'), { newMessages: 1, editedMessages: 1, deletedMessages: 0 });
   // e6's update wrote nothing, so the sync still stores it again with its note.
-  const pdfNote = text('[Attachment: x.pdf (application/pdf)]');
+  const pdfNote = text('[Attachment: x.pdf (application/pdf): this host didn\'t read its contents in, so they aren\'t in your context. If you need them, ask the sender for them in a form you can read, such as pasted text.]');
   assert.deepEqual(rows.map((r) => [r.id, r.content]), [['stored-e1', [text('edited live')]], ['stored-e3', [text('stays')]], ['stored-e6', [text('own'), pdfNote]]]);
   assert.deepEqual([edits.map((e) => e.id), removed], [['stored-e6'], []]);
   // n1 with the text the sync fetched: the live edit that came before any
