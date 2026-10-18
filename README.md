@@ -255,6 +255,17 @@ defaults to `mcpl--<serverId>`: server `search` with no `toolPrefix` offers
 `mcpl--search--query`, and with `toolPrefix: 'search'` it offers
 `search--query`.
 
+No two servers' prefixes may meet, since their servers could then give one
+tool name. Two prefixes meet when one is the other's followed by `-`, or
+begins with the other's followed by `--`: server `foo` listing `bar--echo` and
+server `foo--bar` listing `echo` would both give `foo--bar--echo`. `create()`
+refuses such a pair, and so do a runtime connect and a restart (before it
+disconnects anything), naming both servers and the rule. `foo` beside
+`foo-bar` or `foobar` is fine. A server that lists one tool more than once has
+its first listing offered to the model and the rest left out, and each tool
+refresh that finds it raises an `mcpl-tool-duplicate` ops alert naming the
+tools. Its webhook post goes out at most once per server in 15 minutes.
+
 These settings take RFC-007 §6.2 patterns (`*` matches any run of characters)
 over that full model-facing name, so they need the prefix:
 

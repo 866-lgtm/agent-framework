@@ -43,6 +43,16 @@ function incomingEvent(overrides: {
   } as unknown as ProcessEvent;
 }
 
+/** The store throws when asked to remove this agent's turn checkpoints. */
+function failCheckpointRemoval(framework: AgentFramework, agentName: string): void {
+  const store = framework.getStore();
+  const treeRemove = store.treeRemove.bind(store);
+  (store as unknown as { treeRemove: typeof treeRemove }).treeRemove = (treeId, key) => {
+    if (treeId === 'framework/turn-checkpoints/tree' && key === agentName) throw new Error('injected checkpoint store failure');
+    return treeRemove(treeId, key);
+  };
+}
+
 describe('Conversation routing', () => {
   let tempDir: string;
   let membrane: MockMembrane;
@@ -634,6 +644,40 @@ describe('Conversation routing', () => {
     await framework.stop();
   });
 
+  // A conversation agent's name is its agent's for the framework's life, as an
+  // ephemeral agent's is. Some state the framework keys by name outlives a
+  // disposed agent, and would pass to the next agent given the name. One is
+  // the record of a stream the framework cancelled itself, keyed by the
+  // agent's name and stream id, which stays behind if that stream never ends.
+  // A new agent's stream ids start again from 1, so the framework would read
+  // the old agent's record for the new agent's stream of the same id, and
+  // treat that stream as one it had stopped.
+  it("a disposed conversation agent's name is refused for a new agent", async () => {
+    const framework = await makeFramework();
+    const internals = framework as unknown as {
+      createConversationAgent(name: string, channelId: string): Promise<unknown>;
+      disposeConversationAgent(name: string): void;
+    };
+    const name = forkName('slack:D9', 1);
+    try {
+      await internals.createConversationAgent(name, 'slack:D9');
+      assert.ok(framework.getAgent(name), 'the first agent is registered under the name');
+      internals.disposeConversationAgent(name);
+      assert.equal(framework.getAgent(name), null, 'the agent is gone, so only its name is held');
+      // Twice: a refusal that released the name would let the second through.
+      for (const attempt of [1, 2]) {
+        await assert.rejects(
+          internals.createConversationAgent(name, 'slack:D9'),
+          new RegExp(`Conversation agent name "${name}" is already registered or reserved`),
+          `attempt ${attempt}`,
+        );
+      }
+      assert.equal(framework.getAgent(name), null, 'and no new agent took it');
+    } finally {
+      await framework.stop();
+    }
+  });
+
   it('a write deferred for a fork during its closure turn is stored in the fork before it is disposed', async () => {
     const IDLE_TTL_MS = 60_000;
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello!' }]));
@@ -734,6 +778,86 @@ describe('Conversation routing', () => {
     assert.ok(stored[stored.length - 1]!.includes('Final report posted.'), 'the restarted closure turn finished in the fork');
 
     await framework.stop();
+  });
+
+  it("a closed fork whose turn checkpoints the store fails to remove is still disposed whole at its closure turn's end", async () => {
+    const IDLE_TTL_MS = 60_000;
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello!' }]));
+    const framework = await makeFramework({ idleTtlMs: IDLE_TTL_MS });
+    const errors = mock.method(console, 'error', () => {});
+    try {
+      framework.pushEvent(incomingEvent({ channelId: 'slack:D9', text: 'hi', channelType: 'im' }));
+      await framework.runUntilIdle();
+      const fork = forkName('slack:D9', 1);
+      const g1 = framework.getAgent(fork);
+      assert.ok(g1, 'the fork spawned');
+      const disposed: string[] = [];
+      framework.onTrace((e: TraceEvent) => {
+        if (e.type === 'mcpl:conversation-disposed') disposed.push(e.agentName);
+      });
+      failCheckpointRemoval(framework, fork);
+
+      forceExpiry(framework, 'slack:D9', IDLE_TTL_MS);
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Final report posted.' }]));
+      // The disposal runs in the closure turn's driveStream finally, whose
+      // promise nothing holds: had it rejected, node:test would fail this
+      // test on the unhandled rejection.
+      framework.pushEvent({ type: 'external-message', source: 'test', content: 'tick', metadata: {} } as unknown as ProcessEvent);
+      await framework.runUntilIdle();
+
+      const stored = g1.getContextManager().getAllMessages().map((m) => JSON.stringify(m.content));
+      assert.ok(stored[stored.length - 1]!.includes('Final report posted.'), "the closure turn ran, so its stream's frame disposed the fork");
+      assert.equal(framework.getAgent(fork), null, 'the fork is unregistered');
+      assert.deepEqual(disposed, [fork], 'its disposal ran to the end');
+      assert.ok(
+        errors.mock.calls.some((call) => String(call.arguments[0]).startsWith(`[checkpoints] agent=${fork}: `)),
+        'the failure is logged',
+      );
+    } finally {
+      errors.mock.restore();
+      await framework.stop();
+    }
+  });
+
+  it('the fallback reaper goes on past a fork whose turn checkpoints the store fails to remove', async () => {
+    const framework = await makeFramework({ idleTtlMs: 60_000 });
+    const errors = mock.method(console, 'error', () => {});
+    try {
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'one' }]));
+      framework.pushEvent(incomingEvent({ channelId: 'slack:D10', text: 'hi', channelType: 'im' }));
+      await framework.runUntilIdle();
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'two' }]));
+      framework.pushEvent(incomingEvent({ channelId: 'slack:D11', text: 'hi', channelType: 'im' }));
+      await framework.runUntilIdle();
+      const failing = forkName('slack:D10', 1);
+      const next = forkName('slack:D11', 1);
+      assert.ok(framework.getAgent(failing) && framework.getAgent(next), 'both forks spawned');
+
+      // Both closed, with no closure inference left to run (the case the
+      // reaper is for), and the one whose removal fails comes first.
+      const router = framework.getConversationRouter()!;
+      router.unbind('slack:D10');
+      router.unbind('slack:D11');
+      const internals = framework as unknown as { closingConversationAgents: Set<string>; lastConversationSweep: number };
+      internals.closingConversationAgents.add(failing);
+      internals.closingConversationAgents.add(next);
+      internals.lastConversationSweep = 0;
+      failCheckpointRemoval(framework, failing);
+
+      framework.pushEvent({ type: 'external-message', source: 'test', content: 'tick', metadata: {} } as unknown as ProcessEvent);
+      await framework.runUntilIdle();
+
+      assert.ok(
+        errors.mock.calls.some((call) => String(call.arguments[0]).startsWith(`[checkpoints] agent=${failing}: `)),
+        "the failing fork's removal failed, and was logged",
+      );
+      assert.equal(framework.getAgent(failing), null, 'the failing fork is disposed');
+      assert.equal(framework.getAgent(next), null, 'the reaper went on to the next fork');
+      assert.equal(internals.closingConversationAgents.size, 0);
+    } finally {
+      errors.mock.restore();
+      await framework.stop();
+    }
   });
 
   it('restart does not reuse generation names or re-seed an existing namespace', async () => {

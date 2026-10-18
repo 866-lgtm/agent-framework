@@ -1,4 +1,4 @@
-import { describe, it } from 'node:test';
+import { describe, it, mock } from 'node:test';
 import assert from 'node:assert';
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -146,6 +146,16 @@ async function runStartedEphemeral(
 // A short one turns that into a "stalled" rejection, which the refusal's
 // pattern doesn't match.
 const STOPPED_RUN_WATCHDOGS = { idleTimeoutMs: 20_000, idlePollMs: 50 };
+
+/** The store throws when asked for this agent's turn checkpoints. */
+function failCheckpointReads(framework: AgentFramework, agentName: string): void {
+  const store = framework.getStore();
+  const treeGet = store.treeGet.bind(store);
+  (store as unknown as { treeGet: typeof treeGet }).treeGet = (treeId, key) => {
+    if (treeId === 'framework/turn-checkpoints/tree' && key === agentName) throw new Error('injected checkpoint store failure');
+    return treeGet(treeId, key);
+  };
+}
 
 async function stopAndRemove(framework: AgentFramework, tempDir: string): Promise<void> {
   await framework.stop();
@@ -612,6 +622,46 @@ describe('runEphemeralToCompletion settle signal', () => {
       assert.equal(internals.turnRouting.has(agent.name), false, 'disposal removes turn routing');
       assert.equal(internals.proseSpeechChains.has(agent.name), false, 'disposal removes the speech chain');
     } finally {
+      await stopAndRemove(framework, tempDir);
+    }
+  });
+
+  it('a run whose turn checkpoints the store fails to remove still resolves with its speech, and the failure is logged', async () => {
+    const { tempDir, storePath } = tempStorePath('ephemeral-evict-fails-');
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Plain final answer' }]));
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: [],
+      modules: [new EphemeralToolModule()],
+      syncIntervalMs: 0,
+    });
+    const errors = mock.method(console, 'error', () => {});
+    try {
+      const { agent, contextManager } = await createEphemeral(framework);
+      // The turn's start reads the agent's checkpoints before its stream, so
+      // the store fails from the stream on, and the removal's read is the
+      // next to ask.
+      const streamYielding = membrane.streamYielding.bind(membrane);
+      membrane.streamYielding = (request, options) => {
+        failCheckpointReads(framework, agent.name);
+        return streamYielding(request, options);
+      };
+      const result = await runStartedEphemeral(framework, agent, contextManager);
+
+      assert.deepStrictEqual(result, { speech: 'Plain final answer', toolCallsCount: 0 });
+      assert.strictEqual(framework.getAgent(agent.name), null);
+      const internals = framework as unknown as { activeTurnTokens: Map<string, unknown> };
+      assert.equal(internals.activeTurnTokens.has(agent.name), false, 'the teardown went on past the failure');
+      const lines = errors.mock.calls.map((call) => String(call.arguments[0]));
+      assert.ok(
+        lines.some((line) => line.startsWith(`[checkpoints] agent=${agent.name}: removing its turn checkpoints from the store failed`)
+          && line.includes('injected checkpoint store failure')),
+        lines.join('\n'),
+      );
+    } finally {
+      errors.mock.restore();
       await stopAndRemove(framework, tempDir);
     }
   });
