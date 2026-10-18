@@ -639,6 +639,29 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     }
   });
 
+  it('at a tool boundary, a write context-manager refuses as malformed is dropped, and what is queued behind it lands', async () => {
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    let framework: AgentFramework;
+    try {
+      framework = await runTurn('move', [
+        // A text block whose text isn't a string, which the store refuses.
+        { participant: 'Antra', content: [{ type: 'text', text: 5 } as unknown as ContentBlock] },
+        { participant: 'Antra', content: text('look right') },
+      ]);
+    } finally { console.error = error; }
+    assert.deepEqual(injected(), ['Antra: look right'], 'what was queued behind it is carried');
+    assert.deepEqual(windowOf(framework).slice(2), [
+      'user: <tool_result>',
+      'Antra: look right',
+      'assistant: Done.',
+    ], 'stored where the stream carried it, and the refused write nowhere');
+    assert.equal(internalsOf(framework).deferredMessages.length, 0, 'the refused write was not queued again');
+    assert.ok(errors.some((e) => e.includes("was refused as malformed, so it's dropped rather than queued again") && e.includes('content[0]')), errors.join('\n'));
+    await framework.stop();
+  });
+
   it("a write that throws after it's stored, re-added from the queue, is weighed for its agent's open turn as a stored write is", async () => {
     const framework = await createFramework();
     throwOnceAfterStoring(framework, 'from beta');

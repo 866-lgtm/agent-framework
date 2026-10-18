@@ -9,7 +9,7 @@ import {
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStream, DetailedUsage, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
-import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks } from '@animalabs/context-manager';
+import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks, MalformedContentError, malformedContentPlaces } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import type { SilentHeartbeatStamp } from './silent-heartbeat.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
@@ -10600,6 +10600,20 @@ export class AgentFramework {
     assemblingFor?: string;
     deliverTo?: string;
   }): Promise<CoalescingPlacement | undefined> {
+    // context-manager won't store content that doesn't match ContentBlock
+    // (malformedContentPlaces names where). Refused here, such a message
+    // stores no row, spawns no fork and queues no wake, and the line names
+    // the server and channel it came from. Past this point, a deferred copy
+    // would only be dropped at the drain, and a direct write would throw.
+    const malformed = malformedContentPlaces(event.content);
+    if (malformed.length > 0) {
+      console.error(`[channel-incoming-refused] server=${event.serverId} channel=${logValue(event.channelId)} messageId=${logValue(event.messageId)} reason=malformed-content: ${logDetail(malformed.join('; '))}`);
+      this.emitTrace({
+        type: 'mcpl:malformed-content-refused', lane: 'channel', serverId: event.serverId, places: malformed,
+        channelId: event.channelId, messageId: event.messageId, ...(event.eventId ? { eventId: event.eventId } : {}),
+      });
+      return undefined;
+    }
     // Same backstop as the push lane: no row, no wake, no fork spawned for a
     // message with nothing visible in it.
     if (isVisiblyEmptyContent(event.content)) {
@@ -11826,6 +11840,18 @@ export class AgentFramework {
    * Convert an MCPL push event to a context message.
    */
   private handleMcplPushEvent(event: McplPushEvent): CoalescingPlacement | undefined {
+    // Content context-manager won't store is refused first, as on the
+    // channel lane (handleMcplChannelIncoming): no row, no wake.
+    const malformed = malformedContentPlaces(event.content);
+    if (malformed.length > 0) {
+      const channelId = this.derivePushEventChannel(event.origin)?.channelId;
+      console.error(`[push-event-refused] server=${event.serverId}${channelId ? ` channel=${logValue(channelId)}` : ''} eventId=${logValue(event.eventId ?? '')} reason=malformed-content: ${logDetail(malformed.join('; '))}`);
+      this.emitTrace({
+        type: 'mcpl:malformed-content-refused', lane: 'push', serverId: event.serverId, places: malformed,
+        eventId: event.eventId, ...(channelId ? { channelId } : {}),
+      });
+      return undefined;
+    }
     // Backstop for the MCPL boundary's empty-content rejection, covering
     // events that never crossed it (module-emitted, coalescer deliveries):
     // content with nothing visible stores no row and queues no wake — the
@@ -15615,6 +15641,9 @@ export class AgentFramework {
       // still be stored — not under that turn: queue it as a unit for the
       // next flush (drainDeferredFor keeps order; the tool_result entry is
       // never split from its tool_use because both ride the same drain).
+      // One exception: a tool_use context-manager refuses as malformed is
+      // dropped at the drain, and the tool_result behind it is then stored
+      // alone (writeDrainedInOrder).
       // The finally below flushes it itself if that turn is already over.
       ownedToEnd = this.activeTurnTokens.get(agentName) === turnToken;
       if (ownedToEnd) {
@@ -17395,12 +17424,23 @@ export class AgentFramework {
    *
    * So none of a target's entries lands ahead of an earlier one, and a queued
    * tool_use that can't be stored keeps the tool_result queued behind it from
-   * being stored alone. (A tool_use that is stored, followed by a tool_result
-   * that can't be, stays stored without it until the tool_result lands at a
-   * later flush. The only queued pair is puppetToolCall's defensive one,
-   * which no path reaches today.) An entry that keeps failing is logged by
-   * id at each flush, and holds its target's later queued writes rather than
-   * letting them land out of order.
+   * being stored alone, unless context-manager refused it as malformed
+   * (below). (A tool_use that is stored, followed by a tool_result that
+   * can't be, stays stored without it until the tool_result lands at a later
+   * flush. The only queued pair is puppetToolCall's defensive one, which no
+   * path reaches today.) An entry that keeps failing is logged by id at each
+   * flush, and holds its target's later queued writes rather than letting
+   * them land out of order.
+   *
+   * An entry context-manager refuses as malformed (MalformedContentError) is
+   * the exception. The store refuses its content before storing any of it,
+   * and would refuse it at every flush, so requeued it would hold its
+   * target's later writes for good. It's logged and dropped instead, and its
+   * target isn't cut: left in the un-acked set, the next ack drops it from
+   * the durable queue. A tool_use dropped this way leaves a tool_result
+   * queued behind it to be stored alone. context-manager mends a tool_use
+   * whose input isn't an object, so it refuses one only when that input has
+   * no JSON form or the block itself is malformed.
    *
    * The hold is the queue's alone. A write that isn't deferred is stored at
    * once and can land ahead of a held entry: a fresh tool_result, whatever
@@ -17408,19 +17448,20 @@ export class AgentFramework {
    * cycle are all idle and the host isn't quiesced. So an entry that keeps
    * failing holds only what is deferred behind it.
    *
-   * A write can throw after its message is stored: a store listener, the
-   * strategy's handling of the add, or a later shard of a sharded body can
-   * throw once a record is written. Before an entry that threw is put back,
-   * its target's store is read from where it stood before the write, for
-   * messages carrying the entry's `deferredWriteId`. What it finds counts as
-   * written, at most once: the entry isn't requeued and stored a second
-   * time, and what landed, as later compiles render it (asCompiled), is what
-   * it returns as the entry's content. For a sharded body, that can be its
-   * first shards alone, since the append loop stops at the throw; the rest
-   * of the body isn't stored. (Requeued, the
-   * landed shards would be stored twice, and only the rest could not be
-   * appended later without splitting the body.) Boot's scan for landed
-   * writes counts a landed shard the same way.
+   * A write can throw after its message is stored: the strategy's handling
+   * of the add can throw once a record is written. Before an entry that
+   * threw is put back, its target's store is read from where it stood before
+   * the write, for messages carrying the entry's `deferredWriteId`. What it
+   * finds counts as written, at most once: the entry isn't requeued and
+   * stored a second time, and what landed, as later compiles render it
+   * (asCompiled), is what it returns as the entry's content. For a sharded
+   * body, that can be its first shards alone. Under context-manager 0.14 a
+   * sharded write that threw partway left the shards it had written. From
+   * 0.15 it removes them, and they stay only when that removal fails as
+   * well. (Requeued, the landed shards would be stored twice, and only the
+   * rest could not be appended later without splitting the body.) Boot's
+   * scan for landed writes counts a landed shard the same way, which also
+   * covers a body a 0.14 write left in a store.
    *
    * Returns what was written (stored, or deferred again by addMessage, whose
    * id is then empty), in queue order: for one target, a prefix of its
@@ -17453,6 +17494,10 @@ export class AgentFramework {
           written.set(msg, { id: landed[0]!.id, content: asCompiled(landed) });
           this.logDeferredWriteError(msg, where, error, { count: landed.length, sharded: landed[0]!.bodyGroupId !== undefined });
           onLanded?.(msg, landed[0]!.id);
+          continue;
+        }
+        if (error instanceof MalformedContentError) {
+          this.logDeferredWriteError(msg, where, error, 'dropped');
           continue;
         }
         cut.add(target);
@@ -17498,7 +17543,7 @@ export class AgentFramework {
     msg: DeferredWrite,
     where: string,
     error: unknown,
-    landed?: { count: number; sharded: boolean },
+    outcome?: { count: number; sharded: boolean } | 'dropped',
   ): void {
     let reason: string;
     try {
@@ -17509,11 +17554,13 @@ export class AgentFramework {
     console.error(
       `[deferral] ${where}: deferred write ${describeDeferredWrite(msg)} for ` +
       `${msg.forAgent ?? this.primaryAgentName ?? 'the primary'} ` +
-      (landed
-        ? `threw after ${landed.sharded
-          ? `${landed.count} shard${landed.count === 1 ? '' : 's'} of its body ${landed.count === 1 ? 'was' : 'were'} stored`
-          : 'it was stored'}; what was stored counts as written and isn't stored again: `
-        : `could not be stored; it stays queued, holding what is queued behind it for that agent: `) +
+      (outcome === 'dropped'
+        ? `was refused as malformed, so it's dropped rather than queued again, and what is queued behind it for that agent goes on: `
+        : outcome
+          ? `threw after ${outcome.sharded
+            ? `${outcome.count} shard${outcome.count === 1 ? '' : 's'} of its body ${outcome.count === 1 ? 'was' : 'were'} stored`
+            : 'it was stored'}; what was stored counts as written and isn't stored again: `
+          : `could not be stored; it stays queued, holding what is queued behind it for that agent: `) +
       reason,
     );
   }
