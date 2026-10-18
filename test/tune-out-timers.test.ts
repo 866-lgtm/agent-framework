@@ -519,5 +519,5 @@ it('a thrown value that is not an Error is reported as a string, even one with n
   // String() throws for an object with no prototype.
   h.failNext('addMessage', Object.create(null));
   assert.doesNotThrow(() => t.mock.timers.tick(60_000));
-  assert.deepEqual(h.timerFailures().map((e) => e.error), ['disk full', '[object Object]']);
+  assert.deepEqual(h.timerFailures().map((e) => e.error), ['disk full', '(a value that could not be read)']);
 });

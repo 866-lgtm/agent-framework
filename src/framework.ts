@@ -2443,6 +2443,26 @@ export class AgentFramework {
     // registered for new stores — it's read-only fallback data in old ones.
     ensureStateRegistered(store, { id: TURN_CHECKPOINTS_TREE_ID, strategy: 'tree' });
 
+    // The conversation router's generation counters (see the routing setup
+    // below) are read now, before anything starts, so a read that fails
+    // leaves nothing running: create() fails with the read error, and its
+    // release closes a store it opened. No persisted state yet reads as null.
+    // A read that fails is not that: taken as no counters, it would do what
+    // the routing setup's comment warns of.
+    let routerGenerations: Record<string, number> | undefined;
+    if (config.conversations) {
+      ensureStateRegistered(store, { id: CONVERSATION_ROUTER_STATE_ID, strategy: 'snapshot' });
+      try {
+        routerGenerations = (store.getStateJson(CONVERSATION_ROUTER_STATE_ID) as
+          { generations?: Record<string, number> } | null)?.generations;
+      } catch (error) {
+        throw new Error(
+          `the conversation router's generation counters (${CONVERSATION_ROUTER_STATE_ID}) could not be read: ${thrownText(error)}`,
+          { cause: error },
+        );
+      }
+    }
+
     // Process logging config (default: disabled)
     const processLoggingPersist = config.processLogging?.persist ?? false;
     const processLoggingBroadcast = config.processLogging?.broadcast ?? false;
@@ -2566,16 +2586,10 @@ export class AgentFramework {
 
       // Generation counters persist across restarts — reusing generation 1's
       // agent name after a restart would reopen (and re-seed) the previous
-      // engagement's Chronicle namespace.
-      ensureStateRegistered(store, { id: CONVERSATION_ROUTER_STATE_ID, strategy: 'snapshot' });
-      try {
-        const data = store.getStateJson(CONVERSATION_ROUTER_STATE_ID) as
-          { generations?: Record<string, number> } | null;
-        if (data?.generations) {
-          framework.conversationRouter.hydrateGenerations(data.generations);
-        }
-      } catch {
-        // No persisted state yet
+      // engagement's Chronicle namespace. They were read before anything
+      // started (above).
+      if (routerGenerations) {
+        framework.conversationRouter.hydrateGenerations(routerGenerations);
       }
     }
 
@@ -10811,33 +10825,71 @@ export class AgentFramework {
   }
 
   /**
-   * Create the fork a spawn decision names, bind its channel to it and
-   * persist the counters, registered in conversationSpawns under the channel
-   * until it settles. routeConversation registers a spawn only when none is
+   * Store the router's counters with the spawn's generation, create the fork
+   * the decision names and bind its channel to it, registered in
+   * conversationSpawns under the channel until it settles. The store runs
+   * inside the spawn's promise, still in routeConversation's synchronous
+   * step, so a store that throws rejects the spawn, which each caller reports
+   * as a failed spawn, rather than throwing out of routeConversation before
+   * the caller's try. routeConversation registers a spawn only when none is
    * in flight for the channel, and only this spawn's settlement removes it,
    * so the entry it removes is its own. It's removed before anyone waiting
    * on it resumes, so a waiter that decides again doesn't find it.
    */
   private spawnConversationAgent(channelId: string, decision: { agentName: string; generation: number }): Promise<Agent> {
-    const spawn = this.createConversationAgent(decision.agentName, channelId).then((agent) => {
+    const spawn = (async () => {
+      this.storeConversationGeneration(channelId, decision.generation);
+      const agent = await this.createConversationAgent(decision.agentName, channelId);
       this.conversationRouter!.bind(channelId, decision.agentName, decision.generation);
-      this.persistConversationRouterState();
       return agent;
-    });
+    })();
     const done = (): void => { this.conversationSpawns.delete(channelId); };
     this.conversationSpawns.set(channelId, spawn.then(done, done));
     return spawn;
   }
 
-  /** Persist the router's generation counters (see hydration in create()). */
-  private persistConversationRouterState(): void {
+  /**
+   * Store the router's generation counters with a spawn's generation, before
+   * the spawn it names (see hydration in create()). A fork whose counter isn't
+   * stored would have its name reused at the next restart, reopening its
+   * namespace, so a failed read or write throws and the caller refuses the
+   * spawn. The stored counters, the router's own and this spawn's are
+   * merged, each at its highest, in one synchronous step: another channel's
+   * spawn still in flight has stored its counter but not bound it yet, so
+   * the router's map alone would write that counter back down, and the
+   * router's own counters keep the stored ones from going back down when
+   * they read lower, as on a branch with older counters. The merge is a Map,
+   * so a channel id such as "constructor" is a key like any other. The
+   * callers name the channel; the errors name the state and what failed.
+   */
+  private storeConversationGeneration(channelId: string, generation: number): void {
     if (!this.conversationRouter) return;
+    let stored: unknown;
     try {
-      this.store.setStateJson(CONVERSATION_ROUTER_STATE_ID, {
-        generations: this.conversationRouter.exportGenerations(),
-      });
+      stored = (this.store.getStateJson(CONVERSATION_ROUTER_STATE_ID) as { generations?: unknown } | null)?.generations;
     } catch (error) {
-      console.error('Failed to persist conversation router state:', error);
+      throw new Error(
+        `the conversation router's generation counters (${CONVERSATION_ROUTER_STATE_ID}) could not be read: ${thrownText(error)}`,
+        { cause: error },
+      );
+    }
+    const generations = new Map<string, number>();
+    for (const source of [
+      stored && typeof stored === 'object' ? Object.entries(stored) : [],
+      Object.entries(this.conversationRouter.exportGenerations()),
+      [[channelId, generation]] as Array<[string, unknown]>,
+    ]) {
+      for (const [id, n] of source) {
+        if (typeof n === 'number' && n > (generations.get(id) ?? 0)) generations.set(id, n);
+      }
+    }
+    try {
+      this.store.setStateJson(CONVERSATION_ROUTER_STATE_ID, { generations: Object.fromEntries(generations) });
+    } catch (error) {
+      throw new Error(
+        `the conversation router's generation counters (${CONVERSATION_ROUTER_STATE_ID}) could not be stored: ${thrownText(error)}`,
+        { cause: error },
+      );
     }
   }
 
