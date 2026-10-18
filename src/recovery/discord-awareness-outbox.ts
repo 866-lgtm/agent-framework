@@ -95,11 +95,6 @@ export class DiscordAwarenessRefusal extends Error {
   }
 }
 
-/** AF's own refusal to write a request on a closed connection, as an
- *  imported (pre-journal) ledger recorded it: as text, with no typed
- *  outcome. Live attempts are classified by McplRequestError's outcome. */
-const PRE_WRITE_REFUSAL = /^Cannot send request:/;
-
 /** The pre-journal (version 1 and 2) ledger file name, imported once. */
 const LEGACY_LEDGER_NAME = 'discord-awareness-outbox.json';
 
@@ -165,6 +160,12 @@ export interface DiscordAwarenessBatchRecord {
   activationPolicy?: 'target-branch' | 'explicit';
   /** Idempotent interval operations used to resume an interrupted suppression. */
   suppressionIntervals?: DiscordSuppressionInterval[];
+  /**
+   * An imported batch's: how many of its refs agent-framework 0.22.x's last
+   * attempt saw added (an add it recorded no error for), set at import. It
+   * is history, never a claim about what is on Discord now.
+   */
+  legacyAdded?: number;
 }
 
 /** A surgery's request, as it prepares a batch. */
@@ -297,9 +298,6 @@ export interface DiscordAwarenessCancelReceipt {
    *  wire or unknown), counted per request sent and including earlier
    *  attempts of operations whose last attempt was answered: any may land. */
   unresolvedAttempts: number;
-  /** Imported (pre-journal) attempts on this batch whose outcome the old
-   *  ledger does not establish: any may have landed. */
-  legacyOutcomesUnrecorded: number;
 }
 
 /** Receipt for retract(). */
@@ -319,47 +317,6 @@ export interface DiscordAwarenessRetractReceipt {
   /** Unresolved earlier add requests on those keys (one per request sent,
    *  however many batches' operations it carried). */
   unresolvedAddAttempts: number;
-  /** Keys whose imported (pre-journal) history leaves attempt outcomes
-   *  unrecorded: any of those may have had an effect. */
-  keysWithLegacyUncertainty: number;
-}
-
-/**
- * What a pre-journal ledger recorded about one batch ref, kept as facts. It
- * is evidence for operators and receipts, never a claim about what is on
- * Discord now, and it never causes a dispatch.
- */
-export interface DiscordAwarenessLegacyEvidence {
-  batchId: string;
-  key: DiscordAwarenessRef & { emoji: string };
-  /** Attempts the old ledger counted (it kept only the last one's details). */
-  attempts: number;
-  lastAction: DiscordAwarenessAction;
-  /**
-   * The last attempt's outcome, as far as the old writer's fields establish
-   * it: it recorded a success by clearing `lastError` and a failure by
-   * setting it, and nothing else touched that field. `confirmed`: no error
-   * after an attempt. `not-sent`: AF refused before writing the request.
-   * `refused`: Discord answered that the message or channel is gone or
-   * inaccessible. `unrecorded`: any other error, so the request may have
-   * landed.
-   */
-  lastOutcome: 'confirmed' | 'not-sent' | 'refused' | 'unrecorded';
-  /**
-   * The old writer's reconciliation state at shutdown (`deliveryStatus`):
-   * whether its cached belief about the marker matched what it then wanted.
-   * Branch reconciliation rewrote it without any request, so it says
-   * nothing about any attempt's outcome.
-   */
-  oldDeliveryStatus: 'pending' | 'applied' | 'permanent-failure';
-  lastError?: string;
-  /** What the last error was: AF's refusal before writing a request, a
-   *  Discord answer (message/channel gone or inaccessible), or anything else. */
-  lastErrorKind?: 'pre-write-refusal' | 'discord-answer' | 'other';
-  /** Recorded attempts whose outcome the old ledger does not establish:
-   *  every attempt before the last (only the last one's details were kept),
-   *  and the last when its outcome is `unrecorded`. */
-  outcomesUnrecorded: number;
 }
 
 /** A batch an import kept as history whose undelivered work it retired,
@@ -419,16 +376,9 @@ export interface DiscordAwarenessBatchView {
   removals: Record<DiscordAwarenessOpStatus, number>;
   /** Requests on this batch's refs whose outcome is unknown or on the wire. */
   unresolvedAttempts: number;
-  /** What a pre-journal ledger recorded about this batch's refs, if imported. */
-  legacy?: {
-    entries: number;
-    /** Refs whose last recorded action was an add the old ledger saw applied. */
-    lastAddConfirmed: number;
-    /** Refs whose last recorded action was a removal it saw applied. */
-    lastRemoveConfirmed: number;
-    /** Recorded attempts whose outcome the old ledger does not establish. */
-    outcomesUnrecorded: number;
-  };
+  /** An imported batch's refs that agent-framework 0.22.x's last attempt saw
+   *  added (DiscordAwarenessBatchRecord.legacyAdded). */
+  legacyAdded?: number;
 }
 
 /** One retract request: the removals it queued and what became of them. */
@@ -582,8 +532,7 @@ type JournalRecord =
   | { t: 'retract'; at: number; requestId: string; target: string; by?: string }
   | { t: 'request-cancelled'; at: number; requestId: string; by?: string }
   | { t: 'suppression-complete'; at: number; batchId: string }
-  | { t: 'suppression-abandoned'; at: number; batchId: string }
-  | { t: 'legacy-evidence'; at: number; evidence: DiscordAwarenessLegacyEvidence };
+  | { t: 'suppression-abandoned'; at: number; batchId: string };
 
 /**
  * One journal entry (one Chronicle record): records that apply together, in
@@ -630,8 +579,6 @@ interface JournalState {
    *  keys a dispatch can come from, so a claim reads what is live rather
    *  than what is history (pendingDispatches). */
   liveKeys: Set<string>;
-  /** Imported pre-journal evidence, by reaction key. */
-  legacy: Map<string, DiscordAwarenessLegacyEvidence[]>;
   /** Retract requests, by request id. */
   retracts: Map<string, RetractRequest>;
   /** Records applied so far: each record's journal position. */
@@ -1097,9 +1044,6 @@ export class DiscordAwarenessOutbox {
         [...state.ops.values()].filter((op) => op.cause.batchId === batchId),
         (op, attempt) => this.attemptUnresolved(op, attempt),
       ),
-      legacyOutcomesUnrecorded: [...state.legacy.values()].flat()
-        .filter((evidence) => evidence.batchId === batchId)
-        .reduce((sum, evidence) => sum + evidence.outcomesUnrecorded, 0),
     };
     const at = Date.now();
     const records: JournalRecord[] = [{ t: 'cancelled', at, batchId, ...(by ? { by } : {}) }];
@@ -1150,7 +1094,6 @@ export class DiscordAwarenessOutbox {
       cancelled: 0,
       confirmed: 0,
       unresolvedAttempts: unresolvedDispatches(ops, (op, attempt) => this.attemptUnresolved(op, attempt)),
-      legacyOutcomesUnrecorded: 0,
     };
     const at = Date.now();
     const records: JournalRecord[] = [{ t: 'request-cancelled', at, requestId, ...(by ? { by } : {}) }];
@@ -1162,13 +1105,13 @@ export class DiscordAwarenessOutbox {
   /**
    * Remove this bot's mark (through the configured route) from a batch's refs,
    * or (`all`) from every key of every batch not retired, whether prepared
-   * or active, every key an add was requested for, and every key an
-   * imported ledger recorded. The last two are the direct record of a mark
-   * that may be on Discord. In every state this journal or agent-framework
-   * 0.22.x writes, each of their keys is also a key of a batch not retired:
-   * an add is requested only with its batch's activation, only a prepared
-   * batch is retired, and 0.22.x attempted only an active batch's refs. They
-   * are kept so that `all` doesn't rest on those rules. A reaction is one
+   * or active, and every key an add was requested for. That covers every
+   * mark an import may have left: an imported batch agent-framework 0.22.x
+   * activated is never retired, and 0.22.x attempted only an active batch's
+   * refs. The keys of add requests are the direct record of a mark that may
+   * be on Discord. Each is also a key of a batch not retired, since an add
+   * is requested only with its batch's activation and only a prepared batch
+   * is retired; they are kept so that `all` doesn't rest on those rules. A reaction is one
    * per (route, message, emoji), whichever batches asked for it, so this
    * acts across batches. A removal is queued for every selected key, whatever history
    * says: history can't establish what is on Discord now, and removing an
@@ -1176,8 +1119,7 @@ export class DiscordAwarenessOutbox {
    * keys: adds not yet ended are superseded, and adds an earlier choice
    * requests later (a prepared batch's activation) are recorded superseded.
    * The receipt reports history only: earlier add requests whose outcome is
-   * unresolved, and imported history that leaves outcomes unrecorded, any
-   * of which may land or have landed. An earlier removal's unknown outcome
+   * unresolved, any of which may land or have landed. An earlier removal's unknown outcome
    * isn't disclosed: it can't bring a mark back, and this removal goes out
    * anyway.
    */
@@ -1190,7 +1132,6 @@ export class DiscordAwarenessOutbox {
           .filter((batch) => batch.status !== 'discarded')
           .flatMap((batch) => batch.refs.map((ref) => ({ ...ref, emoji: batch.emoji }))),
         ...[...state.ops.values()].filter((op) => op.action === 'add').map((op) => op.key),
-        ...[...state.legacy.values()].flat().map((evidence) => evidence.key),
       ]);
     } else {
       const batch = state.batches.get(target);
@@ -1205,7 +1146,6 @@ export class DiscordAwarenessOutbox {
       addsSuperseded: 0,
       keysWithUnresolvedAdds: 0,
       unresolvedAddAttempts: 0,
-      keysWithLegacyUncertainty: 0,
     };
     const records: JournalRecord[] = [{ t: 'retract', at, requestId, target, ...(by ? { by } : {}) }];
     const toRemove: Array<DiscordAwarenessRef & { emoji: string; action: DiscordAwarenessAction }> = [];
@@ -1215,9 +1155,6 @@ export class DiscordAwarenessOutbox {
       if (unresolved > 0) {
         receipt.keysWithUnresolvedAdds++;
         receipt.unresolvedAddAttempts += unresolved;
-      }
-      if ((state.legacy.get(markKey(key)) ?? []).some((evidence) => evidence.outcomesUnrecorded > 0)) {
-        receipt.keysWithLegacyUncertainty++;
       }
       toRemove.push({ ...key, action: 'remove' });
     }
@@ -1399,7 +1336,6 @@ export class DiscordAwarenessOutbox {
         }
       }
       const unresolvedAttempts = unresolvedDispatches(onKeys, (op, attempt) => this.attemptUnresolved(op, attempt));
-      const evidence = [...state.legacy.values()].flat().filter((entry) => entry.batchId === batch.id);
       views.push({
         kind: 'batch',
         id: batch.id,
@@ -1417,16 +1353,7 @@ export class DiscordAwarenessOutbox {
         adds,
         removals,
         unresolvedAttempts,
-        ...(evidence.length > 0
-          ? {
-              legacy: {
-                entries: evidence.length,
-                lastAddConfirmed: evidence.filter((entry) => entry.lastAction === 'add' && entry.lastOutcome === 'confirmed').length,
-                lastRemoveConfirmed: evidence.filter((entry) => entry.lastAction === 'remove' && entry.lastOutcome === 'confirmed').length,
-                outcomesUnrecorded: evidence.reduce((sum, entry) => sum + entry.outcomesUnrecorded, 0),
-              },
-            }
-          : {}),
+        ...(batch.legacyAdded !== undefined ? { legacyAdded: batch.legacyAdded } : {}),
       });
     }
     for (const retract of state.retracts.values()) {
@@ -1665,7 +1592,6 @@ function emptyState(): JournalState {
     ops: new Map(),
     byKey: new Map(),
     liveKeys: new Set(),
-    legacy: new Map(),
     retracts: new Map(),
     position: 0,
   };
@@ -1675,13 +1601,6 @@ function emptyState(): JournalState {
 function liveRequests(records: JournalRecord[]): number {
   const cancelled = new Set(records.filter((record) => record.t === 'op-cancelled').map((record) => (record as { opId: string }).opId));
   return records.filter((record) => record.t === 'requested' && !cancelled.has(record.opId)).length;
-}
-
-function addLegacyEvidence(state: JournalState, evidence: DiscordAwarenessLegacyEvidence): void {
-  const key = markKey(evidence.key);
-  const list = state.legacy.get(key);
-  if (list) list.push(evidence);
-  else state.legacy.set(key, [evidence]);
 }
 
 /** Apply one entry's records, in order, to the reduced state. Each record
@@ -1787,9 +1706,6 @@ function applyRecords(state: JournalState, records: JournalRecord[]): void {
         if (batch) batch.suppressionAbandoned = true;
         break;
       }
-      case 'legacy-evidence':
-        addLegacyEvidence(state, structuredClone(record.evidence));
-        break;
       case 'retract':
         if (!state.retracts.has(record.requestId)) {
           state.retracts.set(record.requestId, {
@@ -1927,9 +1843,9 @@ function isLegacyEntry(value: unknown): boolean {
 
 /**
  * Translate a version 1 or 2 ledger into journal records. Batches keep their ids.
- * What the old ledger recorded about each ref is kept as legacy evidence:
- * facts (attempt count, last action, status and error), never synthesized
- * attempts and never a judgment about what is on Discord. The work it had
+ * Of what the old ledger recorded about each ref's attempts, each batch
+ * keeps how many refs its last attempt saw added (`legacyAdded`): never
+ * synthesized attempts, and never a judgment about what is on Discord. The work it had
  * still to do (its pending adds and removals, and every mark of a batch it
  * never activated) is retired, none of it sent, and returned in `unsent`:
  * it was queued before marks were an explicit choice, so nobody chose it.
@@ -1941,8 +1857,8 @@ function isLegacyEntry(value: unknown): boolean {
  * messages, whichever batch placed it, the marks 0.22.x placed among them.
  *
  * Each batch is imported once. A batch the journal already holds, or a
- * second listing of one in this file, is skipped whole: its evidence would
- * be counted twice. Batches new to the journal import as above.
+ * second listing of one in this file, is skipped whole: its unsent work
+ * would be announced again. Batches new to the journal import as above.
  */
 function importLegacy(
   parsed: unknown,
@@ -1968,6 +1884,12 @@ function importLegacy(
       channelId: entry.channelId,
       messageId: entry.messageId,
     }));
+    // Only `lastError` speaks to the last attempt's outcome: the old writer
+    // cleared it on success and set it on failure, and nothing else touched
+    // it. `deliveryStatus` was its reconciliation state, rewritten by
+    // branch switches without any request.
+    const legacyAdded = raw.refs
+      .filter((entry) => !!entry.attempts && entry.lastAction === 'add' && entry.lastError === undefined).length;
     records.push({
       t: 'batch',
       at: raw.createdAt,
@@ -1982,6 +1904,7 @@ function importLegacy(
         refs,
         ...(raw.activationPolicy ? { activationPolicy: raw.activationPolicy } : {}),
         ...(raw.suppressionIntervals?.length ? { suppressionIntervals: raw.suppressionIntervals } : {}),
+        legacyAdded,
       },
     });
     // Its marks were active. That is history, not proof of a suppression's
@@ -1992,7 +1915,6 @@ function importLegacy(
     let adds = 0;
     let removals = 0;
     for (const entry of raw.refs) {
-      const key = { serverId: entry.serverId, channelId: entry.channelId, messageId: entry.messageId, emoji: raw.emoji };
       // v1 entries carry no delivery state. A v1 batch is `prepared` or
       // `pending`, and `pending` was the active one, every mark still to
       // deliver: its entries are pending, a prepared one's are not.
@@ -2002,9 +1924,6 @@ function importLegacy(
       if ((!legacyActive || status === 'pending') && (!legacyActive || desired || entry.markerPresent)) {
         if (desired || !legacyActive) adds++;
         else removals++;
-      }
-      if (entry.attempts && entry.attempts > 0 && entry.lastAction) {
-        records.push({ t: 'legacy-evidence', at, evidence: legacyEvidence(raw.id, key, entry, status) });
       }
     }
     // A batch 0.22.x never activated is retired, unless its
@@ -2025,42 +1944,6 @@ function importLegacy(
     }
   }
   return { records, unsent };
-}
-
-/**
- * The facts a v2 entry recorded about its attempts, and what they leave open.
- * Only `lastError` speaks to the last attempt's outcome (the old writer
- * cleared it on success and set it on failure); `deliveryStatus` was its
- * reconciliation state, rewritten by branch switches without any request,
- * and is kept as that and nothing more.
- */
-function legacyEvidence(
-  batchId: string,
-  key: DiscordAwarenessRef & { emoji: string },
-  entry: LegacyEntry,
-  oldDeliveryStatus: 'pending' | 'applied' | 'permanent-failure',
-): DiscordAwarenessLegacyEvidence {
-  const attempts = entry.attempts!;
-  const lastError = entry.lastError;
-  const lastErrorKind = lastError === undefined ? undefined
-    : PRE_WRITE_REFUSAL.test(lastError) ? 'pre-write-refusal'
-    : isPermanentDiscordReactionFailure(lastError) ? 'discord-answer'
-    : 'other';
-  const lastOutcome = lastErrorKind === undefined ? 'confirmed'
-    : lastErrorKind === 'pre-write-refusal' ? 'not-sent'
-    : lastErrorKind === 'discord-answer' ? 'refused'
-    : 'unrecorded';
-  return {
-    batchId,
-    key: { ...key },
-    attempts,
-    lastAction: entry.lastAction!,
-    lastOutcome,
-    oldDeliveryStatus,
-    ...(lastError !== undefined ? { lastError: boundDiscordAwarenessText(lastError) } : {}),
-    ...(lastErrorKind ? { lastErrorKind } : {}),
-    outcomesUnrecorded: (attempts - 1) + (lastOutcome === 'unrecorded' ? 1 : 0),
-  };
 }
 
 /** A batch a start treats as an interrupted surgery's: one still prepared.

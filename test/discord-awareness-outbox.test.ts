@@ -393,7 +393,6 @@ test('retract queues a removal for every selected key, whatever history says, an
   assert.equal(receipt.addsSuperseded, 3, "m2's due add stops, and m1's unknown ones are no longer retried");
   assert.equal(receipt.keysWithUnresolvedAdds, 1);
   assert.equal(receipt.unresolvedAddAttempts, 1, 'one physical request carried both adds');
-  assert.equal(receipt.keysWithLegacyUncertainty, 0);
   assert.deepEqual(outbox.pendingDispatches('discord').map((d) => `${d.action}:${d.key.messageId}`).sort(),
     ['remove:m1', 'remove:m2', 'remove:m3']);
   for (const id of ['m1', 'm2', 'm3']) answer(outbox, id, 'confirmed');
@@ -926,7 +925,7 @@ test('an entry in a format this build can\'t read stops the reader; one written 
   assert.throws(() => h.reopen().batches(), /is in format 2, which this build can't read \(it reads format 1\)/);
 }));
 
-test('v2 import keeps what the old ledger recorded as evidence, retires pending work unsent, and happens once', withJournal((_outbox, h) => {
+test('v2 import keeps how many refs 0.22.x\'s last attempt saw added, retires pending work unsent, and happens once', withJournal((_outbox, h) => {
   const entry = (messageId: string, fields: Record<string, unknown>) => ({ ...ref(messageId), lastAction: 'add', ...fields });
   const legacy = {
     version: 2,
@@ -963,35 +962,26 @@ test('v2 import keeps what the old ledger recorded as evidence, retires pending 
   assert.equal(existsSync(h.legacyPath), false);
   assert.equal(existsSync(`${h.legacyPath}.migrated-v2`), true);
   const views = new Map(batches(outbox).map((v) => [v.id, v]));
-  assert.deepEqual(views.get('dd34b043')!.legacy, {
-    entries: 5,
-    lastAddConfirmed: 1,
-    lastRemoveConfirmed: 0,
-    // u1: its one outcome unrecorded; g3: two earlier attempts unrecorded.
-    outcomesUnrecorded: 3,
-  });
+  // a1 alone: every other ref's last attempt left an error.
+  assert.equal(views.get('dd34b043')!.legacyAdded, 1);
   // Its pending add is retired, never sent, and named at the start that
   // imported it.
   assert.equal(views.get('pending-batch')!.status, 'active');
   assert.deepEqual(h.announced.flat().map((b) => [b.batchId, b.adds, b.removals]), [['pending-batch', 1, 0]]);
   assert.equal(outbox.pendingDispatches('discord').length, 0);
 
-  // Retract carries out the act for every ref and discloses what history leaves open.
+  // Retract carries out the act for every ref.
   const receipt = outbox.retract('dd34b043', 'operator');
   assert.equal(receipt.removalsQueued, 5);
   assert.equal(receipt.unresolvedAddAttempts, 0, 'no physical request of this journal');
-  assert.equal(receipt.keysWithLegacyUncertainty, 2, 'u1 and g3');
-  const probe = outbox.retract('pending-batch');
-  assert.equal(probe.removalsQueued, 1);
-  assert.equal(probe.keysWithLegacyUncertainty, 1);
-  assert.equal(outbox.cancel('pending-batch').legacyOutcomesUnrecorded, 1);
+  assert.equal(outbox.retract('pending-batch').removalsQueued, 1);
 
   // A crash between the import and the rename: every batch in the file is
   // in the journal, so it imports nothing again, and is renamed.
   writeFileSync(h.legacyPath, JSON.stringify(legacy));
   const again = h.reopen();
   assert.equal(again.batches().filter((b) => b.id === 'dd34b043').length, 1);
-  assert.equal(batches(again).find((v) => v.id === 'dd34b043')!.legacy!.entries, 5);
+  assert.equal(batches(again).find((v) => v.id === 'dd34b043')!.legacyAdded, 1);
   assert.equal(existsSync(h.legacyPath), false);
 }));
 
@@ -1041,7 +1031,7 @@ test('a restored copy of an imported ledger changes nothing: import is once per 
   const later = batches(widened).find((v) => v.id === 'later')!;
   assert.equal(later.status, 'active');
   assert.deepEqual(h.announced.slice(announcedBefore).flat().map((b) => [b.batchId, b.adds]), [['later', 1]]);
-  assert.deepEqual(later.legacy, { entries: 1, lastAddConfirmed: 0, lastRemoveConfirmed: 0, outcomesUnrecorded: 1 });
+  assert.equal(later.legacyAdded, 0, 'its one add left an error');
   assert.deepEqual(widened.view().filter((v) => v.id !== 'later'), view);
   assert.deepEqual(widened.operations(), operations);
   assert.equal(existsSync(h.legacyPath), false);
@@ -1064,7 +1054,7 @@ test('a legacy ledger that cannot be imported refuses every read until it can be
   assert.equal(existsSync(h.legacyPath), false);
 }));
 
-test('legacy evidence reads outcomes from the old writer\'s lastError, never from its reconciliation state', withJournal((_outbox, h) => {
+test('an import counts what 0.22.x saw added from the old writer\'s lastError, never from its reconciliation state', withJournal((_outbox, h) => {
   // Entries exactly as the 64c480b writer leaves them (recordSuccess clears
   // lastError, recordFailure sets it; setDesired rewrites deliveryStatus
   // from the cached markerPresent without any request).
@@ -1088,22 +1078,20 @@ test('legacy evidence reads outcomes from the old writer\'s lastError, never fro
   writeFileSync(h.legacyPath, JSON.stringify(legacy));
   const outbox = h.reopen();
   const [view] = batches(outbox);
-  assert.deepEqual(view.legacy, { entries: 2, lastAddConfirmed: 1, lastRemoveConfirmed: 0, outcomesUnrecorded: 1 });
+  assert.equal(view.legacyAdded, 1, 'c1 alone: u1\'s add left an error, whatever its reconciliation state says');
   // The old writer's pending removal is retired, never sent, and named.
   assert.equal(view.status, 'active');
   assert.deepEqual(h.announced.flat().map((b) => [b.batchId, b.adds, b.removals]), [['reconciled', 0, 1]]);
   assert.equal(outbox.pendingDispatches('discord').length, 0);
 
   // A retract takes the mark off, and its own requests are disclosed when
-  // it is cancelled; the batch's cancel discloses what the evidence leaves
-  // unrecorded.
+  // it is cancelled.
   const { requestId } = outbox.retract('reconciled');
   answer(outbox, 'c1', 'unknown');
   answer(outbox, 'c1', 'confirmed');
   const receipt = outbox.cancel(requestId);
   assert.equal(receipt.unresolvedAttempts, 1, 'the unknown removal attempt may still land');
   assert.equal(receipt.confirmed, 1);
-  assert.equal(outbox.cancel('reconciled').legacyOutcomesUnrecorded, 1);
 }));
 
 test('an imported active suppression is not proof its body completed: startup still verifies its intervals', withJournal((_outbox, h) => {
@@ -2382,7 +2370,6 @@ test('a legacy import written but out of this view is not imported again in this
   const fresh = h.reopen();
   const [view] = batches(fresh);
   assert.equal(view.id, 'old');
-  assert.equal(view.legacy?.entries, 1);
   assert.equal(h.store.getRecordIdsByType(DISCORD_AWARENESS_RECORD_TYPE).length, 1);
 }));
 
@@ -2518,18 +2505,59 @@ test('Discord refusals that no retry can change are permanent', () => {
   }
 });
 
-test("retract('all') takes the keys of every batch not retired, every key an add was requested for, and every key an imported ledger recorded, and no other key of a retired batch", withJournal((_outbox, h) => {
-  // Imported, never activated, so retired at import: its attempt on m3 is
-  // kept as evidence, and its m4 has none. 0.22.x attempted only an active
-  // batch's refs, so it couldn't write this ledger: it's constructed, to
-  // reach the imported-evidence source alone.
-  const outbox = importLegacyBatch(h, 'old', [{ ...ref('m3'), attempts: 1, lastAction: 'add' } as DiscordAwarenessRef, ref('m4')]);
+test("retract('all') takes the keys of every batch not retired and every key an add was requested for, and no other key of a retired batch", withJournal((outbox) => {
   activeBatch(outbox, [ref('m1')]);
   const retired = outbox.prepare({ agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/2', refs: [ref('m2')], scope: 'all' })!;
   outbox.discard(retired.id);
   const receipt = outbox.retract('all');
-  assert.equal(receipt.removalsQueued, 2);
-  assert.deepEqual(outbox.pendingDispatches('discord').map((d) => `${d.action}:${d.key.messageId}`).sort(), ['remove:m1', 'remove:m3']);
+  assert.equal(receipt.removalsQueued, 1);
+  assert.deepEqual(outbox.pendingDispatches('discord').map((d) => `${d.action}:${d.key.messageId}`), ['remove:m1']);
+}));
+
+test("retract('all') after an import takes off every key 0.22.x attempted, each a ref of an imported batch it activated", withJournal((_outbox, h) => {
+  // A ledger as every release from 0.6.7 to 0.22.2 writes it: attempts only
+  // on refs of a batch it activated (its pending() returns no other),
+  // whatever their outcome, and none on a batch it never activated.
+  const entry = (messageId: string, fields: Record<string, unknown>) =>
+    ({ ...ref(messageId), desired: true, markerPresent: false, deliveryStatus: 'pending', attempts: 0, ...fields });
+  const legacy = {
+    version: 2,
+    batches: [
+      {
+        id: 'active-1', status: 'active', agentName: 'resident', sourceBranch: 'main', targetBranch: 'rollback/resident/1',
+        emoji: '💤', createdAt: 1,
+        refs: [
+          entry('a1', { markerPresent: true, deliveryStatus: 'applied', attempts: 1, lastAction: 'add' }),
+          entry('a2', { attempts: 2, lastAction: 'add', lastError: 'MCPL server "discord" did not respond within 10000ms' }),
+          entry('a3', { desired: false, deliveryStatus: 'applied', attempts: 2, lastAction: 'remove' }),
+          entry('a4', { deliveryStatus: 'permanent-failure', attempts: 1, lastAction: 'add', lastError: 'Unknown Message' }),
+          entry('a5', {}),
+        ],
+      },
+      {
+        id: 'active-2', status: 'active', agentName: 'resident', sourceBranch: 'main', targetBranch: 'rollback/resident/2',
+        emoji: '👀', createdAt: 2,
+        refs: [entry('b1', { markerPresent: true, deliveryStatus: 'applied', attempts: 1, lastAction: 'add' })],
+      },
+      {
+        // Never activated, so never attempted: retired at import.
+        id: 'never', status: 'prepared', agentName: 'resident', sourceBranch: 'main', targetBranch: 'rollback/resident/3',
+        emoji: '💤', createdAt: 3,
+        refs: [entry('c1', { desired: false, deliveryStatus: 'applied' })],
+      },
+    ],
+  };
+  mkdirSync(join(h.dir, 'recovery'), { recursive: true });
+  writeFileSync(h.legacyPath, JSON.stringify(legacy));
+  const outbox = h.reopen();
+  assert.deepEqual(batches(outbox).map((v) => [v.id, v.legacyAdded]), [['active-1', 1], ['active-2', 1]]);
+  const receipt = outbox.retract('all');
+  const removals = outbox.pendingDispatches('discord').map((d) => `${d.action}:${d.key.emoji}:${d.key.messageId}`).sort();
+  const attempted = legacy.batches.flatMap((batch) => batch.refs
+    .filter((r) => r.attempts > 0).map((r) => `remove:${batch.emoji}:${r.messageId}`));
+  assert.deepEqual(attempted.filter((key) => !removals.includes(key)), [], 'every key 0.22.x attempted is taken');
+  assert.deepEqual(removals, ['remove:👀:b1', 'remove:💤:a1', 'remove:💤:a2', 'remove:💤:a3', 'remove:💤:a4', 'remove:💤:a5']);
+  assert.equal(receipt.removalsQueued, 6);
 }));
 
 test('an operator\'s request the journal won\'t carry out is a refusal; a journal failure is not', withJournal((_outbox, h) => {

@@ -9463,10 +9463,9 @@ export class AgentFramework {
   /**
    * Remove this bot's awareness mark, through each ref's configured MCPL
    * route, from a batch's refs, or (`all`) from every ref of every batch not
-   * retired, every key an add was requested for, and every key an imported
-   * ledger recorded. The receipt says how many removals were queued and how
-   * many earlier add attempts are unresolved, any of which may land
-   * afterwards.
+   * retired and every key an add was requested for. The receipt says how
+   * many removals were queued and how many earlier add attempts are
+   * unresolved, any of which may land afterwards.
    */
   retractDiscordAwareness(
     target: string | 'all',

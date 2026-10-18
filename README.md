@@ -480,13 +480,13 @@ const result = await framework.rollbackToMessage('cairn', {
   - `retractDiscordAwareness(batch | 'all')` queues removal of this bot's
     reaction, through each address's configured MCPL route, for every message
     of the batch (or of every batch that isn't retired, whether prepared or
-    active, and every message an imported ledger recorded), whatever
-    history says: removing an absent reaction does nothing. As the latest
+    active), whatever history says: removing an absent reaction does
+    nothing. As the latest
     authorization for those messages, it stops adds that haven't ended and
     any an earlier choice would request later (a prepared batch's
     activation); cancelling it never revives them. Its receipt discloses earlier
     add requests whose outcome is unknown (an unknown removal can't bring a
-    mark back) and imported history that leaves outcomes unrecorded;
+    mark back);
   - `checkDiscordAwarenessBranchName(name)` refuses (`invalid`) a name for
     a new branch that a suppression with pending removals names as its
     target, cancelled or not, since a start on a branch with that name
@@ -514,11 +514,9 @@ A pre-journal awareness ledger (`discord-awareness-outbox.json` under the
 store, or `discordAwarenessOutboxPath`) is imported once on first use and the
 file renamed `.migrated-v2`; a copy put back at that path later imports only
 batches the journal doesn't already hold, and is renamed beside the first
-(`.migrated-v2.<hash>`) rather than over it. What it recorded about each message
-is kept as evidence (attempt count; the last action and the outcome its error field
-establishes; the old writer's delivery status, labelled as the
-reconciliation state it was; and how many attempt outcomes it leaves
-unrecorded), never as a claim about what is on Discord,
+(`.migrated-v2.<hash>`) rather than over it. Each imported batch keeps how many
+of its messages 0.22.x's last attempt saw a mark added to (`legacyAdded` in
+the list), never as a claim about what is on Discord,
 and an imported `active` suppression is not taken as proof that its body
 completed: startup verifies and resumes its intervals on its branch. The
 work agent-framework 0.22.x had still to do is never sent, since nobody

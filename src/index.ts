@@ -143,7 +143,6 @@ export type {
   DiscordAwarenessBatch,
   DiscordAwarenessBatchRecord,
   DiscordAwarenessBatchView,
-  DiscordAwarenessLegacyEvidence,
   DiscordAwarenessRetractView,
   DiscordAwarenessView,
   DiscordAwarenessCancelReceipt,
