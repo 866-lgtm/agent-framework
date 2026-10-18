@@ -1116,12 +1116,12 @@ test('the notices say what happened, name the opt-out, and state no rule about l
       .map((b) => (b as { text: string }).text);
     assert.deepEqual(texts, [
       "[channels] Now open: #general (discord:g1:c1): your own message into the closed channel opened it. " +
-        "Ongoing traffic from this channel will reach you. If you don't want it, use channel_close; your choice outranks policy.",
+        "What an open channel delivers to you depends on its server. If you don't want it, use channel_close; your choice outranks policy.",
       "[channels] Now open: c2: your own message into the closed channel opened it. " +
-        "Ongoing traffic from this channel will reach you. If you don't want it, use channel_close; your choice outranks policy.",
+        "What an open channel delivers to you depends on its server. If you don't want it, use channel_close; your choice outranks policy.",
       '[channels] Selected for opening by subscription policy: c3, ops (c4). ' +
         'This records the admission decision; channel_list shows current transport state. ' +
-        "When open, their ongoing traffic will reach you. If you don't want one of them, use channel_close; your choice outranks policy.",
+        "What an open channel delivers to you depends on its server. If you don't want one of them, use channel_close; your choice outranks policy.",
     ]);
   } finally {
     await framework.stop();

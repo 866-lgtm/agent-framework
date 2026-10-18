@@ -14,9 +14,10 @@
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
-import { INLINE_WITHHELD_TEXT, isInlineContradiction, referenceStubOrNull } from './references.js';
+import { convertBlock } from './convert-block.js';
 import type { JsStore } from '@animalabs/chronicle';
 import { isDeepStrictEqual } from 'node:util';
+import { ensureStateRegistered } from '../module-registry.js';
 
 import type {
   ChannelDescriptor,
@@ -31,7 +32,6 @@ import type {
   ChannelsPublishParams,
   ChannelsOpenResult,
   ChannelHistoryRequest,
-  McplContentBlock,
 } from './types.js';
 
 import type { McplServerRegistry } from './server-registry.js';
@@ -39,7 +39,7 @@ import type { FeatureSetManager } from './feature-set-manager.js';
 import type { ToolDefinition, ToolResult, ProcessEvent } from '../types/index.js';
 import { expandCoreTags } from './tags.js';
 import { coalesceRejectionReason, EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
-import { isVisiblyEmptyContent } from './visible-content.js';
+import { isVisiblyEmptyConversion } from './visible-content.js';
 import { logDetail, logValue } from './log-value.js';
 import { RefusalLines } from './refusal-lines.js';
 import { CapabilityGrant } from './capability-grant.js';
@@ -282,88 +282,6 @@ interface McplChannelIncomingEvent {
 }
 
 // ============================================================================
-// Content Conversion: McplContentBlock → membrane ContentBlock
-// ============================================================================
-
-/**
- * Convert a single MCPL wire-format content block to a membrane ContentBlock.
- */
-function convertBlock(block: McplContentBlock): ContentBlock {
-  switch (block.type) {
-    case 'text':
-      // Text that isn't a string is no text, as the request sanitizer and
-      // the visible-content check already read it.
-      return { type: 'text', text: typeof block.text === 'string' ? block.text : '' };
-
-    case 'image':
-      if (isInlineContradiction(block)) {
-        // RFC-005 vector 2: inline data claiming bulk disposition — fail
-        // closed, withhold the data (checked BEFORE the data branch).
-        return { type: 'text', text: INLINE_WITHHELD_TEXT };
-      }
-      if (isFilledString(block.uri) && block.disposition) {
-        // RFC-005 uri-form media with a disposition claim: stub, do not
-        // hand the URI to the provider or inline it.
-        return { type: 'text', text: referenceStubOrNull(block, 'attachment on channel message') ?? '[reference]' };
-      }
-      if (isFilledString(block.data) && isFilledString(block.mimeType)) {
-        return {
-          type: 'image',
-          source: { type: 'base64', data: block.data, mediaType: block.mimeType },
-        } as ContentBlock;
-      }
-      if (isFilledString(block.uri)) {
-        return {
-          type: 'image',
-          source: { type: 'url', url: block.uri },
-        } as ContentBlock;
-      }
-      return { type: 'text', text: isFilledString(block.data) ? '[Image: no media type]' : '[Image: no data]' };
-
-    case 'audio':
-      if (isInlineContradiction(block)) {
-        // RFC-005 vector 2: inline data claiming bulk disposition — fail
-        // closed, withhold the data (checked BEFORE the data branch).
-        return { type: 'text', text: INLINE_WITHHELD_TEXT };
-      }
-      if (isFilledString(block.uri) && block.disposition) {
-        // RFC-005 uri-form media with a disposition claim: stub, do not
-        // hand the URI to the provider or inline it.
-        return { type: 'text', text: referenceStubOrNull(block, 'attachment on channel message') ?? '[reference]' };
-      }
-      if (isFilledString(block.data) && isFilledString(block.mimeType)) {
-        return {
-          type: 'audio',
-          source: { type: 'base64', data: block.data, mediaType: block.mimeType },
-        } as ContentBlock;
-      }
-      return { type: 'text', text: isFilledString(block.data) ? '[Audio: no media type]' : '[Audio: no data]' };
-
-    case 'resource':
-      // RFC-005: reference blocks become bounded stubs — never raw URIs
-      // (a signed URL is a bearer credential that looks like a location).
-      return { type: 'text', text: referenceStubOrNull(block, 'attachment on channel message') ?? '[reference]' };
-
-    default: {
-      // Unknown wire block types previously fell off the exhaustive switch
-      // and propagated `undefined` into ContentBlock[]. Fail visibly. A type
-      // that isn't a string is no type, and is never converted to one: an
-      // object can throw when it is.
-      const type: unknown = (block as { type?: unknown }).type;
-      return { type: 'text', text: `[unrecognized content block: ${typeof type === 'string' ? type : 'untyped'}]` };
-    }
-  }
-}
-
-/** A string with something in it: the only data, mimeType or uri a block's
- *  source is built from, and the only uri that makes it a reference. Anything
- *  else a sender puts there leaves the block without it, so conversion never
- *  throws and never copies a non-string. */
-function isFilledString(value: unknown): value is string {
-  return typeof value === 'string' && value !== '';
-}
-
-// ============================================================================
 // Channel Tool Definitions
 // ============================================================================
 
@@ -376,9 +294,8 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'channel_open',
     description:
-      'Open a channel to start receiving its ordinary ongoing traffic. The MCPL ' +
-      'integration performs its own subscribe/join/attach operation. Optionally request ' +
-      'history preceding the message that invited you into the channel.',
+      'Open a channel. What an open channel delivers to you depends on its MCPL server. ' +
+      'Optionally request history preceding the message that invited you into the channel.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -418,7 +335,9 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'channel_close',
-    description: 'Close a channel to stop receiving messages',
+    description:
+      'Close a channel. Messages that address you still reach you; what else stops reaching you ' +
+      'depends on its server.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -545,7 +464,8 @@ interface ChannelRegistryOptions {
    * transport RPC; not an open confirmation), or a delivery that turned a
    * closed channel open, once its transport is confirmed. Reconfirming the
    * transport of a channel already decided open or tuned out isn't one.
-   * The host records a durable, non-waking notice.
+   * The host records a durable, non-waking notice. What an open channel
+   * delivers is the server's to say (#406).
    * Policy admissions fire once per channel: the persisted desired-state
    * decision prevents re-announcement on retry or reboot. channel_close
    * supersedes policy; a fresh delivery into a closed locus engages it again.
@@ -1141,8 +1061,8 @@ export class ChannelRegistry {
         }
       }
       if (message.tags) message.tags = expandCoreTags(message.tags);
-      const convertedContent: ContentBlock[] = message.content.map(convertBlock);
-      if (!emptyAllowed && isVisiblyEmptyContent(convertedContent)) {
+      const convertedContent: ContentBlock[] = message.content.map((block) => convertBlock(block, 'attachment on channel message'));
+      if (!emptyAllowed && isVisiblyEmptyConversion(message.content, convertedContent)) {
         rejectEmpty();
         continue;
       }
@@ -1186,7 +1106,7 @@ export class ChannelRegistry {
       if (this.shouldTriggerInference) {
         // The text the agent's context gets, as the push lane's filter reads
         // it: the converted text blocks, a placeholder or reference stub
-        // among them, and a text block's non-string text as empty text.
+        // among them, NON_STRING_TEXT_PLACEHOLDER included.
         const textContent = convertedContent
           .filter((b): b is ContentBlock & { type: 'text' } => b.type === 'text')
           .map((b) => b.text)
@@ -1680,13 +1600,7 @@ export class ChannelRegistry {
   private initializeLifecycleStore(): void {
     if (!this.store) return;
 
-    try {
-      this.store.registerState({ id: CHANNEL_LIFECYCLE_LOG_ID, strategy: 'append_log' });
-    } catch (error) {
-      if (!(error instanceof Error) || !error.message.includes('State already exists')) {
-        throw error;
-      }
-    }
+    ensureStateRegistered(this.store, { id: CHANNEL_LIFECYCLE_LOG_ID, strategy: 'append_log' });
 
     const raw = this.store.getStateJson(CHANNEL_LIFECYCLE_LOG_ID);
     if (!Array.isArray(raw)) return;
@@ -1756,13 +1670,7 @@ export class ChannelRegistry {
   private initializeLabelHistoryStore(): void {
     if (!this.store) return;
 
-    try {
-      this.store.registerState({ id: CHANNEL_LABEL_HISTORY_LOG_ID, strategy: 'append_log' });
-    } catch (error) {
-      if (!(error instanceof Error) || !error.message.includes('State already exists')) {
-        throw error;
-      }
-    }
+    ensureStateRegistered(this.store, { id: CHANNEL_LABEL_HISTORY_LOG_ID, strategy: 'append_log' });
 
     const raw = this.store.getStateJson(CHANNEL_LABEL_HISTORY_LOG_ID);
     if (!Array.isArray(raw)) return;
@@ -2212,17 +2120,13 @@ export class ChannelRegistry {
    */
   readCoordinatorState(stateId: string): unknown {
     if (!this.store) return null;
-    try {
-      this.store.registerState({ id: stateId, strategy: 'snapshot' });
-    } catch { /* already registered */ }
+    ensureStateRegistered(this.store, { id: stateId, strategy: 'snapshot' });
     return this.store.getStateJson(stateId);
   }
 
   writeCoordinatorState(stateId: string, value: unknown): void {
     if (!this.store) return;
-    try {
-      this.store.registerState({ id: stateId, strategy: 'snapshot' });
-    } catch { /* already registered */ }
+    ensureStateRegistered(this.store, { id: stateId, strategy: 'snapshot' });
     this.store.setStateJson(stateId, value);
   }
 
@@ -3030,11 +2934,13 @@ export class ChannelRegistry {
     // A tuned-out channel is transport-open but attention-diverted; a plain
     // open would silently discard the epoch (and its pending backlog dump).
     // Cancelling is the tune-out coordinator's flow, reached via its own
-    // tool — refuse with the pointer rather than eat the state.
+    // tool — refuse with the pointer rather than eat the state. As an error
+    // result, the agent reads the pointer itself; `data` names the refusal
+    // for an in-process caller.
     if (this.getDesiredState(entry.serverId, input.channelId) === 'tuned-out') {
       return {
         success: false,
-        isError: false,
+        isError: true,
         error:
           `Channel ${input.channelId} is tuned out. Cancel the tune-out ` +
           `(tune_out with mode: 'cancel') to resume normal attention — ` +
@@ -3217,7 +3123,7 @@ export class ChannelRegistry {
     if (entry.open || this.getDesiredState(entry.serverId, input.channelId) === 'open') {
       return {
         success: false,
-        error: `Channel is already open: ${input.channelId}. Use channel_close to leave it.`,
+        error: `Channel is already open: ${input.channelId}. Use channel_close to close it.`,
         isError: true,
       };
     }
