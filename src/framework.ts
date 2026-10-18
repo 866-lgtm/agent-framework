@@ -19911,7 +19911,9 @@ export class AgentFramework {
    * addressed to any ordinary resident, since residents share one message
    * slot (sharedSlotAgents). A write whose target is gone isn't among them:
    * no module reads that agent's store, and the write waits for its window's
-   * release (drainDeferredFor) or is dropped at its flush (addMessage).
+   * release (drainDeferredFor) or, at its flush, is dropped (addMessage), a
+   * failed reply passing to the primary as its notice
+   * (queuedFailedReplyForPrimary).
    */
   private heldWritesFor(reader: Agent): DeferredWrite[] {
     return this.deferredMessages
