@@ -1362,3 +1362,28 @@ test('#157: an edit of a follow-up stored at once, which a compile then showed t
   assert(r.sent, 'the explicit send posted');
   assert(!r.replied, 'the prose after the send stayed withheld');
 });
+
+test('#157: an edit admitted while a compile is assembling a message stored at once stays a marker, so the prose after an explicit send stays withheld', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  // The question is stored at once and wakes the turn. The edit is admitted
+  // after the compile has assembled it and before the compile returns, so
+  // the question still counts as unread.
+  const cm = f.framework.getAgent('agent')!.getContextManager() as unknown as { compile: (...args: unknown[]) => Promise<unknown> };
+  const compile = cm.compile.bind(cm);
+  let shown = false;
+  let edited = false;
+  cm.compile = async (...args: unknown[]) => {
+    const result = await compile(...args);
+    if (!edited) {
+      edited = true;
+      shown = JSON.stringify(result).includes('question');
+      await f.send('push/event', { ...f.params('e1', 'question_edited', { channelId: 'chat', key: 'message:m1' }), tags: ['chat:edited'] });
+    }
+    return result;
+  };
+  const r = await sendThenSpeak(f, async () => {});
+  assert(shown, 'the compile assembled the question');
+  assert(r.injected[0].includes('question_edited') && !r.injected[0].includes('replacesUnread'), 'the edit reached the boundary unmarked');
+  assert(r.sent, 'the explicit send posted');
+  assert(!r.replied, 'the prose after the send stayed withheld');
+});

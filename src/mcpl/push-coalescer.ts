@@ -68,7 +68,9 @@ export interface CoalescingPlacement {
   deferredId?: string;
   /** Stored at once, outside the deferred queue: while none of the agent's
    *  turns was alive, or assembled for a start before its compile. No tool
-   *  boundary drained it, so the agent sees it first at a compile. */
+   *  boundary drained it, so the agent sees it first at a compile, and the
+   *  host clears this as a committing compile that reads it begins
+   *  (PushCoalescer.endDirectWindow). */
   direct?: true;
 }
 
@@ -440,6 +442,17 @@ export class PushCoalescer<E = unknown> {
       }
     }
     return structuredClone(entry.result);
+  }
+
+  /** A committing compile of an agent that reads the stores of `agents` is
+   *  about to assemble its request. An occupant stored at once there is in
+   *  that request from now on, though it counts as unread until the compile
+   *  returns, so it is no longer one the agent hasn't seen. */
+  endDirectWindow(agents: ReadonlySet<string>): void {
+    for (const state of this.subjects.values()) {
+      const placement = state.occupant?.placement;
+      if (placement?.direct && agents.has(placement.agent)) delete placement.direct;
+    }
   }
 
   // ---------------------------------------------------------------------------

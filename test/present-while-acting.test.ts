@@ -1456,6 +1456,7 @@ describe('present while acting', () => {
         },
         suspend: () => {},
         isRendering: () => false,
+        endDirectWindow: () => {},
       };
       const lines: string[] = [];
       const error = console.error;

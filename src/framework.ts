@@ -11992,6 +11992,14 @@ export class AgentFramework {
         }
       }
 
+      // The compile below assembles every message stored at once for this
+      // agent, and for a shared slot every resident's, though the watermark
+      // moves only once it returns. So none of them is unseen any more
+      // (CoalescingPlacement.direct). A compile that fails leaves them so,
+      // which errs toward the marker.
+      this.pushCoalescer?.endDirectWindow(new Set(
+        this.sharedSlotAgents.has(agent) ? [...this.sharedSlotAgents].map((a) => a.name) : [agent.name],
+      ));
       const {
         stream,
         request: compiledRequest,
