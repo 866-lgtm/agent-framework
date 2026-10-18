@@ -824,10 +824,16 @@ describe('a stop before the turn has a stream', () => {
       gate: { config: { policies: [], default: 'always' } },
       errorPolicy: { maxRetries: 1, onInferenceError: (_error, _agentName, attempt) => (attempt > 0 ? { retry: false } : { retry: true, delayMs: 60_000 }) },
     });
-    const traces: TraceEvent[] = [];
-    framework.onTrace((event) => traces.push(event));
-    const agent = framework.getAgent('prime')!;
     const gate = (framework as unknown as { eventGate: { inferenceDiagnostics(): { inferring: string[] } } }).eventGate;
+    const traces: TraceEvent[] = [];
+    // stop() disposes the gate, which clears it: the gate is read as the
+    // drop is reported, after the drop's own release.
+    let inferringAtDrop: string[] | undefined;
+    framework.onTrace((event) => {
+      traces.push(event);
+      if (event.type === 'inference:aborted' && inferringAtDrop === undefined) inferringAtDrop = [...gate.inferenceDiagnostics().inferring];
+    });
+    const agent = framework.getAgent('prime')!;
     const noteWrites: string[] = [];
     // The first compile waits at its await on the guard's annotations, and
     // then fails.
@@ -874,7 +880,7 @@ describe('a stop before the turn has a stream', () => {
       assert.deepEqual(abortReasons(traces), [`a turn whose request couldn't be built while ${why} is dropped before it sends anything`], 'the turn was dropped');
       assert.ok(!traces.some((t) => t.type === 'inference:exhausted'), 'not exhausted');
       assert.deepEqual(noteWrites, [], 'and no [turn-interrupted] note was written');
-      assert.deepEqual(gate.inferenceDiagnostics().inferring, [], 'and the turn is closed at the event gate');
+      assert.deepEqual(inferringAtDrop, [], 'and the drop closed the turn at the event gate');
     } finally {
       compileReleased.resolve();
       await within('stop() in cleanup', framework.stop()).catch(() => {});
