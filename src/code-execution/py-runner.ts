@@ -433,12 +433,25 @@ function stoppedReading(background: boolean): string {
 }
 
 /** Why a script stopped when its interpreter exited under it, and what running it again does. */
-function interpreterExit(exitCode: number | null, signal: NodeJS.Signals | null, background: boolean): string {
+function interpreterExit(exitCode: number | null, signal: NodeJS.Signals | null, background: boolean, said = ''): string {
   const how = signal ? `was ended by ${signal}` : `exited with code ${exitCode}`;
+  // The runtime ends itself (runtime-py.ts _fatal) with a line saying which of its fds a script took.
+  const taken = fdTakenFromRuntime(said);
+  const check = taken
+    ? `check whether the script closes or replaces ${taken}, as the runtime's line above says`
+    : `check whether the script itself ends the process, for example ${signal ? 'by using too much memory' : 'with os._exit()'}`;
   return `script stopped: the Python interpreter ${how} while it ran, so the rest of the script didn't run`
     + `${background ? '' : ', and variables from earlier scripts are gone'}. Tool calls it had already made keep their effects, `
-    + 'so check them before you run it again in a new interpreter. If it stops the same way, check whether the script itself '
-    + `ends the process, for example ${signal ? 'by using too much memory' : 'with os._exit()'}; if not, ask whoever runs this host.`;
+    + `so check them before you run it again in a new interpreter. If it stops the same way, ${check}; if not, ask whoever runs this host.`;
+}
+
+/** The file descriptor the runtime's last line of its own says a script took from it (runtime-py.ts _check_own_fd), if it says so. */
+function fdTakenFromRuntime(said: string): string | null {
+  let taken: string | null = null;
+  for (const m of said.matchAll(/\[pytc-runtime\] [^\n]*: a script closed or replaced ((?:the runtime's copy of )?fd \d)[^\n]*; exiting/g)) {
+    taken = m[1];
+  }
+  return taken;
 }
 
 interface PendingExec {
@@ -739,7 +752,9 @@ export class PyRunner {
         return;
       }
       const killedDeaf = inputFailed && signal === 'SIGKILL';
-      const why = killedDeaf ? stoppedReading(pending.background) : interpreterExit(exitCode, signal, pending.background);
+      // Why, from what arrived: the runtime's own exit names the fd it lost in its last line.
+      const why = (said: string) =>
+        killedDeaf ? stoppedReading(pending.background) : interpreterExit(exitCode, signal, pending.background, said);
       // The host's log keeps the short form, with the exit's own code and signal.
       const logged = killedDeaf
         ? "python runtime stopped reading the host's messages, so it was killed"
@@ -893,13 +908,15 @@ export class PyRunner {
    * its interpreter ended keeps its own return code. Returns what the script
    * wrote to stderr (a background script's tail), for the host's log.
    */
-  private stopPending(why: string): string {
+  private stopPending(reason: string | ((said: string) => string)): string {
     const pending = this.pending;
     if (!pending || pending.settled) return '';
     const stdout = this.out?.take() ?? '';
     const stderr = this.err?.take() ?? '';
     const returnCode = pending.returnCode ?? 1;
     const journal = pending.journal;
+    // A background script's stderr, the runtime's own lines among it, is in its journal.
+    const why = typeof reason === 'string' ? reason : reason(journal ? journal.tail : stderr);
     if (journal) {
       const tail = journal.tail;
       // The journal, which the agent reads with its own tools, says why too,

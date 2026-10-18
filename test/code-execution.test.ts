@@ -68,6 +68,13 @@ const exitedUnder = (how: string, background = false): string =>
   + 'so check them before you run it again in a new interpreter. If it stops the same way, check whether the script itself '
   + `ends the process, for example ${how.startsWith('was ended by') ? 'by using too much memory' : 'with os._exit()'}; if not, ask whoever runs this host.`;
 
+/** The result's text after the runtime ended itself because a script took one of its file descriptors. */
+const runtimeLost = (taken: string): string =>
+  "script stopped: the Python interpreter exited with code 70 while it ran, so the rest of the script didn't run, and variables "
+  + 'from earlier scripts are gone. Tool calls it had already made keep their effects, so check them before you run it again in '
+  + `a new interpreter. If it stops the same way, check whether the script closes or replaces ${taken}, as the runtime's line above `
+  + 'says; if not, ask whoever runs this host.';
+
 describe('buildInjectedTools', () => {
   it('sanitizes -- to __ and keeps valid identifiers', () => {
     const injected = buildInjectedTools(['mcpl--discord--send_message', 'think']);
@@ -1370,47 +1377,53 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
   });
 
   it("a script that closes or replaces one of the runtime's own fds ends the interpreter by the end of that script at the latest, saying which", async () => {
-    const rows: [string, string, string, RegExp][] = [
-      ["fd 3, the host's messages", 'import os\nprint("closing")\nos.close(3)', 'closing\n', /cannot read the host's messages any more/],
-      ["fd 4, the runtime's messages", 'import os\nos.close(4)\nprint("closed")', 'closed\n', /cannot send the host a message any more/],
+    const rows: [string, string, string, RegExp, string][] = [
+      ["fd 3, the host's messages", 'import os\nprint("closing")\nos.close(3)', 'closing\n', /cannot read the host's messages any more/, 'fd 3'],
+      ["fd 4, the runtime's messages", 'import os\nos.close(4)\nprint("closed")', 'closed\n', /cannot send the host a message any more/, 'fd 4'],
       [
         'fd 4, replaced',
         'import os\nos.dup2(os.open(os.devnull, os.O_WRONLY), 4)\nprint("replaced")',
         'replaced\n',
         /cannot send the host a message any more: a script closed or replaced fd 4, where they go/,
+        'fd 4',
       ],
       [
         'fd 4, replaced by a socket',
         'import os, socket\na, b = socket.socketpair()\nos.dup2(a.fileno(), 4)\nprint("replaced")',
         'replaced\n',
         /cannot send the host a message any more: a script closed or replaced fd 4, where they go/,
+        'fd 4',
       ],
       [
         'fd 4, replaced before a tool call',
         'import os\nos.dup2(os.open(os.devnull, os.O_WRONLY), 4)\nprint("replaced")\nawait test__echo({})\nprint("called")',
         'replaced\n',
         /cannot send the host a message any more: a script closed or replaced fd 4, where they go/,
+        'fd 4',
       ],
       [
         "the runtime's copy of fd 0",
         'import __main__, os\nos.close(__main__._STD_IN)\nprint("closed")',
         'closed\n',
         /cannot give scripts their stdin any more: a script closed or replaced the runtime's copy of fd 0/,
+        "the runtime's copy of fd 0",
       ],
       [
         "the runtime's copy of fd 1",
         'import __main__, os\nos.close(__main__._STD_OUT)\nprint("closed")',
         'closed\n',
         /cannot reach the output pipes any more: a script closed or replaced the runtime's copy of fd 1/,
+        "the runtime's copy of fd 1",
       ],
       [
         "the runtime's copy of fd 2",
         'import __main__, os\nos.close(__main__._STD_ERR)\nprint("closed")',
         'closed\n',
         /cannot reach the output pipes any more: a script closed or replaced the runtime's copy of fd 2/,
+        "the runtime's copy of fd 2",
       ],
     ];
-    for (const [what, code, stdout, says] of rows) {
+    for (const [what, code, stdout, says, taken] of rows) {
       const runner = new PyRunner({ onToolCall: async () => 'echoed' });
       try {
         // A tool call that waited for its reply would take 270 s, past within's 10 s.
@@ -1418,7 +1431,8 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
         assert.strictEqual(result.aborted, true, what);
         assert.strictEqual(result.stdout, stdout, what);
         assert.match(result.stderr, says, what);
-        assert.match(result.stderr, /; exiting\nscript stopped: the Python interpreter exited with code 70 while it ran, [^\n]*$/, what);
+        // The advice names what the runtime's line names.
+        assert.ok(result.stderr.endsWith(`; exiting\n${runtimeLost(taken)}`), `${what}: ${result.stderr.slice(-500)}`);
         const next = await within(runner.exec('print("fresh")', []), `the next script (${what})`);
         assert.strictEqual(next.stdout, 'fresh\n', what);
       } finally {
@@ -1444,10 +1458,9 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
           `the reader to stop, fd 3 ${how}`,
         );
         assert.strictEqual(result.aborted, true, how);
-        assert.match(
-          result.stderr,
-          /cannot read the host's messages any more: a script closed or replaced fd 3, where they arrive; exiting\nscript stopped: the Python interpreter exited with code 70 while it ran, [^\n]*$/,
-          how,
+        assert.ok(
+          result.stderr.endsWith(`cannot read the host's messages any more: a script closed or replaced fd 3, where they arrive; exiting\n${runtimeLost('fd 3')}`),
+          `${how}: ${result.stderr.slice(-500)}`,
         );
         // The reader names it: it isn't the runtime cancelling the script
         // because the host's messages ended, then finding fd 3 at its end.
@@ -1456,6 +1469,16 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
     } finally {
       runner.dispose();
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("a script's own exit with the runtime's code, 70, keeps the general advice", async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      const result = await within(runner.exec('import os\nos._exit(70)', []), 'the exit');
+      assert.strictEqual(result.stderr, exitedUnder('exited with code 70'));
+    } finally {
+      runner.dispose();
     }
   });
 
@@ -2077,6 +2100,22 @@ describe('PyRunner background mode (real python3)', () => {
       );
       assert.strictEqual(result.aborted, true);
       assert.match(result.tail ?? '', /^watching\nFatal Python error: probe reason\n[\s\S]*\nscript stopped: the Python interpreter was ended by SIGABRT while it ran, so the rest of the script didn't run\. [^\n]*$/);
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it("a background script that takes one of the runtime's fds is told which, from its journal", async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      const result = await within(
+        runner.exec('import os\nprint("watching")\nos.close(4)', [], { logPath: null, lifetimeMs: 30_000, onWake: async () => null }),
+        'the runtime to end',
+      );
+      assert.strictEqual(result.aborted, true);
+      // A background script has its interpreter to itself, so no earlier script's variables are lost.
+      const lost = runtimeLost('fd 4').replace(', and variables from earlier scripts are gone', '');
+      assert.ok((result.tail ?? '').endsWith(`; exiting\n${lost}`), result.tail ?? '');
     } finally {
       runner.dispose();
     }
