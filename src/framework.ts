@@ -1624,16 +1624,12 @@ interface HostCommandParams {
   requesterName?: string;
 }
 
-/** Descriptor of a single refusal-driven rewind (see rewindTriggeringTurn). */
+/** Descriptor of a single refusal-driven rewind (see shedNewestTurn). */
 interface RewindRecord {
-  /** tool = machine tool exchange; human = an ingested message; other = else. */
-  kind: 'tool' | 'human' | 'other';
   /** Content-free, safe-to-replay description of what was withheld. */
   descriptor: string;
   /** All message ids removed in this shed (a tool exchange removes 2+). */
   removedIds: MessageId[];
-  /** Discord (channelId, messageId) of the removed message, if it had one. */
-  discordRef?: { channelId: string; messageId: string };
 }
 
 interface Deferred<T> {
@@ -2101,7 +2097,6 @@ export class AgentFramework {
   /** Per-agent last inference activity (epoch ms), for /healthz + doctor tooling. */
   private lastInferenceAt = new Map<string, { startedAt?: number; endedAt?: number; failedAt?: number; lastError?: string }>();
   private processLoggingPersist: boolean;
-  private processLoggingBroadcast: boolean;
   private activeStreams: Map<string, Promise<void>> = new Map();
   /** Told once per inbound acceptance (mcpl/inbound-source.ts). An internal
    *  seam, unset here: the receipt work (shelf-354) assigns it inside the
@@ -2224,7 +2219,7 @@ export class AgentFramework {
   private refusalStreak: Map<string, number> = new Map();
   /** Per-agent count of consecutive refusal-driven rewinds in the current turn
    *  chain (reset when a turn completes without a refusal). Bounds the auto
-   *  rewind loop — see refusalHandling + rewindTriggeringTurn. */
+   *  rewind loop — see refusalHandling + shedNewestTurn. */
   private refusalRewinds: Map<string, number> = new Map();
   /** Per-agent count of poison-history rewinds performed by the hard-down
    *  breaker (noteInferenceExhausted). Reset when a turn completes
@@ -2604,7 +2599,6 @@ export class AgentFramework {
     syncIntervalMs: number,
     maintenanceIntervalMs: number,
     processLoggingPersist: boolean,
-    processLoggingBroadcast: boolean,
     timeZone: string,
     discordAwarenessOutbox: DiscordAwarenessOutbox | null,
     discordAwarenessEmoji: string,
@@ -2632,7 +2626,6 @@ export class AgentFramework {
     this.syncIntervalMs = syncIntervalMs;
     this.maintenanceIntervalMs = maintenanceIntervalMs;
     this.processLoggingPersist = processLoggingPersist;
-    this.processLoggingBroadcast = processLoggingBroadcast;
     this.timeZone = timeZone;
     this.discordAwarenessOutbox = discordAwarenessOutbox;
     this.discordAwarenessEmoji = discordAwarenessEmoji;
@@ -2798,7 +2791,6 @@ export class AgentFramework {
 
     // Process logging config (default: disabled)
     const processLoggingPersist = config.processLogging?.persist === true;
-    const processLoggingBroadcast = config.processLogging?.broadcast ?? false;
 
     // Register process log state only if persistence is enabled
     if (processLoggingPersist) {
@@ -2837,7 +2829,6 @@ export class AgentFramework {
       config.syncIntervalMs ?? DEFAULT_SYNC_INTERVAL_MS,
       config.maintenanceIntervalMs ?? DEFAULT_MAINTENANCE_INTERVAL_MS,
       processLoggingPersist,
-      processLoggingBroadcast,
       resolveTimeZone(config.timeZone),
       discordAwarenessOutbox,
       config.discordAwarenessEmoji ?? DEFAULT_DISCORD_AWARENESS_EMOJI,
@@ -7206,13 +7197,12 @@ export class AgentFramework {
   }
 
   /**
-   * Check if process logging is enabled.
+   * Whether process events and their responses are written to Chronicle
+   * (`processLogging.persist`). `process:completed` trace events are emitted
+   * either way.
    */
-  isProcessLoggingEnabled(): { persist: boolean; broadcast: boolean } {
-    return {
-      persist: this.processLoggingPersist,
-      broadcast: this.processLoggingBroadcast,
-    };
+  isProcessLoggingEnabled(): { persist: boolean } {
+    return { persist: this.processLoggingPersist };
   }
 
   /**
@@ -8538,17 +8528,17 @@ export class AgentFramework {
   }
 
   /**
-   * Rewind the single turn that fed a refused generation: redact the newest
-   * message the agent did NOT author (a tool result, or an incoming message)
-   * and inject a metadata-only marker in its place. The marker carries a
-   * *description* of what was withheld (kind + size), never the content — so it
-   * cannot itself re-trip the classifier — while the raw record survives in the
-   * chronicle log for forensics. Returns a record describing the removal, or
-   * null if there is nothing eligible to rewind (e.g. only the agent's own
-   * turns, or a prior system marker, remain).
+   * Shed the newest turn: remove the newest message that isn't a system
+   * message, whoever wrote it, with the rest of its exchange (the tool_use
+   * turn paired with a tool result, and the whole of a body stored in
+   * shards). It adds no marker; the caller keeps one consolidated marker for
+   * the episode (updateRewindMarker). The returned record's descriptor says
+   * what was removed and its size, never the content, while the raw record
+   * survives in the chronicle log for forensics. Returns null when only
+   * system messages remain.
    *
-   * Shared by the auto path (on `stop_reason: refusal`) and the `/rewind`
-   * host command.
+   * Shared by the refusal rewind, automatic or forced by `/unstick`, and by
+   * the shed after inference exhaustion (quarantinePoisonedHistory).
    */
   private shedNewestTurn(agent: Agent): RewindRecord | null {
     const cm = agent.getContextManager();
@@ -8580,7 +8570,7 @@ export class AgentFramework {
     const members = all.slice(first, idx + 1);
     const msg = all[idx];
     const md = (msg.metadata ?? {}) as {
-      messageId?: unknown; channelId?: unknown; system?: unknown;
+      messageId?: unknown; system?: unknown;
     };
 
     const content = members.flatMap((m) => (Array.isArray(m.content) ? m.content : []));
@@ -8594,10 +8584,8 @@ export class AgentFramework {
     const removedIds: MessageId[] = members.map((m) => m.id).reverse();
     // Where the exchange starts: this body, or the tool_use turn paired with it.
     let from = first;
-    let kind: RewindRecord['kind'];
     let descriptor: string;
     if (toolBlocks.length > 0) {
-      kind = 'tool';
       // Pair the tool_result with the tool_use assistant turn right before
       // it, the whole of it: a turn stored as a body carries its tool_use on
       // its first shard, not its last.
@@ -8614,21 +8602,15 @@ export class AgentFramework {
       descriptor = `a tool exchange (~${Math.max(1, Math.round(sz / 1024))}KB` +
         `${images ? `, ${images} image(s)` : ''})`;
     } else if (md.messageId) {
-      kind = 'human';
       descriptor = `an incoming message from ${msg.participant} ` +
         `(${textLen} chars${images ? `, ${images} image(s)` : ''})`;
     } else {
-      kind = 'other';
       descriptor = `a ${msg.participant} turn ` +
         `(${textLen} chars${images ? `, ${images} image(s)` : ''})`;
     }
-    const discordRef = md.messageId && md.channelId
-      ? { channelId: String(md.channelId), messageId: String(md.messageId) }
-      : undefined;
-
     // One removal for the whole exchange, so it is never half applied.
     removeStoredMessages(cm, all[from], msg);
-    return { kind, descriptor, removedIds, discordRef };
+    return { descriptor, removedIds };
   }
 
   /**
@@ -8671,40 +8653,6 @@ export class AgentFramework {
       this.rewindEpisode.set(agent.name, { markerId: id, count, category });
     }
     return count;
-  }
-
-  /**
-   * Announce a refusal-rewind on the conversational surface (Discord), used
-   * when the withheld turn was a *human* message so it isn't dropped silently.
-   * Best-effort; mirrors reactToRefusal's locus resolution.
-   */
-  private async announceRewind(
-    agentName: string,
-    rec: RewindRecord,
-    category: string,
-  ): Promise<void> {
-    try {
-      const incoming = this.channelRegistry?.buildChannelContext()?.incoming;
-      if (!incoming) return;
-      const parts = incoming.channelId.split(':');
-      if (parts[0] !== 'discord') return;
-      const channelId = parts[parts.length - 1];
-      const serverId = this.channelRegistry?.getChannelServerId(incoming.channelId);
-      const server = serverId ? this.mcplServerRegistry?.getServer(serverId) : null;
-      if (!server) return;
-      await server.sendToolsCall('send_message', {
-        channelId,
-        content:
-          `⚠️ I had to set aside ${rec.descriptor} — it tripped a content ` +
-          `filter (${category}), so it's withheld from my context and I'm ` +
-          `continuing without it. If it was important, please rephrase or re-send.`,
-      });
-    } catch (err) {
-      console.error(
-        '[refusal-rewind] announce failed:',
-        err instanceof Error ? err.message : err,
-      );
-    }
   }
 
   /**
