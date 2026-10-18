@@ -1,17 +1,20 @@
 /**
- * The framework's and each agent's boolean switches take true or false, or
- * can be left out, with null counting as left out. Each was read by
- * truthiness, so a quoted "false", as a JSON config or a `${VAR}`
+ * Nine boolean switches in the framework's and each agent's config take true
+ * or false, or can be left out, with null counting as left out, and a settings
+ * object holding them takes an object, or null or false for none. Each switch
+ * was read by truthiness, so a quoted "false", as a JSON config or a `${VAR}`
  * substitution can write it, turned it on, and a falsy non-boolean such as 0
  * turned it off without a word.
  */
-import { describe, it } from 'node:test';
+import { describe, it, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { ContextManager } from '@animalabs/context-manager';
+import type { Membrane } from '@animalabs/membrane';
 
-import { AgentFramework } from '../src/index.js';
+import { Agent, AgentFramework } from '../src/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
 function tempStorePath(prefix: string): { tempDir: string; storePath: string } {
@@ -35,6 +38,22 @@ const agentWith = (settings: Record<string, unknown>) => ({
   systemPrompt: 'test',
   ...settings,
 });
+
+/** An Agent built directly, as a caller importing the class can. Building an
+ *  activation request needs only compile(), and membrane is never touched. */
+const stubContextManager = {
+  compile: async () => ({ messages: [], systemInjections: [] }),
+} as unknown as ContextManager;
+const newAgent = (settings: Record<string, unknown>) =>
+  new Agent(agentWith(settings) as never, stubContextManager, {} as Membrane);
+
+/** Records console.error for the rest of the test, so the test can say
+ *  whether the liveness watchdog printed the line it prints when it arms. */
+function watchdogLines(t: TestContext): () => string[] {
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  return () => lines.filter((line) => line.startsWith('[liveness-watchdog]'));
+}
 
 /** create() refuses each config with exactly its message, before anything
  *  opens: no store is left at storePath. */
@@ -65,7 +84,7 @@ const TOOL_RESULT_GUARD = 'true turns on tool-output admission, with one guarded
 const TOOL_WRAPPER_PROSE_GUARD = 'true keeps a response whose whole prose is a tool-call-shaped wrapper from running or entering the agent\'s history, ' + doesnt;
 
 describe('config switches', () => {
-  it('create() refuses a framework switch that is not true or false, and a settings object that is not an object', async () => {
+  it('create() refuses a framework switch that is not true or false, and a settings object that is not an object, null or false', async () => {
     await assertRefused([
       [{ subconscious: { enabled: 'false', systemPrompt: 'x' } }, `subconscious.enabled must be true or false, unquoted, not a string: ${SUBCONSCIOUS_ENABLED}`],
       [{ subconscious: { enabled: true, systemPrompt: 'x', allowChannelSpeech: 'false' } }, `subconscious.allowChannelSpeech must be true or false, unquoted, not a string: ${ALLOW_CHANNEL_SPEECH}`],
@@ -77,7 +96,7 @@ describe('config switches', () => {
     ]);
   });
 
-  it('create() refuses an agent switch that is not true or false, and a settings object that is not an object', async () => {
+  it('create() refuses an agent switch that is not true or false, and a settings object that is not an object, null or false', async () => {
     const refused = (settings: Record<string, unknown>, message: string) =>
       [{ agents: [agentWith(settings)] }, `Agent "agent" ${message}`] as const;
     await assertRefused([
@@ -91,17 +110,21 @@ describe('config switches', () => {
     ]);
   });
 
-  it('createEphemeralAgent refuses an agent switch that is not true or false, and leaves the name free', async () => {
+  it('createEphemeralAgent refuses an agent switch that is not true or false, before it registers anything for the name', async () => {
     const { tempDir, storePath } = tempStorePath('config-switches-ephemeral-');
     let framework: AgentFramework | undefined;
     try {
       framework = await createWith(storePath, {});
+      const store = framework.getStore();
+      const workerStates = () => store.listStates().map((state) => state.id).filter((id) => id.startsWith('subagent/worker/'));
       const worker = { name: 'worker', model: 'test-model', systemPrompt: 'Do the task.' };
       await assert.rejects(framework.createEphemeralAgent({ ...worker, toolWrapperProseGuard: 'false' } as never), (error: Error) => {
         assert.equal(error.message, `Agent "worker" toolWrapperProseGuard must be true or false, unquoted, not a string: ${TOOL_WRAPPER_PROSE_GUARD}`);
         return true;
       });
+      assert.deepEqual(workerStates(), [], 'the refused config registered no state under its name');
       const created = await framework.createEphemeralAgent(worker);
+      assert.notDeepEqual(workerStates(), [], 'a created agent registers its states under its name');
       created.cleanup();
     } finally {
       await framework?.stop();
@@ -109,7 +132,43 @@ describe('config switches', () => {
     }
   });
 
-  it('a null switch counts as left out, and a subconscious that is off has allowChannelSpeech left unchecked', async () => {
+  it('new Agent() refuses a switch that is not true or false, so the rule holds wherever an agent is built', () => {
+    assert.throws(() => newAgent({ promptCaching: 'false' }), (error: Error) => {
+      assert.equal(error.message, `Agent "agent" promptCaching must be true or false, unquoted, not a string: ${PROMPT_CACHING}`);
+      return true;
+    });
+  });
+
+  it('promptCaching false leaves the prompt-caching markers off', async () => {
+    const request = await newAgent({ promptCaching: false }).buildActivationRequest([]);
+    assert.equal(request.promptCaching, false);
+  });
+
+  it('a settings object set to null or false counts as left out', async (t) => {
+    const watchdog = watchdogLines(t);
+    for (const unset of [null, false]) {
+      const { tempDir, storePath } = tempStorePath('config-switches-no-settings-');
+      let framework: AgentFramework | undefined;
+      try {
+        framework = await createWith(storePath, {
+          subconscious: unset,
+          watchdog: unset,
+          processLogging: unset,
+          agents: [agentWith({ thinking: unset, refusalHandling: unset })],
+        });
+        assert.equal(framework.getAgent('Subconscious'), null, 'no subconscious resident');
+        assert.equal(framework.isProcessLoggingEnabled().persist, false);
+        assert.ok(framework.getAgent('agent'));
+      } finally {
+        await framework?.stop();
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+    assert.deepEqual(watchdog(), [], 'the watchdog never armed');
+  });
+
+  it('a null switch counts as left out, and a subconscious that is off has allowChannelSpeech left unchecked', async (t) => {
+    const watchdog = watchdogLines(t);
     for (const enabled of [null, false]) {
       const { tempDir, storePath } = tempStorePath('config-switches-unset-');
       let framework: AgentFramework | undefined;
@@ -138,5 +197,6 @@ describe('config switches', () => {
         rmSync(tempDir, { recursive: true, force: true });
       }
     }
+    assert.deepEqual(watchdog(), [], 'the watchdog never armed');
   });
 });

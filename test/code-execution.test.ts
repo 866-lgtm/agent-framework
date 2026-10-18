@@ -1578,7 +1578,7 @@ describe('code_execution per-call time limit (time_limit_ms)', () => {
     ]);
   });
 
-  it('create() refuses a codeExecution that is not an object, which would read as off', async () => {
+  it('create() refuses a codeExecution that is not an object, null or false, since it would read as off', async () => {
     await assertRefused([
       [true, 'codeExecution must be an object, such as { enabled: true }, not a boolean'],
       ['true', 'codeExecution must be an object, such as { enabled: true }, not a string'],
@@ -1586,11 +1586,12 @@ describe('code_execution per-call time limit (time_limit_ms)', () => {
     ]);
   });
 
-  it('a null or left-out codeExecution.enabled counts as off, and a configuration that is off has nothing else checked', async () => {
+  it('a null or false codeExecution, or a null or left-out codeExecution.enabled, counts as off, and a configuration that is off has nothing else checked', async () => {
     // Contradictory limits are refused only once code execution is on.
     const contradictory = { scriptTimeoutMs: 600_000, maxScriptTimeoutMs: 60_000 };
     for (const codeExecution of [
       null,
+      false,
       { enabled: null, ...contradictory },
       { enabled: false, ...contradictory },
       { ...contradictory },

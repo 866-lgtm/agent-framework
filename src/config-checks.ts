@@ -1,10 +1,10 @@
 /**
  * Refusals shared by the configuration checks. A setting read by truthiness
- * turns on for a quoted "false", and a settings object that isn't an object
- * has every setting in it read as left out. A JSON config, or a `${VAR}`
- * substituted as a string, can carry either where the type says otherwise,
- * so each refusal says what the value would have done. Each names the
- * setting and the value's kind, never the value, which could be a secret
+ * turns on for a quoted "false", and a settings object such as `true`, which
+ * isn't an object, has every setting in it read as left out. A JSON config,
+ * or a `${VAR}` substituted as a string, can carry either where the type says
+ * otherwise, so each refusal says what the value would have done. Each names
+ * the setting and the value's kind, never the value, which could be a secret
  * pasted into the wrong field.
  */
 
@@ -33,13 +33,14 @@ export function assertBooleanSetting(setting: string, value: unknown, whatItDoes
 }
 
 /**
- * Whether a settings object holds settings to check: false when it's null or
- * left out, which count as not set. Anything else that isn't an object, an
- * array included, is refused, since every setting in it would read as left
- * out.
+ * Whether a settings object holds settings to check: false when it's null,
+ * false or left out, which count as not set, since every setting in it reads
+ * as left out and those say as much. Anything else that isn't an object,
+ * `true` and an array included, is refused, since every setting in it would
+ * read as left out whatever it says.
  */
 export function holdsSettings<T>(setting: string, value: T, example: string): value is NonNullable<T> {
-  if (value === undefined || value === null) return false;
+  if (value === undefined || value === null || value === false) return false;
   if (typeof value !== 'object' || Array.isArray(value)) {
     throw new Error(`${setting} must be an object, such as ${example}, not ${kindOf(value)}`);
   }

@@ -121,9 +121,10 @@ export function scriptTimeLimits(opts?: {
  * contradict each other. A JSON config, or a `${VAR}` substituted as a string,
  * can carry a quoted "false" where the type says boolean, and only `true` turns
  * code execution on, so the quotes would hide what the value does; a bare
- * `codeExecution: true` would be read as off. A null codeExecution or switch
- * counts as not set, as a left-out one does. The refusal names the value's
- * kind, not the value. A configuration that isn't on has nothing else read.
+ * `codeExecution: true` would be read as off. A null or false codeExecution,
+ * and a null switch, count as not set, as left-out ones do. The refusal names
+ * the value's kind, not the value. A configuration that isn't on has nothing
+ * else read.
  */
 export function validateCodeExecutionConfig(cfg: {
   enabled?: unknown;

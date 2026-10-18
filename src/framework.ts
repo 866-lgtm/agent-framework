@@ -823,10 +823,11 @@ function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
 }
 
 /**
- * Refuse a config whose `subconscious`, `watchdog` or `processLogging` isn't an
- * object, or whose switch in one holds anything but true or false
- * (assertBooleanSetting). A subconscious that isn't on has its
- * `allowChannelSpeech` left unchecked, since nothing reads it then.
+ * Refuse a config whose `subconscious`, `watchdog` or `processLogging` is
+ * anything but an object, null or false (holdsSettings), or whose switch in
+ * one holds anything but true or false (assertBooleanSetting). A subconscious
+ * that isn't on has its `allowChannelSpeech` left unchecked, since nothing
+ * reads it then.
  */
 function assertFrameworkSwitches(config: FrameworkConfig): void {
   if (holdsSettings('subconscious', config.subconscious, '{ enabled: true }')) {
@@ -6927,7 +6928,8 @@ export class AgentFramework {
     contextManager: ContextManager;
     cleanup: () => void;
   }> {
-    // Checked before the name is reserved, so a refused config leaves it free.
+    // Checked before anything happens: the constructor checks too, but only
+    // after the name is reserved and the agent's states are registered.
     assertAgentSwitches(config);
     // Names are Chronicle namespaces and generation identities. Reserve before
     // opening the namespace so a second creation cannot append to an earlier
