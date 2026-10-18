@@ -382,10 +382,15 @@ describe('MCPL runtime connect: a policy registration that throws', () => {
       if (serverId === chat.id) throw new Error('injected policy registration failure');
       return initializeServer.call(this, serverId, ...rest);
     };
+    // Whether its exchange's marker still held the failing connection's
+    // planes when its close began, which marks it closed for good.
+    const exchanges = (framework as unknown as { mcplPolicyExchanges: WeakMap<object, number> }).mcplPolicyExchanges;
+    const markedAtClose: boolean[] = [];
     const connections = McplServerConnection.prototype as any;
     const close = connections.close;
     let closeFailed = false;
     connections.close = function (this: any) {
+      if (this.id === chat.id) markedAtClose.push(exchanges.get(this) === this.transportEpoch);
       if (closeFails && this.id === chat.id && !closeFailed && this.transport) {
         closeFailed = true;
         const transport = this.transport;
@@ -405,6 +410,9 @@ describe('MCPL runtime connect: a policy registration that throws', () => {
       connections.close = close;
     }
     assert.equal(closeFailed, closeFails, 'the close failed only when asked to');
+    // So no opener, such as a resume finishing meanwhile, could ready it
+    // between its exchange's end and its close.
+    assert.deepEqual(markedAtClose, [true], 'it was closed once, while its exchange still held its planes');
     const registry = (framework as unknown as { mcplServerRegistry: { getServer(id: string): unknown } }).mcplServerRegistry;
     const running = registry.getServer('running') as { isConnected: boolean; dataPlaneReady: boolean };
     assert.equal(running.isConnected, true, 'the running server stays connected');

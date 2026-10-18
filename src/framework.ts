@@ -18716,16 +18716,26 @@ export class AgentFramework {
    * whether the caller may open the planes: the exchange settled (answered or
    * not) on the transport that is still the connection's, and it is
    * connected. A transport that dropped meanwhile is left closed; the next
-   * one's exchange opens the planes.
+   * one's exchange opens the planes. With `closeOnFailure`, as for a runtime
+   * connect or restart, an exchange that throws closes the connection for
+   * good, through the registry, before it lifts the marker: left live, the
+   * connection would be half registered, and unmarked before its close, an
+   * opener that ran in between (a resume finishing meanwhile) would let out
+   * what it held with no grant. A close that fails keeps the connection
+   * registered, but closed for good, it readies nothing.
    */
   private async settlePolicyExchange(
     config: import('./mcpl/types.js').McplServerConfig,
     connection: McplServerConnection,
+    opts: { closeOnFailure?: boolean } = {},
   ): Promise<boolean> {
     const epoch = connection.transportEpoch;
     this.mcplPolicyExchanges.set(connection, epoch);
     try {
       await this.registerMcplServerFeatures(config, connection);
+    } catch (error) {
+      if (opts.closeOnFailure) await this.closeFailedRuntimeConnect(connection, 'policy registration');
+      throw error;
     } finally {
       // A newer transport's exchange may have taken the marker over.
       if (this.mcplPolicyExchanges.get(connection) === epoch) this.mcplPolicyExchanges.delete(connection);
@@ -18826,20 +18836,10 @@ export class AgentFramework {
     // changed before any grant existed). The grant is established (or
     // knowingly left empty) before ANY buffered traffic flows, whoever else
     // opens planes meanwhile (a resume during a runtime connect).
-    let current: boolean;
-    try {
-      current = await this.settlePolicyExchange(config, connection);
-    } catch (error) {
-      // A runtime connect or restart whose policy registration throws would
-      // leave the new connection live and half registered, so it closes the
-      // connection for good through the registry before the failure
-      // propagates. A close that fails keeps the connection registered, but
-      // a connection closed for good readies nothing, so its planes stay
-      // closed. A staged startup connect's failure ends startup instead, and
-      // create()'s release closes its servers.
-      if (!staged) await this.closeFailedRuntimeConnect(connection, 'policy registration');
-      throw error;
-    }
+    // Only a runtime connect or restart closes the connection when its
+    // exchange throws, as on main: a staged startup connect's failure goes to
+    // initializeMcpl's loop, which logs it and goes on with the other servers.
+    const current = await this.settlePolicyExchange(config, connection, { closeOnFailure: !staged });
     // A transport that dropped during its exchange isn't announced: its close
     // reported it gone, and its reconnect announces it.
     if (current) this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
