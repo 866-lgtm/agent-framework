@@ -272,7 +272,7 @@ test('a dispatch is admitted from the journal as it is now: a cancel during an i
   assert.equal(first.length, 1);
   const receipt = outbox.cancel(batch.id, 'operator');
   assert.equal(receipt.cancelled, 2);
-  assert.equal(receipt.inFlight, 1);
+  assert.equal(receipt.unresolvedAttempts, 1, 'the request on the wire may still land');
   // The stale list can no longer authorize anything.
   assert.deepEqual(outbox.recordDispatching(stale[1]), []);
   assert.deepEqual(outbox.recordDispatching(stale[2]), []);
@@ -288,8 +288,8 @@ test('cancel stops every further send of a batch, never removes, and reports wha
 
   const receipt = outbox.cancel(batch.id, 'operator');
   assert.deepEqual(
-    { target: receipt.target, kind: receipt.kind, cancelled: receipt.cancelled, inFlight: receipt.inFlight, unknown: receipt.unknown, confirmed: receipt.confirmed, unresolvedAttempts: receipt.unresolvedAttempts },
-    { target: batch.id, kind: 'batch', cancelled: 1, inFlight: 1, unknown: 1, confirmed: 1, unresolvedAttempts: 2 },
+    { target: receipt.target, kind: receipt.kind, cancelled: receipt.cancelled, confirmed: receipt.confirmed, unresolvedAttempts: receipt.unresolvedAttempts },
+    { target: batch.id, kind: 'batch', cancelled: 1, confirmed: 1, unresolvedAttempts: 2 },
   );
   assert.equal(outbox.pendingDispatches('discord').length, 0, 'nothing new is sent, nothing is removed');
   // The in-flight request lands after the cancel: recorded, not followed up.
@@ -311,7 +311,6 @@ test('the cancel receipt keeps an earlier unresolved request after a later answe
   answer(outbox, 'm2', 'failed', { permanent: true, error: 'Unknown Message' });
   const receipt = outbox.cancel(batch.id);
   assert.equal(receipt.confirmed, 1);
-  assert.equal(receipt.unknown, 0);
   assert.equal(receipt.unresolvedAttempts, 2, 'both first attempts may still land');
 }));
 
@@ -319,13 +318,13 @@ test('a repeated cancel writes nothing, and its receipt is still the truthful hi
   const batch = activeBatch(outbox, [ref('m1'), ref('m2')]);
   const onWire = outbox.claimDispatch('discord', (d) => d.key.messageId !== 'm1')!;
   const first = outbox.cancel(batch.id);
-  assert.deepEqual({ cancelled: first.cancelled, inFlight: first.inFlight, confirmed: first.confirmed }, { cancelled: 1, inFlight: 1, confirmed: 0 });
+  assert.deepEqual({ cancelled: first.cancelled, confirmed: first.confirmed, unresolvedAttempts: first.unresolvedAttempts }, { cancelled: 1, confirmed: 0, unresolvedAttempts: 1 });
   outbox.recordOutcome(onWire.attempts, 'confirmed');
   const records = h.store.getRecordIdsByType(DISCORD_AWARENESS_RECORD_TYPE).length;
   const again = outbox.cancel(batch.id);
   assert.deepEqual(
-    { cancelled: again.cancelled, inFlight: again.inFlight, unknown: again.unknown, confirmed: again.confirmed, unresolvedAttempts: again.unresolvedAttempts },
-    { cancelled: 0, inFlight: 0, unknown: 0, confirmed: 1, unresolvedAttempts: 0 },
+    { cancelled: again.cancelled, confirmed: again.confirmed, unresolvedAttempts: again.unresolvedAttempts },
+    { cancelled: 0, confirmed: 1, unresolvedAttempts: 0 },
   );
   assert.equal(h.store.getRecordIdsByType(DISCORD_AWARENESS_RECORD_TYPE).length, records, 'nothing new written');
 
@@ -336,10 +335,10 @@ test('a repeated cancel writes nothing, and its receipt is still the truthful hi
   const { requestId } = outbox.retract(other.id);
   const removal = outbox.claimDispatch('discord', (d) => d.key.messageId !== 'm3')!;
   const stopped = outbox.cancel(requestId);
-  assert.deepEqual({ cancelled: stopped.cancelled, inFlight: stopped.inFlight }, { cancelled: 1, inFlight: 1 });
+  assert.deepEqual({ cancelled: stopped.cancelled, unresolvedAttempts: stopped.unresolvedAttempts }, { cancelled: 1, unresolvedAttempts: 1 });
   outbox.recordOutcome(removal.attempts, 'confirmed');
   const repeated = outbox.cancel(requestId);
-  assert.deepEqual({ cancelled: repeated.cancelled, inFlight: repeated.inFlight, confirmed: repeated.confirmed }, { cancelled: 0, inFlight: 0, confirmed: 1 });
+  assert.deepEqual({ cancelled: repeated.cancelled, confirmed: repeated.confirmed, unresolvedAttempts: repeated.unresolvedAttempts }, { cancelled: 0, confirmed: 1, unresolvedAttempts: 0 });
 }));
 
 test('cancelling a batch its surgery has not activated stops every mark; a suppression\'s body is still finished', withJournal((outbox) => {
@@ -723,8 +722,8 @@ test('a retract request can be cancelled by the id its receipt returned, even af
   assert.equal(retracts(restarted)[0].id, requestId);
   const receipt = restarted.cancel(requestId, 'operator');
   assert.deepEqual(
-    { kind: receipt.kind, cancelled: receipt.cancelled, inFlight: receipt.inFlight, unknown: receipt.unknown },
-    { kind: 'retract', cancelled: 2, inFlight: 0, unknown: 1 },
+    { kind: receipt.kind, cancelled: receipt.cancelled, unresolvedAttempts: receipt.unresolvedAttempts },
+    { kind: 'retract', cancelled: 2, unresolvedAttempts: 1 },
   );
   outbox.recordOutcome(onWire.attempts, 'confirmed');
   const after = h.reopen();

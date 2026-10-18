@@ -291,10 +291,6 @@ export interface DiscordAwarenessCancelReceipt {
    *  were ever sent (for a batch not yet activated, every mark it would have
    *  requested). A repeated cancel stops none. */
   cancelled: number;
-  /** Operations on the wire right now: they may still land. */
-  inFlight: number;
-  /** Operations whose outcome is unknown: they may have landed. */
-  unknown: number;
   /** Operations Discord already confirmed (cancel does not undo them). */
   confirmed: number;
   /** Requests of this batch or retract whose outcome is unresolved (on the
@@ -1095,8 +1091,6 @@ export class DiscordAwarenessOutbox {
       // A prepared batch (its surgery still running, or its bookkeeping
       // unresolved) has no requests yet: every one of its marks is stopped.
       cancelled: batch.status === 'prepared' && !batch.cancelled ? batch.refs.length : 0,
-      inFlight: 0,
-      unknown: 0,
       confirmed: 0,
       // Every request the batch itself made: its adds.
       unresolvedAttempts: unresolvedDispatches(
@@ -1117,11 +1111,11 @@ export class DiscordAwarenessOutbox {
   }
 
   /**
-   * Count what history says about these requests into a cancel receipt, and
+   * Count the confirmed requests among these into a cancel receipt, and
    * return the records that stop the ones still able to go out (none when
-   * the group was already cancelled). History is counted whatever each
-   * request's cancel state: an attempt on the wire or unanswered may land
-   * after any cancel, and a confirmation is a fact about Discord.
+   * the group was already cancelled). A confirmation is counted whatever
+   * each request's cancel state, since it is a fact about Discord; what may
+   * still land is the receipt's unresolvedAttempts.
    */
   private stopRequests(
     ops: DiscordAwarenessOp[],
@@ -1136,12 +1130,6 @@ export class DiscordAwarenessOutbox {
       if (last?.outcome === 'confirmed') {
         receipt.confirmed++;
         continue;
-      }
-      if (last && last.outcome === undefined) {
-        if (this.inFlight.has(op.opId)) receipt.inFlight++;
-        else receipt.unknown++;
-      } else if (last?.outcome === 'unknown') {
-        receipt.unknown++;
       }
       if (alreadyCancelled || op.cancelled) continue;
       const status = this.opStatus(op);
@@ -1160,8 +1148,6 @@ export class DiscordAwarenessOutbox {
       target: requestId,
       kind: 'retract',
       cancelled: 0,
-      inFlight: 0,
-      unknown: 0,
       confirmed: 0,
       unresolvedAttempts: unresolvedDispatches(ops, (op, attempt) => this.attemptUnresolved(op, attempt)),
       legacyOutcomesUnrecorded: 0,

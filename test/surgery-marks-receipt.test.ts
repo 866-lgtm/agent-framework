@@ -505,9 +505,10 @@ describe('surgery and awareness marks', () => {
       outbox().operations().some((op) => outbox().operationStatus(op) === 'unknown'));
 
     const cancelled = framework.cancelDiscordAwareness(batchId, { requester: { via: 'test', name: 'operator' } });
+    const sentOps = outbox().operations().filter((op) => op.attempts.length > 0).length;
     assert.equal(cancelled.confirmed, 0);
-    assert.equal(cancelled.unknown + cancelled.inFlight + cancelled.cancelled, 3);
-    assert.ok(cancelled.unknown + cancelled.inFlight >= 1, 'the timed-out add may still land');
+    assert.equal(cancelled.cancelled + sentOps, 3, 'every add not yet sent is stopped');
+    assert.ok(cancelled.unresolvedAttempts >= 1, 'the timed-out add may still land');
 
     // Discord finally answers the withheld request: the late add lands.
     writeFileSync(holdPath, '1');
@@ -515,8 +516,8 @@ describe('surgery and awareness marks', () => {
     const sentBeforeRetract = calls().length;
     assert.ok(calls().every((c) => c.name === 'add_reaction'));
     // The cancel stopped every add that hadn't gone out: what went out is
-    // what it counted as on the wire or unknown.
-    assert.equal(sentBeforeRetract, cancelled.unknown + cancelled.inFlight);
+    // what it counted as unresolved, one per request sent.
+    assert.equal(sentBeforeRetract, cancelled.unresolvedAttempts);
 
     const retracted = framework.retractDiscordAwareness(batchId, { requester: { via: 'test', name: 'operator' } });
     assert.equal(retracted.removalsQueued, 3, 'one removal per selected message, whatever history says');
@@ -555,7 +556,7 @@ describe('surgery and awareness marks', () => {
     const batchId = result.markers.status === 'queued' ? result.markers.batchId : '';
     await waitFor('the first add on the wire', () => calls().length === 1);
     const receipt = framework.cancelDiscordAwareness(batchId);
-    assert.deepEqual({ cancelled: receipt.cancelled, inFlight: receipt.inFlight }, { cancelled: 2, inFlight: 1 });
+    assert.deepEqual({ cancelled: receipt.cancelled, unresolvedAttempts: receipt.unresolvedAttempts }, { cancelled: 2, unresolvedAttempts: 1 });
     writeFileSync(holdPath, '1');
     await waitFor('the held add answered and recorded', () =>
       outbox().operations().some((op) => op.attempts[0]?.outcome === 'confirmed'));
