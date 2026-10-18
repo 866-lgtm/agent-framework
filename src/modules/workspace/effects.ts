@@ -53,7 +53,9 @@ import {
   errno,
   checkDir,
   checkRoot,
+  leadsInto,
   nameOf,
+  nestedAtReal,
   parentOf,
 } from './observe.js';
 
@@ -273,7 +275,7 @@ export async function writeContained(
   let stage = 'write the file';
   try {
     const created = touched;
-    await checkOpened(view, rootReal, root, parent, target, handle, expect, noFollow, touched);
+    await checkOpened(view, rootReal, rel, root, parent, target, handle, expect, noFollow, touched);
     touched = true;
     // The mode the bytes are written at, and the one the file ends with.
     let before: number | undefined;
@@ -377,6 +379,7 @@ export async function writeContained(
 async function checkOpened(
   view: MountView,
   rootReal: string,
+  rel: string,
   root: CheckedDir,
   parent: CheckedDir,
   target: string,
@@ -391,6 +394,8 @@ async function checkOpened(
   const real = await realpath(target).catch(() => null);
   if (real === null) throw new EffectFailed(CHANGED, touched);
   if (!contained(rootReal, real)) throw new EffectFailed(view.followSymlinks ? 'a symlink that leaves the mount' : OUTSIDE_PARENT, touched);
+  const holder = nestedAtReal(real, view.nested);
+  if (holder) throw new EffectFailed(leadsInto(view.name, rel, holder), touched);
   const named = await stat(real, { bigint: true }).catch(() => null);
   if (named === null || named.dev !== info.dev || named.ino !== info.ino) throw new EffectFailed(CHANGED, touched);
   if (!view.followSymlinks) {
@@ -459,7 +464,7 @@ export async function chmodContained(
   let touched = false;
   let stage = 'set the file\'s mode';
   try {
-    await checkOpened(view, rootReal, root, parent, target, handle, expect, noFollow, false);
+    await checkOpened(view, rootReal, rel, root, parent, target, handle, expect, noFollow, false);
     const current = Number((await handle.stat({ bigint: true })).mode & 0o777n);
     if (from !== undefined && current !== from) throw new EffectFailed(MODE_CHANGED, false);
     const narrowing = (current & ~mode & 0o777) !== 0;
@@ -525,6 +530,10 @@ export async function unlinkContained(view: MountView, rootReal: string, rel: st
     if (!view.followSymlinks) throw new EffectFailed(NOT_FOLLOWED, false);
     const real = await realpath(target).catch(() => null);
     if (real === null || !contained(rootReal, real)) throw new EffectFailed('a symlink that leaves the mount', false);
+    // One leading into a nested mount's directory is that mount's: the link
+    // and the file it leads to are left as they are.
+    const holder = nestedAtReal(real, view.nested);
+    if (holder) throw new EffectFailed(leadsInto(view.name, rel, holder), false);
     const through = await stat(real, { bigint: true }).catch(() => null);
     if (through === null) throw new EffectFailed(CHANGED, false);
     // A followed link stands for the file it leads to, so it's removed only
