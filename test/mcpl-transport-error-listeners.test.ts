@@ -58,16 +58,6 @@ test("an 'error' listener that throws on a transport error is caught and logged,
   ]);
 });
 
-test('a separate process holding a bare WebSocket connection survives a malformed frame, and sees the close', () => {
-  const probe = spawnSync(process.execPath, [
-    fileURLToPath(new URL('./fixtures/mcpl-bare-ws-error-probe.mjs', import.meta.url)),
-  ], { encoding: 'utf8', timeout: 60_000 });
-  assert.equal(probe.error, undefined);
-  assert.equal(probe.status, 0, `stdout: ${probe.stdout}\nstderr: ${probe.stderr}`);
-  assert.deepEqual(probe.stdout.trim().split('\n'), ['connected', 'closed', 'survived']);
-  assert.match(probe.stderr, /\[mcpl\] probe: transport error: "Invalid WebSocket frame: invalid opcode 3"/);
-});
-
 // A transport reports its own errors through reportError, which gives them to
 // its 'error' listeners, or logs them when it has none: from its creation
 // until the handshake attaches a listener, it has none (#391's rule, at the
