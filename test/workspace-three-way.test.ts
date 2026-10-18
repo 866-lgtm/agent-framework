@@ -7059,6 +7059,24 @@ describe('on-agent-action', () => {
     assert.equal((limited.data as { note?: string }).note, data.note);
   });
 
+  test("a read of a conflict on a read-only mount names only the sync, since nothing writes the workspace's copy there", async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ mode: 'read-only' });
+    env.writeDisk('a.txt', 'v1\n');
+    await call(m, 'sync', {});
+    const main = env.store.currentBranch().name;
+    env.store.createBranch('earlier', main);
+    env.writeDisk('a.txt', 'v2\n');
+    await call(m, 'sync', {});
+    // The earlier branch holds the copy disk had before, and disk then changes again.
+    env.store.switchBranch('earlier');
+    env.writeDisk('a.txt', 'v3 from a shell\n');
+    const data = await call(m, 'read', { path: 'work/a.txt' });
+    assert.equal(data.content, '     1\tv1');
+    assert.equal(data.note, "The path is in conflict with disk (both-changed): this read shows the workspace's copy. "
+      + "Sync the path to keep disk's copy and give up the workspace's. The mount is read-only, so nothing writes the workspace's copy to disk.");
+  });
+
   test("a read of a file the workspace doesn't hold, whose disk check gives up, says disk couldn't be checked", async (t) => {
     const env = new Env(t);
     const m = await env.open();

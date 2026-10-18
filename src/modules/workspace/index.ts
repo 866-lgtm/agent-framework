@@ -3004,7 +3004,7 @@ export class WorkspaceModule implements Module {
         }
         const blob = store.getBlob(entry.blobHash);
         if (!blob) return { error: `Blob not found for: ${input.path}` };
-        return { bytes: blob, notes: whichCopyRead(report, took('modified')) };
+        return { bytes: blob, notes: whichCopyRead(report, took('modified'), mount.config.mode === 'read-only') };
       });
       if ('error' in found) return { success: false, error: found.error, isError: true };
       file = fileText(found.bytes);
@@ -4636,8 +4636,9 @@ function storedButUnfinished(
  * workspace's copy, because disk's couldn't be checked or disk has none that
  * anything accounts for; or a draft in conflict with disk's change. A file
  * the workspace didn't hold has no older copy, so taking it in needs no word.
+ * A conflict's note names the ways to settle it that work on the path's mount.
  */
-function whichCopyRead(report: PathReport | undefined, tookChange: boolean): string[] {
+function whichCopyRead(report: PathReport | undefined, tookChange: boolean, readOnly: boolean): string[] {
   if (tookChange) {
     return ['Disk\'s copy had changed since the workspace last agreed with it, so it was taken in first, and this read shows that text.'];
   }
@@ -4653,11 +4654,18 @@ function whichCopyRead(report: PathReport | undefined, tookChange: boolean): str
     // doesn't follow: where disk has no copy, the sync takes its deletion, and
     // the workspace's copy goes with it. Where disk has one, the sync keeps it
     // and gives up the workspace's, taking disk's in only where the workspace
-    // can hold it (not binary or too large).
-    return [`The path is in conflict with disk (${kind}): this read shows the workspace's copy. `
-      + (report.diskNow === 'absent'
-        ? 'Sync the path to take disk\'s deletion, which removes the workspace\'s copy, or materialize it with force to write the workspace\'s copy back to disk.'
-        : 'Sync the path to keep disk\'s copy and give up the workspace\'s, or materialize it with force to write the workspace\'s over disk\'s.')];
+    // can hold it (not binary or too large). A read-only mount can hold a
+    // copy disk doesn't, such as one a branch switch selected, but a
+    // materialize, forced or not, writes nothing to it.
+    const sync = report.diskNow === 'absent'
+      ? 'Sync the path to take disk\'s deletion, which removes the workspace\'s copy'
+      : 'Sync the path to keep disk\'s copy and give up the workspace\'s';
+    const force = readOnly
+      ? '. The mount is read-only, so nothing writes the workspace\'s copy to disk.'
+      : report.diskNow === 'absent'
+        ? ', or materialize it with force to write the workspace\'s copy back to disk.'
+        : ', or materialize it with force to write the workspace\'s over disk\'s.';
+    return [`The path is in conflict with disk (${kind}): this read shows the workspace's copy. ${sync}${force}`];
   }
   return [];
 }
