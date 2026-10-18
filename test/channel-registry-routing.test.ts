@@ -6,7 +6,7 @@ import { parseProsePrefix } from '../src/mcpl/prose-grammar.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 
-type RouteFailure = { conversationId: string; channelId: string | null; reason: string; textLen: number };
+type RouteFailure = { conversationId: string; channelId: string | null; reason: string; textLen: number; outcome?: 'failed' | 'unknown' };
 
 /**
  * Build a registry with a mock server whose publish result is configurable,
@@ -136,15 +136,16 @@ test('routeSpeech surfaces a failure when the server reports delivered:false', a
   assert.ok(traces.some(t => t.type === 'mcpl:speech-route-failed'));
 });
 
-test('routeSpeech counts a publish reply that leaves delivered out as delivered', async () => {
+test('routeSpeech counts a publish reply that leaves delivered out as unconfirmed, not delivered', async () => {
   const { registry, failures } = makeRegistry({});
   seedRegistered(registry, 'discord', 'ch-x');
   registry.handleIncoming('discord', incoming('ch-x', 'hi'));
 
   const res = await registry.routeSpeech('cairn', 'a reply', registry.resolveLocus('cairn'));
 
-  assert.deepEqual(res, { delivered: true, channelId: 'ch-x' }, 'the outcome says delivered, so the stream follows it');
-  assert.equal(failures.length, 0, 'and no route failure is reported');
+  assert.equal(res, null, 'no delivery is confirmed, so the stream gets none of it');
+  assert.equal(failures.length, 1, 'and the route failure is reported');
+  assert.equal(failures[0].outcome, 'unknown', 'as a post that may or may not exist');
 });
 
 test('routeSpeech reports each delivered publish as mcpl:speech-routed, with nothing that ties it to a stream or ends one', async () => {

@@ -109,17 +109,31 @@ function registry(framework: AgentFramework, options: { streaming?: boolean } = 
   const messageIds = new Map<string, string>();
   const known: Record<string, string> = { '#alpha': 'chan-alpha', '#cafe': 'chan-cafe', '@laria': 'discord:dm:99' };
   let stopped = false;
+  /** One post, with the outcome the real registry's deliverSpeech gives it. */
+  const publish = async (body: string, channelId: string | null) => {
+    if (!channelId) return { status: 'failed' as const, reason: 'no channel', at: Date.now() };
+    log.push({ kind: 'publish', channelId, text: body });
+    await holds.get(body);
+    const failure = fails.get(body);
+    if (failure === 'throw') throw new Error('synthetic publish failure');
+    const destination = { serverId: 'stub', channelId };
+    const messageId = messageIds.get(body);
+    return failure === undefined
+      ? { status: 'delivered' as const, destination, ...(messageId !== undefined ? { messageId } : {}), at: Date.now() }
+      : { status: 'failed' as const, destination, reason: 'the stub reported delivered: false', at: Date.now() };
+  };
   const target: Record<string, unknown> = {
     resolveLocus: () => 'world:test',
     resolveProseTarget: (spec: string) => (known[spec] ? { channelId: known[spec] } : { error: `no channel ${spec}` }),
+    resolveDestination: ({ channelId }: { channelId: string }) => ({ destination: { serverId: 'stub', channelId } }),
+    // Locus prose posts through routeSpeech, a named or sticky destination
+    // through deliverSpeech, as with the real registry.
+    deliverSpeech: async (_agent: string, body: string, channelId: string | null) => publish(body, channelId),
     routeSpeech: async (_agent: string, body: string, channelId: string | null) => {
-      if (!channelId) return null;
-      log.push({ kind: 'publish', channelId, text: body });
-      await holds.get(body);
-      const failure = fails.get(body);
-      if (failure === 'throw') throw new Error('synthetic publish failure');
-      const messageId = messageIds.get(body);
-      return { delivered: failure === undefined, channelId, ...(messageId !== undefined ? { messageId } : {}) };
+      const outcome = await publish(body, channelId);
+      return outcome.status === 'delivered'
+        ? { delivered: true, channelId: outcome.destination.channelId, ...(outcome.messageId !== undefined ? { messageId: outcome.messageId } : {}) }
+        : null;
     },
     sendOutgoingChunk: (channelId: string, _agent: string, inferenceId: string, index: number, delta: string) => {
       if (stopped) return;

@@ -1337,6 +1337,15 @@ export class Agent {
     this.failOpenKvSubmissions();
 
     this._streamId++;
+    // A pending cancel belongs to the stream that was live when cancelStream()
+    // ran. The stream driver collects it on that stream's terminal event, or
+    // at the loop's end when the iterator closed without one, while the
+    // stream still owns the agent. This clear is for the records no driver
+    // collects: a dropped turn's, whose stream no driver iterates; one whose
+    // stream's terminal came after another stream took the agent; or a
+    // cancel after the stream's complete event. A fresh stream must not
+    // inherit one and read its own later error as a deliberate stop.
+    this._pendingCancel = undefined;
     this._inferenceStartedAt = Date.now();
     this.lastStreamInputTokens = 0;
     // Reset the cache-inclusive counters too: a new stream must not inherit
@@ -1493,14 +1502,40 @@ export class Agent {
     this._state = { status: 'streaming', stream };
   }
 
+  /** The most recent cancelStream() of a live stream, until the stream
+   *  driver collects it on that stream's terminal event. Its presence is
+   *  the signal (a reasonless Stop is still a deliberate stop); its reason
+   *  is the caller's own word. Membrane reports every cancel() as reason
+   *  'user' — the call, not the actor — and a stream implementation may
+   *  report the cancel as `error` with no reason at all, so this record is
+   *  the only provenance a host-side cancel has. */
+  private _pendingCancel: { reason?: string } | undefined;
+
   /**
    * Cancel the stream this agent's state holds (streaming, waiting on its
    * tools, or ready at a tool boundary with every result in), and reset to
-   * idle.
+   * idle. `reason` is provenance for the framework's inference:aborted trace
+   * and marker metadata (e.g. 'zombie_reclaim', 'subagent_cancel'); it never
+   * reaches the provider.
    */
-  cancelStream(): void {
-    if ('stream' in this._state) this._state.stream?.cancel();
+  cancelStream(reason?: string): void {
+    if ('stream' in this._state && this._state.stream) {
+      this._pendingCancel = { reason };
+      this._state.stream.cancel();
+    }
     this._state = { status: 'idle' };
+  }
+
+  /** Collect (and clear) the cancel that ended the current stream, if this
+   *  side issued one. The stream driver calls it once, while the stream
+   *  still owns the agent, at the stream's terminal event (`aborted`
+   *  normally, `error` for implementations that report cancel() that way)
+   *  or at the loop's end when the stream closed without one. A record no
+   *  driver collects is cleared when the agent's next stream starts. */
+  takeCancel(): { reason?: string } | undefined {
+    const c = this._pendingCancel;
+    this._pendingCancel = undefined;
+    return c;
   }
 
   /**
@@ -1535,20 +1570,20 @@ export class Agent {
   }
 
   /**
-   * Build the effective system prompt, appending any system-position injections.
+   * Build the effective system prompt, appending any system-position
+   * injections, their blocks joined by line breaks. The system prompt is
+   * text, so a block of another type, such as an image a server or module
+   * injected there, can't go in it: a line in its place says so. The hook
+   * orchestrator tells a server's operator once per server and namespace,
+   * and the module registry tells a module's once per module and namespace.
    */
   private buildSystemPrompt(systemInjections: ContentBlock[]): string {
     if (systemInjections.length === 0) {
       return this.systemPrompt;
     }
 
-    const injectedText = systemInjections
-      .filter((block): block is ContentBlock & { type: 'text' } => block.type === 'text')
-      .map((block) => block.text);
-
-    if (injectedText.length === 0) {
-      return this.systemPrompt;
-    }
+    const injectedText = systemInjections.map((block) =>
+      block.type === 'text' ? block.text : `[${block.type} block not shown: the system prompt carries text only.]`);
 
     return this.systemPrompt + '\n' + injectedText.join('\n');
   }
@@ -1562,7 +1597,7 @@ export class Agent {
 
     if ('stream' in this._state && this._state.stream) {
       const durationMs = Date.now() - this._inferenceStartedAt;
-      this.cancelStream();
+      this.cancelStream(reason);
       return { aborted: true, durationMs };
     }
 

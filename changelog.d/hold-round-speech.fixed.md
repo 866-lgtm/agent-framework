@@ -17,18 +17,21 @@
   The stream is now the prose that delivery published: each publish's
   text, to its channel, sent once the publish succeeds, a later one to the
   same channel opening with a paragraph break. Tool publications, such as
-  `send_message` or the `sleep` tool's announcement, aren't part of it, as
-  before. A publish that fails is never streamed: one refused before
-  sending, one that throws or times out, or one the server reports
-  undelivered (`delivered: false`). A reply that leaves `delivered` out
-  counts as delivered, as delivery counts it. A `{{unsent}}` resend
-  streams the retained text it sends, rather than the token.
+  `send_message`, a `drafts` resend or the `sleep` tool's announcement,
+  aren't part of it, as before. A publish succeeds only when the server
+  confirms it (`delivered: true`), so one refused before sending, one that
+  throws, times out or gets an error response, one the server reports
+  undelivered (`delivered: false`) and one whose reply leaves `delivered`
+  out are never streamed, and neither is text held as a draft. A
+  `{{unsent}}` resend streams the draft's words it sends, rather than the
+  token.
 - With native tool calls (`roundContent`), a call made inside a foreground
   `code_execution` script now counts toward its round's routing, as the
   same call made directly does (#306). In explicit mode an inner
   `skip_reply` keeps the round's envelopes in the context. In locus and
-  hybrid mode an inner `skip_reply` suppresses the round's prose, and an
-  inner silencing send suppresses it and the turn's later prose. An inner
+  hybrid mode an inner `skip_reply` keeps the round's prose private, and an
+  inner silencing send, a `drafts` resend among them, holds it and the
+  turn's later prose as drafts, as a direct one does. An inner
   `think` under the private same-round policy holds the round back in
   every mode. An inner `skip_reply` refused for its `wake_in_seconds`, on
   a host without an EventGate, counts as a refused direct one: it keeps
@@ -40,9 +43,10 @@
 - A round whose script can change its routing waits for the script, and its
   prose goes out when the script finishes. A script can change it when its
   code names a tool whose call changes the round's routing in the turn's
-  mode: in locus and hybrid mode `skip_reply`, a silencing send, `say` or
-  `whisper`; in explicit mode only `skip_reply`; and in either, `think`
-  under the private same-round policy. Disabled mode holds nothing. A name
+  mode: in locus and hybrid mode `skip_reply`, a silencing send, `drafts`
+  (whose resend is one), `say` or `whisper`; in explicit mode only
+  `skip_reply`; and in either, `think` under the private same-round
+  policy. Disabled mode holds nothing. A name
   counts in code wherever it stands as a whole word of ASCII letters, digits
   and underscores, or after `__` as in `mcpl__world__say`, as a function is
   called or a `tools[...]` key is written: `say_hello` doesn't name `say`. A
@@ -75,8 +79,9 @@
   result settles only the round that dispatched it, even when a newer round
   reuses its call id. A round whose turn ends or stops waiting on it, or
   that a newer round of the same agent replaces, before its scripts return,
-  as when the turn is stopped, is withheld: a log line names it, and the
-  turn's delivery receipt counts it as suppressed.
+  as when the turn is stopped, is withheld: it is neither sent nor held as
+  a draft, a log line names it, and in locus and hybrid mode the turn's
+  delivery receipt counts it as suppressed.
 - Every stream now sends `channels/outgoing/complete` for each channel it
   streamed to, on every exit path, as MCPL Spec 14.3 asks: once its
   deliveries have run, or, when the host stops, at once, with what it has
