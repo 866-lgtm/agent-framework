@@ -1369,7 +1369,7 @@ function describeStart(starting: StartingRules, write: StartWrite, held: Readonl
     // gate.json's rules: as loaded, or as read before a write of the start's
     // own left it unable to load; or none, where gate.json wasn't used either.
     const instead = write.kind === 'start-without'
-      ? `gate.json, which has no rules, wasn't used either: under its default, "${write.default}", it would hold back every `
+      ? `gate.json, which has no rules the gate reads, wasn't used either: under its default, "${write.default}", it would hold back every `
         + 'event, so the gate started with no rules, as a start without gate.json does. Whoever runs this host can give '
         + 'gate.json rules under "policies", or fix the starting rules.'
       : held !== null || write.kind === 'reconcile-failed'
@@ -1452,7 +1452,7 @@ function describeUnsaved(starting: StartingRules, write: StartWrite, loaded: boo
     // Starting rules refused whole put none in force, and describeStart says so.
     const out = outOfForce(write);
     if (!out) return null;
-    return `At start, gate.json, which has no rules, wasn't used: under its default, "${write.default}", ${out.said}. The gate `
+    return `At start, gate.json, which has no rules the gate reads, wasn't used: under its default, "${write.default}", ${out.said}. The gate `
       + `runs the starting rules under their own default, "${starting.config?.default ?? 'always'}", as a start without gate.json `
       + 'does, but they aren\'t saved in it: once gate.json changes and loads, what it holds is in force instead. Whoever runs '
       + `this host can give gate.json rules under "policies", or ${out.fix}.`;
