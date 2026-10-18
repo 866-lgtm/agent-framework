@@ -11,7 +11,7 @@
 
 import { EventEmitter } from 'node:events';
 
-import { openTransport, type McplTransport, type TransportCloseInfo } from './transport.js';
+import { openTransport, STDERR_END_WAIT_MS, type McplTransport, type TransportCloseInfo } from './transport.js';
 import { maskNegotiatedCapabilities } from './capability-mask.js';
 import { CapabilityGrant, expandAdvertisementShorthand } from './capability-grant.js';
 import { CAPABILITY_DISABLED, boundedForLog, describeCause } from './errors.js';
@@ -701,7 +701,13 @@ export class McplServerConnection extends EventEmitter {
         const onClose = (info: TransportCloseInfo) => {
           cleanup();
           const code = transport.kind === 'websocket' && typeof info.code === 'number' ? `, code ${info.code}` : '';
-          reject(failed(`MCPL server "${config.id}" transport closed before handshake completed (${closeReasonText(info)}${code})`));
+          const failure = `MCPL server "${config.id}" transport closed before handshake completed (${closeReasonText(info)}${code})`;
+          // The close comes at a stdio child's exit, which Node can emit before
+          // it has read the last of the child's stderr, or when the host closes
+          // the transport, which then ends the child. The tail is taken once
+          // stderr has ended, waiting at most STDERR_END_WAIT_MS. A WebSocket
+          // transport has no stderr to wait for.
+          void transport.stderrEnded(STDERR_END_WAIT_MS).then(() => reject(failed(failure)));
         };
         const onError = (err: Error) => {
           cleanup();
