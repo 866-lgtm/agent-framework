@@ -975,7 +975,7 @@ test('R16b: a producer retry re-wakes a batch left asleep by a failed freeze', a
 });
 
 // The timeout bounds a drain that never returns, such as a backoff regressed
-// to a tight loop; npm test sets no timeout of its own.
+// to a tight loop, far sooner than npm test's ten-minute --test-timeout.
 /**
  * R17's harness: a coalescing fixture whose store fails while `failing` is
  * set, its recovery backoff at `baseMs`, and every traced recovery wake with
