@@ -140,8 +140,9 @@ test('a line page is the longest that fits, though the page that ends where it w
   const atLimit = await readLimit({ limit: 2 }, 5_000_000);
   assert.equal((atLimit.data as LinePage).note, 'Truncated at 2 lines (file has 3). Use offset/limit to read more.');
   assert.deepEqual((await readLimit({ limit: 2 }, stored(atLimit))).data, atLimit.data);
-  // A page whose last line is cut names that line's rest, in more words than
-  // a page whose last line is whole, so the page a line longer can fit where it doesn't.
+  // The page that ends at a cut line names that line's rest, in more words
+  // than a page that ends at a whole line: so the page of lines 1 and 2 fits
+  // where the page of line 1 alone, cut at 2,000 characters, doesn't.
   const { read: readCut } = await setup(t, `${'q'.repeat(2500)}\nz\n${'w'.repeat(300)}\n`);
   const two = (limit: number) => ({
     path: 'work/text.txt', totalLines: 3, fromLine: 1, toLine: 2,

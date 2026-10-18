@@ -110,13 +110,15 @@ export function linePage(path: string, file: FileText, offset: number, limit: nu
     shownLines.length = best;
     return { success: true, data: page(first + best, shownLines.join('\n'), noteAt(first + best)) };
   }
-  // No page fits with its first line as a page shows it, so that line is cut
-  // shorter, at the most the page has room for, and ends the page: its note
-  // names where the line's rest starts, since that comes next. Measured on
-  // the page itself, since its note names the cut. Shown whole, a line carries
-  // no marker and its note no cut, so its page can fit where a cut one
-  // character shorter doesn't. Below that a longer cut never makes the page
-  // shorter, so the first that doesn't fit bounds the search.
+  // No page fits with its first line as a page shows it: the loop tried that
+  // page first, since a read's limit is at least 1, and it is pageWith(over).
+  // So the line is cut shorter, at the most the page has room for, and ends
+  // the page: its note names where the line's rest starts, since that comes
+  // next. Each cut is measured on the page itself, since its note names the
+  // cut. Every cut below `over` shows a marker, and a longer one never makes
+  // the page shorter: the text gains at least a character where the marker's
+  // count loses at most a digit, and the offsets only grow. So the search
+  // finds the longest cut that fits.
   const pageWith = (chars: number) => page(first + 1, shown(first, chars), noteAt(first + 1, chars));
   let fits = 0;
   let over = Math.min(lines[first].length, MAX_LINE_CHARS);
