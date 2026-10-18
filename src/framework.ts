@@ -10612,6 +10612,7 @@ export class AgentFramework {
 
     const decision = await this.routeConversation({
       channelId: event.channelId,
+      serverId: event.serverId,
       mentioned: event.metadata?.mentioned === true,
       kind: ConversationRouter.classifyChannel(descriptor, event.metadata),
     });
@@ -11467,6 +11468,7 @@ export class AgentFramework {
       const metadata = (occ.event.lane === 'channel' ? occ.event.event.metadata : occ.event.event.origin) ?? {};
       const decision = await this.routeConversation({
         channelId: occ.scope.id,
+        serverId: occ.serverId,
         mentioned: metadata.mentioned === true,
         kind: ConversationRouter.classifyChannel(this.channelRegistry?.getDescriptor(occ.scope.id), metadata),
       });
