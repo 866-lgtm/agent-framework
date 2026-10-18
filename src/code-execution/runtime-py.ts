@@ -375,6 +375,8 @@ def _flush_script_streams():
     for stream in (sys.stdout, sys.stderr):
         # A script's own object runs its own code here, which may raise
         # anything, SystemExit included: it's said, and the exec's end goes on.
+        # A closed one's ValueError is passed over, as _flush passes over the
+        # runtime's own: closing it flushed what it held.
         try:
             if any(stream is w for w in writers) or not callable(getattr(stream, "flush", None)):
                 continue
@@ -384,11 +386,13 @@ def _flush_script_streams():
 
 
 def _said(exc):
-    # An exception's text, which a script's own exception class may refuse.
+    # An exception's text, or its type's name when it has none, as SystemExit()
+    # hasn't, or when a script's own exception class refuses to give it.
     try:
-        return str(exc)
+        text = str(exc)
     except BaseException:
-        return type(exc).__name__
+        text = ""
+    return text or type(exc).__name__
 
 
 def _flush(writer):
@@ -413,11 +417,12 @@ def _flush(writer):
 
 def _drop_held(writer):
     # Empty a writer whose flush failed, and leave it usable: one of the
-    # runtime's, or a script's own wrapper over the runtime's raw writer, as
-    # TextIOWrapper(sys.stdout.detach()) makes. What a wrapper holds in a
-    # buffer of its own stays its own; one that shares this writer's buffer,
-    # as TextIOWrapper(sys.stdout.buffer) does, loses with it what it put
-    # there, under the same note.
+    # runtime's, or a script's own wrapper over the runtime's raw writer,
+    # through the runtime's buffer, as TextIOWrapper(sys.stdout.detach())
+    # makes, or through a buffer of its own. Emptying one writer leaves
+    # another wrapper's own buffer as it is; one that shares this writer's
+    # buffer, as TextIOWrapper(sys.stdout.buffer) does, loses with it what it
+    # put there, under the same note.
     raw = getattr(getattr(writer, "buffer", None), "raw", None)
     if not isinstance(raw, _FdWriter):
         return
@@ -524,8 +529,9 @@ _current_exec_task = None
 #  13. a previous script installed an eager task factory -> no effect: the
 #      runtime builds its script task directly, and the state is in place
 #      before the script's first step
-#  14. the flush before a fork the script makes -> queued; the fork goes on,
-#      and the next signal stops the script where it is then
+#  14. the flush before a fork the script makes -> queued, as in 4; the fork
+#      goes on, and the cancellation lands at the script's next await, or the
+#      next signal stops a script that blocks, as in 6
 _PENDING = "pending"
 _REQUESTED = "requested"
 _DELIVERED = "delivered"

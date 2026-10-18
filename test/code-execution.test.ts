@@ -1906,6 +1906,7 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
         ['an error whose text raises', 'class BadText(Exception):\n    def __str__(self): raise RuntimeError("no text")\nclass Out:\n    def write(self, s): return len(s)\n    def flush(self): raise BadText()', 'BadText'],
         ['a flush that is a raising property', 'class Out:\n    def write(self, s): return len(s)\n    @property\n    def flush(self): raise RuntimeError("no flush")', 'no flush'],
         ['SystemExit', 'class Out:\n    def write(self, s): return len(s)\n    def flush(self): raise SystemExit(3)', '3'],
+        ['a SystemExit with no code', 'class Out:\n    def write(self, s): return len(s)\n    def flush(self): raise SystemExit()', 'SystemExit'],
       ];
       for (const [what, defines, said] of cases) {
         const result = await within(runner.exec(`import sys\n${defines}\nsys.stdout = Out()\nkept = "${what}"`, []), what);
@@ -2058,10 +2059,12 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
       const runner = new PyRunner({ onToolCall: async () => '' });
       try {
         const changed = await within(
-          runner.exec(`import os\ntry:\n    os.fchmod(${fd}, 0o600)\nexcept OSError:\n    pass\nkept = ${fd}\nprint("changed")`, []),
+          runner.exec(`import os\ntry:\n    os.fchmod(${fd}, 0o600)\nexcept OSError:\n    pass\nkept = ${fd}\nprint(oct(os.fstat(${fd}).st_mode & 0o777))`, []),
           `fd ${fd}`,
         );
-        assert.deepStrictEqual(changed, { stdout: 'changed\n', stderr: '', returnCode: 0 }, `fd ${fd}`);
+        // On Linux the mode did change, so the check had a change to pass over.
+        const mode = process.platform === 'linux' ? '0o600\n' : changed.stdout;
+        assert.deepStrictEqual(changed, { stdout: mode, stderr: '', returnCode: 0 }, `fd ${fd}`);
         assert.strictEqual((await within(runner.exec('print(kept)', []), `the next script (fd ${fd})`)).stdout, `${fd}\n`, `fd ${fd}`);
       } finally {
         runner.dispose();
@@ -2189,6 +2192,39 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
         rmSync(dir, { recursive: true, force: true });
       }
     });
+  });
+
+  it("a host that sends exit and then ends fd 3 while a script waits on the host gets the script cancelled and a clean exit, with no line about fd 3", async () => {
+    let called!: () => void;
+    const calling = new Promise<void>((r) => {
+      called = r;
+    });
+    // The call is never answered, so the host writes nothing after fd 3's end.
+    const runner = new PyRunner({
+      onToolCall: () => {
+        called();
+        return new Promise<string>(() => {});
+      },
+    });
+    try {
+      const pending = runner.exec('await test__echo({})', ECHO_TOOLS);
+      await within(calling, 'the script to call');
+      // PyRunner never sends exit; a host that runs the runtime itself does, through
+      // the runner's own channel here.
+      const internals = runner as unknown as { send(obj: unknown): void; protoIn: Writable | null; child: ChildProcess | null };
+      const child = internals.child;
+      assert.ok(child && internals.protoIn, 'the interpreter should be running');
+      const exited = new Promise<number | null>((r) => child.once('exit', (code) => r(code)));
+      internals.send({ op: 'exit' });
+      internals.protoIn.end();
+      const result = await within(pending, 'the exec to settle');
+      assert.strictEqual(await within(exited, 'the interpreter to exit'), 0);
+      assert.strictEqual(result.returnCode, 1);
+      assert.match(result.stderr, /KeyboardInterrupt: script cancelled by host/);
+      assert.doesNotMatch(result.stderr, /fd 3/);
+    } finally {
+      runner.dispose();
+    }
   });
 
   it("a host that sends exit and then ends fd 3 while a script blocks gets the script's result and a clean exit, with no line about fd 3", async () => {
