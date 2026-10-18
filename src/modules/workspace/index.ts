@@ -8,7 +8,7 @@
 import { isUtf8 } from 'node:buffer';
 import { constants as fsConstants } from 'node:fs';
 import type { Stats } from 'node:fs';
-import { open, readFile, readdir, stat, lstat, realpath } from 'node:fs/promises';
+import { open, readdir, stat, lstat, realpath } from 'node:fs/promises';
 import { isAbsolute, join, resolve, relative, sep } from 'node:path';
 import type { JsStore } from '@animalabs/chronicle';
 import type { Module, ModuleContext, ProcessState, EventResponse } from '../../types/module.js';
@@ -40,7 +40,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
-import { IGNORED, OTHER_MOUNT, checkDir, filesystemTrustsCtime, inOtherMount, locateRoot, passedOverAt, readPrefix } from './observe.js';
+import { IGNORED, NONBLOCK, OTHER_MOUNT, checkDir, filesystemTrustsCtime, inOtherMount, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, nestedHolder, passedOverAt, readPrefix, type LinkFound } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
 import {
   type MountRuntime,
@@ -101,6 +101,8 @@ class WorkspaceImageReadError extends Error {
       | 'not_found'
       | 'directory'
       | 'symlink'
+      | 'parent_symlink'
+      | 'other_mount'
       | 'escape'
       | 'changed'
       | 'empty'
@@ -121,11 +123,17 @@ class WorkspaceImageReadError extends Error {
  * peer needs to react to differently: a path that never resolved inside the
  * mount (`unknown_mount`, `traversal`), a mount whose root is gone
  * (`mount_unavailable`), an ordinary missing file (`not_found`), a directory
- * (`directory`), a symlink refused by the mount's `followSymlinks` policy
- * (`symlink`), a symlink whose canonical target lands outside the canonical
- * mount root (`escape`), a file swapped underneath the read (`changed`), and a
- * path in another mount's directory nested in the one named (`other_mount`),
- * whose message names the mount that holds it and the path to use there.
+ * (`directory`), a file that is itself a symlink, refused by the mount's
+ * `followSymlinks` policy (`symlink`), a symlink among the path's directories
+ * on a mount that doesn't follow symlinks, leading to a directory or a file
+ * inside the mount, or nowhere (`parent_symlink`), whose message names the
+ * link and, where it leads somewhere, its target, a symlink whose canonical
+ * target lands outside the canonical mount root, or one among the path's
+ * directories leading out of it (`escape`), a file swapped underneath the read
+ * (`changed`), and a path in another mount's directory nested in the one
+ * named, or reached through a symlink among the path's directories leading
+ * there (`other_mount`), whose message names the mount that holds it and the
+ * path to use there.
  */
 export type WorkspaceReadErrorCode =
   | 'unknown_mount'
@@ -135,12 +143,14 @@ export type WorkspaceReadErrorCode =
   | 'not_found'
   | 'directory'
   | 'symlink'
+  | 'parent_symlink'
   | 'escape'
   | 'changed';
 
 /** Where in the open sequence a `WorkspaceReadError` originated (diagnostics). */
 export type WorkspaceReadStage =
   | 'parse'
+  | 'readlink'
   | 'lstat'
   | 'realpath_root'
   | 'open'
@@ -251,6 +261,35 @@ function startsWithBytes(buffer: Buffer, prefix: Buffer): boolean {
 
 function matchesPartialPrefix(buffer: Buffer, prefix: Buffer): boolean {
   return buffer.length > 0 && prefix.subarray(0, buffer.length).equals(buffer);
+}
+
+/**
+ * A disk reader's refusal for what linkOnTheWay found on a path's way: the
+ * link's reason, as the observations give it, after the path; or, for a
+ * directory the walk couldn't ask, a failure to read, coded `not_found` with
+ * the readlink's errno, as every failed lookup is. A link's code follows
+ * where it leads, so a caller choosing advice by code gets advice that fits:
+ * `escape` for a link leading outside the mount, the code a path resolving
+ * outside it gets too; `other_mount` for one into a nested mount's directory,
+ * the code that mount's own paths get; and `parent_symlink` for any other,
+ * which `symlink`, a file that is itself a link, leaves apart.
+ */
+async function linkReadError(
+  mount: { config: { name: string; path: string } },
+  found: LinkFound,
+  mountPrefixedPath: string,
+  nested: readonly { dir: string; name: string }[],
+): Promise<WorkspaceReadError> {
+  if (!('link' in found)) {
+    return new WorkspaceReadError('not_found', `Unable to read file: ${mountPrefixedPath}: ${linkWords(mount.config.name, found, null)}`, 'readlink', found.code);
+  }
+  const rootReal = await realpath(mount.config.path).catch(() => resolve(mount.config.path));
+  const leads = await linkLeads(mount.config.path, rootReal, found.link);
+  const reason = `${mountPrefixedPath}: ${linkWords(mount.config.name, found, leads, nested)}`;
+  const code = leads.kind === 'outside' ? 'escape'
+    : leads.kind === 'inside' && nestedHolder(leads.target, nested) ? 'other_mount'
+    : 'parent_symlink';
+  return new WorkspaceReadError(code, reason, 'readlink');
 }
 
 function isContainedPath(root: string, candidate: string): boolean {
@@ -844,11 +883,13 @@ export class WorkspaceModule implements Module {
       name: mount.config.name,
       view: {
         root,
+        name: mount.config.name,
         rootIdentity: this.agreementOrThrow().rootIdentity(mount.config.name),
         followSymlinks: mount.config.followSymlinks === true,
         maxFileSize: mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE,
         ignore: mount.config.ignore ?? [],
         others: this.othersOf(mount.config.name),
+        nested: this.nestedOf(mount.config.name),
       },
       rootReal,
       ctimeTrustedDev: trustedDev,
@@ -1712,8 +1753,11 @@ export class WorkspaceModule implements Module {
    * permanent cost to send something once is the wrong trade.
    *
    * Same mount boundary and traversal guard as every other path here: only
-   * declared mounts, nothing above their root. Deliberately does NOT sync,
-   * register, or hash anything — it reads and returns.
+   * declared mounts, nothing above their root, and the file reached as
+   * readFileFromDisk reaches it (openContainedFile), so the mount's
+   * `followSymlinks` holds for the file and the directories on its way, and
+   * what it reaches stays canonically inside the mount. Deliberately does NOT
+   * sync, register, or hash anything — it reads and returns.
    */
   async readBinaryFromDisk(
     mountPrefixedPath: string,
@@ -1727,16 +1771,29 @@ export class WorkspaceModule implements Module {
       return { error: error instanceof Error ? error.message : String(error) };
     }
     const absolutePath = resolve(mount.config.path, relativePath);
+    let tooLarge: string | undefined;
     try {
-      const info = await stat(absolutePath);
-      if (!info.isFile()) return { error: `Not a file: ${mountPrefixedPath}` };
-      if (opts.maxBytes !== undefined && info.size > opts.maxBytes) {
-        return { error: `File too large: ${info.size} > ${opts.maxBytes} bytes` };
+      const { handle } = await this.openContainedFile(mount, relativePath, mountPrefixedPath, (fileStat) => {
+        if (opts.maxBytes !== undefined && fileStat.size > opts.maxBytes) {
+          tooLarge = `File too large: ${fileStat.size} > ${opts.maxBytes} bytes`;
+          throw new Error(tooLarge);
+        }
+      });
+      try {
+        return { data: await handle.readFile(), absolutePath };
+      } finally {
+        await handle.close();
       }
-      return { data: await readFile(absolutePath), absolutePath };
     } catch (error) {
-      const code = (error as { code?: string }).code;
-      if (code === 'ENOENT') return { error: `File not found on disk: ${mountPrefixedPath}` };
+      if (tooLarge !== undefined) return { error: tooLarge };
+      // A directory, or a file that isn't regular (the reader's refusal of
+      // one carries no errno), and a missing file keep this reader's words.
+      if (error instanceof WorkspaceReadError && (error.code === 'directory' || (error.code === 'not_found' && error.errno === undefined))) {
+        return { error: `Not a file: ${mountPrefixedPath}` };
+      }
+      if (error instanceof WorkspaceReadError && error.code === 'not_found' && (error.errno === 'ENOENT' || error.errno === 'ENOTDIR')) {
+        return { error: `File not found on disk: ${mountPrefixedPath}` };
+      }
       return { error: error instanceof Error ? error.message : String(error) };
     }
   }
@@ -1744,6 +1801,11 @@ export class WorkspaceModule implements Module {
   /** The directories of the mounts nested inside a mount, mount-relative. */
   private othersOf(mountName: string): string[] {
     return (this.otherMounts.get(mountName) ?? []).map((o) => o.dir);
+  }
+
+  /** The mounts nested in `mountName`, by directory and name (MountView's `nested`). */
+  private nestedOf(mountName: string): { dir: string; name: string }[] {
+    return (this.otherMounts.get(mountName) ?? []).map(({ dir, name }) => ({ dir, name }));
   }
 
   /**
@@ -1879,20 +1941,29 @@ export class WorkspaceModule implements Module {
    * Open a mount-relative file for reading with the mount boundary enforced on
    * the *filesystem*, not just the path string:
    *
+   * 0. On a mount that does not `followSymlinks`, refuse a path with a symlink
+   *    among the directories on its way beneath the mount's root, wherever it
+   *    leads (linkOnTheWay), before anything resolves it: as `escape` for a
+   *    link leading outside the mount, as `other_mount` for one into a nested
+   *    mount's directory, and as `parent_symlink` for any other.
    * 1. `lstat` the lexical path — refuse directories; refuse a final-component
-   *    symlink when the mount does not `followSymlinks`.
+   *    symlink when the mount does not `followSymlinks`; refuse anything else
+   *    that isn't a regular file, such as a FIFO, without opening it.
    * 2. Open with `O_NOFOLLOW` where the platform has it (POSIX) so the refusal
    *    holds against a symlink swapped in between lstat and open; where it
-   *    doesn't (Windows), re-`lstat` after opening instead.
-   * 3. `realpath` both the mount root and the opened path and require canonical
-   *    containment — this is what catches an *intermediate* symlinked
-   *    directory escaping the mount, and a followed symlink whose target lands
-   *    outside, on every platform (junctions included).
+   *    doesn't (Windows), re-`lstat` after opening instead. `O_NONBLOCK`, so a
+   *    FIFO swapped in meanwhile doesn't wait for a writer.
+   * 3. `realpath` both the mount root and the opened path. On a mount that
+   *    does not `followSymlinks`, refuse it again for a symlinked directory on
+   *    its way, which catches one swapped in since step 0 (linkRefusal). Then
+   *    require canonical containment — this is what catches an *intermediate*
+   *    symlinked directory escaping the mount, and a followed symlink whose
+   *    target lands outside, on every platform (junctions included).
    * 4. Confirm the descriptor and the canonical path are the same inode.
    *
-   * `inspect` runs right after the descriptor is stat'd and before the
-   * containment work, so callers can impose size policy in the same order the
-   * image reader always has. The returned handle is the caller's to close.
+   * `inspect` runs last, after the boundary's checks, so a caller's own check
+   * of the file, such as a size limit, never answers for a file the boundary
+   * refuses. The returned handle is the caller's to close.
    */
   private async openContainedFile(
     mount: MountState,
@@ -1903,6 +1974,14 @@ export class WorkspaceModule implements Module {
     const lexicalPath = resolve(mount.config.path, relativePath);
     const follow = mount.config.followSymlinks === true;
     const useNoFollow = !follow && typeof fsConstants.O_NOFOLLOW === 'number';
+
+    // Before anything resolves the path, so a link's own answer comes first: a
+    // mount that doesn't follow symlinks goes through none among the
+    // directories on the way, wherever it leads. Asked again of the path's
+    // resolution after the open, below.
+    const linkView = { root: mount.config.path, followSymlinks: follow };
+    const onTheWay = await linkOnTheWay(linkView, relativePath, 'parents');
+    if (onTheWay !== null) throw await linkReadError(mount, onTheWay, mountPrefixedPath, this.nestedOf(mount.config.name));
 
     let fileInfo: Awaited<ReturnType<typeof lstat>>;
     try {
@@ -1920,6 +1999,10 @@ export class WorkspaceModule implements Module {
     if (fileInfo.isSymbolicLink() && !follow) {
       throw new WorkspaceReadError('symlink', `Symlinks are not allowed: ${mountPrefixedPath}`, 'lstat');
     }
+    if (!fileInfo.isFile() && !fileInfo.isSymbolicLink()) {
+      // A FIFO, socket or device is never opened.
+      throw new WorkspaceReadError('not_found', `Not a regular file: ${mountPrefixedPath}`, 'lstat');
+    }
 
     let realMountRoot: string;
     try {
@@ -1930,7 +2013,9 @@ export class WorkspaceModule implements Module {
 
     let handle: Awaited<ReturnType<typeof open>>;
     try {
-      handle = await open(lexicalPath, fsConstants.O_RDONLY | (useNoFollow ? fsConstants.O_NOFOLLOW : 0));
+      // O_NONBLOCK: a FIFO swapped in since the lstat opens at once instead of
+      // waiting for a writer, and the regular-file check below refuses it.
+      handle = await open(lexicalPath, fsConstants.O_RDONLY | NONBLOCK | (useNoFollow ? fsConstants.O_NOFOLLOW : 0));
     } catch (err) {
       const code = errnoOf(err);
       if (code === 'ENOENT' || code === 'ENOTDIR') {
@@ -1959,9 +2044,8 @@ export class WorkspaceModule implements Module {
         throw new WorkspaceReadError('directory', `Path is a directory: ${mountPrefixedPath}`, 'fstat');
       }
       if (!fileStat.isFile()) {
-        throw new WorkspaceReadError('not_found', `File not found: ${mountPrefixedPath}`, 'fstat');
+        throw new WorkspaceReadError('not_found', `Not a regular file: ${mountPrefixedPath}`, 'fstat');
       }
-      inspect?.(fileStat);
 
       if (!follow && !useNoFollow) {
         let postOpenInfo: Awaited<ReturnType<typeof lstat>>;
@@ -1990,6 +2074,11 @@ export class WorkspaceModule implements Module {
         throw new WorkspaceReadError('not_found', `Unable to resolve file: ${mountPrefixedPath}`, 'realpath', code);
       }
 
+      // A directory swapped for a link since the walk above is caught here, by
+      // what the path resolved to after the open.
+      const resolvedThrough = await linkRefusal(linkView, realMountRoot, relativePath, realFilePath);
+      if (resolvedThrough !== null) throw await linkReadError(mount, resolvedThrough, mountPrefixedPath, this.nestedOf(mount.config.name));
+
       if (!isContainedPath(realMountRoot, realFilePath)) {
         throw new WorkspaceReadError('escape', `Symlink escape detected: ${mountPrefixedPath}`, 'realpath');
       }
@@ -2008,6 +2097,9 @@ export class WorkspaceModule implements Module {
         throw new WorkspaceReadError('changed', `File changed during read: ${mountPrefixedPath}`, 'stat');
       }
 
+      // The caller's checks of the file, such as a size limit, come after the
+      // boundary's, so they never answer for a file the boundary refuses.
+      inspect?.(fileStat);
       return { handle, fileStat, realFilePath };
     } catch (err) {
       await handle.close();
@@ -2090,13 +2182,33 @@ export class WorkspaceModule implements Module {
       case 'directory':
         return new WorkspaceImageReadError('directory', `Path is a directory: ${p}`);
       case 'symlink':
-        return new WorkspaceImageReadError('symlink', `Symlinks are not allowed: ${p}`);
+        // The core reader's own words for a link at the path: "Symlinks are not
+        // allowed: <path>".
+        return new WorkspaceImageReadError('symlink', err.message);
+      case 'parent_symlink':
+        // The core reader's own words for a link on its way: which link and
+        // where it leads, with the setting for a link to a directory.
+        return new WorkspaceImageReadError('parent_symlink', err.message);
+      case 'other_mount':
+        // The core reader's own words for a link on its way into a nested
+        // mount's directory: that mount and the path to use there in place of
+        // the link. (#460's own other_mount, a path in that directory, is
+        // refused at parse.)
+        return new WorkspaceImageReadError('other_mount', err.message);
       case 'escape':
-        return new WorkspaceImageReadError('escape', `Symlink escape detected: ${p}`);
+        // The core reader's own words: "Symlink escape detected: <path>" for a
+        // followed link that resolves outside the mount, and for a link on the
+        // way that leads outside a mount that doesn't follow links, which link.
+        return new WorkspaceImageReadError('escape', err.message);
       case 'changed':
         return new WorkspaceImageReadError('changed', `Image file changed during read: ${p}`);
       case 'not_found':
       default:
+        // The core reader's own words for a file that isn't regular, and for
+        // a directory on the way it couldn't ask about.
+        if (err.message.startsWith('Not a regular file') || err.stage === 'readlink') {
+          return new WorkspaceImageReadError('not_found', err.message);
+        }
         if (err.message.startsWith('File not found')) {
           return new WorkspaceImageReadError('not_found', `File not found: ${p}`);
         }
@@ -2160,8 +2272,10 @@ export class WorkspaceModule implements Module {
 
   /**
    * Commit a tool's write or delete to the workspace tree, with the branch
-   * intent it implies (store origin for a path disk never agreed with; a
-   * tombstone for a deletion), and push it to disk when the mount opts in via
+   * intent it implies: store origin for a path disk never agreed with; for a
+   * deletion, a tombstone, unless the evidence holds no agreed disk copy (P
+   * absent, or no P and store origin), when it clears the path's intent and
+   * pushes nothing. It pushes the change to disk when the mount opts in via
    * `autoMaterialize` — required for cross-agent pipelines, since another
    * agent's watcher on the same directory only sees real filesystem events.
    * The push follows materialize's rule: a disk copy that changed since it
@@ -2171,22 +2285,25 @@ export class WorkspaceModule implements Module {
    * change reached the workspace but not disk (`refused`): the
    * autoMaterialize contract is that disk is the source of truth for
    * downstream agents. And, apart from it, why a write whose bytes reached
-   * disk left the file's mode as disk had it (`modeKept`). The caller holds
-   * the mount's turn and has settled the path first (settleBeforeMutation, or
-   * a pass over the path, as an edit makes).
+   * disk left the file's mode as disk had it (`modeKept`), and, for a
+   * deletion that cleared a conflict naming a disk file the workspace never
+   * took in, that nothing was unlinked (`note`). The caller holds the mount's
+   * turn and has settled the path first (settleBeforeMutation, or a pass over
+   * the path, as an edit makes).
    */
   private async commitToolChange(
     mount: MountState,
     relativePath: string,
     change: { kind: 'set'; blobHash: string; size: number; mode?: number } | { kind: 'remove'; previousHash: string },
     onCommitted?: () => void,
-  ): Promise<{ refused: string | null; modeKept: string | null }> {
+  ): Promise<{ refused: string | null; modeKept: string | null; note: string | null }> {
     const store = this.getStore();
     const intents = this.intents.get(mount.config.name)!;
     // The mutation's precondition, enforced here, synchronously with the
     // commit: whatever settleBeforeMutation's pass could or couldn't settle.
     settleAdoptionBeforeMutation(store, this.agreementOrThrow(), { name: mount.config.name, treeStateId: mount.treeStateId }, relativePath);
-    const known = this.agreementOrThrow().get(mount.config.name, relativePath) !== undefined;
+    const evidence = this.agreementOrThrow().get(mount.config.name, relativePath);
+    const known = evidence !== undefined;
     if (change.kind === 'set') {
       store.treeSet(mount.treeStateId, relativePath, { blobHash: change.blobHash, size: change.size, mode: change.mode ?? 0o644 });
       // A later intent update or disk push can throw; the tree entry is
@@ -2205,20 +2322,49 @@ export class WorkspaceModule implements Module {
     } else {
       store.treeRemove(mount.treeStateId, relativePath);
       onCommitted?.();
+      // A deletion whose evidence holds no agreed disk copy (disk last agreed
+      // it had nothing here, or has never agreed with this entry, which the
+      // workspace created) puts the store back at the agreement. Nothing on
+      // disk is the workspace's to unlink, so it pushes nothing, and it
+      // clears the path's whole intent: no tombstone, so it needs no proof of
+      // absence, which a path disk can't show, such as one beneath a symlink
+      // the mount doesn't follow, would never give; and no conflict, which
+      // has nothing left to be about once the workspace has given up its
+      // side. Whatever disk holds there is a sync's to observe, a file the
+      // workspace never saw included. Any other deletion keeps its
+      // tombstone, which guards it: a copy disk agreed with, a push of ours
+      // that may have landed (pending or interrupted), or an entry from
+      // before the evidence.
+      let agreed = true;
+      let note: string | null = null;
       intents.update(relativePath, (cur) => {
-        const next = { ...cur, tombstone: { hash: change.previousHash } };
-        delete next.origin;
-        return next;
+        agreed = !(evidence?.kind === 'absent' || (evidence === undefined && cur.origin === 'store'));
+        if (agreed) {
+          const next = { ...cur, tombstone: { hash: change.previousHash } };
+          delete next.origin;
+          return next;
+        }
+        // A conflict it clears may name a file disk held there, which the
+        // workspace never took in: the answer says that file wasn't unlinked,
+        // where the deletion alone would read as having removed it. The
+        // deletion doesn't look at disk, so a file nothing recorded gets no
+        // note.
+        if (cur.conflict?.disk) {
+          note = `nothing was unlinked: when last observed, disk held a file at ${mount.config.name}/${relativePath} ` +
+            `that the workspace never took in (conflict: ${cur.conflict.kind}), and a sync observes whatever disk holds there`;
+        }
+        return {};
       });
+      if (!agreed) return { refused: null, modeKept: null, note };
     }
-    if (!this.pushesOnCommit(mount)) return { refused: null, modeKept: null };
+    if (!this.pushesOnCommit(mount)) return { refused: null, modeKept: null, note: null };
 
     const pushed = await this.pushUnlocked(mount, [relativePath], {
       applyDeletions: change.kind === 'remove',
       branchId: store.currentBranch().id,
     });
     const refused = pushed.skipped.find((s) => s.path === relativePath);
-    if (!refused) return { refused: null, modeKept: pushed.modesKept.find((k) => k.path === relativePath)?.reason ?? null };
+    if (!refused) return { refused: null, modeKept: pushed.modesKept.find((k) => k.path === relativePath)?.reason ?? null, note: null };
     this.ctx?.pushEvent({
       type: 'workspace:materialize-failed',
       mount: mount.config.name,
@@ -2226,7 +2372,7 @@ export class WorkspaceModule implements Module {
       op: change.kind === 'set' ? 'write' : 'delete',
       error: refused.reason,
     } as ProcessEvent);
-    return { refused: refused.reason, modeKept: null };
+    return { refused: refused.reason, modeKept: null, note: null };
   }
 
   // ==========================================================================
@@ -2665,13 +2811,17 @@ export class WorkspaceModule implements Module {
           return { success: false, error: this.notInWorkspace(input.path, report), isError: true };
         }
 
-        const { refused } = await this.commitToolChange(mount, relativePath, { kind: 'remove', previousHash: entry.blobHash },
+        const { refused, note } = await this.commitToolChange(mount, relativePath, { kind: 'remove', previousHash: entry.blobHash },
           () => { committed = true; });
         if (refused !== null) return storedButUnfinished('delete', input.path, { refused });
 
         // Its whole receipt is what it changed: kept in the stub if the guard
         // withholds the result (agent-framework #277).
-        return { success: true, data: { path: input.path, deleted: true }, keepWhenWithheld: ['path', 'deleted'] };
+        return {
+          success: true,
+          data: { path: input.path, deleted: true, ...(note ? { note } : {}) },
+          keepWhenWithheld: ['path', 'deleted', 'note'],
+        };
       });
     } catch (error) {
       if (!committed) throw error;
