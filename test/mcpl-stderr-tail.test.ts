@@ -278,7 +278,7 @@ test("at startup, a failed connect's trace and log line carry the server's stder
     mcplServers: [{
       id: 'needs-token',
       command: process.execPath,
-      args: ['-e', "console.error('fatal: DISCORD_TOKEN ' + process.env.DISCORD_TOKEN + ' was refused'); process.exit(1)"],
+      args: ['-e', `console.error('fatal: DISCORD_TOKEN ' + process.env.DISCORD_TOKEN + ' was refused'); ${EXIT_ON_INITIALIZE}`],
       env: { DISCORD_TOKEN: 'tok-0123456789abcdef' },
     }],
   });

@@ -25,7 +25,6 @@ async function connectionEnv(
     mcplHostCapabilities: {},
     mcplPrefixMap: new Map(),
     mcplServerConfigs: new Map(),
-    mcplConnecting: new Set(),
     channelRegistry: null,
     discordAwarenessOutbox: null,
     discordAwarenessEmoji: '🔕',
