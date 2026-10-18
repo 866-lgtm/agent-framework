@@ -21,9 +21,8 @@ class FakeService {
   /** When set, /delete answers this status instead of deleting. */
   deleteStatus: number | null = null;
   /** When set, /delete answers 404 while the namespace holds nothing, as
-   *  /stats does. The comment at semantic.ts's /delete catch said, before
-   *  F82's fix (d6593a3), that a service may answer so for a namespace that
-   *  does not exist. */
+   *  /stats does, the way a service may answer for a namespace that doesn't
+   *  exist. */
   deleteNeedsIndex = false;
   /** When set, /stats answers 200 with JSON that isn't stats, as a page
    *  shown while the service restarts may. */
@@ -217,8 +216,15 @@ describe('semantic sync: Greptile #173 findings', () => {
 
   it('re-review #1: a 404 from /delete (service without the route) drops the removals instead of retrying forever', async (t) => {
     const warned = t.mock.method(console, 'warn', () => {});
-    const cm = new StubCm([msg('a', T0, 'first message'), msg('b', T0 + 1, 'second message'), msg('d', T0 + 3, 'fourth message')]);
+    const cm = new StubCm([
+      msg('a', T0, 'first message'), msg('b', T0 + 1, 'second message'),
+      msg('d', T0 + 3, 'fourth message'), msg('e', T0 + 4, 'fifth message'),
+    ]);
+    let state: unknown = null;
+    const ctx = { getState: () => state, setState: (v: unknown) => { state = v; } } as never;
+    const pending = () => (state as { semanticPending: { edited: string[]; removed: string[] } }).semanticPending;
     const m = mod(cm);
+    await m.start(ctx);
     await m.syncSemanticIndex();
     cm.remove('a');
     cm.edit('b', '');
@@ -228,40 +234,79 @@ describe('semantic sync: Greptile #173 findings', () => {
     assert.ok(svc.items.has('msg:c'), 'new messages still index when /delete is missing');
     assert.deepEqual(warned.mock.calls.map((c) => String(c.arguments[0])), [
       '[history/semantic] index "n": /delete answered 404, so the service lacks that route; dropping 1 removal(s) and '
-        + '1 edit(s) down to nothing indexable, and every later one until the host restarts or binds the history module '
-        + 'again: the semantic index service answered the delete request with an error (HTTP 404: delete failed)',
+        + '1 edit(s) down to nothing indexable. Later removals and edits down to nothing indexable are dropped too, '
+        + 'until the host restarts or binds the history module again: the semantic index service answered the delete '
+        + 'request with an error (HTTP 404: delete failed)',
     ]);
     svc.calls.length = 0;
     svc.deleteStatus = null;
-    // A later removal, and a later edit down to nothing indexable, make no call either.
+    // A later removal is dropped as it comes, not queued.
     cm.remove('c');
+    assert.deepEqual(pending().removed, []);
+    // A later edit down to nothing indexable makes no call and isn't kept,
+    // and an indexable edit still reaches the index.
     cm.edit('d', '');
+    cm.edit('e', 'fifth message, reworded');
     await m.syncSemanticIndex();
     assert.ok(!svc.calls.includes('delete'), `/delete called after the route was found missing: ${JSON.stringify(svc.calls)}`);
+    assert.deepEqual(pending(), { edited: [], removed: [] });
+    assert.equal(svc.items.get('msg:e')?.text, 'fifth message, reworded');
     assert.equal(warned.mock.calls.length, 1);
     await m.stop();
   });
 
+  it('the route-missing warning names what its pass dropped: removals, edits down to nothing indexable, or both', async (t) => {
+    const warned = t.mock.method(console, 'warn', () => {});
+    const later = '. Later removals and edits down to nothing indexable are dropped too, until the host restarts or binds '
+      + 'the history module again: the semantic index service answered the delete request with an error (HTTP 404: '
+      + 'delete failed)';
+    // A pass whose delete held only a removal.
+    const cm1 = new StubCm([msg('a', T0, 'first message'), msg('b', T0 + 1, 'second message')]);
+    const m1 = mod(cm1);
+    await m1.syncSemanticIndex();
+    svc.deleteStatus = 404;
+    cm1.remove('a');
+    await m1.syncSemanticIndex();
+    await m1.stop();
+    // A pass whose delete held only an edit down to nothing indexable.
+    svc.deleteStatus = null;
+    svc.items.clear();
+    const cm2 = new StubCm([msg('p', T0, 'first message'), msg('q', T0 + 1, 'second message')]);
+    const m2 = mod(cm2);
+    await m2.syncSemanticIndex();
+    svc.deleteStatus = 404;
+    cm2.edit('q', '');
+    await m2.syncSemanticIndex();
+    await m2.stop();
+    assert.deepEqual(warned.mock.calls.map((c) => String(c.arguments[0])), [
+      `[history/semantic] index "n": /delete answered 404, so the service lacks that route; dropping 1 removal(s)${later}`,
+      '[history/semantic] index "n": /delete answered 404, so the service lacks that route; dropping 1 edit(s) down to '
+        + `nothing indexable${later}`,
+    ]);
+  });
+
   it('a 404 from /delete in a pass whose /stats answered with something that isn\'t stats is re-queued, not read as a missing route', async (t) => {
     const warned = t.mock.method(console, 'warn', () => {});
-    const cm = new StubCm([msg('a', T0, 'first message'), msg('b', T0 + 1, 'second message')]);
+    const cm = new StubCm([msg('a', T0, 'first message'), msg('b', T0 + 1, 'second message'), msg('c', T0 + 2, 'third message')]);
     const m = mod(cm);
     await m.syncSemanticIndex();
     cm.remove('a');
+    cm.edit('b', '');
     svc.statsNotStats = true;
     svc.deleteStatus = 404;
     svc.calls.length = 0;
     await m.syncSemanticIndex();
     assert.ok(svc.calls.includes('delete'), `a pass whose /stats wasn't 404 made no /delete call: ${JSON.stringify(svc.calls)}`);
     assert.deepEqual(warned.mock.calls.map((c) => String(c.arguments[0])), [
-      '[history/semantic] index "n": delete failed, 1 removal(s) re-queued: the semantic index service answered the '
-        + 'delete request with an error (HTTP 404: delete failed)',
+      '[history/semantic] index "n": delete failed, 1 removal(s) and 1 edit(s) down to nothing indexable re-queued: the '
+        + 'semantic index service answered the delete request with an error (HTTP 404: delete failed)',
     ]);
     svc.statsNotStats = false;
     svc.deleteStatus = null;
     await m.syncSemanticIndex();
-    assert.deepEqual(svc.deleted, ['msg:a']);
+    assert.deepEqual(svc.deleted, ['msg:a', 'msg:b']);
     assert.ok(!svc.items.has('msg:a'));
+    assert.ok(!svc.items.has('msg:b'));
     await m.stop();
   });
 
