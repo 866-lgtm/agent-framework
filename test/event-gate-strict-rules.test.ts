@@ -1431,8 +1431,8 @@ test("a later start over a gate.json with no rule list it could add to without w
     + `every event, so the gate started with no rules, as a start without gate.json does. ${fixStarting}`), neitherSaid[1]);
   assert.equal(neitherSaid.length, 2);
 
-  // Where every one of them is left out, none runs, and where the starting rules aren't used beside a gate.json whose
-  // default is "always", which holds nothing back, gate.json's rules run.
+  // Where every one of them is left out, none runs; and where the starting rules aren't used beside a gate.json whose
+  // default is "always", which holds nothing back, gate.json's own reading runs: no rules, every event waking the agent.
   const allOut = makeGate(tempDir(t), { file: [{ name: 'dm', behavior: 'always' }], initialConfig: { default: 'always', policies: [limited] } });
   assert.deepEqual(names(allOut.gate), []);
   assert.ok(allOut.gate.getStatus().errors.some((e) => e.endsWith(notPut('"limited"', `gate.json is a list, ${noListWhy}`))),
@@ -1442,6 +1442,12 @@ test("a later start over a gate.json with no rule list it could add to without w
   assert.deepEqual(names(notUsed.gate), []);
   assert.ok(notUsed.gate.getStatus().errors.some((e) => e.includes("The gate started with gate.json's rules.")), JSON.stringify(notUsed.gate.getStatus().errors));
   notUsed.gate.dispose();
+  // And beside a gate.json with a list of its own, starting rules refused whole leave its rules in force, under "skip" too.
+  const ownList = makeGate(tempDir(t), { file: { default: 'skip', policies: [MENTIONS] }, initialConfig: { default: 'skip', policies: [limited, MENTIONS] } });
+  assert.deepEqual(names(ownList.gate), ['mentions']);
+  assert.equal(ownList.gate.getStatus().configSource, 'file');
+  assert.ok(ownList.gate.getStatus().errors.some((e) => e.includes("The gate started with gate.json's rules.")), JSON.stringify(ownList.gate.getStatus().errors));
+  ownList.gate.dispose();
 
   // Beside rules under a name it doesn't read, which stay as written, it adds them in a "policies" list, as to a file with none.
   const theirs = { rules: [{ name: 'dm', behavior: 'always' }] };
