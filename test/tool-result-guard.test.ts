@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassthroughStrategy, type StoredMessage, type StrategyContext } from '@animalabs/context-manager';
 import type { ContentBlock, Membrane, NormalizedRequest, NormalizedResponse, YieldingStreamOptions } from '@animalabs/membrane';
-import { Membrane as RealMembrane, NativeFormatter, type ProviderAdapter, type ProviderRequest,
+import { MembraneError, Membrane as RealMembrane, NativeFormatter, type ProviderAdapter, type ProviderRequest,
   type ProviderResponse, type StreamCallbacks } from '@animalabs/membrane';
 import { AgentFramework, type AgentConfig, type AgentSettingsExtension, type Module, type ModuleContext,
   type ToolCall, type ToolResult, type ProcessEvent, type ProcessState } from '../src/index.js';
@@ -2200,6 +2200,184 @@ for (const how of ['abortInference', 'cancelStream'] as const) {
     });
   }
 }
+
+// What an ephemeral run's batch left in the guard's audit, read after a
+// restart: its records in order, and the reason its withheld record gives.
+async function ephemeralBatchAudit(base: Parameters<typeof AgentFramework.create>[0]): Promise<{ types: unknown[]; reason: unknown }> {
+  const restarted = await AgentFramework.create(base);
+  try {
+    const audit = restarted.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
+    const mine = audit.filter((r) => r.agentName === 'ephemeral');
+    return { types: mine.map((r) => r.type), reason: mine.find((r) => r.type === 'withheld')?.reason };
+  } finally { await restarted.stop(); }
+}
+const SETTLED_AS_IT_LEFT = ['staged', 'linked', 'withheld', 'annotated', 'stub_updated'];
+
+// An ephemeral run that leaves with its batch still pending settles it as it
+// leaves, before it's deregistered: once it's gone, driveStream's finally,
+// which abandons only while the agent is registered, and every later turn are
+// gone with it. Pinned for a failure whose stream ends only after the run's
+// caller has deregistered the agent, in both shapes, and for a run the
+// completion watchdog ends while its stream says nothing.
+for (const how of ['an uncaused error', 'an abort whose reason is timeout', 'the completion watchdog'] as const) {
+  test(`an ephemeral run that ends by ${how} with its batch pending settles the batch as it leaves`, async () => {
+    const h = await harness([[calls('one')]]);
+    if (how !== 'the completion watchdog') waitAfterTerminal(h.membrane, () => h.framework.getAgent('ephemeral') === null);
+    let spills = 0;
+    slowSpill(h.framework, async () => { spills++; });
+    h.membrane.onSubmit = () => {
+      // Once the results go in, the stream starts no next round: it reports
+      // the failure, or for the watchdog says nothing more.
+      const stream = h.membrane.streams.at(-1)! as unknown as { events: unknown[]; processResponse: (index: number) => void };
+      stream.processResponse = () => {};
+      if (how === 'an uncaused error') {
+        stream.events.push({ type: 'error', error: new MembraneError({ type: 'auth', retryable: false, message: 'key revoked', rawError: { status: 401 } }) });
+      } else if (how === 'an abort whose reason is timeout') {
+        stream.events.push({ type: 'aborted', reason: 'timeout' });
+      }
+    };
+    let outcome = 'pending';
+    try {
+      const created = await h.framework.createEphemeralAgent({
+        name: 'ephemeral', model: 'test', systemPrompt: 'system', toolResultGuard: true,
+      });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'read' }]);
+      const completion = h.framework.runEphemeralToCompletion(created.agent, created.contextManager,
+        how === 'the completion watchdog' ? { idleTimeoutMs: 200, idlePollMs: 20 } : undefined)
+        .then(() => { outcome = 'resolved'; }, (e) => { outcome = `rejected: ${(e as Error).message}`; });
+      h.framework.start();
+      await bounded(completion, 'the run settling');
+      assert.equal(created.agent.toolResultGuard.hasPending, false, 'the run left no batch pending');
+    } finally { await h.framework.stop(); }
+    assert.match(outcome, how === 'the completion watchdog' ? /^rejected: Ephemeral agent "ephemeral" stalled/
+      : how === 'an uncaused error' ? /^rejected: key revoked/ : /^rejected: Stream aborted: timeout/, 'the run ends as expected');
+    assert.equal(spills, 1, "the batch's original is offered to the host's spill once");
+    const audit = await ephemeralBatchAudit(h.base);
+    assert.deepEqual(audit.types, SETTLED_AS_IT_LEFT, 'the batch is settled once, and its stub says where its original is');
+    assert.equal(audit.reason, how === 'the completion watchdog' ? 'run_stalled' : 'aborted', 'naming why');
+  });
+}
+
+// A budget restart, and an error retry, keep the batch for the stream that
+// follows. When that stream's start fails before any stream exists, the
+// failure settles the run, and the batch is settled as the run leaves.
+for (const shape of ['a budget restart', 'an error retry'] as const) {
+  test(`an ephemeral run whose new start after ${shape} fails settles the batch it kept as it leaves`, async () => {
+    const h = await harness([[calls('one')], [answer()]]);
+    let spills = 0;
+    slowSpill(h.framework, async () => { spills++; });
+    if (shape === 'an error retry') {
+      h.membrane.onSubmit = () => {
+        // Once the results go in, the stream fails in a way the error policy retries.
+        const stream = h.membrane.streams.at(-1)! as unknown as { events: unknown[]; processResponse: (index: number) => void };
+        stream.processResponse = () => {};
+        stream.events.push({ type: 'error', error: new MembraneError({ type: 'server', retryable: true, retryAfterMs: 1, message: 'overloaded', rawError: { status: 529 } }) });
+      };
+    }
+    const make = h.membrane.streamYielding.bind(h.membrane);
+    let starts = 0;
+    h.membrane.streamYielding = (request, options) => {
+      starts++;
+      if (starts === 2) throw new MembraneError({ type: 'auth', retryable: false, message: 'key revoked at the new start', rawError: { status: 401 } });
+      return make(request, options);
+    };
+    let outcome = 'pending';
+    try {
+      const created = await h.framework.createEphemeralAgent({
+        name: 'ephemeral', model: 'test', systemPrompt: 'system', toolResultGuard: true,
+        ...(shape === 'a budget restart' ? { maxStreamTokens: 5 } : {}),
+      });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'read' }]);
+      const completion = h.framework.runEphemeralToCompletion(created.agent, created.contextManager)
+        .then(() => { outcome = 'resolved'; }, (e) => { outcome = `rejected: ${(e as Error).message}`; });
+      h.framework.start();
+      await bounded(completion, 'the run settling');
+      assert.equal(starts, 2, 'the new start was tried');
+      assert.equal(created.agent.toolResultGuard.hasPending, false, 'the run left no batch pending');
+    } finally { await h.framework.stop(); }
+    assert.match(outcome, /^rejected: key revoked at the new start/, "the run ends with the new start's error");
+    assert.equal(spills, 1, "the batch's original is offered to the host's spill once");
+    const audit = await ephemeralBatchAudit(h.base);
+    assert.deepEqual(audit.types, SETTLED_AS_IT_LEFT, 'the batch is settled once, and its stub says where its original is');
+    assert.equal(audit.reason, 'aborted', 'naming why');
+  });
+}
+
+// stop() ends a run as a stop, with no stop terminal: by its sweep of the
+// runs still registered once its waits have settled or run out, here with
+// the run's stream still running past stop()'s budget, or by the completion
+// watchdog, firing while stop() waits for that stream. Either way the batch
+// reads `aborted`, as the run's error is a stop's.
+for (const how of ["stop()'s sweep", 'the completion watchdog during a stop()'] as const) {
+  test(`an ephemeral run ended by ${how} while its stream is still running settles its batch as it leaves`, async () => {
+    const h = await harness([[calls('one')]]);
+    let endStream: (() => void) | undefined;
+    h.membrane.onSubmit = () => {
+      // Once the results go in, the stream says nothing more, and stop()'s
+      // cancel doesn't end it: the test does, once it has looked.
+      const stream = h.membrane.streams.at(-1)! as unknown as { processResponse: (index: number) => void; cancel: () => void };
+      stream.processResponse = () => {};
+      endStream = stream.cancel.bind(stream);
+      stream.cancel = () => {};
+    };
+    let outcome = 'pending';
+    try {
+      const created = await h.framework.createEphemeralAgent({
+        name: 'ephemeral', model: 'test', systemPrompt: 'system', toolResultGuard: true,
+      });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'read' }]);
+      const completion = h.framework.runEphemeralToCompletion(created.agent, created.contextManager,
+        how === "stop()'s sweep" ? undefined : { idleTimeoutMs: 200, idlePollMs: 20 })
+        .then(() => { outcome = 'resolved'; }, (e) => { outcome = `rejected: ${(e as Error).message}`; });
+      h.framework.start();
+      for (let i = 0; i < 400 && !created.agent.toolResultGuard.hasPending; i++) await new Promise((r) => setTimeout(r, 5));
+      assert.ok(created.agent.toolResultGuard.hasPending, 'the results went in');
+      const stopped = await h.framework.stop(how === "stop()'s sweep" ? 100 : 1_000).then(() => 'resolved', (e: unknown) => e);
+      assert.ok(stopped instanceof Error && /^Shutdown timed out/.test(stopped.message), `stop() waited for the stream: ${String(stopped)}`);
+      await bounded(completion, 'the run settling');
+      assert.equal(h.framework.getAgent('ephemeral'), null, 'the run has left');
+      assert.equal(created.agent.toolResultGuard.hasPending, false, 'the run left no batch pending');
+    } finally {
+      endStream?.();
+      await h.framework.stop();
+    }
+    assert.match(outcome, how === "stop()'s sweep" ? /^rejected: Ephemeral agent "ephemeral" refused: the framework is stopping$/
+      : /^rejected: Ephemeral agent "ephemeral" refused: the framework is stopping \(no stream-driver activity/, 'the run ends as a stop');
+    const audit = await ephemeralBatchAudit(h.base);
+    assert.deepEqual(audit.types, SETTLED_AS_IT_LEFT, 'the batch is settled once, and its stub says where its original is');
+    assert.equal(audit.reason, 'aborted', 'naming why');
+  });
+}
+
+// The rest of the run's teardown, its stream's cancel and its deregistration,
+// doesn't depend on the batch's record: a leave-point abandon that throws is
+// said, and the run still ends with its own error and leaves the framework.
+test('an ephemeral run whose batch fails to record as it leaves still ends with its own error and is deregistered', async (t) => {
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  const h = await harness([[calls('one')]]);
+  h.membrane.onSubmit = () => {
+    // Once the results go in, the stream says nothing more.
+    (h.membrane.streams.at(-1)! as unknown as { processResponse: (index: number) => void }).processResponse = () => {};
+  };
+  let outcome = 'pending';
+  try {
+    const created = await h.framework.createEphemeralAgent({
+      name: 'ephemeral', model: 'test', systemPrompt: 'system', toolResultGuard: true,
+    });
+    created.agent.toolResultGuard.abandon = () => { throw new Error('audit unavailable'); };
+    created.contextManager.addMessage('user', [{ type: 'text', text: 'read' }]);
+    const completion = h.framework.runEphemeralToCompletion(created.agent, created.contextManager,
+      { idleTimeoutMs: 200, idlePollMs: 20 })
+      .then(() => { outcome = 'resolved'; }, (e) => { outcome = `rejected: ${(e as Error).message}`; });
+    h.framework.start();
+    await bounded(completion, 'the run settling');
+    assert.equal(h.framework.getAgent('ephemeral'), null, 'the run is deregistered');
+  } finally { await h.framework.stop(); }
+  assert.match(outcome, /^rejected: Ephemeral agent "ephemeral" stalled/, 'the run ends with its own error');
+  assert.ok(lines.some((line) => line.includes('failed to record a batch the ephemeral run left')
+    && line.includes('audit unavailable')), 'the failed record is said');
+});
 
 // ---------------------------------------------------------------------------
 // #281's review: each withheld result's file is its own, a branch change stops
