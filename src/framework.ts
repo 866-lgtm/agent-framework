@@ -492,7 +492,7 @@ const COALESCING_RECENT_ID = 'mcpl/coalescing-recent';
  *  string's length (UTF-16 code units, which the messages call characters),
  *  its record isn't written at all and keeps what it last held, rather than
  *  rewriting a multi-MB snapshot per deferral. quiesce() refuses a queue
- *  over it (writeDeferredWritesForQuiesce). */
+ *  over it, unless the call has `abandon` (writeDeferredWritesForQuiesce). */
 const DEFERRED_WRITES_PERSIST_CAP_CHARS = 4 * 1024 * 1024;
 
 /** Requests that CONTINUE a turn whose token is already held — a context-
@@ -1014,6 +1014,20 @@ export class ResumeBlockedError extends Error {
   ) {
     super(message);
     this.name = 'ResumeBlockedError';
+  }
+}
+
+/**
+ * Thrown by `quiesce()` without `abandon` when the queue of deferred context
+ * writes is over its cap, so its record can't hold it and a restart would
+ * lose it. The host's mode is as it was, and the message names the ways out:
+ * wait for the writes to land, or quiesce with `abandon: true` to end the
+ * turns they wait for, then resume.
+ */
+export class QuiesceBlockedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'QuiesceBlockedError';
   }
 }
 
@@ -1967,8 +1981,8 @@ export class AgentFramework {
    *  clears the record once the queue drains. */
   private deferredWritesPersisted = false;
   /** True from a write of the queue that failed or met the cap, outside
-   *  quiesce(), until one succeeds: a run of failures
-   *  (deferredWritesFellBehind). */
+   *  quiesce()'s refusal (quiesce({ abandon: true }) over the cap included),
+   *  until one succeeds: a run of failures (deferredWritesFellBehind). */
   private deferredWritesBehind = false;
   /** True once the cap has been met in the current run, so its line is
    *  logged once a run, whatever began the run. */
@@ -4905,8 +4919,8 @@ export class AgentFramework {
    * in-flight turns to settle (turn-alive is `activeTurnTokens`, which spans
    * dequeue → settled teardown). Idempotent, but for the queue's write, which
    * every call makes first: a write that fails rejects with the host's mode
-   * as it was, and so does a queue over the cap, unless the call has
-   * `abandon`, which goes on with the cap's alert
+   * as it was, and so does a queue over the cap, with a QuiesceBlockedError,
+   * unless the call has `abandon`, which goes on with the cap's alert
    * (writeDeferredWritesForQuiesce).
    *
    * On drain timeout the host STAYS quiesced (`drained: false` in the
@@ -5522,8 +5536,8 @@ export class AgentFramework {
    * with the host's mode as it was (store only, the slot set before a sync
    * that failed leaves the queue mirrored: writeDeferredWritesSlot). A queue
    * over the cap writes nothing. A call with `abandon` goes on, with the
-   * cap's alert, and any other throws an error naming the cap and the ways
-   * out.
+   * cap's alert, and any other throws a QuiesceBlockedError naming the cap
+   * and the ways out.
    */
   private writeDeferredWritesForQuiesce(abandon: boolean): void {
     const outcome = this.writeDeferredWrites(true);
@@ -5535,15 +5549,16 @@ export class AgentFramework {
         this.deferredWritesFellBehind('over-cap');
         return;
       }
-      throw new Error(
+      throw new QuiesceBlockedError(
         `quiesce refused: the queue's ${this.durableDeferredWrites().length} deferred context write(s) come to ` +
         `more than ${DEFERRED_WRITES_PERSIST_CAP_CHARS} characters of JSON, the cap, so ` +
         `${this.deferredWritesRecord()} can't hold them, and a restart would lose them. ` +
         (this.quiesced
-          ? 'Resume so they land, then quiesce again; if a turn they wait for won\'t end, ' +
-            'quiesce with abandon: true first to end it.'
-          : 'Quiesce again once they have landed, or quiesce with abandon: true to end the turns ' +
-            'they wait for, then resume so they land, and quiesce again.'),
+          ? 'Resume so they land, then quiesce again. If a turn they wait for won\'t end, quiesce with ' +
+            'abandon: true first. '
+          : 'Quiesce again once they have landed, or quiesce with abandon: true to end the turns they ' +
+            'wait for, then resume so they land, and quiesce again. ') +
+        'A turn the abandon can\'t end is listed as unabandonable, and its writes land when it ends on its own.',
       );
     }
     if (outcome !== 'nothing') this.deferredWritesCaughtUp();
@@ -7595,12 +7610,20 @@ export class AgentFramework {
     if (params.command === 'quiesce') {
       // quiesce() clamps timeoutMs to [1s, 10m] itself — one clamp for every ingress.
       console.error(`[host-command] quiesce by=${requester} (server=${serverId})`);
-      const hostMode = await this.quiesce({
-        reason: params.reason ?? `host/command by ${requester}`,
-        ...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs } : {}),
-        ...(params.abandon ? { abandon: true } : {}),
-      });
-      return { ok: true, hostMode };
+      try {
+        const hostMode = await this.quiesce({
+          reason: params.reason ?? `host/command by ${requester}`,
+          ...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs } : {}),
+          ...(params.abandon ? { abandon: true } : {}),
+        });
+        return { ok: true, hostMode };
+      } catch (error) {
+        // A refusal, as resume()'s is below: the host's mode is as it was.
+        if (error instanceof QuiesceBlockedError) {
+          return { ok: false, error: error.message, hostMode: this.getHostModeStatus() };
+        }
+        throw error;
+      }
     }
     if (params.command === 'resume') {
       console.error(`[host-command] resume by=${requester} (server=${serverId})`);

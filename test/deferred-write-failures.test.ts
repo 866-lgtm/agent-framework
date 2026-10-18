@@ -1,8 +1,9 @@
 /**
  * The queue of context writes deferred while quiesced, when its record can't
  * be written or the queue is over the cap: quiesce() writes the queue before
- * it changes anything and rejects when it can't, and elsewhere a write that
- * fails keeps the queue in memory with one ops alert a run.
+ * it changes the host's mode, and rejects when the write fails or, without
+ * abandon, when the queue is over the cap; elsewhere a write that fails or
+ * meets the cap keeps the queue in memory with one ops alert a run.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -12,7 +13,8 @@ import { join } from 'node:path';
 import type { NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import { JsStore } from '@animalabs/chronicle';
 
-import { AgentFramework } from '../src/index.js';
+import * as indexExports from '../src/index.js';
+import { AgentFramework, ApiServer } from '../src/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
 /** A stream that ends only when cancelled: a turn that stays alive. */
@@ -234,11 +236,14 @@ test('a queue over the cap is refused by a quiesce() without abandon, with the h
     await h.liveTurn();
     h.add(OVER_CAP);
     await assert.rejects(h.framework.quiesce({ reason: 'surgery', timeoutMs: 1_000 }), {
+      name: 'QuiesceBlockedError',
       message: `quiesce refused: the queue's 1 deferred context write(s) come to more than 4194304 characters of JSON, ` +
         `the cap, so ${h.queuePath} can't hold them, and a restart would lose them. Quiesce again once they have landed, ` +
-        'or quiesce with abandon: true to end the turns they wait for, then resume so they land, and quiesce again.',
+        'or quiesce with abandon: true to end the turns they wait for, then resume so they land, and quiesce again. ' +
+        "A turn the abandon can't end is listed as unabandonable, and its writes land when it ends on its own.",
     });
     assert.equal(h.framework.getHostModeStatus().quiesced, false, 'the host is still serving');
+    assert.equal(h.framework.getHostModeStatus().activeTurns, 1, 'the turn is still alive');
     assert.equal(existsSync(h.hostModePath), false, 'no host-mode record was written');
     assert.equal(h.queued(), undefined, 'and no queue');
   });
@@ -249,18 +254,57 @@ test('a queue over the cap is refused by a quiesce() without abandon, with the h
     await assert.rejects(h.framework.quiesce({ reason: 'surgery' }), {
       message: `quiesce refused: the queue's 2 deferred context write(s) come to more than 4194304 characters of JSON, ` +
         `the cap, so ${h.queuePath} can't hold them, and a restart would lose them. Resume so they land, then quiesce ` +
-        "again; if a turn they wait for won't end, quiesce with abandon: true first to end it.",
+        "again. If a turn they wait for won't end, quiesce with abandon: true first. A turn the abandon can't end is " +
+        'listed as unabandonable, and its writes land when it ends on its own.',
     });
     assert.equal(h.framework.getHostModeStatus().quiesced, true, 'still quiesced');
     assert.deepEqual(h.queued(), ['small'], 'the record keeps what it last held');
+    const alerts = h.alerts.length;
+    const repeat = await h.framework.quiesce({ reason: 'surgery', abandon: true });
+    assert.equal(repeat.quiesced, true, 'a repeat with abandon goes past the cap');
+    assert.equal(h.alerts.length, alerts, 'within the run the deferral began, with no second alert');
   });
 });
 
-test('a queue over the cap held for a turn that never ends: a plain quiesce() refuses, quiesce({ abandon: true }) goes on with the alert, and after resume() the writes land', async () => {
+test('a refusal over the cap answers host/command with ok: false and the host mode, and the HTTP route with a 409, as resume()\'s refusal does', async () => {
   await withHost('recovery file', async (h) => {
     await h.liveTurn();
     h.add(OVER_CAP);
-    await assert.rejects(h.framework.quiesce({ reason: 'surgery', timeoutMs: 1_000 }), /^Error: quiesce refused: /);
+    const command = (h.framework as unknown as {
+      handleHostCommand(serverId: string, params: { command: string; timeoutMs?: number }): Promise<{
+        ok: boolean; error?: string; hostMode?: { quiesced: boolean };
+      }>;
+    }).handleHostCommand('test-server', { command: 'quiesce', timeoutMs: 1_000 });
+    const answer = await command;
+    assert.equal(answer.ok, false);
+    assert.match(answer.error ?? '', /^quiesce refused: /);
+    assert.equal(answer.hostMode?.quiesced, false);
+
+    const server = new ApiServer(h.framework, { port: 0, host: '127.0.0.1' });
+    await server.start();
+    try {
+      const port = (server as unknown as { httpServer: { address(): { port: number } } }).httpServer.address().port;
+      const response = await fetch(`http://127.0.0.1:${port}/quiesce?timeoutMs=1000`, { method: 'POST', headers: { 'x-admin-token': 'any' } });
+      assert.equal(response.status, 409);
+      const body = await response.json() as { error: string; hostMode: { quiesced: boolean } };
+      assert.match(body.error, /^quiesce refused: /);
+      assert.equal(body.hostMode.quiesced, false);
+    } finally {
+      await server.stop();
+    }
+    // Exported, as ResumeBlockedError is (read by name so this file builds against main's exports too).
+    const Blocked = (indexExports as unknown as Record<string, unknown>).QuiesceBlockedError as (new (...args: never[]) => Error) | undefined;
+    assert.equal(typeof Blocked, 'function', 'QuiesceBlockedError is exported');
+    await assert.rejects(h.framework.quiesce({ timeoutMs: 1_000 }), (error) => error instanceof Blocked!);
+  });
+});
+
+test('a queue over the cap held for a turn whose stream never ends: a plain quiesce() refuses, quiesce({ abandon: true }) goes on with the alert, and after resume() the writes land', async () => {
+  await withHost('recovery file', async (h) => {
+    await h.liveTurn();
+    h.add(OVER_CAP);
+    await assert.rejects(h.framework.quiesce({ reason: 'surgery', timeoutMs: 1_000 }),
+      { name: 'QuiesceBlockedError', message: /^quiesce refused: / });
     assert.equal(h.framework.getHostModeStatus().quiesced, false);
     assert.equal(h.alerts.length, 0, 'a refusal raises no alert');
 
