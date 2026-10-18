@@ -77,9 +77,11 @@ export interface MountView {
  * A mount nested in another: its directory in one of its spellings,
  * mount-relative and `/`-separated, its name, and its root as realpath
  * resolves it (the nearest existing directory's, where the root isn't made
- * yet), which every spelling shares.
+ * yet), which every spelling shares. No real root where it's this mount's
+ * own or holds it: the mount is nested by its configured path alone, since
+ * through its real root it would claim this mount's every path.
  */
-export type NestedMount = { dir: string; name: string; real: string };
+export type NestedMount = { dir: string; name: string; real?: string };
 
 export type StatFingerprint = Omit<Fingerprint, 'hashedAt'>;
 
@@ -309,7 +311,7 @@ export async function linkReason(view: Pick<MountView, 'root' | 'name' | 'nested
  */
 export function nestedAtReal(real: string, nested: readonly NestedMount[] = []): { name: string; use: string } | undefined {
   const holder = nested
-    .filter((n) => contained(n.real, real))
+    .flatMap((n) => (n.real !== undefined && contained(n.real, real) ? [{ name: n.name, real: n.real }] : []))
     .sort((a, b) => b.real.length - a.real.length)[0];
   if (!holder) return undefined;
   const rest = relative(holder.real, real).split(sep).join('/');

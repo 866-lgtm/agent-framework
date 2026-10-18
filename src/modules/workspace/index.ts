@@ -6,7 +6,7 @@
  */
 
 import { isUtf8 } from 'node:buffer';
-import { constants as fsConstants, readlinkSync, realpathSync } from 'node:fs';
+import { constants as fsConstants } from 'node:fs';
 import type { Stats } from 'node:fs';
 import { open, readdir, readlink, stat, lstat, realpath } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve, relative, sep } from 'node:path';
@@ -305,47 +305,47 @@ function nestedDir(from: string, to: string): string | undefined {
   return rel.split(sep).join('/');
 }
 
-/** How many links realRoot and realBeneath follow to a place not made yet before they stop, as the kernel's limit does. */
+/** A mount nested in another, as the outer mount's otherMounts holds it. */
+interface NestedMountEntry {
+  name: string;
+  /**
+   * Its real root, as realBeneath places it once a start has read it, and
+   * its root as resolved until then. None where it's the outer mount's own
+   * or holds it (NestedMount).
+   */
+  real?: string;
+  /** Its directory as configured and as the real roots place it. */
+  fromRoots: Array<{ dir: string; root: string }>;
+  /** Those, and each as disk spells it where that differs. */
+  spellings: Array<{ dir: string; root: string }>;
+}
+
+/** How many links realBeneath follows to a place not made yet before it stops, as the kernel's limit does. */
 const LINKS_FOLLOWED = 40;
 
 /**
- * A mount root as realpath resolves it, with the links on its way and in it
- * taken out. Where nothing is there yet, a link leads where its target would
- * be, and anything else lies beneath its nearest existing directory's real
- * path, with the rest as configured. Where a directory can't be resolved for
- * any other reason, such as a loop or a lack of permission, the path as
- * resolved lexically from there.
+ * An absolute path, a mount root's or one beneath it, as realpath resolves
+ * it, with the links on its way and in it taken out, read without holding
+ * the process. Where nothing is there yet, a link leads where its target
+ * would be, and anything else lies beneath its nearest existing directory's
+ * real path, with the rest as given. A link's target is read from the
+ * link's directory as it is on disk, and nothing is resolved lexically on
+ * the way, so a `..` is taken from where the links before it lead, as the
+ * kernel takes it. Where a directory can't be resolved for any other
+ * reason, such as a loop or a lack of permission, the path as resolved
+ * lexically from there.
  */
-function realRoot(path: string, links = 0): string {
-  const absolute = resolve(path);
-  try {
-    return realpathSync.native(absolute);
-  } catch (err) {
-    const code = errnoOf(err);
-    if ((code !== 'ENOENT' && code !== 'ENOTDIR') || links >= LINKS_FOLLOWED) return absolute;
-    let target: string | null = null;
-    try {
-      target = readlinkSync(absolute);
-    } catch {
-      // Not a link: what's missing is it or a directory above it.
-    }
-    if (target !== null) return realRoot(resolve(dirname(absolute), target), links + 1);
-    const parent = dirname(absolute);
-    return parent === absolute ? absolute : join(realRoot(parent, links), basename(absolute));
-  }
-}
-
-/** realRoot for any absolute path, read without holding the process. */
 async function realBeneath(absolute: string, links = 0): Promise<string> {
   try {
     return await realpath(absolute);
   } catch (err) {
     const code = errnoOf(err);
-    if ((code !== 'ENOENT' && code !== 'ENOTDIR') || links >= LINKS_FOLLOWED) return absolute;
-    const target = await readlink(absolute).catch(() => null);
-    if (target !== null) return realBeneath(resolve(dirname(absolute), target), links + 1);
     const parent = dirname(absolute);
-    return parent === absolute ? absolute : join(await realBeneath(parent, links), basename(absolute));
+    if ((code !== 'ENOENT' && code !== 'ENOTDIR') || links >= LINKS_FOLLOWED || parent === absolute) return resolve(absolute);
+    const place = await realBeneath(parent, links);
+    const target = await readlink(absolute).catch(() => null);
+    if (target !== null) return realBeneath(isAbsolute(target) ? target : `${place}${sep}${target}`, links + 1);
+    return join(place, basename(absolute));
   }
 }
 
@@ -790,19 +790,16 @@ export class WorkspaceModule implements Module {
   private ctimeTrust = new Map<string, string | null>();
   /**
    * Each mount's directories that are other mounts nested inside it, with
-   * each mount's name and real root (realRoot), in each spelling that names
-   * the directory: as configured; as the real roots place it, where that
-   * differs (`fromRoots`, both found at construction); and as disk spells
-   * each of those where that differs (spellNestedDirs). Each spelling is
-   * mount-relative and `/`-separated, with its root beneath the mount's
-   * resolved root.
+   * each mount's name and real root, in each spelling that names the
+   * directory: as configured; as the real roots place it, where that differs
+   * (`fromRoots`); and as disk spells each of those where that differs.
+   * Each spelling is mount-relative and `/`-separated, with its root beneath
+   * the mount's resolved root. The constructor nests by configured path,
+   * with each root as resolved standing for its real one, and each start
+   * reads it all again with the roots placed where disk has them
+   * (readNesting).
    */
-  private otherMounts = new Map<string, Array<{
-    name: string;
-    real: string;
-    fromRoots: Array<{ dir: string; root: string }>;
-    spellings: Array<{ dir: string; root: string }>;
-  }>>();
+  private otherMounts = new Map<string, NestedMountEntry[]>();
   /**
    * Whether a file's mode is observed, taken in and applied (MountRuntime's
    * `modesObserved`): not on Windows, which reports no POSIX modes. A test
@@ -831,32 +828,21 @@ export class WorkspaceModule implements Module {
     // named or not, and in its watcher (OTHER_MOUNT). It's kept apart from
     // the outer mount's ignore list, which a sync that names a path sets
     // aside for what it names (#276), so no sync of the outer mount takes in
-    // the inner one's files. A root configured through a symlink, or beneath
-    // one, is nested where realpath places it, so each root is resolved
-    // once, here, before any path is parsed: an inner mount nested only that
-    // way, and one whose directory the real roots place elsewhere than the
-    // configured paths do, is passed over at each place. Reading a root that
-    // stops answering holds the process here, as the watcher's start does
-    // (#311).
-    const reals = new Map(config.mounts.map((mount) => [mount.name, realRoot(mount.path)]));
+    // the inner one's files. Here by configured path, before any path is
+    // parsed; each start places the roots where disk has them too
+    // (readNesting).
     for (const outer of config.mounts) {
       for (const inner of config.mounts) {
         if (outer === inner) continue;
         const outerPath = resolve(outer.path);
-        const real = reals.get(inner.name)!;
-        // A mount whose real root is this one's, or holds it, isn't nested in
-        // it, however its configured path reads: it would claim this mount's
-        // every path.
-        if (isContainedPath(real, reals.get(outer.name)!)) continue;
-        const fromRoots: Array<{ dir: string; root: string }> = [];
-        for (const dir of [nestedDir(outerPath, resolve(inner.path)), nestedDir(reals.get(outer.name)!, real)]) {
-          if (dir !== undefined && !fromRoots.some((s) => s.dir === dir)) fromRoots.push({ dir, root: join(outerPath, ...dir.split('/')) });
-        }
-        if (fromRoots.length === 0) continue;
-        this.otherMounts.set(outer.name, [...(this.otherMounts.get(outer.name) ?? []), { name: inner.name, real, fromRoots, spellings: [...fromRoots] }]);
+        const innerPath = resolve(inner.path);
+        const dir = nestedDir(outerPath, innerPath);
+        if (dir === undefined) continue;
+        const configured = [{ dir, root: innerPath }];
+        this.otherMounts.set(outer.name, [...(this.otherMounts.get(outer.name) ?? []), { name: inner.name, real: innerPath, fromRoots: configured, spellings: [...configured] }]);
         console.warn(
           `[workspace] Mount "${outer.name}" contains mount "${inner.name}" ` +
-          `at ${fromRoots.map((s) => `${s.dir}/`).join(' and ')} — passing over it as another mount's directory`,
+          `at ${dir}/ — passing over it as another mount's directory`,
         );
       }
     }
@@ -1033,13 +1019,15 @@ export class WorkspaceModule implements Module {
   }
 
   async start(ctx: ModuleContext): Promise<void> {
-    // Each nested mount's directory as disk spells it, read before this start
-    // sets anything, so a restart takes no call and walks or watches nothing
-    // before the spellings are known. A stop begun meanwhile stands, and this
-    // start then sets nothing.
+    // Which mounts are nested where, with the roots placed where disk has
+    // them and each nested mount's directory as disk spells it, read before
+    // this start sets anything, so a restart takes no call and walks or
+    // watches nothing before they're known. A stop begun meanwhile stands,
+    // and this start then sets nothing.
     const stops = this.stopsBegun;
-    await this.spellNestedDirs();
+    const nesting = await this.readNesting();
     if (this.stopsBegun !== stops) return;
+    this.otherMounts = nesting;
 
     this.ctx = ctx;
     this.stopped = false;
@@ -1731,7 +1719,7 @@ export class WorkspaceModule implements Module {
     try {
       // Synchronous, so the path as given: it reaches the same file, and
       // the nested-mount check matches it as configured or as disk spells
-      // the nested mount's directory (spellNestedDirs).
+      // the nested mount's directory (readNesting).
       const { mount, relativePath } = this.refuseNested({ ...this.parsePathAsGiven(mountPrefixedPath), path: mountPrefixedPath });
       return resolve(mount.config.path, relativePath);
     } catch {
@@ -1927,28 +1915,55 @@ export class WorkspaceModule implements Module {
   }
 
   /**
-   * Adds to each nested mount's directory the spelling disk lists it by,
-   * where that differs from those found at construction (`fromRoots`). On a
+   * Which mounts are nested in which, read afresh at each start. A mount is
+   * nested in another where its configured path, or its real root, lies
+   * beneath the other's. Each root is placed by realBeneath, awaited, so a
+   * root on a share that stops answering holds this start and not the
+   * process, and a root moved while the module was stopped is placed where
+   * it is now. A mount whose real root is the other's own, or holds it, is
+   * nested by its configured path alone, with no real root, since through it
+   * it would claim the other's every path.
+   *
+   * Each way it lies there is a spelling of its directory (`fromRoots`), and
+   * so is the spelling disk lists each of those by, where that differs. On a
    * disk that folds names, the outer mount's walks name the directory as
    * disk does, and so does a path parsePath has respelled, while a path given
    * as configured still names it as configured (resolveAbsolutePath). A
-   * directory not on disk keeps the spellings found at construction alone.
-   * Run at each start.
+   * directory not on disk keeps the spellings the roots give alone.
    */
-  private async spellNestedDirs(): Promise<void> {
-    for (const [outerName, nested] of this.otherMounts) {
-      const outer = this.config.mounts.find((m) => m.name === outerName);
-      if (!outer) continue;
-      const outerRoot = resolve(outer.path);
-      for (const entry of nested) {
-        const spellings = [...entry.fromRoots];
-        for (const found of entry.fromRoots) {
-          const dir = await diskSpelling(outerRoot, found.dir);
-          if (!spellings.some((s) => s.dir === dir)) spellings.push({ dir, root: join(outerRoot, ...dir.split('/')) });
+  private async readNesting(): Promise<Map<string, NestedMountEntry[]>> {
+    const reals = new Map<string, string>();
+    for (const mount of this.config.mounts) reals.set(mount.name, await realBeneath(resolve(mount.path)));
+    const nesting = new Map<string, NestedMountEntry[]>();
+    for (const outer of this.config.mounts) {
+      const outerPath = resolve(outer.path);
+      const outerReal = reals.get(outer.name)!;
+      for (const inner of this.config.mounts) {
+        if (outer === inner) continue;
+        const real = reals.get(inner.name)!;
+        const configured = nestedDir(outerPath, resolve(inner.path));
+        const fromRoots: Array<{ dir: string; root: string }> = [];
+        for (const dir of [configured, nestedDir(outerReal, real)]) {
+          if (dir !== undefined && !fromRoots.some((s) => s.dir === dir)) fromRoots.push({ dir, root: join(outerPath, ...dir.split('/')) });
         }
-        entry.spellings = spellings;
+        if (fromRoots.length === 0) continue;
+        const spellings = [...fromRoots];
+        for (const found of fromRoots) {
+          const dir = await diskSpelling(outerPath, found.dir);
+          if (!spellings.some((s) => s.dir === dir)) spellings.push({ dir, root: join(outerPath, ...dir.split('/')) });
+        }
+        const claims = !isContainedPath(real, outerReal);
+        nesting.set(outer.name, [...(nesting.get(outer.name) ?? []), { name: inner.name, ...(claims ? { real } : {}), fromRoots, spellings }]);
+        const placed = fromRoots.filter((s) => s.dir !== configured);
+        if (placed.length > 0) {
+          console.warn(
+            `[workspace] Mount "${outer.name}" contains mount "${inner.name}" where its root is on disk, ` +
+            `at ${placed.map((s) => `${s.dir}/`).join(' and ')} — passing over it as another mount's directory`,
+          );
+        }
       }
     }
+    return nesting;
   }
 
   /** The mounts nested in `mountName`, by directory, name and real root (MountView's `nested`), in each spelling known. */
@@ -2382,10 +2397,10 @@ export class WorkspaceModule implements Module {
         // where it leads, with the setting for a link to a directory.
         return new WorkspaceImageReadError('parent_symlink', err.message);
       case 'other_mount':
-        // The core reader's own words for a link on its way into a nested
-        // mount's directory: that mount and the path to use there in place of
-        // the link. (#460's own other_mount, a path in that directory, is
-        // refused at parse.)
+        // The core reader's own words for a path a link takes into a nested
+        // mount's directory: that mount and the path to use there. (#460's
+        // own other_mount, a path in that directory, is refused at parse,
+        // and so is a link found there before the read.)
         return new WorkspaceImageReadError('other_mount', err.message);
       case 'escape':
         // The core reader's own words: "Symlink escape detected: <path>" for a
