@@ -1592,6 +1592,43 @@ for (const method of ['compileContext', 'compileWithInjections'] as const) test(
   assert(isMarked(stored), "the edit is the agent's first view");
 });
 
+test("#157: a compile that throws after a tool boundary has moved the shown mark leaves the boundary's move, so an edit of a message stored at once is a marker", async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close); await f.register();
+  await f.send('push/event', f.params('d1', 'doc_unseen', { initial: true }));
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 0, 'no turn ran');
+  const agent = f.framework.getAgent('agent')!;
+  const cm = agent.getContextManager() as unknown as { compile: (...args: unknown[]) => Promise<unknown> };
+  const compile = cm.compile;
+  // A boundary of another turn injects while the compile runs, then the compile fails.
+  cm.compile = async () => { agent.markContextShown(); throw new Error('compile_failed'); };
+  await assert.rejects(agent.compileContext(), /compile_failed/);
+  cm.compile = compile;
+  const edit = await f.send('push/event', { ...f.params('d2', 'doc_edited'), tags: ['chat:edited'] });
+  assert.equal(edit.result.coalesce.outcome, 'replaced', 'the message is still unread');
+  const stored = storedWith(f, 'doc_edited');
+  assert(stored, 'the edit is stored');
+  assert(!isMarked(stored), "the edit isn't the agent's first view");
+});
+
+test('#157: a tool boundary that cannot read the store counts every message as shown, so an edit of a message stored at once is a marker', async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close); await f.register();
+  await f.send('push/event', f.params('d1', 'doc_unseen', { initial: true }));
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 0, 'no turn ran');
+  const agent = f.framework.getAgent('agent')!;
+  const cm = agent.getContextManager() as unknown as { currentBranch: () => unknown };
+  const currentBranch = cm.currentBranch;
+  cm.currentBranch = () => { throw new Error('store_unreadable'); };
+  agent.markContextShown();
+  cm.currentBranch = currentBranch;
+  const edit = await f.send('push/event', { ...f.params('d2', 'doc_edited'), tags: ['chat:edited'] });
+  assert.equal(edit.result.coalesce.outcome, 'replaced', 'the message is still unread');
+  const stored = storedWith(f, 'doc_edited');
+  assert(stored, 'the edit is stored');
+  assert(!isMarked(stored), "the edit isn't the agent's first view");
+});
+
 test("#157: a dry-run preview shows the agent nothing, so an edit of a message stored at once after one is still its first view", async (t) => {
   const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close); await f.register();
   await f.send('push/event', f.params('d1', 'doc_unseen', { initial: true }));
@@ -1637,6 +1674,34 @@ test("#157: a render that lands unread in another agent's deferred queue keeps i
   const edit = await coalescer.accept(occurrence('e1', { tags: ['chat:edited'] }));
   assert.equal(edit.coalesce?.outcome, 'replaced', 'the edit replaced the unread render');
   assert.deepEqual(delivered, [{ eventId: 'n1', replacesUnread: true }, { eventId: 'e1', replacesUnread: true }], 'the render and the edit that replaced it are each marked');
+});
+
+test("#157: a notice's render that lands while an earlier render of its subject waits unread in a deferred queue is no first view", async () => {
+  const delivered: Array<{ eventId: string; replacesUnread?: true }> = [];
+  let releaseFirst!: () => void;
+  const firstRender = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  const host: CoalescerHost<null> = {
+    isUnread: () => true, isUnshown: () => true, remove: () => true,
+    // Every delivery lands in the deferred queue of an agent whose turn is alive.
+    deliver: async (occ) => { delivered.push({ eventId: occ.eventId, ...(occ.replacesUnread ? { replacesUnread: true as const } : {}) }); return { agent: 'other', deferredId: `deferred-${delivered.length}` }; },
+    wakeForBatch: async () => {}, cancelWake: () => {}, authorized: () => true,
+    audience: async () => ['agent', 'other'],
+    render: async (occ) => { if (occ.eventId === 'n1') await firstRender; return { content: [{ type: 'text', text: `diff_${occ.eventId}` }] }; },
+    audit: () => {}, save: () => {},
+  };
+  const coalescer = new PushCoalescer<null>(host);
+  const occurrence = (eventId: string, flags: Partial<CoalescedOccurrence<null>>): CoalescedOccurrence<null> => ({
+    serverId: 'editor', binding: 'binding', scope: { kind: 'featureSet', id: 'doc' }, key: 'document', eventId, timestamp: TS,
+    retract: false, deferred: false, initial: false, content: [{ type: 'text', text: eventId }], event: null, ...flags,
+  });
+  await coalescer.accept(occurrence('n1', { deferred: true, initial: true }));
+  const first = coalescer.assemble('agent');
+  // A second notice arrives while the first batch renders, so it opens a new batch.
+  await coalescer.accept(occurrence('n2', { deferred: true }));
+  releaseFirst();
+  await first;
+  await coalescer.assemble('agent');
+  assert.deepEqual(delivered, [{ eventId: 'n1', replacesUnread: true }, { eventId: 'n2' }], 'only the first render is the first view');
 });
 
 for (const shown of [false, true]) test(`#157: a notice that displaces an unread first view ${shown ? 'that something may have shown the agent opens a batch whose render is no first view' : 'that nothing has shown the agent opens a batch whose render is the first view'}`, async () => {
