@@ -2051,6 +2051,24 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
     }
   });
 
+  it("a script that changes the mode of fd 1 or fd 3 keeps the interpreter: the check of the runtime's own fds compares which file each is, not its mode, which macOS sets from a socket's state", async () => {
+    // Linux lets a script change a socket's mode with fchmod. Where that's refused,
+    // the script goes on without it, and on macOS the shutdown tests cover the check.
+    for (const fd of [1, 3]) {
+      const runner = new PyRunner({ onToolCall: async () => '' });
+      try {
+        const changed = await within(
+          runner.exec(`import os\ntry:\n    os.fchmod(${fd}, 0o600)\nexcept OSError:\n    pass\nkept = ${fd}\nprint("changed")`, []),
+          `fd ${fd}`,
+        );
+        assert.deepStrictEqual(changed, { stdout: 'changed\n', stderr: '', returnCode: 0 }, `fd ${fd}`);
+        assert.strictEqual((await within(runner.exec('print(kept)', []), `the next script (fd ${fd})`)).stdout, `${fd}\n`, `fd ${fd}`);
+      } finally {
+        runner.dispose();
+      }
+    }
+  });
+
   it('an interpreter that exits while no script runs says so in the host log', async () => {
     await logging(async (logged) => {
       const runner = new PyRunner({ onToolCall: async () => '' });

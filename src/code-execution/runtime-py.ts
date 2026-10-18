@@ -97,6 +97,7 @@ import os
 import re
 import select
 import signal
+import stat
 import sys
 import threading
 import traceback
@@ -225,8 +226,12 @@ def _enable_faulthandler(fd):
 
 
 def _identity(fd):
+    # Which file the fd is: its type, device and inode. Not its whole mode:
+    # macOS's fstat sets a socket's permission bits from its state, so they
+    # change when its write side is shut down or its peer ends it, as when a
+    # host ends fd 3 after the exit op, while the fd is still the runtime's own.
     st = os.fstat(fd)
-    return (st.st_mode, st.st_dev, st.st_ino)
+    return (stat.S_IFMT(st.st_mode), st.st_dev, st.st_ino)
 
 
 def _own(fd, stops, which):
