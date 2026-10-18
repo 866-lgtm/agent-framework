@@ -240,7 +240,8 @@ test('a queue over the cap is refused by a quiesce() without abandon, with the h
       message: `quiesce refused: the queue's 1 deferred context write(s) come to more than 4194304 characters of JSON, ` +
         `the cap, so ${h.queuePath} can't hold them, and a restart would lose them. Quiesce again once they have landed, ` +
         'or quiesce with abandon: true to end the turns they wait for, then resume so they land, and quiesce again. ' +
-        "A turn the abandon can't end is listed as unabandonable, and its writes land when it ends on its own.",
+        "The abandon's answer lists a turn it can't end as unabandonable, and its writes land once it has ended and " +
+        'the host is serving.',
     });
     assert.equal(h.framework.getHostModeStatus().quiesced, false, 'the host is still serving');
     assert.equal(h.framework.getHostModeStatus().activeTurns, 1, 'the turn is still alive');
@@ -254,8 +255,9 @@ test('a queue over the cap is refused by a quiesce() without abandon, with the h
     await assert.rejects(h.framework.quiesce({ reason: 'surgery' }), {
       message: `quiesce refused: the queue's 2 deferred context write(s) come to more than 4194304 characters of JSON, ` +
         `the cap, so ${h.queuePath} can't hold them, and a restart would lose them. Resume so they land, then quiesce ` +
-        "again. If a turn they wait for won't end, quiesce with abandon: true first. A turn the abandon can't end is " +
-        'listed as unabandonable, and its writes land when it ends on its own.',
+        'again. A write held for a turn still alive stays queued through a resume, so to end a turn that won\'t, ' +
+        "quiesce with abandon: true before resuming. The abandon's answer lists a turn it can't end as unabandonable, " +
+        'and its writes land once it has ended and the host is serving.',
     });
     assert.equal(h.framework.getHostModeStatus().quiesced, true, 'still quiesced');
     assert.deepEqual(h.queued(), ['small'], 'the record keeps what it last held');
@@ -266,16 +268,17 @@ test('a queue over the cap is refused by a quiesce() without abandon, with the h
   });
 });
 
-test('a refusal over the cap answers host/command with ok: false and the host mode, and the HTTP route with a 409, as resume()\'s refusal does', async () => {
+test('a refusal over the cap answers host/command with ok: false and the HTTP route with a 409, each with the host mode, as resume()\'s refusal does, and each passes abandon on', async () => {
   await withHost('recovery file', async (h) => {
     await h.liveTurn();
     h.add(OVER_CAP);
-    const command = (h.framework as unknown as {
-      handleHostCommand(serverId: string, params: { command: string; timeoutMs?: number }): Promise<{
+    type Params = { command: string; timeoutMs?: number; abandon?: boolean };
+    const hostCommand = (params: Params) => (h.framework as unknown as {
+      handleHostCommand(serverId: string, params: Params): Promise<{
         ok: boolean; error?: string; hostMode?: { quiesced: boolean };
       }>;
-    }).handleHostCommand('test-server', { command: 'quiesce', timeoutMs: 1_000 });
-    const answer = await command;
+    }).handleHostCommand('test-server', params);
+    const answer = await hostCommand({ command: 'quiesce', timeoutMs: 1_000 });
     assert.equal(answer.ok, false);
     assert.match(answer.error ?? '', /^quiesce refused: /);
     assert.equal(answer.hostMode?.quiesced, false);
@@ -284,11 +287,24 @@ test('a refusal over the cap answers host/command with ok: false and the host mo
     await server.start();
     try {
       const port = (server as unknown as { httpServer: { address(): { port: number } } }).httpServer.address().port;
-      const response = await fetch(`http://127.0.0.1:${port}/quiesce?timeoutMs=1000`, { method: 'POST', headers: { 'x-admin-token': 'any' } });
+      const post = (query: string) => fetch(`http://127.0.0.1:${port}/quiesce?${query}`, { method: 'POST', headers: { 'x-admin-token': 'any' } });
+      const response = await post('timeoutMs=1000');
       assert.equal(response.status, 409);
       const body = await response.json() as { error: string; hostMode: { quiesced: boolean } };
       assert.match(body.error, /^quiesce refused: /);
       assert.equal(body.hostMode.quiesced, false);
+
+      // The way out the refusal names, through each ingress: host/command on the serving host, then the HTTP
+      // route on the quiesced one, where a plain repeat is refused too.
+      const abandoned = await hostCommand({ command: 'quiesce', timeoutMs: 1_000, abandon: true });
+      assert.equal(abandoned.ok, true, abandoned.error);
+      assert.equal(abandoned.hostMode?.quiesced, true);
+      const plain = await post('timeoutMs=1000');
+      assert.equal(plain.status, 409);
+      await plain.text();
+      const repeat = await post('timeoutMs=1000&abandon=true');
+      assert.equal(repeat.status, 200);
+      assert.equal((await repeat.json() as { quiesced: boolean }).quiesced, true);
     } finally {
       await server.stop();
     }
@@ -322,6 +338,29 @@ test('a queue over the cap held for a turn whose stream never ends: a plain quie
     assert.equal(h.framework.getHostModeStatus().deferredWrites, 0);
     assert.deepEqual(h.queued(), [], 'the record is cleared');
     assert.ok(h.errors.some((l) => l.startsWith(`[host-mode] ${h.queuePath} written again:`)), h.errors.join('\n'));
+  });
+});
+
+test('a turn the abandon can\'t cancel, a token with no stream, is listed as unabandonable with its write still queued, and a resume after it ends lands the write', async () => {
+  await withHost('recovery file', async (h) => {
+    // A turn between dequeue and stream registration: its token is held, and there's no stream to cancel.
+    const tokens = (h.framework as unknown as { activeTurnTokens: Map<string, object> }).activeTurnTokens;
+    tokens.set('agent', {});
+    try {
+      h.add(OVER_CAP);
+      const status = await h.framework.quiesce({ reason: 'surgery', timeoutMs: 1_000, abandon: true });
+      assert.equal(status.quiesced, true);
+      assert.deepEqual(status.unabandonable, ['agent']);
+      assert.equal(status.deferredWrites, 1, 'its write is still queued');
+      assert.equal(h.alerts.length, 1, 'the cap\'s alert');
+    } finally {
+      tokens.delete('agent'); // the turn ends
+    }
+    await h.framework.resume();
+    const texts = h.framework.getAgent('agent')!.getContextManager().getAllMessages()
+      .map((m) => (m.content[0] as { text?: string } | undefined)?.text);
+    assert.ok(texts.includes(OVER_CAP), 'the write landed');
+    assert.equal(h.framework.getHostModeStatus().deferredWrites, 0);
   });
 });
 

@@ -2009,13 +2009,14 @@ export class AgentFramework {
   private lastUnabandonable: string[] = [];
   /** True while the deferred-write queue is mirrored to its record, so each
    *  change of it writes it: from a write of it that reached or may reach
-   *  the record, one that failed or met the cap outside quiesce()'s refusal
-   *  (deferredWritesFellBehind), or a boot that restored it, until a write
-   *  clears the record once the queue drains. */
+   *  the record, one that failed or met the cap unless quiesce() rejected
+   *  for it (deferredWritesFellBehind), or a boot that restored it, until a
+   *  write clears the record once the queue drains. */
   private deferredWritesPersisted = false;
-  /** True from a write of the queue that failed or met the cap, outside
-   *  quiesce()'s refusal (quiesce({ abandon: true }) over the cap included),
-   *  until one succeeds: a run of failures (deferredWritesFellBehind). */
+  /** True from a write of the queue that failed or met the cap, unless
+   *  quiesce() rejected for it, until one succeeds: a run of failures
+   *  (deferredWritesFellBehind). A quiesce({ abandon: true }) over the cap
+   *  goes on rather than rejecting, so its write begins a run too. */
   private deferredWritesBehind = false;
   /** True once the cap has been met in the current run, so its line is
    *  logged once a run, whatever began the run. */
@@ -5698,19 +5699,20 @@ export class AgentFramework {
         `more than ${DEFERRED_WRITES_PERSIST_CAP_CHARS} characters of JSON, the cap, so ` +
         `${this.deferredWritesRecord()} can't hold them, and a restart would lose them. ` +
         (this.quiesced
-          ? 'Resume so they land, then quiesce again. If a turn they wait for won\'t end, quiesce with ' +
-            'abandon: true first. '
+          ? 'Resume so they land, then quiesce again. A write held for a turn still alive stays queued through ' +
+            'a resume, so to end a turn that won\'t, quiesce with abandon: true before resuming. '
           : 'Quiesce again once they have landed, or quiesce with abandon: true to end the turns they ' +
             'wait for, then resume so they land, and quiesce again. ') +
-        'A turn the abandon can\'t end is listed as unabandonable, and its writes land when it ends on its own.',
+        'The abandon\'s answer lists a turn it can\'t end as unabandonable, and its writes land once it has ' +
+        'ended and the host is serving.',
       );
     }
     if (outcome !== 'nothing') this.deferredWritesCaughtUp();
   }
 
   /**
-   * A write of the queue failed, or met the cap, outside quiesce()'s
-   * refusal. The queue stays mirrored, so its next change writes it again.
+   * A write of the queue failed, or met the cap, and quiesce() didn't reject
+   * for it. The queue stays mirrored, so its next change writes it again.
    * The first such write since one that succeeded raises an ops alert naming
    * the record, and the rest of the run raises none. A failed write's own
    * line is logged each time (persistDeferredWrites), and the cap's line the
