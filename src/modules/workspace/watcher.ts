@@ -68,7 +68,7 @@ export class MountWatcher {
   private readonly debounceMs: number;
   private readonly config: MountConfig;
   /**
-   * The root as the watcher makes, watches and checks it, and as each
+   * The root as the watcher makes, holds, watches and checks it, and as each
    * event's path is read against: the configured path resolved (a link in it
    * kept), since chokidar hands back the paths it reports normalized, and
    * those of a root configured as `./m` matched none of them.
