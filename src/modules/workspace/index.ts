@@ -1943,10 +1943,11 @@ export class WorkspaceModule implements Module {
    * spelled. On a disk that folds names, a path spelled otherwise reaches
    * disk's file, so every tool takes it by disk's name: one name per file,
    * and the names its answers give are disk's, except that a path that
-   * names a workspace entry exactly keeps that spelling. The workspace's
-   * entries (entriesOf) stand in for disk where it has nothing yet, so a
-   * draft has one name too. Neither applies to a path that disk's spelling
-   * puts in a nested mount's directory.
+   * names a workspace entry exactly, or does once its directories take
+   * disk's spelling, keeps the entry's spelling. The workspace's entries
+   * (entriesOf) stand in for disk where it has nothing yet, so a draft has
+   * one name too. Neither applies to a path that disk's spelling puts in a
+   * nested mount's directory.
    * A handler that must read something at the moment it's asked, as
    * handleSync reads the branch a path sync adopts on, reads it before
    * calling this, since this awaits disk. The entries are read when the

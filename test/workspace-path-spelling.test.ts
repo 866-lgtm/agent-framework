@@ -1,17 +1,16 @@
 // On a disk that folds names (macOS's default folds case, and Unicode
 // normalization), a path spelled otherwise than disk spells it reaches disk's
 // file. The workspace's tools take such a path as disk spells it, unless it
-// names a workspace entry exactly, so they name each file by one name and
-// take nothing in twice. Most of these tests
-// need a temp directory that folds case, and skip, saying why, where it
-// doesn't, since a disk that tells spellings apart has nothing to respell;
-// one needs it to fold normalization, and three to fold ß with ss, ſ with s
-// and ς with σ. A draft not yet on disk takes the spelling of a workspace
-// entry it equals in simple case folding, on a disk that folds case, and a
-// path that names an entry exactly keeps its spelling. Neither applies where
-// disk's spelling puts the path in a nested mount's directory. Four run
-// only where the disk tells case apart, and those about starting and
-// stopping run anywhere.
+// names a workspace entry exactly, or does once its directories take disk's
+// spelling, so they name each file by one name and take nothing in twice. Most
+// of these tests need a temp directory that folds case, and skip, saying why,
+// where it doesn't, since a disk that tells spellings apart has nothing to
+// respell; one, and part of another, need it to fold normalization, and three
+// to fold ß with ss, ſ with s and ς with σ. A draft not yet on disk takes the
+// spelling of a workspace entry it equals in simple case folding, on a disk
+// that folds case. Neither applies where disk's spelling puts the path in a
+// nested mount's directory. Four run only where the disk tells case apart, and
+// those about starting and stopping run anywhere.
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import fs, { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -565,6 +564,24 @@ test('the step takes an entry\'s name where disk has nothing, keeps an entry\'s 
   assert.equal(await diskSpelling(root, 'DOCS/../docs/b.txt', entries), 'DOCS/../docs/b.txt', 'a `..` among entries keeps the rest');
   assert.equal(await diskSpelling(root, 'src/CAFE\u0301.txt', entries), 'src/CAFE\u0301.txt', 'no entry is equal to it in lower case without normalizing');
   assert.equal(await diskSpelling(root, 'src/NEW.txt'), 'src/NEW.txt', 'without entries, as before');
+  // A name with nothing to flip is looked up as given: disk has it, so no
+  // entry spells it.
+  writeFileSync(join(root, 'src', '\u03c2'), '');
+  assert.equal(await diskSpelling(root, 'src/\u03c2', entriesOf(['src/\u03a3'])), 'src/\u03c2', 'disk lists \u03c2 as given');
+  // A path that names an entry reads no other entry, even where disk lacks
+  // its directory or spells it otherwise.
+  let listings = 0;
+  let lookups = 0;
+  const counted = entriesOf(['Gone/a.txt', 'LOWER/a.txt', 'lower/a.txt']);
+  const counting = {
+    ...counted,
+    has: (path: string) => { lookups += 1; return counted.has(path); },
+    under: (prefix: string) => { listings += 1; return counted.under(prefix); },
+  };
+  assert.equal(await diskSpelling(root, 'Gone/a.txt', counting), 'Gone/a.txt');
+  assert.equal(await diskSpelling(root, 'LOWER/a.txt', counting), 'LOWER/a.txt');
+  assert.equal(listings, 0, 'no entries listed for a path at an entry');
+  assert.equal(lookups, 2, 'one lookup each, of the path itself');
   // Whether a directory folds case: the root's as read at start, and beneath
   // it, as the directory holding it did when the walk looked its name up
   // flipped, or for a name with no letter to flip, as the nearest above.
@@ -629,16 +646,17 @@ test('an entry\'s spelling takes no path out of a nested mount\'s directory that
   await workspace.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
   t.after(async () => { await workspace.stop(); store.close(); rmSync(root, { recursive: true, force: true }); });
   // Entries the outer mount holds from before: a file named as the nested
-  // mount inner's directory in another case; one beneath the directory of
-  // the nested mount later, which isn't on disk, spelled as configured; one
-  // beneath cafe's directory in the other normalization form; and one in
-  // another spelling of proj, the directory that holds deep's, which isn't
-  // on disk either.
+  // mount inner's directory in another case, and one beneath that directory;
+  // one beneath the directory of the nested mount later, which isn't on
+  // disk, spelled as configured; one beneath cafe's directory in the other
+  // normalization form; and one in another spelling of proj, the directory
+  // that holds deep's, which isn't on disk either.
   const entry = { blobHash: 'a'.repeat(64), size: 1, mode: 0o100644 };
   store.treeSet('workspace/outer/tree', 'Inner', entry);
   store.treeSet('workspace/outer/tree', 'later/z.txt', entry);
   store.treeSet('workspace/outer/tree', 'cafe\u0301/x.txt', entry);
   store.treeSet('workspace/outer/tree', 'Proj/z.txt', entry);
+  store.treeSet('workspace/outer/tree', 'inner/Late.txt', entry);
   const call = (name: string, input: unknown) => workspace.handleToolCall({ id: name, name, input } as Parameters<WorkspaceModule['handleToolCall']>[0]);
   const refusedAs = async (tool: string, input: { path: string; [field: string]: unknown }, mount: string) => {
     const result = await call(tool, input);
@@ -652,7 +670,13 @@ test('an entry\'s spelling takes no path out of a nested mount\'s directory that
   await refusedAs('read', { path: 'outer/Inner', offsetChars: 0, limitChars: 10 }, 'inner');
   await refusedAs('write', { path: 'outer/proj/inner/x.txt', content: 'x\n' }, 'deep');
   await refusedAs('write', { path: 'outer/proj/other/../inner/x.txt', content: 'x\n' }, 'deep');
-  if (!NORMALIZATION_FOLDING_ONLY) await refusedAs('read', { path: 'outer/cafe\u0301/x.txt', offsetChars: 0, limitChars: 10 }, 'cafe');
+  await t.test('in the other normalization form', { skip: NORMALIZATION_FOLDING_ONLY }, async () => {
+    await refusedAs('read', { path: 'outer/cafe\u0301/x.txt', offsetChars: 0, limitChars: 10 }, 'cafe');
+  });
+  // Where both spellings lie in one nested mount's directory, the refusal
+  // names disk's, as without the entries.
+  const late = await call('write', { path: 'outer/inner/LATE.txt', content: 'x\n' });
+  assert.equal(late.error, '"outer/inner/LATE.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/LATE.txt".');
   // As configured, a path is later's, and so is one the entry spelled as
   // configured gives that spelling.
   await refusedAs('write', { path: 'outer/later/y.txt', content: 'y\n' }, 'later');
