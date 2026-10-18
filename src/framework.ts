@@ -2,7 +2,10 @@ import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogu
 import { dirname, join } from 'node:path';
 import { INLINE_WITHHELD_TEXT, REFERENCE_LIMITS, classifyBlock, isInlineContradiction, isReferenceExpired, referenceRegistry, referenceStubOrNull, referenceTypeLabel, sanitizeLabel, unfetchableReason } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStream, DetailedUsage, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
@@ -5418,13 +5421,74 @@ export class AgentFramework {
     return landed;
   }
 
-  /** Atomic JSON write for the recovery files (tmp + rename, 0600) — the
-   *  same idiom as the Discord awareness outbox. */
+  /** Atomic, durable JSON write for the recovery files. The document goes to
+   *  a temp file at 0600, which is synced and renamed over the record, so
+   *  the new record's data is asked to reach the disk before the rename
+   *  publishes it. Then the directory is synced, for the record's entry in
+   *  it, and its parent, for the directory's own entry, which is new when a
+   *  write, this one or an earlier one, had to make the directory; levels
+   *  above are left to the filesystem. Directories aren't synced on win32,
+   *  which syncs the file alone, or where the filesystem can't sync one
+   *  (syncRecoveryDirectory). A failure before the rename removes the temp
+   *  file, if it was made, and throws an error saying the record was left as
+   *  it was, with the original as its cause and its code kept. A directory
+   *  sync that fails, other than where the filesystem can't sync one, is
+   *  raised as an ops alert, not thrown: the new record is in place, and the
+   *  callers go on to record it as written. */
   private writeRecoveryFile(path: string, document: unknown): void {
-    mkdirSync(dirname(path), { recursive: true });
+    const directory = dirname(path);
     const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-    writeFileSync(temporary, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600 });
-    renameSync(temporary, path);
+    let opened = false;
+    try {
+      mkdirSync(directory, { recursive: true });
+      const fd = openSync(temporary, 'w', 0o600);
+      opened = true;
+      try {
+        writeFileSync(fd, `${JSON.stringify(document, null, 2)}\n`);
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      renameSync(temporary, path);
+    } catch (err) {
+      if (opened) {
+        try {
+          unlinkSync(temporary);
+        } catch (unlinkErr) {
+          console.error(`[host-mode] couldn't remove ${temporary} after a failed write:`, unlinkErr);
+        }
+      }
+      const cause = err as NodeJS.ErrnoException;
+      throw Object.assign(new Error(`${path} was left as it was: ${cause.message}`, { cause }), cause.code ? { code: cause.code } : {});
+    }
+    this.syncRecoveryDirectory(directory, path);
+    this.syncRecoveryDirectory(dirname(directory), path);
+  }
+
+  /** Syncs the directory a recovery file is in, or that directory's parent,
+   *  so its entries reach the disk. win32 is left out. So is a sync refused
+   *  with EINVAL or EBADF, the answer where the filesystem or system can't
+   *  sync a directory: that refusal would come again on every write, and
+   *  PostgreSQL's fsync_fname_ext lets the same two go. Any other failure is
+   *  raised as an ops alert naming the record. */
+  private syncRecoveryDirectory(directory: string, record: string): void {
+    if (process.platform === 'win32') return;
+    try {
+      const fd = openSync(directory, 'r');
+      try {
+        fsyncSync(fd);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== 'EINVAL' && code !== 'EBADF') throw err;
+      } finally {
+        closeSync(fd);
+      }
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      this.opsAlert('recovery-sync', 'framework',
+        `syncing ${directory} failed, so ${record} may not survive a crash: ${reason}`,
+        { data: { record, directory, code: (err as NodeJS.ErrnoException).code } });
+    }
   }
 
   /** A recovery file's document, or undefined when there's no file. Only a
