@@ -65,7 +65,8 @@
   isn't held for the script's runtime. What goes unseen is routed as it was
   before scripts counted, such as a tool name the code doesn't spell out
   (built at runtime, written with escapes, or in non-ASCII spellings), code
-  loaded from a file or module, an enumeration of the tools, a call written
+  loaded from a file or module, an enumeration of the tools, a kept key
+  whose prefix, as the script writes it, contains whitespace, a call written
   in a string's text (code run with `exec` or `eval`, or an f-string's
   field), inside a definition too, a definition or alias made inside such a
   string, a call that outlives its script (one it awaits only in a later
