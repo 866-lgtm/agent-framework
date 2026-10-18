@@ -662,7 +662,7 @@ export type TraceEvent =
       parkedAdmissions?: number;
       /** True when undrained turns were force-cancelled (abandon). */
       abandoned?: boolean;
-      /** Agents whose turn abandon could not cancel (token held, no stream). */
+      /** Agents whose turn the abandon had not ended when its grace ran out: a token held with no stream and no check ahead (a puppet tool turn, a store surgery's reservation, a turn finishing its last delivery), or a turn with no stream that hadn't reached its next check. A turn whose stream the abandon cancelled isn't listed, even one still running when the grace ran out, as one whose tool-result guard waits on its speech may be. */
       unabandonable?: string[];
     })
   | (TraceEventBase & {
