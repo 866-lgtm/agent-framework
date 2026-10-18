@@ -596,14 +596,21 @@ describe('MountWatcher lifecycle', () => {
     skip: process.platform !== 'linux',
   }, async (t) => {
     // Whether this disk gives a removed directory's number to the next one
-    // made. tmpfs doesn't, and there the test has nothing to show.
+    // made. tmpfs doesn't, and there the test has nothing to show. Another
+    // process can take the number first on a busy disk, so it's tried a few
+    // times.
     const scratch = join(tmp, 'scratch');
-    mkdirSync(scratch);
-    const scratchIno = statSync(scratch).ino;
-    rmdirSync(scratch);
-    mkdirSync(scratch);
-    if (statSync(scratch).ino !== scratchIno) {
-      t.skip("this disk didn't give the removed directory's inode number to the next one made");
+    const givesNumberBack = (): boolean => {
+      mkdirSync(scratch);
+      const removed = statSync(scratch).ino;
+      rmdirSync(scratch);
+      mkdirSync(scratch);
+      const again = statSync(scratch).ino === removed;
+      rmdirSync(scratch);
+      return again;
+    };
+    if (![1, 2, 3, 4, 5].some(givesNumberBack)) {
+      t.skip("this disk didn't give a removed directory's inode number to the next one made, in five tries");
       return;
     }
     const root = join(realpathSync(tmp), 'work');
@@ -920,6 +927,44 @@ describe('MountWatcher lifecycle', () => {
     }
   });
 
+  // A path that fails with another error than ENOENT can't say whether the
+  // root is still there, as when a parent loses search permission, so a held
+  // root that hasn't been removed stays held and attached.
+  it('keeps a root in place held when its path fails with another error', {
+    skip: process.platform !== 'linux',
+  }, async () => {
+    const root = join(realpathSync(tmp), 'work');
+    mkdirSync(root);
+    let ready = false;
+    let reattachCount = 0;
+    const { watcher } = collectWithNative(
+      { onReady: () => { ready = true; }, onReattach: () => { reattachCount++; } },
+      { ...makeConfig(), path: root },
+    );
+    // Counts the root's checks, so the test waits for polls, not for a time.
+    const internals = watcher as unknown as { checkRootLiveness(opts?: { force?: boolean }): Promise<void> };
+    const check = internals.checkRootLiveness.bind(watcher);
+    let checks = 0;
+    internals.checkRootLiveness = (opts) => {
+      checks++;
+      return check(opts);
+    };
+    try {
+      await waitFor(() => ready, 'expected initial watcher ready');
+      await withFs('statSync', (stat) => (file: unknown, ...rest: unknown[]) => {
+        if (String(file) === root) throw fsError('EACCES', 'stat', root);
+        return stat(file, ...rest);
+      }, async () => {
+        const polled = checks;
+        await waitFor(() => checks >= polled + 3, 'expected three root polls');
+      });
+      assert.deepStrictEqual(descriptorsOf(root), [root], 'the watcher let go of its root in place');
+      assert.strictEqual(reattachCount, 0, 'the watcher re-attached to its root in place');
+    } finally {
+      await watcher.stop();
+    }
+  });
+
   // What the watcher opened of a root whose identity it then can't read isn't
   // held: the attach reports the error, and the next check attaches again.
   it("holds nothing of a root it opened but couldn't read", {
@@ -943,9 +988,9 @@ describe('MountWatcher lifecycle', () => {
     });
   });
 
-  // Where a root's link count reads 0 as it's opened, the count can't tell a
-  // removed root from one in place, so the root isn't held, and its polls
-  // leave it be.
+  // A root whose link count reads 0 as it's opened isn't held: if that's the
+  // file system's count for a directory in place, every later check would
+  // take the root for removed. Its polls leave it be.
   it('holds no root whose link count reads 0, and its polls leave it be', {
     skip: process.platform !== 'linux',
   }, async () => {

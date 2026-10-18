@@ -406,8 +406,9 @@ export class MountWatcher {
    * given out. Elsewhere, or where the root can't be opened as a directory,
    * as without read permission, at the process's file limit or when the
    * path isn't a directory, it isn't held, and its identity is read from its
-   * path. So too where the root's link count reads 0 as it's opened, since
-   * there the count can't tell a removed root from one in place.
+   * path. So too where the root's link count reads 0 as it's opened: if
+   * that's the file system's count for a directory in place, a later check
+   * would take the root for removed and re-attach at every poll.
    */
   private holdRoot(): RootIdentity {
     if (process.platform !== 'linux') return this.readRootIdentity();
@@ -432,8 +433,10 @@ export class MountWatcher {
    * Whether the directory the watcher holds has been removed, which its link
    * count says whatever has since been made at its path. On a file system
    * whose inode numbers a server gives out, the hold can't keep a root made
-   * again from taking the removed one's number. A held directory that can't
-   * be read, as a stale one on a network file system, counts as removed.
+   * again from taking the removed one's number, and a removal by another
+   * client shows once this one revalidates the directory's cached
+   * attributes. A held directory that can't be read, as a stale one on a
+   * network file system, counts as removed.
    */
   private heldRootRemoved(): boolean {
     if (this.rootFd === null) return false;
