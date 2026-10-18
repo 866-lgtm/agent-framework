@@ -73,14 +73,15 @@ function wildcardMatch(pattern: string, name: string): boolean {
 
 /**
  * The inference/request result for a completed inference, the same for both
- * modes: the response's text, why it stopped, and its usage.
+ * modes: the response's text, the model that served it, why it stopped, and
+ * its usage.
  *
  * A response MCPL can't report as a completion throws, and is answered with
  * the error: one the provider ended with an error, one where the model wrote a
  * tool call, since inference/request offers the model none, and one with a
  * stop reason FinishReason has no value for (see finishReasonFor).
  */
-function resultFrom(response: NormalizedResponse, model: string): McplInferenceRequestResult {
+function resultFrom(response: NormalizedResponse, routedModel: string): McplInferenceRequestResult {
   // A provider can end an inference with finish_reason 'error' and no error
   // object. membrane 0.5.87's OpenAI-style adapters fail a stream on a frame
   // that carries one, as OpenRouter's mid-stream error does, but pass the token
@@ -114,13 +115,25 @@ function resultFrom(response: NormalizedResponse, model: string): McplInferenceR
       .filter((b: ContentBlock): b is ContentBlock & { type: 'text' } => b.type === 'text')
       .map((b) => b.text)
       .join(''),
-    model,
+    // Spec §11.3: the actual model used, which can differ from the routed one
+    // where routing or fallback applies. When membrane names none, the routed
+    // model is the only one there is to report.
+    model: actualModelOf(response) ?? routedModel,
     finishReason: finishReasonFor(response.stopReason),
     usage: {
       inputTokens: response.usage.inputTokens,
       outputTokens: response.usage.outputTokens,
     },
   };
+}
+
+/**
+ * The model membrane says served the response, or undefined when it names
+ * none. membrane's type says it always names one, but some of its adapters
+ * pass the provider's own value through as it is, which can be empty.
+ */
+function actualModelOf(response: NormalizedResponse): string | undefined {
+  return response.details.model.actual || undefined;
 }
 
 /**
@@ -264,11 +277,15 @@ export class InferenceRouter {
 
       // 6. Answer
       const result = resultFrom(response, model);
+      const actualModel = actualModelOf(response);
 
       this.emitTraceFn({
         type: 'mcpl:inference_complete',
         serverId,
+        // The routed model, as inference_start has it. actualModel is the one
+        // the result reports, left out when membrane named none.
         model,
+        ...(actualModel !== undefined ? { actualModel } : {}),
         inputTokens: result.usage.inputTokens,
         outputTokens: result.usage.outputTokens,
         streamed,

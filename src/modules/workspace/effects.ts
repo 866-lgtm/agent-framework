@@ -483,10 +483,14 @@ export async function chmodContained(
 
 /**
  * Unlink a mount-relative file, or confirm it gone (`absent` expected: a
- * file found there is never removed). Returns the mount directory whose
- * entries make the absence durable, for the caller's barrier: the file's
- * parent, or — when the parent itself is gone — the directory proven to lack
- * it, since that removal may not be durable either.
+ * file found there is never removed). What it removes is a regular file, or
+ * a followed symlink to a regular file inside the mount (the link itself).
+ * Anything else there is refused, forced or not: a directory; a pipe, socket
+ * or device; a symlink the mount doesn't follow; and a followed one that
+ * doesn't lead to a regular file inside the mount. Returns the mount
+ * directory whose entries make the absence durable, for the caller's
+ * barrier: the file's parent, or — when the parent itself is gone — the
+ * directory proven to lack it, since that removal may not be durable either.
  */
 export async function unlinkContained(view: MountView, rootReal: string, rel: string, expect: Expect): Promise<string> {
   const checked = await parentFor(view, rootReal, rel, false);
@@ -512,7 +516,7 @@ export async function unlinkContained(view: MountView, rootReal: string, rel: st
   // Confirming an unlink that already happened never removes a file that
   // appeared since.
   if (expect.kind === 'absent') {
-    const kind = info.isDirectory() ? 'a directory' : info.isSymbolicLink() ? 'a symlink' : 'a file';
+    const kind = info.isDirectory() ? 'a directory' : info.isSymbolicLink() ? 'a symlink' : info.isFile() ? 'a file' : 'a pipe, socket or device';
     throw new EffectFailed(`${kind} appeared at this path since it was checked`, false);
   }
   let file = info;
@@ -523,9 +527,17 @@ export async function unlinkContained(view: MountView, rootReal: string, rel: st
     if (real === null || !contained(rootReal, real)) throw new EffectFailed('a symlink that leaves the mount', false);
     const through = await stat(real, { bigint: true }).catch(() => null);
     if (through === null) throw new EffectFailed(CHANGED, false);
+    // A followed link stands for the file it leads to, so it's removed only
+    // for a regular one, as the file the workspace deleted. This refusal,
+    // and the one below for what isn't a regular file at the path, use
+    // observation's words for the path, so the push answers a forced unlink
+    // and an unforced one alike (reconcile.ts inTheWay).
+    if (!through.isFile()) throw new EffectFailed(through.isDirectory() ? 'a symlink to a directory, not walked' : 'not a regular file', false);
     file = through;
   } else if (info.isDirectory()) {
     throw new EffectFailed('a directory', false);
+  } else if (!info.isFile()) {
+    throw new EffectFailed('not a regular file', false);
   }
   if (expect.kind === 'content' && (await hashAt(target, file, noFollowFlag(view))) !== expect.hash) throw new EffectFailed(CHANGED, false);
   const gone = await moved(root, parent);
