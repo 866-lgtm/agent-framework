@@ -671,6 +671,25 @@ describe('mount include', () => {
     assert.equal(readFileSync(join(env.root, 'outside.txt'), 'utf8'), 'outside\n');
   });
 
+  test('without an include, glob and grep read their path in one spelling too, and refuse a climb above the root', async (t) => {
+    // F208: they took a path with a `.` or `..` segment as written, so the
+    // store refused the key each made from it ("Invalid tree path").
+    const env = new Env(t);
+    env.writeDisk('src/a.ts', 'export const a = 1;\n');
+    const m = await env.open();
+    await call(m, 'sync', {});
+    for (const path of ['work/src/../src', 'work/./src']) {
+      const globbed = await call(m, 'glob', { pattern: '*.ts', path });
+      assert.deepEqual((globbed.matches as Array<{ path: string }>).map((e) => e.path), ['work/src/a.ts'], `glob ${path}`);
+      const grepped = await call(m, 'grep', { pattern: 'export', path });
+      assert.deepEqual((grepped.results as Array<{ file: string }>).map((r) => r.file), ['work/src/a.ts'], `grep ${path}`);
+    }
+    // Out of the root and back in by the mount directory's own name.
+    const climbs = /climbs above the root of mount "work"/;
+    assert.match(await refused(m, 'glob', { pattern: '*.ts', path: 'work/../work/src' }), climbs, 'glob');
+    assert.match(await refused(m, 'grep', { pattern: 'export', path: 'work/../work/src' }), climbs, 'grep');
+  });
+
   test('an entry an earlier version stored under another spelling is outside the mount', async (t) => {
     const env = new Env(t);
     const m = await env.open();
