@@ -23,6 +23,7 @@ import { StringDecoder } from 'node:string_decoder';
 import WebSocket from 'ws';
 
 import type { McplServerConfig } from './types.js';
+import { assertBooleanSetting } from '../config-checks.js';
 
 /** Why/how a transport closed. `code`/`signal` are populated for stdio child
  *  exits; `reason` carries a WebSocket close reason or an error message. */
@@ -511,23 +512,8 @@ const SERVER_CONFIG_BOOLEANS: Record<BooleanSetting, string> = {
 export function assertServerConfigBooleans(config: McplServerConfig): void {
   for (const [setting, whatTrueDoes] of Object.entries(SERVER_CONFIG_BOOLEANS) as Array<[BooleanSetting, string]>) {
     if (setting === 'inheritEnv' && isWebSocketTransport(config)) continue;
-    const value: unknown = config[setting];
-    if (value === undefined || value === null || typeof value === 'boolean') continue;
-    const wanted = typeof value === 'string' ? 'true or false, unquoted,' : 'true or false,';
-    throw new Error(`MCPL server "${config.id}" ${setting} must be ${wanted} not ${kindOf(value)}: ${whatTrueDoes}`);
+    assertBooleanSetting(`MCPL server "${config.id}" ${setting}`, config[setting], whatTrueDoes);
   }
-}
-
-/** The kind of a value that isn't undefined, null or a boolean, as a refusal
- *  names it in place of the value. */
-export function kindOf(value: unknown): string {
-  if (Array.isArray(value)) return 'an array';
-  if (typeof value !== 'object') return `a ${typeof value}`;
-  const prototype = Object.getPrototypeOf(value) as { constructor?: { name?: string } } | null;
-  if (prototype === null || prototype === Object.prototype) return 'an object';
-  const name = prototype.constructor?.name;
-  if (!name) return 'an object that isn\'t plain';
-  return `${/^[aeiou]/i.test(name) ? 'an' : 'a'} ${name}`;
 }
 
 /**

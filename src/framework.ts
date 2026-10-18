@@ -74,7 +74,8 @@ import type {
 import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
-import { Agent } from './agent.js';
+import { Agent, assertAgentSwitches } from './agent.js';
+import { assertBooleanSetting, holdsSettings } from './config-checks.js';
 import { ModuleRegistry, checkedToolResult, ensureStateRegistered, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { logValue } from './mcpl/log-value.js';
@@ -819,6 +820,45 @@ function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
     MIN_DISCORD_AWARENESS_DEADLINE_MS,
     Math.min(MAX_DISCORD_AWARENESS_DEADLINE_MS, Math.floor(value)),
   );
+}
+
+/**
+ * Refuse a config whose `subconscious`, `watchdog` or `processLogging` isn't an
+ * object, or whose switch in one holds anything but true or false
+ * (assertBooleanSetting). A subconscious that isn't on has its
+ * `allowChannelSpeech` left unchecked, since nothing reads it then.
+ */
+function assertFrameworkSwitches(config: FrameworkConfig): void {
+  if (holdsSettings('subconscious', config.subconscious, '{ enabled: true }')) {
+    assertBooleanSetting(
+      'subconscious.enabled',
+      config.subconscious.enabled,
+      'true creates the subconscious resident, a side agent that reads the residents\' timeline and delivers into their window, ' +
+        'and false or leaving it out doesn\'t',
+    );
+    if (config.subconscious.enabled === true) {
+      assertBooleanSetting(
+        'subconscious.allowChannelSpeech',
+        config.subconscious.allowChannelSpeech,
+        'true lets the subconscious speak in channels with speak_in_channel, and false or leaving it out refuses it',
+      );
+    }
+  }
+  if (holdsSettings('watchdog', config.watchdog, '{ enabled: true }')) {
+    assertBooleanSetting(
+      'watchdog.enabled',
+      config.watchdog.enabled,
+      'true arms the liveness watchdog, which ends the process when the main thread misses its heartbeat for thresholdMs, ' +
+        'and false or leaving it out doesn\'t',
+    );
+  }
+  if (holdsSettings('processLogging', config.processLogging, '{ persist: true }')) {
+    assertBooleanSetting(
+      'processLogging.persist',
+      config.processLogging.persist,
+      'true writes each process event and its responses to Chronicle, and false or leaving it out doesn\'t',
+    );
+  }
 }
 
 /** Messages copied into another conversation (a fork's seed) without their
@@ -2351,6 +2391,8 @@ export class AgentFramework {
   static async create(config: FrameworkConfig): Promise<AgentFramework> {
     // Before anything opens or starts: a refused config must leave nothing behind.
     if (config.codeExecution != null) validateCodeExecutionConfig(config.codeExecution);
+    assertFrameworkSwitches(config);
+    for (const agentConfig of config.agents) assertAgentSwitches(agentConfig);
 
     // Create or use existing store
     let store: JsStore;
@@ -2468,7 +2510,7 @@ export class AgentFramework {
     }
 
     // Process logging config (default: disabled)
-    const processLoggingPersist = config.processLogging?.persist ?? false;
+    const processLoggingPersist = config.processLogging?.persist === true;
     const processLoggingBroadcast = config.processLogging?.broadcast ?? false;
 
     // Register process log state only if persistence is enabled
@@ -2551,7 +2593,7 @@ export class AgentFramework {
     // The subconscious resident (issue #77) registers after the residents so
     // it can never become primary; it is excluded from every broadcast
     // fan-out and woken only by the tune-out coordinator's explicit pushes.
-    if (config.subconscious?.enabled) {
+    if (config.subconscious?.enabled === true) {
       await framework.createSubconsciousAgent(config.subconscious);
     }
 
@@ -2652,7 +2694,7 @@ export class AgentFramework {
     }
 
     // Liveness watchdog: fail hard if the main thread wedges (opt-in).
-    if (config.watchdog?.enabled) {
+    if (config.watchdog?.enabled === true) {
       const { LivenessWatchdog } = await import('./runtime/liveness-watchdog.js');
       framework.livenessWatchdog = new LivenessWatchdog({
         enabled: true,
@@ -2803,7 +2845,7 @@ export class AgentFramework {
             [...framework.conversationAgentHomes.values()].includes(channelId),
           isPrivilegedAuthor: (authorId) =>
             framework.eventGate?.isPrivilegedUser(authorId) ?? false,
-          allowChannelSpeech: () => !!framework.subconsciousConfig?.allowChannelSpeech,
+          allowChannelSpeech: () => framework.subconsciousConfig?.allowChannelSpeech === true,
           emitTrace: (e) => framework.emitTrace(e as never),
         },
       );
@@ -6885,6 +6927,8 @@ export class AgentFramework {
     contextManager: ContextManager;
     cleanup: () => void;
   }> {
+    // Checked before the name is reserved, so a refused config leaves it free.
+    assertAgentSwitches(config);
     // Names are Chronicle namespaces and generation identities. Reserve before
     // opening the namespace so a second creation cannot append to an earlier
     // generation before runEphemeralToCompletion has a chance to reject it.
@@ -14422,7 +14466,7 @@ export class AgentFramework {
                   },
                   () => this.finishUnstick(agent.name, false, category),
                 );
-              } else if (rh?.autoRewind && !guardRefusal) {
+              } else if (rh?.autoRewind === true && !guardRefusal) {
                 const cap = Math.max(1, rh.maxRewinds ?? 3);
                 const used = this.refusalRewinds.get(agent.name) ?? 0;
                 doRewind(
