@@ -1,0 +1,579 @@
+/*
+ * code_execution's engine: agent-framework's interface to QuickJS-ng, compiled with the vendored
+ * engine (engine/quickjs-ng) into one WebAssembly module, src/code-execution/quickjs.wasm.
+ *
+ * It is held to what code_execution's bridge needs: limits, evaluating the prelude and a script,
+ * one host function whose calls the host settles by id, running jobs, the interrupt, and output.
+ * The guest reaches nothing outside JavaScript except through the three imports below, and only
+ * JSON text and output text cross them. The host's side is src/code-execution/engine.ts.
+ *
+ * One runtime and one context per module instance, made by engine_init. A child process holds
+ * one instance for one script, so nothing here is reentrant or thread-safe.
+ */
+#include <malloc.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "quickjs.h"
+
+#define IMPORT(name) __attribute__((import_module("env"), import_name(name)))
+#define EXPORT(name) __attribute__((export_name(name)))
+
+/* The guest called __host(name, args): the host takes call `id`, to settle later with
+   engine_settle. Returns 0 when the host took it, nonzero when the host failed (the binding
+   keeps why). */
+IMPORT("host_call")
+extern int host_call(uint32_t id, const char *name, uint32_t name_len,
+                     const char *args, uint32_t args_len);
+
+/* QuickJS's interrupt handler, called while the guest runs. Nonzero stops the guest for good. */
+IMPORT("host_interrupt")
+extern int host_interrupt(void);
+
+/* The guest called __output(stream, text), stream 1 for out and 2 for err. Returns 0, or
+   nonzero when the host failed. */
+IMPORT("host_output")
+extern int host_output(uint32_t stream, const char *text, uint32_t len);
+
+/* How a call into the guest left it; engine.ts mirrors these. */
+enum {
+    ENGINE_PENDING = 0,      /* the queue is empty and the script hasn't settled */
+    ENGINE_FULFILLED = 1,    /* the script settled with a value: engine_result has it */
+    ENGINE_REJECTED = 2,     /* the script, or the prelude, threw: engine_result has why */
+    ENGINE_INTERRUPTED = 3,  /* host_interrupt returned nonzero while it ran */
+    ENGINE_HOST_FAILED = 4,  /* an import reported failure, so the run ended */
+    ENGINE_MISUSE = -1,      /* called out of order, or with a malformed buffer */
+    ENGINE_NO_MEMORY = -2,   /* the engine couldn't allocate its own state */
+    ENGINE_UNKNOWN_CALL = -3 /* engine_settle named no pending call */
+};
+
+static JSRuntime *rt;
+static JSContext *ctx;
+/* Call id -> [resolve, reject]. Held only here, so guest code can't reach it. */
+static JSValue pending;
+/* The script's completion promise from JS_EVAL_FLAG_ASYNC, which settles to { value }. */
+static JSValue completion;
+/* What ended the run when it wasn't the completion promise: the prelude's or the script's
+   synchronous throw, or an exception that escaped a job. */
+static JSValue failure;
+static bool started;
+static bool failed;
+static bool interrupted;
+static bool host_failed;
+static uint32_t next_id = 1;
+
+/*
+ * QuickJS's allocations, held to the memory limit here rather than by JS_SetMemoryLimit.
+ * Adapted from quickjs-wasi 3.6.2's c/interface.c (MIT, Copyright (c) 2026 Vercel, Inc.; the
+ * notice is in src/code-execution/quickjs.wasm.LICENSES).
+ *
+ * QuickJS checks its own limit before it allocates, and refuses at exactly the limit. When a
+ * script reaches it with many small allocations, the "out of memory" InternalError QuickJS then
+ * builds is refused too, and the script's catch gets a bare null (the engine test's small-objects
+ * case shows it). So QuickJS's own limit stays off, and these functions refuse ordinary
+ * allocations at a soft limit OOM_HEADROOM under the limit. After a refusal, allocations may use
+ * the headroom up to the limit, so that the error, and the code that handles it, can allocate;
+ * the reserve re-arms once usage is back under the soft limit.
+ */
+#define OOM_HEADROOM (64 * 1024)
+
+static size_t mem_limit; /* 0: no limit */
+static size_t mem_used;  /* the usable size of every live allocation */
+static bool mem_in_oom;  /* a refusal has opened the headroom */
+
+static size_t soft_limit(void) {
+    return mem_limit > 2 * OOM_HEADROOM ? mem_limit - OOM_HEADROOM : mem_limit / 2;
+}
+
+/* Whether mem_used + size would pass cap, without overflowing. */
+static bool exceeds(size_t size, size_t cap) {
+    return size > cap || mem_used > cap - size;
+}
+
+static bool refuse(size_t size) {
+    if (mem_limit == 0)
+        return false;
+    if (!exceeds(size, soft_limit())) {
+        mem_in_oom = false;
+        return false;
+    }
+    if (mem_in_oom && !exceeds(size, mem_limit))
+        return false;
+    mem_in_oom = true;
+    return true;
+}
+
+static void *limited_calloc(void *opaque, size_t count, size_t size) {
+    (void)opaque;
+    /* QuickJS has checked count * size for overflow. */
+    if (refuse(count * size))
+        return NULL;
+    void *ptr = calloc(count, size);
+    if (ptr)
+        mem_used += malloc_usable_size(ptr);
+    return ptr;
+}
+
+static void *limited_malloc(void *opaque, size_t size) {
+    (void)opaque;
+    if (refuse(size))
+        return NULL;
+    void *ptr = malloc(size);
+    if (ptr)
+        mem_used += malloc_usable_size(ptr);
+    return ptr;
+}
+
+static void limited_free(void *opaque, void *ptr) {
+    (void)opaque;
+    if (!ptr)
+        return;
+    size_t usable = malloc_usable_size(ptr);
+    mem_used -= usable <= mem_used ? usable : mem_used;
+    free(ptr);
+}
+
+static void *limited_realloc(void *opaque, void *ptr, size_t size) {
+    (void)opaque;
+    size_t old_usable = ptr ? malloc_usable_size(ptr) : 0;
+    /* Only growth is held to the limit: a shrinking realloc releases memory. */
+    size_t growth = size > old_usable ? size - old_usable : 0;
+    if (growth > 0 && refuse(growth))
+        return NULL;
+    void *new_ptr = realloc(ptr, size);
+    if (new_ptr) {
+        mem_used -= old_usable <= mem_used ? old_usable : mem_used;
+        mem_used += malloc_usable_size(new_ptr);
+    }
+    return new_ptr;
+}
+
+static size_t limited_usable_size(const void *ptr) {
+    return malloc_usable_size((void *)ptr);
+}
+
+static const JSMallocFunctions limited_malloc_funcs = {
+    limited_calloc, limited_malloc, limited_free, limited_realloc, limited_usable_size,
+};
+
+static int interrupt_handler(JSRuntime *r, void *opaque) {
+    (void)r;
+    (void)opaque;
+    if (interrupted)
+        return 1;
+    if (host_interrupt()) {
+        interrupted = true;
+        return 1;
+    }
+    return 0;
+}
+
+/* __host(name, args): name and args are strings (the prelude stringifies the arguments).
+   Returns a promise the host settles with engine_settle. */
+static JSValue js_host(JSContext *c, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 2 || !JS_IsString(argv[0]) || !JS_IsString(argv[1]))
+        return JS_ThrowTypeError(c, "__host takes a tool name and its arguments as JSON text");
+    if (next_id == UINT32_MAX)
+        return JS_ThrowRangeError(c, "__host: no call ids left");
+
+    JSValue funcs[2];
+    JSValue promise = JS_NewPromiseCapability(c, funcs);
+    if (JS_IsException(promise))
+        return promise;
+    JSValue entry = JS_NewArray(c);
+    if (JS_IsException(entry)) {
+        JS_FreeValue(c, funcs[0]);
+        JS_FreeValue(c, funcs[1]);
+        JS_FreeValue(c, promise);
+        return JS_EXCEPTION;
+    }
+    /* JS_SetPropertyUint32 takes each value, and frees it if it fails. */
+    if (JS_SetPropertyUint32(c, entry, 0, funcs[0]) < 0 ||
+        JS_SetPropertyUint32(c, entry, 1, funcs[1]) < 0) {
+        JS_FreeValue(c, entry);
+        JS_FreeValue(c, promise);
+        return JS_EXCEPTION;
+    }
+
+    size_t name_len, args_len;
+    const char *name = JS_ToCStringLen(c, &name_len, argv[0]);
+    if (!name) {
+        JS_FreeValue(c, entry);
+        JS_FreeValue(c, promise);
+        return JS_EXCEPTION;
+    }
+    const char *args = JS_ToCStringLen(c, &args_len, argv[1]);
+    if (!args) {
+        JS_FreeCString(c, name);
+        JS_FreeValue(c, entry);
+        JS_FreeValue(c, promise);
+        return JS_EXCEPTION;
+    }
+
+    uint32_t id = next_id;
+    if (JS_SetPropertyUint32(c, pending, id, entry) < 0) {
+        JS_FreeCString(c, name);
+        JS_FreeCString(c, args);
+        JS_FreeValue(c, promise);
+        return JS_EXCEPTION;
+    }
+    next_id++;
+    int refused = host_call(id, name, (uint32_t)name_len, args, (uint32_t)args_len);
+    JS_FreeCString(c, name);
+    JS_FreeCString(c, args);
+    if (refused) {
+        JSAtom atom = JS_NewAtomUInt32(c, id);
+        if (atom != JS_ATOM_NULL) {
+            JS_DeleteProperty(c, pending, atom, 0);
+            JS_FreeAtom(c, atom);
+        }
+        JS_FreeValue(c, promise);
+        host_failed = true;
+        return JS_ThrowInternalError(c, "the host failed while taking a call");
+    }
+    return promise;
+}
+
+/* __output(stream, text): stream 1 is out and 2 is err. */
+static JSValue js_output(JSContext *c, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    int32_t stream;
+    if (argc < 2 || !JS_IsNumber(argv[0]) || !JS_IsString(argv[1]))
+        return JS_ThrowTypeError(c, "__output takes a stream, 1 or 2, and a string");
+    if (JS_ToInt32(c, &stream, argv[0]) < 0)
+        return JS_EXCEPTION;
+    if (stream != 1 && stream != 2)
+        return JS_ThrowRangeError(c, "__output's stream is 1 or 2");
+    size_t len;
+    const char *text = JS_ToCStringLen(c, &len, argv[1]);
+    if (!text)
+        return JS_EXCEPTION;
+    int refused = host_output((uint32_t)stream, text, (uint32_t)len);
+    JS_FreeCString(c, text);
+    if (refused) {
+        host_failed = true;
+        return JS_ThrowInternalError(c, "the host failed while taking output");
+    }
+    return JS_UNDEFINED;
+}
+
+/* Keeps `exc` as what ended the run, unless something already did. Takes `exc`. */
+static void fail_with(JSValue exc) {
+    if (failed) {
+        JS_FreeValue(ctx, exc);
+        return;
+    }
+    failure = exc;
+    failed = true;
+}
+
+/* Runs pending jobs one at a time until none is left or the run has ended. */
+static void run_jobs(void) {
+    for (;;) {
+        if (interrupted || host_failed || failed)
+            return;
+        JSContext *job_ctx;
+        int r = JS_ExecutePendingJob(rt, &job_ctx);
+        if (r == 0)
+            return;
+        if (r < 0) {
+            /* A promise job catches what its handler throws, so only an uncatchable error or a
+               failure in the job machinery itself gets here. */
+            JSValue exc = JS_GetException(job_ctx);
+            if (interrupted)
+                JS_FreeValue(ctx, exc);
+            else
+                fail_with(exc);
+            return;
+        }
+    }
+}
+
+static int state(void) {
+    if (interrupted)
+        return ENGINE_INTERRUPTED;
+    if (host_failed)
+        return ENGINE_HOST_FAILED;
+    if (failed)
+        return ENGINE_REJECTED;
+    switch (JS_PromiseState(ctx, completion)) {
+    case JS_PROMISE_FULFILLED:
+        return ENGINE_FULFILLED;
+    case JS_PROMISE_REJECTED:
+        return ENGINE_REJECTED;
+    case JS_PROMISE_PENDING:
+        return ENGINE_PENDING;
+    default:
+        return ENGINE_MISUSE;
+    }
+}
+
+/* Makes the runtime and context. memory_limit is the limit on QuickJS's allocations, which the
+   binding sets a margin under the linear memory's maximum (0 means none). stack_size is the
+   stack QuickJS allows below this call, which the binding keeps under the link-time stack. */
+EXPORT("engine_init")
+int engine_init(uint32_t memory_limit, uint32_t stack_size) {
+    if (rt)
+        return ENGINE_MISUSE;
+    mem_limit = memory_limit;
+    rt = JS_NewRuntime2(&limited_malloc_funcs, NULL);
+    if (!rt)
+        return ENGINE_NO_MEMORY;
+    JS_SetMaxStackSize(rt, stack_size);
+    JS_SetInterruptHandler(rt, interrupt_handler, NULL);
+    ctx = JS_NewContext(rt);
+    if (!ctx) {
+        JS_FreeRuntime(rt);
+        rt = NULL;
+        return ENGINE_NO_MEMORY;
+    }
+    completion = JS_UNDEFINED;
+    failure = JS_UNDEFINED;
+    pending = JS_NewObjectProto(ctx, JS_NULL);
+    if (JS_IsException(pending))
+        return ENGINE_NO_MEMORY;
+    JSValue global = JS_GetGlobalObject(ctx);
+    int bad = JS_SetPropertyStr(ctx, global, "__host", JS_NewCFunction(ctx, js_host, "__host", 2)) < 0 ||
+              JS_SetPropertyStr(ctx, global, "__output", JS_NewCFunction(ctx, js_output, "__output", 2)) < 0;
+    JS_FreeValue(ctx, global);
+    return bad ? ENGINE_NO_MEMORY : 0;
+}
+
+/* Evaluates the prelude as a global script, then the script as global code with top-level await,
+   then runs jobs. Each buffer must end in a NUL at [len], as JS_Eval requires; filename is a
+   NUL-terminated string. Called once. */
+EXPORT("engine_start")
+int engine_start(const char *prelude, uint32_t prelude_len, const char *script, uint32_t script_len,
+                 const char *filename) {
+    if (!ctx || started || !prelude || !script || !filename || prelude[prelude_len] != '\0' ||
+        script[script_len] != '\0')
+        return ENGINE_MISUSE;
+    started = true;
+    JSValue r = JS_Eval(ctx, prelude, prelude_len, "<prelude>", JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(r)) {
+        JSValue exc = JS_GetException(ctx);
+        if (interrupted || host_failed)
+            JS_FreeValue(ctx, exc);
+        else
+            fail_with(exc);
+        return state();
+    }
+    JS_FreeValue(ctx, r);
+    r = JS_Eval(ctx, script, script_len, filename, JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_ASYNC);
+    if (JS_IsException(r)) {
+        /* A syntax error, or a failure before the async function started. */
+        JSValue exc = JS_GetException(ctx);
+        if (interrupted || host_failed)
+            JS_FreeValue(ctx, exc);
+        else
+            fail_with(exc);
+        return state();
+    }
+    completion = r;
+    run_jobs();
+    return state();
+}
+
+/* Settles call `id`, then runs jobs. With ok, the call's promise resolves to the parsed JSON;
+   otherwise it rejects with it. json must end in a NUL at [json_len], as JS_ParseJSON requires.
+   A null json means the host couldn't copy the result in, and a result that doesn't parse, or
+   doesn't fit the memory limit, rejects the promise with that error instead. */
+EXPORT("engine_settle")
+int engine_settle(uint32_t id, int ok, const char *json, uint32_t json_len) {
+    if (!started || (json && json[json_len] != '\0'))
+        return ENGINE_MISUSE;
+    JSValue entry = JS_GetPropertyUint32(ctx, pending, id);
+    if (JS_IsException(entry)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return ENGINE_NO_MEMORY;
+    }
+    if (JS_IsUndefined(entry))
+        return ENGINE_UNKNOWN_CALL;
+    JSAtom atom = JS_NewAtomUInt32(ctx, id);
+    if (atom == JS_ATOM_NULL) {
+        JS_FreeValue(ctx, entry);
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return ENGINE_NO_MEMORY;
+    }
+    JS_DeleteProperty(ctx, pending, atom, 0);
+    JS_FreeAtom(ctx, atom);
+    if (interrupted || host_failed || failed) {
+        JS_FreeValue(ctx, entry);
+        return state();
+    }
+
+    JSValue value;
+    bool resolve = ok != 0;
+    if (!json) {
+        JS_ThrowOutOfMemory(ctx);
+        value = JS_GetException(ctx);
+        resolve = false;
+    } else {
+        value = JS_ParseJSON(ctx, json, json_len, "<result>");
+        if (JS_IsException(value)) {
+            value = JS_GetException(ctx);
+            resolve = false;
+        }
+    }
+    JSValue fn = JS_GetPropertyUint32(ctx, entry, resolve ? 0 : 1);
+    JS_FreeValue(ctx, entry);
+    if (JS_IsException(fn)) {
+        JS_FreeValue(ctx, value);
+        fail_with(JS_GetException(ctx));
+        return state();
+    }
+    JSValue r = JS_Call(ctx, fn, JS_UNDEFINED, 1, (JSValueConst *)&value);
+    JS_FreeValue(ctx, fn);
+    JS_FreeValue(ctx, value);
+    if (JS_IsException(r))
+        fail_with(JS_GetException(ctx));
+    else
+        JS_FreeValue(ctx, r);
+    run_jobs();
+    return state();
+}
+
+/* The text of a value or an error, for engine_result. Takes v. Returns a JS string, undefined,
+   or an exception. */
+static JSValue error_json(JSValue v) {
+    JSValue o = JS_NewObject(ctx);
+    if (JS_IsException(o)) {
+        JS_FreeValue(ctx, v);
+        return o;
+    }
+    JSValue name = JS_UNDEFINED, message = JS_UNDEFINED, stack = JS_UNDEFINED;
+    if (JS_IsObject(v)) {
+        name = JS_GetPropertyStr(ctx, v, "name");
+        message = JS_GetPropertyStr(ctx, v, "message");
+        stack = JS_GetPropertyStr(ctx, v, "stack");
+    } else {
+        message = JS_ToString(ctx, v);
+    }
+    /* A getter that throws, or a value with no string form, leaves that part out. */
+    JSValue parts[3] = {name, message, stack};
+    const char *keys[3] = {"name", "message", "stack"};
+    for (int i = 0; i < 3; i++) {
+        JSValue p = parts[i];
+        if (JS_IsException(p)) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            continue;
+        }
+        if (i < 2 && !JS_IsUndefined(p) && !JS_IsString(p)) {
+            JSValue s = JS_ToString(ctx, p);
+            JS_FreeValue(ctx, p);
+            if (JS_IsException(s)) {
+                JS_FreeValue(ctx, JS_GetException(ctx));
+                continue;
+            }
+            p = s;
+        }
+        if (JS_IsString(p))
+            JS_SetPropertyStr(ctx, o, keys[i], p);
+        else
+            JS_FreeValue(ctx, p);
+    }
+    JS_FreeValue(ctx, v);
+    JSValue text = JS_JSONStringify(ctx, o, JS_UNDEFINED, JS_UNDEFINED);
+    JS_FreeValue(ctx, o);
+    return text;
+}
+
+/* Copies a JS string into a buffer for the host: [u32 kind][u32 length][UTF-8 bytes]. */
+static uint8_t *pack(uint32_t kind, JSValue text) {
+    size_t len = 0;
+    const char *s = NULL;
+    if (JS_IsString(text)) {
+        s = JS_ToCStringLen(ctx, &len, text);
+        if (!s) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            JS_FreeValue(ctx, text);
+            return NULL;
+        }
+    }
+    uint8_t *buf = limited_malloc(NULL, 8 + len);
+    if (buf) {
+        memcpy(buf, &kind, 4);
+        uint32_t len32 = (uint32_t)len;
+        memcpy(buf + 4, &len32, 4);
+        if (len)
+            memcpy(buf + 8, s, len);
+    }
+    if (s)
+        JS_FreeCString(ctx, s);
+    JS_FreeValue(ctx, text);
+    return buf;
+}
+
+/* After ENGINE_FULFILLED or ENGINE_REJECTED: a buffer the host frees with engine_free,
+   [u32 kind][u32 length][UTF-8]. Kind 0: fulfilled with undefined (or a value JSON.stringify
+   leaves out), no text. Kind 1: fulfilled, the value's JSON. Kind 2: an error, as JSON
+   {name?, message?, stack?}: what the script threw, or why its value couldn't be stringified.
+   Returns 0 in any other state, or when it can't allocate. */
+EXPORT("engine_result")
+uint8_t *engine_result(void) {
+    int st = state();
+    if (st == ENGINE_REJECTED) {
+        JSValue why = failed ? JS_DupValue(ctx, failure) : JS_PromiseResult(ctx, completion);
+        JSValue text = error_json(why);
+        if (JS_IsException(text)) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            return NULL;
+        }
+        return pack(2, text);
+    }
+    if (st != ENGINE_FULFILLED)
+        return NULL;
+    JSValue settled = JS_PromiseResult(ctx, completion);
+    JSValue value = JS_GetPropertyStr(ctx, settled, "value");
+    JS_FreeValue(ctx, settled);
+    if (JS_IsException(value)) {
+        JSValue text = error_json(JS_GetException(ctx));
+        return JS_IsException(text) ? NULL : pack(2, text);
+    }
+    JSValue text = JS_JSONStringify(ctx, value, JS_UNDEFINED, JS_UNDEFINED);
+    JS_FreeValue(ctx, value);
+    if (JS_IsException(text)) {
+        JSValue etext = error_json(JS_GetException(ctx));
+        if (JS_IsException(etext)) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            return NULL;
+        }
+        return pack(2, etext);
+    }
+    if (JS_IsUndefined(text))
+        return pack(0, text);
+    return pack(1, text);
+}
+
+/* Buffers the host fills for engine_start and engine_settle, and frees after engine_result.
+   They're held to the same limit as QuickJS's allocations: a result's copy and the value parsed
+   from it share the guest's memory, and with the copy outside the limit, the two together could
+   exhaust the linear memory before the limit refused anything, leaving no room for the error.
+   A refused buffer opens the headroom, so the out-of-memory error engine_settle then throws can
+   be built. */
+EXPORT("engine_alloc")
+void *engine_alloc(uint32_t size) {
+    return limited_malloc(NULL, size ? size : 1);
+}
+
+EXPORT("engine_free")
+void engine_free(void *ptr) {
+    limited_free(NULL, ptr);
+}
+
+/* Frees the context and runtime. Nothing may be called after it. */
+EXPORT("engine_dispose")
+void engine_dispose(void) {
+    if (!rt)
+        return;
+    JS_FreeValue(ctx, completion);
+    JS_FreeValue(ctx, failure);
+    JS_FreeValue(ctx, pending);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    ctx = NULL;
+    rt = NULL;
+}

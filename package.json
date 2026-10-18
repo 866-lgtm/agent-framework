@@ -26,7 +26,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "postbuild": "node -e \"const fs=require('node:fs'); for (const p of ['dist/src/api/mcp-server.js','dist/src/recovery/recover-cli.js']) fs.chmodSync(p, 0o755)\"",
+    "postbuild": "node -e \"const fs=require('node:fs'); for (const p of ['dist/src/api/mcp-server.js','dist/src/recovery/recover-cli.js']) fs.chmodSync(p, 0o755); fs.copyFileSync('src/code-execution/quickjs.wasm', 'dist/src/code-execution/quickjs.wasm')\"",
     "dev": "tsc --watch",
     "clean": "rm -rf dist",
     "typecheck": "tsc --noEmit",
