@@ -20,16 +20,17 @@
     for an operator's abandon. The framework's `abortInference()` returns
     `true` for such a turn. `abortInference()` and an operator's abandon end
     a turn's wait to retry, however long, so the turn ends at once; a stop
-    through `Agent.cancelStream()` ends it when the wait runs out. In the
+    through `Agent.cancelStream()` ends it when the wait runs out. An MCPL
+    server granted `inferenceLifecycle` sees a failed inference whose retry
+    such a stop cancels end `failed`, as when `stop()` cancels it. In the
     tool-result guard's wait, `stop()` and an operator's abandon end the
     turn as their own stop even when a caller's stop came first, and as
-    `stop()`'s when both reach it.
-    `host:quiesce`'s `unabandonable` lists a turn that the abandon hasn't
-    ended when its grace runs out: one with no stream and no check ahead,
-    such as a puppet tool turn, or one that hasn't reached its check yet,
-    the tool-result guard's wait for its speech included. A turn whose stream
-    the abandon cancelled while it was still streaming isn't listed, even
-    one still running.
+    `stop()`'s when both reach it. `host:quiesce`'s `unabandonable` lists a
+    turn that the abandon hasn't ended when its grace runs out: one with no
+    stream and no check ahead, such as a puppet tool turn, or one that
+    hasn't reached its check yet, the tool-result guard's wait for its
+    speech included. A turn whose stream the abandon cancelled while it was
+    still streaming isn't listed, even one still running.
   - **A failure's report:** a turn's stream that failed or threw no longer
     holds the agent while its `inference:failed` is delivered, nor does a
     compiled stream held for a provider's wait. A listener sees the agent
