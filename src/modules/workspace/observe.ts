@@ -89,10 +89,12 @@ export type NestedMount = { dir: string; name: string; real?: string };
 export type StatFingerprint = Omit<Fingerprint, 'hashedAt'>;
 
 /**
- * Opened with every read or write of a workspace path, where the platform has
- * it: for a regular file it changes nothing, and a FIFO or other special file
- * swapped in at the path neither blocks the open nor passes the regular-file
- * check that follows.
+ * Opened with every open of a workspace path that may already be there, a
+ * read, a write in place or a directory's sync, where the platform has it:
+ * for a regular file or a directory it changes nothing, and a FIFO or other
+ * special file swapped in at the path neither blocks the open nor passes the
+ * check of its kind that follows. A create needs none: O_CREAT | O_EXCL fails
+ * at once on anything already at the path.
  */
 export const NONBLOCK = typeof fsConstants.O_NONBLOCK === 'number' ? fsConstants.O_NONBLOCK : 0;
 
@@ -502,7 +504,11 @@ export class CheckedDir {
    */
   async sync(): Promise<void> {
     if (process.platform === 'win32') return;
-    const handle = await open(this.real, 'r');
+    // NONBLOCK: a FIFO put at its path since it was checked opens at once,
+    // and is refused below as not this directory, instead of holding the
+    // open, and with it the mount's turn, until something opens it for
+    // writing.
+    const handle = await open(this.real, fsConstants.O_RDONLY | NONBLOCK);
     try {
       const info = await handle.stat({ bigint: true });
       if (!info.isDirectory() || info.dev !== this.dev || info.ino !== this.ino) throw new Error(CHANGED);
