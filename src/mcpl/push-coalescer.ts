@@ -177,6 +177,8 @@ interface SubjectState<E> {
   touchedAt: number;
 }
 
+interface ReceiptEntry { result: PushEventResult; at: number; committed: boolean; firstView?: true }
+
 export interface CoalescingSnapshot {
   version: 1;
   receipts: Array<[string, { result: PushEventResult; at: number }]>;
@@ -395,8 +397,15 @@ export class PushCoalescer<E = unknown> {
   private readonly subjects = new Map<string, SubjectState<E>>();
   /** `committed`: the durability barrier succeeded after this receipt was
    *  written. An uncommitted receipt deduplicates effects but is not an
-   *  acknowledgement until a commit succeeds. */
-  private readonly receipts = new Map<string, { result: PushEventResult; at: number; committed: boolean }>();
+   *  acknowledgement until a commit succeeds. `firstView`: the admission it
+   *  records delivered its occurrence as the agent's first view
+   *  (`replacesUnread`), so a retry answered from it says so too. Kept in
+   *  memory only: a receipt restored from a snapshot reads as no first view. */
+  private readonly receipts = new Map<string, ReceiptEntry>();
+  /** Set by a delivery that carries `replacesUnread`. admit() clears it before
+   *  an admission's effects and reads it after them; every delivery runs
+   *  under the lock, so between the two it is that admission's alone. */
+  private deliveredFirstView = false;
   private readonly retryWindowMs: number;
   private readonly maxSubjects: number;
   private readonly maxNotices: number;
@@ -452,12 +461,26 @@ export class PushCoalescer<E = unknown> {
     return (this.rendersInFlight.get(serverId) ?? 0) > 0;
   }
 
+  /** The host's delivery, noting one that carries `replacesUnread` for the
+   *  receipt of the admission it belongs to (deliveredFirstView). */
+  private deliver(...args: Parameters<CoalescerHost<E>['deliver']>): ReturnType<CoalescerHost<E>['deliver']> {
+    if (args[0].replacesUnread) this.deliveredFirstView = true;
+    return this.host.deliver(...args);
+  }
+
   receipt(serverId: string, binding: string, eventId: string): PushEventResult | undefined {
     const entry = this.receiptEntry(coalescingReceiptKey(serverId, binding, eventId));
     return entry && structuredClone(entry.result);
   }
 
-  private receiptEntry(key: string): { result: PushEventResult; at: number; committed: boolean } | undefined {
+  /** Whether the admission this receipt records delivered its occurrence as
+   *  the agent's first view: for the host's own bookkeeping, such as the
+   *  channel registry's reply anchor, and never part of the wire result. */
+  receiptFirstView(serverId: string, binding: string, eventId: string): boolean {
+    return this.receiptEntry(coalescingReceiptKey(serverId, binding, eventId))?.firstView === true;
+  }
+
+  private receiptEntry(key: string): ReceiptEntry | undefined {
     const entry = this.receipts.get(key);
     if (!entry) return undefined;
     if (this.now() - entry.at > this.retryWindowMs) { this.receipts.delete(key); return undefined; }
@@ -467,7 +490,7 @@ export class PushCoalescer<E = unknown> {
   /** Acknowledge a receipt: durable first. A receipt whose commit failed is
    *  committed now (no effects are repeated); if that fails again, so does
    *  the acknowledgement, and the producer retries once more. */
-  private async acknowledge(key: string, entry: { result: PushEventResult; at: number; committed: boolean }, subject: string, eventId: string): Promise<PushEventResult> {
+  private async acknowledge(key: string, entry: ReceiptEntry, subject: string, eventId: string): Promise<PushEventResult> {
     if (!entry.committed) {
       try {
         await this.host.commit?.();
@@ -512,6 +535,7 @@ export class PushCoalescer<E = unknown> {
     this.host.audit({ kind: 'received', subject, eventId: occurrence.eventId, retract: occurrence.retract, deferred: occurrence.deferred });
 
     let outcome: CoalesceOutcome;
+    this.deliveredFirstView = false;
     if (occurrence.retract) {
       outcome = await this.retract(subject, state, occurrence, occupantUnread);
     } else if (occurrence.deferred) {
@@ -525,7 +549,7 @@ export class PushCoalescer<E = unknown> {
     state.touchedAt = this.now();
     const result: PushEventResult = { accepted: true, coalesce: { outcome, ...(priorEventId ? { priorEventId } : {}) } };
     const receiptKey = coalescingReceiptKey(occurrence.serverId, occurrence.binding, occurrence.eventId);
-    const entry = { result: structuredClone(result), at: this.now(), committed: false };
+    const entry: ReceiptEntry = { result: structuredClone(result), at: this.now(), committed: false, ...(this.deliveredFirstView ? { firstView: true as const } : {}) };
     try {
       this.host.recordReceipt?.({
         key: receiptKey, result: entry.result, at: entry.at, subject, ...(born ? { born } : {}),
@@ -639,7 +663,7 @@ export class PushCoalescer<E = unknown> {
     // The notice is an ordinary occurrence: it rides the normal delivery path
     // (tags → gate policy → wake) and is consumed like any message — in the
     // context that read a version, never a new one (§3.2).
-    const placement = await this.host.deliver({ ...occurrence, deliverTo: state.audienceAgent });
+    const placement = await this.deliver({ ...occurrence, deliverTo: state.audienceAgent });
     if (placement) {
       state.occupant = { eventId: occurrence.eventId, placement };
       state.audienceAgent = placement.agent;
@@ -663,7 +687,7 @@ export class PushCoalescer<E = unknown> {
       if (this.host.remove(prior.placement)) {
         this.host.cancelWake(subject);
         // The replacement follows the prior delivery's audience (§3.2).
-        const placement = await this.host.deliver({
+        const placement = await this.deliver({
           ...occurrence, deliverTo: prior.placement.agent,
           ...(firstView ? { replacesUnread: true } : {}),
         });
@@ -682,7 +706,7 @@ export class PushCoalescer<E = unknown> {
     // The subject's `initial` birth is the agent's first view of it, and so
     // is an occurrence that takes a first-view batch's place.
     const firstView = hadBatch ? batchFirstView && state.history === 'none' : outcome === 'first';
-    const placement = await this.host.deliver(hadBatch && firstView ? { ...occurrence, replacesUnread: true } : occurrence);
+    const placement = await this.deliver(hadBatch && firstView ? { ...occurrence, replacesUnread: true } : occurrence);
     state.occupant = placement ? { eventId: occurrence.eventId, placement, ...(firstView ? { firstView: true as const } : {}) } : undefined;
     if (placement) state.audienceAgent = placement.agent;
     return outcome;
@@ -917,7 +941,7 @@ export class PushCoalescer<E = unknown> {
         // The batch's first delivery is the agent's first view while nothing
         // of the subject has been read and no other version of it is placed.
         const firstView = batch.firstView === true && state.history === 'none' && !state.occupant;
-        const placement = await this.host.deliver({ ...occurrence, timestamp, content, ...(firstView ? { replacesUnread: true } : {}) }, content, assemblingFor);
+        const placement = await this.deliver({ ...occurrence, timestamp, content, ...(firstView ? { replacesUnread: true } : {}) }, content, assemblingFor);
         if (placement?.deferredId) {
           // Landed in another agent's deferred queue (its turn is alive): still
           // unread there, so it stays replaceable and withdrawable. The turn
@@ -1032,7 +1056,7 @@ export class PushCoalescer<E = unknown> {
   snapshot(): CoalescingSnapshot {
     return {
       version: 1,
-      receipts: [...this.receipts],
+      receipts: [...this.receipts].map(([key, { result, at }]): [string, { result: PushEventResult; at: number }] => [key, { result, at }]),
       subjects: [...this.subjects].map(([subject, s]) => ({
         subject, history: s.history, consumedEventId: s.consumedEventId, identity: s.identity,
         ...(s.audienceAgent ? { audienceAgent: s.audienceAgent } : {}),

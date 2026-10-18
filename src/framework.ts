@@ -2341,10 +2341,6 @@ export class AgentFramework {
   /** Both lanes are admitted in arrival order: a create, edit and delete of
    *  one subject must not overtake one another while routing awaits. */
   private coalescingAdmission: Promise<unknown> = Promise.resolve();
-  /** The event of the channel message the admission under way delivered as
-   *  the agent's first view (`replacesUnread`), for the registry's anchor.
-   *  Admissions are serialized, so it is only ever the current one's. */
-  private coalescedFirstView: string | undefined;
   private coalescingSaveTimer: ReturnType<typeof setTimeout> | null = null;
   private coalescingSnapshotDirty: (() => CoalescingSnapshot) | null = null;
   private coalescingRecentReceipts: CoalescingReceiptRecord[] = [];
@@ -12222,7 +12218,6 @@ export class AgentFramework {
       if (typeof message.timestamp !== 'string') throw new CoalesceError('timestamp', 'timestamp is required');
       validateCoalescedContent(message.content, { allowEmpty: message.coalesce.retract === true });
       const c = message.coalesce;
-      this.coalescedFirstView = undefined;
       // The inbound source envelope, frozen at acceptance: deferral, fan-out
       // and replay deliver it unchanged (mcpl/inbound-source.ts).
       const inboundSource = this.channelSource({
@@ -12253,9 +12248,10 @@ export class AgentFramework {
         event: { lane: 'channel', event: { ...event, eventId: message.eventId, inboundSource } },
       });
       // The registry's anchor follows a delivery the coalescer marked as the
-      // agent's first view, as the turn's locus does.
-      const firstView = this.coalescedFirstView === message.eventId;
-      this.coalescedFirstView = undefined;
+      // agent's first view, as the turn's locus does. The receipt says so for
+      // this acceptance, and for a retry it answers, whose first attempt
+      // delivered the message but failed before its acknowledgement.
+      const firstView = this.pushCoalescer.receiptFirstView(serverId, this.coalescingBinding(serverId), message.eventId);
       return { messageId: message.messageId, accepted: true, coalesce: result.coalesce, ...(firstView ? { firstView: true as const } : {}) };
     });
   }
@@ -12400,7 +12396,6 @@ export class AgentFramework {
         ? { inboundSource: materialized && source.kind !== 'surface' ? { ...source, materialized: true } : source }
         : {};
     if (occ.event.lane === 'channel') {
-      if (occ.replacesUnread) this.coalescedFirstView = occ.eventId;
       const event = { ...occ.event.event, coalescingSubject, ...narrowing, ...firstView, ...(assemblingFor ? { assemblingFor } : {}) };
       const placement = await this.handleMcplChannelIncoming(event);
       await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);

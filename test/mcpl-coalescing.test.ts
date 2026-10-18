@@ -2488,6 +2488,42 @@ test("#157: a channel edit that is the agent's first view moves context.incoming
   assert.equal(incomingAnchor(f)?.messageId, 'ma', "and to the edit's message");
 });
 
+test("#157: a channel edit that is the agent's first view moves context.incoming to its message when its acceptance is retried after a failed commit", async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close); await f.register(); await f.register('other');
+  await f.send('channels/incoming', { messages: [f.channel('a1', 'question_wiht_typo', { initial: true }, 'other', 'ma')] });
+  await f.send('channels/incoming', { messages: [f.channel('b1', 'unrelated', { initial: true }, 'chat', 'mb')] });
+  assert.equal(incomingAnchor(f)?.messageId, 'mb', 'the later message is the anchor');
+  // The edit's acceptance commit fails once, after its delivery (R10's seam),
+  // so the server retries, and the retry is answered from the receipt.
+  const internals = f.framework as unknown as { commitCoalescingDurable: () => Promise<void> };
+  const commit = internals.commitCoalescingDurable.bind(internals);
+  internals.commitCoalescingDurable = () => { internals.commitCoalescingDurable = commit; return Promise.reject(new Error('EIO simulated')); };
+  const message = { ...f.channel('a2', 'question_fixed', {}, 'other', 'ma'), tags: ['chat:edited'] };
+  const first = await f.send('channels/incoming', { messages: [message] });
+  assert.equal(first.result.results[0].accepted, false, 'the failed commit leaves the edit unacknowledged');
+  assert(isMarked(storedWith(f, 'question_fixed')), "the edit was delivered as the agent's first view");
+  assert.equal(incomingAnchor(f)?.messageId, 'mb', 'an unacknowledged acceptance moves no anchor');
+  const retry = await f.send('channels/incoming', { messages: [message] });
+  assert.equal(retry.result.results[0].coalesce.outcome, 'replaced', "the retry is answered from the first attempt's receipt");
+  assert(!('firstView' in retry.result.results[0]), "the host's mark isn't in the answer to the server");
+  assert.equal(incomingAnchor(f)?.channelId, 'other', "the anchor moved to the edit's channel");
+  assert.equal(incomingAnchor(f)?.messageId, 'ma', "and to the edit's message");
+});
+
+test("#157: a channel edit after an earlier edit that was the agent's first view, of a message the agent has since read, leaves context.incoming where it was", async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close); await f.register(); await f.register('other');
+  await f.send('channels/incoming', { messages: [f.channel('a1', 'question_wiht_typo', { initial: true }, 'other', 'ma')] });
+  await f.send('channels/incoming', { messages: [f.channel('b1', 'unrelated', { initial: true }, 'chat', 'mb')] });
+  await f.send('channels/incoming', { messages: [{ ...f.channel('a2', 'question_fixed', {}, 'other', 'ma'), tags: ['chat:edited'] }] });
+  assert.equal(incomingAnchor(f)?.messageId, 'ma', "the first-view edit moved the anchor to its message");
+  await f.send('channels/incoming', { messages: [f.channel('c1', 'later', { initial: true }, 'chat', 'mc')] });
+  await f.framework.getAgent('agent')!.compileContext();
+  // Each admission records only its own delivery's mark.
+  const edit = await f.send('channels/incoming', { messages: [{ ...f.channel('a3', 'question_fixed_again', {}, 'other', 'ma'), tags: ['chat:edited'] }] });
+  assert.equal(edit.result.results[0].coalesce.outcome, 'appended', 'the agent had read the edit');
+  assert.equal(incomingAnchor(f)?.messageId, 'mc', 'the marker left the anchor at the later message');
+});
+
 test('#157: a channel edit of a message the agent has read leaves context.incoming where it was', async (t) => {
   const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close); await f.register(); await f.register('other');
   await f.send('channels/incoming', { messages: [f.channel('a1', 'question_wiht_typo', { initial: true }, 'other', 'ma')] });
