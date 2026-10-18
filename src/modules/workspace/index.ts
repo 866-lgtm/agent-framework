@@ -1964,7 +1964,7 @@ export class WorkspaceModule implements Module {
         const placed = fromRoots.filter((s) => s.dir !== configured);
         if (placed.length > 0) {
           console.warn(
-            `[workspace] Mount "${outer.name}" contains mount "${inner.name}" where its root is on disk, ` +
+            `[workspace] Mount "${outer.name}" contains mount "${inner.name}" where it lies on disk, ` +
             `at ${placed.map((s) => `${s.dir}/`).join(' and ')} — passing over it as another mount's directory`,
           );
         }
