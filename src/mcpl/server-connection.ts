@@ -491,12 +491,13 @@ export class McplServerConnection extends EventEmitter {
    * Nothing else moves, so a snapshot with nothing kept is flushed as it was
    * held. A registration also passes whatever its own transport sent before
    * it, which a server that announces its channels first, as a bridge does,
-   * never has. Nothing passes a removal: registrations move only up to the
-   * transport's first `channels-changed` that removes a channel, which stays
-   * where it was held, with everything after it. So in a flush that opens
-   * both planes, what the transport sent before a removal is admitted before
-   * it, its messages for that channel included, and a registration it sent
-   * after a removal is admitted after it. A flush that opens only the control
+   * never has. A registration passes a removal only of another channel: one
+   * that names a channel the transport removed before it stays where it was
+   * held, so one channel's removal and its re-registration keep their order.
+   * A removal stays where it was held, as everything does that isn't a
+   * registration, so in a flush that opens both planes, what the transport
+   * sent before a removal is admitted before it, its messages for that
+   * channel included. A flush that opens only the control
    * plane, as during a quiesce, admits the control traffic, a removal
    * included, and holds the data plane's again until that plane opens, as
    * live traffic is during a quiesce: a message held for a channel a removal
@@ -505,19 +506,37 @@ export class McplServerConnection extends EventEmitter {
   private static admissionOrder(pending: HeldItem[]): HeldItem[] {
     if (!pending.some((item) => item.kept)) return pending;
     const registrations = new Set<HeldItem>();
+    // The channels a removal the transport sent so far names.
+    const removed = new Set<string>();
     for (const item of pending) {
       if (item.kept) continue;
-      if (item.event === 'channels-changed' && McplServerConnection.removesChannels(item)) break;
-      if (item.event === 'channels-register' || item.event === 'channels-changed') registrations.add(item);
+      if (item.event !== 'channels-register' && item.event !== 'channels-changed') continue;
+      const removes = McplServerConnection.removedChannelIds(item);
+      if (removes.length === 0
+        && !McplServerConnection.registeredChannelIds(item).some((id) => removed.has(id))) {
+        registrations.add(item);
+      }
+      for (const id of removes) removed.add(id);
     }
     if (registrations.size === 0) return pending;
     return [...registrations, ...pending.filter((item) => !registrations.has(item))];
   }
 
-  /** Whether a held `channels-changed` removes any channel. */
-  private static removesChannels(item: HeldItem): boolean {
+  /** The channels a held `channels-changed` removes. */
+  private static removedChannelIds(item: HeldItem): string[] {
+    if (item.event !== 'channels-changed') return [];
     const params = item.args[0] as { removed?: unknown } | null | undefined;
-    return Array.isArray(params?.removed) && params.removed.length > 0;
+    return Array.isArray(params?.removed) ? params.removed.filter((id): id is string => typeof id === 'string') : [];
+  }
+
+  /** The channels a held `channels-register` registers, or a held
+   *  `channels-changed` adds or updates. */
+  private static registeredChannelIds(item: HeldItem): string[] {
+    const params = item.args[0] as { channels?: unknown; added?: unknown; updated?: unknown } | null | undefined;
+    const lists = item.event === 'channels-register' ? [params?.channels] : [params?.added, params?.updated];
+    return lists.flatMap((list) => (Array.isArray(list) ? list : []))
+      .map((channel) => (channel as { id?: unknown } | null)?.id)
+      .filter((id): id is string => typeof id === 'string');
   }
 
   /**

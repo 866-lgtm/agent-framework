@@ -440,7 +440,7 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     await waitFor(() => reconnected === 1, 5000, 'reconnect after crash');
     registered.length = 0;
     const rejected = () => traces.filter((trace) => trace.type === 'mcpl:channel-incoming-rejected');
-    return { grant, admitted, rejected, register, incoming, removeRoom, removeChannel, addRoom, registered };
+    return { grant, admitted, rejected, register, incoming, removeRoom, removeChannel, addRoom, registered, registry };
   }
 
   it("lets a registration pass what its own transport sent before it, once a kept message is held", async () => {
@@ -461,7 +461,7 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     assert.deepStrictEqual(admitted.map((event) => event.messageId), ['kept-1', 'new-1']);
   });
 
-  it("doesn't move a registration past a removal, so what the transport sent before the removal is admitted", async () => {
+  it('keeps a removal where it was held, so what the transport sent before it is admitted, its message for that channel included', async () => {
     const { grant, admitted, rejected, register, incoming, removeRoom } = await keptIncomingSetup();
     // The next process registers the channel, sends a message in it, and
     // then removes it, all while the kept message is held.
@@ -481,7 +481,7 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     assert.deepStrictEqual(admitted.map((event) => event.messageId), ['kept-1', 'new-1']);
   });
 
-  it('keeps a registration sent after a removal behind it, so a kept message for its channel is admitted first and refused', async () => {
+  it('moves a registration ahead of a removal of another channel, so a kept message for its channel is admitted', async () => {
     const { grant, admitted, rejected, register, removeChannel, registered } = await keptIncomingSetup();
     // The next process removes another channel, and only then registers the
     // kept message's channel.
@@ -496,8 +496,32 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     } finally {
       console.error = consoleError;
     }
-    assert.deepStrictEqual(registered, [4], 'the registration is admitted, after the removal');
-    assert.deepStrictEqual(admitted, [], 'the kept message went first');
+    assert.deepStrictEqual(registered, [4], 'the registration is admitted');
+    assert.deepStrictEqual(rejected(), [], 'not refused as an unknown channel');
+    assert.deepStrictEqual(admitted.map((event) => event.messageId), ['kept-1']);
+  });
+
+  it("keeps a registration behind a removal of its own channel, so that channel's removal and re-registration stay in order", async () => {
+    const { grant, admitted, rejected, register, removeRoom, registered, registry } = await keptIncomingSetup();
+    // The next process removes the kept message's channel, and then
+    // registers it again.
+    removeRoom(3);
+    register(4);
+    const consoleError = console.error;
+    console.error = () => {};
+    try {
+      connection!.establishGrant(grant());
+      connection!.ready();
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      console.error = consoleError;
+    }
+    assert.deepStrictEqual(registered, [4], 'the registration is admitted');
+    assert.ok(
+      registry.listChannelsRaw().some((channel) => channel.serverId === 'flaky' && channel.descriptor.id === 'room'),
+      'the channel is registered at the end, as the server last said: its registration came after its removal',
+    );
+    assert.deepStrictEqual(admitted, [], 'the kept message went ahead of both');
     assert.equal(rejected().length, 1, 'and was refused as an unknown channel');
   });
 

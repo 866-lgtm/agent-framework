@@ -21,9 +21,12 @@
   grant, since the next process won't send them again. A channel
   registration the next process sends while they are still held is
   admitted ahead of them, so a kept message isn't refused as an unknown
-  channel, up to the first `channels/changed` it sends that removes a
-  channel: nothing passes a removal, so when both planes open together,
-  what the next process sent before one is admitted before it. While the
+  channel, unless the next process removed that channel before
+  registering it: a registration passes a removal only of another
+  channel, so one channel's removal and its re-registration stay in
+  order. A removal stays where it was held, so when both planes open
+  together, what the next process sent before one is admitted before it.
+  While the
   host is quiesced its control plane opens first, so a removal is admitted
   then, ahead of the incoming messages still held, as live traffic is during
   a quiesce, and a message held for a channel it removed is refused when the
