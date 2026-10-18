@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
-import fs, { existsSync, mkdtempSync, mkdirSync, readdirSync, readlinkSync, realpathSync, renameSync, rmdirSync, statSync, writeFileSync, unlinkSync, rmSync } from 'node:fs';
+import fs, { existsSync, mkdtempSync, mkdirSync, readdirSync, readlinkSync, realpathSync, renameSync, rmdirSync, statSync, symlinkSync, writeFileSync, unlinkSync, rmSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
@@ -669,6 +669,44 @@ describe('MountWatcher lifecycle', () => {
         await watcher.stop();
       }
     });
+  });
+
+  // The watcher holds, and checks, the root it watches: the configured path
+  // resolved. A link followed by `..` in that path makes the directory the
+  // kernel opens for the path as written another one, and a root held or
+  // checked there would read as replaced at every poll.
+  it('holds and checks the root it watches when a link and .. in its configured path lead elsewhere', {
+    skip: process.platform !== 'linux',
+  }, async () => {
+    const base = realpathSync(tmp);
+    const root = join(base, 'work');
+    mkdirSync(root);
+    mkdirSync(join(base, 'elsewhere', 'inner'), { recursive: true });
+    mkdirSync(join(base, 'elsewhere', 'work'));
+    symlinkSync(join(base, 'elsewhere', 'inner'), join(base, 'link'));
+    let ready = false;
+    let reattachCount = 0;
+    const { watcher } = collectWithNative(
+      { onReady: () => { ready = true; }, onReattach: () => { reattachCount++; } },
+      { ...makeConfig(), path: `${base}/link/../work` },
+    );
+    // Counts the root's checks, so the test waits for polls, not for a time.
+    const internals = watcher as unknown as { checkRootLiveness(opts?: { force?: boolean }): Promise<void> };
+    const check = internals.checkRootLiveness.bind(watcher);
+    let checks = 0;
+    internals.checkRootLiveness = (opts) => {
+      checks++;
+      return check(opts);
+    };
+    try {
+      await waitFor(() => ready, 'expected initial watcher ready');
+      assert.deepStrictEqual(descriptorsOf(root), [root], 'the watcher holds the root it watches');
+      const polled = checks;
+      await waitFor(() => checks >= polled + 3, 'expected three root polls');
+      assert.strictEqual(reattachCount, 0, 'the watcher re-attached to the root it watches');
+    } finally {
+      await watcher.stop();
+    }
   });
 
   it('lets go of its root at a stop whose close of chokidar fails', {
