@@ -58,7 +58,7 @@ export function buildCodeExecutionToolDefinition(opts?: {
       'time) is delivered into your context and starts a turn for you. A script that ends ' +
       'without calling wake_agent wakes nobody — that silence is the point (poll cheaply, ' +
       'wake only on signal). If your background script CRASHES you are woken with the error. ' +
-      'Its output streams to a workspace log file you can read any time. Wakes are ' +
+      'If you have a writable workspace, its output streams to a log file there that you can read any time. Wakes are ' +
       'rate-limited (early wakes are delayed, not dropped) and capped per script. ' +
       'CAUTION: background scripts die silently if the host process restarts — for a wake ' +
       'you absolutely must not miss, also arm a wake rule as backup. ' +

@@ -482,7 +482,7 @@ function interpreterExit(exitCode: number | null, signal: NodeJS.Signals | null,
   // The runtime ends itself (_fatal) with code 70 after a line saying which of its fds a script took,
   // or shut down the socket under. The line reaches the host unless the script took both the runtime's
   // copy of fd 2 and fd 2 itself, or shut down the socket under them, and it's read from what the result
-  // keeps, which past the stderr cap or a journal's tail lacks it.
+  // keeps, which past a stream's cap or a journal's tail lacks it.
   const taken = exitCode === RUNTIME_FATAL_EXIT ? fdTakenFromRuntime(said) : null;
   const check = taken
     ? `check whether the script closes, shuts down or replaces ${taken}, as the runtime's line above says`
@@ -769,7 +769,7 @@ export class PyRunner {
       // and any Python a script starts. So what it writes reaches the host as
       // it's written, and in UTF-8, where Python before 3.15 on Windows writes
       // a pipe in the ANSI code page unless told otherwise; a host's own
-      // PYTHONUTF8 no longer reaches the interpreter.
+      // PYTHONUTF8 reaches the interpreter only with inheritEnv: true.
       env: { ...buildChildEnv(this.envOptions), PYTHONUNBUFFERED: '1', PYTHONIOENCODING: 'utf-8' },
     });
     this.child = child;
@@ -1006,9 +1006,10 @@ export class PyRunner {
     if (journal) {
       const tail = journal.tail;
       // The journal, which the agent reads with its own tools, says why too,
-      // unless it reached its cap or a write to it failed.
+      // unless it reached its cap or a write to it failed, and the result's
+      // tail is the journal's.
       writeLine(journal, why);
-      this.settlePending({ stdout: '', stderr: why, returnCode, aborted: true, tail: onItsOwnLine(tail, why) });
+      this.settlePending({ stdout: '', stderr: why, returnCode, aborted: true, tail: journal.tail });
       return tail;
     }
     this.settlePending({ stdout, stderr: onItsOwnLine(stderr, why), returnCode, aborted: true });
@@ -1027,11 +1028,13 @@ export class PyRunner {
         + `${limitRemedy(pending.deadlineMs, pending.ceilingMs, pending.background, pending.backgroundCeilingMs)}\n`;
       // On a line of its own: a script's output, and the runner's own texts, such as an
       // interpreter's exit, can end without a newline.
-      const withNote = (text: string) => onItsOwnLine(text, note);
-      // A background script reports its output tail, so the note goes there too,
-      // and into its journal, which the agent reads with its own tools.
-      result = { ...result, stderr: withNote(result.stderr), ...(result.tail !== undefined ? { tail: withNote(result.tail) } : {}) };
-      if (pending.journal) writeLine(pending.journal, note.trimEnd());
+      result = { ...result, stderr: onItsOwnLine(result.stderr, note) };
+      // A background script's journal, which the agent reads with its own tools, says
+      // so too, and its tail is the result's.
+      if (pending.journal) {
+        writeLine(pending.journal, note.trimEnd());
+        result = { ...result, tail: pending.journal.tail };
+      }
     }
     // Only now: what the stop wrote above is the journal's last.
     pending.journal?.close();

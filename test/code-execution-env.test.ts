@@ -148,7 +148,9 @@ test('PYTHONUNBUFFERED and PYTHONIOENCODING are set last, over a declared env', 
 });
 
 test("a script's output that UTF-8 can't encode still returns, each lone surrogate escaped as backslashreplace writes it", async () => {
-  const runner = new PyRunner({ onToolCall: async () => '' });
+  // A result that didn't arrive would wait out the script's time limit, so a
+  // short one makes that a failure here rather than a ten-minute stall.
+  const runner = new PyRunner({ onToolCall: async () => '', scriptTimeoutMs: 15_000 });
   try {
     // A filename byte that isn't UTF-8, as os.fsdecode gives it, and a lone
     // surrogate from a JSON escape, as a tool's result can carry one.
@@ -167,7 +169,7 @@ test('a tool call carrying a lone surrogate reaches the host with U+FFFD in its 
   // The protocol's channel is strict UTF-8: unsent, the call would raise
   // UnicodeEncodeError in the script. A wake's payload goes the same way.
   const calls: Array<Record<string, unknown>> = [];
-  const runner = new PyRunner({ onToolCall: async (_name, args) => { calls.push(args); return 'sent'; } });
+  const runner = new PyRunner({ onToolCall: async (_name, args) => { calls.push(args); return 'sent'; }, scriptTimeoutMs: 15_000 });
   try {
     const r = await runner.exec(String.raw`import json, os
 print(await t({"name": os.fsdecode(b"\xff"), "text": json.loads('"a\\ud800b"')}))`, [{ pyName: 't', toolName: 't' }]);

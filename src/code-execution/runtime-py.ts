@@ -23,7 +23,8 @@
  *     journal of its output (a log file the agent can read, and a tail for the
  *     crash envelope) holds their lines in the order they were written. The
  *     runtime's own lines and faulthandler's traceback go to that pipe too, so
- *     a crash's text comes after what the script wrote before it.
+ *     a crash's text comes after the lines the script wrote before it; a
+ *     partial line still in a script's writer is lost with the process.
  *
  * OUTPUT. The protocol has file descriptors of its own: the host opens the
  * runtime's fds 3 (host -> py) and 4 (py -> host), which the runtime makes
@@ -187,6 +188,14 @@ def _start():
     _own(4, "cannot send the host a message any more", "fd 4, where they go")
     PROTO_IN = open(3, "r", encoding="utf-8", newline="\n")
     PROTO_OUT = open(4, "w", encoding="utf-8", newline="\n")
+    # Between scripts, a thread a script left running prints through these:
+    # a lone surrogate is escaped there, as in a script's own writers, rather
+    # than raising in the thread (PYTHONIOENCODING names no handler).
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except Exception:
+            pass
     _take_std_fds()
 
 
@@ -252,8 +261,8 @@ def _diag(text):
     # one of the two outputs the host gave the runtime, as the runtime found
     # them at its start: a note never goes into a file a script put in its
     # place. A background script's journal is one stream, stdout's pipe, so
-    # there the note goes through fd 1's copy first, after what the script
-    # wrote before it. It waits for room on a pipe a command left non-blocking,
+    # there the note goes through fd 1's copy first, after the lines the
+    # script wrote before it. It waits for room on a pipe a command left non-blocking,
     # as the marks do (_write_some).
     data = ("[pytc-runtime] " + text + "\n").encode("utf-8", "backslashreplace")
     pipes = [_OWN_FDS[fd][2] for fd in (_STD_OUT, _STD_ERR) if fd in _OWN_FDS]
@@ -342,37 +351,46 @@ def _flush_writers():
     # Send what the script left in its writers, the ones it kept from earlier
     # execs too.
     for writer in list(_script_writers):
-        try:
-            writer.flush()
-        except ValueError:
-            # A script closed or detached it, or the stream under it: nothing
-            # more goes through it. A script that closed or detached the writer
-            # itself flushed it then, and saw any failure of that flush.
-            continue
-        except Exception as exc:
-            # Its fd closed or broke under it, so that much can't be sent.
-            # Dropped, it can't go out later, once the fd is back, in another
-            # exec's output: a writer the script kept would flush it there.
-            _drop_held(writer)
-            _diag("some of what the script wrote couldn't be sent (" + str(exc) + ")")
+        _flush(writer)
 
 
 def _flush_script_streams():
     # What a script left in a wrapper of its own that it put in sys.stdout or
     # sys.stderr goes out in its exec, as Python flushes them at exit. The
     # runtime's own writers are _flush_writers', and a wrapper the script
-    # keeps anywhere else is its own.
+    # keeps anywhere else is its own. Compared by identity: the weak set's
+    # membership test would hash the object, which a script's may refuse.
+    writers = list(_script_writers)
     for stream in (sys.stdout, sys.stderr):
-        if stream not in _script_writers:
-            try:
-                stream.flush()
-            except Exception:
-                pass
+        if any(stream is w for w in writers) or not callable(getattr(stream, "flush", None)):
+            continue
+        _flush(stream)
+
+
+def _flush(writer):
+    try:
+        writer.flush()
+    except ValueError:
+        # A script closed or detached it, or the stream under it: nothing more
+        # goes through it. A script that closed or detached the writer itself
+        # flushed it then, and saw any failure of that flush.
+        return
+    except Exception as exc:
+        # Its fd closed or broke under it, so that much can't be sent. Dropped,
+        # it can't go out later, once the fd is back, in another exec's output:
+        # a writer the script kept would flush it there.
+        _drop_held(writer)
+        _diag("some of what the script wrote couldn't be sent (" + str(exc) + ")")
 
 
 def _drop_held(writer):
-    # Empty a writer whose flush failed, and leave it usable.
-    raw = writer.buffer.raw
+    # Empty a writer whose flush failed, and leave it usable: one of the
+    # runtime's, or a script's own wrapper over the runtime's raw writer, as
+    # TextIOWrapper(sys.stdout.detach()) makes. What another wrapper holds is
+    # its own.
+    raw = getattr(getattr(writer, "buffer", None), "raw", None)
+    if not isinstance(raw, _FdWriter):
+        return
     raw.dropping = True
     try:
         writer.flush()
@@ -380,10 +398,16 @@ def _drop_held(writer):
         raw.dropping = False
 
 
+def _before_fork():
+    _flush_script_streams()
+    _flush_writers()
+
+
 if hasattr(os, "register_at_fork"):
-    # A fork copies what the script's writers hold. Sent first, it reaches the
-    # host once, and a forked child's writers hold only what the child writes.
-    os.register_at_fork(before=_flush_writers)
+    # A fork copies what the script's writers hold, and what its own wrappers
+    # in sys.stdout and sys.stderr hold. Sent first, it reaches the host once,
+    # and a forked child's writers hold only what the child writes.
+    os.register_at_fork(before=_before_fork)
 
 
 def _write_marks(mark):
@@ -404,7 +428,8 @@ def _write_marks(mark):
 def _fatal(why):
     # The runtime can't go on, as when a script closed one of the runtime's own
     # fds under it: say why through its copy of fd 2, which the host reads
-    # unless a script replaced that too (_diag), and end, so the host settles
+    # unless a script replaced that too, or shut down the socket under it
+    # (_diag), and end, so the host settles
     # the exec on the exit with the output that arrived, rather than waiting
     # out its time limit for a result that can't come.
     _diag(why + "; exiting")
@@ -631,7 +656,7 @@ def handle_init(msg):
         CALL_TIMEOUT_S = float(timeout)
     BACKGROUND = bool(msg.get("background"))
     # A background script's stderr joins its stdout's pipe (_open_streams), so
-    # a crash's traceback goes there too, after what the script wrote first.
+    # a crash's traceback goes there too, after the lines the script wrote first.
     _enable_faulthandler(_STD_OUT if BACKGROUND else _STD_ERR)
 
     # Remove functions injected by a previous init that are no longer present
@@ -797,8 +822,16 @@ async def main():
     queue = asyncio.Queue()
 
     def reader():
+        exiting = False
         try:
             for raw_line in PROTO_IN:
+                # The host's exit op, after which the end of fd 3 is the host's
+                # too: the loop stops reading and exits once it has it.
+                if len(raw_line) < 100 and '"exit"' in raw_line:
+                    try:
+                        exiting = exiting or json.loads(raw_line).get("op") == "exit"
+                    except Exception:
+                        pass
                 loop.call_soon_threadsafe(queue.put_nowait, raw_line)
         except (OSError, ValueError) as exc:
             # A script closed fd 3 under it, or a file it opened took the
@@ -809,10 +842,11 @@ async def main():
         # The end of fd 3: the host closed it, unless a script shut down the
         # socket under it, or put a file in its place that has run out. While a
         # script runs, it's the script's doing: PyRunner closes fd 3 only as it
-        # kills the runtime, and a host that stops the runtime sends exit. An
-        # end while no script runs is a clean exit, the host's own way out.
+        # kills the runtime, and a host that stops the runtime sends exit
+        # first. An end while no script runs, or after exit, is a clean exit,
+        # the host's own way out.
         task = _current_exec_task
-        if task is not None and not task.done():
+        if not exiting and task is not None and not task.done():
             _fatal(_lost(3))
         loop.call_soon_threadsafe(queue.put_nowait, None)
 

@@ -17819,7 +17819,7 @@ export class AgentFramework {
       data: {
         status: 'background script started',
         script_id: scriptId,
-        log: logPath ?? "no writable workspace mount, so its output isn't kept in a file: wake_agent() reaches you, and if the script dies, so does the last of its output",
+        log: logPath ?? "no writable workspace mount, so its output isn't kept in a file: wake_agent() reaches you, and if the script dies, the last of its output reaches you too",
         lifetime_hours: Math.round(lifetimeMs / 3_600_000 * 10) / 10,
         lifetime: formatLimit(lifetimeMs), // exact for short limits, which lifetime_hours rounds to 0
         note: 'The script dies if the host process restarts. Manage with code_execution {"action": "list"|"cancel"}.',

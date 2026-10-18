@@ -14,6 +14,7 @@ import { ChildProcess, execFileSync } from 'node:child_process';
 import { chmodSync, closeSync, existsSync, mkdtempSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { Writable } from 'node:stream';
 import type {
   EventResponse,
   Module,
@@ -1326,7 +1327,9 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
           [
             'import os, time',
             `open(os.path.join(${JSON.stringify(dir)}, "during"), "w").close()`,
-            `while not os.path.exists(os.path.join(${JSON.stringify(dir)}, "written")): time.sleep(0.05)`,
+            'for _ in range(400):',
+            `    if os.path.exists(os.path.join(${JSON.stringify(dir)}, "written")): break`,
+            '    time.sleep(0.05)',
             'print("after it")',
           ].join('\n'),
           [],
@@ -1855,6 +1858,44 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
     }
   });
 
+  it("what a script's own wrapper in sys.stdout couldn't send when its script ended is said and dropped, and the wrapper still writes", async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      // The wrapper sits over the runtime's raw writer, as the detach-and-rewrap idiom leaves it.
+      const failed = await within(
+        runner.exec('import io, os, sys\nw = io.TextIOWrapper(sys.stdout.detach())\nsys.stdout = w\nprint("held", end="")\nos.close(1)', []),
+        'the script that closes fd 1',
+      );
+      assert.match(failed.stderr, /^\[pytc-runtime\] some of what the script wrote couldn't be sent \(\[Errno 9\] [^\n]*\)\n$/);
+      const later = await within(runner.exec('w.write("later\\n")\nw.flush()', []), 'a script writing through the wrapper');
+      assert.deepStrictEqual({ stdout: later.stdout, stderr: later.stderr }, { stdout: 'later\n', stderr: '' });
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it("a script that leaves something unhashable in sys.stdout still settles", async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      // Defining __eq__ without __hash__ makes the class unhashable.
+      const result = await within(
+        runner.exec([
+          'import sys',
+          'class Out:',
+          '    def __eq__(self, other): return self is other',
+          '    def write(self, s): return len(s)',
+          '    def flush(self): pass',
+          'sys.stdout = Out()',
+          'print("swallowed")',
+        ].join('\n'), []),
+        'the script to settle',
+      );
+      assert.deepStrictEqual({ stdout: result.stdout, stderr: result.stderr, returnCode: result.returnCode }, { stdout: '', stderr: '', returnCode: 0 });
+    } finally {
+      runner.dispose();
+    }
+  });
+
   it("a multiprocessing child doesn't send the parent's partial line again", async () => {
     const runner = new PyRunner({ onToolCall: async () => '' });
     try {
@@ -1920,17 +1961,19 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
     }
   });
 
-  it("a forked process that leaves through sys.exit() sends what a wrapper of its own in sys.stdout holds, as Python's exit would", async () => {
+  it("a script's own wrapper in sys.stdout sends what the parent held once, at the fork, and what a forked process wrote as it leaves through sys.exit()", async () => {
     const runner = new PyRunner({ onToolCall: async () => '' });
     try {
+      // The wrapper holds the parent's "a" at the fork, and the child's line at its exit.
       const result = await within(
         runner.exec(
           [
             'import io, os, sys, warnings',
             'warnings.simplefilter("ignore", DeprecationWarning)',
+            'sys.stdout = io.TextIOWrapper(sys.stdout.detach())',
+            'print("a", end="")',
             'pid = os.fork()',
             'if pid == 0:',
-            '    sys.stdout = io.TextIOWrapper(sys.stdout.detach())',
             '    print("child")',
             '    sys.exit(0)',
             'os.waitpid(pid, 0)',
@@ -1942,7 +1985,7 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
       );
       assert.deepStrictEqual(
         { stdout: result.stdout, stderr: result.stderr, returnCode: result.returnCode },
-        { stdout: 'child\nparent\n', stderr: '', returnCode: 0 },
+        { stdout: 'achild\nparent\n', stderr: '', returnCode: 0 },
       );
     } finally {
       runner.dispose();
@@ -2069,14 +2112,73 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
         assert.ok(child, 'the interpreter should still run');
         process.on('uncaughtException', onUncaught);
         child.stdio[4]?.destroy(new Error('a probe read error'));
-        await new Promise((r) => setTimeout(r, 100));
+        // The stream's own listener logs the error as readline passes it on, in the same turn.
+        await until(() => logged.some((l) => l.includes("reading the python runtime's messages failed: a probe read error")), 'the logged error');
+        await new Promise((r) => setImmediate(r));
         assert.deepStrictEqual(thrown, []);
-        assert.ok(logged.some((l) => l.includes("reading the python runtime's messages failed: a probe read error")), JSON.stringify(logged));
       } finally {
         process.off('uncaughtException', onUncaught);
         runner.dispose();
       }
     });
+  });
+
+  it("a thread a script left running prints a lone surrogate between scripts as backslashreplace writes it, into the host's log", async () => {
+    await logging(async (logged) => {
+      const dir = mkdtempSync(join(tmpdir(), 'pytc-thread-surrogate-'));
+      const runner = new PyRunner({ onToolCall: async () => '' });
+      try {
+        // The thread prints once the test makes the file, after its script has returned.
+        const go = join(dir, 'go');
+        const first = await runner.exec([
+          'import os, threading, time',
+          'def later():',
+          `    while not os.path.exists(${JSON.stringify(go)}): time.sleep(0.05)`,
+          '    print("between a\\udcffb")',
+          'threading.Thread(target=later, daemon=True).start()',
+          'print("started")',
+        ].join('\n'), []);
+        assert.strictEqual(first.stdout, 'started\n');
+        writeFileSync(go, '');
+        await until(() => logged.some((l) => l.endsWith('stdout while its interpreter runs no script: between a\\udcffb')), "the thread's line in the log");
+      } finally {
+        runner.dispose();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it("a host that sends exit and then ends fd 3 while a script runs gets the script cancelled and a clean exit, with no line about fd 3", async () => {
+    let called!: () => void;
+    const calling = new Promise<void>((r) => {
+      called = r;
+    });
+    // The call is never answered, so the host writes nothing after fd 3's end.
+    const runner = new PyRunner({
+      onToolCall: () => {
+        called();
+        return new Promise<string>(() => {});
+      },
+    });
+    try {
+      const pending = runner.exec('await test__echo({})', ECHO_TOOLS);
+      await within(calling, 'the script to call');
+      // PyRunner never sends exit; a host that runs the runtime itself does, through
+      // the runner's own channel here.
+      const internals = runner as unknown as { send(obj: unknown): void; protoIn: Writable | null; child: ChildProcess | null };
+      const child = internals.child;
+      assert.ok(child && internals.protoIn, 'the interpreter should be running');
+      const exited = new Promise<number | null>((r) => child.once('exit', (code) => r(code)));
+      internals.send({ op: 'exit' });
+      internals.protoIn.end();
+      const result = await within(pending, 'the exec to settle');
+      assert.strictEqual(await within(exited, 'the interpreter to exit'), 0);
+      assert.strictEqual(result.returnCode, 1);
+      assert.match(result.stderr, /KeyboardInterrupt: script cancelled by host/);
+      assert.doesNotMatch(result.stderr, /fd 3/);
+    } finally {
+      runner.dispose();
+    }
   });
 });
 
@@ -2597,7 +2699,7 @@ describe('PyRunner background mode (real python3)', () => {
         'the crash to settle',
       );
       assert.strictEqual(result.aborted, true);
-      assert.match(result.tail ?? '', /^watching\nFatal Python error: probe reason\n[\s\S]*\nscript stopped: the Python interpreter was ended by SIGABRT while it ran, so the rest of the script didn't run\. [^\n]*$/);
+      assert.match(result.tail ?? '', /^watching\nFatal Python error: probe reason\n[\s\S]*\nscript stopped: the Python interpreter was ended by SIGABRT while it ran, so the rest of the script didn't run\. [^\n]*\n$/);
     } finally {
       runner.dispose();
     }
@@ -2658,7 +2760,7 @@ describe('PyRunner background mode (real python3)', () => {
       assert.strictEqual(result.aborted, true);
       // A background script has its interpreter to itself, so no earlier script's variables are lost.
       const lost = runtimeLost('fd 4').replace(', and variables from earlier scripts are gone', '');
-      assert.ok((result.tail ?? '').endsWith(`; exiting\n${lost}`), result.tail ?? '');
+      assert.ok((result.tail ?? '').endsWith(`; exiting\n${lost}\n`), result.tail ?? '');
     } finally {
       runner.dispose();
     }
@@ -2677,7 +2779,7 @@ describe('PyRunner background mode (real python3)', () => {
       await until(() => existsSync(logPath) && readFileSync(logPath, 'utf8') === 'watching\n', 'its line in the journal');
       runner.abort('stopped watching');
       const result = await pending;
-      assert.strictEqual(result.tail, 'watching\nscript aborted by host: stopped watching');
+      assert.strictEqual(result.tail, 'watching\nscript aborted by host: stopped watching\n');
       assert.strictEqual(readFileSync(logPath, 'utf8'), 'watching\nscript aborted by host: stopped watching\n');
     } finally {
       runner.dispose();
