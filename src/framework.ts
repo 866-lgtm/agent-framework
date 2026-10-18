@@ -170,6 +170,15 @@ function mcplToolDeniedText(serverId: string, toolName: string): string {
     "and calling it again won't change that. If you need it, ask whoever runs this host.";
 }
 
+/** A runtime connect, restart or disconnect refused because a connect of the
+ *  server is in flight (mcplConnecting). The registry takes a server only once
+ *  its handshake is done, and nothing can stop that connect meanwhile, so it
+ *  would register the server after whatever ran beside it. Whoever asked reads
+ *  it: an operator, or an agent through a host's tool that passes it on. */
+function mcplConnectInFlightError(serverId: string): Error {
+  return new Error(`MCPL server "${serverId}" has a connect in flight; try again once it settles`);
+}
+
 /** Detect a supported image media type from magic bytes (the model API
  *  rejects mislabeled media types, so trust bytes over extensions).
  *  Returns undefined for non-image content. */
@@ -2348,9 +2357,9 @@ export class AgentFramework {
   /** Servers whose connect is in flight (connectMcplServerInternal), from the
    *  registry's handshake until it settles: a call their prefix routes then
    *  finds no server registered, and is told this host is connecting to it.
-   *  One mark per id: the registry holds one connection per id, and
-   *  refuseMcplConnect refuses a second connect, or a restart, of an id
-   *  whose connect is in flight. */
+   *  One mark per id: the registry holds one connection per id, and a
+   *  second connect, a restart or a disconnect of an id whose connect is in
+   *  flight is refused (refuseMcplConnect, runDisconnectMcplServer). */
   private mcplConnecting: Set<string> = new Set();
   /** Host capabilities advertised during the MCP handshake — stored so servers
    *  can be connected at runtime (connectMcplServer) after initialization. */
@@ -21270,9 +21279,7 @@ export class AgentFramework {
     // connects it or a restart replaces it: the restart's disconnect can't
     // stop a connect in flight, which would register the server after it.
     const inFlight = [config.id, replacing].find((id) => id !== undefined && this.mcplConnecting.has(id));
-    if (inFlight !== undefined) {
-      throw new Error(`MCPL server "${inFlight}" has a connect in flight; try again once it settles`);
-    }
+    if (inFlight !== undefined) throw mcplConnectInFlightError(inFlight);
     // The registry refuses a second server under one id too, but only once
     // the connect has written its config and prefix over the live server's.
     if (config.id !== replacing && this.mcplServerRegistry?.getServer(config.id)) {
@@ -21312,6 +21319,10 @@ export class AgentFramework {
     if (!this.mcplServerRegistry) {
       throw new Error('MCPL subsystem is not initialized');
     }
+    // A connect in flight would register the server after this disconnect,
+    // with its config and prefix gone, where only another disconnect reaches
+    // it; refused as a second connect of it is (refuseMcplConnect).
+    if (this.mcplConnecting.has(id)) throw mcplConnectInFlightError(id);
     const config = this.mcplServerConfigs.get(id);
     const oldToolNames = new Set(this.mcplTools.map(t => t.name));
 

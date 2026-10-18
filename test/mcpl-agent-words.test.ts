@@ -329,7 +329,7 @@ test("a call while this host connects to the tool's server says so, and after a 
   assert.equal((await framework.executeMcplToolCall(call('c6'), 'words', 'words')).error, goneText, "a script's call reads the same");
 });
 
-test('a second connect, or a restart, of a server whose connect is in flight is refused before it writes anything', async () => {
+test('a second connect, a restart or a disconnect of a server whose connect is in flight is refused before it writes anything', async () => {
   // The registry takes the server once its handshake is done, so until then
   // only the connecting mark says the id is taken. Each handshake here waits for the test.
   const servers = new Map<string, unknown>();
@@ -359,6 +359,7 @@ test('a second connect, or a restart, of a server whose connect is in flight is 
   const fw = framework as unknown as {
     connectMcplServerInternal(config: McplServerConfig, deferAwareness?: boolean): Promise<void>;
     refuseMcplConnect(config: McplServerConfig, replacing?: string): void;
+    runDisconnectMcplServer(id: string): Promise<void>;
   };
   const words = { id: 'words', url: 'ws://127.0.0.1:9', toolPrefix: 'words' } as McplServerConfig;
   const other = { id: 'other', url: 'ws://127.0.0.1:9', toolPrefix: 'other' } as McplServerConfig;
@@ -371,6 +372,9 @@ test('a second connect, or a restart, of a server whose connect is in flight is 
   assert.throws(() => fw.refuseMcplConnect(words, 'words'), inFlight, 'a restart of it');
   assert.throws(() => fw.refuseMcplConnect(other, 'words'), inFlight, 'a restart of it into another id');
   assert.throws(() => fw.refuseMcplConnect(words, 'other'), inFlight, 'a restart of another server into its id');
+  // A disconnect can't stop it either: the server would register after it, its config and prefix gone.
+  await assert.rejects(fw.runDisconnectMcplServer('words'), inFlight, 'a disconnect of it');
+  assert.equal((framework.mcplPrefixMap as Map<string, string>).get('words'), 'words', 'the refused disconnect left its prefix');
   handshakes[0]!();
   await connecting;
   // Once the connect settles, the mark is gone: the registry's check refuses a
