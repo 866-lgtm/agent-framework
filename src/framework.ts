@@ -9764,6 +9764,14 @@ export class AgentFramework {
    * Drop a departed agent's checkpoint tree key and turn/redo bookkeeping.
    * Without this, spawn-and-dispose agents leave a key (and in-memory map
    * entries) behind for the life of the store/session.
+   *
+   * Its callers are tearing an agent down: a conversation fork's disposal and
+   * an ephemeral run's end. A throw from the store here would stop that
+   * teardown partway, reject a finished ephemeral run in place of its result,
+   * and at a closure turn's end reject a stream promise that nothing holds.
+   * So a failed removal is logged and goes no further, and the agent's
+   * checkpoints stay in the store under its name, as a crash before its
+   * teardown leaves them.
    */
   private evictTurnCheckpoints(agentName: string): void {
     this.turnCounters.delete(agentName);
@@ -9772,18 +9780,25 @@ export class AgentFramework {
     // spawn-and-dispose fleets would grow them for the session's life.
     this.staleWarnAt.delete(agentName);
     this.lastInferenceAt.delete(agentName);
-    const entry = this.store.treeGet(TURN_CHECKPOINTS_TREE_ID, agentName);
-    if (this.hasLegacyCheckpoints(agentName)) {
-      // A bare treeRemove would resurrect the legacy map's list through the
-      // fallback next time this name is reused — shadow it with an empty
-      // tombstone instead. size <= 2 ⇔ the blob is already "[]".
-      if (!entry || entry.size > 2) {
-        this.saveTurnCheckpoints(agentName, []);
+    try {
+      const entry = this.store.treeGet(TURN_CHECKPOINTS_TREE_ID, agentName);
+      if (this.hasLegacyCheckpoints(agentName)) {
+        // A bare treeRemove would resurrect the legacy map's list through the
+        // fallback next time this name is reused — shadow it with an empty
+        // tombstone instead. size <= 2 ⇔ the blob is already "[]".
+        if (!entry || entry.size > 2) {
+          this.saveTurnCheckpoints(agentName, []);
+        }
+        return;
       }
-      return;
-    }
-    if (entry) {
-      this.store.treeRemove(TURN_CHECKPOINTS_TREE_ID, agentName);
+      if (entry) {
+        this.store.treeRemove(TURN_CHECKPOINTS_TREE_ID, agentName);
+      }
+    } catch (error) {
+      console.error(
+        `[checkpoints] agent=${agentName}: removing its turn checkpoints from the store failed, ` +
+        `so they stay there: ${thrownText(error)}`,
+      );
     }
   }
 
