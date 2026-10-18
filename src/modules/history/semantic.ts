@@ -376,9 +376,11 @@ export class SemanticIndexer {
   private readonly removedIds = new Set<string>();
   private detach: (() => void) | null = null;
   /**
-   * Set once the service answers 404 to /delete (a build without the route, or
-   * a store whose index doesn't exist yet): removals are dropped from then on,
-   * until the host restarts or binds the module again, which makes a new indexer.
+   * Set once the service answers 404 to /delete in a pass whose /stats
+   * answered, which means a build without the route: removals are dropped
+   * from then on, until the host restarts or binds the module again, which
+   * makes a new indexer. A pass whose /stats answers 404 has no index made
+   * yet, so it doesn't call /delete, and this stays as it was.
    */
   private deleteUnsupported = false;
   /** Called whenever the pending edit/remove sets change. */
@@ -449,6 +451,9 @@ export class SemanticIndexer {
         if (!(e instanceof EmbedServiceError && e.status !== null && e.status >= 200 && e.status < 300)) throw e;
         notStats = e;
       }
+      // /stats answered 404 (stats() reads it as null): this store's index
+      // isn't made yet.
+      const noIndex = stats === null && notStats === null;
       const msgWm = stats?.by_kind.message?.max_cursor ?? null;
       const sumWm = stats?.by_kind.summary?.max_cursor ?? null;
       let budget = maxItems;
@@ -490,18 +495,23 @@ export class SemanticIndexer {
           if (item) toUpsert.push(item); else { toDelete.push(`msg:${id}`); blanked.push(id); }
         }
         if (this.editedIds.size > 0) report.more = true;
-        if (toDelete.length > 0) {
+        // With no index made yet, the removals and blanked edits are done
+        // without a call: an index has nothing to remove before it exists,
+        // and none of them can come into the one this pass makes, since the
+        // time walk upserts only what the store still holds and can index.
+        if (toDelete.length > 0 && !noIndex) {
           try {
             await this.client.delete(toDelete);
           } catch (e) {
             const msg = e instanceof Error ? e.message : String(e);
             if (e instanceof EmbedServiceError && e.status === 404) {
-              // A service build without /delete (or a namespace that does
-              // not exist). Drop the removals and blanked edits: search-time
-              // checks (on-branch, still indexable) keep them out of results.
+              // This pass's /stats didn't answer 404, so the 404 is the
+              // route's: a service build without /delete. Drop the removals
+              // and blanked edits: search-time checks (on-branch, still
+              // indexable) keep them out of results.
               this.deleteUnsupported = true;
               this.warn(
-                "/delete answered 404, so the service lacks that route or this index isn't made yet; "
+                '/delete answered 404, so the service lacks that route; '
                   + `dropping ${toDelete.length} removal(s), and every later one until the host restarts or binds the `
                   + `history module again: ${msg}`,
               );
