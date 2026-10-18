@@ -235,19 +235,26 @@ function urlPath(url: string): string {
   return url.split(/[?#]/)[0] ?? url;
 }
 
-/** The attachment a block the host added stands for, as the live conversion
- *  writes it: an image by its URL, a file's text by its header, a note by its
- *  filename. Null for a block that names none, such as EMPTY_MESSAGE. */
-function blockAttachment(block: ContentBlock): { url: string } | { filename: string } | null {
+/**
+ * Whether a block the host added for an attachment stands for none of
+ * `attachments`, matched as the live conversion writes it: an image by its
+ * URL, a file's text by its header, and a note by the filename it opens
+ * with, as every note for an attachment does, whatever its words after it.
+ * A block that stands for no attachment, such as EMPTY_MESSAGE, never does.
+ */
+function forGoneAttachment(block: ContentBlock, attachments: readonly DiscordAttachment[]): boolean {
   if (block.type === 'image') {
     const source = (block as { source?: { type?: string; url?: unknown } }).source;
-    return source?.type === 'url' && typeof source.url === 'string' ? { url: urlPath(source.url) } : null;
+    if (source?.type !== 'url' || typeof source.url !== 'string') return false;
+    const path = urlPath(source.url);
+    return !attachments.some((attachment) => urlPath(attachment.url) === path);
   }
-  if (block.type !== 'text') return null;
-  const file = /^\n--- File: (.*) ---\n/.exec(block.text);
-  if (file) return { filename: file[1]! };
-  const note = /^\[Attachment: (.*) \([^()]*\)\]$/.exec(block.text);
-  return note ? { filename: note[1]! } : null;
+  if (block.type !== 'text') return false;
+  const { text } = block;
+  const opening = text.startsWith('\n--- File: ') ? (filename: string) => `\n--- File: ${filename} ---\n`
+    : text.startsWith('[Attachment: ') ? (filename: string) => `[Attachment: ${filename} `
+    : null;
+  return opening !== null && !attachments.some((attachment) => text.startsWith(opening(attachment.filename)));
 }
 
 /**
@@ -260,12 +267,7 @@ function blockAttachment(block: ContentBlock): { url: string } | { filename: str
 function withoutGoneAttachments(content: ContentBlock[], attachments: readonly DiscordAttachment[]): ContentBlock[] {
   const [first, ...rest] = content;
   if (first?.type !== 'text') return content;
-  const urls = new Set(attachments.map((attachment) => urlPath(attachment.url)));
-  const filenames = new Set(attachments.map((attachment) => attachment.filename));
-  const kept = rest.filter((block) => {
-    const named = blockAttachment(block);
-    return named === null || ('url' in named ? urls.has(named.url) : filenames.has(named.filename));
-  });
+  const kept = rest.filter((block) => !forGoneAttachment(block, attachments));
   if (kept.length === rest.length) return content;
   return textFirst(first.text, kept);
 }

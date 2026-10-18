@@ -722,7 +722,7 @@ test('an edit that comes while its create converts a file is folded into the cre
   assert.deepEqual(rows.map((r) => [r.id, r.content]), [['stored-x2', [text('second wording'), fileBlock]]]);
 });
 
-test('an edit that takes attachments away drops their blocks from a text-first row: an image by its URL whatever its query, a file by its header, a note by its filename; a block another attachment of its name may stand for stays, and so do a row stored before the mark and one the client passed no attachments for', async (t) => {
+test('an edit that takes attachments away drops their blocks from a text-first row: an image by its URL whatever its query, a file by its header, a note by the filename it opens with whatever its words; a block another attachment of its name may stand for stays, and so do a row stored before the mark and one the client passed no attachments for', async (t) => {
   const pdf: DiscordAttachment = { id: 'a3', filename: 'x.pdf', url: 'https://cdn.example/x.pdf', contentType: 'application/pdf', size: 50 };
   const lost: DiscordAttachment = { id: 'a4', filename: 'gone.txt', url: 'https://cdn.example/gone.txt', contentType: 'text/plain', size: 9 };
   t.mock.method(globalThis, 'fetch', async (url: string) => url === lost.url ? new Response('', { status: 404 }) : new Response('file body', { status: 200 }));
@@ -730,14 +730,18 @@ test('an edit that takes attachments away drops their blocks from a text-first r
     row('p2', [text('two files'), fileBlock, fileBlock], true),
     row('p3', [text('old'), imageBlock], false),
     row('p4', [text(''), imageBlock], true),
+    row('p5', [text('worded'), text('[Attachment: old.txt was noted in other words.]'), text('[Attachment: x.pdf was noted in other words.]')], true),
   ];
   const { harness, events, apply } = setup(rows);
   const content = (id: string) => rows.find((r) => r.id === `stored-${id}`)?.content;
+  const opens = (block: Block | undefined, filename: string) => block?.type === 'text' && block.text?.startsWith(`[Attachment: ${filename} `) === true;
   // Stored through the live conversion, so its file, its notice and its
-  // note are as the live path writes them.
+  // note are as the live path writes them, whatever their words.
   await harness.handleDiscordMessage(live('p1', 'look', [image, notes, lost, pdf]));
   for (const event of events.splice(0)) await apply(event as unknown as Record<string, unknown>);
-  assert.deepEqual(content('p1'), [text('look'), imageBlock, fileBlock, text('[Attachment: gone.txt (failed to fetch)]'), text('[Attachment: x.pdf (application/pdf)]')]);
+  const stored = content('p1') ?? [];
+  assert.deepEqual(stored.slice(0, 3), [text('look'), imageBlock, fileBlock]);
+  assert.deepEqual([stored.length, opens(stored[3], 'gone.txt'), opens(stored[4], 'x.pdf')], [5, true, true]);
   // The image's URL comes signed afresh; the file, the notice and the note are gone.
   await apply({ type: 'discord:edit', discordMessageId: 'p1', newContent: 'look', attachments: [{ ...image, url: `${image.url}?ex=2&hm=b` }] });
   assert.deepEqual(content('p1'), [text('look'), imageBlock]);
@@ -748,6 +752,9 @@ test('an edit that takes attachments away drops their blocks from a text-first r
   // Nothing left: the empty marker, as a message with neither gets.
   await apply({ type: 'discord:edit', discordMessageId: 'p4', newContent: '', attachments: [] });
   assert.deepEqual(content('p4'), [text(''), text('[Empty message]')]);
+  // A note in other words is matched by the filename it opens with.
+  await apply({ type: 'discord:edit', discordMessageId: 'p5', newContent: 'worded', attachments: [pdf] });
+  assert.deepEqual(content('p5'), [text('worded'), text('[Attachment: x.pdf was noted in other words.]')]);
   // A client that passes no attachments changes the text alone.
   await apply({ type: 'discord:edit', discordMessageId: 'p1', newContent: 'look again' });
   assert.deepEqual(content('p1'), [text('look again'), imageBlock]);
