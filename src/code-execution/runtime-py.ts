@@ -59,13 +59,19 @@
  *                {op:"wake_ack", id, error?}
  *                {op:"cancel", id, reason?}
  *                {op:"exit"}   stops the runtime: a running script is
- *                              cancelled, and it exits 0. A host that closes
- *                              fd 3 instead while a script runs gets exit
- *                              code 70 and the line "cannot read the host's
- *                              messages any more: a script closed, shut down
- *                              or replaced fd 3, where they arrive", since the
- *                              runtime can't tell that from a script's own
- *                              shutdown of the socket under fd 3.
+ *                              cancelled at its next await, one blocked in
+ *                              synchronous code runs on until then (a host
+ *                              that can't wait sends SIGINT, as at a time
+ *                              limit), and it exits 0. It goes alone on a
+ *                              line under 100 characters, as {"op":"exit"}
+ *                              does: the reader thread looks for it only in
+ *                              such lines. A host that closes fd 3 instead
+ *                              while a script runs gets exit code 70 and the
+ *                              line "cannot read the host's messages any
+ *                              more: a script closed, shut down or replaced
+ *                              fd 3, where they arrive", since the runtime
+ *                              can't tell that from a script's own shutdown
+ *                              of the socket under fd 3.
  *   py -> host : {op:"ready"}
  *                {op:"tool_call", id, exec_id, name, args}
  *                {op:"wake", id, exec_id, line, payload}
@@ -362,9 +368,22 @@ def _flush_script_streams():
     # membership test would hash the object, which a script's may refuse.
     writers = list(_script_writers)
     for stream in (sys.stdout, sys.stderr):
-        if any(stream is w for w in writers) or not callable(getattr(stream, "flush", None)):
-            continue
-        _flush(stream)
+        # A script's own object runs its own code here, which may raise
+        # anything, SystemExit included: it's said, and the exec's end goes on.
+        try:
+            if any(stream is w for w in writers) or not callable(getattr(stream, "flush", None)):
+                continue
+            _flush(stream)
+        except BaseException as exc:
+            _diag("some of what the script wrote couldn't be sent (" + _said(exc) + ")")
+
+
+def _said(exc):
+    # An exception's text, which a script's own exception class may refuse.
+    try:
+        return str(exc)
+    except BaseException:
+        return type(exc).__name__
 
 
 def _flush(writer):
@@ -373,21 +392,27 @@ def _flush(writer):
     except ValueError:
         # A script closed or detached it, or the stream under it: nothing more
         # goes through it. A script that closed or detached the writer itself
-        # flushed it then, and saw any failure of that flush.
+        # flushed it then, and saw any failure of that flush; one that closed
+        # the stream under it dropped what the writer held, which can't be told
+        # from nothing here.
         return
     except Exception as exc:
         # Its fd closed or broke under it, so that much can't be sent. Dropped,
-        # it can't go out later, once the fd is back, in another exec's output:
-        # a writer the script kept would flush it there.
+        # it can't go out later, once the fd is back, in another exec's output,
+        # where a writer the script kept would flush it: a writer over the
+        # runtime's raw writer is (_drop_held), and what a file of the script's
+        # own holds stays its own, as with any file a script keeps.
         _drop_held(writer)
-        _diag("some of what the script wrote couldn't be sent (" + str(exc) + ")")
+        _diag("some of what the script wrote couldn't be sent (" + _said(exc) + ")")
 
 
 def _drop_held(writer):
     # Empty a writer whose flush failed, and leave it usable: one of the
     # runtime's, or a script's own wrapper over the runtime's raw writer, as
-    # TextIOWrapper(sys.stdout.detach()) makes. What another wrapper holds is
-    # its own.
+    # TextIOWrapper(sys.stdout.detach()) makes. What a wrapper holds in a
+    # buffer of its own stays its own; one that shares this writer's buffer,
+    # as TextIOWrapper(sys.stdout.buffer) does, loses with it what it put
+    # there, under the same note.
     raw = getattr(getattr(writer, "buffer", None), "raw", None)
     if not isinstance(raw, _FdWriter):
         return
@@ -406,7 +431,9 @@ def _before_fork():
 if hasattr(os, "register_at_fork"):
     # A fork copies what the script's writers hold, and what its own wrappers
     # in sys.stdout and sys.stderr hold. Sent first, it reaches the host once,
-    # and a forked child's writers hold only what the child writes.
+    # and a forked child's writers hold only what the child writes. A wrapper
+    # the script keeps anywhere else is its own, at a fork as at its end, as
+    # any buffered file a Python program forks with is.
     os.register_at_fork(before=_before_fork)
 
 
@@ -492,6 +519,8 @@ _current_exec_task = None
 #  13. a previous script installed an eager task factory -> no effect: the
 #      runtime builds its script task directly, and the state is in place
 #      before the script's first step
+#  14. the flush before a fork the script makes -> queued; the fork goes on,
+#      and the next signal stops the script where it is then
 _PENDING = "pending"
 _REQUESTED = "requested"
 _DELIVERED = "delivered"
@@ -826,7 +855,8 @@ async def main():
         try:
             for raw_line in PROTO_IN:
                 # The host's exit op, after which the end of fd 3 is the host's
-                # too: the loop stops reading and exits once it has it.
+                # too: the main loop stops, and the runtime exits, once it takes
+                # the op from the queue.
                 if len(raw_line) < 100 and '"exit"' in raw_line:
                     try:
                         exiting = exiting or json.loads(raw_line).get("op") == "exit"
@@ -841,10 +871,12 @@ async def main():
             _fatal("cannot read the host's messages any more (" + str(exc) + ")")
         # The end of fd 3: the host closed it, unless a script shut down the
         # socket under it, or put a file in its place that has run out. While a
-        # script runs, it's the script's doing: PyRunner closes fd 3 only as it
-        # kills the runtime, and a host that stops the runtime sends exit
-        # first. An end while no script runs, or after exit, is a clean exit,
-        # the host's own way out.
+        # script runs, it's the script's doing, or the host process's own exit,
+        # which leaves nobody to read the line: PyRunner closes fd 3 only as it
+        # kills the runtime, and its SIGKILL lands before the end can, and a
+        # host that stops the runtime without killing it sends exit first, as
+        # the protocol notes ask. An end while no script runs, or after exit,
+        # is a clean exit, the host's own way out.
         task = _current_exec_task
         if not exiting and task is not None and not task.done():
             _fatal(_lost(3))
@@ -901,9 +933,13 @@ async def main():
 #   - Anywhere else it only queues the cancellation on the loop (which also
 #     wakes select(), otherwise resuming its wait after a signal): cancelling
 #     here could cancel a future between main()'s done() check and its
-#     set_result, and an exception mid-send would tear a protocol line.
+#     set_result, an exception mid-send would tear a protocol line, and one in
+#     the flush before a fork, which runs a script's own sys.stdout's code
+#     too, would be lost there, since os.fork() reports a hook's exception
+#     and goes on.
 _RUN_SCRIPT_CODE = _run_script.__code__
 _SEND_CODE = send.__code__
+_BEFORE_FORK_CODE = _before_fork.__code__
 
 
 def _on_sigint(signum, frame):
@@ -913,7 +949,7 @@ def _on_sigint(signum, frame):
     if st.running:
         while frame is not None:
             code = frame.f_code
-            if code is _SEND_CODE:
+            if code is _SEND_CODE or code is _BEFORE_FORK_CODE:
                 break
             if code is _RUN_SCRIPT_CODE:
                 st.state = _DELIVERED

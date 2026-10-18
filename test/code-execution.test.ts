@@ -1874,7 +1874,7 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
     }
   });
 
-  it("a script that leaves something unhashable in sys.stdout still settles", async () => {
+  it("a script that leaves something unhashable in sys.stdout, or None, still settles, with no note", async () => {
     const runner = new PyRunner({ onToolCall: async () => '' });
     try {
       // Defining __eq__ without __hash__ makes the class unhashable.
@@ -1891,6 +1891,31 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
         'the script to settle',
       );
       assert.deepStrictEqual({ stdout: result.stdout, stderr: result.stderr, returnCode: result.returnCode }, { stdout: '', stderr: '', returnCode: 0 });
+      // None, as pythonw leaves it, has nothing to flush.
+      const none = await within(runner.exec('import sys\nsys.stdout = None', []), 'the script that sets None');
+      assert.deepStrictEqual({ stdout: none.stdout, stderr: none.stderr, returnCode: none.returnCode }, { stdout: '', stderr: '', returnCode: 0 });
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it("a script whose own object in sys.stdout raises anything from its flush, SystemExit included, still settles with the runtime's note, and keeps its interpreter", async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      const cases: [string, string, string][] = [
+        ['an error whose text raises', 'class BadText(Exception):\n    def __str__(self): raise RuntimeError("no text")\nclass Out:\n    def write(self, s): return len(s)\n    def flush(self): raise BadText()', 'BadText'],
+        ['a flush that is a raising property', 'class Out:\n    def write(self, s): return len(s)\n    @property\n    def flush(self): raise RuntimeError("no flush")', 'no flush'],
+        ['SystemExit', 'class Out:\n    def write(self, s): return len(s)\n    def flush(self): raise SystemExit(3)', '3'],
+      ];
+      for (const [what, defines, said] of cases) {
+        const result = await within(runner.exec(`import sys\n${defines}\nsys.stdout = Out()\nkept = "${what}"`, []), what);
+        assert.deepStrictEqual(
+          { stdout: result.stdout, stderr: result.stderr, returnCode: result.returnCode },
+          { stdout: '', stderr: `[pytc-runtime] some of what the script wrote couldn't be sent (${said})\n`, returnCode: 0 },
+          what,
+        );
+        assert.strictEqual((await within(runner.exec('print(kept)', []), `the next script (${what})`)).stdout, `${what}\n`, what);
+      }
     } finally {
       runner.dispose();
     }
@@ -2148,21 +2173,15 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
     });
   });
 
-  it("a host that sends exit and then ends fd 3 while a script runs gets the script cancelled and a clean exit, with no line about fd 3", async () => {
-    let called!: () => void;
-    const calling = new Promise<void>((r) => {
-      called = r;
-    });
-    // The call is never answered, so the host writes nothing after fd 3's end.
-    const runner = new PyRunner({
-      onToolCall: () => {
-        called();
-        return new Promise<string>(() => {});
-      },
-    });
+  it("a host that sends exit and then ends fd 3 while a script blocks gets the script's result and a clean exit, with no line about fd 3", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pytc-exit-then-end-'));
+    const runner = new PyRunner({ onToolCall: async () => '' });
     try {
-      const pending = runner.exec('await test__echo({})', ECHO_TOOLS);
-      await within(calling, 'the script to call');
+      // The script blocks, so the runtime's reader meets the end of fd 3 before the loop
+      // takes the exit op, with the script still running.
+      const started = join(dir, 'started');
+      const pending = runner.exec(`import time\nopen(${JSON.stringify(started)}, "w").close()\ntime.sleep(2)\nprint("slept")`, []);
+      await until(() => existsSync(started), 'the script to start');
       // PyRunner never sends exit; a host that runs the runtime itself does, through
       // the runner's own channel here.
       const internals = runner as unknown as { send(obj: unknown): void; protoIn: Writable | null; child: ChildProcess | null };
@@ -2173,11 +2192,10 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
       internals.protoIn.end();
       const result = await within(pending, 'the exec to settle');
       assert.strictEqual(await within(exited, 'the interpreter to exit'), 0);
-      assert.strictEqual(result.returnCode, 1);
-      assert.match(result.stderr, /KeyboardInterrupt: script cancelled by host/);
-      assert.doesNotMatch(result.stderr, /fd 3/);
+      assert.deepStrictEqual({ stdout: result.stdout, stderr: result.stderr, returnCode: result.returnCode }, { stdout: 'slept\n', stderr: '', returnCode: 0 });
     } finally {
       runner.dispose();
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });
@@ -3760,6 +3778,38 @@ describe('code_execution time limit vs blocking code (real python3)', { skip: pr
         assert.match(result.stderr, /script stopped: it reached its 1s time limit/);
         assert.ok(Date.now() - started < 3000, `stopped at the limit (${Date.now() - started}ms)`);
       }
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it("a time limit's signal that lands in the flush before a fork, in a script's own sys.stdout, stops the script after the fork, keeping its interpreter", async () => {
+    const runner = new PyRunner({ onToolCall: async () => '', cancelGraceMs: 3000 });
+    try {
+      assert.strictEqual((await runner.exec('kept = 41', [])).returnCode, 0);
+      // The script's own sys.stdout flushes slowly as the script forks, through the limit's first signals.
+      const code = [
+        'import os, sys, time, warnings',
+        'warnings.simplefilter("ignore", DeprecationWarning)',
+        'class Out:',
+        '    slow = False',
+        '    def write(self, s): return len(s)',
+        '    def flush(self):',
+        '        if Out.slow: time.sleep(1.5)',
+        'sys.stdout = Out()',
+        'Out.slow = True',
+        'pid = os.fork()',
+        'if pid == 0:',
+        '    os._exit(0)',
+        'Out.slow = False',
+        'os.waitpid(pid, 0)',
+        'time.sleep(30)',
+      ].join('\n');
+      const result = await within(runner.exec(code, [], undefined, { deadlineMs: 1000 }), 'the script to stop');
+      assert.strictEqual(result.returnCode, 1, result.stderr);
+      assert.match(result.stderr, /KeyboardInterrupt: script interrupted by host/);
+      assert.doesNotMatch(result.stderr, /couldn't be sent|killed/);
+      assert.strictEqual((await runner.exec('print(kept)', [])).stdout, '41\n', 'the same interpreter');
     } finally {
       runner.dispose();
     }

@@ -768,8 +768,9 @@ export class PyRunner {
       // between scripts, which a thread a script left running prints through,
       // and any Python a script starts. So what it writes reaches the host as
       // it's written, and in UTF-8, where Python before 3.15 on Windows writes
-      // a pipe in the ANSI code page unless told otherwise; a host's own
-      // PYTHONUTF8 reaches the interpreter only with inheritEnv: true.
+      // a pipe in the ANSI code page unless told otherwise; a PYTHONUTF8 in
+      // the host process's own environment reaches the interpreter only with
+      // inheritEnv: true or declared in env.
       env: { ...buildChildEnv(this.envOptions), PYTHONUNBUFFERED: '1', PYTHONIOENCODING: 'utf-8' },
     });
     this.child = child;
@@ -1005,9 +1006,9 @@ export class PyRunner {
     const why = typeof reason === 'string' ? reason : reason(journal ? journal.tail : `${stdout}\n${stderr}`);
     if (journal) {
       const tail = journal.tail;
-      // The journal, which the agent reads with its own tools, says why too,
-      // unless it reached its cap or a write to it failed, and the result's
-      // tail is the journal's.
+      // The journal says why too: in its file, which the agent reads with its
+      // own tools, when it has one that hasn't reached its cap or failed a
+      // write, and in its tail, which the result carries.
       writeLine(journal, why);
       this.settlePending({ stdout: '', stderr: why, returnCode, aborted: true, tail: journal.tail });
       return tail;
@@ -1029,8 +1030,8 @@ export class PyRunner {
       // On a line of its own: a script's output, and the runner's own texts, such as an
       // interpreter's exit, can end without a newline.
       result = { ...result, stderr: onItsOwnLine(result.stderr, note) };
-      // A background script's journal, which the agent reads with its own tools, says
-      // so too, and its tail is the result's.
+      // A background script's journal says so too: in its file, when it has one,
+      // and in its tail, which is the result's.
       if (pending.journal) {
         writeLine(pending.journal, note.trimEnd());
         result = { ...result, tail: pending.journal.tail };
