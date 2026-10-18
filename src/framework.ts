@@ -2099,9 +2099,12 @@ export class AgentFramework {
    * The window of the frame that holds an agent's turn with no stream to
    * carry a stop and one of its checks ahead: a start, from its entry until
    * it hands its turn to a stream or ends (its checks after the hooks, after
-   * the compile, at a failure and after a wait to retry its compile), and
+   * the compile, at a failure and after a wait to retry its compile),
    * driveStream's wait to retry a failed inference (its check after the
-   * wait). Each frame opens a window of its own and closes it only while it
+   * wait), and the tool-result guard's wait for the agent's speech (its
+   * check after the wait, which the window lets the abandon reach once a
+   * caller's cancelStream() has left the agent holding no stream). Each
+   * frame opens a window of its own and closes it only while it
    * is still the agent's, so a start that ends after a later frame opened
    * one, such as its retry's stream waiting to retry, leaves that one open.
    * An operator's abandon marks the window, and the frame's check collects
@@ -4366,8 +4369,8 @@ export class AgentFramework {
   /**
    * Abort an in-flight inference for an agent. True when there was one to
    * stop: a stream, or a turn with no stream and one of its checks ahead (its
-   * hooks or compile, a wait to retry), which ends at that check, before it
-   * sends anything more.
+   * hooks or compile, a wait to retry, the tool-result guard's wait), which
+   * ends at that check, before it sends anything more.
    */
   abortInference(agentName: string, reason?: string): boolean {
     const agent = this.agents.get(agentName);
@@ -5459,8 +5462,9 @@ export class AgentFramework {
         stream.cancel();
       } else if (checkWindow) {
         // A turn with no stream and a check ahead (its hooks or compile, a
-        // wait to retry): the abandon marks its frame's window, that check
-        // collects the mark (takeStartStop), and the turn ends there. A turn
+        // wait to retry, the tool-result guard's wait once a caller's stop
+        // has taken its finished stream): the abandon marks its frame's
+        // window, that check collects the mark, and the turn ends there. A turn
         // waiting to retry reaches the check after its wait now rather than
         // when the wait runs out, as stop() wakes it, with the rest of a long
         // wait ended too.
@@ -13742,9 +13746,11 @@ export class AgentFramework {
       // A stop made while the hooks or the compile ran had no stream to
       // cancel, and the failure skipped the checks after them: it ends the
       // turn here, as it would have there, before a hold parks the turn, a
-      // retry waits or the failure exhausts it.
+      // retry waits or the failure exhausts it. As there, a replaced agent
+      // or a stopping framework comes first: the paths below end those turns
+      // as they end any failed start.
       const stopAtFailure = this.takeStartStop(agent, checkWindow);
-      if (stopAtFailure) {
+      if (stopAtFailure && this.agents.get(agent.name) === agent && !this.providerAdmissionClosed) {
         this.endStoppedStart(agent, stopAtFailure, routing, turnStartedAt, undefined, opensTurn);
         return false;
       }
@@ -14521,7 +14527,14 @@ export class AgentFramework {
                   reason: 'tool_result_guard', inputTokens: agent.lastStreamInputTokens,
                   budget: agent.maxStreamTokens,
                 });
+                // The wait has its own window (checkAhead), so a stop reaches
+                // the turn even once a caller's cancelStream() has left the
+                // agent holding no stream: the abandon marks the window, and
+                // the check below collects the mark.
+                const guardWindow: CheckWindow = { abandoned: false };
+                this.checkAhead.set(agent, guardWindow);
                 await turnSpeechChain;
+                if (this.checkAhead.get(agent) === guardWindow) this.checkAhead.delete(agent);
                 if (this.agents.get(agent.name) !== agent || agent.streamId !== myStreamId) {
                   generationLost = true;
                   lifecyclePhase = 'aborted';
@@ -14529,9 +14542,13 @@ export class AgentFramework {
                 }
                 // The stream has completed, so a stop made during the wait
                 // reached no stream event: it ends the turn here instead of
-                // the retry. The framework's own record comes first, as at a
-                // stream's terminal.
-                const frameworkStop = this.frameworkCancelledStreams.get(`${agent.name}:${myStreamId}`);
+                // the retry. The framework's own stop comes first, as at a
+                // stream's terminal, whichever was made first: its record on
+                // the stream, the abandon's mark on the window, or stop()
+                // having closed admission, which marks only an agent still
+                // holding a stream.
+                const frameworkStop = this.frameworkCancelledStreams.get(`${agent.name}:${myStreamId}`)
+                  ?? (guardWindow.abandoned ? 'quiesce_abandoned' : this.providerAdmissionClosed ? 'shutdown' : undefined);
                 const callerStop = agent.takeCancel();
                 if (frameworkStop === 'shutdown' || frameworkStop === 'quiesce_abandoned') {
                   lifecyclePhase = 'aborted';
@@ -15121,6 +15138,24 @@ export class AgentFramework {
 
             // Only reset + retry if this is still the active stream
             if (agent.streamId !== myStreamId) break;
+
+            // A caller's stop made while inference:failed was delivered (a
+            // listener's abortInference(), while the agent still held the
+            // failed stream) went to that stream's record after this stream's
+            // terminal had been read, and nothing later collects it. It ends
+            // the turn here, as the caller-cancel twin above ends one, before
+            // a hold parks the turn or a retry is sent.
+            const stopAtFailureTrace = agent.takeCancel();
+            if (stopAtFailureTrace) {
+              lifecyclePhase = 'aborted';
+              this.settleDeliberateCancel({
+                agent, myStreamId, startTime, compiledRequest,
+                reason: stopAtFailureTrace.reason ?? 'user',
+                closes: this.agents.get(agent.name) === agent ? streamRouting : undefined,
+                log: logStream, before: 'finishing',
+              });
+              break;
+            }
 
             this.abortAgentScript(agent.name, 'stream error');
             agent.reset();

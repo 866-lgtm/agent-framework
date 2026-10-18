@@ -20,7 +20,11 @@
     for an operator's abandon. The framework's `abortInference()` returns
     `true` for such a turn. `abortInference()` and an operator's abandon end
     a turn's wait to retry, however long, so the turn ends at once; a stop
-    through `Agent.cancelStream()` ends it when the wait runs out.
+    through `Agent.cancelStream()` ends it when the wait runs out. A stop
+    made while a failed inference's `inference:failed` is delivered ends the
+    turn there, before a hold or a retry. In the tool-result guard's wait,
+    `stop()` and an operator's abandon end the turn as their own stop even
+    when a caller's stop came first.
     `host:quiesce`'s `unabandonable` lists a turn with no stream that the
     abandon hasn't ended when its grace runs out: one with no check ahead,
     such as a puppet tool turn, or one that hasn't reached its check yet. A
