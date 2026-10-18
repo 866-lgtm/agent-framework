@@ -5686,8 +5686,12 @@ export class AgentFramework {
    * Any other throws a QuiesceBlockedError naming the ways out, so quiesce()
    * rejects with the host's mode as it was (store only, the slot set before
    * a sync that failed leaves the queue mirrored: writeDeferredWritesSlot).
+   * Writes a flush landed stay in the queue until a store sync acks them, so
+   * it first retries an ack whose sync failed: once a sync succeeds they're
+   * on disk, and they leave the queue rather than count against the cap.
    */
   private writeDeferredWritesForQuiesce(abandon: boolean): void {
+    this.ackDeferredWrites();
     // Abandon is the call for a turn that won't end. The queue stays in
     // memory whichever way the call goes, and writes held for such a turn
     // don't land until it does, so refusing it would leave only a restart,

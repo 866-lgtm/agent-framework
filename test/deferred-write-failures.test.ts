@@ -411,6 +411,40 @@ test('a turn the abandon can\'t cancel, a token with no stream, is listed as una
   });
 });
 
+for (const where of ['recovery file', 'store only'] as const) {
+  test(`${where}: writes resume() landed over the cap, whose store sync failed, are acked by the next quiesce() once the store syncs, rather than refused`, async () => {
+    await withHost(where, async (h) => {
+      await h.framework.quiesce({ reason: 'surgery', timeoutMs: 1_000 });
+      h.add(OVER_CAP);
+      assert.equal(h.alerts.length, 1, "the cap's alert");
+
+      // resume() lands the write, and its ack's sync fails.
+      const proto = JsStore.prototype as unknown as { sync(this: JsStore): void };
+      const sync = proto.sync;
+      proto.sync = function (this: JsStore) {
+        if (new Error().stack?.includes('ackDeferredWrites')) throw new Error('injected EIO syncing the store');
+        return sync.call(this);
+      };
+      try {
+        await h.framework.resume();
+      } finally {
+        proto.sync = sync;
+      }
+      assert.equal(h.framework.getHostModeStatus().quiesced, false);
+      const texts = h.framework.getAgent('agent')!.getContextManager().getAllMessages()
+        .map((m) => (m.content[0] as { text?: string } | undefined)?.text);
+      assert.ok(texts.includes(OVER_CAP), 'the write landed');
+      assert.ok(h.errors.some((l) => l.startsWith('[host-mode] chronicle sync failed — 1 flushed deferred write(s) stay ' +
+        'in the recovery queue until a sync succeeds:')), h.errors.join('\n'));
+
+      const status = await h.framework.quiesce({ reason: 'surgery', timeoutMs: 1_000 });
+      assert.equal(status.quiesced, true);
+      assert.deepEqual(h.queued(), [], 'the record holds none of it');
+      assert.equal(h.alerts.length, 1, 'no alert since');
+    });
+  });
+}
+
 test('a deferral whose write fails while quiesced keeps the write in memory, raises one ops alert a run, and logs a line once a write succeeds', async () => {
   await withHost('recovery file', async (h) => {
     await h.framework.quiesce({ reason: 'surgery' });
