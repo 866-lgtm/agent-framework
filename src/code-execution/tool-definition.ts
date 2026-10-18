@@ -9,6 +9,7 @@
  */
 
 import type { ToolDefinition } from '../types/index.js';
+import { assertBooleanSetting, holdsSettings } from '../config-checks.js';
 import { formatLimit, MAX_TIMER_MS } from './py-runner.js';
 
 export const CODE_EXECUTION_TOOL_NAME = 'code_execution';
@@ -106,15 +107,38 @@ export function scriptTimeLimits(opts?: {
   const defaultMs = Math.min(MAX_TIMER_MS, opts?.scriptTimeoutMs ?? 600_000);
   return {
     defaultMs,
-    // A ceiling below the default is refused when the framework is created
-    // (validateCodeExecutionConfig); never below the default here either.
+    // A ceiling below the default is refused when a framework with code
+    // execution on is created (validateCodeExecutionConfig); never below the
+    // default here either.
     maxMs: Math.min(MAX_TIMER_MS, Math.max(defaultMs, opts?.maxScriptTimeoutMs ?? defaultMs)),
     backgroundMaxMs: Math.min(MAX_TIMER_MS, opts?.backgroundMaxLifetimeMs ?? 86_400_000),
   };
 }
 
-/** Refuse a configuration whose time limits contradict each other. */
-export function validateCodeExecutionConfig(cfg: { scriptTimeoutMs?: number; maxScriptTimeoutMs?: number }): void {
+/**
+ * Refuse a codeExecution that isn't an object, or whose switch is set to
+ * anything but true or false, and, once it's on, one whose time limits
+ * contradict each other. A JSON config, or a `${VAR}` substituted as a string,
+ * can carry a quoted "false" where the type says boolean, and only `true` turns
+ * code execution on, so the quotes would hide what the value does; a bare
+ * `codeExecution: true` would be read as off. A null or false codeExecution,
+ * and a null switch, count as not set, as left-out ones do. The refusal names
+ * the value's kind, not the value. A configuration that isn't on has nothing
+ * else read.
+ */
+export function validateCodeExecutionConfig(cfg: {
+  enabled?: unknown;
+  scriptTimeoutMs?: number;
+  maxScriptTimeoutMs?: number;
+}): void {
+  if (!holdsSettings('codeExecution', cfg, '{ enabled: true }')) return;
+  assertBooleanSetting(
+    'codeExecution.enabled',
+    cfg.enabled,
+    'true gives agents the code_execution tool, which runs their scripts in a python interpreter on the host, ' +
+      'and false or leaving it out doesn\'t',
+  );
+  if (cfg.enabled !== true) return;
   const defaultMs = cfg.scriptTimeoutMs ?? 600_000;
   if (cfg.maxScriptTimeoutMs !== undefined && !(cfg.maxScriptTimeoutMs >= defaultMs)) {
     throw new Error(

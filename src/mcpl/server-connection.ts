@@ -11,10 +11,10 @@
 
 import { EventEmitter } from 'node:events';
 
-import { openTransport, type McplTransport, type TransportCloseInfo } from './transport.js';
+import { openTransport, STDERR_END_WAIT_MS, type McplTransport, type TransportCloseInfo } from './transport.js';
 import { maskNegotiatedCapabilities } from './capability-mask.js';
 import { CapabilityGrant, expandAdvertisementShorthand } from './capability-grant.js';
-import { CAPABILITY_DISABLED } from './errors.js';
+import { CAPABILITY_DISABLED, boundedForLog, describeCause } from './errors.js';
 import { logDetail, logValue } from './log-value.js';
 
 import type {
@@ -172,6 +172,13 @@ interface HeldItem {
   kept?: true;
 }
 
+/** A request's method for a log line, whatever the server sent there. */
+function describeMethod(method: unknown): string {
+  return typeof method === 'string'
+    ? `method ${logValue(method)}`
+    : `a method of type ${method === null ? 'null' : typeof method}`;
+}
+
 /**
  * McplServerConnection manages a single JSON-RPC 2.0 connection to an
  * MCPL server over stdio. Use the static `connect()` factory to create
@@ -297,7 +304,7 @@ export class McplServerConnection extends EventEmitter {
     // written to the next transport (sameTransport). The host's own reports
     // about the transport stay too: its lifecycle (connect-failed,
     // reconnect-failed), the server's stderr, and orphaned-response audits.
-    this.bufferedEvents = this.keepAcrossBoundary(this.bufferedEvents);
+    this.replaceHeld(this.keepAcrossBoundary(this.bufferedEvents));
     // RFC-007 §6.5: a filter is per connection epoch — after a reconnect the
     // server sends it again, and until then receives metadata only.
     this.toolObserveFilter = null;
@@ -327,6 +334,14 @@ export class McplServerConnection extends EventEmitter {
     return kept.map((item) => ({ ...item, kept: true as const }));
   }
 
+  /** Hold these items in place of what is held, with heldRequests counting
+   *  the requests among them: a boundary keeps some of what was held, and a
+   *  flush that crosses one holds the rest of its snapshot again. */
+  private replaceHeld(items: HeldItem[]): void {
+    this.bufferedEvents = items;
+    this.heldRequests = items.filter((item) => McplServerConnection.hasResponder(item)).length;
+  }
+
   /** The active transport (stdio child or WebSocket). Null for a disconnected
    *  stub awaiting its first background reconnect. */
   private transport: McplTransport | null;
@@ -341,7 +356,10 @@ export class McplServerConnection extends EventEmitter {
   private pendingRequests = new Map<string | number, PendingRequest>();
   /** Metadata retained after selected request deadlines so a late response is
    * observable even though its original promise has already been rejected. */
-  private orphanedRequests = new Map<string | number, { method: string; renderParams?: Record<string, unknown> }>();
+  private orphanedRequests = new Map<string | number, {
+    method: string;
+    renderParams?: { featureSet: string; key: string; eventId: string; channelId?: string };
+  }>();
   private closed = false;
   /** Set by `reconnectAfterFailure()` before it closes a live transport, so
    *  the transport close handler reports that teardown as `byHost: true`. */
@@ -352,6 +370,9 @@ export class McplServerConnection extends EventEmitter {
 
   /** Per-request timeout in ms (0 disables). See McplServerConfig.requestTimeoutMs. */
   private requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS;
+  /** The deadline a channels/publish or channels/open request keeps when
+   *  requestTimeoutMs is 0 (see sendChannelsPublish). */
+  private publishDeadlineMs = DEFAULT_REQUEST_TIMEOUT_MS;
 
   // Event buffering: control-plane traffic can be released independently from
   // inference-bearing data-plane traffic. This lets a server finish its own
@@ -360,15 +381,24 @@ export class McplServerConnection extends EventEmitter {
   private controlPlaneReady = false;
   private dataPlaneReady = false;
   private bufferedEvents: HeldItem[] = [];
-  /** Cap on buffered responder-less events during a plane pause (issue #122).
-   *  Held server→host requests are never dropped and may exceed this. */
-  private static readonly MAX_BUFFERED_EVENTS = 1000;
+  /** How many of bufferedEvents are server→host requests, each holding a
+   *  responder its server waits on. Every change to bufferedEvents keeps it. */
+  private heldRequests = 0;
+  /** Cap on held notifications (responder-less events) during a plane pause
+   *  (issue #122), counted apart from requests: past it, the oldest held
+   *  notification is dropped. */
+  private static readonly MAX_HELD_NOTIFICATIONS = 1000;
+  /** Budget of held requests during a plane pause (#387), counted apart from
+   *  notifications: past it, a request is refused at once, never dropped. It
+   *  bounds a server that pipelines requests without waiting for answers. A
+   *  server that doesn't send a refused request again loses it (discord-mcpl
+   *  doesn't), so the budget sits far above the notifications' cap, to leave
+   *  a busy server's long pause room. */
+  private static readonly MAX_HELD_REQUESTS = 10_000;
   private droppedBufferedEvents = 0;
-  /** True while ready()/readyControlPlane() re-emit a buffer snapshot. Items
-   *  re-buffering mid-flush were already admitted once — applying the cap to
-   *  them again would evict events that were legally held (the cap targets
-   *  NEW arrivals during a pause, not churn from control-plane flushes). */
-  private flushDepth = 0;
+  /** Requests refused at the budget since the planes last opened (ready()),
+   *  so each pause's first refusal is logged. */
+  private refusedHeldRequests = 0;
 
   // Reconnect state (adapted from Anarchid/agent-framework@mcpl-module-proto)
   private config: McplServerConfig | null = null;
@@ -440,6 +470,8 @@ export class McplServerConnection extends EventEmitter {
     // reports that pause's drops, and the next pause counts (and logs) its own.
     const dropped = this.droppedBufferedEvents;
     this.droppedBufferedEvents = 0;
+    this.heldRequests = 0;
+    this.refusedHeldRequests = 0;
     if (pending.length > 200) {
       console.error(
         `[mcpl] ${this.id}: flushing ${pending.length} buffered event(s) synchronously ` +
@@ -453,28 +485,24 @@ export class McplServerConnection extends EventEmitter {
   }
 
   /**
-   * Re-emit a held snapshot through the admission gate (this.emit), in
-   * admission order (admissionOrder). A transport boundary crossed during the
-   * flush (a listener that closes the connection, say) leaves the rest of the
-   * snapshot to the boundary rule, as if it had still been held: what the
-   * server said about its own process is dropped, and the rest is held
-   * again, after whatever this flush held.
+   * Re-emit a held snapshot through the admission gate (this.emit), inside
+   * the containment boundary every inbound event shares
+   * (dispatchInboundEvent), in admission order (admissionOrder). A transport
+   * boundary crossed during the flush (a listener that closes the connection,
+   * say) leaves the rest of the snapshot to the boundary rule, as if it had
+   * still been held: what the server said about its own process is dropped,
+   * and the rest is held again, after whatever this flush held.
    */
   private flushHeld(pending: HeldItem[]): void {
     const ordered = McplServerConnection.admissionOrder(pending);
     const epoch = this.transportEpoch;
-    this.flushDepth++;
-    try {
-      for (let index = 0; index < ordered.length; index++) {
-        if (this.transportEpoch !== epoch) {
-          this.bufferedEvents.push(...this.keepAcrossBoundary(ordered.slice(index)));
-          return;
-        }
-        const { event, args } = ordered[index]!;
-        this.emit(event, ...args);
+    for (let index = 0; index < ordered.length; index++) {
+      if (this.transportEpoch !== epoch) {
+        this.replaceHeld([...this.bufferedEvents, ...this.keepAcrossBoundary(ordered.slice(index))]);
+        return;
       }
-    } finally {
-      this.flushDepth--;
+      const { event, args } = ordered[index]!;
+      this.dispatchInboundEvent(event, ...args);
     }
   }
 
@@ -561,6 +589,7 @@ export class McplServerConnection extends EventEmitter {
     this.controlPlaneReady = true;
     const pending = this.bufferedEvents;
     this.bufferedEvents = [];
+    this.heldRequests = 0;
     // Re-enter the ADMISSION gate (this.emit), never super.emit: control
     // events include channels-register/changed, which are grant-gated —
     // the old direct flush bypassed positive-grant enforcement entirely
@@ -624,35 +653,71 @@ export class McplServerConnection extends EventEmitter {
         }
         return true;
       }
-      return super.emit(event, ...args);
-    }
-    // Buffer cap (issue #122): a long data-plane pause (quiesce window) on a
-    // busy server would otherwise grow this array without bound. Only
-    // responder-LESS events are ever dropped — a buffered server→host REQUEST
-    // holds a live responder the server is blocking on, and dropping it would
-    // strand that call forever (the server timing out and reconnecting is the
-    // accepted bound there, and a reconnect runs the policy exchange again
-    // before its planes open).
-    if (this.flushDepth === 0 && this.bufferedEvents.length >= McplServerConnection.MAX_BUFFERED_EVENTS) {
-      const hasResponder = McplServerConnection.hasResponder;
-      if (!hasResponder({ args })) {
-        this.droppedBufferedEvents++;
-        if (this.droppedBufferedEvents % 100 === 1) {
-          console.error(
-            `[mcpl] ${this.id}: buffered-event cap (${McplServerConnection.MAX_BUFFERED_EVENTS}) — ` +
-            `dropped ${this.droppedBufferedEvents} responder-less event(s) while the plane is paused`,
-          );
-        }
-        const dropIndex = this.bufferedEvents.findIndex((item) => !hasResponder(item));
-        if (dropIndex >= 0) {
-          this.bufferedEvents.splice(dropIndex, 1); // drop-oldest non-request
-          this.bufferedEvents.push({ event: name, args });
-        }
-        // else: buffer is all held requests — drop the incoming event instead.
+      // §6.6: a request that will never be answered MUST get an error. A
+      // request whose event nothing on this host listens for would never be.
+      const request = args[1] as {
+        respond?: (result: unknown) => void;
+        respondError?: (code: number, message: string, data?: unknown) => void;
+      } | undefined;
+      if (typeof request?.respondError === 'function' && this.listenerCount(event) === 0) {
+        request.respondError(-32601, 'Method not found');
+        console.error(`[mcpl] ${this.id}: answered -32601 to ${logValue(name)}, which nothing on this host handles`);
         return true;
       }
+      // mcpl/manifestChanged (§17.3) and tools/list_changed are notifications.
+      // Sent as a request, either is answered with an empty result as it's
+      // admitted, and passed on as the notification is, with no responder:
+      // the host acts on it the same way, so the answer doesn't depend on what
+      // the refresh does, and it's written before any request the refresh
+      // sends. This is where live routing and buffer flushes meet, so a request
+      // held while its plane is closed is answered only when it's let through,
+      // never by a startup that fails first.
+      if ((name === 'manifest-changed' || name === 'tools-list-changed') && typeof request?.respond === 'function') {
+        request.respond({});
+        return super.emit(event, args[0]);
+      }
+      return super.emit(event, ...args);
+    }
+    // Held until the plane opens. A long pause (a quiesce, say) on a busy or a
+    // runaway server would otherwise grow this array without bound, so
+    // requests and notifications each have a bound, counted apart. A request
+    // holds a responder its server waits on, and dropping it would strand that
+    // call, so past MAX_HELD_REQUESTS (#387) it's refused at once with -32000,
+    // the code of the host's other transient refusals, and its server can send
+    // it again. A notification has no one to tell, so past
+    // MAX_HELD_NOTIFICATIONS (issue #122) the oldest held notification is
+    // dropped to make room. A flush takes the whole buffer and zeroes its
+    // count, so what it holds again was admitted within these bounds and
+    // stays within them.
+    const responder = args[1] as { respond?: unknown; respondError?: (code: number, message: string) => void } | undefined;
+    const isRequest = McplServerConnection.hasResponder({ args });
+    if (isRequest && this.heldRequests >= McplServerConnection.MAX_HELD_REQUESTS) {
+      this.refusedHeldRequests++;
+      if (this.refusedHeldRequests % 100 === 1) {
+        console.error(
+          `[mcpl] ${this.id}: held-request budget (${McplServerConnection.MAX_HELD_REQUESTS}) — ` +
+          `refused ${this.refusedHeldRequests} request(s) with -32000 while the plane is paused`,
+        );
+      }
+      responder?.respondError?.(
+        -32000,
+        `the host is busy: ${McplServerConnection.MAX_HELD_REQUESTS} of this server's requests are already waiting; send this one again later`,
+      );
+      return true;
+    }
+    if (!isRequest && this.bufferedEvents.length - this.heldRequests >= McplServerConnection.MAX_HELD_NOTIFICATIONS) {
+      this.droppedBufferedEvents++;
+      if (this.droppedBufferedEvents % 100 === 1) {
+        console.error(
+          `[mcpl] ${this.id}: buffered-event cap (${McplServerConnection.MAX_HELD_NOTIFICATIONS}) — ` +
+          `dropped ${this.droppedBufferedEvents} responder-less event(s) while the plane is paused`,
+        );
+      }
+      const oldest = this.bufferedEvents.findIndex((item) => !McplServerConnection.hasResponder(item));
+      if (oldest >= 0) this.bufferedEvents.splice(oldest, 1);
     }
     this.bufferedEvents.push({ event: name, args });
+    if (isRequest) this.heldRequests++;
     return true;
   }
 
@@ -809,10 +874,30 @@ export class McplServerConnection extends EventEmitter {
           } catch {
             return; // Ignore non-JSON lines (e.g. logback output from Java servers)
           }
+          if (msg === null || typeof msg !== 'object' || Array.isArray(msg)) return;
+          // A request or a notification from the server is never the
+          // initialize response, whatever its id: a server's own ids can start
+          // at 0, this handshake's. MCP lets a server ping before
+          // initialization completes, and the ping gets its empty result, as
+          // on a connected transport. Anything else it sends now is ignored.
+          if ('method' in msg) {
+            const request = msg as unknown as JsonRpcRequest;
+            if (request.method === 'ping' && request.id != null) {
+              transport.writeLine(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: {} }));
+            }
+            return;
+          }
           if (msg.id !== initId) return;
           cleanup();
           if (msg.error) {
-            reject(new Error(`MCPL server "${config.id}" initialize error: ${msg.error.message}`));
+            // describeCause rather than the template's own conversion: the
+            // server's `message` can be any JSON value, and one that has no
+            // primitive form, such as {"toString":1}, would throw out of this
+            // listener after cleanup() has cleared the timeout: an uncaught
+            // exception, which ends a host that doesn't catch them, and a
+            // handshake left to wait forever. It's the server's text in an
+            // error's message, so it's bounded as errors.ts says.
+            reject(new Error(`MCPL server "${config.id}" initialize error: ${boundedForLog(describeCause(msg.error.message))}`));
             return;
           }
           const result = msg.result as Record<string, unknown> | undefined;
@@ -829,7 +914,13 @@ export class McplServerConnection extends EventEmitter {
         const onClose = (info: TransportCloseInfo) => {
           cleanup();
           const code = transport.kind === 'websocket' && typeof info.code === 'number' ? `, code ${info.code}` : '';
-          reject(failed(`MCPL server "${config.id}" transport closed before handshake completed (${closeReasonText(info)}${code})`));
+          const failure = `MCPL server "${config.id}" transport closed before handshake completed (${closeReasonText(info)}${code})`;
+          // The close comes at a stdio child's exit, which Node can emit before
+          // it has read the last of the child's stderr, or when the host closes
+          // the transport, which then ends the child. The tail is taken once
+          // stderr has ended, waiting at most STDERR_END_WAIT_MS. A WebSocket
+          // transport has no stderr to wait for.
+          void transport.stderrEnded(STDERR_END_WAIT_MS).then(() => reject(failed(failure)));
         };
         const onError = (err: Error) => {
           cleanup();
@@ -1002,9 +1093,13 @@ export class McplServerConnection extends EventEmitter {
     return this.sendRequest(McplMethod.StateRollback, params as unknown as Record<string, unknown>) as Promise<StateRollbackResult>;
   }
 
-  /** Send `channels/open` request and await result. */
+  /** Send `channels/open` request and await result. It keeps a deadline as
+   *  channels/publish does: a delivery opens a closed channel before it
+   *  publishes, so an open that is never answered would hold the delivery,
+   *  and the turn that waits for it, for good. */
   sendChannelsOpen(params: ChannelsOpenParams): Promise<ChannelsOpenResult> {
-    return this.sendRequest(McplMethod.ChannelsOpen, params as unknown as Record<string, unknown>) as Promise<ChannelsOpenResult>;
+    const timeoutMs = this.requestTimeoutMs > 0 ? this.requestTimeoutMs : this.publishDeadlineMs;
+    return this.sendRequest(McplMethod.ChannelsOpen, params as unknown as Record<string, unknown>, { timeoutMs }) as Promise<ChannelsOpenResult>;
   }
 
   /** Send `channels/close` request and await result. */
@@ -1029,13 +1124,20 @@ export class McplServerConnection extends EventEmitter {
    * Send `channels/publish`.
    * May be sent as a request (if an ACK is desired) or notification.
    * When `params.stream` is true, sends as a notification (no ACK).
+   *
+   * A request always has a deadline: the server's requestTimeoutMs, or
+   * publishDeadlineMs when that is 0 (disabled). A publish is a side effect
+   * whose outcome the resident is told and a held draft's attempt records,
+   * so one that is never answered would hold both open for good. Its expiry
+   * is a no-response, which the caller reads as unknown.
    */
   sendChannelsPublish(params: ChannelsPublishParams): Promise<ChannelsPublishResult | void> {
     if (params.stream) {
       this.sendNotification(McplMethod.ChannelsPublish, params as unknown as Record<string, unknown>);
       return Promise.resolve();
     }
-    return this.sendRequest(McplMethod.ChannelsPublish, params as unknown as Record<string, unknown>) as Promise<ChannelsPublishResult>;
+    const timeoutMs = this.requestTimeoutMs > 0 ? this.requestTimeoutMs : this.publishDeadlineMs;
+    return this.sendRequest(McplMethod.ChannelsPublish, params as unknown as Record<string, unknown>, { timeoutMs }) as Promise<ChannelsPublishResult>;
   }
 
   /** Send `channels/outgoing/chunk` notification. */
@@ -1329,7 +1431,19 @@ export class McplServerConnection extends EventEmitter {
         pending.timer = setTimeout(() => {
           this.pendingRequests.delete(id);
           if (options.surfaceOrphanedResponse) {
-            this.orphanedRequests.set(id, { method, ...(method === 'push/render' ? { renderParams: { featureSet: params.featureSet, key: params.key, eventId: params.eventId } } : {}) });
+            this.orphanedRequests.set(id, {
+              method,
+              ...(method === 'push/render'
+                ? {
+                  renderParams: {
+                    featureSet: params.featureSet as string,
+                    key: params.key as string,
+                    eventId: params.eventId as string,
+                    ...(typeof params.channelId === 'string' ? { channelId: params.channelId } : {}),
+                  },
+                }
+                : {}),
+            });
             if (this.orphanedRequests.size > 4096) this.orphanedRequests.delete(this.orphanedRequests.keys().next().value!);
           }
           reject(new McplRequestError(
@@ -1346,7 +1460,18 @@ export class McplServerConnection extends EventEmitter {
         pending.timer.unref?.();
       }
       this.pendingRequests.set(id, pending);
-      this.transport!.writeLine(JSON.stringify(request));
+      try {
+        this.transport!.writeLine(JSON.stringify(request));
+      } catch (err) {
+        // A synchronous write rejection sent no request. Remove its pending
+        // state and watchdog before reporting that it is safe to retry.
+        this.pendingRequests.delete(id);
+        if (pending.timer) clearTimeout(pending.timer);
+        reject(new McplRequestError(
+          `Cannot send ${method} to MCPL server "${this.id}": ${err instanceof Error ? err.message : String(err)}`,
+          'not-sent',
+        ));
+      }
     });
   }
 
@@ -1436,7 +1561,9 @@ export class McplServerConnection extends EventEmitter {
     this.setupLifecycle(transport);
     // Surface transport diagnostics (stdio child stderr) as 'stderr' events,
     // preserving the `{ line }` payload existing consumers expect.
-    transport.on('stderr', (line: string) => this.emit('stderr', { line }));
+    // Through the same containment boundary as every inbound event, so a
+    // stderr listener that throws is reported, not thrown into the transport.
+    transport.on('stderr', (line: string) => this.dispatchInboundEvent('stderr', { line }));
   }
 
   /**
@@ -1452,64 +1579,151 @@ export class McplServerConnection extends EventEmitter {
         return;
       }
 
-      // Is this a response to one of our outbound requests?
-      if ('id' in msg && msg.id != null && !('method' in msg)) {
-        this.handleResponse(msg as JsonRpcResponse);
-        return;
-      }
-
-      // It is an inbound request or notification from the server
-      const request = msg as JsonRpcRequest;
-      const eventName = McplServerConnection.METHOD_TO_EVENT[request.method];
-
-      // §7 is removed in 0.5.0: scope/elevate is no longer a method. Answer
-      // rather than hang (§6.6 — a method that will never be answered MUST
-      // return an error).
-      // featureSets/changed is REMOVED in 0.5.0 (§6.7 — it carried a
-      // server-authored change payload, the self-attestation defect; the
-      // need is met by §17's host-diffed manifest fetch). It was still
-      // routed, control-plane classified, and mutating declarations — a
-      // live ungated self-attestation path (PR #79 review blocker 4).
-      if (request.method === McplMethod.FeatureSetsChanged) {
-        if (request.id != null) {
-          this.sendErrorResponse(request.id, -32601, 'featureSets/changed removed in MCPL 0.5.0 (superseded by mcpl/manifestChanged, SPEC §17)');
-        } else {
-          console.error(`[mcpl] ${this.id}: discarded featureSets/changed — removed in 0.5.0 (§6.7/§17)`);
-        }
-        return;
-      }
-
-      if (request.method === McplMethod.ScopeElevate) {
-        if (request.id != null) {
-          this.sendErrorResponse(request.id, -32601, 'scope/elevate removed in MCPL 0.5.0 (SPEC §7)');
-        }
-        return;
-      }
-
-      // Positive-grant enforcement (§5.4, §14.1) happens at ADMISSION, in
-      // the emit() override below — the one choke-point that live routing
-      // and staged-buffer flushes share. See the comment there for why
-      // rejecting here, at line receipt, was wrong for staged connections.
-
-      if (eventName) {
-        // Emit the typed event with params and (for requests) a respond callback
-        if (request.id != null) {
-          // Server expects a response — provide a respond helper, bound to
-          // the transport the request came on: an answer after a reconnect
-          // would reach a server that never asked it.
-          const epoch = this.transportEpoch;
-          this.emit(eventName, request.params, {
-            id: request.id,
-            respond: (result: unknown) => this.sendResponse(request.id!, result, epoch),
-            respondError: (code: number, message: string, data?: unknown) =>
-              this.sendErrorResponse(request.id!, code, message, data, epoch),
-          });
-        } else {
-          // Notification — no response expected
-          this.emit(eventName, request.params);
-        }
+      // JSON-RPC messages must be objects. Ignore unrelated stdout/log values
+      // before property access, just as malformed JSON lines are ignored.
+      if (msg === null || typeof msg !== 'object' || Array.isArray(msg)) return;
+      try {
+        this.dispatchMessage(msg);
+      } catch (error) {
+        const request = msg as { method?: unknown; id?: unknown };
+        this.reportInboundFailure(error, {
+          ...(typeof request.method === 'string' ? { event: request.method } : {}),
+          ...(typeof request.id === 'string' || typeof request.id === 'number' ? { requestId: request.id } : {}),
+        });
       }
     });
+  }
+
+  /** Contain synchronous dispatch failures; async RPC handlers own their promises. */
+  private dispatchMessage(msg: JsonRpcRequest | JsonRpcResponse): void {
+    // Is this a response to one of our outbound requests?
+    if ('id' in msg && msg.id != null && !('method' in msg)) {
+      this.handleResponse(msg as JsonRpcResponse);
+      return;
+    }
+
+    // It is an inbound request or notification from the server
+    const request = msg as JsonRpcRequest;
+
+    // MCP's ping, which either side may send: its receiver answers promptly
+    // with an empty result. It's answered as it arrives, before admission and
+    // buffering, since it asks only whether the connection is alive, and a
+    // paused plane mustn't hold that answer. A ping sent as a notification
+    // has nothing to answer. The handshake answers one too.
+    if (request.method === 'ping') {
+      if (request.id != null) this.sendResponse(request.id, {});
+      return;
+    }
+
+    const eventName = typeof request.method === 'string' && Object.hasOwn(McplServerConnection.METHOD_TO_EVENT, request.method)
+      ? McplServerConnection.METHOD_TO_EVENT[request.method] : undefined;
+
+    // §7 is removed in 0.5.0: scope/elevate is no longer a method. Answer
+    // rather than hang (§6.6 — a method that will never be answered MUST
+    // return an error).
+    // featureSets/changed is REMOVED in 0.5.0 (§6.7 — it carried a
+    // server-authored change payload, the self-attestation defect; the
+    // need is met by §17's host-diffed manifest fetch). It was still
+    // routed, control-plane classified, and mutating declarations — a
+    // live ungated self-attestation path (PR #79 review blocker 4).
+    if (request.method === McplMethod.FeatureSetsChanged) {
+      if (request.id != null) {
+        this.sendErrorResponse(request.id, -32601, 'featureSets/changed removed in MCPL 0.5.0 (superseded by mcpl/manifestChanged, SPEC §17)');
+      } else {
+        console.error(`[mcpl] ${this.id}: discarded featureSets/changed — removed in 0.5.0 (§6.7/§17)`);
+      }
+      return;
+    }
+
+    if (request.method === McplMethod.ScopeElevate) {
+      if (request.id != null) {
+        this.sendErrorResponse(request.id, -32601, 'scope/elevate removed in MCPL 0.5.0 (SPEC §7)');
+      }
+      return;
+    }
+
+    // Positive-grant enforcement (§5.4, §14.1) happens at ADMISSION, in
+    // the emit() override below — the one choke-point that live routing
+    // and staged-buffer flushes share. See the comment there for why
+    // rejecting here, at line receipt, was wrong for staged connections.
+
+    if (!eventName) {
+      // §6.6: a request that will never be answered MUST get an error, so a
+      // request (it has an id) whose method isn't a string, or isn't one this
+      // host handles, is answered -32601. A notification nobody handles is
+      // ignored, as JSON-RPC asks.
+      if (request.id != null) {
+        this.sendErrorResponse(request.id, -32601, 'Method not found');
+        console.error(`[mcpl] ${this.id}: answered -32601 to a request for ${describeMethod(request.method)}, which this host doesn't handle`);
+      }
+      return;
+    }
+
+    // Emit the typed event with params and (for requests) a respond callback
+    if (request.id != null) {
+      // Server expects a response — provide a respond helper, bound to
+      // the transport the request came on: an answer after a reconnect
+      // would reach a server that never asked it.
+      const epoch = this.transportEpoch;
+      this.dispatchInboundEvent(eventName, request.params, {
+        id: request.id,
+        respond: (result: unknown) => this.sendResponse(request.id!, result, epoch),
+        respondError: (code: number, message: string, data?: unknown) =>
+          this.sendErrorResponse(request.id!, code, message, data, epoch),
+      });
+    } else {
+      // Notification — no response expected
+      this.dispatchInboundEvent(eventName, request.params);
+    }
+  }
+
+  /** Live delivery and delayed plane flushes share the same containment boundary. */
+  private dispatchInboundEvent(event: string, ...args: unknown[]): void {
+    try {
+      this.emit(event, ...args);
+    } catch (error) {
+      const requestId = (args[1] as { id?: unknown } | undefined)?.id;
+      this.reportInboundFailure(error, {
+        event,
+        ...(typeof requestId === 'string' || typeof requestId === 'number' ? { requestId } : {}),
+      });
+    }
+  }
+
+  /** Report a failure the containment boundary caught, naming the event (or
+   *  method) and request it was dispatching, and what failed. The message is
+   *  what the framework's 'error' listener traces. */
+  private reportInboundFailure(cause: unknown, context: { event?: string; requestId?: string | number } = {}): void {
+    const where = (show: (text: string) => string): string => (context.event === undefined ? '' : ` for ${show(context.event)}`) +
+      (context.requestId === undefined ? '' : ` (request ${show(String(context.requestId))})`);
+    // The error's message is what the 'error' listener traces, as text a
+    // reader parses, so it is bounded rather than escaped (boundedForLog);
+    // the log line prints the same through log-value.
+    const error = new Error(`MCPL server "${this.id}" inbound dispatch failed${where(boundedForLog)}: ${boundedForLog(describeCause(cause))}`, { cause });
+    console.error(`[mcpl] ${this.id}: inbound dispatch failed${where(logValue)}: ${logDetail(describeCause(cause))}`);
+    this.emitToErrorListeners(error);
+  }
+
+  /**
+   * Give an error to the connection's 'error' listeners, and say whether it
+   * has any. EventEmitter throws an 'error' that nothing listens for, and
+   * from a transport's callback, where these errors arise, nothing catches
+   * that throw, so it ends the process. A bare connection has no listener:
+   * the class is exported, and a probe, a playtest or a harness often attaches
+   * none. So with no listener, the error is the caller's to log, unless it
+   * already has. A listener that throws is caught and logged, with the error
+   * it was handling.
+   */
+  private emitToErrorListeners(error: Error): boolean {
+    if (this.listenerCount('error') === 0) return false;
+    try { this.emit('error', error); }
+    catch (listenerError) {
+      console.error(
+        `[mcpl] ${this.id}: an 'error' listener failed: ${logDetail(describeCause(listenerError))}` +
+          `, handling ${logDetail(error.message)}`,
+      );
+    }
+    return true;
   }
 
   /**
@@ -1526,10 +1740,17 @@ export class McplServerConnection extends EventEmitter {
       // re-inject either result because the original dispatch context is gone.
       const orphaned = this.orphanedRequests.get(response.id);
       this.orphanedRequests.delete(response.id);
-      if (orphaned?.renderParams) {
-        this.emit('orphaned-render-response', { params: orphaned.renderParams, result: response.result, error: response.error });
-        return; // audit only: a timeout fallback can never be replaced
-      }
+      // A push/render answered after its timeout (RFC-006 §5.3) is reported
+      // with the render's featureSet, key, eventId and, for a channel-scoped
+      // subject, channelId, kept from its request when the timeout fired, so
+      // its discarded answer can be recorded beside its batch's other
+      // coalescing records (§11). It is only reported: the fallback the
+      // timeout materialized stands (§5.4 rule 3). A late JSON-RPC error is
+      // passed on as `error`, so its record can be told from a late result's,
+      // and so is one beside a result, which JSON-RPC forbids: the live path
+      // rejects such an answer as an error.
+      const render = orphaned?.renderParams ?? {};
+      const failure = response.error ? { error: { code: response.error.code, message: response.error.message } } : {};
       const result = response.result;
       if (result && typeof result === 'object') {
         const r = result as { state?: unknown; checkpoint?: unknown };
@@ -1539,6 +1760,8 @@ export class McplServerConnection extends EventEmitter {
             method: orphaned?.method,
             hadState: r.state !== undefined,
             hadCheckpoint: r.checkpoint !== undefined,
+            ...render,
+            ...failure,
           });
         }
       } else if (orphaned) {
@@ -1547,6 +1770,8 @@ export class McplServerConnection extends EventEmitter {
           method: orphaned.method,
           hadState: false,
           hadCheckpoint: false,
+          ...render,
+          ...failure,
         });
       }
       return; // Orphaned response — ignore
@@ -1556,9 +1781,16 @@ export class McplServerConnection extends EventEmitter {
     if (pending.timer) clearTimeout(pending.timer);
 
     if (response.error) {
+      // describeCause rather than the template's own conversion, as for an
+      // initialize error: the server's code and message can be any JSON
+      // value, and one with no primitive form, such as {"toString":1}, would
+      // throw here, after the request has left pendingRequests and its timer
+      // is cleared, so it would never settle. Both are the server's text, a
+      // code as much as a message, since a server can send a string, so both
+      // are bounded as errors.ts says.
       pending.reject(
         new McplRequestError(
-          `MCPL server "${this.id}" returned error for ${pending.method}: [${response.error.code}] ${response.error.message}`,
+          `MCPL server "${this.id}" returned error for ${pending.method}: [${boundedForLog(describeCause(response.error.code))}] ${boundedForLog(describeCause(response.error.message))}`,
           'error-response',
           (response.error as { data?: unknown }).data,
         ),
@@ -1619,7 +1851,8 @@ export class McplServerConnection extends EventEmitter {
   private setupLifecycle(transport: McplTransport): void {
     this.hostCloseRequested = false;
     transport.on('error', (err: Error) => {
-      this.emit('error', new Error(`MCPL server "${this.id}" transport error: ${err.message}`));
+      const error = new Error(`MCPL server "${this.id}" transport error: ${err.message}`);
+      if (!this.emitToErrorListeners(error)) console.error(`[mcpl] ${this.id}: transport error: ${logDetail(err.message)}`);
     });
 
     transport.on('close', (info: TransportCloseInfo) => {
