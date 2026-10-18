@@ -508,7 +508,7 @@ import { UsageTracker, persistedUsageProblem, type PersistedUsageState } from '.
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import { McplProtocolVersionError, McplUnreapedLaunchError, stderrTailOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
 import { ModernMcpConnection } from './mcpl/modern-connection.js';
-import { asText, credentialRedactor, redactUrl, redactServerText, resolveServerBinding, serverConfigProblems, serverCredentialPatterns, serverTextRedactor } from './mcpl/protocol-family.js';
+import { WITHHELD_TEXT, asText, credentialRedactor, redactUrl, redactServerText, resolveServerBinding, serverConfigProblems, serverCredentialPatterns, serverTextRedactor, type CredentialPattern } from './mcpl/protocol-family.js';
 import { MALFORMED_CONTENT_NOTICE, normalizeStandardToolResult } from './mcpl/tool-result-normalize.js';
 import { boundedForLog, describeCause } from './mcpl/errors.js';
 import { assertServerConfigBooleans, buildWebSocketUrl, isWebSocketTransport } from './mcpl/transport.js';
@@ -22246,6 +22246,9 @@ export class AgentFramework {
     // under its id or spawned (a reconnecting server would otherwise be left
     // registered as a closed stub). With no outbox configured nothing is read.
     // A modern connection has no awareness barrier and no reaction default.
+    // A ledger that breaks after this read meets the spawn's own read: a
+    // connect with `reconnect` then leaves its stub retrying until the ledger
+    // reads again, as a reconnect does, and one without refuses.
     if (family === 'legacy') this.getPlacedReactionBaseline();
 
     // Register prefix + config for tool dispatch routing (idempotent with
@@ -23187,7 +23190,8 @@ export class AgentFramework {
    * server's credentials replaced: those of the configurations present when
    * it's made, then those present when it's used. An operation makes it
    * before it waits, so a server removed meanwhile, and one connected
-   * meanwhile, both have their credentials replaced.
+   * meanwhile, both have their credentials replaced. When one of them can't
+   * be read, the text is withheld, as redactServerText withholds it.
    */
   private everyServerRedactor(): (text: unknown) => string {
     const snapshot = [...this.mcplServerConfigs.values()];
@@ -23196,9 +23200,15 @@ export class AgentFramework {
     // covered, each with what its dials have sent by the time the text is
     // recorded. One pass over all their strings, so a secret that begins
     // another server's longer one can't cut that one short.
-    return (text) => credentialRedactor(
-      [...new Set([...snapshot, ...this.mcplServerConfigs.values()])].flatMap(config => serverCredentialPatterns(config)),
-    )(text);
+    return (text) => {
+      let patterns: CredentialPattern[];
+      try {
+        patterns = [...new Set([...snapshot, ...this.mcplServerConfigs.values()])].flatMap(config => serverCredentialPatterns(config));
+      } catch {
+        return WITHHELD_TEXT;
+      }
+      return credentialRedactor(patterns)(text);
+    };
   }
 
   /** Why a connect for this id is refused, or null when the id is free. One
