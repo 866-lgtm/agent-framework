@@ -166,8 +166,9 @@ function scan(haystack: string, needle: string, keep: number, accept?: (at: numb
 /**
  * Every position needle starts at in haystack, overlapping ones included,
  * each given to `visit` in turn until it returns false, in one pass over the
- * haystack however the needle repeats itself (Knuth–Morris–Pratt). Whether it
- * read the haystack to its end.
+ * haystack however the needle repeats itself (Knuth–Morris–Pratt). False once
+ * `visit` returns false, even for an occurrence that ends the haystack, as
+ * scan's indexOf loop stops; true when every occurrence was visited.
  */
 function everyOccurrence(haystack: string, needle: string, visit: (at: number) => boolean): boolean {
   // border[i]: how long the needle's longest prefix is that also ends its

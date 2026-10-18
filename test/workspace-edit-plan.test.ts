@@ -361,7 +361,8 @@ test('an old text read without its BOM or CR is found in one pass over a long ru
   // Only the text's start, or a place before a CRLF line end, takes such an
   // old text, so the places it passes over are most of the run. Searching
   // again from each, the planner compared the old text in full at every
-  // place: about 2 s of CPU for each of these, on Linux with Node 24.22.0.
+  // place: 3.3 s of CPU for the first of these and 5.3 s for the second, on
+  // Linux with Node 24.22.0.
   const run = 'a'.repeat(200_000);
   const needle = 'a'.repeat(50_000);
   for (const [text, oldText, newText, after] of [
@@ -374,6 +375,27 @@ test('an old text read without its BOM or CR is found in one pass over a long ru
     assert.ok((used.user + used.system) / 1000 < 500, `${(used.user + used.system) / 1000} ms of CPU`);
     assert.equal(planned.bytes.toString(), after);
   }
+});
+
+test("a read form's one pass finds a match inside one it passed over, and none that a mismatch ends", () => {
+  // Each old text carries a line's CR, so it matches only before a CRLF line
+  // end, and repeats part of itself.
+  // "aa" at 0 isn't before the line end; the one at 1, inside it, is.
+  assert.equal(plan('aaa\r\n', [spec(0, 'aa\r', 'b\r')]).bytes.toString(), 'ab\r\n');
+  // Neither of these occurs before the line end: "bab" and "bba" do, which a
+  // match that a mismatch didn't end would take for them.
+  for (const [text, oldText] of [['aabab\r\n', 'aab\r'], ['abba\r\n', 'aba\r']]) {
+    assert.deepEqual(problems(text!, [spec(0, oldText!, 'x\r')]).map((problem) => problem.kind), ['miss'], text);
+  }
+});
+
+test('overlapping occurrences a read form finds stop the count once a refusal has more than it shows', () => {
+  // "a\na" with a line's CR occurs before every line end but the first, each
+  // occurrence overlapping the one before: 29 of them.
+  const [run] = problems('a\r\n'.repeat(30), [spec(0, 'a\na\r', 'x\r', 'all')]);
+  assert.equal(run!.kind, 'count');
+  if (run!.kind !== 'count') return;
+  assert.deepEqual([run.found, run.atLeast, run.overlapping, run.lines.length], [21, true, true, 20]);
 });
 
 test("an old text carrying the file's BOM at its start matches at the text's start, keeping one BOM", () => {

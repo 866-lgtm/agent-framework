@@ -1058,7 +1058,7 @@ test('a receipt names a region too long to show by its lines without building it
   assert.ok(sliced < 5_000, `sliced ${sliced} code units`);
 });
 
-test('a receipt keeps to its cap with the longest notes it adds after its budget: twenty regions of eight-digit lines, and every count', () => {
+test('a receipt keeps to its cap with the longest notes it adds after its budget: twenty regions of eight-digit lines', () => {
   // Two files of 10,000,400 lines, each with 25 edits far apart near its end:
   // past what the regions may take, the note naming them lists twenty
   // ranges of eight-digit line numbers.
@@ -1078,6 +1078,47 @@ test('a receipt keeps to its cap with the longest notes it adds after its budget
   for (let maxChars = 700; maxChars <= 1_700; maxChars++) {
     const length = JSON.stringify(editReceipt('edit_many', files, 50, maxChars)).length;
     if (length > maxChars) assert.fail(`${length} characters at a cap of ${maxChars}`);
+  }
+});
+
+test("edit_many's receipt keeps to its cap with a last line that counts each of the four things it leaves out", () => {
+  // Five files of 25 edits, each with a note: as the cap falls, files are
+  // listed without their notes, then without their edits' numbers, then not
+  // at all, and those listed past the budget show no region.
+  const text = Array.from({ length: 25 }, (_, k) => `line ${k}\n`).join('');
+  const bytes = Buffer.from(text);
+  const planned = planFile(decodeForEdit(bytes)!, bytes, Array.from({ length: 25 }, (_, k) => ({ index: k, oldText: `line ${k}\n`, newText: `LINE ${k}\n`, expected: 1 })));
+  assert.ok('plan' in planned);
+  const files = [0, 1, 2, 3, 4].map((i) => ({
+    path: `work/f${i}.txt`,
+    plan: planned.plan,
+    notes: [`Disk's copy of work/f${i}.txt had changed since the workspace last read it, and the call took that in first.`],
+  }));
+  const allFour = /\[To keep this answer within [\d,]+ characters, it leaves out \d+ of the call's 5 files, the changed regions of \d+ more files?, the notes of \d+ files? and the edit numbers of \d+ files?\.\]$/;
+  let counted = 0;
+  for (let maxChars = 700; maxChars <= 2_500; maxChars++) {
+    const receipt = editReceipt('edit_many', files, 125, maxChars);
+    const length = JSON.stringify(receipt).length;
+    if (length > maxChars) assert.fail(`${length} characters at a cap of ${maxChars}`);
+    if (allFour.test(receipt.changed as string)) counted++;
+  }
+  assert.ok(counted > 0, 'no receipt counted all four');
+});
+
+test('a receipt keeps aside only what its own call can add: one edit of a file of one long line shows its region where it fits', () => {
+  // The note naming the region of this call's one edit, were it left out,
+  // would name line 1 alone. Kept aside as twenty ranges of numbers as long
+  // as the file is in code units, it took more than the 300 characters this
+  // receipt has to spare.
+  const bytes = Buffer.from(`x${'a'.repeat(999_999)}`);
+  const planned = planFile(decodeForEdit(bytes)!, bytes, [{ index: 0, oldText: 'x', newText: 'y', expected: 1 }]);
+  assert.ok('plan' in planned);
+  const files = [{ path: 'work/long.txt', plan: planned.plan, notes: [] }];
+  for (const [tool, start] of [['edit', /^ {5}1\ty/], ['edit_many', /^work\/long\.txt\n {5}1\ty/]] as const) {
+    const whole = JSON.stringify(editReceipt(tool, files, 1, 1_000_000)).length;
+    const receipt = editReceipt(tool, files, 1, whole + 300);
+    assert.match(receipt.changed as string, start, tool);
+    assert.ok(JSON.stringify(receipt).length <= whole + 300);
   }
 });
 

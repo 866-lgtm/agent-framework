@@ -433,17 +433,25 @@ export interface StoredFile {
 
 /**
  * What a receipt keeps aside for what it adds after its budget is spent, at
- * its longest for this call, as fitted keeps a refusal's last line: one
- * file's note naming the regions past it, SHOWN_MATCHES of them with the
- * most lines any of its files could have, and a count of the rest, which are
- * fewer than its edits; and edit_many's last line, every count at its most.
- * Each with the line feed or blank line before it.
+ * its longest for this call, as fitted keeps a refusal's last line: the note
+ * naming the regions of the one file whose regions pass the budget, which
+ * lists SHOWN_MATCHES of them at most, each as wide as that file's last
+ * region line could be, and counts the rest. A file has a region for each
+ * edit at most, and a region ends at most two lines past its change's new
+ * text (regionOf). Then edit_many's last line, every count at its most. Each
+ * with the line feed or blank line before it.
  */
-function receiptReserve(tool: EditTool, files: StoredFile[], editCount: number, maxChars: number): number {
-  let lines = 1;
-  for (const { plan } of files) lines = Math.max(lines, plan.updated.length + 1);
-  const range = `${lines}–${lines}`;
-  const regions = jsonLength('\n') + jsonLength(regionsLeftOut(maxChars, Array.from({ length: SHOWN_MATCHES }, () => range), editCount, false));
+function receiptReserve(tool: EditTool, files: StoredFile[], maxChars: number): number {
+  let regions = 0;
+  for (const { plan } of files) {
+    if (!plan.edits.length) continue;
+    let last = 1;
+    for (const { first } of plan.edits) last = Math.max(last, first.line + first.lines + 1);
+    const listed = Math.min(SHOWN_MATCHES, plan.edits.length);
+    const range = `${last}–${last}`;
+    const note = regionsLeftOut(maxChars, Array.from({ length: listed }, () => range), plan.edits.length - listed, false);
+    regions = Math.max(regions, jsonLength('\n') + jsonLength(note));
+  }
   if (tool === 'edit') return regions;
   const most = files.length;
   return regions + jsonLength('\n\n') + jsonLength(filesLeftOut(maxChars, most, { notListed: most, unshown: most, notes: most, edits: most })!);
@@ -460,7 +468,7 @@ function receiptReserve(tool: EditTool, files: StoredFile[], editCount: number, 
  * region where those alone pass `maxChars`.
  */
 export function editReceipt(tool: EditTool, files: StoredFile[], editCount: number, maxChars: number): Record<string, unknown> {
-  const reserve = receiptReserve(tool, files, editCount, maxChars);
+  const reserve = receiptReserve(tool, files, maxChars);
   const notesOf = ({ plan, notes }: StoredFile): string[] => {
     const lineEnds = lineEndNote(plan);
     return [

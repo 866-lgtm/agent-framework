@@ -3178,16 +3178,16 @@ export class WorkspaceModule implements Module {
    * stored: edit names its first problem, and edit_many every problem found.
    *
    * Each edit's own input is checked first, and each path's mount. A problem
-   * there refuses edit at once, before anything is read, and edit_many when
-   * its edits name more than one mount, which no one pass settles. Otherwise
-   * edit_many goes on to settle and plan the rest, so its one refusal names
-   * the problems it finds; the settling is what a read or a listing of its
-   * files would take in from disk, and the refusal says what it took in. A
-   * failure before the commit sets the entries stores none of them, and
-   * edit_many's answer to it says so. A store that throws as it sets them is
-   * read back (commitToolChanges), so the answer says they're stored where
-   * its record landed, and that it can't tell where they couldn't be read
-   * back.
+   * there refuses edit at once, before any file's text is read, and edit_many
+   * when its edits name more than one mount, which no one pass settles.
+   * Otherwise edit_many goes on to settle and plan the rest, so its one
+   * refusal names the problems it finds; the settling is what a read or a
+   * listing of its files would take in from disk, and the refusal says what
+   * it took in. A failure before the commit sets the entries stores none of
+   * them, and edit_many's answer to it says so. A store that throws as it
+   * sets them is read back (commitToolChanges), so the answer says they're
+   * stored where its record landed, and that it can't tell where they
+   * couldn't be read back.
    * Under the mount's turn, one pass settles every path with disk, by the
    * rule a listing uses, so the edits apply to what disk now holds. That pass
    * is the only step that awaits before the commit: every file is then read,
@@ -3241,12 +3241,12 @@ export class WorkspaceModule implements Module {
       if (problems.length === found) specs.set(index, spec);
     }
     // edit names its first problem, so one in its input refuses it before
-    // its path is looked up on disk, as edit always has.
+    // its path is looked up on disk.
     if (tool === 'edit' && problems.length) return refuse(problems);
 
-    // Each path in its mount, as disk spells it, before anything is read.
-    // Edits of one stored path are one file, planned once from one text,
-    // whatever path named it, and named as disk spells it.
+    // Each path in its mount, as disk spells it, before any file's text is
+    // read. Edits of one stored path are one file, planned once from one
+    // text, whatever path named it, and named as disk spells it.
     const parsed = new Map<string, { mount: MountState; relativePath: string; path: string } | Extract<EditProblem, { kind: 'file' }>>();
     const targets = new Map<string, EditTarget>();
     const mounts = new Map<string, MountState>();
