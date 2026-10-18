@@ -14,7 +14,7 @@ import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule, WorkspaceReadError } from '../src/modules/workspace/index.js';
-import { diskSpelling } from '../src/modules/workspace/observe.js';
+import { beginsWithDir, diskSpelling } from '../src/modules/workspace/observe.js';
 import type { MountConfig } from '../src/modules/workspace/types.js';
 import type { ModuleContext } from '../src/types/module.js';
 import type { ProcessEvent, ToolResult } from '../src/types/events.js';
@@ -51,6 +51,8 @@ const FINAL_SIGMA_FOLDING_ONLY = folds.finalSigma ? false
   : 'the temp directory keeps \u03c2 apart from \u03c3, so \u039f\u0394\u039f\u03a3 reaches nothing where disk has \u03bf\u03b4\u03bf\u03c2';
 const CASE_SENSITIVE_ONLY = folds.case
   ? 'the temp directory folds case, so two names that differ only in case are one name here' : false;
+const CASE_NOT_SHARP_S_ONLY = folds.case && !folds.sharpS ? false
+  : 'these need a temp directory that folds case and keeps \u00df apart from ss';
 
 async function setup(t: TestContext, mounts: (dir: string) => MountConfig[] = (dir) => [
   { name: 'work', path: dir, mode: 'read-write', watch: 'never', autoMaterialize: true },
@@ -384,6 +386,17 @@ test('resolveAbsolutePath takes a nested mount\'s directory in any spelling disk
   assert.notEqual(workspace.resolveAbsolutePath('outer/src/a.ts'), null, "the outer mount's own file");
 });
 
+test('resolveAbsolutePath takes a nested mount\'s directory in the other normalization form as that mount\'s', { skip: NORMALIZATION_FOLDING_ONLY }, async (t) => {
+  const { workspace } = await setup(t, (d) => {
+    mkdirSync(join(d, 'caf\u00e9'), { recursive: true });
+    return [
+      { name: 'outer', path: d, mode: 'read-write', watch: 'never' },
+      { name: 'cafe', path: join(d, 'caf\u00e9'), mode: 'read-write', watch: 'never' },
+    ];
+  });
+  for (const path of ['outer/caf\u00e9/x.txt', 'outer/cafe\u0301/x.txt']) assert.equal(workspace.resolveAbsolutePath(path), null, path);
+});
+
 test('on a disk that tells case apart, a directory spelled otherwise than a nested mount\'s is the outer mount\'s own',
   { skip: CASE_SENSITIVE_ONLY }, async (t) => {
     const { workspace, call } = await setup(t, (d) => {
@@ -401,6 +414,59 @@ test('on a disk that tells case apart, a directory spelled otherwise than a nest
     const listed = await call('ls', { path: 'outer', recursive: true });
     assert.deepEqual((listed.data as { entries: Array<{ path: string }> }).entries.map((e) => e.path), ['Inner/x.txt', 'src/a.ts']);
   });
+
+test('a nested mount\'s directory is matched level by level, as each level\'s directory compares names', () => {
+  const none = { case: false, normalization: false };
+  const both = { case: true, normalization: true };
+  const caseOnly = { case: true, normalization: false };
+  const formsOnly = { case: false, normalization: true };
+  // A disk that folds names mounted beneath one that tells them apart, and
+  // the reverse: each level is compared as its own directory compares names.
+  assert.equal(beginsWithDir(['fold', 'M', 'x.txt'], ['fold', 'm'], [none, both]), true, 'the folding level takes another case');
+  assert.equal(beginsWithDir(['FOLD', 'm', 'x.txt'], ['fold', 'm'], [none, both]), false, 'the level above it does not');
+  assert.equal(beginsWithDir(['A', 'b'], ['a', 'b'], [both, none]), true);
+  assert.equal(beginsWithDir(['a', 'B'], ['a', 'b'], [both, none]), false);
+  assert.equal(beginsWithDir(['M'], ['m'], [none]), false, 'on a disk that tells names apart, another case is another directory');
+  // Case and normalization fold apart: a level may fold either alone.
+  assert.equal(beginsWithDir(['cafe\u0301', 'x'], ['caf\u00e9'], [formsOnly]), true, 'another normalization form, where the level folds forms');
+  assert.equal(beginsWithDir(['CAF\u00c9'], ['caf\u00e9'], [formsOnly]), false, 'but not another case there');
+  assert.equal(beginsWithDir(['cafe\u0301'], ['caf\u00e9'], [caseOnly]), false, 'and where it folds case alone, not another form');
+  assert.equal(beginsWithDir(['CAFE\u0301'], ['caf\u00e9'], [both]), true);
+  assert.equal(beginsWithDir(['STRASSE'], ['stra\u00dfe'], [both]), true, 'as listedName compares case, loosely too');
+  assert.equal(beginsWithDir(['fold'], ['fold', 'm'], [none, both]), false, 'a path above the directory is not in it');
+  assert.equal(beginsWithDir(['fold', 'M'], ['fold', 'm'], []), false, 'with nothing known of a level, it is compared exactly');
+});
+
+test('where disk folds case and keeps \u00df apart from ss, the tools take a directory spelled with ss as the outer mount\'s own', { skip: CASE_NOT_SHARP_S_ONLY }, async (t) => {
+  const { workspace, call } = await setup(t, (d) => {
+    mkdirSync(join(d, 'stra\u00dfe'), { recursive: true });
+    mkdirSync(join(d, 'strasse'), { recursive: true });
+    writeFileSync(join(d, 'strasse', 'x.txt'), 'outer\n');
+    return [
+      { name: 'outer', path: d, mode: 'read-write', watch: 'never' },
+      { name: 'nested', path: join(d, 'stra\u00dfe'), mode: 'read-write', watch: 'never' },
+    ];
+  });
+  // The tools compare a respelled path exactly, so `strasse` is the outer
+  // mount's own directory, as disk keeps it.
+  const read = await call('read', { path: 'outer/strasse/x.txt', offsetChars: 0, limitChars: 100 });
+  assert.equal((read.data as { content: string }).content, 'outer\n');
+  // resolveAbsolutePath folds case as listedName does, loosely too, with no
+  // same-file check, so it errs toward the nested mount and gives null.
+  assert.equal(workspace.resolveAbsolutePath('outer/strasse/x.txt'), null);
+});
+
+test('resolveAbsolutePath takes a nested mount\'s directory not on disk at start as that mount\'s in another case, until a start finds it', async (t) => {
+  const { workspace, dir } = await setup(t, (d) => [
+    { name: 'outer', path: d, mode: 'read-write', watch: 'never' },
+    { name: 'later', path: join(d, 'later'), mode: 'read-write', watch: 'never' },
+  ]);
+  mkdirSync(join(dir, 'later'), { recursive: true });
+  // A level nobody could test at start is taken to fold, so a spelling that
+  // may reach the directory gives null, as one that does.
+  for (const path of ['outer/later/x.txt', 'outer/LATER/x.txt']) assert.equal(workspace.resolveAbsolutePath(path), null, path);
+  assert.notEqual(workspace.resolveAbsolutePath('outer/src/a.ts'), null, "the outer mount's own file");
+});
 
 /** A workspace with a mount nested in another, stored but not yet started. */
 function nestedWorkspace(t: TestContext, watch?: 'never'): { workspace: WorkspaceModule; ls: () => Promise<ToolResult> } {

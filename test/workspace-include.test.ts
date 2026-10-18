@@ -86,15 +86,17 @@ describe('mount include', () => {
   test('the walk takes only what include covers: names and extension globs at any depth, a directory glob beneath it', async (t) => {
     const env = new Env(t);
     // Beside them, a directory whose name starts with `docs` and a file whose
-    // name ends in `md` without the dot: each pattern's boundary holds.
-    for (const path of ['gate.json', 'gate.json.bak', 'gate.json.unreadable-1', 'notes.md', 'other.txt', 'sub/gate.json', 'sub/x.md', 'sub/y.txt', 'docs/a/b.txt', 'docsx/c.txt', 'readmemd']) {
+    // name ends in `md` without the dot: each pattern's boundary holds. An
+    // editor's swap file is passed over as one, before the include judges it.
+    for (const path of ['gate.json', 'gate.json.bak', 'gate.json.unreadable-1', 'notes.md', 'other.txt', 'sub/gate.json', 'sub/x.md', 'sub/y.txt', 'docs/a/b.txt', 'docsx/c.txt', 'readmemd', '.gate.json.swp']) {
       env.writeDisk(path, `${path}\n`);
     }
     const m = await env.open({ include: ['gate.json', '*.md', 'docs/**'] });
     assert.deepEqual(await listed(m), ['docs/a/b.txt', 'gate.json', 'notes.md', 'sub/gate.json', 'sub/x.md']);
     assert.deepEqual(env.tree(), ['docs/a/b.txt', 'gate.json', 'notes.md', 'sub/gate.json', 'sub/x.md'], 'nothing else is versioned');
     const data = await call(m, 'sync', {});
-    assert.deepEqual(data.passedOver, [{ mount: 'work', reason: OUTSIDE, count: 6 }], 'a sync says what it passed over, and why');
+    const byReason = (data.passedOver as Array<{ reason: string; count: number }>).map((p) => [p.reason, p.count]).sort();
+    assert.deepEqual(byReason, [["an editor's swap or backup file", 1], [OUTSIDE, 6]], 'a sync says what it passed over, and why');
     for (const path of ['work', 'work/sub']) {
       const found = await call(m, 'grep', { path, pattern: 'gate' });
       assert.deepEqual((found.results as Array<{ file: string }>).map((r) => r.file).sort(),

@@ -40,7 +40,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
-import { IGNORED, NONBLOCK, OTHER_MOUNT, OUTSIDE_INCLUDE, checkDir, containedFolded, diskSpelling, filesystemTrustsCtime, foldsNames, inOtherMount, insideMount, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, namesHolder, nestedHolder, type NestedMount, parsedSpelling, passedOverAt, pathSegments, readPrefix, type LinkFound } from './observe.js';
+import { IGNORED, NONBLOCK, OTHER_MOUNT, OUTSIDE_INCLUDE, beginsWithDir, type LevelFolds, checkDir, diskSpelling, filesystemTrustsCtime, foldsAtEach, inOtherMount, insideMount, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, namesHolder, nestedHolder, type NestedMount, parsedSpelling, passedOverAt, pathSegments, readPrefix, type LinkFound } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
 import {
   type MountRuntime,
@@ -763,10 +763,12 @@ export class WorkspaceModule implements Module {
    * each mount's name, in each spelling that names the directory: as
    * configured, and as disk spells it where that differs (spellNestedDirs).
    * Each spelling is mount-relative and `/`-separated, with its resolved root.
-   * `folds` says whether the disk folds names there, so that any spelling it
-   * folds to the directory's names that mount's directory (holderOf).
+   * `folds` gives, for each segment of the directory, how the directory
+   * holding it compares names (spellNestedDirs), which holderOf uses to take
+   * a path judged as given into that mount's directory in a spelling disk
+   * folds to it.
    */
-  private otherMounts = new Map<string, Array<{ name: string; spellings: Array<{ dir: string; root: string }>; folds: boolean }>>();
+  private otherMounts = new Map<string, Array<{ name: string; spellings: Array<{ dir: string; root: string }>; folds: LevelFolds[] }>>();
   /**
    * Whether a file's mode is observed, taken in and applied (MountRuntime's
    * `modesObserved`): not on Windows, which reports no POSIX modes. A test
@@ -834,7 +836,7 @@ export class WorkspaceModule implements Module {
           // directory, read against `/`-separated paths, whatever the
           // platform's.
           const relPath = rel.split(sep).join('/');
-          this.otherMounts.set(outer.name, [...(this.otherMounts.get(outer.name) ?? []), { name: inner.name, spellings: [{ dir: relPath, root: innerPath }], folds: false }]);
+          this.otherMounts.set(outer.name, [...(this.otherMounts.get(outer.name) ?? []), { name: inner.name, spellings: [{ dir: relPath, root: innerPath }], folds: [] }]);
           console.warn(
             `[workspace] Mount "${outer.name}" contains mount "${inner.name}" ` +
             `at ${relPath}/ — passing over it as another mount's directory`,
@@ -1731,15 +1733,15 @@ export class WorkspaceModule implements Module {
   resolveAbsolutePath(mountPrefixedPath: string): string | null {
     try {
       // Synchronous, so the path as given. The nested-mount check takes it
-      // as configured, as disk spells the nested mount's directory, or, where
-      // the disk folds names there, in any spelling it folds to (holderOf).
+      // as configured, as disk spells the nested mount's directory, or in
+      // any spelling disk folds to it, level by level (holderOf's asGiven).
       // The include judges it as given, so on a disk that folds names a
       // covered name whose file disk spells otherwise returns that file's
       // path, which the tools refuse, and a covered file named in another
       // case is null, which the tools read. A path the mount doesn't hold,
       // outside its include or in another mount's directory nested in it, is
       // null, as for a path that leaves the mount's directory.
-      const { mount, relativePath } = this.refuseNotHeld({ ...this.parsePathAsGiven(mountPrefixedPath), path: mountPrefixedPath }, mountPrefixedPath);
+      const { mount, relativePath } = this.refuseNotHeld({ ...this.parsePathAsGiven(mountPrefixedPath), path: mountPrefixedPath }, mountPrefixedPath, true);
       return resolve(mount.config.path, relativePath);
     } catch {
       return null;
@@ -1938,11 +1940,12 @@ export class WorkspaceModule implements Module {
    * where that differs from the configuration's. On a disk that folds names,
    * the outer mount's walks name the directory as disk does, and so does a
    * path parsePath has respelled, while a path given as configured
-   * still names it as configured (resolveAbsolutePath). It also notes
-   * whether the disk folds names at the directory (foldsNames), since a path
-   * judged as given can spell it a third way there. A directory not on disk
-   * keeps its configured spelling alone, and isn't taken to fold. Run at each
-   * start.
+   * still names it as configured (resolveAbsolutePath). It also notes, for
+   * each segment of the directory, how the directory holding it compares
+   * names (foldsAtEach), since a path judged as given can spell a segment a
+   * third way where it folds. A directory not on disk keeps its configured
+   * spelling alone, and its levels are taken to fold until a start finds it.
+   * Run at each start.
    */
   private async spellNestedDirs(): Promise<void> {
     for (const [outerName, nested] of this.otherMounts) {
@@ -1952,8 +1955,11 @@ export class WorkspaceModule implements Module {
       for (const entry of nested) {
         const configured = entry.spellings[0]!;
         const dir = await diskSpelling(outerRoot, configured.dir);
+        const folds = await foldsAtEach(outerRoot, dir);
+        // Both together, so nothing reads one spelling's list beside the
+        // other's levels.
         entry.spellings = dir === configured.dir ? [configured] : [configured, { dir, root: join(outerRoot, ...dir.split('/')) }];
-        entry.folds = await foldsNames(outerRoot, dir);
+        entry.folds = folds;
       }
     }
   }
@@ -1972,24 +1978,27 @@ export class WorkspaceModule implements Module {
    * of that mount, judged lexically where the path lands (`.`, `..` and
    * repeated separators resolved, as for the traversal guard; a link of the
    * outer mount isn't followed), with the path to use there; undefined when
-   * no nested mount's directory holds it. Where the disk folds names at the
-   * directory, a path that spells it in any way disk folds to it lies there
-   * too, so a path judged as given (resolveAbsolutePath) can't reach that
-   * mount's directory by spelling it otherwise.
+   * no nested mount's directory holds it. A path parsePath has respelled is
+   * compared with the directory's spellings exactly. One judged as given
+   * (`asGiven`, resolveAbsolutePath's) is compared level by level as each
+   * level's directory compares names (beginsWithDir), so it can't reach that
+   * mount's directory by spelling a segment otherwise; on a level that tells
+   * names apart, a directory spelled otherwise stays this mount's own.
    */
-  private holderOf(mountName: string, relativePath: string): { name: string; use: string } | undefined {
+  private holderOf(mountName: string, relativePath: string, asGiven = false): { name: string; use: string } | undefined {
     const mount = this.mounts.get(mountName);
     if (!mount) return undefined;
-    const resolved = resolve(mount.config.path, relativePath);
+    const root = resolve(mount.config.path);
+    const resolved = resolve(root, relativePath);
+    if (!isContainedPath(root, resolved)) return undefined;
+    const segments = resolved === root ? [] : relative(root, resolved).split(sep);
     const holder = (this.otherMounts.get(mountName) ?? [])
       .flatMap((o) => o.spellings
-        .filter((s) => isContainedPath(s.root, resolved) || (o.folds && containedFolded(s.root, resolved)))
-        .map((s) => ({ name: o.name, root: s.root })))
-      .sort((a, b) => b.root.length - a.root.length)[0];
+        .filter((s) => beginsWithDir(segments, s.dir.split('/'), asGiven ? o.folds : []))
+        .map((s) => ({ name: o.name, depth: s.dir.split('/').length })))
+      .sort((a, b) => b.depth - a.depth)[0];
     if (!holder) return undefined;
-    // The rest by segment: a spelling disk folds to the directory's has as
-    // many segments, whatever their letters.
-    const rest = resolved.split(sep).slice(resolve(holder.root).split(sep).length).join('/');
+    const rest = segments.slice(holder.depth).join('/');
     return { name: holder.name, use: rest ? `${holder.name}/${rest}` : holder.name };
   }
 
@@ -2026,12 +2035,13 @@ export class WorkspaceModule implements Module {
    * mount's directory first, naming the mount that holds it, then outside
    * the mount's include. Each is judged on the path as the caller parsed it:
    * as disk spells it for parseFilePath, as given for resolveAbsolutePath,
-   * which is synchronous. The include's refusal shows the path as given
+   * which is synchronous and says so (`asGiven`, so the nested-mount check
+   * folds where disk does). The include's refusal shows the path as given
    * (`given`), since disk's spelling of a name the include doesn't cover
    * would tell whether a file is there.
    */
-  private refuseNotHeld<P extends { mount: MountState; relativePath: string; path: string }>(parsed: P, given: string): P {
-    const holder = this.holderOf(parsed.mount.config.name, parsed.relativePath);
+  private refuseNotHeld<P extends { mount: MountState; relativePath: string; path: string }>(parsed: P, given: string, asGiven = false): P {
+    const holder = this.holderOf(parsed.mount.config.name, parsed.relativePath, asGiven);
     if (holder) throw new NestedMountError(parsed.path, parsed.mount.config.name, holder.name, holder.use);
     if (!insideMount(parsed.relativePath, parsed.mount.config.include)) {
       throw new OutsideIncludeError(given, parsed.mount.config);

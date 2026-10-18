@@ -96,18 +96,21 @@ export interface MountConfig {
    * is synchronous, judges the include on the path as given: on such a disk it
    * returns the path to a covered name's file that disk spells otherwise, and
    * null for a covered file named in another case. It takes a nested mount's
-   * directory in any spelling disk folds to it as that mount's. It names paths:
-   * on a mount that follows symlinks, a link among a covered path's parent
-   * directories is followed, and a link it covers is read and written through
-   * its own name, wherever the link leads inside the mount. On one that
-   * doesn't, a link on a path's way is refused, as on any such mount, and the
-   * refusal names an inside target only where a tool could name it: a
-   * directory, or a file the include covers, and in a nested mount's directory,
-   * a directory or a file that mount's own include covers. A path in a nested
-   * mount's directory is that mount's, whatever this include covers: every tool
-   * gives the answer that names the mount holding it, with the rest of the path
-   * past that mount's directory as given. A path with a `..` segment is refused
-   * before that, as above. Text the host registers for a path
+   * directory as that mount's in any spelling disk folds to it, compared level
+   * by level as each directory on the way compares names; where a level can't
+   * be told at start, as for a nested directory not yet on disk, it's taken to
+   * fold, so it errs toward the nested mount. It names paths: on a mount that
+   * follows symlinks, a link among a covered path's parent directories is
+   * followed, and a link it covers is read and written through its own name,
+   * wherever the link leads inside the mount. On one that doesn't, a link on a
+   * path's way is refused, as on any such mount, and the refusal names an
+   * inside target only where a tool could name it: a directory, or a file the
+   * include covers, and in a nested mount's directory, a directory or a file
+   * that mount's own include covers. A path in a nested mount's directory is
+   * that mount's, whatever this include covers: every tool gives the answer
+   * that names the mount holding it, with the rest of the path past that
+   * mount's directory as given. A path with a `..` segment is refused before
+   * that, as above. Text the host registers for a path
    * (`registerGeneratedTextFile`) is served there whatever the include says,
    * since it isn't one of the mount's files: it's matched by the path a
    * spelling resolves to, before anything else checks the path, so every

@@ -334,33 +334,64 @@ const flippedCase = (name: string): string =>
   }).join('');
 
 /**
- * Whether the disk folds names at the directory `relativePath` beneath
- * `root`: a variant of the path, its letters' case flipped or its other
- * Unicode normalization form, reaches the same directory (device and inode),
- * as listedName tests a segment. No directory there, or no variant, says no.
+ * How the directory holding one level of a path compares names: whether it
+ * folds case, and whether it folds Unicode normalization (NFC against NFD).
  */
-export async function foldsNames(root: string, relativePath: string): Promise<boolean> {
-  const own = await lstat(join(root, ...relativePath.split('/')), { bigint: true }).catch(() => null);
-  if (own === null || !own.isDirectory()) return false;
-  const variants = new Set([flippedCase(relativePath), relativePath.normalize('NFC'), relativePath.normalize('NFD')]);
-  variants.delete(relativePath);
-  for (const variant of variants) {
-    const other = await lstat(join(root, ...variant.split('/')), { bigint: true }).catch(() => null);
-    if (other !== null && sameFile(other, own)) return true;
-  }
-  return false;
-}
+export interface LevelFolds { case: boolean; normalization: boolean }
 
 /**
- * Whether the absolute path `candidate` lies within the absolute `root` on a
- * disk that folds names, comparing them as listedName compares a name with
- * disk's: as NFC in lower case, then more loosely.
+ * For each segment of the directory `relativePath` beneath `root`, how the
+ * directory holding it compares names (foldsAtEach's LevelFolds): a variant
+ * of that segment alone, its letters' case flipped or its other Unicode
+ * normalization form, reaches the same entry (device and inode), as
+ * listedName tests one. Where a level can't be tested, because the segment
+ * has no such variant or isn't on disk, it's taken to fold, so a comparison
+ * errs toward the directory: resolveAbsolutePath then gives null for a path
+ * it can't tell apart from one into the directory.
  */
-export function containedFolded(root: string, candidate: string): boolean {
-  return [folded, foldedLoosely].some((fold) => {
-    const base = fold(root);
-    const path = fold(candidate);
-    return path === base || path.startsWith(base.endsWith(sep) ? base : base + sep);
+export async function foldsAtEach(root: string, relativePath: string): Promise<LevelFolds[]> {
+  const segments = relativePath.split('/');
+  const levels: LevelFolds[] = segments.map(() => ({ case: true, normalization: true }));
+  let dir = root;
+  for (let i = 0; i < segments.length; i++) {
+    const segment = segments[i]!;
+    const own = await lstat(join(dir, segment), { bigint: true }).catch(() => null);
+    if (own === null) break;
+    const reaches = async (variant: string): Promise<boolean> => {
+      const other = await lstat(join(dir, variant), { bigint: true }).catch(() => null);
+      return other !== null && sameFile(other, own);
+    };
+    const flipped = flippedCase(segment);
+    if (flipped !== segment) levels[i]!.case = await reaches(flipped);
+    const forms = [segment.normalize('NFC'), segment.normalize('NFD')].filter((f) => f !== segment);
+    if (forms.length > 0) levels[i]!.normalization = await reaches(forms[0]!);
+    dir = join(dir, segment);
+  }
+  return levels;
+}
+
+/** A name as a level compares it (LevelFolds), strictly or, for case, through upper case and back too. */
+const foldedAt = (name: string, at: LevelFolds, loosely: boolean): string => {
+  const n = at.normalization ? name.normalize('NFC') : name;
+  return !at.case ? n : loosely ? n.toLowerCase().toUpperCase().toLowerCase() : n.toLowerCase();
+};
+
+/**
+ * Whether a path's segments begin with a directory's, compared level by
+ * level: as each level's directory compares names (`levels[i]`, from
+ * foldsAtEach), and exactly where nothing is known of the level. Case is
+ * compared as listedName compares it, strictly and then more loosely, but
+ * with no same-file check, so on a disk that folds case and keeps `ß` apart
+ * from `ss`, or `ı` from `i`, a distinct directory spelled with one of them
+ * matches too, and resolveAbsolutePath, the one caller that folds, gives
+ * null for it.
+ */
+export function beginsWithDir(segments: readonly string[], dir: readonly string[], levels: readonly LevelFolds[]): boolean {
+  if (segments.length < dir.length) return false;
+  return dir.every((d, i) => {
+    const s = segments[i]!;
+    const at = levels[i];
+    return s === d || (at !== undefined && [false, true].some((loosely) => foldedAt(s, at, loosely) === foldedAt(d, at, loosely)));
   });
 }
 
