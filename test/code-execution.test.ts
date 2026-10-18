@@ -1309,6 +1309,23 @@ describe("a round that runs code_execution is routed once its scripts return (re
     } finally { await h.done(); }
   });
 
+  // skip_reply's privacy outranks a send's hold, as for direct calls: a
+  // round whose script calls both keeps its prose private, and holds no draft.
+  for (const mode of ['locus', 'hybrid'] as const) it(`${mode}: a script that sends and calls skip_reply keeps its round's prose private, with no draft`, async () => {
+    const h = await scriptRound(mode, [
+      createMockResponse([
+        { type: 'text', text: 'posting the summary, then going quiet' },
+        scriptCall({ code: 'await test__send_message({})\nawait skip_reply({})' }),
+      ] as ContentBlock[], 'tool_use'),
+    ]);
+    try {
+      await h.run();
+      assert.ok(h.log.includes('tool:send_message') && h.log.includes('tool:skip_reply'), 'the script sent and skipped');
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:') || e.startsWith('chunk:')), [], 'nothing is published');
+      assert.deepStrictEqual(heldDrafts(h.framework), [], 'and the round is kept private, not held as a draft');
+    } finally { await h.done(); }
+  });
+
   it("explicit: a send inside the script silences neither its round nor the turn's later prose, as a direct send doesn't", async () => {
     const h = await scriptRound('explicit', [
       createMockResponse([

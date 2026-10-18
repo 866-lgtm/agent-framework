@@ -5,9 +5,9 @@
  * delivery withholds never reaches it: a round that a silencing tool,
  * `skip_reply` or a private `think` keeps back, text under a hybrid hold, a
  * bounce, or a round the stream never finished. Nor does a publish that
- * throws or that the server reports undelivered. A voice server speaks what
- * it gets, and words already spoken can't be taken back, so the stream can't
- * run ahead of delivery.
+ * throws, that the server reports undelivered, or that it doesn't confirm.
+ * A voice server speaks what it gets, and words already spoken can't be
+ * taken back, so the stream can't run ahead of delivery.
  */
 
 import { afterEach, test } from 'node:test';
@@ -103,8 +103,13 @@ function registry(framework: AgentFramework, options: { streaming?: boolean } = 
   const log: Logged[] = [];
   /** A publish whose text is held here doesn't return until the test lets it go. */
   const holds = new Map<string, Promise<void>>();
-  /** A publish of one of these texts fails: the server reports it undelivered (`delivered: false`), or it throws. */
-  const fails = new Map<string, 'undelivered' | 'throw'>();
+  /**
+   * A publish of one of these texts fails: the server reports it undelivered
+   * (`delivered: false`); its reply confirms nothing, so it may or may not
+   * have been posted (`unknown`, as the real registry reads a reply that
+   * leaves `delivered` out, an error answer or a timeout); or it throws.
+   */
+  const fails = new Map<string, 'undelivered' | 'unknown' | 'throw'>();
   /** A publish of one of these texts is answered with this message id, as a server that returns one. */
   const messageIds = new Map<string, string>();
   const known: Record<string, string> = { '#alpha': 'chan-alpha', '#cafe': 'chan-cafe', '@laria': 'discord:dm:99' };
@@ -118,6 +123,9 @@ function registry(framework: AgentFramework, options: { streaming?: boolean } = 
     if (failure === 'throw') throw new Error('synthetic publish failure');
     const destination = { serverId: 'stub', channelId };
     const messageId = messageIds.get(body);
+    if (failure === 'unknown') {
+      return { status: 'unknown' as const, destination, reason: 'the stub returned no delivery receipt (delivery uncertain)', at: Date.now() };
+    }
     return failure === undefined
       ? { status: 'delivered' as const, destination, ...(messageId !== undefined ? { messageId } : {}), at: Date.now() }
       : { status: 'failed' as const, destination, reason: 'the stub reported delivered: false', at: Date.now() };
@@ -438,8 +446,12 @@ test("explicit: a stream's complete waits for the deliveries it queued, so no ch
   }
 });
 
-for (const failure of ['undelivered', 'throw'] as const) {
-  test(`a publish that ${failure === 'throw' ? 'throws' : 'the server reports undelivered'} never streams, and the stream goes on with what is`, async () => {
+/** How a test title says a publish failed. */
+const failedHow = (failure: 'undelivered' | 'unknown' | 'throw'): string =>
+  failure === 'throw' ? 'throws' : failure === 'unknown' ? "the server doesn't confirm" : 'the server reports undelivered';
+
+for (const failure of ['undelivered', 'unknown', 'throw'] as const) {
+  test(`a publish that ${failedHow(failure)} never streams, and the stream goes on with what is`, async () => {
     const h = await harness([[round(text('lost'), call('one', 'test--read')), final(text('kept'))]]);
     h.fails.set('lost', failure);
     try {
@@ -716,8 +728,8 @@ test('a published trace carries no message id when the server returned none', as
 });
 
 for (const c of failedPublishCases) {
-  for (const failure of ['undelivered', 'throw'] as const) {
-    test(`${c.name}: a publish that ${failure === 'throw' ? 'throws' : 'the server reports undelivered'} streams nothing`, async () => {
+  for (const failure of ['undelivered', 'unknown', 'throw'] as const) {
+    test(`${c.name}: a publish that ${failedHow(failure)} streams nothing`, async () => {
       const h = await harness([c.script()], { proseRouting: c.mode });
       h.fails.set(c.lost, failure);
       try {
