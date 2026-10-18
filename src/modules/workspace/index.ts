@@ -40,7 +40,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
-import { IGNORED, NONBLOCK, OTHER_MOUNT, checkDir, diskSpelling, filesystemTrustsCtime, inOtherMount, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, nestedHolder, passedOverAt, readPrefix, foldsCase, type LinkFound, type WorkspaceEntries } from './observe.js';
+import { IGNORED, NONBLOCK, OTHER_MOUNT, checkDir, diskSpelling, filesystemTrustsCtime, inOtherMount, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, nestedHolder, passedOverAt, readPrefix, foldsCase, lowered, type LinkFound, type WorkspaceEntries } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
 import {
   type MountRuntime,
@@ -1947,7 +1947,8 @@ export class WorkspaceModule implements Module {
    * one name too, and a path that names an entry exactly keeps that spelling.
    * A handler that must read something at the moment it's asked, as
    * handleSync reads the branch a path sync adopts on, reads it before
-   * calling this, since this awaits disk.
+   * calling this, since this awaits disk. The entries are read when the
+   * step needs them, some after those awaits, from the branch current then.
    */
   private async parsePath(path: string): Promise<{ mount: MountState; relativePath: string; path: string }> {
     const given = this.parsePathAsGiven(path);
@@ -1960,15 +1961,23 @@ export class WorkspaceModule implements Module {
   }
 
   /**
-   * A mount's entries on the current branch, and whether its root folds case
-   * as the last start read it (false before the first), as diskSpelling
-   * reads them.
+   * A mount's entries on the current branch, as diskSpelling reads them when
+   * it does, and whether its root folds case as the last start read it
+   * (false before the first). An entry in a nested mount's directory, in any
+   * spelling that names it in lower case (lowered), isn't the mount's to
+   * spell by: a path there takes disk's spelling, which the nested-mount
+   * checks know.
    */
   private entriesOf(mount: MountState): WorkspaceEntries {
     const store = this.getStore();
+    const nested = this.othersOf(mount.config.name).map(lowered);
+    const outside = (path: string): boolean => {
+      const name = lowered(path);
+      return !nested.some((dir) => name === dir || name.startsWith(`${dir}/`));
+    };
     return {
-      has: (path) => store.treeGet(mount.treeStateId, path) !== null,
-      under: (prefix) => store.treeList(mount.treeStateId, prefix).map((entry) => entry.path),
+      has: (path) => outside(path) && store.treeGet(mount.treeStateId, path) !== null,
+      under: (prefix) => store.treeList(mount.treeStateId, prefix).map((entry) => entry.path).filter(outside),
       rootFoldsCase: this.rootFoldsCase.get(mount.config.name) ?? false,
     };
   }

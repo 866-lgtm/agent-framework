@@ -7,11 +7,12 @@
 // one needs it to fold normalization, and three to fold ß with ss, ſ with s
 // and ς with σ. A draft not yet on disk takes the spelling of a workspace
 // entry it equals in lower case, on a disk that folds case, and a path that
-// names an entry exactly keeps its spelling. Four run only where the disk
+// names an entry exactly keeps its spelling. Three run only where the disk
 // tells case apart, and those about starting and stopping run anywhere.
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import fs, { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
@@ -57,10 +58,10 @@ const CASE_SENSITIVE_ONLY = folds.case
 /** A mount whose writes stay drafts until they're materialized, as by default. */
 const drafts = (dir: string): MountConfig[] => [{ name: 'work', path: dir, mode: 'read-write', watch: 'never' }];
 
-/** Workspace entries at these paths, in this order, as the spelling step reads them, in a mount whose root folds case or not. */
+/** Workspace entries at these paths, as the spelling step reads them, in path order as the store lists them, in a mount whose root folds case or not. */
 const entriesOf = (paths: string[], rootFoldsCase = true) => ({
   has: (path: string) => paths.includes(path),
-  under: (prefix: string) => paths.filter((path) => path.startsWith(prefix)),
+  under: (prefix: string) => paths.filter((path) => path.startsWith(prefix)).sort(),
   rootFoldsCase,
 });
 
@@ -490,8 +491,29 @@ test('a draft that disk lists in another case is reached by its own path, and de
   assert.equal((read.data as { content: string }).content, 'draft\n');
   const deleted = await call('delete', { path: 'work/src/Late.txt' });
   assert.equal((deleted.data as { path: string }).path, 'work/src/Late.txt');
+  const listed = await call('ls', { path: 'work', recursive: true });
+  assert.ok(!(listed.data as { entries: Array<{ path: string }> }).entries.some((e) => e.path === 'src/Late.txt'), 'the draft is gone');
   assert.deepEqual(readdirSync(join(dir, 'src')).sort(), ['LATE.txt', 'a.ts']);
   assert.equal(readFileSync(join(dir, 'src', 'LATE.txt'), 'utf8'), 'made on disk\n');
+});
+
+test('a draft in a directory disk comes to list in another case is still reached by its own path', { skip: FOLDING_ONLY }, async (t) => {
+  // Ezra-2423's probe (J20026): disk comes to list the draft's directory as
+  // docs before the draft is materialized.
+  const { dir, call } = await setup(t, drafts);
+  await call('write', { path: 'work/Docs/a.txt', content: 'draft\n' });
+  mkdirSync(join(dir, 'docs'));
+  writeFileSync(join(dir, 'docs', 'x.txt'), 'made on disk\n');
+  const read = await call('read', { path: 'work/Docs/a.txt', offsetChars: 0, limitChars: 100 });
+  assert.equal((read.data as { path: string }).path, 'work/Docs/a.txt');
+  assert.equal((read.data as { content: string }).content, 'draft\n');
+  const again = await call('write', { path: 'work/Docs/a.txt', content: 'again\n' });
+  assert.equal((again.data as { path: string }).path, 'work/Docs/a.txt');
+  const listed = await call('ls', { path: 'work', recursive: true });
+  assert.deepEqual((listed.data as { entries: Array<{ path: string }> }).entries.map((e) => e.path).filter((p) => p.toLowerCase() === 'docs/a.txt'), ['Docs/a.txt'], 'one entry');
+  const deleted = await call('delete', { path: 'work/Docs/a.txt' });
+  assert.equal((deleted.data as { path: string }).path, 'work/Docs/a.txt');
+  assert.equal(readFileSync(join(dir, 'docs', 'x.txt'), 'utf8'), 'made on disk\n');
 });
 
 test('the step takes an entry\'s name where disk has nothing, keeps an entry\'s own spelling, and normalizes nothing', { skip: FOLDING_ONLY }, async (t) => {
@@ -503,10 +525,20 @@ test('the step takes an entry\'s name where disk has nothing, keeps an entry\'s 
   const entries = entriesOf(['src/New.txt', 'src/Late.txt', 'src/REAL.txt', 'src/caf\u00e9.txt', 'Docs/Sub/a.txt', 'DOCS/c.txt']);
   assert.equal(await diskSpelling(root, 'src/NEW.txt', entries), 'src/New.txt');
   assert.equal(await diskSpelling(root, 'src/Late.txt', entries), 'src/Late.txt', 'an entry\'s own spelling, where disk lists LATE.txt');
+  assert.equal(await diskSpelling(root, 'SRC/Late.txt', entries), 'src/Late.txt', 'the last segment\'s, once the directory takes disk\'s spelling');
+  mkdirSync(join(root, 'lower'));
+  assert.equal(await diskSpelling(root, 'LOWER/a.txt', entriesOf(['LOWER/a.txt'])), 'LOWER/a.txt', 'a path at an entry kept whole, where disk lists its directory as lower');
   assert.equal(await diskSpelling(root, 'src/late.txt', entries), 'src/LATE.txt', 'disk\'s spelling first, where no entry has this one');
   assert.equal(await diskSpelling(root, 'src/Real.txt', entries), 'src/Real.txt', 'a name disk lists as given');
-  assert.equal(await diskSpelling(root, 'DOCS/d.txt', entries), 'DOCS/d.txt', 'a directory spelled as an entry has it keeps that spelling');
-  assert.equal(await diskSpelling(root, 'docs/./SUB/b.txt', entries), 'Docs/./Sub/b.txt', 'else the first entry equal to it in lower case');
+  assert.equal(await diskSpelling(root, 'Docs/d.txt', entries), 'Docs/d.txt', 'a directory spelled as an entry has it keeps that spelling, though DOCS comes first');
+  assert.equal(await diskSpelling(root, 'docs/d.txt', entries), 'DOCS/d.txt', 'else the first in path order equal to it in lower case');
+  assert.equal(await diskSpelling(root, 'docs/./SUB/b.txt', entriesOf(['Docs/Sub/a.txt'])), 'Docs/./Sub/b.txt', 'passing over . among entries');
+  // Letter by letter, so a word's last Σ is σ and ς is σ, and İ, whose lower
+  // case is two letters, stays as it is.
+  const greek = entriesOf(['src/\u039f\u0394\u039f\u03a3.txt', 'src/\u0130.txt']);
+  assert.equal(await diskSpelling(root, 'src/\u03bf\u03b4\u03bf\u03c2.txt', greek), 'src/\u039f\u0394\u039f\u03a3.txt');
+  assert.equal(await diskSpelling(root, 'src/\u03bf\u03b4\u03bf\u03c3.txt', greek), 'src/\u039f\u0394\u039f\u03a3.txt');
+  assert.equal(await diskSpelling(root, 'src/i\u0307.txt', greek), 'src/i\u0307.txt');
   assert.equal(await diskSpelling(root, 'DOCS/../docs/b.txt', entries), 'DOCS/../docs/b.txt', 'a `..` among entries keeps the rest');
   assert.equal(await diskSpelling(root, 'src/CAFE\u0301.txt', entries), 'src/CAFE\u0301.txt', 'no entry is equal to it in lower case without normalizing');
   assert.equal(await diskSpelling(root, 'src/NEW.txt'), 'src/NEW.txt', 'without entries, as before');
@@ -530,6 +562,77 @@ test('a directory folds case if a name it lists does, flipped, or where it lists
   assert.equal(await foldsCase(join(root, 'empty')), true);
   mkdirSync(join(root, '2025'));
   assert.equal(await foldsCase(join(root, '2025')), false, 'nothing to tell by');
+});
+
+test('a mount whose root is empty, or not there yet, at start takes a draft\'s spelling at its top level', { skip: FOLDING_ONLY }, async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-new-roots-'));
+  mkdirSync(join(root, 'empty'));
+  const store = JsStore.openOrCreate({ path: join(root, 'store') });
+  const workspace = new WorkspaceModule({ mounts: [
+    { name: 'empty', path: join(root, 'empty'), mode: 'read-write', watch: 'never' },
+    { name: 'later', path: join(root, 'later'), mode: 'read-write', watch: 'never' },
+  ] });
+  workspace.initStore(store);
+  await workspace.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
+  t.after(async () => { await workspace.stop(); store.close(); rmSync(root, { recursive: true, force: true }); });
+  for (const mount of ['empty', 'later']) {
+    const first = await workspace.handleToolCall({ id: 'w1', name: 'write', input: { path: `${mount}/Notes.md`, content: 'one\n' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+    assert.equal(first.success, true, String(first.error));
+    const second = await workspace.handleToolCall({ id: 'w2', name: 'write', input: { path: `${mount}/NOTES.md`, content: 'two\n' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+    assert.equal((second.data as { path: string }).path, `${mount}/Notes.md`, mount);
+  }
+});
+
+test('an entry in a nested mount\'s directory, in any case, isn\'t the outer mount\'s to spell a path by', { skip: FOLDING_ONLY }, async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-nested-entries-'));
+  const dir = join(root, 'mount');
+  mkdirSync(join(dir, 'inner'), { recursive: true });
+  const store = JsStore.openOrCreate({ path: join(root, 'store') });
+  const workspace = new WorkspaceModule({ mounts: [
+    { name: 'outer', path: dir, mode: 'read-write', watch: 'never' },
+    { name: 'inner', path: join(dir, 'inner'), mode: 'read-write', watch: 'never' },
+    { name: 'later', path: join(dir, 'later'), mode: 'read-write', watch: 'never' },
+  ] });
+  workspace.initStore(store);
+  await workspace.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
+  t.after(async () => { await workspace.stop(); store.close(); rmSync(root, { recursive: true, force: true }); });
+  // Entries the outer mount holds from before: a file named as one nested
+  // mount's directory in another case, and one beneath the directory of a
+  // nested mount that isn't on disk yet, in another case.
+  const entry = { blobHash: 'a'.repeat(64), size: 1, mode: 0o100644 };
+  store.treeSet('workspace/outer/tree', 'Inner', entry);
+  store.treeSet('workspace/outer/tree', 'Later/x.txt', entry);
+  const call = (name: string, input: unknown) => workspace.handleToolCall({ id: name, name, input } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+  const read = await call('read', { path: 'outer/Inner', offsetChars: 0, limitChars: 10 });
+  assert.equal(read.success, false);
+  assert.match(String(read.error), /lies in mount "inner"/);
+  const write = await call('write', { path: 'outer/later/y.txt', content: 'y\n' });
+  assert.equal(write.success, false);
+  assert.match(String(write.error), /lies in mount "later"/);
+});
+
+test('a stop made while start reads whether a mount\'s root folds case leaves the workspace stopped', async (t) => {
+  const { workspace, ls } = nestedWorkspace(t, 'never');
+  const original = fs.promises.readdir;
+  let stopped: Promise<void> | undefined;
+  fs.promises.readdir = ((path: fs.PathLike, ...rest: unknown[]) => {
+    // Start lists the inner mount's root only for whether it folds case,
+    // after it has read the nested mounts' spellings: stop then.
+    if (basename(String(path)) === 'inner') stopped ??= workspace.stop();
+    return (original as (...args: unknown[]) => unknown)(path, ...rest);
+  }) as typeof fs.promises.readdir;
+  syncBuiltinESMExports();
+  try {
+    await workspace.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
+  } finally {
+    fs.promises.readdir = original;
+    syncBuiltinESMExports();
+  }
+  assert.notEqual(stopped, undefined, 'start listed a root');
+  await stopped;
+  const listed = await ls();
+  assert.equal(listed.success, false);
+  assert.match(String(listed.error), /The workspace has stopped/);
 });
 
 test('on a disk that tells case apart, two drafts that differ only in case stay two files', { skip: CASE_SENSITIVE_ONLY }, async (t) => {
