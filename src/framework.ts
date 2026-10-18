@@ -13758,18 +13758,21 @@ export class AgentFramework {
       });
       agent.reset();
 
-      // A stop made while the hooks or the compile ran had no stream to
-      // cancel, and the failure skipped the checks after them: it ends the
-      // turn here, as it would have there, before a hold parks the turn, a
-      // retry waits or the failure exhausts it. As after the hooks and after
-      // the compile, a replaced agent or a stopping framework comes first:
-      // the turn is dropped as theirs, and the stop goes with it. A failed
-      // start with no stop goes on below as before.
+      // A stop made while the compile ran had no stream to cancel, and the
+      // compile's failure skipped the check after it; a stop made while the
+      // failure is reported, with this start's window still open, is kept
+      // the same way. Either ends the turn here, as at that check, before a
+      // hold parks the turn, a retry waits or the failure exhausts it. (The
+      // hooks fail open, and nothing after the compile throws here, so this
+      // catch never holds a compiled request.) As at the checks after the
+      // hooks and after the compile, a replaced agent or a stopping framework
+      // comes first: the turn is dropped as theirs, and the stop goes with
+      // it. A failed start with no stop goes on below as before.
       const stopAtFailure = this.takeStartStop(agent, checkWindow);
       if (stopAtFailure) {
         if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed) {
           const why = this.agents.get(agent.name) !== agent ? 'the agent was replaced or removed' : 'the framework was stopping';
-          const reason = `a turn whose hooks or compile failed while ${why} is dropped before it sends anything`;
+          const reason = `a turn whose request couldn't be built while ${why} is dropped before it sends anything`;
           console.error(`[turn] ${agent.name}: ${reason}`);
           this.endDroppedTurn(agent.name, routing);
           this.eventGate?.onInferenceEnded(agent.name);
@@ -14568,15 +14571,16 @@ export class AgentFramework {
                 // The stream has completed, so a stop made during the wait
                 // reached no stream event: it ends the turn here instead of
                 // the retry. The framework's own stop comes first, as at a
-                // stream's terminal, even when a caller's came before it: its
-                // record on the stream (where stop()'s shutdown overwrites an
-                // abandon's), else stop() having closed admission, else the
-                // abandon's mark on the window. Once a caller's stop has taken
-                // the stream, stop() and the abandon have no stream to record
-                // on, and only the last two reach the turn.
+                // stream's terminal, even when a caller's came before it, and
+                // stop() before an abandon: stop() by its record on the stream
+                // or by having closed admission, since a caller's stop that
+                // took the stream leaves it nothing to record on, and the
+                // abandon by its record or by its mark on the window. Which
+                // of them came first, and where a caller's stop fell between
+                // them, then changes nothing.
                 const recorded = this.frameworkCancelledStreams.get(`${agent.name}:${myStreamId}`);
-                const frameworkStop = recorded === 'shutdown' || recorded === 'quiesce_abandoned' ? recorded
-                  : this.providerAdmissionClosed ? 'shutdown' : guardWindow.abandoned ? 'quiesce_abandoned' : undefined;
+                const frameworkStop = recorded === 'shutdown' || this.providerAdmissionClosed ? 'shutdown'
+                  : recorded === 'quiesce_abandoned' || guardWindow.abandoned ? 'quiesce_abandoned' : undefined;
                 const callerStop = agent.takeCancel();
                 if (frameworkStop === 'shutdown' || frameworkStop === 'quiesce_abandoned') {
                   lifecyclePhase = 'aborted';

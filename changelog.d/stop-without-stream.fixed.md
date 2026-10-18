@@ -27,8 +27,9 @@
     `host:quiesce`'s `unabandonable` lists a turn that the abandon hasn't
     ended when its grace runs out: one with no stream and no check ahead,
     such as a puppet tool turn, or one that hasn't reached its check yet,
-    the tool-result guard's wait for its speech included. A turn whose live
-    stream the abandon cancelled isn't listed, even one still running.
+    the tool-result guard's wait for its speech included. A turn whose stream
+    the abandon cancelled while it was still streaming isn't listed, even
+    one still running.
   - **A failure's report:** a turn's stream that failed or threw no longer
     holds the agent while its `inference:failed` is delivered, nor does a
     compiled stream held for a provider's wait. A listener sees the agent
@@ -36,14 +37,16 @@
     or check is there to take the stop. A stop through
     `Agent.cancelStream()` made then ends the turn at the check after its
     wait to retry, if the error policy retries it, and otherwise ends
-    nothing.
-  - **A stop followed by a failure:** when a turn's hooks or compile fail
-    after a stop reached it, the turn ends at the failure: its
-    `inference:failed`, then its `inference:aborted`. It isn't held by a
-    provider hold, and the error policy doesn't retry it. If the agent was
-    replaced or the framework is stopping by then, the turn is dropped as
-    theirs, before it sends anything, as at the checks after the hooks and
-    the compile. A failure that would have exhausted the turn emits no
+    nothing. A failure to build a turn's request is reported while the
+    turn's check is still ahead: `abortInference()` from a listener reports
+    `true` there, and the turn ends at that check.
+  - **A stop followed by a failure:** when a turn's compile fails after a
+    stop reached it, the turn ends at the failure: its `inference:failed`,
+    then its `inference:aborted`. It isn't held by a provider hold, and the
+    error policy doesn't retry it. If the agent was replaced or the
+    framework is stopping by then, the turn is dropped as theirs, before it
+    sends anything, as at the checks after the hooks and the compile. A
+    failure that would have exhausted the turn emits no
     `inference:exhausted`, the event from which the hard-down alert's
     failure streak, the over-budget drain and the poison-history breaker
     count failures, so none of them counts it.
