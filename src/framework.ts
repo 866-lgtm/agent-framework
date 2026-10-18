@@ -134,6 +134,7 @@ import {
 import { randomUUID, createHash } from 'node:crypto';
 import { PyRunner, buildInjectedTools, formatLimit, type ScriptToolResult } from './code-execution/py-runner.js';
 import { scriptToolNames } from './code-execution/script-tool-names.js';
+import { scriptEndText, scriptEndTextWithin, type ScriptEnd } from './code-execution/result-text.js';
 import {
   buildCodeExecutionToolDefinition,
   CODE_EXECUTION_TOOL_NAME,
@@ -19444,9 +19445,18 @@ export class AgentFramework {
       this.scriptRoutingInterpreters.set(agentName, { interpreter, names: new Set([...earlier, ...reachable]) });
     }
 
+    // The model reads how the script ended as text, its ending first, within
+    // the agent's inline cap; hosts read the fields in `structured`.
+    const cap = agent ? this.resolveToolResultInlineCap(agent).cap : DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS;
+    const text = await this.scriptEndResultText(
+      { stdout: exec.stdout, stderr: exec.stderr, returnCode: exec.returnCode, ...(capNote ? { timeLimitNote: capNote } : {}) },
+      cap,
+      call.id,
+    );
     return {
       success: true,
-      data: {
+      data: [{ type: 'text', text }],
+      structured: {
         stdout: exec.stdout,
         stderr: exec.stderr,
         return_code: exec.returnCode,
@@ -19455,6 +19465,26 @@ export class AgentFramework {
       isError: false,
       ...(endTurn ? { endTurn: true } : {}),
     };
+  }
+
+  /**
+   * A foreground script's ending as the model reads it: whole when it fits
+   * `cap`, or else cut to fit beside a notice, with the whole text written
+   * to the tool result's file, where the inline cap's spill would put it.
+   * A cap too small to hold a cut of each stream leaves the whole text to
+   * that spill, which keeps its head.
+   */
+  private async scriptEndResultText(end: ScriptEnd, cap: number, callId: string): Promise<string> {
+    const whole = scriptEndText(end);
+    if (whole.length <= cap) return whole;
+    const written = await this.writeToolResultFile(`${new Date().toISOString().slice(0, 10)}-${callId}`, whole);
+    const notice = written && written.error === undefined
+      ? `[cut to fit; the whole output (${whole.length} chars): workspace file ${written.path}. ${this.spillPageAdvice(written.path, cap)}]`
+      : written
+        ? `[cut to fit; writing the whole output (${whole.length} chars) to workspace file ${written.path} FAILED (${written.error}); what was cut was not retained]`
+        : `[cut to fit; the whole output was ${whole.length} chars, and with no writable workspace, what was cut was not retained]`;
+    const within = scriptEndTextWithin(end, cap - notice.length);
+    return within === null ? whole : within + notice;
   }
 
   // ---------------------------------------------------------------------------
@@ -19946,6 +19976,19 @@ export class AgentFramework {
     return { path, error: failure };
   }
 
+  /** How to read a tool result's file back a page at a time, with each page
+   *  sized to come back within `cap`. */
+  private spillPageAdvice(path: string, cap: number): string {
+    // JSON serialization can expand each read-back code unit to six
+    // chars (\\u0000). Leave room for the page's metadata and a possible
+    // extra code unit at a surrogate-pair boundary.
+    const pageOverhead = JSON.stringify(path).length + 256;
+    const readLimit = Math.max(1, Math.min(2000, Math.floor((cap - pageOverhead) / 6) - 1));
+    return `Page with workspace--read ${JSON.stringify({ path, offsetChars: 0, limitChars: readLimit })}; `
+      + 'use nextOffsetChars as offsetChars until null, keeping limitChars. Or raise the inline cap via '
+      + 'agent_settings update tool_result_inline_max_chars.';
+  }
+
   private async spillOrTruncate(
     content: string,
     cap: number | undefined,
@@ -19969,17 +20012,10 @@ export class AgentFramework {
     const written = await this.writeToolResultFile(label, content);
     if (written && written.error === undefined) {
       const path = written.path;
-      // JSON serialization can expand each read-back code unit to six
-      // chars (\\u0000). Leave room for the page's metadata and a possible
-      // extra code unit at a surrogate-pair boundary.
-      const pageOverhead = JSON.stringify(path).length + 256;
-      const readLimit = Math.max(1, Math.min(2000, Math.floor((cap - pageOverhead) / 6) - 1));
       return {
         text: head
           + `\n\n[truncated — showing ${head.length} of ${content.length} chars; full content: workspace file ${path}`
-          + `. Page with workspace--read ${JSON.stringify({ path, offsetChars: 0, limitChars: readLimit })}; `
-          + 'use nextOffsetChars as offsetChars until null, keeping limitChars. Or raise the inline cap via '
-          + 'agent_settings update tool_result_inline_max_chars.]'
+          + `. ${this.spillPageAdvice(path, cap)}]`
           + kept,
         filePath: path,
       };

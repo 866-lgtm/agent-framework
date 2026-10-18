@@ -3006,7 +3006,7 @@ describe('framework code_execution integration (real python3)', () => {
       // Through the framework, each result says it isn't an error (a
       // handler that passed on only the string would make it None).
       assert.match(wireResult.content, /is_error: \[False, False\]/);
-      assert.match(wireResult.content, /"return_code":\s*0/);
+      assert.match(wireResult.content, /^exit code: 0\n/);
       // ...and NOT the intermediate tool results.
       assert.ok(
         !wireResult.content.includes('"echoed"'),
@@ -3127,7 +3127,7 @@ describe('framework code_execution integration (real python3)', () => {
       // The first script is stopped at its time limit while its call that ends the turn is running.
       const stopped = await run({ code: 'await test__finish({})', time_limit_ms: 1000 });
       assert.ok(finishStarted);
-      assert.match((stopped.data as { stderr: string }).stderr, /reached its 1s time limit/);
+      assert.match((stopped.structured as { stderr: string }).stderr, /reached its 1s time limit/);
       assert.ok(!stopped.endTurn);
 
       // The call finishes while the next script runs; its request belonged to the stopped script.
@@ -3135,7 +3135,7 @@ describe('framework code_execution integration (real python3)', () => {
       await new Promise((r) => setTimeout(r, 300));
       releaseFinish();
       const result = await next;
-      assert.strictEqual((result.data as { stdout: string }).stdout, 'next done\n');
+      assert.strictEqual((result.structured as { stdout: string }).stdout, 'next done\n');
       assert.ok(!result.endTurn, "the stopped script's request ended the next script's turn");
     } finally {
       await framework.stop();
@@ -5263,7 +5263,7 @@ describe('code_execution per-call time limit (time_limit_ms)', () => {
 
   const run = (framework: AgentFramework, input: Record<string, unknown>) =>
     framework.executeToolCall({ id: `ce-${Math.random()}`, name: 'code_execution', input });
-  const dataOf = (r: ToolResult) => r.data as { stdout: string; stderr: string; return_code: number; time_limit_note?: string };
+  const dataOf = (r: ToolResult) => r.structured as { stdout: string; stderr: string; return_code: number; time_limit_note?: string };
 
   it('the tool tells the agent its time limit and offers time_limit_ms', async () => {
     await withFramework({ scriptTimeoutMs: 300_000, maxScriptTimeoutMs: 1_800_000 }, async (framework) => {
