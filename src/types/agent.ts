@@ -32,9 +32,19 @@ export interface AgentConfig {
   strategy?: ContextStrategy;
 
   /**
-   * Which tools this agent can use.
+   * Enforced at dispatch for registered agent callers; omitted means 'all'.
    * - 'all': all available tools
-   * - string[]: specific tool names (with module prefix)
+   * - string[]: exact tool names, including module--utility names for utilities.
+   * Utilities aren't tools of their own: an agent's model and its scripts are
+   * offered them only through 'utils', whose run checks the utility's own
+   * name. An agent that should use a utility lists both 'utils' and
+   * 'module--utility'. The name alone passes the dispatch check for any call
+   * by that name, whether the host makes it with executeToolCall on the
+   * agent's behalf or the model or a script makes it without being offered
+   * it. The slot is hidden when no utility is permitted.
+   * Trusted module calls are exempt. Genuinely unidentified public callers,
+   * including unknown legacy names, remain unrestricted. Framework-created
+   * identities have tool authority only while registered.
    */
   allowedTools?: 'all' | string[];
 
@@ -177,12 +187,6 @@ export interface AgentConfig {
     autoRewind?: boolean;
     /** Max consecutive rewinds before giving up a turn. Default 3. */
     maxRewinds?: number;
-    /**
-     * When the rewound turn is a *human* message (not a machine tool result),
-     * announce the withholding on the conversational surface (Discord) rather
-     * than dropping it silently. Default true.
-     */
-    announceHumanTurns?: boolean;
   };
 
   /** Opt-in tool-output admission and one guarded retry after a provider
@@ -202,7 +206,8 @@ export interface AgentConfig {
    *   that publication envelope through the same authorized resolver.
    *   See docs/hybrid-prose-routing.md.
    * - 'disabled': generated prose is never published. Only explicit tools may
-   *   send externally; prose remains in Chronicle with a private suppression receipt.
+   *   send externally; prose remains in Chronicle, and a turn that wrote plain
+   *   speech ends with a private `[delivered] plain speech → no channel` receipt.
    */
   proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled';
 
@@ -411,11 +416,10 @@ export interface InferenceRequest {
   /** Suppress every automatic plain-prose delivery for this logical turn.
    * Explicit tool calls remain available. Used by authenticated silent wakes. */
   suppressProse?: boolean;
-  /** Ephemeral system-position prompt for this turn only. Never written to
-   * Chronicle; callers must supply bounded non-secret control text. */
-  ephemeralSystemPrompt?: string;
-  /** The authenticated silent heartbeat tick this turn answers. Every row the
-   * turn stores is stamped `metadata.silentHeartbeat` with it, and request
-   * builds render a request-only separator before the tick's first row. */
+  /** The authenticated silent heartbeat tick this turn answers. The rows the
+   * turn's reply stores (its assistant responses and tool results) are
+   * stamped `metadata.silentHeartbeat` with it, and request builds render a
+   * request-only separator carrying the tick's instruction before the tick's
+   * first surviving row (`SILENT_HEARTBEAT_SEPARATOR`). */
   silentHeartbeat?: SilentHeartbeatTick;
 }
