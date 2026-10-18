@@ -19261,8 +19261,10 @@ export class AgentFramework {
    * one still queued for it. Writes still
    * queued would wait for a boundary it never reaches, and the flush that
    * finds it gone would drop them, so they land in its own window now, which
-   * Chronicle keeps for investigation; its stream is over or cancelled, so
-   * nothing it compiles can diverge from them.
+   * Chronicle keeps for investigation. Its stream is over or cancelled, so it
+   * compiles nothing more; a run that a watchdog ends while its stream awaits
+   * the spill of its last tool results still stores those results, after
+   * these writes.
    */
   private releaseWindow(agent: Agent): void {
     for (const metadata of this.unreadFailedReplies(agent)) this.passFailedReplyToPrimary(agent.name, metadata);
@@ -19388,8 +19390,9 @@ export class AgentFramework {
    * unread, or its delivery failed after release. (A notice still queued for
    * it, at release or restored at boot, goes on as the queue entry itself:
    * queuedFailedReplyForPrimary.) Tell the primary instead, naming the
-   * speaker, so an agent who can still act learns of it: to resend, or to
-   * tell the human. The words follow the speaker's own notice
+   * speaker, so an agent who can still act learns of it and can tell the
+   * human. It gives the reply's length, not its words, which stay in the
+   * speaker's window. Its wording follows the speaker's own notice
    * (onRouteFailure): a delivery that wasn't confirmed may have been posted,
    * and neither text says no one saw the reply, since only this channel's
    * routing failed. Only for a delivery to a channel; a reply that had no
