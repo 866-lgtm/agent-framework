@@ -1535,20 +1535,20 @@ export class Agent {
   }
 
   /**
-   * Build the effective system prompt, appending any system-position injections.
+   * Build the effective system prompt, appending any system-position
+   * injections, their blocks joined by line breaks. The system prompt is
+   * text, so a block of another type, such as an image a server or module
+   * injected there, can't go in it: a line in its place says so. The hook
+   * orchestrator tells a server's operator once per server and namespace,
+   * and the module registry tells a module's once per module and namespace.
    */
   private buildSystemPrompt(systemInjections: ContentBlock[]): string {
     if (systemInjections.length === 0) {
       return this.systemPrompt;
     }
 
-    const injectedText = systemInjections
-      .filter((block): block is ContentBlock & { type: 'text' } => block.type === 'text')
-      .map((block) => block.text);
-
-    if (injectedText.length === 0) {
-      return this.systemPrompt;
-    }
+    const injectedText = systemInjections.map((block) =>
+      block.type === 'text' ? block.text : `[${block.type} block not shown: the system prompt carries text only.]`);
 
     return this.systemPrompt + '\n' + injectedText.join('\n');
   }
