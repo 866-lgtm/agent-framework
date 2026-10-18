@@ -59,8 +59,10 @@ function config(overrides?: Partial<McplServerConfig>): McplServerConfig {
 
 /** Lift a connection's request timeout, so the tools/list that releases a
  *  held reply has no watchdog of its own to race. It sets a private field,
- *  which sendRequest reads for each request. */
+ *  which sendRequest reads for each request; the check fails the test if the
+ *  field is renamed, where the lift would otherwise set nothing. */
 function liftRequestTimeout(c: McplServerConnection): void {
+  assert.ok(Object.hasOwn(c, 'requestTimeoutMs'), 'the connection still has its requestTimeoutMs field');
   (c as unknown as { requestTimeoutMs: number }).requestTimeoutMs = 0;
 }
 
