@@ -17,6 +17,7 @@ import type {
   EventResponse,
   Module,
   ProcessEvent,
+  ScriptToolResult,
   ToolCall,
   ToolDefinition,
   ToolResult,
@@ -186,15 +187,16 @@ describe('ToolCall.resultMaxChars', () => {
     const { framework, probe, done } = await makeFramework();
     try {
       const script = framework as unknown as {
-        handleScriptToolCall(agentName: string, toolName: string, args: Record<string, unknown>): Promise<string>;
+        handleScriptToolCall(agentName: string, toolName: string, args: Record<string, unknown>): Promise<ScriptToolResult>;
       };
       const at = await script.handleScriptToolCall('prime', 'probe--look', { over: 0 });
       const past = await script.handleScriptToolCall('prime', 'probe--look', { over: 1 });
       await script.handleScriptToolCall('prime', 'utils', { action: 'run', name: 'probe--peek', args: {} });
       assert.deepEqual(probe.calls.map((call) => [call.name, call.resultMaxChars]),
         [['look', SCRIPT_LIMIT], ['look', SCRIPT_LIMIT], ['peek', SCRIPT_LIMIT]], 'a utility the script runs carries its limit too');
-      assert.equal(at, 'x'.repeat(SCRIPT_LIMIT), 'a result of resultMaxChars reaches the script whole');
-      assert.equal(past, `${'x'.repeat(SCRIPT_LIMIT)}\n\n[truncated — original was ${SCRIPT_LIMIT + 1} chars]`, 'one character more is cut at the limit');
+      // The text a script's await returns (#538 gives it with isError beside it).
+      assert.deepEqual([at.text, at.isError], ['x'.repeat(SCRIPT_LIMIT), false], 'a result of resultMaxChars reaches the script whole');
+      assert.equal(past.text, `${'x'.repeat(SCRIPT_LIMIT)}\n\n[truncated — original was ${SCRIPT_LIMIT + 1} chars]`, 'one character more is cut at the limit');
     } finally {
       await done();
     }
