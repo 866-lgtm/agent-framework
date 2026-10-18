@@ -118,6 +118,59 @@ test('a line page stops before its result would pass the limit, and says where t
   }
 });
 
+test('a line page is the longest that fits, though the page that ends where it was asked to carries a shorter note', async t => {
+  // The page that ends the file has no stop note, so it can fit where a
+  // shorter page with one doesn't: both lines, rather than the first cut short.
+  const { read } = await setup(t, `${'x'.repeat(900)}\na\n`);
+  const both = await read({}, 1_000);
+  assert.ok(stored(both) <= 1_000, `${stored(both)}`);
+  assert.deepEqual(both.data, { path: 'work/text.txt', totalLines: 2, fromLine: 1, toLine: 2, content: `     1\t${'x'.repeat(900)}\n     2\ta` });
+  const { read: readThree } = await setup(t, `${'a'.repeat(300)}\n${'b'.repeat(550)}\nc\n`);
+  const three = await readThree({}, 1_000);
+  assert.ok(stored(three) <= 1_000, `${stored(three)}`);
+  assert.equal((three.data as LinePage).toLine, 3);
+  assert.equal((three.data as LinePage).note, undefined);
+  // The page at the line limit says so in fewer words than a stop, so it fits
+  // at its own length, where the page a line shorter, with a stop note, doesn't.
+  const { read: readLimit } = await setup(t, `${'a'.repeat(800)}\nb\nc\n`);
+  const atLimit = await readLimit({ limit: 2 }, 5_000_000);
+  assert.equal((atLimit.data as LinePage).note, 'Truncated at 2 lines (file has 3). Use offset/limit to read more.');
+  assert.deepEqual((await readLimit({ limit: 2 }, stored(atLimit))).data, atLimit.data);
+  // A page whose last line is cut names that line's rest, in more words than
+  // a page whose last line is whole, so the page a line longer can fit where it doesn't.
+  const { read: readCut } = await setup(t, `${'q'.repeat(2500)}\nz\n${'w'.repeat(300)}\n`);
+  const two = (limit: number) => ({
+    path: 'work/text.txt', totalLines: 3, fromLine: 1, toLine: 2,
+    note: `Stopped at line 2 to stay within the ${limit}-character result limit (file has 3). Continue with offset=3.`,
+    content: `     1\t${'q'.repeat(2000)} [… 500 more chars; read them with offsetChars=2000]\n     2\tz`,
+  });
+  const limit = JSON.stringify(two(9_999)).length;
+  assert.equal(String(limit).length, 4, 'the limit has as many digits as the 9,999 it was measured with');
+  assert.deepEqual((await readCut({}, limit)).data, two(limit));
+});
+
+test('a page with notes holds to the result limit with its notes', async t => {
+  // A CRLF file's note shares a line page's room with its lines and its stop note.
+  const { read } = await setup(t, Array.from({ length: 300 }, (_, i) => `l${i}`).join('\r\n') + '\r\n');
+  for (const limit of [1_000, 1_500]) {
+    const result = await read({}, limit);
+    assert.ok(stored(result) <= limit, `${stored(result)} > ${limit}`);
+    const page = result.data as LinePage;
+    assert.equal(page.note, `Stopped at line ${page.toLine} to stay within the ${limit}-character result limit (file has 300). Continue with offset=${page.toLine! + 1}. Line ends are CRLF, shown without the CR. An edit matches text as read shows it, and keeps the CRLF ends.`);
+    // One more line would have passed the limit.
+    const more = await read({ limit: page.toLine! + 1 }, 5_000_000);
+    assert.ok(JSON.stringify({ ...page, toLine: page.toLine! + 1, content: (more.data as LinePage).content }).length > limit);
+  }
+  // An invalid-UTF-8 file's note shares a character page's room.
+  const { read: readBad } = await setup(t, Buffer.concat([Buffer.from('a'.repeat(5000)), Buffer.from([0xff]), Buffer.from('b'.repeat(5000))]));
+  for (const limit of [1_000, 1_500]) {
+    const result = await readBad({ offsetChars: 0, limitChars: 100_000 }, limit);
+    assert.ok(stored(result) <= limit, `${stored(result)} > ${limit}`);
+    const page = result.data as CharPage;
+    assert.equal(page.note, `Stopped at character ${page.nextOffsetChars} to stay within the ${limit}-character result limit; continue with offsetChars=${page.nextOffsetChars}. The file isn't valid UTF-8: each invalid byte sequence shows as U+FFFD. Edit refuses this file, and write replaces it whole.`);
+  }
+});
+
 test('a first line that alone would pass the limit is cut where it fits', async t => {
   // Each quote takes two characters as JSON.
   const { read } = await setup(t, '"'.repeat(1500) + '\nnext\n');

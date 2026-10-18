@@ -33,9 +33,9 @@ const joined = (notes: Array<string | null>): string | undefined => {
 
 /**
  * Lines from `offset` (1-based), at most `limit` of them, each numbered and a
- * long one cut with the offsetChars that reads the rest. The page stops where
- * one more line would take its data past `maxChars` as JSON; if even the
- * first line doesn't fit, that line is cut shorter, at the most the page has
+ * long one cut with the offsetChars that reads the rest. The page is the
+ * longest that fits within `maxChars` as JSON; where none fits with its first
+ * line as a page shows it, that line is cut shorter, at the most the page has
  * room for. Where the page's last line is cut, its note names where that
  * line's rest starts, since reading on in order starts there: before the next
  * line, or, on the page that ends the file, before the file is read whole. A
@@ -78,67 +78,53 @@ export function linePage(path: string, file: FileText, offset: number, limit: nu
     const whole = lines.slice(first, last).map((line, k) => numberedLine(line, first + k + 1, Infinity)).join('\n');
     return { success: true, data: page(last, whole, joined([last < total ? limitNote(last, null) : null, ...notes])) };
   }
-  // The most anything but the lines can take: the longer note, with the
-  // largest numbers this page could show.
-  const overhead = Math.max(
-    JSON.stringify(page(last, '', joined([limitNote(last, file.raw.length), ...notes]))).length,
-    JSON.stringify(page(last, '', joined([budgetNote(last, file.raw.length), ...notes]))).length,
-  );
-  const shownLines: string[] = [];
-  let used = overhead;
-  for (let i = first; i < last; i++) {
-    const line = shown(i);
-    // Each line after the first comes after a line feed, which JSON writes as two characters.
-    const cost = jsonLength(line) + (i > first ? 2 : 0);
-    if (used + cost > maxChars) break;
-    shownLines.push(line);
-    used += cost;
-  }
-  // The page with the lines shown so far, its last one shown at most
-  // lastMax long.
-  const final = (lastMax = MAX_LINE_CHARS) => {
-    const to = first + shownLines.length;
+  // The note of the page that ends at line `to`, its last line shown at most
+  // lastMax long: the page that ends where it was asked to, at the file's end
+  // or the line limit, says so, and any other says it stopped for the limit.
+  const noteAt = (to: number, lastMax = MAX_LINE_CHARS) => {
     const rest = restOf(to - 1, lastMax);
     const endNote = to < total ? limitNote(to, rest) : rest === null ? null : `${cutLine(to, rest)}.`;
-    return page(to, shownLines.join('\n'), joined([to === last ? endNote : budgetNote(to, rest), ...notes]));
+    return joined([to === last ? endNote : budgetNote(to, rest), ...notes]);
   };
-  if (shownLines.length === 0) {
-    // The estimate above found no room for the first line as a page shows it.
-    // Measured on the page itself, since its note names a cut: the line as a
-    // page shows it first, then, where that doesn't fit, the most a cut can
-    // show. Shown whole, a line carries no marker and its note no cut, so its
-    // page can fit where a cut one character shorter doesn't. Below that a
-    // longer cut never makes the page shorter, so the first that doesn't fit
-    // bounds the search.
-    const whole = Math.min(lines[first].length, MAX_LINE_CHARS);
-    const fitsAt = (chars: number) => {
-      shownLines[0] = shown(first, chars);
-      return JSON.stringify(final(chars)).length <= maxChars;
-    };
-    let fits = whole;
-    if (!fitsAt(whole)) {
-      fits = 0;
-      let over = whole;
-      while (over - fits > 1) {
-        const mid = Math.floor((fits + over) / 2);
-        if (fitsAt(mid)) fits = mid; else over = mid;
-      }
-    }
-    shownLines[0] = shown(first, fits);
-    // Cut shorter than a page shows it, the line ends the page: its rest
-    // comes next. Shown as a page shows it, more lines may fit beside it.
-    if (fits < whole) return { success: true, data: final(fits) };
+  // A page's length as JSON: its fields' and note's, measured with no content,
+  // and its lines', which JSON writes inside the content's quotes.
+  const lengthAt = (to: number, contentChars: number, note: string | undefined) =>
+    JSON.stringify(page(to, '', note)).length + contentChars;
+  // The page is the longest that fits. Its length isn't monotone in its
+  // lines: the page that ends the file carries no stop note, the one at the
+  // line limit a shorter one than a stop, and one whose last line is cut a
+  // longer one. But every page carries `notes` and a longer page shows more,
+  // so once a page passes the limit with those alone, no longer one fits.
+  const shownLines: string[] = [];
+  let contentChars = 0;
+  let best = 0;
+  for (let i = first; i < last; i++) {
+    const line = shown(i);
+    shownLines.push(line);
+    // Each line after the first comes after a line feed, which JSON writes as two characters.
+    contentChars += jsonLength(line) + (i > first ? 2 : 0);
+    if (lengthAt(i + 1, contentChars, noteAt(i + 1)) <= maxChars) best = shownLines.length;
+    else if (lengthAt(i + 1, contentChars, joined(notes)) > maxChars) break;
   }
-  // The overhead allowed for the largest numbers; a line more may fit beside
-  // the real ones.
-  while (first + shownLines.length < last) {
-    shownLines.push(shown(first + shownLines.length));
-    if (JSON.stringify(final()).length > maxChars) {
-      shownLines.pop();
-      break;
-    }
+  if (best > 0) {
+    shownLines.length = best;
+    return { success: true, data: page(first + best, shownLines.join('\n'), noteAt(first + best)) };
   }
-  return { success: true, data: final() };
+  // No page fits with its first line as a page shows it, so that line is cut
+  // shorter, at the most the page has room for, and ends the page: its note
+  // names where the line's rest starts, since that comes next. Measured on
+  // the page itself, since its note names the cut. Shown whole, a line carries
+  // no marker and its note no cut, so its page can fit where a cut one
+  // character shorter doesn't. Below that a longer cut never makes the page
+  // shorter, so the first that doesn't fit bounds the search.
+  const pageWith = (chars: number) => page(first + 1, shown(first, chars), noteAt(first + 1, chars));
+  let fits = 0;
+  let over = Math.min(lines[first].length, MAX_LINE_CHARS);
+  while (over - fits > 1) {
+    const mid = Math.floor((fits + over) / 2);
+    if (JSON.stringify(pageWith(mid)).length <= maxChars) fits = mid; else over = mid;
+  }
+  return { success: true, data: pageWith(fits) };
 }
 
 const splitsPair = (text: string, at: number): boolean =>
