@@ -97,27 +97,28 @@ export interface MountConfig {
    * returns the path to a covered name's file that disk spells otherwise, and
    * null for a covered file named in another case. It takes a nested mount's
    * directory as that mount's in any spelling disk folds to it, compared level
-   * by level as each directory on the way compares names; where a level can't
-   * be told at start, as for a nested directory not yet on disk, it's taken to
-   * fold, so it errs toward the nested mount. It names paths: on a mount that
-   * follows symlinks, a link among a covered path's parent directories is
-   * followed, and a link it covers is read and written through its own name,
-   * wherever the link leads inside the mount. On one that doesn't, a link on a
-   * path's way is refused, as on any such mount, and the refusal names an
-   * inside target only where a tool could name it: a directory, or a file the
-   * include covers, and in a nested mount's directory, a directory or a file
-   * that mount's own include covers. A path in a nested mount's directory is
-   * that mount's, whatever this include covers: every tool gives the answer
-   * that names the mount holding it, with the rest of the path past that
-   * mount's directory as given. A path with a `..` segment is refused before
-   * that, as above. Text the host registers for a path
-   * (`registerGeneratedTextFile`) is served there whatever the include says,
-   * since it isn't one of the mount's files: it's matched by the path a
-   * spelling resolves to, before anything else checks the path, so every
-   * spelling that resolves to its registered path reads it, a `..` one
-   * included, and none writes it. On a disk that folds names, a spelling in
-   * another case isn't its path, and reaches whatever file disk has there. The
-   * framework keeps its own files (`tool-results/`, `refs/`,
+   * by level as each directory on the way compares names. Where it can't tell,
+   * it errs toward the nested mount: a level it can't tell at start, as for a
+   * nested directory not yet on disk, is taken to fold, and it compares case
+   * loosely too, so it also takes a spelling a disk may keep apart, such as
+   * `strasse` for a nested `straße`. It names paths: on a mount that follows
+   * symlinks, a link among a covered path's parent directories is followed, and
+   * a link it covers is read and written through its own name, wherever the
+   * link leads inside the mount. On one that doesn't, a link on a path's way is
+   * refused, as on any such mount, and the refusal names an inside target only
+   * where a tool could name it: a directory, or a file the include covers, and
+   * in a nested mount's directory, a directory or a file that mount's own
+   * include covers. A path in a nested mount's directory is that mount's,
+   * whatever this include covers: every tool gives the answer that names the
+   * mount holding it, with the rest of the path past that mount's directory as
+   * given. A path with a `..` segment is refused before that, as above. Text
+   * the host registers for a path (`registerGeneratedTextFile`) is served there
+   * whatever the include says, since it isn't one of the mount's files: it's
+   * matched by the path a spelling resolves to, before anything else checks the
+   * path, so every spelling that resolves to its registered path reads it, a
+   * `..` one included, and none writes it. On a disk that folds names, a
+   * spelling in another case isn't its path, and reaches whatever file disk has
+   * there. The framework keeps its own files (`tool-results/`, `refs/`,
    * `background-scripts/`) only in a writable mount without an include, and
    * what it kept in a mount before the mount had one is outside the mount once
    * it has one, unless the include covers it. Left out, the mount holds

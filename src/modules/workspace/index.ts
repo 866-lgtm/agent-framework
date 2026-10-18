@@ -1734,7 +1734,8 @@ export class WorkspaceModule implements Module {
     try {
       // Synchronous, so the path as given. The nested-mount check takes it
       // as configured, as disk spells the nested mount's directory, or in
-      // any spelling disk folds to it, level by level (holderOf's asGiven).
+      // any spelling disk folds to it, level by level, erring toward that
+      // mount where it can't tell (holderOf's asGiven, beginsWithDir).
       // The include judges it as given, so on a disk that folds names a
       // covered name whose file disk spells otherwise returns that file's
       // path, which the tools refuse, and a covered file named in another

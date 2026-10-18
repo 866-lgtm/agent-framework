@@ -14,7 +14,7 @@ import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule, WorkspaceReadError } from '../src/modules/workspace/index.js';
-import { beginsWithDir, diskSpelling } from '../src/modules/workspace/observe.js';
+import { beginsWithDir, diskSpelling, foldsAtEach } from '../src/modules/workspace/observe.js';
 import type { MountConfig } from '../src/modules/workspace/types.js';
 import type { ModuleContext } from '../src/types/module.js';
 import type { ProcessEvent, ToolResult } from '../src/types/events.js';
@@ -466,6 +466,32 @@ test('resolveAbsolutePath takes a nested mount\'s directory not on disk at start
   // may reach the directory gives null, as one that does.
   for (const path of ['outer/later/x.txt', 'outer/LATER/x.txt']) assert.equal(workspace.resolveAbsolutePath(path), null, path);
   assert.notEqual(workspace.resolveAbsolutePath('outer/src/a.ts'), null, "the outer mount's own file");
+  // A start that finds the directory tells its level: where disk tells case
+  // apart, LATER is then the outer mount's own.
+  await workspace.stop();
+  await workspace.start({ isRestart: true, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
+  assert.equal(workspace.resolveAbsolutePath('outer/later/x.txt'), null, 'outer/later/x.txt after a start found it');
+  assert.equal(workspace.resolveAbsolutePath('outer/LATER/x.txt'), folds.case ? null : join(dir, 'LATER', 'x.txt'), 'outer/LATER/x.txt after a start found later');
+});
+
+test('foldsAtEach tells each level by a variant of its own name, in the directory holding it', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-levels-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  mkdirSync(join(root, 'Aa', 'caf\u00e9'), { recursive: true });
+  mkdirSync(join(root, '12'));
+  // Each level as the directory holding it compares names. An ASCII name has
+  // no other normalization form, so that half of its level can't be told,
+  // and a level that can't be told is taken to fold.
+  assert.deepEqual(await foldsAtEach(root, 'Aa/caf\u00e9'), [
+    { case: folds.case, normalization: true },
+    { case: folds.case, normalization: folds.normalization },
+  ]);
+  assert.deepEqual(await foldsAtEach(root, '12'), [{ case: true, normalization: true }], 'no letter to flip');
+  assert.deepEqual(await foldsAtEach(root, 'Aa/missing/deeper'), [
+    { case: folds.case, normalization: true },
+    { case: true, normalization: true },
+    { case: true, normalization: true },
+  ], 'every level from one not on disk');
 });
 
 /** A workspace with a mount nested in another, stored but not yet started. */
