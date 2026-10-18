@@ -96,6 +96,12 @@ export interface CoalescedOccurrence<E = unknown> {
   /** Set by the coalescer: deliver into this agent only (§3.2 audience may
    *  narrow, never widen — a replacement or notice follows the prior delivery). */
   deliverTo?: string;
+  /** Set by the coalescer when a plain occurrence replaces one that was the
+   *  agent's first view of the subject (its `initial` birth, or a
+   *  replacement so marked) and is still waiting in the host's deferred
+   *  queue, so never shown to the agent: the replacement is then the agent's
+   *  first view. No other path sets it. */
+  replacesUnread?: boolean;
 }
 
 export interface DeferredNotice { eventId: string; timestamp: string; data?: unknown }
@@ -139,7 +145,11 @@ export interface AssemblyResult {
 
 interface SubjectState<E> {
   history: 'none' | 'some' | 'unknown';
-  occupant?: { eventId: string; placement: CoalescingPlacement };
+  /** `firstView`: this occupant is the agent's first view of the subject,
+   *  as `replacesUnread` defines it, so nothing of the subject has been read:
+   *  a read takes the occupant away. Unknown counts as not one. In memory
+   *  only: a snapshot's occupant comes back as read. */
+  occupant?: { eventId: string; placement: CoalescingPlacement; firstView?: true };
   batch?: DeferredBatch<E>;
   rendering?: Rendering<E>;
   consumedEventId?: string;
@@ -593,12 +603,20 @@ export class PushCoalescer<E = unknown> {
     const hadBatch = this.dropBatches(subject, state);
     if (occupantUnread && state.occupant) {
       const prior = state.occupant;
+      // The replacement is the agent's first view only when its prior was
+      // one and the agent was never shown it: still waiting in the host's
+      // deferred queue, not even injected at a tool boundary. An occupant
+      // that isn't a first view ends the chain for every later replacement.
+      const firstView = prior.firstView === true && prior.placement.deferredId !== undefined;
       this.host.audit({ kind: 'displaced', subject, eventId: prior.eventId });
       if (this.host.remove(prior.placement)) {
         this.host.cancelWake(subject);
         // The replacement follows the prior delivery's audience (§3.2).
-        const placement = await this.host.deliver({ ...occurrence, deliverTo: prior.placement.agent });
-        state.occupant = placement ? { eventId: occurrence.eventId, placement } : undefined;
+        const placement = await this.host.deliver({
+          ...occurrence, deliverTo: prior.placement.agent,
+          ...(firstView ? { replacesUnread: true } : {}),
+        });
+        state.occupant = placement ? { eventId: occurrence.eventId, placement, ...(firstView ? { firstView: true as const } : {}) } : undefined;
         if (placement) state.audienceAgent = placement.agent;
         return 'replaced';
       }
@@ -610,10 +628,11 @@ export class PushCoalescer<E = unknown> {
     }
     if (hadBatch) this.host.cancelWake(subject);
     const placement = await this.host.deliver(occurrence);
-    state.occupant = placement ? { eventId: occurrence.eventId, placement } : undefined;
+    const outcome: CoalesceOutcome = hadBatch ? 'replaced' : state.consumedEventId || state.history !== 'none' ? 'appended' : 'first';
+    // The subject's `initial` birth is the agent's first view of it.
+    state.occupant = placement ? { eventId: occurrence.eventId, placement, ...(outcome === 'first' ? { firstView: true as const } : {}) } : undefined;
     if (placement) state.audienceAgent = placement.agent;
-    if (hadBatch) return 'replaced';
-    return state.consumedEventId || state.history !== 'none' ? 'appended' : 'first';
+    return outcome;
   }
 
   private async acceptDeferred(subject: string, state: SubjectState<E>, occurrence: CoalescedOccurrence<E>, occupantUnread: boolean): Promise<CoalesceOutcome> {
@@ -897,7 +916,7 @@ export class PushCoalescer<E = unknown> {
       subjects: [...this.subjects].map(([subject, s]) => ({
         subject, history: s.history, consumedEventId: s.consumedEventId, identity: s.identity,
         ...(s.audienceAgent ? { audienceAgent: s.audienceAgent } : {}),
-        ...(s.occupant ? { occupant: s.occupant } : {}),
+        ...(s.occupant ? { occupant: { eventId: s.occupant.eventId, placement: s.occupant.placement } } : {}),
         ...(s.batch ? { batch: { latest: s.batch.latest as CoalescedOccurrence<unknown>, notices: s.batch.notices, dropped: s.batch.dropped, ...(s.batch.noRender ? { rendering: true } : {}) } }
           : s.rendering ? { batch: { latest: s.rendering.batch.latest as CoalescedOccurrence<unknown>, notices: s.rendering.batch.notices, dropped: s.rendering.batch.dropped, rendering: true } }
           : {}),

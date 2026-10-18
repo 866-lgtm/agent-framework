@@ -12,7 +12,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createMockResponse } from './helpers/mock-membrane.js';
+import type { ContentBlock } from '@animalabs/membrane';
+import { createMockResponse, MockYieldingStream } from './helpers/mock-membrane.js';
 import { fixture, eventually, crash, ok, TS } from './helpers/coalescing-fixture.js';
 
 // ---------------------------------------------------------------------------
@@ -1092,4 +1093,196 @@ for (const reader of ['other', 'agent'] as const) test(`R18 (${reader} read it):
   const del = await f.send('push/event', f.params('3', 'deletion_notice', { retract: true }));
   assert.equal(del.result.coalesce.outcome, 'noted');
   assert(f.context().includes('read_by_one') && f.context().includes('deletion_notice') && !f.context().includes('later_edit'));
+});
+
+// ---------------------------------------------------------------------------
+// #157's markers: an edit the agent sees first is the message it replaced
+// ---------------------------------------------------------------------------
+
+type Fixture = Awaited<ReturnType<typeof fixture>>;
+
+/**
+ * A turn, started by a mention in `chat`, with one round per `during` that
+ * sends explicitly (channel_publish), then a round that speaks. Each sending
+ * round streams only once its `during` has run: the first while the turn is
+ * live, each later one after the previous round's tool boundary. So what a
+ * `during` delivers reaches the agent at its round's tool boundary.
+ */
+async function sendThenSpeak(f: Fixture, ...during: Array<() => Promise<void>>) {
+  const gates = during.map(() => {
+    const gate = {} as { open: () => void; opened: Promise<void>; reached: () => void; atGate: Promise<void> };
+    gate.opened = new Promise<void>((resolve) => { gate.open = resolve; });
+    gate.atGate = new Promise<void>((resolve) => { gate.reached = resolve; });
+    return gate;
+  });
+  let first: MockYieldingStream | undefined;
+  (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: unknown) => {
+    f.membrane.calls.push(request as never);
+    if (first) return new MockYieldingStream([ok()]);
+    const stream = new MockYieldingStream([
+      ...during.map((_, i) => createMockResponse([{ type: 'tool_use', id: `p${i}`, name: 'channel_publish', input: { content: `explicit_send_${i}` } }] as ContentBlock[], 'tool_use')),
+      createMockResponse([{ type: 'text', text: 'prose_reply' }] as ContentBlock[]),
+    ]);
+    first = stream;
+    let provided = 0;
+    const provide = stream.provideToolResults.bind(stream);
+    stream.provideToolResults = (results, options) => { provided++; provide(results, options); };
+    const inner = stream[Symbol.asyncIterator].bind(stream);
+    (stream as unknown as Record<symbol, unknown>)[Symbol.asyncIterator] = async function* () {
+      gates[0].reached();
+      await gates[0].opened;
+      const it = inner();
+      let streamed = 0;
+      while (true) {
+        const n = await it.next();
+        if (n.done) return;
+        // A later sending round's first event: hold it until its `during` ran.
+        if (provided > streamed && provided < gates.length) {
+          streamed = provided;
+          gates[streamed].reached();
+          await gates[streamed].opened;
+        }
+        yield n.value;
+      }
+    };
+    return stream;
+  };
+  await f.send('channels/incoming', { messages: [f.channel('c1', 'question', { initial: true }, 'chat', 'm1')] });
+  const run = f.framework.runUntilIdle();
+  for (const [i, deliver] of during.entries()) {
+    await gates[i].atGate;
+    await deliver();
+    gates[i].open();
+  }
+  await run;
+  const posted = f.published.map((p) => JSON.stringify(p.content));
+  return {
+    /** What each tool boundary injected, in order. */
+    injected: first!.receivedToolResultOptions.map((o) => JSON.stringify(o?.injectedMessages ?? [])),
+    sent: during.every((_, i) => posted.some((c) => c.includes(`explicit_send_${i}`))),
+    replied: posted.some((c) => c.includes('prose_reply')),
+  };
+}
+
+const unreadFollowUp = (f: Fixture, initial = true) =>
+  f.send('channels/incoming', { messages: [f.channel('c2', 'follow_up_wiht_typo', initial ? { initial: true } : {}, 'chat', 'm2')] });
+const pushTagged = async (f: Fixture, tags: string[], eventId = 'e2', text = 'follow_up_fixed') =>
+  (await f.send('push/event', { ...f.params(eventId, text, { channelId: 'chat', key: 'message:m2' }), tags })).result.coalesce.outcome as string;
+
+/** A follow-up the agent hasn't been shown, then its edit, in each lane; returns the edit's outcome. */
+const followUpThenEdit: Record<string, (f: Fixture) => Promise<string>> = {
+  'channel-scoped push': async (f) => {
+    await unreadFollowUp(f);
+    return pushTagged(f, ['chat:edited']);
+  },
+  'channel message': async (f) => {
+    await unreadFollowUp(f);
+    return (await f.send('channels/incoming', { messages: [{ ...f.channel('e2', 'follow_up_fixed', {}, 'chat', 'm2'), tags: ['chat:edited'] }] })).result.results[0].coalesce.outcome;
+  },
+  'feature-set push': async (f) => {
+    await f.send('push/event', { ...f.params('c2', 'follow_up_wiht_typo', { key: 'message:m2', initial: true }), tags: ['chat:mention'] });
+    return (await f.send('push/event', { ...f.params('e2', 'follow_up_fixed', { key: 'message:m2' }), tags: ['chat:edited'] })).result.coalesce.outcome;
+  },
+};
+
+for (const [lane, arrive] of Object.entries(followUpThenEdit)) test(`#157 (${lane}): an edit of a follow-up the agent hasn't been shown is its first view, so the reply after an explicit send routes`, async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  let outcome: string | undefined;
+  const r = await sendThenSpeak(f, async () => { outcome = await arrive(f); });
+  assert.equal(outcome, 'replaced');
+  assert(r.injected[0].includes('follow_up_fixed') && !r.injected[0].includes('follow_up_wiht_typo'), 'the edit alone reached the boundary');
+  assert(r.sent, 'the explicit send posted');
+  assert(r.replied, 'the reply to the follow-up posted');
+});
+
+for (const tag of ['chat:reaction', 'chat:reaction-remove', 'chat:deleted']) test(`#157: a ${tag} occurrence that replaced an unread follow-up is still a notice about it, so the prose after an explicit send stays withheld`, async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  let outcome: string | undefined;
+  const r = await sendThenSpeak(f, async () => { await unreadFollowUp(f); outcome = await pushTagged(f, [tag], 'e2', `${tag}_notice`); });
+  assert.equal(outcome, 'replaced');
+  assert(r.injected[0].includes(`${tag}_notice`), 'the notice reached the boundary');
+  assert(r.sent, 'the explicit send posted');
+  assert(!r.replied, 'the prose after the send stayed withheld');
+});
+
+test('#157: an edit of an edit, after the agent read the message, stays a marker, so the prose after an explicit send stays withheld', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  const outcomes: string[] = [];
+  const r = await sendThenSpeak(f, async () => {
+    for (const [eventId, text] of [['e1', 'question_edited_once'], ['e2', 'question_edited_twice']]) {
+      outcomes.push((await f.send('push/event', { ...f.params(eventId, text, { channelId: 'chat', key: 'message:m1' }), tags: ['chat:edited'] })).result.coalesce.outcome);
+    }
+  });
+  assert.deepEqual(outcomes, ['appended', 'replaced'], 'the agent had read the question, and the second edit replaced the unread first');
+  assert(r.injected[0].includes('question_edited_twice') && !r.injected[0].includes('question_edited_once'), 'the second edit alone reached the boundary');
+  assert(r.sent, 'the explicit send posted');
+  assert(!r.replied, 'the prose after the send stayed withheld');
+});
+
+test('#157: an edit of a follow-up the agent was shown at a tool boundary stays a marker, so the prose after the next explicit send stays withheld', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  const r = await sendThenSpeak(f, async () => { await unreadFollowUp(f); }, async () => { await pushTagged(f, ['chat:edited']); });
+  assert(r.injected[0].includes('follow_up_wiht_typo'), 'the first boundary showed the agent the follow-up');
+  assert(r.injected[1].includes('follow_up_fixed'), 'the second boundary showed it the edit');
+  assert(r.sent, 'both explicit sends posted');
+  assert(!r.replied, 'the prose after the second send stayed withheld');
+});
+
+test('#157: an edit of an edit of a follow-up the agent was shown at a tool boundary stays a marker, so the prose after the next explicit send stays withheld', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  const r = await sendThenSpeak(f, async () => { await unreadFollowUp(f); }, async () => {
+    await pushTagged(f, ['chat:edited'], 'e2', 'follow_up_fixed');
+    await pushTagged(f, ['chat:edited'], 'e3', 'follow_up_fixed_again');
+  });
+  assert(r.injected[0].includes('follow_up_wiht_typo'), 'the first boundary showed the agent the follow-up');
+  assert(r.injected[1].includes('follow_up_fixed_again') && !r.injected[1].includes('replacesUnread'), 'the second boundary showed it the last edit, unmarked');
+  assert(r.sent, 'both explicit sends posted');
+  assert(!r.replied, 'the prose after the second send stayed withheld');
+});
+
+test('#157: two edits of a follow-up the agent hasn\'t been shown leave the last its first view, so the reply after an explicit send routes', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  const outcomes: string[] = [];
+  const r = await sendThenSpeak(f, async () => {
+    await unreadFollowUp(f);
+    outcomes.push(await pushTagged(f, ['chat:edited'], 'e2', 'follow_up_fixed'));
+    outcomes.push(await pushTagged(f, ['chat:edited'], 'e3', 'follow_up_fixed_again'));
+  });
+  assert.deepEqual(outcomes, ['replaced', 'replaced']);
+  assert(r.injected[0].includes('follow_up_fixed_again') && r.injected[0].includes('replacesUnread'), 'the boundary showed the agent the last edit, marked');
+  assert(r.sent, 'the explicit send posted');
+  assert(r.replied, 'the reply to the follow-up posted');
+});
+
+test('#157: an edit of a follow-up whose producer never marked it initial stays a marker, so the prose after an explicit send stays withheld', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  let outcome: string | undefined;
+  const r = await sendThenSpeak(f, async () => { await unreadFollowUp(f, false); outcome = await pushTagged(f, ['chat:edited']); });
+  assert.equal(outcome, 'replaced', 'the edit replaced the unread follow-up, whose history the host can\'t know');
+  assert(r.injected[0].includes('follow_up_fixed'), 'the edit reached the boundary');
+  assert(r.sent, 'the explicit send posted');
+  assert(!r.replied, 'the prose after the send stayed withheld');
+});
+
+const serverMarked: Record<string, (f: Fixture) => Promise<string>> = {
+  'channel message': async (f) => (await f.send('channels/incoming', { messages: [{
+    ...f.channel('e9', 'edit_claiming_first_view', {}, 'chat', 'm9'), tags: ['chat:edited'], metadata: { replacesUnread: true },
+  }] })).result.results[0].coalesce.outcome,
+  'channel-scoped push': async (f) => (await f.send('push/event', {
+    ...f.params('e9', 'edit_claiming_first_view', { channelId: 'chat', key: 'message:m9' }), tags: ['chat:edited'], origin: { replacesUnread: true },
+  })).result.coalesce.outcome,
+  'feature-set push': async (f) => (await f.send('push/event', {
+    ...f.params('e9', 'edit_claiming_first_view', { key: 'message:m9' }), tags: ['chat:edited'], origin: { replacesUnread: true },
+  })).result.coalesce.outcome,
+};
+
+for (const [lane, deliver] of Object.entries(serverMarked)) test(`#157 (${lane}): a server can't mark its own edit as the agent's first view`, async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  let outcome: string | undefined;
+  const r = await sendThenSpeak(f, async () => { outcome = await deliver(f); });
+  assert.equal(outcome, 'appended');
+  assert(r.injected[0].includes('edit_claiming_first_view'), 'the edit reached the boundary');
+  assert(!r.injected[0].includes('replacesUnread'), "the server's own mark was dropped");
+  assert(r.sent, 'the explicit send posted');
+  assert(!r.replied, 'the prose after the send stayed withheld');
 });

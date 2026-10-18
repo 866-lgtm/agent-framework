@@ -50,6 +50,9 @@ export interface McplPushEvent {
   coalescingSubject?: string;
   /** RFC-006 assembly: materialized for this agent's turn (store directly). */
   assemblingFor?: string;
+  /** The coalescer's mark: the agent's first view of the subject (see
+   *  CoalescedOccurrence.replacesUnread). */
+  replacesUnread?: boolean;
 }
 
 // ============================================================================
