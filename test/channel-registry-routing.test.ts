@@ -823,12 +823,13 @@ test("publishForAgent traces what a rejected publish may have done: unknown afte
 
   // An error response may follow a partial post.
   setOnPublish(async () => {
-    throw new McplRequestError('MCPL server "body" returned error for channels/publish: [-32000] Rate limited after part 1', 'error-response', undefined, 'Rate limited after part 1');
+    throw new McplRequestError('MCPL server "body" returned error for channels/publish: [-32000] Rate limited after part 1', 'error-response', { posted: ['m-1'] }, 'Rate limited after part 1');
   });
   const unconfirmed = await registry.publishForAgent('body:home', 'a long thought', 'Subconscious');
-  assert.equal(unconfirmed.error, 'Publish to body:home wasn\'t confirmed: server "body" answered with an error: Rate limited after part 1 (delivery uncertain). It may or may not have been posted, so sending it again could post it twice.');
-  assert.deepEqual(failed().map((t) => [t.reason, t.outcome]),
-    [['server "body" answered with an error: Rate limited after part 1 (delivery uncertain)', 'unknown']]);
+  assert.equal(unconfirmed.error, 'Publish to body:home wasn\'t confirmed: server "body" answered with an error: Rate limited after part 1 (delivery uncertain). It may or may not have been posted, so sending it again could post it twice. Connector detail: {"posted":["m-1"]}');
+  assert.deepEqual(failed().map((t) => [t.reason, t.outcome, t.detail]),
+    [['server "body" answered with an error: Rate limited after part 1 (delivery uncertain)', 'unknown', '{"posted":["m-1"]}']],
+    "the trace carries the connector's detail, as plain speech's does");
 
   // So may a request that went out and got no answer.
   setOnPublish(async () => {
@@ -844,6 +845,7 @@ test("publishForAgent traces what a rejected publish may have done: unknown afte
   const notSent = await registry.publishForAgent('body:home', 'another', 'Subconscious');
   assert.match(notSent.error ?? '', /^Publish to body:home failed: .*is closed\. Nothing was posted\./);
   assert.equal(failed()[2]!.outcome, 'failed');
+  assert.equal('detail' in failed()[2]!, false, 'no detail when the connector sent none');
   assert.equal(traces.filter((t) => t.type === 'mcpl:speech-routed').length, 0);
 });
 

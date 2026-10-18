@@ -1842,6 +1842,24 @@ describe('explicit prose routing', () => {
     }
   });
 
+  it('hybrid: a hold beside a send refuses a >>> target its server declared inbound-only, as delivery does, and pins nothing', async () => {
+    const framework = await createFramework('hybrid');
+    stubRegistry(framework);
+    const gateway = framework as unknown as {
+      holdSilencedProse(agent: unknown, segments: string[], cause: 'send', privateThink: boolean, round: { routing: RoutingState; notice: 'later' }): void;
+    };
+    const agent = framework.getAgent('assistant')!;
+    try {
+      const routing: RoutingState = routingState();
+      gateway.holdSilencedProse(agent, ['>>>#ears for the room', 'after it'], 'send', false, { routing, notice: 'later' });
+      assert.equal(routing.pin, undefined, 'the inbound-only channel is never pinned');
+      assert.equal(routing.hybridHold, 'failed', 'the envelope fails as a refused target does at delivery');
+      assert.deepEqual(routing.drafts.map((d) => d.text), ['for the room', 'after it'], 'and the words are held as drafts');
+    } finally {
+      await framework.stop();
+    }
+  });
+
   it('hybrid: after >>>skip_reply, the next unprefixed envelope stays in the context and counts as kept private', async () => {
     const framework = await createFramework('hybrid');
     const routed = stubRegistry(framework);

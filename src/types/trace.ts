@@ -443,9 +443,9 @@ export type TraceEvent =
 
   // Host-owned speech routing (ChannelRegistry.routeSpeech). One trace per
   // delivered prose segment, and one per publish the subconscious's
-  // speak_in_channel delivers (ChannelRegistry.publishForAgent, whose
-  // conversationId is the speaking agent's name, and which carries no
-  // messageId). `text` is the segment verbatim — the same content
+  // speak_in_channel delivers (ChannelRegistry.publishForAgent): that one's
+  // conversationId is the speaking agent's name, and it carries no
+  // messageId. `text` is the segment verbatim — the same content
   // already on the bus chunk-by-chunk via inference:tokens, and mcpl:* traces
   // are 'ops'-scoped on the webui wire — and `messageId` is the surface's id
   // for the posted message (on routeSpeech's traces, when the MCPL server
@@ -477,6 +477,9 @@ export type TraceEvent =
       /** `failed`: nothing was posted; `unknown`: the request was dispatched
        *  and no valid receipt came back, so it may have been. */
       outcome?: 'failed' | 'unknown';
+      /** The connector error's structured data, bounded (connectorText),
+       *  when it sent some: it may say what a multi-part send posted. */
+      detail?: string;
     })
 
   // Admin puppet: an operator executed a tool AS an agent and stored the

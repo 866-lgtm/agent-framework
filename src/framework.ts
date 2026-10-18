@@ -12746,7 +12746,9 @@ export class AgentFramework {
           if (parsed.body.includes('{{unsent}}')) this.dismissLatestBounce(agent);
           privateCount++;
         } else if (parsed.kind === 'target') {
-          const resolved = this.channelRegistry?.resolveProseTarget(parsed.target!);
+          // As deliverHybridProse resolves it: a channel its server declared
+          // inbound-only is refused as a target for speech.
+          const resolved = this.channelRegistry?.resolveProseTarget(parsed.target!, { forSpeech: true });
           if (resolved && !('error' in resolved)) {
             routing.pin = resolved.channelId;
             delete routing.hybridHold;
@@ -15825,7 +15827,8 @@ export class AgentFramework {
                     // unprefixed text: the turn's destination. The stream
                     // followed this round's prefixes as it was written, but a
                     // private round's, a >>skip_reply envelope's or a target
-                    // that didn't resolve leave the destination as it was.
+                    // that didn't resolve leave the destination as it was,
+                    // and a target refused for speech clears it.
                     proseStream?.retarget(streamRouting.destination);
                   } else if (turnSilenced) {
                     console.error(

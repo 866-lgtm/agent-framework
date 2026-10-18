@@ -27,17 +27,21 @@
     declared that channel inbound-only.
 - A server's error response reaches the resident in the server's own words,
   naming the server: in the send-failure marker, in a draft's recorded
-  outcome, and in the errors of `channel_publish`, `speak_in_channel`,
-  `channel_open` and `channel_close`, and of `channel_decline` when its
-  acknowledgement request fails. A publish answered with an error still says
-  delivery wasn't confirmed.
+  outcome, in the errors of `channel_publish`, `speak_in_channel`,
+  `channel_open` and `channel_close`, and in `channel_decline`'s
+  `acknowledgmentError` when its acknowledgement request fails. A publish
+  answered with an error still says delivery wasn't confirmed.
+  `McplRequestError` carries those words as `serverMessage` on an
+  `error-response`, bounded as its message is.
 - A server's error response, to a request the host sends once the connection
-  is up, says what came whatever it holds: text sent in place of an error
-  object is still the server's words, a missing message says so, and a
-  message that isn't text, a code that is neither a number nor text, or an
+  is up, now says what came whatever it holds, in `serverMessage` and in the
+  error's message: text sent in place of an error object is still the
+  server's words, a missing message says so, a missing code reads `none`, and
+  a message that isn't text, a code that is neither a number nor text, or an
   error that is neither an object nor text, is shown as JSON, bounded.
 - `speak_in_channel`'s `mcpl:speech-routed` trace now follows a confirmed
   delivery, with `serverId`, `delivered` and `textLen` as plain speech's trace
   has them, and no `messageId`, as before. Any other result is traced as
-  `mcpl:speech-route-failed`, with `outcome: "unknown"` when the words may
-  have been posted and `"failed"` when nothing was, a refusal included.
+  `mcpl:speech-route-failed`, with the publish's reason, the connector's
+  detail when it sent some, and `outcome: "unknown"` when the words may have
+  been posted or `"failed"` when nothing was, a refusal included.

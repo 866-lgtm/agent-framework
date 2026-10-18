@@ -2238,11 +2238,12 @@ export class ChannelRegistry {
         type: 'mcpl:speech-route-failed',
         conversationId: agentName,
         channelId,
-        // The publish's own reason, as deliverSpeech's trace gives it, or the
-        // refusal before any publish.
+        // The publish's own reason and the connector's detail, as
+        // deliverSpeech's trace gives them, or the refusal before any publish.
         reason: seen.outcome?.reason ?? result.error ?? 'the publish failed',
         textLen: text.length,
         outcome: seen.outcome?.status === 'unknown' ? 'unknown' : 'failed',
+        ...(seen.outcome?.detail !== undefined ? { detail: connectorText(seen.outcome.detail) } : {}),
       });
     }
     return result;
@@ -3336,7 +3337,8 @@ export class ChannelRegistry {
    * possible to send into a closed channel: a closed but registered
    * destination is opened first (`openSource` names why), once its server
    * and that server's channels.publish grant are known to take the send, so
-   * a refused send opens nothing; and a failed open sends nothing.
+   * a send refused before the open opens nothing; and a failed open sends
+   * nothing.
    *
    * A channel its server declared inbound-only (isInboundOnly) takes nothing
    * the host would post, whichever path the words took, a drafts resend
@@ -3461,10 +3463,11 @@ export class ChannelRegistry {
    * Plain speech for one turn segment: publish `text` to the turn's frozen
    * locus and report the PublishOutcome. A failure (or an uncertain outcome)
    * is surfaced as a trace and through onRouteFailure, so the agent learns
-   * its words did not (or may not have) reached anyone. This is host-owned
-   * output routing (see forking-knowledge-miner LOCUS-ROUTING-DESIGN), which
-   * replaced the per-surface sticky auto-post that used to live in
-   * discord-mcpl.
+   * its words did not (or may not have) reached anyone, except a `failed`
+   * one whose caller holds its words with a notice of its own
+   * (`heldOnFailure`). This is host-owned output routing (see
+   * forking-knowledge-miner LOCUS-ROUTING-DESIGN), which replaced the
+   * per-surface sticky auto-post that used to live in discord-mcpl.
    */
   async deliverSpeech(
     conversationId: string,
