@@ -24,7 +24,8 @@
  * Node has no openat, so a create, mkdir or unlink still resolves its path by
  * name after the parent was checked: a parent replaced concurrently in that
  * window can redirect that one operation, leaving an empty file or directory
- * outside the mount or unlinking a same-named file there. Nor is there an
+ * outside the mount or in a nested mount's directory, or unlinking a
+ * same-named file there. Nor is there an
  * unlink bound to an inode: an unlink checks the entry's identity again just
  * before it, and a file replaced at its path after that check is the one
  * unlinked. Content writes stay bound to the descriptor verified before
