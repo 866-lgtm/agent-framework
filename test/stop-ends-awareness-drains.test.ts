@@ -103,6 +103,30 @@ const internals = (framework: AgentFramework) => framework as unknown as Drains 
   drainDiscordAwarenessOutbox(serverId: string): Promise<unknown>;
 };
 
+/** Registers `drain` as a server's running drain, which leaves the map as it
+ *  settles, as a real one does. */
+function registerDrain(framework: AgentFramework, serverId: string, drain: Promise<void>): void {
+  const drains = internals(framework).discordAwarenessDrains;
+  drains.set(serverId, drain);
+  const leave = () => { drains.delete(serverId); };
+  drain.then(leave, leave);
+}
+
+/** The host log's lines, from here on. */
+function captureLog(t: import('node:test').TestContext): string[] {
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  return lines;
+}
+
+/** What `settling` came to within `ms`: 'resolved', its rejection, or 'still waiting'. */
+function settlesWithin(settling: Promise<unknown>, ms: number): Promise<unknown> {
+  return Promise.race([
+    settling.then(() => 'resolved', (error: unknown) => error),
+    new Promise((resolve) => setTimeout(() => resolve('still waiting'), ms)),
+  ]);
+}
+
 describe('stop() and Discord awareness drains', () => {
   it('a drain sending when stop() begins sends nothing more, and stop() waits for it to record the call its close ended', async (t) => {
     const dir = tempDir(t);
@@ -111,6 +135,7 @@ describe('stop() and Discord awareness drains', () => {
     const writes = recordLedgerWrites(t);
     framework.startDiscordAwarenessDelivery('a test branch move');
     await untilServerLogs(dir, 'reaction-call');
+    const log = captureLog(t);
     await framework.stop();
     const stopped = performance.now();
     assert.equal(internals(framework).discordAwarenessDrains.size, 0, 'no drain is running once stop() has returned');
@@ -120,6 +145,8 @@ describe('stop() and Discord awareness drains', () => {
     assert.equal(entries.m1.attempts, 1, 'the call in flight is recorded');
     assert.match(entries.m1.lastError ?? '', /closed while awaiting response/);
     assert.deepEqual([entries.m2, entries.m3], [{ attempts: 0 }, { attempts: 0 }], 'what the drain had not sent stays pending, unrecorded');
+    assert.ok(log.some((line) => line.startsWith(
+      '[discord-awareness] discord: 2 mark(s) not sent: the framework is stopping; the next start delivers them')), log.join('\n'));
   });
 
   it('a drain started once stop() has begun sends and records nothing', async (t) => {
@@ -127,25 +154,51 @@ describe('stop() and Discord awareness drains', () => {
     const framework = await AgentFramework.create(frameworkConfig(dir, [server(dir, 'discord')]));
     pendingMarks(dir, [['discord', 'm1'], ['discord', 'm2']]);
     await framework.stop();
+    const log = captureLog(t);
     await internals(framework).drainDiscordAwarenessOutbox('discord');
     assert.deepEqual(ledger(dir), { m1: { attempts: 0 }, m2: { attempts: 0 } },
       'no "not attempted" record: the marks stay pending as they were, for the next start');
+    assert.ok(log.some((line) => line.startsWith(
+      '[discord-awareness] discord: drain not started: the framework is stopping; the next start delivers what is pending')), log.join('\n'));
   });
 
-  it('a drain whose wait runs out fails the stop(), naming it, and keeps the store open', async (t) => {
+  it('stop() returns only once a drain still running has settled', async (t) => {
+    const dir = tempDir(t);
+    const framework = await AgentFramework.create(frameworkConfig(dir, []));
+    let settled = false;
+    registerDrain(framework, 'discord', new Promise<void>((resolve) => setTimeout(() => { settled = true; resolve(); }, 200)));
+    await framework.stop();
+    assert.equal(settled, true, 'the drain had settled');
+    assert.equal(internals(framework).ownedStoreClosed, true);
+  });
+
+  it("a drain that rejects while stop() waits for it settles the wait, and the store closes: the failure is its barrier's to report", async (t) => {
+    const dir = tempDir(t);
+    const framework = await AgentFramework.create(frameworkConfig(dir, []));
+    registerDrain(framework, 'discord', new Promise<void>((_resolve, reject) => {
+      setTimeout(() => reject(new Error('zz the ledger refused the write')), 50);
+    }));
+    await framework.stop();
+    assert.equal(internals(framework).discordAwarenessDrains.size, 0);
+    assert.equal(internals(framework).ownedStoreClosed, true);
+  });
+
+  it('a drain whose wait runs out fails the stop(), naming it, keeps the store open, and a later stop() waits for it', async (t) => {
     const dir = tempDir(t);
     const framework = await AgentFramework.create(frameworkConfig(dir, []));
     let settle!: () => void;
-    internals(framework).discordAwarenessDrains.set('discord', new Promise<void>((resolve) => { settle = resolve; }));
+    registerDrain(framework, 'discord', new Promise<void>((resolve) => { settle = resolve; }));
     await assert.rejects(framework.stop(50), (error: unknown) => {
       assert.ok(error instanceof ShutdownTimeoutError, String(error));
       assert.deepEqual(error.pending, ['awareness drain:discord']);
       return true;
     });
     assert.equal(internals(framework).ownedStoreClosed, false, 'the store stays open for another stop()');
-    internals(framework).discordAwarenessDrains.delete('discord');
+    // The drain is still registered, so a later stop() waits for it.
+    const later = framework.stop();
+    assert.equal(await settlesWithin(later, 200), 'still waiting', 'a later stop() waits for the drain');
     settle();
-    await framework.stop();
+    await later;
     assert.equal(internals(framework).ownedStoreClosed, true);
   });
 

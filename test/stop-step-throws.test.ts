@@ -75,7 +75,7 @@ async function frameworkToStop(t: import('node:test').TestContext, membrane = ne
     storePath: join(dir, 'store'), membrane: membrane.asMembrane(), syncIntervalMs: 0, maintenanceIntervalMs: 0,
     agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'test' }], modules: [module],
   });
-  const watchdog = { stopped: false, stop() { this.stopped = true; } };
+  const watchdog = { stopped: false, stops: 0, stop() { this.stopped = true; this.stops++; } };
   internals(framework).livenessWatchdog = watchdog;
   const { agent, contextManager } = await framework.createEphemeralAgent({
     name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
@@ -193,16 +193,16 @@ describe('a step of stop() that throws', () => {
 
   it("a resident's stream whose cancel() throws is left running: stop() fails with that error without waiting for it, and a later stop() waits for it", async (t) => {
     let release!: () => void;
-    let isReleased = false;
-    const released = new Promise<void>((resolve) => { release = () => { isReleased = true; resolve(); }; });
+    const released = new Promise<void>((resolve) => { release = resolve; });
     t.after(() => release());
     const error = new Error("zz the stream's cancel failed");
+    let cancels = 0;
     class CancelThrows extends HeldStream {
-      // A host's stream that can't be stopped while it runs, and runs until
-      // the test releases it.
+      // A host's stream whose cancel always throws, and which runs until the
+      // test releases it.
       override cancel(): void {
-        if (!isReleased) throw error;
-        super.cancel();
+        cancels++;
+        throw error;
       }
     }
     const membrane = new MockMembrane();
@@ -227,8 +227,9 @@ describe('a step of stop() that throws', () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     const ended = startRun();
-    // No budget, as connectome-host stops a framework.
-    const first = await settlesWithin(framework.stop(), 2_000);
+    // No budget, as connectome-host stops a framework. The stream runs until
+    // the test releases it, so a stop() that waited for it wouldn't settle.
+    const first = await settlesWithin(framework.stop(), 10_000);
     assert.notEqual(first, 'still waiting', "stop() doesn't wait for a stream whose cancel threw");
     assert.ok(failedWith(first, error), `stop() fails with the cancel's error, got ${String(first)}`);
     assert.deepEqual(calls, ['start', 'stop'], 'the module was stopped');
@@ -238,17 +239,23 @@ describe('a step of stop() that throws', () => {
     assert.match(String(ended()), /refused: the framework is stopping/, "stop()'s sweep ended the pending ephemeral run");
     assert.equal(internals(framework).ownedStoreClosed, false, 'the store stays open while the stream runs');
     assert.equal(internals(framework).deferredMessages.length, 1, "the resident's deferred write stays queued while its stream runs");
-    // A later stop() waits for the stream the first one left running.
+    // A later stop() waits for the stream the first one left running: its own
+    // cancel has run (and thrown), and it hasn't reached the watchdog's stop,
+    // which comes after the waits.
     const later = framework.stop();
     assert.equal(await settlesWithin(later, 200), 'still waiting', 'a later stop() waits for the stream');
+    assert.equal(cancels, 2, "the later stop()'s cancel ran");
+    assert.equal(watchdog.stops, 1, 'the later stop() is still at its waits');
     release();
-    // Its own cancel, made before the release, threw too, so it fails as the
-    // first did and keeps the store open; once the stream has ended, a stop()
-    // closes it.
+    // Its own cancel threw too, so it fails as the first did and keeps the
+    // store open. Once the stream has ended, its agent holds no stream, so a
+    // stop() makes no cancel and closes the store.
     const second = await later.then(() => 'resolved', (e: unknown) => e);
     assert.ok(failedWith(second, error), `the later stop() fails with the cancel's error, got ${String(second)}`);
+    assert.equal(watchdog.stops, 2, 'the later stop() went on once the stream ended');
     assert.equal(internals(framework).ownedStoreClosed, false);
     await framework.stop();
+    assert.equal(cancels, 2, 'no cancel once the stream has ended');
     assert.equal(internals(framework).ownedStoreClosed, true, 'once the stream has ended, a stop() closes the store');
   });
 });
@@ -273,11 +280,20 @@ describe("stop()'s waits on the tool-result guard's annotations", () => {
   }
 
   it('an annotation that rejects while stop() waits settles the wait before the modules stop, and the teardown goes on', async (t) => {
-    const { framework, calls } = await frameworkToStop(t);
-    // Both still running when stop() reaches the wait: one rejects, and the
+    const { framework, calls, watchdog } = await frameworkToStop(t);
+    let fail!: (error: Error) => void;
+    let finish!: () => void;
+    annotate(framework, new Promise((_resolve, reject) => { fail = reject; }));
+    annotate(framework, new Promise((resolve) => { finish = () => { calls.push('annotation done'); resolve(); }; }));
+    // The watchdog's stop is the step just before the wait. From there, the
+    // timers fire once the wait has begun: one annotation rejects, and the
     // other ends after it.
-    annotate(framework, new Promise((_resolve, reject) => setTimeout(() => reject(new Error('zz an annotation failed')), 200)));
-    annotate(framework, new Promise((resolve) => setTimeout(() => { calls.push('annotation done'); resolve(); }, 400)));
+    const stopWatchdog = watchdog.stop.bind(watchdog);
+    watchdog.stop = () => {
+      stopWatchdog();
+      setTimeout(() => fail(new Error('zz an annotation failed')), 0);
+      setTimeout(finish, 20);
+    };
     await framework.stop();
     assert.deepEqual(calls, ['start', 'annotation done', 'stop'], 'every annotation settled before the modules stopped');
     assert.equal(internals(framework).ownedStoreClosed, true);
@@ -286,8 +302,12 @@ describe("stop()'s waits on the tool-result guard's annotations", () => {
   it('one that a module starts and that rejects while stop() waits settles the wait before the final sync, and the store closes', async (t) => {
     let framework!: AgentFramework;
     const built = await frameworkToStop(t, new MockMembrane(), () => {
-      // Still running when stop() reaches its second wait, after the modules stop.
-      annotate(framework, new Promise((_resolve, reject) => setTimeout(() => reject(new Error('zz a late annotation failed')), 200)));
+      // Started as the module stops; its timer fires once stop() has reached
+      // its second wait, which follows the modules' stop with no timer of its
+      // own between.
+      annotate(framework, new Promise((_resolve, reject) => {
+        setTimeout(() => reject(new Error('zz a late annotation failed')), 0);
+      }));
     });
     framework = built.framework;
     const { calls } = built;

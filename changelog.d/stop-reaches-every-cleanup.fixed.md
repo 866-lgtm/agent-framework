@@ -15,7 +15,8 @@
     it closes the store.
 - `stop()` now ends Discord awareness delivery. A drain running when
   `stop()` begins sends nothing more, and the marks it hasn't sent stay
-  pending in the outbox, unrecorded, for the next start's barrier. `stop()`
+  pending in the outbox, unrecorded, for the next start's barrier; a line in
+  the host log names the server and how many marks it held. `stop()`
   waits, within `teardownTimeoutMs`, for each drain still running to record
   the call that closing its MCPL server ended. Before, `stop()` neither
   stopped nor waited for drains: once the servers had closed, a drain went
