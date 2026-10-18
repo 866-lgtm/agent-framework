@@ -610,6 +610,17 @@ test('a resumed suppression announces its retirement before recording it', withJ
   assert.deepEqual([settled.status, settled.suppressionComplete], ['discarded', true], 'the record landed');
 }));
 
+test("finishing the body of a suppression its surgery activated retires nothing, so it announces nothing", withJournal((outbox) => {
+  const suppression = activeBatch(outbox, [ref('m1')], {
+    targetBranch: 'suppress/cairn/1', activationPolicy: 'explicit', suppressionIntervals: [{ fromId: 'i1', toId: 'i1' }],
+  });
+  const announced: string[] = [];
+  assert.deepEqual(outbox.completeSuppression(suppression.id, () => { announced.push(suppression.id); }), { retired: false });
+  assert.deepEqual(announced, [], 'no retirement, so no notice');
+  const settled = outbox.batches().find((b) => b.id === suppression.id)!;
+  assert.deepEqual([settled.status, settled.suppressionComplete], ['active', true], 'its marks stay, and its body is recorded complete');
+}));
+
 test('an import announces what it retires before recording it, so a record whose sync fails still had its notice', withJournal((_outbox, h) => {
   mkdirSync(join(h.dir, 'recovery'), { recursive: true });
   writeFileSync(h.legacyPath, JSON.stringify({
@@ -1719,10 +1730,11 @@ test("a switch onto a suppression's target whose removals aren't recorded as fin
   await assert.rejects(
     framework.switchBranch('partial'),
     (error) => error instanceof OperatorActionError && error.code === 'invalid'
-      && error.message === `Branch partial is the target of suppression ${batch.id}, whose removals aren't recorded as `
-        + "finished, so it isn't safe to serve from. To give the suppression up, delete partial: the next start finds no "
-        + 'branch with that name and gives it up, and until then the name stays claimed. To apply it, switch to main and '
-        + 'run the suppression again there, onto a new branch name',
+      && error.message === `Branch partial is the target of awareness batch ${batch.id} (a suppression, or an offline `
+        + "recovery that suppressed), whose removals aren't recorded as finished, so it isn't safe to serve from. To give "
+        + 'the suppression up, delete partial: the next start finds no branch with that name and gives it up, and until '
+        + 'then the name stays claimed. To apply it, redo the surgery from main, if it still has every message the '
+        + 'surgery removed, onto a new branch name',
   );
   await framework.switchBranch('elsewhere');
   assert.deepEqual(switched, ['elsewhere'], 'only the claimed target is refused');
@@ -1752,7 +1764,8 @@ test("a redo onto a suppression's target whose removals aren't recorded as finis
   assert.throws(
     () => framework.redo('cairn'),
     (error) => error instanceof OperatorActionError && error.code === 'invalid'
-      && error.message.startsWith(`Branch partial is the target of suppression ${batch.id}, whose removals aren't recorded as finished`),
+      && error.message.startsWith(`Branch partial is the target of awareness batch ${batch.id} (a suppression, or an `
+        + "offline recovery that suppressed), whose removals aren't recorded as finished"),
   );
   assert.deepEqual(switched, [], 'nothing switched');
   assert.deepEqual(framework.redoStacks.get('cairn'), [entry], 'the refused redo stays on its stack');

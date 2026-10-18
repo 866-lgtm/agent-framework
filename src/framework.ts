@@ -2460,8 +2460,13 @@ export class AgentFramework {
       legacyPath: config.discordAwarenessOutboxPath
         ?? (config.storePath ? defaultDiscordAwarenessOutboxPath(config.storePath) : undefined),
       // The start's reconciliation is the journal's first read, so the
-      // framework is built when an import announces itself.
-      announceImport: (unsent) => building.framework?.announceDiscordAwarenessImport(unsent),
+      // framework is built when an import announces itself. A read before
+      // then would be refused here, before the import is recorded, rather
+      // than record it unannounced.
+      announceImport: (unsent) => {
+        if (!building.framework) throw new Error('The awareness journal was read before the framework was built');
+        building.framework.announceDiscordAwarenessImport(unsent);
+      },
     });
 
     const operatorLogPath = config.operatorLogPath === false
@@ -9428,12 +9433,15 @@ export class AgentFramework {
     }
     const batch = unfinished[0];
     if (!batch) return;
+    // A batch doesn't say which surgery made it, so the redo is the surgery
+    // again from its source, as reportRetiredAwareness's is.
     throw new OperatorActionError(
       'invalid',
-      `Branch ${name} is the target of suppression ${batch.id}, whose removals aren't recorded as finished, so it ` +
-        `isn't safe to serve from. To give the suppression up, delete ${name}: the next start finds no branch with ` +
-        `that name and gives it up, and until then the name stays claimed. To apply it, switch to ` +
-        `${batch.sourceBranch} and run the suppression again there, onto a new branch name`,
+      `Branch ${name} is the target of awareness batch ${batch.id} (a suppression, or an offline recovery that ` +
+        `suppressed), whose removals aren't recorded as finished, so it isn't safe to serve from. To give the ` +
+        `suppression up, delete ${name}: the next start finds no branch with that name and gives it up, and until ` +
+        `then the name stays claimed. To apply it, redo the surgery from ${batch.sourceBranch}, if it still has every ` +
+        'message the surgery removed, onto a new branch name',
     );
   }
 
@@ -9665,7 +9673,10 @@ export class AgentFramework {
    * operator's operation, as syncDiscordAwarenessMarkers is: stop() waits
    * for running drains only before the store closes, and once stop() has
    * begun none is started, since the teardown would cut it off. The next
-   * start delivers what is due.
+   * start delivers what is due. A quiesce doesn't hold it, as it holds turns
+   * and what servers send: a delivery starts no turn, and the answers to the
+   * host's own requests are never held, so a surgery made during a quiesce
+   * has its marks sent then.
    */
   private deliverDiscordAwarenessInBackground(
     occasion: 'rollback' | 'suppress' | 'hide' | 'undo' | 'retract' | 'startup' | 'connect' | 'list-change' | 'reconnect',
