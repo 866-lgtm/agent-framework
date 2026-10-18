@@ -140,7 +140,7 @@ export class DiscordJsClient implements DiscordClientInterface {
   private channelIds?: string[];
 
   private messageHandler?: (message: DiscordMessageData) => void;
-  private editHandler?: (messageId: string, newContent: string) => void;
+  private editHandler?: (messageId: string, newContent: string, attachments?: DiscordAttachment[]) => void;
   private deleteHandler?: (messageId: string) => void;
   private readyHandler?: () => void;
 
@@ -171,13 +171,18 @@ export class DiscordJsClient implements DiscordClientInterface {
       }
     });
 
-    this.client.on('messageUpdate', (_oldMessage, newMessage) => {
+    this.client.on('messageUpdate', (oldMessage, newMessage) => {
       // content is null for a partial message, one discord.js hadn't cached
       // and whose update carried no text, so there's no text to compare; a
       // cached message keeps the text it had. An edit that leaves no text,
       // beside an attachment, is '' and is still an edit.
       if (typeof newMessage.content !== 'string' || !this.editHandler) return;
-      this.editHandler(newMessage.id, newMessage.content);
+      // Its attachments as the edit left them, for a message discord.js had
+      // cached: it takes the update's list when the update carries one and
+      // keeps the cached list when it doesn't. A message it hadn't cached
+      // starts with an empty list, so one whose update carried none would read
+      // as having none; it passes none, and the row's blocks stay.
+      this.editHandler(newMessage.id, newMessage.content, oldMessage.partial ? undefined : newMessage.attachments?.map(toAttachment));
     });
 
     this.client.on('messageDelete', (message) => {
@@ -476,7 +481,7 @@ export class DiscordJsClient implements DiscordClientInterface {
     this.messageHandler = handler;
   }
 
-  onMessageEdit(handler: (messageId: string, newContent: string) => void): void {
+  onMessageEdit(handler: (messageId: string, newContent: string, attachments?: DiscordAttachment[]) => void): void {
     this.editHandler = handler;
   }
 

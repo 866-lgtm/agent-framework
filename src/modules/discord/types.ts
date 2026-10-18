@@ -375,6 +375,10 @@ export interface DiscordEditEvent {
   type: 'discord:edit';
   discordMessageId: string;
   newContent: string;
+  /** The message's attachments as the edit left them, when the client knows
+   *  them: a stored row whose text comes first drops the blocks of those it
+   *  no longer has. */
+  attachments?: DiscordAttachment[];
   [key: string]: unknown;
 }
 
@@ -469,8 +473,10 @@ export interface DiscordClientInterface {
   /** Register message handler */
   onMessage(handler: (message: DiscordMessageData) => void): void;
 
-  /** Register message edit handler */
-  onMessageEdit(handler: (messageId: string, newContent: string) => void): void;
+  /** Register message edit handler. A client that knows the edited
+   *  message's attachments passes them third; one that passes two arguments
+   *  leaves a stored row's attachment blocks as they are. */
+  onMessageEdit(handler: (messageId: string, newContent: string, attachments?: DiscordAttachment[]) => void): void;
 
   /** Register message delete handler */
   onMessageDelete(handler: (messageId: string) => void): void;
