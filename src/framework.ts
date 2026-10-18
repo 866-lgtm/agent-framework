@@ -1038,14 +1038,15 @@ export class ResumeBlockedError extends Error {
 
 /**
  * Thrown by `quiesce()` without `abandon` when the queue of deferred context
- * writes is over its cap, so its record can't hold it and a restart would
- * lose it. The host's mode is as it was, and the message names the ways out:
- * wait for the writes to land, or quiesce with `abandon: true` to end the
- * turns they wait for, then resume.
+ * writes can't reach disk: it's over its cap, so its record can't hold it, or
+ * its write failed, and that error is the `cause`. A restart would restore
+ * only what the record last held. The host's mode is as it was, and the
+ * message names the ways out, among them quiescing with `abandon: true`,
+ * which goes on with the queue in memory.
  */
 export class QuiesceBlockedError extends Error {
-  constructor(message: string) {
-    super(message);
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
     this.name = 'QuiesceBlockedError';
   }
 }
@@ -4985,9 +4986,10 @@ export class AgentFramework {
    * suppress gate deliveries, pause all MCPL data planes, and wait for
    * in-flight turns to settle (turn-alive is `activeTurnTokens`, which spans
    * dequeue → settled teardown). Idempotent, but for the queue's write, which
-   * every call makes first: a write that fails rejects with the host's mode
-   * as it was, and so does a queue over the cap, with a QuiesceBlockedError,
-   * unless the call has `abandon`, which goes on with the cap's alert
+   * every call makes first: when the queue can't reach disk, because its
+   * write fails or it's over the cap, the call rejects with a
+   * QuiesceBlockedError and the host's mode as it was, unless it has
+   * `abandon`, which goes on with the queue in memory and an alert
    * (writeDeferredWritesForQuiesce).
    *
    * On drain timeout the host STAYS quiesced (`drained: false` in the
@@ -5012,7 +5014,7 @@ export class AgentFramework {
     // The deferred-write queue first, as a quiesced host keeps it, on a first
     // call and a repeat alike: what it holds is on disk before the record says
     // quiesced, including a write held only in memory, such as one deferred
-    // behind a turn still alive.
+    // behind a turn still alive, unless an abandon goes on without it.
     this.writeDeferredWritesForQuiesce(opts?.abandon === true);
     if (this.quiesced) {
       // Idempotent — EXCEPT abandon escalation: a first quiesce that timed
@@ -5594,8 +5596,8 @@ export class AgentFramework {
    * lose a write that can still land at resume. The first such write after
    * one that succeeded raises an ops alert, and a line says when a write
    * succeeds again (deferredWritesFellBehind). quiesce() writes the queue
-   * itself before it changes the host's mode, and rejects instead, but for
-   * a queue over the cap with `abandon` (writeDeferredWritesForQuiesce).
+   * itself before it changes the host's mode, and refuses instead, unless
+   * the call has `abandon` (writeDeferredWritesForQuiesce).
    */
   private persistDeferredWrites(): void {
     let outcome: DeferredWritesOutcome;
@@ -5677,21 +5679,39 @@ export class AgentFramework {
    * quiesce()'s write of the queue, before it changes the host's mode, as a
    * quiesced host keeps it: a write held only in memory, such as one
    * deferred behind a turn still alive, is on disk before quiesce() goes on,
-   * as its record is. What the write throws is thrown, so quiesce() rejects
-   * with the host's mode as it was (store only, the slot set before a sync
-   * that failed leaves the queue mirrored: writeDeferredWritesSlot). A queue
-   * over the cap writes nothing. A call with `abandon` goes on, with the
-   * cap's alert, and any other throws a QuiesceBlockedError naming the cap
-   * and the ways out.
+   * as its record is. When the queue can't reach disk, because its write
+   * fails or it's over the cap, which writes nothing, a call with `abandon`
+   * goes on with the queue in memory and the failure's or the cap's alert.
+   * Any other throws a QuiesceBlockedError naming the ways out, so quiesce()
+   * rejects with the host's mode as it was (store only, the slot set before
+   * a sync that failed leaves the queue mirrored: writeDeferredWritesSlot).
    */
   private writeDeferredWritesForQuiesce(abandon: boolean): void {
-    const outcome = this.writeDeferredWrites(true);
-    if (outcome === 'over-cap') {
-      // Abandon is the call for a turn that won't end, and writes held for
-      // such a turn don't land until it does, so it goes on, with the cap's
-      // alert as everywhere else.
+    // Abandon is the call for a turn that won't end. The queue stays in
+    // memory whichever way the call goes, and writes held for such a turn
+    // don't land until it does, so refusing it would leave only a restart,
+    // which loses them: it goes on, with the alert as everywhere else.
+    let outcome: DeferredWritesOutcome;
+    try {
+      outcome = this.writeDeferredWrites(true);
+    } catch (error) {
       if (abandon) {
-        this.deferredWritesFellBehind('over-cap');
+        console.error('[host-mode] failed to persist deferred context writes:', error);
+        this.deferredWritesFellBehind({ error }, true);
+        return;
+      }
+      const record = this.deferredWritesRecord();
+      throw new QuiesceBlockedError(
+        `quiesce refused: writing ${record} failed: ${thrownText(error)}. A restart would restore only what it ` +
+        `last held, not the queue's ${this.durableDeferredWrites().length} deferred context write(s). Make ` +
+        `${record} writable and quiesce again, or quiesce with abandon: true to go on with the queue in memory, ` +
+        'and resume before any restart.',
+        { cause: error },
+      );
+    }
+    if (outcome === 'over-cap') {
+      if (abandon) {
+        this.deferredWritesFellBehind('over-cap', true);
         return;
       }
       throw new QuiesceBlockedError(
@@ -5716,20 +5736,23 @@ export class AgentFramework {
    * The first such write since one that succeeded raises an ops alert naming
    * the record, and the rest of the run raises none. A failed write's own
    * line is logged each time (persistDeferredWrites), and the cap's line the
-   * first time the cap is met in a run, whatever began it.
+   * first time the cap is met in a run, whatever began it. On a host that is
+   * or is about to be quiesced, both say to resume before any restart, since
+   * the writes land at the resume.
    */
-  private deferredWritesFellBehind(cause: { error: unknown } | 'over-cap'): void {
+  private deferredWritesFellBehind(cause: { error: unknown } | 'over-cap', quiesced = this.quiesced): void {
     this.deferredWritesPersisted = true;
     const startsRun = !this.deferredWritesBehind;
     this.deferredWritesBehind = true;
     const record = this.deferredWritesRecord();
     const queued = this.durableDeferredWrites().length;
+    const resumeFirst = quiesced ? '. Resume before any restart' : '';
     if (cause === 'over-cap') {
       if (this.deferredWritesCapLogged) return;
       this.deferredWritesCapLogged = true;
       const message = `the queue's ${queued} deferred context write(s) come to more than ` +
         `${DEFERRED_WRITES_PERSIST_CAP_CHARS} characters of JSON, the cap, so ${record} isn't written, ` +
-        `and a crash before the queue is under the cap and written restores what it last held`;
+        `and a restart before the queue is under the cap and written restores what it last held${resumeFirst}`;
       console.error(`[host-mode] ${message}`);
       if (startsRun) {
         this.opsAlert('deferred-writes', 'framework', message,
@@ -5742,8 +5765,9 @@ export class AgentFramework {
     const reason = error instanceof Error ? error.message : String(error);
     const code = (error as NodeJS.ErrnoException | undefined)?.code;
     this.opsAlert('deferred-writes', 'framework',
-      `writing ${record} failed: ${reason}. The queue's next change writes it again, and a crash before ` +
-      `a write of it succeeds restores what it last held, not the queue's ${queued} deferred context write(s)`,
+      `writing ${record} failed: ${reason}. The queue's next change writes it again, and a restart before ` +
+      `a write of it succeeds restores what it last held, not the queue's ${queued} deferred context ` +
+      `write(s)${resumeFirst}`,
       { data: { record, queued, ...(code ? { code } : {}) } });
   }
 
