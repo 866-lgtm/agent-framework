@@ -1942,9 +1942,10 @@ export class WorkspaceModule implements Module {
    * disk spells it (diskSpelling), with `path` the mount-prefixed path so
    * spelled. On a disk that folds names, a path spelled otherwise reaches
    * disk's file, so every tool takes it by disk's name: one name per file,
-   * and the names its answers give are disk's. The workspace's entries
-   * (entriesOf) stand in for disk where it has nothing yet, so a draft has
-   * one name too, and a path that names an entry exactly keeps that spelling.
+   * and the names its answers give are disk's, except that a path that
+   * names a workspace entry exactly keeps that spelling. The workspace's
+   * entries (entriesOf) stand in for disk where it has nothing yet, so a
+   * draft has one name too.
    * A handler that must read something at the moment it's asked, as
    * handleSync reads the branch a path sync adopts on, reads it before
    * calling this, since this awaits disk. The entries are read when the
@@ -1963,15 +1964,19 @@ export class WorkspaceModule implements Module {
   /**
    * A mount's entries on the current branch, as diskSpelling reads them when
    * it does, and whether its root folds case as the last start read it
-   * (false before the first). An entry's spelling of a path, the whole of it
-   * or its first segments, may stand for a path (`usable`) unless it lies on
-   * the way to a nested mount's directory, at it or inside it, and spells the
-   * segments it shares with that directory otherwise than both the
+   * (false before the first). An entry's spelling may stand for a path
+   * (`usable`, asked of the whole path it would make) unless that path lies
+   * on the way to a nested mount's directory, at it or inside it, and spells
+   * the segments it shares with that directory otherwise than both the
    * configured spelling and disk's: the nested-mount checks compare
-   * spellings as they are, and know only those two (spellNestedDirs). Which
-   * paths lie there is judged as loosely as the walk respells a name disk
-   * lists (foldedLoosely), so a spelling the walk would have respelled into
-   * one the checks know isn't kept instead.
+   * spellings as they are, and know only those two (spellNestedDirs). So a
+   * path beside that directory, such as a sibling of it, still takes an
+   * entry's spelling. Which paths lie there is judged as loosely as the walk
+   * respells a name disk lists (foldedLoosely), so a spelling the walk would
+   * have respelled into one the checks know isn't kept instead. That errs
+   * toward refusing: on a disk that keeps them apart, an entry in `dır/` is
+   * refused where a nested mount owns `dir/`, which leaves main's two
+   * entries.
    */
   private entriesOf(mount: MountState): WorkspaceEntries {
     const store = this.getStore();

@@ -1,7 +1,8 @@
 // On a disk that folds names (macOS's default folds case, and Unicode
 // normalization), a path spelled otherwise than disk spells it reaches disk's
-// file. The workspace's tools take such a path as disk spells it, so they
-// name each file by one name and take nothing in twice. Most of these tests
+// file. The workspace's tools take such a path as disk spells it, unless it
+// names a workspace entry exactly, so they name each file by one name and
+// take nothing in twice. Most of these tests
 // need a temp directory that folds case, and skip, saying why, where it
 // doesn't, since a disk that tells spellings apart has nothing to respell;
 // one needs it to fold normalization, and three to fold ß with ss, ſ with s
@@ -448,7 +449,7 @@ test('on a disk that tells case apart, two hard links that differ only in case k
     assert.equal(await foldsCase(root), false);
   });
 
-test('on a disk that tells case apart, an empty directory with no letter in its name, or with a link at its flipped name, tells case apart',
+test('on a disk that tells case apart, an empty directory with no letter in its name, or with a link at its flipped name, or that is a link to its flipped twin, tells case apart',
   { skip: CASE_SENSITIVE_ONLY }, async (t) => {
     const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-own-name-'));
     t.after(() => rmSync(root, { recursive: true, force: true }));
@@ -457,6 +458,9 @@ test('on a disk that tells case apart, an empty directory with no letter in its 
     mkdirSync(join(root, 'proj'));
     symlinkSync('proj', join(root, 'PROJ'));
     assert.equal(await foldsCase(join(root, 'proj')), false, 'a link at the flipped name is another file');
+    mkdirSync(join(root, 'LNK'));
+    symlinkSync('LNK', join(root, 'lnk'));
+    assert.equal(await foldsCase(join(root, 'lnk')), false, 'a root that is a link to its flipped twin is found as itself');
   });
 
 test('a second draft spelled in another case is the first one, and a push writes one file', { skip: FOLDING_ONLY }, async (t) => {
@@ -580,6 +584,10 @@ test('a directory folds case if a name it lists does, flipped, or where none tel
   assert.equal(await foldsCase(join(root, 'empty')), true);
   mkdirSync(join(root, '2025'));
   assert.equal(await foldsCase(join(root, '2025')), true, 'as the directory holding it');
+  // A root that is a link to an empty directory: Ezra-2423's probe.
+  mkdirSync(join(root, 'real'));
+  symlinkSync('real', join(root, 'proj'));
+  assert.equal(await foldsCase(join(root, 'proj')), true, 'a link, found as itself under its flipped name');
 });
 
 test('a mount whose root is empty, or not there yet, at start takes a draft\'s spelling at its top level', { skip: FOLDING_ONLY }, async (t) => {
@@ -631,6 +639,7 @@ test('an entry in a nested mount\'s directory spelled otherwise than its configu
   store.treeSet('workspace/outer/tree', 'later/z.txt', entry);
   store.treeSet('workspace/outer/tree', 'cafe\u0301/x.txt', entry);
   store.treeSet('workspace/outer/tree', 'Proj/z.txt', entry);
+  store.treeSet('workspace/outer/tree', 'proj/w.txt', entry);
   const call = (name: string, input: unknown) => workspace.handleToolCall({ id: name, name, input } as Parameters<WorkspaceModule['handleToolCall']>[0]);
   const read = await call('read', { path: 'outer/Inner', offsetChars: 0, limitChars: 10 });
   assert.equal(read.success, false);
@@ -640,9 +649,17 @@ test('an entry in a nested mount\'s directory spelled otherwise than its configu
     assert.equal(write.success, false, path);
     assert.match(String(write.error), /lies in mount "later"/, path);
   }
-  const deep = await call('write', { path: 'outer/proj/inner/x.txt', content: 'x\n' });
-  assert.equal(deep.success, false);
-  assert.match(String(deep.error), /lies in mount "deep"/);
+  for (const path of ['outer/proj/inner/x.txt', 'outer/Proj/inner/x.txt']) {
+    const deep = await call('write', { path, content: 'x\n' });
+    assert.equal(deep.success, false, path);
+    assert.match(String(deep.error), /lies in mount "deep"/, path);
+  }
+  // Beside that directory, an entry's spelling stands: a sibling takes the
+  // draft's directory, and the directory itself, the configured spelling.
+  const sibling = await call('write', { path: 'outer/PROJ/z.txt', content: 'z\n' });
+  assert.equal((sibling.data as { path: string }).path, 'outer/Proj/z.txt');
+  const listed = await call('ls', { path: 'outer/PROJ' });
+  assert.equal((listed.data as { path: string }).path, 'outer/proj');
   if (!NORMALIZATION_FOLDING_ONLY) {
     const nfd = await call('read', { path: 'outer/cafe\u0301/x.txt', offsetChars: 0, limitChars: 10 });
     assert.equal(nfd.success, false);

@@ -329,9 +329,10 @@ export interface WorkspaceEntries {
   /** The paths of the entries under `prefix`, a directory's path and `/`, or `''` for every entry. */
   under(prefix: string): string[];
   /**
-   * Whether an entry's spelling of this path, the whole of it or its first
-   * segments, may stand for a path: false where it lies in a nested mount's
-   * directory in a spelling the nested-mount checks don't know.
+   * Whether an entry's spelling may stand for this path, the whole path it
+   * would make: false where the path lies on the way to a nested mount's
+   * directory, or inside it, in a spelling the nested-mount checks don't
+   * know.
    */
   usable(path: string): boolean;
   /** Whether the mount's root folds case (foldsCase). */
@@ -368,27 +369,29 @@ export async function foldsCase(dir: string): Promise<boolean> {
   if (holder === dir) return false;
   // The directory and its holder are looked up through links, so a root
   // that is one, or is reached through one, is compared by the device it
-  // lies on. The flipped name isn't: a link there to the directory would
-  // make a disk that tells case apart look as if it folds.
+  // lies on. Whether the holder folds is told by its own entries, the root's
+  // name and the flipped name, each looked up without following a link
+  // there: a link at the flipped name to the root is another file, and a
+  // root that is a link is found as itself.
   const see = (path: string) => stat(path, { bigint: true }).catch(() => null);
   const own = basename(dir);
-  const [self, held, flipped] = await Promise.all([see(dir), see(holder), look(join(holder, flippedCase(own)))]);
+  const [self, held, entry, flipped] = await Promise.all([see(dir), see(holder), look(dir), look(join(holder, flippedCase(own)))]);
   if (self == null || held == null || self.dev !== held.dev) return false;
   if (flippedCase(own) === own) return foldsCase(holder);
-  return flipped != null && sameFile(self, flipped);
+  return entry != null && flipped != null && sameFile(entry, flipped);
 }
 
 /**
  * A name in simple case folding, letter by letter: each letter as the lower
  * case of its upper case, so `Σ` and a word's last `ς` are both `σ`, `ſ` is
  * `s` and `µ` is `μ`. A letter whose upper case is more than one letter
- * takes its own lower case instead, as the Greek `ᾈ` takes `ᾀ`. A letter
- * that comes back as more than one either way, as `ß` and `İ` do, stays as
- * it is, and so does dotless `ı`, whose upper case `I` lowers to `i`, which
- * case folding keeps apart from it. Unicode normalization is left alone, and
- * so are letters only a fuller folding joins, such as `ß` with `ss`: no
- * listing shows two such names to be one file, and a disk that folds case
- * needn't join them.
+ * takes its own lower case instead, as the Greek `ᾈ` takes `ᾀ` and `ß` stays
+ * `ß`. A letter whose lower case is more than one letter too, as `İ`'s is,
+ * stays as it is, and so does dotless `ı`, whose upper case `I` lowers to
+ * `i`, which case folding keeps apart from it. Unicode normalization is left
+ * alone, and so are letters only a fuller folding joins, such as `ß` with
+ * `ss`: no listing shows two such names to be one file, and a disk that
+ * folds case needn't join them.
  */
 export const lowered = (name: string): string =>
   [...name].map((c) => {
@@ -400,15 +403,15 @@ export const lowered = (name: string): string =>
 
 /**
  * The name `segment` takes among the workspace's entries directly under the
- * directory `prefix` (its path and `/`, or `''` for the mount's root): the
- * segment itself where an entry is there under it, else the first name, in
- * the order given, equal to it in simple case folding (lowered), else null,
- * taking only a name that may stand for a path there (`usable`). A name is
- * compared again only where another name came between its entries, as
- * `N.txt` comes between `N` and `N/x` in path order, so the step doesn't
- * fold a name once for every entry beneath it.
+ * directory `prefix` (its path and `/`, or `''` for the mount's root), of
+ * the names `usable` allows there: the segment itself where an entry is
+ * there under it, else the first name, in the order given, equal to it in
+ * simple case folding (lowered), else null. A name is compared again only
+ * where another name came between its entries, as `N.txt` comes between `N`
+ * and `N/x` in path order, so the step doesn't fold a name once for every
+ * entry beneath it.
  */
-function entryName(paths: readonly string[], prefix: string, segment: string, usable: (path: string) => boolean): string | null {
+function entryName(paths: readonly string[], prefix: string, segment: string, usable: (name: string) => boolean): string | null {
   const want = lowered(segment);
   let found: string | null = null;
   let previous: string | null = null;
@@ -420,7 +423,7 @@ function entryName(paths: readonly string[], prefix: string, segment: string, us
     if (name === previous) continue;
     previous = name;
     if (name !== segment && (found !== null || lowered(name) !== want)) continue;
-    if (!usable(`${prefix}${name}`)) continue;
+    if (!usable(name)) continue;
     if (name === segment) return segment;
     found = name;
   }
@@ -446,8 +449,9 @@ function entryName(paths: readonly string[], prefix: string, segment: string, us
  * and `caseFolds` what looking the segment up with its case flipped showed
  * of `dir`: that it folds case, that it tells case apart, or nothing (null),
  * for a segment with no letter to flip. For a segment not looked up as
- * given (`given` null), it tells nothing of `dir`, since any file under the
- * flipped spelling counts there.
+ * given (`given` null), it's set from whatever file the flipped spelling
+ * finds, which tells nothing of `dir`; diskSpelling reads it only for
+ * directories, which are looked up as given.
  */
 async function listedName(dir: string, segment: string, given: BigIntStats | null): Promise<{ name: string; found: boolean; caseFolds: boolean | null }> {
   const flipped = flippedCase(segment);
@@ -506,13 +510,13 @@ async function listedName(dir: string, segment: string, given: BigIntStats | nul
  * takes the name of an entry it equals in simple case folding (entryName),
  * as the disk will once that entry is written: a second draft spelled in
  * another case is the first one. An entry's spelling stands for a path only
- * where the entries allow it (`usable`), which they don't for one in a
- * nested mount's directory that the nested-mount checks wouldn't know. The
- * root's folding is read at start (`rootFoldsCase`), and a directory beneath
- * it is taken to fold as the directory holding it did when its name was
- * looked up with its case flipped, or, for a name with no letter to flip, as
- * the nearest directory above that told, so the step reads nothing more of
- * disk for this.
+ * where the entries allow it for the whole path it makes (`usable`), which
+ * they don't on the way to a nested mount's directory, or inside it, in a
+ * spelling the nested-mount checks wouldn't know. The root's folding is read
+ * at start (`rootFoldsCase`), and a directory beneath it is taken to fold as
+ * the directory holding it did when its name was looked up with its case
+ * flipped, or, for a name with no letter to flip, as the nearest directory
+ * above that told, so the step reads nothing more of disk for this.
  */
 export async function diskSpelling(root: string, relativePath: string, entries?: WorkspaceEntries): Promise<string> {
   if (relativePath === '' || isAbsolute(relativePath) || (entries?.has(relativePath) && entries.usable(relativePath))) return relativePath;
@@ -539,7 +543,14 @@ export async function diskSpelling(root: string, relativePath: string, entries?:
     for (let j = from; j < segments.length; j++) {
       const segment = segments[j]!;
       if (segment === '' || segment === '.') continue;
-      const name = entryName(paths, prefix, segment, entries.usable);
+      // The path a name would make: the segments before it as taken so far,
+      // the name, and the rest as given, up to a `..`.
+      const rest: string[] = [];
+      for (const later of segments.slice(j + 1)) {
+        if (later === '..') break;
+        if (later !== '' && later !== '.') rest.push(later);
+      }
+      const name = entryName(paths, prefix, segment, (candidate) => entries.usable([`${prefix}${candidate}`, ...rest].join('/')));
       if (name === null) return;
       segments[j] = name;
       prefix = `${prefix}${name}/`;
