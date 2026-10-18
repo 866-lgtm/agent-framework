@@ -2,12 +2,11 @@
   streams it cancels, on maintenance in flight and on the event loop, as it
   did its waits on an operator's operations and on modules and MCPL servers
   (#373). Each wait takes the whole budget, so a `stop()` with one can take
-  up to six budgets, counting its wait on Discord awareness drains, besides
-  the withheld-spill deadline of a guard's write still under way. Before, a
-  stream whose cancel couldn't reach it, a maintenance tick that didn't
-  settle, or a module's `onProcess` that never returned kept `stop(t)`
-  waiting without end, whatever `t` was. With no budget, `stop()` waits for
-  each as before.
+  up to five budgets, besides the withheld-spill deadline of a guard's write
+  still under way. Before, a stream whose cancel couldn't reach it, a
+  maintenance tick that didn't settle, or a module's `onProcess` that never
+  returned kept `stop(t)` waiting without end, whatever `t` was. With no
+  budget, `stop()` waits for each as before.
   - A wait whose budget runs out fails the `stop()` with a
     `ShutdownTimeoutError` naming what it waited for (`stream:<agent>`,
     `maintenance` or `event loop`), once teardown has gone on; with more

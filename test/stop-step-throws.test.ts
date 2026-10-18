@@ -102,7 +102,12 @@ interface Row {
   own?: 'watchdog' | 'queue';
   /** A step after everything stop() started has stopped: the store closes. */
   finishing?: boolean;
+  /** A further check of the step's own, once stop() has settled. */
+  check?(framework: AgentFramework): void;
 }
+
+/** The releases whose unread pass ran, in the unread pass's row. */
+const unreadPassed: string[] = [];
 
 const ROWS: Row[] = [
   { step: "the push coalescer's suspend()", inject: (fw, e) => throwIn(internals(fw), 'pushCoalescer', 'suspend', e) },
@@ -146,6 +151,32 @@ const ROWS: Row[] = [
     },
   },
   {
+    step: "a postponed release's unread pass",
+    finishing: true,
+    inject: (fw, e) => {
+      // Two releases a quiesce postponed: the first one's pass throws.
+      unreadPassed.length = 0;
+      const releases = internals(fw).releasesAfterResume as Map<string, { name: string }>;
+      releases.set('first', { name: 'first' });
+      releases.set('second', { name: 'second' });
+      // Other agents, such as the run whose end releases its window, read
+      // their unread replies as usual.
+      const owner = fw as unknown as Record<string, unknown>;
+      const usual = (owner.unreadFailedReplies as (agent: unknown) => unknown[]).bind(fw);
+      owner.unreadFailedReplies = (agent: { name: string }) => {
+        if (agent.name === 'first') throw e;
+        if (agent.name !== 'second') return usual(agent);
+        unreadPassed.push(agent.name);
+        return [];
+      };
+      return () => { delete owner.unreadFailedReplies; };
+    },
+    check: (fw) => {
+      assert.deepEqual(unreadPassed, ['second'], "the other release's unread pass still ran");
+      assert.equal((internals(fw).releasesAfterResume as Map<string, unknown>).size, 0, 'the postponed releases are cleared');
+    },
+  },
+  {
     step: 'the last flush of deferred writes',
     finishing: true,
     inject: (fw, e) => {
@@ -180,6 +211,7 @@ describe('a step of stop() that throws', () => {
       assert.equal(diagnosed().has(framework), false, 'the framework left the diagnostics registry');
       await new Promise((resolve) => setImmediate(resolve));
       assert.match(String(ended()), /refused: the framework is stopping/, "stop()'s sweep ended the pending ephemeral run");
+      row.check?.(framework);
       if (row.finishing) {
         assert.equal(internals(framework).ownedStoreClosed, true, 'a step that finishes the stop leaves the store to close');
         return;

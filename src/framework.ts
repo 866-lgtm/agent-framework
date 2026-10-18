@@ -3464,9 +3464,13 @@ export class AgentFramework {
     // once the host stops, so its unread pass runs here: each failed reply
     // stored unread in that window goes to the primary now, deferred while
     // quiesced like any write, so it waits in the queue with the rest. What
-    // was queued for that agent stays queued, as a gone agent's.
+    // was queued for that agent stays queued, as a gone agent's. Each
+    // release's pass is a step of its own: one that throws fails the stop()
+    // and leaves the others, and the flush below, to run.
     for (const agent of this.releasesAfterResume.values()) {
-      for (const metadata of this.unreadFailedReplies(agent)) this.passFailedReplyToPrimary(agent.name, metadata);
+      step(() => {
+        for (const metadata of this.unreadFailedReplies(agent)) this.passFailedReplyToPrimary(agent.name, metadata);
+      });
     }
     this.releasesAfterResume.clear();
     // Like a guard's storage work above and the final sync below, this flush
