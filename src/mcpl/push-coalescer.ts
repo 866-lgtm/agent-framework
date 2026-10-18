@@ -133,26 +133,21 @@ export interface AssemblyResult {
    *  completion, freeze() declined them for this agent, or they were among
    *  the turn's causes and their batch was gone or another assembly's. */
   settled: Set<string>;
-  /** Of those, the subjects whose content the turn being assembled reads as
-   *  its own: a render or fallback this assembly delivered where its compile
-   *  reads it, or, for a cause, a render queued for this agent that no request
-   *  consumed, which the flush has stored and nothing has read yet. A settled
-   *  subject that is not here gave the turn nothing to read: empty or blank
-   *  render (§5.2), cancelled, revoked before the render or at its response, a
-   *  render-start that could not be made durable (the batch then waits for its
-   *  recovery wake), a batch whose audience doesn't include the agent, a
-   *  render placed in another agent's deferred queue, a render another
-   *  assembly froze, or a cause whose batch was withdrawn, displaced or
-   *  consumed by another request. */
+  /** Of those, the subjects whose render or fallback this assembly delivered
+   *  where its compile reads it, as content the turn reads as its own. A
+   *  settled subject that is not here gave the turn nothing to read: empty or
+   *  blank render (§5.2), cancelled, revoked before the render or at its
+   *  response, a render-start that could not be made durable (the batch then
+   *  waits for its recovery wake), a batch whose audience doesn't include the
+   *  agent, a render placed in another agent's deferred queue, a render
+   *  another assembly froze, or a cause whose batch was withdrawn, displaced
+   *  or consumed by another request. */
   materialized: Set<string>;
 }
 
 interface SubjectState<E> {
   history: 'none' | 'some' | 'unknown';
-  /** The subject's delivery that may still be unread. `reader` marks a render
-   *  no request consumed, placed in that agent's deferred queue: the agent
-   *  woken to read it (§5.2). */
-  occupant?: { eventId: string; placement: CoalescingPlacement; reader?: string };
+  occupant?: { eventId: string; placement: CoalescingPlacement };
   batch?: DeferredBatch<E>;
   rendering?: Rendering<E>;
   consumedEventId?: string;
@@ -194,10 +189,6 @@ export interface CoalescingReceiptRecord {
 export interface CoalescerHost<E> {
   /** True iff the placement still exists and no model request has included it. */
   isUnread(placement: CoalescingPlacement): boolean;
-  /** True iff the placement is stored in a context, no longer in the deferred
-   *  queue, and no model request has included it: the next compile of a turn
-   *  that reads that context shows it as new. */
-  isStoredUnread(placement: CoalescingPlacement): boolean;
   /** False when the unread occurrence could not be removed (it may still be read). */
   remove(placement: CoalescingPlacement): boolean;
   /** Ordinary delivery of the event; undefined when routing delivered nowhere.
@@ -206,9 +197,10 @@ export interface CoalescerHost<E> {
   deliver(occurrence: CoalescedOccurrence<E>, materialized?: McplContentBlock[], assemblingFor?: string): Promise<CoalescingPlacement | undefined>;
   /** Queue a wake for a batch that has no model-visible content yet. */
   wakeForBatch(occurrence: CoalescedOccurrence<E>): Promise<void>;
-  /** Queue a wake for `agent` to read a render of the batch that no request
-   *  consumed, as the batch's own wake would wake it; the subject's other
-   *  wakes stay. */
+  /** Queue an ordinary push wake for `agent`, under the batch's own wake
+   *  policy, to read a render of the batch placed in its deferred queue that
+   *  no request consumed. It carries no subject, so the subject's other wakes,
+   *  and later withdrawals of them, leave it. */
   wakeToRead(occurrence: CoalescedOccurrence<E>, agent: string): Promise<void>;
   /** Withdraw unstarted wakes whose sole cause is this subject. */
   cancelWake(subject: string): void;
@@ -697,12 +689,10 @@ export class PushCoalescer<E = unknown> {
    *
    * `causes` are the subjects whose batch wakes started the turn. A batch has
    * one consumer, the request it was frozen for (§5.2: the materialized
-   * occurrence is consumed by that request), so a cause whose batch is gone
-   * by now, or another assembly's render, settles and gives the turn nothing
-   * of it. The exception is a render no request consumed, placed in this
-   * agent's deferred queue: this agent was woken to read it, and once the
-   * flush has stored it, this request consumes it, as it would a render it
-   * materialized.
+   * occurrence is consumed by that request). So a cause whose batch is gone
+   * by now settles and gives the turn nothing, and an assembly that joins
+   * another's render waits for it, so its compile shows the content, without
+   * taking it as its own.
    */
   async assemble(agentName: string, causes: readonly string[] = []): Promise<AssemblyResult> {
     const result: AssemblyResult = { settled: new Set(), materialized: new Set() };
@@ -710,17 +700,10 @@ export class PushCoalescer<E = unknown> {
     const work: Promise<void>[] = [];
     const wanted = new Set(causes);
     for (const subject of new Set([...this.subjects.keys(), ...causes])) {
-      const cause = wanted.has(subject);
       // The handle is wrapped: a bare promise returned through `locked` would
       // be flattened by `then`, holding the lock until the render settled —
-      // and the settlement itself needs the lock. The queued render is taken
-      // under the same lock, before any render this freeze starts can settle
-      // and take the occupant's place.
-      const { queued, started } = await this.locked(async () => ({
-        queued: cause && this.takeQueued(subject, agentName),
-        started: await this.freeze(subject, agentName, cause),
-      }));
-      if (queued) { result.settled.add(subject); result.materialized.add(subject); }
+      // and the settlement itself needs the lock.
+      const started = await this.locked(() => this.freeze(subject, agentName, wanted.has(subject)));
       if (started === 'declined') result.settled.add(subject);
       else if (started) {
         work.push(started.done.then(() => {
@@ -733,24 +716,6 @@ export class PushCoalescer<E = unknown> {
     await Promise.all(work);
     this.persist();
     return result;
-  }
-
-  /**
-   * Under the lock: whether a render of `subject` that no request consumed
-   * waits in `agentName`'s context, placed in its deferred queue, stored by
-   * the flush and read by nothing yet. `agentName` was woken to read it, and
-   * the request being assembled consumes it, as the settlement records a
-   * materialized render, so a retraction or a replacement from here on
-   * appends rather than taking it away from that request.
-   */
-  private takeQueued(subject: string, agentName: string): boolean {
-    const state = this.subjects.get(subject);
-    const occupant = state?.occupant;
-    if (!state || occupant?.reader !== agentName || !this.host.isStoredUnread(occupant.placement)) return false;
-    state.history = 'some';
-    state.consumedEventId = occupant.eventId;
-    state.occupant = undefined;
-    return true;
   }
 
   /**
@@ -774,8 +739,10 @@ export class PushCoalescer<E = unknown> {
     // The batch whose wake started this turn is gone: a retraction or a
     // displacement withdrew it after the wake was dispatched, or another
     // request consumed it, the batch's one consumption, as the freeze's
-    // withdrawal of the other queued wakes already makes it. Whatever
-    // replaced it is read through its own delivery and wake.
+    // withdrawal of the other queued wakes already makes it. Whatever replaced
+    // it is read through its own delivery and wake. (A retry of a turn that
+    // read its batch comes back without the marks of a batch wake, so it
+    // never reaches here as a cause: beginAgentTurn.)
     if (!state || (!state.batch && !state.rendering)) return cause ? 'declined' : undefined;
     if (state.rendering) {
       // Another assembly froze this batch, and the request it assembles
@@ -893,10 +860,10 @@ export class PushCoalescer<E = unknown> {
           // unread there, so it stays replaceable and withdrawable. The turn
           // being assembled doesn't read it, so it isn't materialized for that
           // turn, and no request has consumed it. The freeze withdrew the
-          // queue's agent's wake for this batch; wake it again, beside any
-          // wakes a newer batch has, so that its next turn, once the flush has
-          // stored the content, reads it.
-          state.occupant = { eventId: occurrence.eventId, placement, reader: placement.agent };
+          // queue's agent's wake for this batch; give it an ordinary wake, as
+          // any delivery during its turn has, beside any wakes a newer batch
+          // has, so that its next turn reads the content.
+          state.occupant = { eventId: occurrence.eventId, placement };
           state.audienceAgent = placement.agent;
           await this.host.wakeToRead(occurrence, placement.agent);
           return;
@@ -1003,8 +970,7 @@ export class PushCoalescer<E = unknown> {
       subjects: [...this.subjects].map(([subject, s]) => ({
         subject, history: s.history, consumedEventId: s.consumedEventId, identity: s.identity,
         ...(s.audienceAgent ? { audienceAgent: s.audienceAgent } : {}),
-        // A restart counts the occupant as read (restore), so its reader isn't kept.
-        ...(s.occupant ? { occupant: { eventId: s.occupant.eventId, placement: s.occupant.placement } } : {}),
+        ...(s.occupant ? { occupant: s.occupant } : {}),
         ...(s.batch ? { batch: { latest: s.batch.latest as CoalescedOccurrence<unknown>, notices: s.batch.notices, dropped: s.batch.dropped, ...(s.batch.noRender ? { rendering: true } : {}) } }
           : s.rendering ? { batch: { latest: s.rendering.batch.latest as CoalescedOccurrence<unknown>, notices: s.rendering.batch.notices, dropped: s.rendering.batch.dropped, rendering: true } }
           : {}),
