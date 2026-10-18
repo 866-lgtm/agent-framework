@@ -16,6 +16,19 @@
  *     stopping"), never "accepted", and never thrown out of the
  *     connection's listener; a handler's own fault is answered -32603.
  * Any other event pushed to a stopped framework still throws to its caller.
+ * A turn waiting to retry is work in flight too: stop() cancels the retry,
+ * and leaves no agent inferring at the event gate, which a start() after the
+ * stop goes on with (#334). The turn ends with inference:aborted, saying no
+ * retry follows its inference:failed, whether its stream failed to start or
+ * failed once started. A turn that continues after that start() is marked
+ * inferring again.
+ * Work that outlasts stop()'s budget fails the stop, with teardown gone on
+ * and the store left open (#373): a stream whose cancel can't reach it,
+ * whose agent's deferred writes wait for its own end, and an event loop in a
+ * module's onProcess, which finishes that iteration once the call returns
+ * and exits, rather than run beside the loop of a start() made meanwhile.
+ * Two such waits fail it together, and a later stop() waits for what an
+ * earlier one left running, a start() between them or not.
  * Each test waits on the event it needs (a log line, an answer), not on a
  * fixed delay, and then one more turn, so a late rejection would be seen.
  */
@@ -28,8 +41,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse } from '@babel/parser';
-import type { ContentBlock } from '@animalabs/membrane';
+import { JsStore } from '@animalabs/chronicle';
+import type { ContentBlock, StreamEvent } from '@animalabs/membrane';
 import type {
+  ErrorAction,
   Module,
   ModuleContext,
   ProcessEvent,
@@ -39,8 +54,8 @@ import type {
   ToolDefinition,
   ToolResult,
 } from '../src/index.js';
-import { AgentFramework } from '../src/index.js';
-import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { AgentFramework, ShutdownTimeoutError } from '../src/index.js';
+import { HeldStream, MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 
 /** Resolve once `cond` holds, polling each turn; fail, naming `what`, after `ms`. */
 async function until(cond: () => boolean, what: string, ms = 5000): Promise<void> {
@@ -347,6 +362,464 @@ describe('stop() with work still in flight', () => {
     module.finish('success');
     await droppedLine();
     assert.deepEqual(rejections, []);
+  });
+
+  /** A resident whose retry waits longer than the test, so only stop() ends
+   *  the wait, which cancels the retry; `stream` is its one stream. */
+  async function frameworkWaitingToRetry(stream: () => MockYieldingStream): Promise<{
+    framework: AgentFramework; membrane: MockMembrane; inDelay: Promise<void>; turnEvents: Array<{ type: string; reason?: string }>;
+  }> {
+    let waiting!: () => void;
+    const inDelay = new Promise<void>((resolve) => { waiting = resolve; });
+    const membrane = new MockMembrane();
+    membrane.streamYielding = (request) => {
+      membrane.calls.push(request);
+      return stream();
+    };
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'store'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'test' }],
+      modules: [new SlowModule()],
+      gate: { config: { policies: [], default: 'always' } },
+      errorPolicy: {
+        maxRetries: 1,
+        onInferenceError: (_error: Error, _agent: string, attempt: number): ErrorAction => {
+          waiting();
+          return attempt < 1 ? { retry: true, delayMs: 60_000 } : { retry: false };
+        },
+      },
+    });
+    // What a listener that brackets the turn sees, such as a typing loop.
+    const turnEvents: Array<{ type: string; reason?: string }> = [];
+    framework.onTrace((event) => {
+      const traced = event as { type: string; agentName?: string; reason?: string };
+      if (traced.agentName === 'assistant' && /^inference:(started|completed|failed|aborted|exhausted)$/.test(traced.type)) {
+        turnEvents.push({ type: traced.type, ...(traced.reason !== undefined ? { reason: traced.reason } : {}) });
+      }
+    });
+    framework.start();
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+    return { framework, membrane, inDelay, turnEvents };
+  }
+
+  /** The turn's record on /healthz, which ends when the turn does. */
+  function lastInference(framework: AgentFramework): { startedAt?: number; endedAt?: number } | null | undefined {
+    const snapshot = framework.healthSnapshot() as {
+      agents: Array<{ name: string; lastInference: { startedAt?: number; endedAt?: number } | null }>;
+    };
+    return snapshot.agents.find((agent) => agent.name === 'assistant')?.lastInference;
+  }
+
+  const RETRY_CANCELLED = 'a retry waiting while the framework was stopping is dropped before it sends anything';
+
+  /** A stream that fails once it has started, so driveStream waits to retry. */
+  function failingOnceStarted(): MockYieldingStream {
+    const stream = new MockYieldingStream([]);
+    (stream as unknown as { events: unknown[] }).events.push({ type: 'error', error: new Error('overloaded') });
+    return stream;
+  }
+
+  it('a turn whose retry stop() cancels leaves no agent inferring at the event gate, and ends saying why', { timeout: 60_000 }, async () => {
+    // The stream can't start. While an agent is inferring at the gate, the
+    // gate buffers every batch it debounces instead of delivering it, and
+    // wakes no agent for it.
+    const { framework, membrane, inDelay, turnEvents } = await frameworkWaitingToRetry(() => {
+      throw new Error('the stream could not start');
+    });
+    const gate = (framework as unknown as { eventGate: { inferenceDiagnostics(): { inferring: string[] } } }).eventGate;
+    await inDelay;
+    assert.deepEqual(gate.inferenceDiagnostics().inferring, ['assistant'], 'the turn is open at the gate while its retry waits');
+    await framework.stop();
+    assert.deepEqual(gate.inferenceDiagnostics().inferring, [], 'stop() leaves no agent inferring');
+    assert.equal(membrane.calls.length, 1, 'the retry was cancelled, not sent');
+    // The attempt's inference:failed is usually followed by its retry: the
+    // turn ends with an event saying none follows, and its record ends.
+    assert.deepEqual(turnEvents, [
+      { type: 'inference:started' }, { type: 'inference:failed' }, { type: 'inference:aborted', reason: RETRY_CANCELLED },
+    ]);
+    const last = lastInference(framework);
+    assert.ok(last?.endedAt !== undefined && last.endedAt >= (last.startedAt ?? Infinity), JSON.stringify(last));
+    assert.deepEqual(rejections, []);
+  });
+
+  it('a turn whose stream failed once started, and whose retry stop() cancels, ends saying why', { timeout: 60_000 }, async () => {
+    // The same cancelled retry, waited for by the stream's own frame.
+    const { framework, membrane, inDelay, turnEvents } = await frameworkWaitingToRetry(failingOnceStarted);
+    await inDelay;
+    await framework.stop();
+    assert.equal(membrane.calls.length, 1, 'the retry was cancelled, not sent');
+    assert.deepEqual(turnEvents, [
+      { type: 'inference:started' }, { type: 'inference:failed' }, { type: 'inference:aborted', reason: RETRY_CANCELLED },
+    ]);
+    const last = lastInference(framework);
+    assert.ok(last?.endedAt !== undefined && last.endedAt >= (last.startedAt ?? Infinity), JSON.stringify(last));
+    assert.deepEqual(rejections, []);
+  });
+
+  it("a stream's cancelled retry says nothing when another turn of its agent's name holds the turn", { timeout: 60_000 }, async () => {
+    // The events carry only the name, so this frame's end would end that
+    // newer turn's bracket instead, as abortDroppedTurn's drops avoid too.
+    const { framework, inDelay, turnEvents } = await frameworkWaitingToRetry(failingOnceStarted);
+    await inDelay;
+    (framework as unknown as { activeTurnTokens: Map<string, number> }).activeTurnTokens.set('assistant', -1);
+    await framework.stop();
+    assert.deepEqual(turnEvents, [{ type: 'inference:started' }, { type: 'inference:failed' }]);
+    assert.deepEqual(rejections, []);
+  });
+
+  it('a budget restart taken up after a stop() and a start() marks its agent inferring again', { timeout: 60_000 }, async () => {
+    // A restart left queued when stop() ends the loop continues its turn once
+    // a start() on the same framework takes it up. stop() cleared the gate's
+    // entries, and a turn that continues another doesn't start a new one, so
+    // it has to take its agent's again: while no agent is inferring, the gate
+    // delivers debounced batches, and residents share one message slot.
+    const store = JsStore.openOrCreate({ path: join(tempDir, 'store') });
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    let streaming!: () => void;
+    const inStream = new Promise<void>((resolve) => { streaming = resolve; });
+    const membrane = new MockMembrane();
+    membrane.streamYielding = (request) => {
+      membrane.calls.push(request);
+      streaming();
+      return new HeldStream(released, [createMockResponse([{ type: 'text', text: 'continued' }] as ContentBlock[])]);
+    };
+    const framework = await AgentFramework.create({
+      store,
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'test' }],
+      modules: [new SlowModule()],
+      gate: { configPath: join(tempDir, 'gate.json'), config: { policies: [], default: 'always' } },
+    });
+    const internal = framework as unknown as {
+      eventGate: { inferenceDiagnostics(): { inferring: string[] } };
+      pendingRequests: Array<{ agentName: string; reason: string; source: string; timestamp: number }>;
+    };
+    try {
+      framework.start();
+      await framework.stop();
+      // Queued while the framework is stopped, as a restart that stop() left
+      // queued is: the next start()'s loop takes it up.
+      internal.pendingRequests.push({ agentName: 'assistant', reason: 'context_budget_restart', source: 'framework', timestamp: Date.now() });
+      framework.start();
+      await inStream;
+      assert.deepEqual(internal.eventGate.inferenceDiagnostics().inferring, ['assistant'], 'the continuing turn holds its entry');
+      release();
+      await until(() => internal.eventGate.inferenceDiagnostics().inferring.length === 0, 'the turn to end');
+      assert.equal(membrane.calls.length, 1);
+      assert.deepEqual(rejections, []);
+    } finally {
+      release();
+      await framework.stop();
+      store.close();
+    }
+  });
+
+  describe("stop()'s budget, with work that outlasts it", () => {
+    /** What `promise` has come to after `ms`: its rejection, 'resolved', or
+     *  'still pending', so a stop() that doesn't come back fails the test
+     *  rather than hanging it. */
+    async function settledWithin(promise: Promise<unknown>, ms: number): Promise<unknown> {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const late = new Promise<string>((resolve) => { timer = setTimeout(() => resolve('still pending'), ms); });
+      try {
+        return await Promise.race([promise.then(() => 'resolved', (error: unknown) => error), late]);
+      } finally { clearTimeout(timer); }
+    }
+
+    /**
+     * A resident whose stream, once started, yields nothing until the test
+     * releases it, cancel included (HeldStream), and a module whose onProcess
+     * waits on any text that starts with "hang" until the test lets it go.
+     * Any other text is added for the resident and asks for its inference.
+     */
+    async function frameworkWithHeldWork() {
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      let streaming!: () => void;
+      const residentStreaming = new Promise<void>((resolve) => { streaming = resolve; });
+      const membrane = new MockMembrane();
+      membrane.streamYielding = (request) => {
+        membrane.calls.push(request);
+        streaming();
+        return new HeldStream(released, [createMockResponse([{ type: 'text', text: 'resident done' }] as ContentBlock[])]);
+      };
+      const entered: string[] = [];
+      const hung = new Map<string, () => void>();
+      const order: string[] = [];
+      const events: Module = {
+        name: 'events',
+        async start() {},
+        async stop() { order.push('modules stopped'); },
+        getTools: () => [],
+        async handleToolCall() { return { success: true }; },
+        async onProcess(event) {
+          if (event.type !== 'external-message') return {};
+          const text = String((event as { content?: unknown }).content);
+          if (text.startsWith('hang')) {
+            entered.push(text);
+            await new Promise<void>((resolve) => { hung.set(text, resolve); });
+            return {};
+          }
+          return { addMessages: [{ participant: 'User', content: [{ type: 'text', text }] }], requestInference: true };
+        },
+      };
+      const framework = await AgentFramework.create({
+        storePath: join(tempDir, 'store'),
+        membrane: membrane.asMembrane(),
+        agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'test' }],
+        modules: [events],
+        syncIntervalMs: 0,
+      });
+      const push = (content: string) =>
+        framework.pushEvent({ type: 'external-message', source: 'test', content, metadata: {} } as unknown as ProcessEvent);
+      const letGo = (text: string) => { hung.get(text)?.(); };
+      const internals = framework as unknown as { deferredMessages: Array<{ forAgent?: string }>; loopPromise: Promise<void> | null };
+      const storedTexts = (): string[] => framework.getAgent('assistant')!.getContextManager().getAllMessages()
+        .flatMap((m) => m.content.map((b) => (b.type === 'text' ? (b as { text: string }).text : `<${b.type}>`)));
+      return { framework, release, residentStreaming, entered, letGo, order, push, internals, storedTexts };
+    }
+
+    it("a stream that outlasts the budget fails the stop, keeps the store open, and keeps its agent's deferred write queued until its own end stores it", { timeout: 30_000 }, async () => {
+      // The deferral's rule holds through the timeout: no entry lands ahead of
+      // a stream that may still write.
+      const { framework, release, residentStreaming, order, push, internals, storedTexts } = await frameworkWithHeldWork();
+      try {
+        framework.start();
+        push('go');
+        await residentStreaming;
+        push('a note for later');
+        await until(() => internals.deferredMessages.length === 1, 'the note to be deferred behind the stream');
+        const outcome = await settledWithin(framework.stop(100), 5_000);
+        assert.ok(outcome instanceof ShutdownTimeoutError
+          && outcome.message === 'Shutdown timed out after 100 ms; pending: stream:assistant', String(outcome));
+        assert.ok(order.includes('modules stopped'), 'teardown went on');
+        assert.equal(framework.getStore().isClosed(), false, 'the stream may still write');
+        assert.equal(internals.deferredMessages.length, 1, 'the note stays queued');
+        assert.ok(!storedTexts().includes('a note for later'), 'nothing landed ahead of the stream');
+        assert.ok(logged.includes(
+          "[deferral] stop: 1 deferred write(s) for assistant stay queued: its stream outlasted stop()'s wait and may still write; " +
+          'this memory-only queue loses them if the process exits before that stream settles'), logged.join('\n'));
+        release();
+        await until(() => internals.deferredMessages.length === 0, "the stream's own end to take the note");
+        assert.ok(storedTexts().includes('a note for later'), `its turn-end flush stored the note:\n${storedTexts().join('\n')}`);
+        await framework.stop();
+        assert.equal(framework.getStore().isClosed(), true, 'a later stop() closes the store');
+        assert.deepEqual(rejections, []);
+      } finally {
+        release();
+        await framework.stop().catch(() => {});
+      }
+    });
+
+    it("a write deferred behind the entry a retry that failed to compile left is stored by stop(), with a budget or without", { timeout: 30_000 }, async () => {
+      // A resident stream fails and its error policy retries, but the retry's
+      // compile throws after taking the agent's stream id. The old frame no
+      // longer owns the activeStreams entry, so its finally leaves it, and no
+      // new handle replaces it: the entry outlives its stream. No stream that
+      // stop() waited on is still running, so the final flush stores a write
+      // deferred behind that entry, as on main.
+      class FailingStream extends MockYieldingStream {
+        constructor(private readonly released: Promise<void>) {
+          super([createMockResponse([{ type: 'text', text: 'unused' }] as ContentBlock[])]);
+        }
+        override async *[Symbol.asyncIterator](): AsyncGenerator<StreamEvent> {
+          await this.released;
+          yield { type: 'error', error: new Error('the provider failed') } as unknown as StreamEvent;
+        }
+      }
+      const agents = [{ name: 'assistant', model: 'test-model', systemPrompt: 'test' }];
+      const textsIn = (framework: AgentFramework): string[] => framework.getAgent('assistant')!.getContextManager().getAllMessages()
+        .flatMap((m) => m.content.map((b) => (b.type === 'text' ? (b as { text: string }).text : `<${b.type}>`)));
+      for (const budget of [undefined, 100]) {
+        let release!: () => void;
+        const released = new Promise<void>((resolve) => { release = resolve; });
+        const membrane = new MockMembrane();
+        membrane.streamYielding = (request) => {
+          membrane.calls.push(request);
+          return new FailingStream(released);
+        };
+        const events: Module = {
+          name: 'events',
+          async start() {},
+          async stop() {},
+          getTools: () => [],
+          async handleToolCall() { return { success: true }; },
+          async onProcess(event) {
+            if (event.type !== 'external-message') return {};
+            return { addMessages: [{ participant: 'User', content: [{ type: 'text', text: 'go' }] }], requestInference: true };
+          },
+        };
+        const attempts: number[] = [];
+        const storePath = join(tempDir, `store-${budget ?? 'unbounded'}`);
+        const framework = await AgentFramework.create({
+          storePath,
+          membrane: membrane.asMembrane(),
+          agents,
+          modules: [events],
+          syncIntervalMs: 0,
+          errorPolicy: {
+            maxRetries: 1,
+            onInferenceError: (_error: Error, _agent: string, attempt: number): ErrorAction => {
+              attempts.push(attempt);
+              return attempt < 1 ? { retry: true, delayMs: 0 } : { retry: false };
+            },
+          },
+        });
+        const internals = framework as unknown as {
+          activeStreams: Map<string, Promise<void>>;
+          deferredMessages: unknown[];
+          addMessage(participant: string, content: ContentBlock[]): string;
+        };
+        try {
+          framework.start();
+          framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+          await until(() => internals.activeStreams.has('assistant'), 'the first stream');
+          const handle = internals.activeStreams.get('assistant')!;
+          (framework.getAgent('assistant') as unknown as { buildActivationRequest: () => never }).buildActivationRequest = () => {
+            throw new Error('the compile failed');
+          };
+          release();
+          await handle;
+          await until(() => attempts.length === 2, 'the retry to fail');
+          assert.equal(internals.activeStreams.get('assistant'), handle, 'the old frame left its entry');
+          assert.equal(internals.addMessage('Antra', [{ type: 'text', text: 'late note' }] as ContentBlock[]), '', 'deferred behind it');
+          await framework.stop(budget);
+          assert.equal(internals.deferredMessages.length, 0, `budget ${budget}: the final flush took the write`);
+          assert.ok(!logged.some((line) => line.startsWith('[deferral] stop:')), logged.join('\n'));
+        } finally {
+          release();
+          await framework.stop().catch(() => {});
+        }
+        const reopened = await AgentFramework.create({ storePath, membrane: new MockMembrane().asMembrane(), agents, modules: [], syncIntervalMs: 0 });
+        try {
+          assert.ok(textsIn(reopened).includes('late note'), `budget ${budget}: the store has the write:\n${textsIn(reopened).join('\n')}`);
+        } finally {
+          await reopened.stop();
+        }
+      }
+      assert.deepEqual(rejections, []);
+    });
+
+    it("a stream handle that rejects settles stop()'s wait on it, as on main, with a budget or without", { timeout: 30_000 }, async () => {
+      // A driver that crashed rather than ended: stop() waited on the
+      // streams with Promise.allSettled, so a rejection never failed it.
+      for (const budget of [undefined, 100]) {
+        const { framework } = await frameworkWithHeldWork();
+        const streams = (framework as unknown as { activeStreams: Map<string, Promise<void>> }).activeStreams;
+        const crashed = Promise.reject(new Error('the driver crashed'));
+        crashed.catch(() => {});
+        streams.set('assistant', crashed);
+        try {
+          framework.start();
+          await framework.stop(budget);
+          assert.equal(framework.getStore().isClosed(), true, `budget ${budget}: the stop finished`);
+        } finally {
+          streams.delete('assistant');
+          await framework.stop().catch(() => {});
+        }
+      }
+      assert.deepEqual(rejections, []);
+    });
+
+    it("an event loop still in a module's onProcess when the budget runs out fails the stop, and teardown goes on", { timeout: 30_000 }, async () => {
+      const { framework, entered, letGo, order, push } = await frameworkWithHeldWork();
+      try {
+        framework.start();
+        push('hang');
+        await until(() => entered.includes('hang'), 'the loop to enter the call');
+        const outcome = await settledWithin(framework.stop(100), 5_000);
+        assert.ok(outcome instanceof ShutdownTimeoutError
+          && outcome.message === 'Shutdown timed out after 100 ms; pending: event loop', String(outcome));
+        assert.ok(order.includes('modules stopped'), 'teardown went on, the module whose call is still running included');
+        assert.equal(framework.getStore().isClosed(), false);
+        letGo('hang');
+        await framework.stop();
+        assert.equal(framework.getStore().isClosed(), true, 'once the call returns, the loop ends and a later stop() closes the store');
+        assert.deepEqual(rejections, []);
+      } finally {
+        letGo('hang');
+        await framework.stop().catch(() => {});
+      }
+    });
+
+    it('a stream and the event loop that both outlast the budget each fail the stop, together as an AggregateError', { timeout: 30_000 }, async () => {
+      const { framework, release, residentStreaming, entered, letGo, push } = await frameworkWithHeldWork();
+      try {
+        framework.start();
+        push('go');
+        await residentStreaming;
+        push('hang');
+        await until(() => entered.includes('hang'), 'the loop to enter the call');
+        const outcome = await settledWithin(framework.stop(100), 5_000);
+        assert.ok(outcome instanceof AggregateError && !(outcome instanceof ShutdownTimeoutError), String(outcome));
+        assert.deepEqual(outcome.errors.map((error: unknown) => error instanceof ShutdownTimeoutError ? error.pending : String(error)),
+          [['stream:assistant'], ['event loop']]);
+        assert.equal(outcome.message,
+          'Framework shutdown failed: Shutdown timed out after 100 ms; pending: stream:assistant; Shutdown timed out after 100 ms; pending: event loop');
+        assert.equal(framework.getStore().isClosed(), false);
+        release();
+        letGo('hang');
+        await framework.stop();
+        assert.equal(framework.getStore().isClosed(), true);
+        assert.deepEqual(rejections, []);
+      } finally {
+        release();
+        letGo('hang');
+        await framework.stop().catch(() => {});
+      }
+    });
+
+    it("a stop() after a timed-out one and a start() waits for the old loop too, and keeps the store open until it has settled", { timeout: 30_000 }, async () => {
+      // The start() replaces the loop a stop() waits for. What the first
+      // stop()'s budget left running stays the framework's to wait for, so
+      // the second one doesn't close the store under the old loop's call.
+      const { framework, entered, letGo, push } = await frameworkWithHeldWork();
+      try {
+        framework.start();
+        push('hang');
+        await until(() => entered.includes('hang'), 'the loop to enter the call');
+        const first = await settledWithin(framework.stop(100), 5_000);
+        assert.ok(first instanceof ShutdownTimeoutError && first.pending.includes('event loop'), String(first));
+        framework.start();
+        const second = await settledWithin(framework.stop(100), 5_000);
+        assert.ok(second instanceof ShutdownTimeoutError
+          && second.message === 'Shutdown timed out after 100 ms; pending: event loop', String(second));
+        assert.equal(framework.getStore().isClosed(), false, "the old loop's call is still running");
+        letGo('hang');
+        await framework.stop();
+        assert.equal(framework.getStore().isClosed(), true, 'a stop() closes the store once the old loop has settled');
+        assert.deepEqual(rejections, []);
+      } finally {
+        letGo('hang');
+        await framework.stop().catch(() => {});
+      }
+    });
+
+    it("a loop whose stop() came back while it was in a call exits once that call returns, though a start() was made meanwhile, and the new lifecycle's loop runs on", { timeout: 30_000 }, async () => {
+      const { framework, entered, letGo, push, internals } = await frameworkWithHeldWork();
+      try {
+        framework.start();
+        push('hang');
+        await until(() => entered.includes('hang'), 'the loop to enter the call');
+        const outcome = await settledWithin(framework.stop(100), 5_000);
+        assert.ok(outcome instanceof ShutdownTimeoutError && outcome.pending.includes('event loop'), String(outcome));
+        const oldLoop = internals.loopPromise!;
+        framework.start();
+        const newLoop = internals.loopPromise!;
+        assert.notEqual(newLoop, oldLoop, 'the start() runs a loop of its own');
+        letGo('hang');
+        assert.equal(await settledWithin(oldLoop, 5_000), 'resolved', 'the old loop exits once its call returns');
+        assert.equal(await settledWithin(newLoop, 100), 'still pending', "the new lifecycle's loop runs on");
+        await framework.stop();
+        assert.equal(await settledWithin(newLoop, 5_000), 'resolved', 'and ends with its own stop()');
+        assert.deepEqual(rejections, []);
+      } finally {
+        letGo('hang');
+        await framework.stop().catch(() => {});
+      }
+    });
   });
 
   describe("tune-out's subconscious tools", () => {
