@@ -16,6 +16,12 @@
  *     stopping"), never "accepted", and never thrown out of the
  *     connection's listener; a handler's own fault is answered -32603.
  * Any other event pushed to a stopped framework still throws to its caller.
+ * A turn waiting to retry is work in flight too: stop() cancels the retry,
+ * and leaves no agent inferring at the event gate, which a start() after the
+ * stop goes on with (#334). The turn ends with inference:aborted, saying no
+ * retry follows its inference:failed, whether its stream failed to start or
+ * failed once started. A turn that continues after that start() is marked
+ * inferring again.
  * Each test waits on the event it needs (a log line, an answer), not on a
  * fixed delay, and then one more turn, so a late rejection would be seen.
  */
@@ -27,9 +33,11 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import ts from 'typescript';
+import { parse } from '@babel/parser';
+import { JsStore } from '@animalabs/chronicle';
 import type { ContentBlock } from '@animalabs/membrane';
 import type {
+  ErrorAction,
   Module,
   ModuleContext,
   ProcessEvent,
@@ -40,7 +48,7 @@ import type {
   ToolResult,
 } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
-import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { HeldStream, MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 
 /** Resolve once `cond` holds, polling each turn; fail, naming `what`, after `ms`. */
 async function until(cond: () => boolean, what: string, ms = 5000): Promise<void> {
@@ -53,6 +61,104 @@ async function until(cond: () => boolean, what: string, ms = 5000): Promise<void
 
 /** One more turn of the event loop: an unhandled rejection is reported by then. */
 const turn = (): Promise<void> => new Promise((r) => setImmediate(() => setImmediate(r)));
+
+/**
+ * The tool-result scan: in each source, every object literal whose `type`
+ * property is the string 'tool-result', read as a syntax tree (Babel's
+ * TypeScript parser) rather than as text, wherever the literal sits.
+ * - A property is read when it's written `key: value` or as a shorthand.
+ *   Its key is an identifier, or a string in any quoting, computed or not; a
+ *   computed key that isn't a string, a getter or a method, and a spread
+ *   aren't read.
+ * - A value is read through `as`, `satisfies`, `<T>`, `!` and parentheses,
+ *   and a string in any quoting, escapes included. A string built at run
+ *   time, by a template with substitutions or by `+`, or held in a const,
+ *   isn't read.
+ * Each literal must carry toolName. Where its callId reads a call's `id`
+ * and its toolName that call's `name`, as `X.id`, `X?.id` or `X['id']`
+ * through the same wrappers, they must read the same X, compared as source
+ * text. Any other callId or toolName (a string, a variable, a fallback with
+ * `??`) isn't compared.
+ */
+function scanToolResults(sources: Array<{ name: string; text: string }>): {
+  literals: string[];
+  paired: number;
+  missing: string[];
+  mismatched: string[];
+} {
+  // Babel's nodes, read structurally: each has a `type`, its children are
+  // its node-valued fields, and its source span is `start`..`end`.
+  type Node = { type: string; start?: number | null; end?: number | null; loc?: { start: { line: number } } | null; [field: string]: unknown };
+  const isNode = (v: unknown): v is Node => typeof v === 'object' && v !== null && typeof (v as Node).type === 'string';
+  const child = (n: Node | undefined, field: string): Node | undefined => (n && isNode(n[field]) ? n[field] as Node : undefined);
+  const unwrap = (e: Node | undefined): Node | undefined => {
+    while (e && ['TSAsExpression', 'TSSatisfiesExpression', 'TSTypeAssertion', 'TSNonNullExpression'].includes(e.type)) {
+      e = child(e, 'expression');
+    }
+    return e;
+  };
+  // A string's text, in any quoting: '…', "…" or a template with no substitutions.
+  const stringOf = (e: Node | undefined): string | undefined => {
+    e = unwrap(e);
+    if (e?.type === 'StringLiteral') return e.value as string;
+    if (e?.type === 'TemplateLiteral' && (e.expressions as unknown[]).length === 0) {
+      return ((e.quasis as Node[])[0].value as { cooked?: string }).cooked;
+    }
+    return undefined;
+  };
+  // A property's name, however its key is written; a computed key that isn't a string has none.
+  const nameOf = (p: Node): string | undefined => {
+    const key = child(p, 'key');
+    return !p.computed && key?.type === 'Identifier' ? key.name as string : stringOf(key);
+  };
+  const literals: string[] = [];
+  const missing: string[] = [];
+  const mismatched: string[] = [];
+  let paired = 0;
+  for (const { name, text } of sources) {
+    let program: Node;
+    try {
+      // Babel keeps no node for parentheses, so `(x)` reads as `x`.
+      program = parse(text, { sourceType: 'module', plugins: ['typescript'] }).program as unknown as Node;
+    } catch (error) {
+      throw new Error(`${name}: ${(error as Error).message}`);
+    }
+    // The call an `X.id` or `X.name` reads, as X's source text (`call`, `tc`).
+    const callRead = (p: Node | undefined, field: 'id' | 'name'): string | undefined => {
+      const e = unwrap(child(p, 'value'));
+      if (e?.type !== 'MemberExpression' && e?.type !== 'OptionalMemberExpression') return undefined;
+      const property = child(e, 'property');
+      const read = e.computed ? stringOf(property) : property?.type === 'Identifier' ? property.name as string : undefined;
+      const object = unwrap(child(e, 'object'));
+      return read === field && object ? text.slice(object.start!, object.end!) : undefined;
+    };
+    const visit = (node: Node): void => {
+      if (node.type === 'ObjectExpression') {
+        const properties = (node.properties as Node[]).filter((p) => p.type === 'ObjectProperty');
+        const type = properties.find((p) => nameOf(p) === 'type');
+        if (type && stringOf(child(type, 'value')) === 'tool-result') {
+          const where = `${name}:${node.loc!.start.line}`;
+          literals.push(where);
+          const property = (field: string) => properties.find((p) => nameOf(p) === field);
+          const toolName = property('toolName');
+          if (!toolName) missing.push(where);
+          const idOf = callRead(property('callId'), 'id');
+          const nameFrom = callRead(toolName, 'name');
+          if (idOf !== undefined && nameFrom !== undefined) {
+            paired++;
+            if (idOf !== nameFrom) mismatched.push(`${where}: callId reads ${idOf}, toolName reads ${nameFrom}`);
+          }
+        }
+      }
+      for (const value of Object.values(node)) {
+        if (Array.isArray(value)) { for (const v of value) if (isNode(v)) visit(v); }
+        else if (isNode(value)) visit(value);
+      }
+    };
+    visit(program);
+  }
+  return { literals, paired, missing, mismatched };
+}
 
 /** A tool that settles only when the test says so, so the test owns the work it started. */
 class SlowModule implements Module {
@@ -251,6 +357,158 @@ describe('stop() with work still in flight', () => {
     assert.deepEqual(rejections, []);
   });
 
+  /** A resident whose retry waits longer than the test, so only stop() ends
+   *  the wait, which cancels the retry; `stream` is its one stream. */
+  async function frameworkWaitingToRetry(stream: () => MockYieldingStream): Promise<{
+    framework: AgentFramework; membrane: MockMembrane; inDelay: Promise<void>; turnEvents: Array<{ type: string; reason?: string }>;
+  }> {
+    let waiting!: () => void;
+    const inDelay = new Promise<void>((resolve) => { waiting = resolve; });
+    const membrane = new MockMembrane();
+    membrane.streamYielding = (request) => {
+      membrane.calls.push(request);
+      return stream();
+    };
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'store'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'test' }],
+      modules: [new SlowModule()],
+      gate: { config: { policies: [], default: 'always' } },
+      errorPolicy: {
+        maxRetries: 1,
+        onInferenceError: (_error: Error, _agent: string, attempt: number): ErrorAction => {
+          waiting();
+          return attempt < 1 ? { retry: true, delayMs: 60_000 } : { retry: false };
+        },
+      },
+    });
+    // What a listener that brackets the turn sees, such as a typing loop.
+    const turnEvents: Array<{ type: string; reason?: string }> = [];
+    framework.onTrace((event) => {
+      const traced = event as { type: string; agentName?: string; reason?: string };
+      if (traced.agentName === 'assistant' && /^inference:(started|completed|failed|aborted|exhausted)$/.test(traced.type)) {
+        turnEvents.push({ type: traced.type, ...(traced.reason !== undefined ? { reason: traced.reason } : {}) });
+      }
+    });
+    framework.start();
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+    return { framework, membrane, inDelay, turnEvents };
+  }
+
+  /** The turn's record on /healthz, which ends when the turn does. */
+  function lastInference(framework: AgentFramework): { startedAt?: number; endedAt?: number } | null | undefined {
+    const snapshot = framework.healthSnapshot() as {
+      agents: Array<{ name: string; lastInference: { startedAt?: number; endedAt?: number } | null }>;
+    };
+    return snapshot.agents.find((agent) => agent.name === 'assistant')?.lastInference;
+  }
+
+  const RETRY_CANCELLED = 'a retry waiting while the framework was stopping is dropped before it sends anything';
+
+  /** A stream that fails once it has started, so driveStream waits to retry. */
+  function failingOnceStarted(): MockYieldingStream {
+    const stream = new MockYieldingStream([]);
+    (stream as unknown as { events: unknown[] }).events.push({ type: 'error', error: new Error('overloaded') });
+    return stream;
+  }
+
+  it('a turn whose retry stop() cancels leaves no agent inferring at the event gate, and ends saying why', { timeout: 60_000 }, async () => {
+    // The stream can't start. While an agent is inferring at the gate, the
+    // gate buffers every batch it debounces instead of delivering it, and
+    // wakes no agent for it.
+    const { framework, membrane, inDelay, turnEvents } = await frameworkWaitingToRetry(() => {
+      throw new Error('the stream could not start');
+    });
+    const gate = (framework as unknown as { eventGate: { inferenceDiagnostics(): { inferring: string[] } } }).eventGate;
+    await inDelay;
+    assert.deepEqual(gate.inferenceDiagnostics().inferring, ['assistant'], 'the turn is open at the gate while its retry waits');
+    await framework.stop();
+    assert.deepEqual(gate.inferenceDiagnostics().inferring, [], 'stop() leaves no agent inferring');
+    assert.equal(membrane.calls.length, 1, 'the retry was cancelled, not sent');
+    // The attempt's inference:failed is usually followed by its retry: the
+    // turn ends with an event saying none follows, and its record ends.
+    assert.deepEqual(turnEvents, [
+      { type: 'inference:started' }, { type: 'inference:failed' }, { type: 'inference:aborted', reason: RETRY_CANCELLED },
+    ]);
+    const last = lastInference(framework);
+    assert.ok(last?.endedAt !== undefined && last.endedAt >= (last.startedAt ?? Infinity), JSON.stringify(last));
+    assert.deepEqual(rejections, []);
+  });
+
+  it('a turn whose stream failed once started, and whose retry stop() cancels, ends saying why', { timeout: 60_000 }, async () => {
+    // The same cancelled retry, waited for by the stream's own frame.
+    const { framework, membrane, inDelay, turnEvents } = await frameworkWaitingToRetry(failingOnceStarted);
+    await inDelay;
+    await framework.stop();
+    assert.equal(membrane.calls.length, 1, 'the retry was cancelled, not sent');
+    assert.deepEqual(turnEvents, [
+      { type: 'inference:started' }, { type: 'inference:failed' }, { type: 'inference:aborted', reason: RETRY_CANCELLED },
+    ]);
+    const last = lastInference(framework);
+    assert.ok(last?.endedAt !== undefined && last.endedAt >= (last.startedAt ?? Infinity), JSON.stringify(last));
+    assert.deepEqual(rejections, []);
+  });
+
+  it("a stream's cancelled retry says nothing when another turn of its agent's name holds the turn", { timeout: 60_000 }, async () => {
+    // The events carry only the name, so this frame's end would end that
+    // newer turn's bracket instead, as abortDroppedTurn's drops avoid too.
+    const { framework, inDelay, turnEvents } = await frameworkWaitingToRetry(failingOnceStarted);
+    await inDelay;
+    (framework as unknown as { activeTurnTokens: Map<string, number> }).activeTurnTokens.set('assistant', -1);
+    await framework.stop();
+    assert.deepEqual(turnEvents, [{ type: 'inference:started' }, { type: 'inference:failed' }]);
+    assert.deepEqual(rejections, []);
+  });
+
+  it('a budget restart taken up after a stop() and a start() marks its agent inferring again', { timeout: 60_000 }, async () => {
+    // A restart left queued when stop() ends the loop continues its turn once
+    // a start() on the same framework takes it up. stop() cleared the gate's
+    // entries, and a turn that continues another doesn't start a new one, so
+    // it has to take its agent's again: while no agent is inferring, the gate
+    // delivers debounced batches, and residents share one message slot.
+    const store = JsStore.openOrCreate({ path: join(tempDir, 'store') });
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    let streaming!: () => void;
+    const inStream = new Promise<void>((resolve) => { streaming = resolve; });
+    const membrane = new MockMembrane();
+    membrane.streamYielding = (request) => {
+      membrane.calls.push(request);
+      streaming();
+      return new HeldStream(released, [createMockResponse([{ type: 'text', text: 'continued' }] as ContentBlock[])]);
+    };
+    const framework = await AgentFramework.create({
+      store,
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'test' }],
+      modules: [new SlowModule()],
+      gate: { configPath: join(tempDir, 'gate.json'), config: { policies: [], default: 'always' } },
+    });
+    const internal = framework as unknown as {
+      eventGate: { inferenceDiagnostics(): { inferring: string[] } };
+      pendingRequests: Array<{ agentName: string; reason: string; source: string; timestamp: number }>;
+    };
+    try {
+      framework.start();
+      await framework.stop();
+      // Queued while the framework is stopped, as a restart that stop() left
+      // queued is: the next start()'s loop takes it up.
+      internal.pendingRequests.push({ agentName: 'assistant', reason: 'context_budget_restart', source: 'framework', timestamp: Date.now() });
+      framework.start();
+      await inStream;
+      assert.deepEqual(internal.eventGate.inferenceDiagnostics().inferring, ['assistant'], 'the continuing turn holds its entry');
+      release();
+      await until(() => internal.eventGate.inferenceDiagnostics().inferring.length === 0, 'the turn to end');
+      assert.equal(membrane.calls.length, 1);
+      assert.deepEqual(rejections, []);
+    } finally {
+      release();
+      await framework.stop();
+      store.close();
+    }
+  });
+
   describe("tune-out's subconscious tools", () => {
     /** A framework whose tune-out coordinator is a stand-in that settles when the test says. */
     async function withTuneOut() {
@@ -306,64 +564,81 @@ describe('stop() with work still in flight', () => {
     // The drop's log line names the tool from the event's toolName, so a
     // producer that leaves it out logs a drop nobody can reconcile, and one
     // that names another call's tool misleads whoever reconciles it. Every
-    // object literal in src whose `type` is the string 'tool-result' (in any
-    // quoting) carries toolName, and where its callId and toolName both read
-    // a call (`X.id`, `Y.name`), they read the same one. Read as TypeScript's
-    // syntax tree, not as text, so no spelling of the literal escapes the check.
+    // tool-result object literal in src carries toolName, and where its
+    // callId and toolName both read a call, they read the same one
+    // (scanToolResults, which the next test checks).
     const src = fileURLToPath(new URL('../../src/', import.meta.url));
-    const files: string[] = [];
+    const sources: Array<{ name: string; text: string }> = [];
     const walk = (dir: string): void => {
       for (const name of readdirSync(dir)) {
         const full = join(dir, name);
         if (statSync(full).isDirectory()) walk(full);
-        else if (name.endsWith('.ts')) files.push(full);
+        else if (name.endsWith('.ts')) sources.push({ name: full.slice(src.length), text: readFileSync(full, 'utf8') });
       }
     };
     walk(src);
-    const nameOf = (n: ts.PropertyName): string | undefined =>
-      ts.isIdentifier(n) || ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n) ? n.text : undefined;
-    const isToolResult = (e: ts.Expression): boolean => {
-      while (ts.isAsExpression(e) || ts.isSatisfiesExpression(e) || ts.isParenthesizedExpression(e)) e = e.expression;
-      return (ts.isStringLiteral(e) || ts.isNoSubstitutionTemplateLiteral(e)) && e.text === 'tool-result';
-    };
-    // The call an `X.id` or `X.name` reads, as source text (`call`, `tc`).
-    const callRead = (p: ts.ObjectLiteralElementLike | undefined, field: 'id' | 'name'): string | undefined => {
-      if (!p || !ts.isPropertyAssignment(p)) return undefined;
-      const e = p.initializer;
-      return ts.isPropertyAccessExpression(e) && e.name.text === field ? e.expression.getText() : undefined;
-    };
-    const missing: string[] = [];
-    const mismatched: string[] = [];
-    let literals = 0;
-    let paired = 0;
-    for (const file of files) {
-      const sf = ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true);
-      const visit = (node: ts.Node): void => {
-        if (ts.isObjectLiteralExpression(node)) {
-          const type = node.properties.find((p) => ts.isPropertyAssignment(p) && nameOf(p.name) === 'type');
-          if (type && ts.isPropertyAssignment(type) && isToolResult(type.initializer)) {
-            literals++;
-            const where = `${file.slice(src.length)}:${sf.getLineAndCharacterOfPosition(node.getStart()).line + 1}`;
-            const property = (name: string) => node.properties.find((p) =>
-              (ts.isPropertyAssignment(p) || ts.isShorthandPropertyAssignment(p)) && nameOf(p.name) === name);
-            const toolName = property('toolName');
-            if (!toolName) missing.push(where);
-            const idOf = callRead(property('callId'), 'id');
-            const nameFrom = callRead(toolName, 'name');
-            if (idOf !== undefined && nameFrom !== undefined) {
-              paired++;
-              if (idOf !== nameFrom) mismatched.push(`${where}: callId reads ${idOf}, toolName reads ${nameFrom}`);
-            }
-          }
-        }
-        ts.forEachChild(node, visit);
-      };
-      visit(sf);
-    }
-    assert.ok(literals > 20, `found ${literals} tool-result literals; the scan has lost them`);
+    assert.ok(sources.some((s) => s.name.includes('/')), 'the walk reaches src\'s subdirectories');
+    const { literals, paired, missing, mismatched } = scanToolResults(sources);
+    assert.ok(literals.length > 20, `found ${literals.length} tool-result literals; the scan has lost them`);
     assert.deepEqual(missing, [], 'tool-result events without toolName');
     assert.ok(paired > 20, `paired ${paired} callId/toolName reads; the pairing has lost them`);
     assert.deepEqual(mismatched, [], "tool-result events naming another call's tool");
+  });
+
+  it('the tool-result scan reads every way the literal can be written, and reports what it should', () => {
+    const a = [
+      'declare const call: { id: string; name: string };',
+      'declare const other: { id: string; name: string };',
+      'declare const maybe: { id: string; name: string } | undefined;',
+      'export const events = [',
+      "  { type: 'tool-result', callId: call.id, toolName: call.name },",
+      '  { type: "tool-result", callId: call.id, toolName: call.name },',
+      '  { type: `tool-result`, callId: call.id, toolName: call.name },',
+      "  { type: 'tool\\x2dresult', callId: call.id, toolName: call.name },",
+      "  { 'type': 'tool-result' as const, callId: call.id, toolName: call.name },",
+      "  { type: ('tool-result') satisfies string, callId: call.id, toolName: call.name },",
+      "  { ['type']: <const>'tool-result', callId: call.id, toolName: call.name },",
+      "  { type: 'tool-result'!, callId: (call as typeof call).id as string, toolName: call!.name! },",
+      "  { type: 'tool-result', callId: maybe?.id, toolName: maybe?.name },",
+      "  { type: 'tool-result', callId: call['id'], toolName: call[`name`] },",
+      "  { type: 'tool-result', callId: ev.call.id, toolName: ev.call.name },",
+      "  { type: 'tool-result', callId: call.id },",
+      "  { type: 'tool-result', callId: call.id, toolName: other.name },",
+      "  { type: 'tool-result', callId: (call).id, toolName: (other as typeof other).name },",
+      "  { type: 'tool-result', callId: 'c1', toolName: 'read' },",
+      "  { type: 'tool-result', callId: call.id, toolName: call.id },",
+      "  { type: 'tool-result', callId: call[id], toolName: call.name },",
+      "  { type: 'tool-result', callId: call.id, toolName: other.name ?? 'read' },",
+      "  { type: 'tool-result', callId: call.id, [toolName]: call.name },",
+      "  { type: 'tool-result', callId: call.id, get toolName() { return call.name; } },",
+      "  { ...base, type: 'tool-result', callId: call.id },",
+      "  { [type]: 'tool-result', callId: call.id },",
+      '  { type: `tool-result${suffix}`, callId: call.id },',
+      "  { type: 'tool-results', callId: call.id },",
+      "  { kind: 'tool-result', callId: call.id },",
+      '];',
+    ].join('\n');
+    const b = [
+      'export function emit(wrap: (e: unknown) => void, call: { id: string; name: string }) {',
+      "  wrap({ inner: { type: 'tool-result', callId: call.id, toolName: call.name } });",
+      "  wrap({ type: 'tool-result', callId: call.id });",
+      '}',
+    ].join('\n');
+    const result = scanToolResults([{ name: 'a.ts', text: a }, { name: 'b.ts', text: b }]);
+    const at = (name: string, ...ns: number[]) => ns.map((n) => `${name}:${n}`);
+    assert.deepEqual(result.literals, [...at('a.ts', 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25), ...at('b.ts', 2, 3)],
+      'each spelling of the literal, wherever it sits, and nothing else');
+    // A computed variable key, a getter and a spread aren't read, so their toolName is missing.
+    assert.deepEqual(result.missing, [...at('a.ts', 16, 23, 24, 25), ...at('b.ts', 3)]);
+    // Through wrappers, optional and computed string members, and a member chain;
+    // not a wrong field, a variable index, a string or a fallback.
+    assert.equal(result.paired, 14, 'the call reads paired');
+    assert.deepEqual(result.mismatched, [
+      'a.ts:17: callId reads call, toolName reads other',
+      'a.ts:18: callId reads call, toolName reads other',
+    ]);
+    // A source Babel can't parse fails the scan by name.
+    assert.throws(() => scanToolResults([{ name: 'broken.ts', text: 'const = ;' }]), /^Error: broken\.ts: /);
   });
 
   describe('a server sending while the host stops', () => {
