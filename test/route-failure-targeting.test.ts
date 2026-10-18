@@ -395,6 +395,7 @@ describe('notices about an agent\'s own action', () => {
         takeUnsent(agent: unknown, body: string, round: unknown, prefix: '>>'): unknown;
         dismissLatestBounce(agent: unknown): void;
         draftsSending: Set<string>;
+        draftsInFlight: Set<string>;
       };
       const agent = framework.getAgent('secondary')!;
       const writes = [
@@ -412,9 +413,11 @@ describe('notices about an agent\'s own action', () => {
         assert.deepEqual(state.takeUnsent(agent, '{{unsent}}', round, '>>'), { refused: true });
         const held = state.holdProseDrafts(agent, [{ text: 'words held at once' }], 'bounced', { routing: state.routingOf('secondary'), notice: 'now' });
         assert.equal(held.length, 1, 'the draft is held as before');
-        // >>skip_reply {{unsent}} while that draft is being sent.
+        // >>skip_reply {{unsent}}, and {{unsent}}, while that draft is being sent.
         state.draftsSending.add(`secondary\u0000${held[0]!.id}`);
+        state.draftsInFlight.add(`secondary\u0000${held[0]!.id}`);
         state.dismissLatestBounce(agent);
+        assert.equal((state.takeUnsent(agent, '{{unsent}}', round, '>>') as { refused?: unknown }).refused, true);
         state.bounceProse(agent, 'words whose send threw', 'connection lost', undefined, '>>', round, { outcome: 'unknown' });
         await framework.runUntilIdle();
       } finally {
@@ -428,6 +431,7 @@ describe('notices about an agent\'s own action', () => {
       assert.ok(errors.includes('[notice] secondary is no longer registered, so its unknown-send notice is dropped'));
       assert.ok(errors.includes('[notice] secondary is no longer registered, so its empty-{{unsent}} notice is dropped'));
       assert.ok(errors.includes('[notice] secondary is no longer registered, so its in-flight-dismiss notice is dropped'));
+      assert.ok(errors.includes('[notice] secondary is no longer registered, so its refused-{{unsent}} notice is dropped'));
       assert.ok(!errors.some((e) => /not a registered agent/.test(e)), 'not dropped by addMessage instead');
     });
 
