@@ -32,9 +32,19 @@ export interface AgentConfig {
   strategy?: ContextStrategy;
 
   /**
-   * Which tools this agent can use.
+   * Enforced at dispatch for registered agent callers; omitted means 'all'.
    * - 'all': all available tools
-   * - string[]: specific tool names (with module prefix)
+   * - string[]: exact tool names, including module--utility names for utilities.
+   * Utilities aren't tools of their own: an agent's model and its scripts are
+   * offered them only through 'utils', whose run checks the utility's own
+   * name. An agent that should use a utility lists both 'utils' and
+   * 'module--utility'. The name alone passes the dispatch check for any call
+   * by that name, whether the host makes it with executeToolCall on the
+   * agent's behalf or the model or a script makes it without being offered
+   * it. The slot is hidden when no utility is permitted.
+   * Trusted module calls are exempt. Genuinely unidentified public callers,
+   * including unknown legacy names, remain unrestricted. Framework-created
+   * identities have tool authority only while registered.
    */
   allowedTools?: 'all' | string[];
 

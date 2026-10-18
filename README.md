@@ -64,12 +64,32 @@ Chronicle's audit history.
   model: 'claude-opus-4-20250514',
   systemPrompt: '...',
   strategy: new AutobiographicalStrategy({ recentWindowTokens: 30000 }),
-  allowedTools: ['search', 'read', 'write'],   // or 'all'
+  allowedTools: ['search--query', 'utils', 'files--archive'], // or 'all'
   triggerSources: ['discord'],                   // or 'all'
   maxTokens: 8192,
   maxStreamTokens: 150_000,  // input token budget before stream restart
 }
 ```
+
+`allowedTools` is enforced at dispatch for registered agents. Omission or
+`'all'` permits all tools; an explicit list matches exact names, including
+`module--utility` names. Utilities aren't tools of their own: an agent's model
+and its scripts are offered them only through `utils`, whose `run` checks the
+utility's own name. An agent that should use a utility lists both `utils` and
+`module--utility`. The name alone passes the dispatch check for any call by
+that name, whether the host makes it with `executeToolCall` on the agent's
+behalf or the model or a script makes it without being offered it. The slot
+is hidden when the agent can use no registered utility. If utilities exist
+but none are permitted, `list` returns a failed `ToolResult` with the registered
+and permitted counts and migration advice, and a list containing `utils`
+logs one warning per Agent instance after registration.
+An empty registry still returns a successful empty list.
+
+Trusted module calls are exempt from agent allowlists. Genuinely unidentified
+public callers, including unknown legacy caller names, remain unrestricted.
+Framework-created ephemeral and conversation identities fail closed while
+unregistered. Hosts using `createEphemeralAgent` must register and run the
+returned agent through `runEphemeralToCompletion` for tool authority.
 
 **Inference modes:**
 - **Streaming** (default in framework): `startStreamWithInjections()` returns a `YieldingStream` that emits tokens, tool calls, and completion events. The framework drives the stream, dispatches tools, and resumes automatically.
