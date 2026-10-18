@@ -20,10 +20,6 @@
   `agent-framework-recover --awareness list|cancel|retract`. Each control
   that changes the journal is recorded in the operator log, and refuses
   once `stop()` has begun, like every operator entry point.
-- A turn-based `host/command` `undo` that undoes a turn records one
-  `undo-turns` entry in the operator log: the requested turns, the marks
-  choice (`none` included) and the receipt, beside the per-turn `undo-turn`
-  entries.
 - `agent-framework-recover` records its acts in the store's operator log
   (`<store>/operator-actions.jsonl`), done or refused, with the OS account
   that ran it: each `--awareness` cancel and retract, and each recovery with

@@ -1520,9 +1520,10 @@ interface HostCommandParams {
    *  (regardless of participant) are no longer on the active branch.
    *  Mutually exclusive with `turns`. */
   messages?: number;
-  /** Message-granular undo and `hide`: awareness marks on the removed
-   *  Discord messages, `none` (the default), `addressed` or `all`. Any other
-   *  value is refused. */
+  /** Message-granular undo: awareness marks on the removed Discord
+   *  messages, `none` (the default), `addressed` or `all`. Any other value
+   *  is refused, and so is a choice other than `none` for `hide` or an undo
+   *  by turns, which place no marks. */
   marks?: string;
   /** For the `marks` command: `list`, `cancel` or `retract`. */
   action?: string;
@@ -8482,8 +8483,8 @@ export class AgentFramework {
     /** Discord addresses removed by message-granular undo. The durable outbox
      *  owns eventual delivery; this is also returned for immediate surfaces. */
     removedRefs?: Array<{ serverId: string; channelId: string; messageId: string }>;
-    /** For message-granular undo and `hide`: whether awareness marks were
-     *  scheduled (not whether Discord has accepted them). */
+    /** For message-granular undo: whether awareness marks were scheduled
+     *  (not whether Discord has accepted them). */
     markers?: SurgeryMarkerReceipt;
     /** For the `marks` command: the journal's batches (`list`) or the
      *  action's receipt. */
@@ -8525,14 +8526,22 @@ export class AgentFramework {
     ) {
       return { ok: false, error: `Unknown host command: ${String(params.command)}` };
     }
-    if (
-      (params.command === 'undo' || params.command === 'hide')
-      && params.marks !== undefined && params.marks !== 'none' && params.marks !== 'addressed' && params.marks !== 'all'
-    ) {
+    if ((params.command === 'undo' || params.command === 'hide') && params.marks !== undefined && params.marks !== 'none') {
       // A publication choice is never guessed: a mistyped scope is refused
-      // rather than silently treated as none (or as anything else). The
-      // verbs that remove nothing take no choice and ignore the field.
-      return { ok: false, error: `marks must be none, addressed or all (got ${JSON.stringify(params.marks)})` };
+      // rather than silently treated as none (or as anything else), and so
+      // is a choice the command can't carry out. Only an undo by messages,
+      // which rolls back, marks what it removes: hide's marks are
+      // discord-mcpl's own, and an undo by turns places none. The verbs that
+      // remove nothing take no choice and ignore the field.
+      if (params.command === 'hide' || !(typeof params.messages === 'number' && params.messages > 0)) {
+        return {
+          ok: false,
+          error: `marks apply only to an undo by messages; ${params.command === 'hide' ? 'hide' : 'an undo by turns'} places none (got ${JSON.stringify(params.marks)})`,
+        };
+      }
+      if (params.marks !== 'addressed' && params.marks !== 'all') {
+        return { ok: false, error: `marks must be none, addressed or all (got ${JSON.stringify(params.marks)})` };
+      }
     }
 
     // Host-scoped verbs (issue #122) — no agent resolution.
@@ -8697,9 +8706,6 @@ export class AgentFramework {
           error: `Cannot hide: a live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName} holds the store — retry when it completes`,
         };
       }
-      const hideMarks: DiscordAwarenessMarks = params.marks === 'addressed' || params.marks === 'all'
-        ? { scope: params.marks }
-        : 'none';
       if (!params.fromMessageId) {
         return { ok: false, error: 'hide: fromMessageId is required' };
       }
@@ -8769,18 +8775,6 @@ export class AgentFramework {
         };
       }
 
-      // Like every surgery, a redaction holds the whole store: no turn (of
-      // any agent sharing it) may start while messages are being removed.
-      let release: () => void;
-      try {
-        release = this.reserveStoreForSurgery('hide', agentName);
-      } catch (error) {
-        return {
-          ok: false,
-          error: error instanceof Error ? error.message : String(error),
-          ...(error instanceof OperatorActionError ? { code: error.code } : {}),
-        };
-      }
       try {
         if (params.toMessageId) {
           const toIdx = byDiscordId(params.toMessageId);
@@ -8803,9 +8797,6 @@ export class AgentFramework {
           const hidden = messagesIn(runs);
           const rangeIds = runs.flatMap(({ from, to }) => all.slice(from, to + 1).map((m) => String(m.id)));
           for (const { from, to } of runs) removeStoredMessages(cm, all[from], all[to]);
-          const markers = this.scheduleAppliedMarks(
-            'hide', agentName, serverId, runs.flatMap(({ from, to }) => all.slice(from, to + 1)), hideMarks,
-          );
           console.error(
             `[host-command] hide agent=${agentName} range removed=${hidden} ` +
               `(${params.fromMessageId}..${params.toMessageId}) by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
@@ -8815,24 +8806,18 @@ export class AgentFramework {
             kind: 'hide',
             agent: agentName,
             requester: hostCommandRequester(serverId, params),
-            params: {
-              fromMessageId: params.fromMessageId,
-              toMessageId: params.toMessageId,
-              marks: describeMarksChoice(hideMarks),
-            },
+            params: { fromMessageId: params.fromMessageId, toMessageId: params.toMessageId },
             result: {
               branch: this.store.currentBranch().name,
               hidden,
               removedIds: loggedRange.ids,
               ...(loggedRange.truncated ? { removedIdsTruncated: true } : {}),
-              markers,
             },
           });
           return {
             ok: true,
             hidden,
             hiddenRefs: refs,
-            markers,
             lastVisible: await this.lastVisiblePreview(agentName),
           };
         }
@@ -8841,9 +8826,6 @@ export class AgentFramework {
         const hidden = messagesIn(runs);
         const hiddenIds = runs.flatMap(({ from, to }) => all.slice(from, to + 1).map((m) => String(m.id)));
         for (const { from, to } of runs) removeStoredMessages(cm, all[from], all[to]);
-        const markers = this.scheduleAppliedMarks(
-          'hide', agentName, serverId, runs.flatMap(({ from, to }) => all.slice(from, to + 1)), hideMarks,
-        );
         console.error(
           `[host-command] hide agent=${agentName} removed=${hidden} (${params.fromMessageId}) ` +
             `by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
@@ -8855,26 +8837,22 @@ export class AgentFramework {
           kind: 'hide',
           agent: agentName,
           requester: hostCommandRequester(serverId, params),
-          params: { fromMessageId: params.fromMessageId, marks: describeMarksChoice(hideMarks) },
+          params: { fromMessageId: params.fromMessageId },
           result: {
             branch: this.store.currentBranch().name,
             hidden,
             removedIds: loggedIds.ids,
             ...(loggedIds.truncated ? { removedIdsTruncated: true } : {}),
-            markers,
           },
         });
         return {
           ok: true,
           hidden,
           hiddenRefs: refs,
-          markers,
           lastVisible: await this.lastVisiblePreview(agentName),
         };
       } catch (error) {
         return { ok: false, error: error instanceof Error ? error.message : String(error) };
-      } finally {
-        release();
       }
     }
 
@@ -8925,103 +8903,31 @@ export class AgentFramework {
     }
 
     const requested = Math.max(1, Math.min(20, Math.floor(params.turns ?? 1)));
-    const turnMarks: DiscordAwarenessMarks = params.marks === 'addressed' || params.marks === 'all'
-      ? { scope: params.marks }
-      : 'none';
-    // Each undone turn switches the whole store: hold it, like every surgery,
-    // for the whole act, so no agent sharing it can start a turn between the
-    // address snapshots and the switches they bracket.
-    let release: () => void;
-    try {
-      release = this.reserveStoreForSurgery('undo turns', agentName);
-    } catch (error) {
-      return {
-        ok: false,
-        error: error instanceof Error ? error.message : String(error),
-        ...(error instanceof OperatorActionError ? { code: error.code } : {}),
-      };
-    }
     let undone = 0;
-    let markers: SurgeryMarkerReceipt;
     try {
-      // What the undone turns remove from this agent's context is whatever is
-      // in it now and not after: addressing metadata only, never content.
-      const before = this.addressingSnapshot(agentName);
-      try {
-        for (let i = 0; i < requested; i++) {
-          const r = this.runUndoLastTurn(agentName, hostCommandRequester(serverId, params), true);
-          if (!r.undone) break;
-          undone++;
-        }
-      } catch (error) {
-        // e.g. "Cannot undo while agent is streaming" — report what happened,
-        // including any turns already undone before the failure.
-        const msg = error instanceof Error ? error.message : String(error);
-        if (undone === 0) return { ok: false, error: msg, ...(error instanceof OperatorActionError ? { code: error.code } : {}) };
-        console.error(`[host-command] undo partially failed after ${undone}/${requested}: ${msg}`);
+      for (let i = 0; i < requested; i++) {
+        const r = this.runUndoLastTurn(agentName, hostCommandRequester(serverId, params));
+        if (!r.undone) break;
+        undone++;
       }
-
-      console.error(
-        `[host-command] undo agent=${agentName} requested=${requested} undone=${undone}` +
-          ` by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
-      );
-
-      if (undone === 0) {
-        return {
-          ok: true,
-          undone: 0,
-          requested,
-          markers: { scope: marksScope(turnMarks) as SurgeryMarkerReceipt['scope'], unmarked: 0, notRemoved: 0, status: 'none', queued: 0 },
-          lastVisible: null,
-        };
-      }
-
-      // Marks are a one-shot choice about the messages these turns removed;
-      // the branch move itself never adds or removes any.
-      const after = new Set(this.addressingSnapshot(agentName).keys());
-      const removed = [...before].filter(([id]) => !after.has(id)).map(([, carrier]) => carrier);
-      markers = this.scheduleAppliedMarks('undo', agentName, serverId, removed, turnMarks);
-      // Each turn is logged by undoLastTurn; the command's marks choice
-      // (`none` included) and what it scheduled are logged here, as hide and
-      // rollback log theirs.
-      this.recordOperatorAction({
-        kind: 'undo-turns',
-        agent: agentName,
-        requester: hostCommandRequester(serverId, params),
-        params: { turns: requested, marks: describeMarksChoice(turnMarks) },
-        result: { undone, markers },
-      });
-    } finally {
-      release();
+    } catch (error) {
+      // e.g. "Cannot undo while agent is streaming" — report what happened,
+      // including any turns already undone before the failure.
+      const msg = error instanceof Error ? error.message : String(error);
+      if (undone === 0) return { ok: false, error: msg, ...(error instanceof OperatorActionError ? { code: error.code } : {}) };
+      console.error(`[host-command] undo partially failed after ${undone}/${requested}: ${msg}`);
     }
-    return { ok: true, undone, requested, markers, lastVisible: await this.lastVisiblePreview(agentName) };
-  }
 
-  /**
-   * The addressing metadata of every message in an agent's context, by
-   * message id, read in bounded windows without resolving blobs: the Discord
-   * address and MCPL tags only, never content.
-   */
-  private addressingSnapshot(agentName: string): Map<string, { metadata: Record<string, unknown> }> {
-    const snapshot = new Map<string, { metadata: Record<string, unknown> }>();
-    const cm = this.agents.get(agentName)?.getContextManager();
-    if (!cm) return snapshot;
-    const total = cm.getMessageCount();
-    for (let offset = 0; offset < total; offset += 500) {
-      const { messages } = cm.getMessageWindow(offset, Math.min(500, total - offset), { resolveBlobs: false });
-      for (const message of messages) {
-        const metadata = (message.metadata ?? {}) as Record<string, unknown>;
-        snapshot.set(String(message.id), {
-          metadata: {
-            serverId: metadata.serverId,
-            channelId: metadata.channelId,
-            messageId: metadata.messageId,
-            tags: metadata.tags,
-          },
-        });
-      }
+    console.error(
+      `[host-command] undo agent=${agentName} requested=${requested} undone=${undone}` +
+        ` by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
+    );
+
+    if (undone === 0) {
+      return { ok: true, undone: 0, requested, lastVisible: null };
     }
-    return snapshot;
+
+    return { ok: true, undone, requested, lastVisible: await this.lastVisiblePreview(agentName) };
   }
 
   /**
@@ -9379,10 +9285,8 @@ export class AgentFramework {
   }
 
   /** undoLastTurn's work, for a host/command undo already admitted: a stop()
-   *  begun by a trace of one of its turns doesn't refuse the next. That undo
-   *  holds the store for all its turns (`holdsStore`); any other caller is
-   *  refused while a surgery or a branch switch holds it. */
-  private runUndoLastTurn(agentName: string, requester?: OperatorRequester, holdsStore = false): {
+   *  begun by a trace of one of its turns doesn't refuse the next. */
+  private runUndoLastTurn(agentName: string, requester?: OperatorRequester): {
     undone: boolean;
     turnIndex?: number;
     fromBranch?: string;
@@ -9396,7 +9300,7 @@ export class AgentFramework {
       throw new Error(`Cannot undo while agent is ${agent.state.status}`);
     }
     // A surgery or a branch switch holds the store while it awaits its steps.
-    if (this.surgeryHold && !holdsStore) {
+    if (this.surgeryHold) {
       throw new OperatorActionError('agent-busy', `Cannot undo: the store is under live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName}`);
     }
 
@@ -9705,7 +9609,7 @@ export class AgentFramework {
     } catch (error) {
       const detail = boundDiscordAwarenessText(error instanceof Error ? error.message : String(error));
       // A retirement can land before its durable barrier fails: what the
-      // journal holds decides, as in settleApplied. Undefined: it can't be
+      // journal holds decides, as in settleActivation. Undefined: it can't be
       // read back.
       let landed: boolean | undefined;
       try {
@@ -10372,7 +10276,7 @@ export class AgentFramework {
    */
   private activateSurgeryMarkers(
     batch: DiscordAwarenessBatch | null,
-    verb: 'rollback' | 'suppress' | 'hide' | 'undo',
+    verb: 'rollback' | 'suppress',
     agentName: string,
     facts: SurgeryMarkerFacts,
   ): SurgeryMarkerReceipt {
@@ -10417,7 +10321,7 @@ export class AgentFramework {
     settled: DiscordAwarenessSettlement,
     batchId: string,
     marks: number,
-    verb: 'rollback' | 'suppress' | 'hide' | 'undo',
+    verb: 'rollback' | 'suppress',
     agentName: string,
     facts: SurgeryMarkerFacts,
   ): SurgeryMarkerReceipt {
@@ -10452,59 +10356,6 @@ export class AgentFramework {
   }
 
   /**
-   * Marks for a change already applied in place (an in-place `hide`, or a
-   * turn undo), recorded and settled after it by the journal
-   * (settleApplied): the batch is written only once the change is synced,
-   * and a failed write is reported from what the journal then holds. Old
-   * records without a serverId are routed through the server that issued
-   * the command. Never throws: the change stands either way.
-   */
-  private scheduleAppliedMarks(
-    verb: 'hide' | 'undo',
-    agentName: string,
-    serverId: string,
-    removed: Array<{ metadata?: Record<string, unknown> }>,
-    marks: DiscordAwarenessMarks,
-  ): SurgeryMarkerReceipt {
-    const carriers = removed.map((message) => ({
-      metadata: { ...(message.metadata ?? {}), serverId: message.metadata?.serverId ?? serverId },
-    }));
-    const selection = selectDiscordAwarenessRefs(carriers, marks);
-    const facts: SurgeryMarkerFacts = {
-      scope: marksScope(marks) as SurgeryMarkerReceipt['scope'],
-      unmarked: selection.unmarked,
-      notRemoved: selection.notRemoved,
-    };
-    if (selection.refs.length === 0) return { ...facts, status: 'none', queued: 0 };
-    let branch: string;
-    try {
-      branch = this.store.currentBranch().name;
-    } catch (error) {
-      // Nothing was recorded, so nothing will be sent.
-      const detail = boundDiscordAwarenessText(error instanceof Error ? error.message : String(error));
-      this.opsAlert(
-        'discord-awareness-not-scheduled',
-        agentName,
-        `${verb} applied, but its ${selection.refs.length} awareness mark(s) were not scheduled: ${detail}`,
-      );
-      return { ...facts, status: 'not-scheduled', queued: 0, error: detail };
-    }
-    const applied = this.discordAwarenessOutbox.settleApplied({
-      agentName,
-      branch,
-      refs: selection.refs,
-      scope: marksScope(marks),
-      unmarked: selection.unmarked,
-      notRemoved: selection.notRemoved,
-      emoji: this.discordAwarenessEmoji,
-    });
-    if (!applied) return { ...facts, status: 'none', queued: 0 };
-    const receipt = this.settledMarkerReceipt(applied.settled, applied.batchId, applied.marks, verb, agentName, facts);
-    if (receipt.status === 'queued') this.deliverDiscordAwarenessInBackground(verb, agentName);
-    return receipt;
-  }
-
-  /**
    * Start awareness delivery without the caller awaiting it. The drain starts
    * in the same synchronous run (the first request can be written before
    * this returns) and continues independently. Delivery never gates MCPL
@@ -10519,7 +10370,7 @@ export class AgentFramework {
    * surgery made during a quiesce has its marks sent then.
    */
   private deliverDiscordAwarenessInBackground(
-    occasion: 'rollback' | 'suppress' | 'hide' | 'undo' | 'retract' | 'startup' | 'connect' | 'list-change' | 'reconnect',
+    occasion: 'rollback' | 'suppress' | 'retract' | 'startup' | 'connect' | 'list-change' | 'reconnect',
     agentName: string,
   ): void {
     if (this.stopHasBegun()) {
@@ -21525,8 +21376,7 @@ export class AgentFramework {
    * as a rollback's, or as a suppression's when the recovery suppressed, so
    * the report names both. One with marks not applied, or a body given up, raises an ops alert; one
    * with neither (no marks chosen, or its marks cancelled, and its body
-   * finished) is only logged. A hide or turn undo records its batch and its
-   * activation as one entry, so it never leaves a batch for a start.
+   * finished) is only logged.
    */
   private reportRetiredAwareness(retirement: DiscordAwarenessRetirement, opts: { finished?: boolean } = {}): void {
     const { batchId, agentName, sourceBranch, targetBranch, marks } = retirement;

@@ -782,11 +782,9 @@ describe('stop() with an operator operation in flight', () => {
           respondError: (error: unknown) => { answer = { respondError: String(error) }; },
         });
         await until(() => answer !== undefined, 'the host/command undo to answer');
-        // It holds the store for all its turns, so its own reservation is
-        // what refuses.
         assert.deepEqual(answer, {
           ok: false,
-          error: 'Cannot undo turns: a live switch branch for every agent is already in progress',
+          error: 'Cannot undo: the store is under live switch branch for every agent',
           code: 'agent-busy',
         });
       } finally { release(); }
@@ -893,7 +891,7 @@ describe('stop() with an operator operation in flight', () => {
     const drain = fw.drainDiscordAwarenessOutbox('srv').catch(() => {});
     const alerts: string[] = [];
     fw.opsAlert = (kind, _key, text) => { alerts.push(`${kind}: ${text}`); };
-    fw.deliverDiscordAwarenessInBackground('hide', 'agent'); // nothing is due
+    fw.deliverDiscordAwarenessInBackground('rollback', 'agent'); // nothing is due
     fail(new Error('the route went away'));
     await drain;
     for (let turn = 0; turn < 5; turn++) await new Promise<void>((resolve) => { setImmediate(resolve); });

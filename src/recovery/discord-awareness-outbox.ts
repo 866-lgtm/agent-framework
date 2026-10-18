@@ -17,8 +17,8 @@ import { OperatorActionError } from '../operator-log.js';
  * state, and a restart never activates a surgery's marks. A batch a crash
  * left prepared is retired at startup, unsent, and the operator redoes the surgery from its source to
  * choose marks again (see recoverAtStartup). Marks already recorded as
- * requests (an activated batch's, or the one-entry batch of a hide or turn
- * undo) go out with any delivery pass, a start's included. What
+ * requests (an activated batch's) go out with any delivery pass, a start's
+ * included. What
  * a restart does finish is an interrupted suppression's body, on its own
  * branch. An operator retracts or cancels explicitly. An imported ledger's
  * batches are kept as history, and the work it had still to do is retired,
@@ -423,8 +423,8 @@ export function extractDiscordAwarenessRefs(
  * scope filter and mark every addressable message. Each entry point that
  * takes a choice in this form checks it with this before it plans or
  * changes anything: the framework's rollback and suppression, and the
- * offline recovery. host/command's undo and hide take the bare scope words
- * instead and refuse any other, and the recovery CLI parses its --marks.
+ * offline recovery. host/command's undo by messages takes the bare scope
+ * words instead and refuses any other, and the recovery CLI parses its --marks.
  */
 export function checkedDiscordAwarenessMarks(marks: unknown): DiscordAwarenessMarks {
   if (marks === undefined || marks === 'none') return 'none';
@@ -690,74 +690,6 @@ export class DiscordAwarenessOutbox {
    *  failed inside the store, until the store is reopened (see load). */
   get readable(): boolean {
     return !this.journal.needsReopen;
-  }
-
-  /**
-   * Marks for a body change already applied on `branch` (an in-place hide, a
-   * turn undo): a batch for exactly that branch, recorded and activated in
-   * one entry, with what the journal will do. Its record asserts the change
-   * before it, so it is written only after that change is synced: a crash can
-   * never keep the batch and lose the change, and, being one entry, it never
-   * leaves the batch prepared, for a startup to retire. If writing it fails,
-   * the journal is read back, so the result follows what it holds: a batch
-   * that is not there is `not-scheduled` (nothing was recorded); one that is
-   * there is `queued`, since the entry landed whole before a later step
-   * failed; and if the journal can't be read back, `unresolved`, since the
-   * entry may be there. That includes a write that failed inside the store:
-   * its record may be in the store's log, which this process can't read
-   * until the store is reopened (see load). Returns null when there is
-   * nothing to mark. Never throws.
-   */
-  settleApplied(
-    input: Omit<DiscordAwarenessPrepareInput, 'sourceBranch' | 'targetBranch' | 'activationPolicy' | 'suppressionIntervals'>
-      & { branch: string },
-  ): { batchId: string; marks: number; settled: DiscordAwarenessSettlement } | null {
-    const { branch, ...rest } = input;
-    const batch = batchRecord({ ...rest, sourceBranch: branch, targetBranch: branch, activationPolicy: 'explicit' });
-    if (!batch) return null;
-    const settle = (settled: DiscordAwarenessSettlement) => ({ batchId: batch.id, marks: batch.refs.length, settled });
-    let state: JournalState;
-    try {
-      state = this.load();
-    } catch (error) {
-      // Nothing is written to a journal that can't be read, and nothing
-      // schedules these marks later.
-      return settle({
-        status: 'not-scheduled',
-        error: `the journal could not be read: ${errorText(error)}. Nothing schedules these marks later: the change ` +
-          'stands, and a later hide or undo can\'t choose the messages it removed. No hide or undo schedules marks ' +
-          `until the journal can be read: ${DISCORD_AWARENESS_READ_LIFT}`,
-      });
-    }
-    const at = Date.now();
-    // The choice and its application are one act, later than everything
-    // recorded: its adds take the latest authorization.
-    const requested = this.requestRecords(
-      state,
-      batch.refs.map((ref) => ({ ...ref, action: 'add' as const })),
-      batch.emoji,
-      { kind: 'batch', batchId: batch.id },
-      at,
-    );
-    try {
-      this.append(
-        [{ t: 'batch', at: batch.createdAt, batch }, { t: 'activated', at, batchId: batch.id }, ...requested],
-        { afterCommittedState: true, durable: true },
-      );
-    } catch (error) {
-      const detail = `recording the batch failed: ${errorText(error)}`;
-      try {
-        const after = this.load();
-        if (!after.batches.has(batch.id)) return settle({ status: 'not-scheduled', error: detail });
-        const queued = [...after.ops.values()]
-          .filter((op) => op.cause.kind === 'batch' && op.cause.batchId === batch.id && !op.cancelled).length;
-        // Recorded, so delivered, but not known to be on stable storage.
-        return settle({ status: 'queued', queued, error: detail });
-      } catch (readError) {
-        return settle({ status: 'unresolved', error: `${detail}; reading the journal back also failed: ${errorText(readError)}` });
-      }
-    }
-    return settle({ status: 'queued', queued: liveRequests(requested) });
   }
 
   /**

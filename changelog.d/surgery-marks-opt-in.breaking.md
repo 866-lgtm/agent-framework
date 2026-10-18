@@ -9,25 +9,20 @@
   - **Who needs to act:** a surface that should keep offering marks passes the
     operator's choice: `marks: { scope: 'addressed' | 'all', refs? }` on
     `rollbackToMessage`/`suppressMessages`, `marks: 'addressed' | 'all'` on
-    `host/command` `undo` (by messages or by turns) and `hide`, and
-    `--marks addressed|all` on the CLI. Show `previewSurgeryMarks()` before
+    a `host/command` `undo` by messages, and `--marks addressed|all` on the
+    CLI. Show `previewSurgeryMarks()` before
     the choice, and pass a scope's `refs` back to bind the choice to exactly
     the previewed messages. Any other `marks` value is refused rather than
-    guessed (`invalid`, from the two methods). A surface that reacted to
-    `hide`'s `hiddenRefs` itself should leave marking to the framework: a
-    mark it places itself is outside the journal, so nothing can list or
-    cancel it.
+    guessed (`invalid`, from the two methods). `hide` and an `undo` by turns
+    place no marks, and refuse a `marks` choice other than `none`.
   - **Unchanged:** the body change itself (fork, switch, redaction), the
     receipt's `status` values, the emoji (`discordAwarenessEmoji`) and the
     reaction deadline (`discordAwarenessDeadlineMs`). Marks already on Discord
     are left alone. Receipts (`markers`) now also carry `scope`, `unmarked`
     and `notRemoved`.
-  - `host/command` `hide` and turn-based `undo` now hold the store like
-    every surgery, so they are refused (`agent-busy`) while any agent
-    sharing the store is mid-turn.
-  - An older discord-mcpl's `/hide` reacts 💤 to every message in
-    `hiddenRefs` itself, whatever the framework does, until its companion
-    release, which passes the operator's choice instead.
+  - discord-mcpl 0.3.0's `/hide` reacts 💤 to every message in `hiddenRefs`
+    itself, whatever this framework does: those marks are its own, outside
+    the journal.
 - **Code using `DiscordAwarenessOutbox` directly:** the awareness ledger is now
   an append-only journal of typed records in the Chronicle store, so the
   constructor takes the store: `new DiscordAwarenessOutbox(store, { legacyPath? })`.

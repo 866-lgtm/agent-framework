@@ -455,9 +455,9 @@ const result = await framework.rollbackToMessage('cairn', {
   operations raises one `discord-awareness-delivery` ops alert, and so does
   a start whose reconciliation gives up on any. A JSON-RPC error answer,
   which may come after the server acted, counts as unanswered.
-- **Marks are one-shot.** Switching branches, a redo and restarts never
-  request a mark or a removal of their own: what goes out is what a surgery,
-  a hide or turn undo (the marks chosen for it) or a retract recorded, and a start's delivery sends what of that hasn't gone out. The
+- **Marks are one-shot.** Switching branches, a turn undo, a redo and
+  restarts never request a mark or a removal of their own: what goes out is what a surgery
+  (the marks chosen for it) or a retract recorded, and a start's delivery sends what of that hasn't gone out. The
   journal is an append-only history of requests and their attempts, kept as
   typed records in the Chronicle store: it survives rollbacks, branch
   deletion and a killed process, and lives with its store. Each request is
@@ -470,14 +470,11 @@ const result = await framework.rollbackToMessage('cairn', {
   *authorization* wins, whenever each request was created: a surgery's adds
   carry the moment of its marks choice, even when activation comes later, so
   a retract made in between prevails. A record that
-  certifies a body change (an activation, a completed suppression, a
-  retirement, or the batch a hide or turn undo records after its change) is
-  written only after that change is synced. A journal write the store took
+  certifies a body change (an activation, a completed suppression or a
+  retirement) is written only after that change is synced. A journal write the store took
   but this process can't read back (Chronicle's periodic sync failing inside
   an append) leaves the journal refusing every read and write until the
-  store is reopened; the next start reads that record with the rest. A
-  `hide` or turn `undo` records its batch and the batch's activation as one
-  entry.
+  store is reopened; the next start reads that record with the rest.
 - **A start never activates a surgery's marks.** A batch an interrupted
   surgery left prepared is retired at the next start, none of its marks
   sent. One that had marks to apply raises a `discord-awareness-not-scheduled` ops alert that names the
@@ -536,11 +533,12 @@ const result = await framework.rollbackToMessage('cairn', {
   A request the journal won't carry out (an unknown batch, or one in the
   wrong state) is refused as `invalid`; a failure to read or write the
   journal is `failed`.
-- **Over `host/command`** (servers granted `allowHostCommands`): `undo` (by
-  messages or by turns) and `hide` take `marks: 'none' | 'addressed' | 'all'`
-  (default `none`; any other value is refused) and return `markers`. Each
-  holds the store like every surgery, so it is refused while any agent
-  sharing the store is mid-turn. The `marks` verb takes `action: 'list'
+- **Over `host/command`** (servers granted `allowHostCommands`): an `undo` by
+  messages takes `marks: 'none' | 'addressed' | 'all'` (default `none`; any
+  other value is refused) and returns `markers`. It holds the store like
+  every surgery, so it is refused while any agent sharing the store is
+  mid-turn. `hide` and an `undo` by turns place no marks, and refuse a
+  `marks` choice other than `none`. The `marks` verb takes `action: 'list'
   | 'cancel' | 'retract'` with a `target` (a batch id; for cancel also a
   retract request id; for retract also `all`).
 

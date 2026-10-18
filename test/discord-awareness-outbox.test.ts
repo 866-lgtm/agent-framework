@@ -1809,16 +1809,6 @@ test("an activation that reached the store before its durability barrier failed 
   assert.equal(h.reopen().batches().find((b) => b.id === batch.id)?.status, 'active');
 }));
 
-test("a hide's marks are not scheduled while the journal can't be read, and the receipt says nothing schedules them later", withJournal((_outbox, h) => {
-  h.store.appendJson(DISCORD_AWARENESS_RECORD_TYPE, { v: 99, records: [] });
-  const applied = h.reopen().settleApplied({ agentName: 'cairn', branch: 'main', refs: [ref('m1')], scope: 'all' })!;
-  assert.equal(applied.settled.status, 'not-scheduled');
-  assert.match(
-    applied.settled.error ?? '',
-    /^the journal could not be read: Discord awareness journal entry \S+ is in format 99, which this build can't read \(it reads format 1\); a later build wrote it\. Nothing schedules these marks later: the change stands, and a later hide or undo can't choose the messages it removed\. No hide or undo schedules marks until the journal can be read: after a write that failed inside the store, a restart, which reopens the store, ends this; an entry a later build wrote stays unreadable, and stops every start too, until a build that reads its format runs, and a corrupt entry, or a pre-journal ledger that can't be read, until it is repaired; each is the host operator's to do$/,
-  );
-}));
-
 test("a suppression's resume journal closed with a failed sync is logged, and a closed one says nothing", () => {
   const logged: string[] = [];
   const framework = Object.create(AgentFramework.prototype) as any;
@@ -1856,7 +1846,7 @@ test('the per-batch alerts of a surgery whose marks or journal could not be sett
     framework.traceListeners = [];
     const facts = { scope: 'all', unmarked: 0, notRemoved: 0 };
     // A marker batch whose activation couldn't be recorded, twice.
-    for (const id of ['b1', 'b2']) framework.settledMarkerReceipt({ status: 'not-scheduled', error: 'injected' }, id, 1, 'hide', 'cairn', facts);
+    for (const id of ['b1', 'b2']) framework.settledMarkerReceipt({ status: 'not-scheduled', error: 'injected' }, id, 1, 'rollback', 'cairn', facts);
     // A suppression's resume journal that could be neither closed nor retired, twice.
     framework.discordAwarenessOutbox = { settleActivation: () => ({ status: 'unresolved', error: 'injected' }) };
     for (const id of ['s1', 's2']) framework.activateSurgeryMarkers({ id, refs: [] }, 'suppress', 'cairn', facts);
@@ -1975,137 +1965,40 @@ test('message-granular host/command undo places no marks unless asked; the marks
   }
 });
 
-test('turn-based host/command undo honours the marks choice for the messages its turns removed', async () => {
+test('hide and an undo by turns place no marks: a marks choice is refused before anything is removed', async () => {
   const h = storeHarness();
   try {
-    const messages = [
-      { id: 'i0', metadata: { ...ref('m0') } },
-      { id: 'i1', metadata: { ...ref('m1'), tags: ['chat:addressed'] } }, // arrived during the turn
-      { id: 'i2', metadata: {} },                                          // the agent's reply
-    ];
-    const { framework, removed } = hostCommandFramework(h, messages);
-    let turns = 1;
-    framework.runUndoLastTurn = () => {
-      if (turns === 0) return { undone: false };
-      turns--;
-      removed.add('i1');
-      removed.add('i2');
-      return { undone: true };
-    };
-    await muted(async () => {
-      // Another agent sharing the store is mid-turn: refused, nothing undone.
-      framework.activeTurnTokens.set('other', 99);
-      const busy = await framework.handleHostCommand('discord', { command: 'undo', agentName: 'cairn', turns: 2, marks: 'addressed' });
-      assert.equal(busy.ok, false);
-      assert.equal(busy.code, 'agent-busy');
-      assert.equal(turns, 1);
-      framework.activeTurnTokens.delete('other');
-
-      const result = await framework.handleHostCommand('discord', { command: 'undo', agentName: 'cairn', turns: 2, marks: 'addressed' });
-      assert.equal(framework.surgeryHold, null, 'the reservation was released');
-      assert.equal(result.ok, true);
-      assert.equal(result.undone, 1);
-      assert.equal(result.markers.status, 'queued');
-      assert.equal(result.markers.queued, 1);
-      assert.deepEqual(h.outbox.pendingDispatches('discord').map((d) => d.key.messageId), ['m1']);
-    });
-  } finally {
-    h.cleanup();
-  }
-});
-
-test('a turn undo records its marks choice and what it scheduled in the operator log, also for marks none', async () => {
-  const h = storeHarness();
-  try {
-    const messages = [
+    const { framework, removed } = hostCommandFramework(h, [
       { id: 'i0', metadata: { ...ref('m0') } },
       { id: 'i1', metadata: { ...ref('m1'), tags: ['chat:addressed'] } },
-      { id: 'i2', metadata: { ...ref('m2') } },
-    ];
-    const { framework, removed } = hostCommandFramework(h, messages);
-    // Each stubbed turn undo removes the next of these from the context.
-    let undoable = ['i1', 'i2'];
-    framework.runUndoLastTurn = () => {
-      const next = undoable[0];
-      if (!next) return { undone: false };
-      undoable = undoable.slice(1);
-      removed.add(next);
-      return { undone: true };
-    };
-    const logged: Array<Record<string, unknown>> = [];
-    framework.recordOperatorAction = (entry: Record<string, unknown>) => { logged.push(entry); return entry; };
-    let marked: any;
-    let local: any;
-    await muted(async () => {
-      marked = await framework.handleHostCommand('discord', {
-        command: 'undo', agentName: 'cairn', turns: 1, marks: 'addressed', requesterName: 'op',
-      });
-      local = await framework.handleHostCommand('discord', { command: 'undo', agentName: 'cairn', turns: 3 });
-      const nothing = await framework.handleHostCommand('discord', { command: 'undo', agentName: 'cairn', turns: 1, marks: 'all' });
-      assert.equal(nothing.undone, 0);
-    });
-    assert.equal(marked.markers.status, 'queued');
-    assert.equal(local.markers.status, 'none');
-    assert.deepEqual(logged, [
-      {
-        kind: 'undo-turns',
-        agent: 'cairn',
-        requester: { via: 'host-command:discord', name: 'op' },
-        params: { turns: 1, marks: { scope: 'addressed' } },
-        result: { undone: 1, markers: marked.markers },
-      },
-      {
-        kind: 'undo-turns',
-        agent: 'cairn',
-        requester: { via: 'host-command:discord' },
-        params: { turns: 3, marks: 'none' },
-        result: { undone: 1, markers: local.markers },
-      },
-    ], 'one entry per command that undid a turn, with the receipt it returned; none when nothing was undone');
-  } finally {
-    h.cleanup();
-  }
-});
-
-test('host/command hide takes the store reservation and marks only on request, through the journal', async () => {
-  const h = storeHarness();
-  try {
-    const { framework } = hostCommandFramework(h, [
-      { id: 'i0', metadata: { ...ref('m0') } },
-      { id: 'i1', metadata: { channelId: 'discord:g1:c1', messageId: 'm1', tags: ['chat:addressed'] } }, // pre-serverId record
-      { id: 'i2', metadata: { ...ref('m2'), tags: ['chat:ambient'] } },
-      { id: 'i3', metadata: { ...ref('m3') } },
     ]);
+    let turnsUndone = 0;
+    framework.runUndoLastTurn = () => { turnsUndone++; return { undone: true }; };
     const logged: Array<Record<string, any>> = [];
     framework.recordOperatorAction = (entry: Record<string, unknown>) => { logged.push(entry); return entry; };
     await muted(async () => {
-      // Another agent sharing the store is mid-turn: hide refuses, removes nothing.
-      framework.activeTurnTokens.set('other', 99);
-      const busy = await framework.handleHostCommand('discord', { command: 'hide', agentName: 'cairn', fromMessageId: 'm3' });
-      assert.equal(busy.ok, false);
-      assert.equal(busy.code, 'agent-busy');
-      framework.activeTurnTokens.delete('other');
+      for (const params of [
+        { command: 'hide', agentName: 'cairn', fromMessageId: 'm1', marks: 'all' },
+        { command: 'undo', agentName: 'cairn', turns: 1, marks: 'addressed' },
+        { command: 'undo', agentName: 'cairn', marks: 'all' },
+      ]) {
+        const refused = await framework.handleHostCommand('discord', params);
+        assert.equal(refused.ok, false, JSON.stringify(params));
+        assert.match(refused.error, /^marks apply only to an undo by messages; (hide|an undo by turns) places none \(got "(all|addressed)"\)$/);
+      }
+      assert.equal(removed.size, 0, 'nothing was hidden');
+      assert.equal(turnsUndone, 0, 'no turn was undone');
 
-      const silent = await framework.handleHostCommand('discord', { command: 'hide', agentName: 'cairn', fromMessageId: 'm3' });
-      assert.equal(silent.ok, true);
-      assert.equal(silent.markers.status, 'none');
-      assert.equal(silent.markers.unmarked, 1);
-      assert.equal(h.outbox.batches().length, 0);
-      assert.equal(framework.surgeryHold, null, 'the reservation was released');
-
-      const marked = await framework.handleHostCommand('discord', {
-        command: 'hide', agentName: 'cairn', fromMessageId: 'm1', toMessageId: 'm2', marks: 'addressed',
-      });
-      assert.equal(marked.hidden, 2);
-      assert.equal(marked.markers.status, 'queued');
-      assert.equal(marked.markers.queued, 1);
-      const [dispatch] = h.outbox.pendingDispatches('discord');
-      assert.deepEqual(dispatch.key, { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm1', emoji: '🫥' });
-      assert.deepEqual(new DiscordAwarenessOutbox(h.store).recoverAtStartup(), { retired: [], pending: [], unknownAttempts: 0, givenUp: 0 });
-      // Each hide that removed messages records its marks choice and the
-      // receipt it returned; the refused one records nothing.
-      const hides = logged.filter((entry) => entry.kind === 'hide');
-      assert.deepEqual(hides.map((entry) => [entry.params?.marks, entry.result?.markers]), [['none', silent.markers], [{ scope: 'addressed' }, marked.markers]]);
+      const hidden = await framework.handleHostCommand('discord', { command: 'hide', agentName: 'cairn', fromMessageId: 'm1', marks: 'none' });
+      assert.equal(hidden.ok, true);
+      assert.equal(hidden.hidden, 1);
+      assert.equal('markers' in hidden, false);
+      const undone = await framework.handleHostCommand('discord', { command: 'undo', agentName: 'cairn', turns: 1 });
+      assert.equal(undone.ok, true);
+      assert.equal(undone.undone, 1);
+      assert.equal('markers' in undone, false);
+      assert.equal(h.outbox.batches().length, 0, 'neither recorded a batch');
+      assert.deepEqual(logged.map((entry) => [entry.kind, entry.params]), [['hide', { fromMessageId: 'm1' }]]);
     });
   } finally {
     h.cleanup();
@@ -2171,159 +2064,6 @@ function journalSeams(store: JsStore) {
     },
   };
 }
-
-/**
- * A hide with marks over a journal whose store faults as `arrange` says.
- * The removal shows in the calls as `remove`.
- */
-async function hideOverFaultyJournal(arrange: (seams: ReturnType<typeof journalSeams>) => void) {
-  const h = storeHarness();
-  const seams = journalSeams(h.store);
-  const outbox = new DiscordAwarenessOutbox(seams.store);
-  outbox.batches(); // loaded before the hide, as a running framework's is
-  const { framework, removed } = hostCommandFramework(h, [
-    { id: 'i0', metadata: { ...ref('m0') } },
-    { id: 'i1', metadata: { ...ref('m1'), tags: ['chat:addressed'] } },
-  ]);
-  framework.discordAwarenessOutbox = outbox;
-  framework.agents.get('cairn').getContextManager().removeMessage = (id: string) => {
-    seams.calls.push('remove');
-    removed.add(id);
-  };
-  const alerts: string[] = [];
-  framework.opsAlert = (kind: string) => { alerts.push(kind); };
-  arrange(seams);
-  const result: any = await muted(() => framework.handleHostCommand('discord', {
-    command: 'hide', agentName: 'cairn', fromMessageId: 'm1', marks: 'all',
-  }));
-  return { h, seams, outbox, result, alerts };
-}
-
-test('a hide records its batch only after the removal is synced: the batch can never outlive the change', async () => {
-  const { h, seams, result } = await hideOverFaultyJournal(() => {});
-  try {
-    assert.equal(result.markers.status, 'queued');
-    const removal = seams.calls.indexOf('remove');
-    const batchAppend = seams.calls.indexOf(JOURNAL_APPEND, removal);
-    assert.ok(removal >= 0 && batchAppend > removal, `calls: ${seams.calls.join(', ')}`);
-    assert.ok(
-      seams.calls.slice(removal, batchAppend).includes('sync'),
-      `the removal is synced before the batch is appended: ${seams.calls.join(', ')}`,
-    );
-  } finally {
-    h.cleanup();
-  }
-});
-
-test('an applied change\'s batch that failed before reaching the store is not scheduled, and nothing delivers it', async () => {
-  // The barrier sync between the removal and the batch's append fails:
-  // nothing is written.
-  const { h, result, alerts } = await hideOverFaultyJournal((seams) => {
-    seams.fail('sync', 'before', (calls) => calls.includes('remove') && !afterAnAppend(calls));
-  });
-  try {
-    assert.equal(result.ok, true, 'the hide stands');
-    assert.equal(result.markers.status, 'not-scheduled');
-    const fresh = new DiscordAwarenessOutbox(h.store);
-    assert.equal(fresh.batches().length, 0, 'nothing was recorded');
-    assert.deepEqual(fresh.recoverAtStartup(), { retired: [], pending: [], unknownAttempts: 0, givenUp: 0 });
-    assert.equal(fresh.pendingDispatches('discord').length, 0);
-    assert.match(result.markers.error, /recording the batch failed: injected sync failure/);
-    assert.deepEqual(alerts, ['discord-awareness-not-scheduled']);
-  } finally {
-    h.cleanup();
-  }
-});
-
-test('an applied change\'s batch that reached the store before its barrier failed is queued, and the receipt follows it', async () => {
-  // The append lands and its durability sync fails: the batch and its
-  // activation are one entry, in the journal, so the operator's choice is
-  // carried out rather than reported as never scheduled.
-  const { h, result, alerts } = await hideOverFaultyJournal((seams) => {
-    seams.fail('sync', 'before', rightAfterAppend);
-  });
-  try {
-    assert.equal(result.markers.status, 'queued', 'not a not-scheduled receipt over a batch that would be delivered');
-    assert.equal(result.markers.queued, 1);
-    // Recorded, but not known to be on stable storage: the receipt says why.
-    assert.match((result.markers as { error?: string }).error ?? '', /^recording the batch failed: injected sync failure/);
-    const fresh = new DiscordAwarenessOutbox(h.store);
-    const [batch] = fresh.batches();
-    assert.equal(batch.id, result.markers.batchId);
-    assert.equal(batch.status, 'active');
-    assert.deepEqual(fresh.pendingDispatches('discord').map((d) => d.key.messageId), ['m1']);
-    assert.deepEqual(fresh.recoverAtStartup(), { retired: [], pending: [], unknownAttempts: 0, givenUp: 0 });
-    assert.deepEqual(alerts, []);
-  } finally {
-    h.cleanup();
-  }
-});
-
-test('an applied change\'s batch is one entry with its activation: once it lands, no later failure leaves it prepared', async () => {
-  // The append lands, and every sync from its own on fails. The batch and
-  // its activation landed together, so there is no prepared batch for a
-  // start to retire: the marks are queued, and a start leaves them so.
-  const { h, result, alerts } = await hideOverFaultyJournal((seams) => {
-    seams.fail('sync', 'before', afterAnAppend, Number.POSITIVE_INFINITY);
-  });
-  try {
-    assert.equal(result.markers.status, 'queued');
-    const fresh = new DiscordAwarenessOutbox(h.store);
-    const [batch] = fresh.batches();
-    assert.equal(batch.id, result.markers.batchId);
-    assert.equal(batch.status, 'active');
-    assert.deepEqual(fresh.recoverAtStartup(), { retired: [], pending: [], unknownAttempts: 0, givenUp: 0 });
-    assert.deepEqual(fresh.pendingDispatches('discord').map((d) => d.key.messageId), ['m1']);
-    assert.deepEqual(alerts, []);
-  } finally {
-    h.cleanup();
-  }
-});
-
-test('an applied change\'s batch whose journal cannot be read back after a failed write is unresolved, with its id', async () => {
-  // The append lands, its durability sync fails, and the read-back fails.
-  const { h, result, alerts } = await hideOverFaultyJournal((seams) => {
-    seams.fail('sync', 'before', rightAfterAppend);
-    seams.fail('list', 'before', afterAnAppend);
-  });
-  try {
-    assert.equal(result.markers.status, 'unresolved');
-    const [batch] = new DiscordAwarenessOutbox(h.store).batches();
-    assert.equal(batch.id, result.markers.batchId, 'the receipt names the batch that may be delivered');
-    assert.equal(batch.status, 'active', 'it landed, activation and all');
-    assert.match(result.markers.error, /reading the journal back also failed: injected list failure/);
-    assert.deepEqual(alerts, ['discord-awareness-unresolved']);
-  } finally {
-    h.cleanup();
-  }
-});
-
-test('an applied change\'s batch written but out of this view of the store is unresolved, and the journal refuses until reopened', async () => {
-  // The batch's append writes its record, then Chronicle's periodic sync
-  // fails: the record is in the store's log, unindexed until a reopen. Read
-  // back in this process, it would look like nothing was recorded.
-  const { h, outbox, result, alerts } = await hideOverFaultyJournal((seams) => {
-    seams.fail('append', 'unindexed', (calls) => calls.includes('remove'));
-  });
-  try {
-    assert.equal(result.ok, true, 'the hide stands');
-    assert.equal(result.markers.status, 'unresolved', 'not a not-scheduled receipt over a batch the next start may deliver');
-    assert.match(result.markers.error, /recording the batch failed: injected append failure after writing.*until the store is reopened/);
-    assert.deepEqual(alerts, ['discord-awareness-unresolved']);
-    assert.throws(() => outbox.batches(), /can't be read in this process.*until the store is reopened/);
-    assert.throws(() => outbox.claimDispatch('discord'), /until the store is reopened/);
-    // The next start reads the entry and, as the receipt says it may,
-    // delivers its marks: it holds the activation too.
-    const fresh = new DiscordAwarenessOutbox(h.store);
-    const [batch] = fresh.batches();
-    assert.equal(batch.id, result.markers.batchId);
-    assert.equal(batch.status, 'active');
-    assert.deepEqual(fresh.recoverAtStartup(), { retired: [], pending: [], unknownAttempts: 0, givenUp: 0 });
-    assert.deepEqual(fresh.pendingDispatches('discord').map((d) => d.key.messageId), ['m1']);
-  } finally {
-    h.cleanup();
-  }
-});
 
 test('an activation written but out of this view is unresolved: nothing retires it, and the next start delivers it', withJournal((_outbox, h) => {
   const seams = journalSeams(h.store);

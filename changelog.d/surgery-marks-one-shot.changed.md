@@ -1,8 +1,7 @@
-- Awareness marks are one-shot. Switching branches, a redo and restarts no
-  longer request marks or removals of their own, and a turn undo requests
-  only the marks chosen for it; previously a mark followed the branch, removed
-  when the source branch became active and re-added when the recovery branch
-  did. An operation is not sent again after three unconfirmed attempts, or
+- Awareness marks are one-shot. Switching branches, a turn undo, a redo and
+  restarts no longer request marks or removals of their own; previously a
+  mark followed the branch, removed when the source branch became active and
+  re-added when the recovery branch did. An operation is not sent again after three unconfirmed attempts, or
   after a refusal no retry can change, and giving up raises a
   `discord-awareness-delivery` ops alert. The README's
   [Live surgery and Discord awareness marks](README.md#live-surgery-and-discord-awareness-marks)
@@ -20,9 +19,8 @@
   offline recovery or the API's `branch.create` refuses its branch name,
   and a switch or a redo onto that branch is refused.
 - A journal record that certifies a body change (a marks activation, a
-  completed suppression, a retired batch, or the batch a `hide` or turn
-  `undo` records after its change) is now written only after that change is
-  synced to the store. Previously a crash could keep marks active for a
+  completed suppression or a retired batch) is now written only after that
+  change is synced to the store. Previously a crash could keep marks active for a
   rollback the store had lost.
 - Awareness delivery no longer holds MCPL traffic. Previously every MCPL
   data plane waited at startup, at reconnect, at a runtime
