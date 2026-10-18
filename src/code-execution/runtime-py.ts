@@ -360,9 +360,14 @@ def _note(stream, text):
 
 def _flush_writers():
     # Send what the script left in its writers, the ones it kept from earlier
-    # execs too.
+    # execs too. A script can put its own code in one, as by replacing its
+    # flush, which may raise anything, SystemExit included: it's said, and the
+    # exec's end goes on, as for a script's own object (_flush_script_streams).
     for writer in list(_script_writers):
-        _flush(writer)
+        try:
+            _flush(writer)
+        except BaseException as exc:
+            _diag("some of what the script wrote couldn't be sent (" + _said(exc) + ")")
 
 
 def _flush_script_streams():

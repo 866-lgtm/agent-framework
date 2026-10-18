@@ -1936,6 +1936,27 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
     }
   });
 
+  it("a script that replaces its writer's flush with one that raises anything, SystemExit included, still settles with the runtime's note, and keeps its interpreter", async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      const cases: [string, string, string][] = [
+        ['an error', 'def flush():\n    raise RuntimeError("no flush")', 'no flush'],
+        ['SystemExit', 'def flush():\n    raise SystemExit(3)', '3'],
+      ];
+      for (const [what, defines, said] of cases) {
+        const result = await within(runner.exec(`import sys\n${defines}\nsys.stdout.flush = flush\nkept = "${what}"`, []), what);
+        assert.deepStrictEqual(
+          { stdout: result.stdout, stderr: result.stderr, returnCode: result.returnCode },
+          { stdout: '', stderr: `[pytc-runtime] some of what the script wrote couldn't be sent (${said})\n`, returnCode: 0 },
+          what,
+        );
+        assert.strictEqual((await within(runner.exec('print(kept)', []), `the next script (${what})`)).stdout, `${what}\n`, what);
+      }
+    } finally {
+      runner.dispose();
+    }
+  });
+
   it("a multiprocessing child doesn't send the parent's partial line again", async () => {
     const runner = new PyRunner({ onToolCall: async () => '' });
     try {
