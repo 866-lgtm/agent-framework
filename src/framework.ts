@@ -101,7 +101,7 @@ import { parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.j
 import { ProseStreamRouter } from './mcpl/prose-stream-router.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
-import { ChannelRegistry, connectorText, type ChannelToolOrigin, type PublishDestination, type PublishOutcome } from './mcpl/channel-registry.js';
+import { ChannelRegistry, connectorText, journalToolDescription, type ChannelToolOrigin, type PublishDestination, type PublishOutcome } from './mcpl/channel-registry.js';
 import { KEEP_IDLE_MS, KEEP_NEWEST, ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftAttempt, type DraftReason, type DraftState, type InheritedRisk } from './prose-drafts.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import { INBOUND_SOURCE_KEY, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
@@ -180,9 +180,11 @@ function sniffImageMediaType(data: Buffer): string | undefined {
  * another external message is injected. The suppression prevents a
  * `send_message` followed by "sent it" from double-posting, but a new message
  * starts a new conversational round and must be answerable with plain prose.
- * `skip_reply` ends the turn at the tool-result boundary, unless it's refused
- * (a wake_in_seconds without an EventGate, or one that isn't a number of
- * seconds): then the turn goes on, and only its own round stays silent.
+ * `skip_reply` ends the turn at the tool-result boundary, unless it's refused,
+ * because the agent's allowedTools doesn't name it or because it asks for a
+ * wake_in_seconds this host can't set (one without an EventGate, or one that
+ * isn't a number of seconds): then the turn goes on, and only its own round
+ * stays silent.
  */
 const SILENCING_TOOLS = new Set([
   'skip_reply', 'channel_publish', 'send_message', 'reply_message', 'send_dm',
@@ -364,7 +366,7 @@ const isAddressedMessage = (
 // envelopes can never disagree on what is a prefix.
 
 /** One-time primer appended when an agent's proseRouting mode changes. */
-function proseModePrimer(mode: 'explicit' | 'hybrid' | 'locus' | 'disabled'): string {
+function proseModePrimer(mode: 'explicit' | 'hybrid' | 'locus' | 'disabled', helpAvailable: boolean): string {
   if (mode === 'locus') {
     return '[prose-routing] Mode change: your plain text auto-routes to the ' +
       'conversational locus again. `>>` destination prefixes are no longer needed.';
@@ -381,14 +383,14 @@ function proseModePrimer(mode: 'explicit' | 'hybrid' | 'locus' | 'disabled'): st
   // message drew a deterministic reasoning_extraction refusal (ablation A/B).
   // The grammar is TAUGHT BY BOUNCE: the first undelivered text produces a
   // notice with the exact resend syntax, and the full reference is available
-  // on demand via the prose_help tool (a tool RESULT is model-requested
+  // on demand via prose_help when allowed by the agent's list (a tool RESULT is model-requested
   // content — the safest role there is). Nothing is injected into the system
   // prompt: those bytes belong to the recipe, and the deepest KV prefix must
   // not vary with framework code.
   return (
     '[prose-routing] Output mode changed: plain text is delivered only with a ' +
-    'destination prefix line, e.g. ">>#channel-name your text". ' +
-    'The prose_help tool shows the full syntax.'
+    'destination prefix line, e.g. ">>#channel-name your text".' +
+    (helpAvailable ? ' The prose_help tool shows the full syntax.' : '')
   );
 }
 
@@ -402,7 +404,7 @@ const PROSE_ROUTING_HELP =
   '  The first destination in a turn applies to the rest of that turn.\n' +
   '  Append " !" after the destination (e.g. ">>#ops !") to start your next turn\n' +
   '  immediately when this one ends, instead of pausing until the next event.\n' +
-  '  >>skip_reply — text stays in your context only, like the skip_reply tool.\n' +
+  '  >>skip_reply — text stays in your context only.\n' +
   'Text without a destination is not delivered: it is held as a draft, and a notice\n' +
   'names it — reply e.g. ">>#channel {{unsent}}" to deliver your latest bounce draft\n' +
   'unchanged, or use the drafts tool to list, resend or dismiss any draft by id.\n' +
@@ -417,6 +419,9 @@ const PROSE_HELP_TOOL: import('./types/index.js').ToolDefinition = {
 /** Strip the `server--` MCPL prefix from a tool name. */
 const bareToolName = (n: string): string => n.split('--').pop()!;
 
+/** "1 registered utility", "2 registered utilities". */
+const registeredUtilities = (n: number): string => `${n} registered ${n === 1 ? 'utility' : 'utilities'}`;
+
 /** The single slot behind which every rarely-used capability lives. Only
  *  advertised when at least one module contributes utilities — with none
  *  registered the surface is byte-identical to before this existed. */
@@ -424,7 +429,7 @@ const UTILS_TOOL: import('./types/index.js').ToolDefinition = {
   name: 'utils',
   description:
     'Rarely-used utilities, behind one slot instead of each costing a tool. ' +
-    '"list" names them all with one-liners; "describe" returns one utility\'s full ' +
+    '"list" names the utilities you can use, with one-liners; "describe" returns one utility\'s full ' +
     'input schema; "run" invokes it (args are validated against that schema — a ' +
     'miss bounces back with the schema and the specific error).',
   inputSchema: {
@@ -2049,6 +2054,8 @@ export class AgentFramework {
   private usedEphemeralAgentNames: Set<string> = new Set();
   /** One-shot generation tickets minted by createEphemeralAgent. */
   private ephemeralCandidates: WeakMap<Agent, ContextManager> = new WeakMap();
+  /** Warn only once per Agent instance after utilities are registered. */
+  private emptyUtilityPermissionWarnings: WeakSet<Agent> = new WeakSet();
   /** Physical ephemeral frames deliberately disposed by their run watchdog/caller.
    * The name is single-generation, so these frames still own their terminal
    * typing/outgoing close even after runEphemeralToCompletion deregisters them. */
@@ -2673,6 +2680,9 @@ export class AgentFramework {
     // Add modules
     for (const module of config.modules) {
       await framework.addModule(module);
+    }
+    for (const agent of framework.agents.values()) {
+      framework.warnEmptyUtilityPermissions(agent);
     }
     for (const [agentName, presentation] of framework.toolPresentations) {
       const workspace = framework.getWorkspaceModule();
@@ -4684,6 +4694,11 @@ export class AgentFramework {
     return this.moduleRegistry.getAllModules();
   }
 
+  /** Read the namespaced utility catalogue without adding first-class model tools. */
+  getAllUtilities(): import('./types/index.js').ToolDefinition[] {
+    return this.moduleRegistry.getAllUtilities();
+  }
+
   /**
    * Get all available tools from all modules and MCPL servers.
    */
@@ -5040,8 +5055,10 @@ export class AgentFramework {
     return guards;
   }
 
+  /** `think` for one agent: its same-round policy, and `skip_reply` named only where the agent may call it. */
   private buildThinkTool(
     policy: SameRoundThinkTextPolicy,
+    canSkipReply: boolean,
   ): import('./types/index.js').ToolDefinition {
     return {
       name: 'think',
@@ -5052,7 +5069,8 @@ export class AgentFramework {
           ? 'Your current same_round_think_text_policy is private, so ordinary text emitted in the SAME native assistant round as think() is withheld from channel routing. Later rounds without think() route normally.'
           : 'Your current same_round_think_text_policy is public, so ordinary text emitted in the SAME native assistant round as think() may still be routed publicly as your speech. Later rounds without think() route normally.'
         ) +
-        ' Use think() to work things out privately. To inspect or change this policy, use agent_settings get/update on same_round_think_text_policy. To deliberately not reply this turn, call skip_reply instead.',
+        ' Use think() to work things out privately. To inspect or change this policy, use agent_settings get/update on same_round_think_text_policy.' +
+        (canSkipReply ? ' To deliberately not reply this turn, call skip_reply instead.' : ''),
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -5105,10 +5123,23 @@ export class AgentFramework {
     };
   }
 
+  private warnEmptyUtilityPermissions(agent: Agent): void {
+    if (agent.allowedTools === 'all' || !agent.allowedTools.includes('utils')
+        || this.emptyUtilityPermissionWarnings.has(agent)) return;
+    const utilities = this.moduleRegistry.getAllUtilities();
+    if (utilities.length === 0 || utilities.some(tool => agent.canUseTool(tool.name))) return;
+    console.warn(`[utils] Agent '${agent.name}': ${registeredUtilities(utilities.length)}, 0 permitted; none permitted by this agent's allowedTools. Add each required module--utility name to allowedTools.`);
+    this.emptyUtilityPermissionWarnings.add(agent);
+  }
+
   private getToolsForAgent(
     agentName: string,
     snapshot?: InferenceToolSnapshot,
   ): import('./types/index.js').ToolDefinition[] {
+    const agent = this.agents.get(agentName);
+    // Model-facing advice names skip_reply only where dispatch would let this
+    // agent call it: a refused skip_reply leaves the turn going on.
+    const canSkipReply = this.canAgentUseTool(agentName, 'skip_reply');
     // The subconscious gets its own small surface (plus think/skip_reply/
     // end_turn), not the residents' tool board: no channel lifecycle, no
     // gate rules, no workspace — it observes, judges, and reports.
@@ -5119,17 +5150,23 @@ export class AgentFramework {
           ? this.buildThinkTool(
               snapshot?.sameRoundThinkTextPolicy
                 ?? this.getAgentRuntimeSettings(agentName).sameRoundThinkTextPolicy,
+              canSkipReply,
             )
           : t);
       return [...SUBCONSCIOUS_TOOLS, ...basics];
     }
-    return [...this.getAllTools(), ...(this.toolPresentations.has(agentName) ? presentationTools(this.toolPresentations.get(agentName)!.config.cataloguePath) : [])].map((tool) => {
+    if (agent) this.warnEmptyUtilityPermissions(agent);
+    const hasPermittedUtility = !agent || this.moduleRegistry.getAllUtilities().some(tool => agent.canUseTool(tool.name));
+    return [...this.getAllTools(), ...(this.toolPresentations.has(agentName) ? presentationTools(this.toolPresentations.get(agentName)!.config.cataloguePath) : [])]
+      .filter(tool => tool.name !== 'utils' || hasPermittedUtility).map((tool) => {
       if (tool.name === 'think') {
         return this.buildThinkTool(
           snapshot?.sameRoundThinkTextPolicy
             ?? this.getAgentRuntimeSettings(agentName).sameRoundThinkTextPolicy,
+          canSkipReply,
         );
       }
+      if (tool.name === 'journal' && !canSkipReply) return { ...tool, description: journalToolDescription(false) };
       return tool;
     });
   }
@@ -7205,8 +7242,10 @@ export class AgentFramework {
   /**
    * Create an ephemeral agent that is NOT registered in the main event loop.
    *
-   * Used by SubagentModule (and similar) to create short-lived agents
-   * that are driven externally (not by the framework's event loop).
+   * Used by SubagentModule (and similar) to prepare short-lived agents.
+   * Call runEphemeralToCompletion(agent, contextManager) to register and run
+   * the returned agent. Framework-created identities have tool authority only
+   * while registered; public tool calls before a run or after retirement fail.
    * The returned agent has its own ContextManager on a namespaced state
    * within the framework's shared Chronicle store — messages go to
    * `{namespace}/messages`, context log to `{namespace}/context`.
@@ -14559,7 +14598,7 @@ export class AgentFramework {
     const delivered = after.outcome === 'unknown' ? 'may not have been delivered' : 'was not delivered';
     const notice =
       `[prose-routing] Your text (${text.length} chars) ${delivered} — ${reason}.${cand} ${kept}${risky}` +
-      (prefix === '>>' ? ' The prose_help tool shows the full syntax.' : '');
+      (prefix === '>>' && this.canAgentUseTool(agent.name, 'prose_help') ? ' The prose_help tool shows the full syntax.' : '');
     const target = this.noticeTargetFor(name, 'prose-bounce');
     if (target) {
       try {
@@ -14635,7 +14674,7 @@ export class AgentFramework {
     try {
       const id = agent.getContextManager().addMessage(
         'user',
-        [{ type: 'text', text: proseModePrimer(mode) }],
+        [{ type: 'text', text: proseModePrimer(mode, this.canAgentUseTool(agent.name, 'prose_help')) }],
         { system: true, kind: 'prose-routing-primer' },
       );
       this.emitTrace({ type: 'message:added', messageId: id, source: 'prose-routing-primer' });
@@ -15845,11 +15884,18 @@ export class AgentFramework {
               (event.context as { supportsInjectedMessages?: boolean }).supportsInjectedMessages,
             );
 
-            // A refused call doesn't silence: the silence before it, and its
-            // round's other silencing calls, come back at the next round, each
-            // with why it silences.
-            if (event.calls.some((call) => this.refusesSelfWake(call))) {
-              const otherCause = silenceCauseOf(event.calls.filter((call) => !this.refusesSelfWake(call)));
+            // A refused skip_reply, whether the agent's allowedTools doesn't
+            // name it or this host can't set the wake it asks for, keeps its
+            // own round private and silences nothing after it: the silence
+            // before it, and its round's other permitted silencing calls,
+            // come back at the next round, each with why it silences. A
+            // refusal withholds the call's effect, not the model's choice to
+            // keep its words private.
+            const refusedSkipReply = (call: ToolCall): boolean => bareToolName(call.name) === 'skip_reply'
+              && (!this.canAgentUseTool(agent.name, call.name) || this.refusesSelfWake(call));
+            if (event.calls.some(refusedSkipReply)) {
+              const otherCause = silenceCauseOf(event.calls.filter((call) =>
+                this.canAgentUseTool(agent.name, call.name) && !refusedSkipReply(call)));
               silenceBeforeRefusal = silenceCause === 'private' || otherCause === 'private'
                 ? 'private'
                 : (silenceCause ?? otherCause);
@@ -15879,11 +15925,17 @@ export class AgentFramework {
             // with verbatim roundContent are live-routed (see liveProseRouting
             // note above — the fallback preamble is cumulative in XML mode).
             if (this.channelRegistry) {
+              // Every call the model made in the round, refused or not: a
+              // skip_reply or think refused still asks for the round's words
+              // to stay private. A refused send posted nothing, so it
+              // silences nothing; a refused skip_reply silences its own
+              // round, and the silence before it comes back at the next.
               const roundToolNames = event.calls.map((c) => c.name);
               const hasSameRoundPrivateThink =
                 roundToolNames.includes('think') &&
                 requestSnapshot.sameRoundThinkTextPolicy === 'private';
-              const roundCause = silenceCauseOf(event.calls);
+              const roundCause = silenceCauseOf(event.calls.filter((c) =>
+                this.canAgentUseTool(agent.name, c.name) || refusedSkipReply(c)));
               if (roundCause) {
                 turnSilenced = true;
                 silenceCause = roundCause === 'private' || silenceCause === 'private' ? 'private' : 'send';
@@ -16453,7 +16505,8 @@ export class AgentFramework {
               const toolCalls = response.content
                 .filter((b) => b.type === 'tool_use')
                 .map((b) => b as unknown as { name?: unknown; input?: unknown })
-                .filter((c): c is { name: string; input?: unknown } => typeof c.name === 'string');
+                .filter((c): c is { name: string; input?: unknown } =>
+                  typeof c.name === 'string' && this.canAgentUseTool(agent.name, c.name));
               const toolNames = toolCalls.map((c) => c.name);
               // A refused skip_reply isn't a silencing call; a plain one is.
               const fallbackCause = liveProseRouting
@@ -17239,8 +17292,12 @@ export class AgentFramework {
    * call entered through — a public method shared with model callers can
    * never confer module trust, whatever the input claims. Module origin
    * exists only through the private closure handed to ModuleRegistry
-   * (ctx.callTool → executeToolCallFrom with {kind:'module'}). Callers that
-   * don't identify themselves fail safe to agent semantics too.
+   * (ctx.callTool → executeToolCallFrom with {kind:'module'}), which is exempt
+   * from agent allowlists. Registered agents' allowedTools is enforced at
+   * dispatch, including namespaced utility names; utils only grants the
+   * list/describe/run slot. Genuinely unidentified public callers (including
+   * unknown legacy names) remain unrestricted. Framework-created identities
+   * are refused while unregistered, even if their configured list allows it.
    */
   async executeToolCall(call: ToolCall): Promise<ToolResult> {
     return this.executeToolCallFrom(call, {
@@ -17427,6 +17484,11 @@ export class AgentFramework {
   }
 
   private async executeToolCallFrom(call: ToolCall, origin: ChannelToolOrigin): Promise<ToolResult> {
+    if (origin.kind === 'agent') {
+      const refusal = this.agentToolPermissionFailure(origin.agentName, call);
+      if (refusal) return refusal;
+    }
+
     if (isPresentationTool(call.name)) return this.editToolPresentation(call.callerAgentName ?? '__ephemeral__', call);
     // Client-side programmatic tool calling for promise-based callers
     // (SubagentModule ephemerals). Keyed by callerAgentName so each ephemeral
@@ -17468,7 +17530,7 @@ export class AgentFramework {
     // ephemerals, ModuleContext.callTool) reach utilities the same way the
     // model does.
     if (call.name === 'utils') {
-      return this.handleUtilsToolCall(call.callerAgentName ?? '__ephemeral__', call, { inProcess: true });
+      return this.handleUtilsToolCall(call.callerAgentName ?? '__ephemeral__', call, { inProcess: true, trustedModule: origin.kind === 'module' });
     }
 
     // Module tools. The caller uses the result in process, so it gets the
@@ -18756,6 +18818,27 @@ export class AgentFramework {
     return best;
   }
 
+  /** Registered policy; framework-created identities have no dispatch authority
+   * while unregistered. Genuine legacy caller names retain their surface. */
+  private canAgentUseTool(agentName: string, toolName: string): boolean {
+    const agent = this.agents.get(agentName);
+    return agent ? agent.canUseTool(toolName) : !this.usedEphemeralAgentNames.has(agentName);
+  }
+
+  private agentToolPermissionFailure(agentName: string, call: ToolCall, reportRefusal = true): ToolResult | undefined {
+    if (this.canAgentUseTool(agentName, call.name)) return undefined;
+    const error = !this.agents.has(agentName) && this.usedEphemeralAgentNames.has(agentName)
+      ? `Caller '${agentName}' is not a running agent; framework-created agents have tool authority only while registered.`
+      : `Tool '${call.name}' is not permitted by this agent's allowedTools.`;
+    if (reportRefusal) {
+      this.toolLifecycleEmitter?.refuse(agentName, call.id);
+      this.emitTrace({
+        type: 'tool:failed', module: 'framework', tool: call.name, callId: call.id, error,
+      });
+    }
+    return { success: false, error, isError: true };
+  }
+
   /**
    * Why this host refuses a skip_reply call, as the model will read it, or
    * undefined when it doesn't (skipReplyWakeRefusal): without an EventGate,
@@ -18784,6 +18867,14 @@ export class AgentFramework {
    * background script's call has none.
    */
   private dispatchToolCall(agentName: string, call: ToolCall, turnId?: number): void {
+    const refusal = this.agentToolPermissionFailure(agentName, call);
+    if (refusal) {
+      this.pushEvent({
+        type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'framework', result: refusal,
+      });
+      return;
+    }
+
     // Enrich call with caller identity so modules can resolve the calling agent,
     // and with the turn it was made in. Here both are the framework's to set:
     // a turn id the call arrives with never survives.
@@ -23779,28 +23870,46 @@ export class AgentFramework {
    *  (Module.getUtilities). Shared by the model-facing dispatcher and the
    *  programmatic path (executeToolCall), so code_execution scripts and
    *  ephemerals reach utilities too. */
-  private async handleUtilsToolCall(agentName: string, call: ToolCall, options: { inProcess?: boolean } = {}): Promise<ToolResult> {
+  private async handleUtilsToolCall(agentName: string, call: ToolCall, options: { inProcess?: boolean; trustedModule?: boolean } = {}): Promise<ToolResult> {
     const input = (call.input ?? {}) as { action?: unknown; name?: unknown; args?: unknown };
-    const utilities = this.moduleRegistry.getAllUtilities();
-    const available = (): string =>
-      utilities.length ? utilities.map((u) => u.name).join(', ') : '(none registered)';
+    const allUtilities = this.moduleRegistry.getAllUtilities();
+    const utilities = allUtilities.filter(def => options.trustedModule || this.canAgentUseTool(agentName, def.name));
+    const counts = `${registeredUtilities(allUtilities.length)}, ${utilities.length} permitted`;
+    const available = (): string => utilities.length
+      ? `Available: ${utilities.map((u) => u.name).join(', ')} (${counts})`
+      : allUtilities.length
+        ? `${counts}; none permitted by this agent's allowedTools. Add each required module--utility name to allowedTools.`
+        : `${counts} (none registered)`;
     switch (input.action) {
       case 'list':
+        if (allUtilities.length > 0 && utilities.length === 0) {
+          return { success: false, isError: true, error: available() };
+        }
         return {
           success: true,
           data: utilities.map((u) => ({ name: u.name, description: utilityOneLiner(u.description) })),
         };
       case 'describe': {
-        const def = utilities.find((u) => u.name === input.name);
+        const def = allUtilities.find((u) => u.name === input.name);
         if (!def) {
-          return { success: false, isError: true, error: `No utility "${String(input.name)}". Available: ${available()}` };
+          return { success: false, isError: true, error: `No utility "${String(input.name)}". ${available()}` };
+        }
+        if (!options.trustedModule) {
+          const refusal = this.agentToolPermissionFailure(agentName, { ...call, name: def.name }, false);
+          if (refusal) return refusal;
         }
         return { success: true, data: def };
       }
       case 'run': {
-        const def = utilities.find((u) => u.name === input.name);
+        const def = allUtilities.find((u) => u.name === input.name);
         if (!def) {
-          return { success: false, isError: true, error: `No utility "${String(input.name)}". Available: ${available()}` };
+          return { success: false, isError: true, error: `No utility "${String(input.name)}". ${available()}` };
+        }
+        if (!options.trustedModule) {
+          // The allowed outer utils call owns its lifecycle and terminal trace;
+          // refusing the utility does not create or refuse a separate call.
+          const refusal = this.agentToolPermissionFailure(agentName, { ...call, name: def.name }, false);
+          if (refusal) return refusal;
         }
         const args = input.args ?? {};
         const problem = validateUtilityArgs(args, def.inputSchema);
