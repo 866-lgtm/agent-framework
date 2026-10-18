@@ -380,9 +380,12 @@ test('a rebuild whose file wasn\'t fetched writes nothing over a row holding tex
     row('p4', [text('caption')], false, 4_000),
     // A message whose own text reads as the notice for its file.
     row('p5', [notFetched, fileBlock, more], true, 5_000),
+    // An attachment-only message that has gained text since its row was stored.
+    row('p6', [fileBlock], false, 6_000),
   ];
   const { harness } = setup(rows, {
     fetchHistory: async () => [
+      history('p6', 'gained', 6_000, [notes]),
       history('p5', notFetched.text, 5_000, [notes]),
       history('p4', 'caption', 4_000, [notes]),
       history('p3', '', 3_000, [notes]),
@@ -392,10 +395,10 @@ test('a rebuild whose file wasn\'t fetched writes nothing over a row holding tex
   });
   const held = () => rows.map((r) => r.content);
   assert.deepEqual(await harness.syncChannelHistory('c1'), { newMessages: 0, editedMessages: 2, deletedMessages: 0 });
-  assert.deepEqual(held(), [[fileBlock], [text('both'), fileBlock, more], [text(''), notFetched], [text('caption'), notFetched], [notFetched, fileBlock, more]]);
+  assert.deepEqual(held(), [[fileBlock], [text('both'), fileBlock, more], [text(''), notFetched], [text('caption'), notFetched], [notFetched, fileBlock, more], [fileBlock]]);
   reachable = true;
-  assert.deepEqual(await harness.syncChannelHistory('c1'), { newMessages: 0, editedMessages: 3, deletedMessages: 0 });
-  assert.deepEqual(held(), [[text(''), fileBlock], [text('both'), fileBlock], [text(''), notFetched], [text('caption'), notFetched], [notFetched, fileBlock]]);
+  assert.deepEqual(await harness.syncChannelHistory('c1'), { newMessages: 0, editedMessages: 4, deletedMessages: 0 });
+  assert.deepEqual(held(), [[text(''), fileBlock], [text('both'), fileBlock], [text(''), notFetched], [text('caption'), notFetched], [notFetched, fileBlock], [text('gained'), fileBlock]]);
   assert.deepEqual(await harness.syncChannelHistory('c1'), { newMessages: 0, editedMessages: 0, deletedMessages: 0 });
 });
 

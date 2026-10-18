@@ -924,7 +924,7 @@ export class DiscordModule implements Module {
         if (stored && (stored.bodyGroupId || !needsRebuild(stored, discordMsg))) continue;
         const content = await this.convertMessageToContent(discordMsg);
         if (this.ctx !== ctx) return unchanged;
-        // A rebuild never leaves a row holding less than it had: when a file
+        // A failed fetch never costs a row the text it holds: when a file
         // wasn't fetched, a row holding other text, which may be that file's,
         // keeps what it holds, and the next sync tries again.
         if (stored && holdsNotFetched(content, discordMsg) && holdsOtherText(stored, discordMsg)) continue;
