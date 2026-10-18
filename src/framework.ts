@@ -6113,7 +6113,8 @@ export class AgentFramework {
    * against a specific rule, which is usually what a sampler or debounce
    * actually wants. When gate.json is there but won't load, a copy of it is
    * kept beside it before the change is written, and `onUnreadableKept` says
-   * where. Throws if no gate is configured, the policy is invalid, the
+   * where, once the change is made; a throw from it is logged, not thrown.
+   * Throws if no gate is configured, the policy is invalid, the
    * placement can't be made, or gate.json can't be read, kept or written
    * (EventGate.addPolicy).
    */

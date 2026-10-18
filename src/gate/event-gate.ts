@@ -11,7 +11,7 @@
  * inference tokens, not whether the agent should know about the event.
  */
 
-import { chmodSync, chownSync, existsSync, lstatSync, readdirSync, readFileSync, unlinkSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, unlinkSync, writeFileSync, mkdirSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
 
@@ -556,6 +556,28 @@ export function formatUnreadableKept(kept: UnreadableConfigKept): string {
     + 'runs this host can restore rules from it.';
 }
 
+/** The text of a thrown value, for a log line. It never throws itself, whatever was thrown. */
+function errorText(err: unknown): string {
+  try {
+    return err instanceof Error ? err.message : String(err);
+  } catch {
+    return 'a value that could not be printed';
+  }
+}
+
+/**
+ * Run a caller's callback once the change it's told of is made and traced. A
+ * throw from it is logged, not thrown, so the call answers as the change it
+ * made: told the change had failed, an agent could make it a second time.
+ */
+function afterChange(name: string, callback: () => void): void {
+  try {
+    callback();
+  } catch (err) {
+    console.error(`[gate] ${name} threw once the change was made, and the change stands: ${errorText(err)}`);
+  }
+}
+
 /** The privileged-users file's error when some entries of its list aren't user ids. */
 function skippedPrivilegedIds(skipped: unknown[], loaded: number): string {
   const one = skipped.length === 1;
@@ -869,18 +891,12 @@ export class EventGate {
     // No colons: Windows doesn't allow them in a file name.
     const stamp = new Date(this.now()).toISOString().replace(/\.\d+Z$/, 'Z').replace(/[-:]/g, '');
     const base = `${this.configPath}.unreadable-${stamp}`;
-    // The copy is no more readable than gate.json: it's created owner-only,
-    // then given gate.json's group, and only then its permission bits. A copy
-    // that can't take the group (this process isn't in it), or whose
-    // gate.json can't be stat'd, stays owner-only. So does the copy of a
-    // gate.json that's a symbolic link: what keeps others out of the file it
-    // points to can be a directory on the way there, and the copy, beside the
-    // link, isn't behind it.
-    let gateFile: { gid: number; mode: number } | undefined;
-    try {
-      const file = lstatSync(this.configPath);
-      if (!file.isSymbolicLink()) gateFile = file;
-    } catch { /* owner-only */ }
+    // The copy is created with mode 0600, and nothing widens it, so on Linux
+    // only the user the host runs as can read it (a directory's default ACL is
+    // masked by that mode). What keeps others out of gate.json can be more than
+    // its own bits, such as a directory on the way to the file a link or a
+    // single-file bind mount puts there, or an ACL, and the copy, beside it, has
+    // none of those. The host read gate.json, so its user is one who could.
     for (let n = 1; ; n++) {
       const kept = n === 1 ? base : `${base}-${n}`;
       try {
@@ -897,14 +913,6 @@ export class EventGate {
           `gate.json couldn't be read (${reason}), and keeping a copy of it at ${kept} failed (${e.message ?? String(err)}), `
           + 'so nothing was written.',
         );
-      }
-      if (gateFile) {
-        try {
-          // The copy's own owner, this process, rather than -1 for "unchanged",
-          // which Bun 1.3.14 refuses with EPERM.
-          chownSync(kept, process.geteuid?.() ?? -1, gateFile.gid);
-          chmodSync(kept, gateFile.mode & 0o777);
-        } catch { /* it stays owner-only */ }
       }
       console.error(`[gate] ${this.configPath} couldn't be read (${reason}); kept a copy at ${kept} before writing the rules in force`);
       this.emitTrace({
@@ -1066,14 +1074,15 @@ export class EventGate {
    * isn't clobbered. When gate.json is there but won't load, the change starts
    * from the rules in force, after a copy of the file is kept beside it
    * (keepUnreadableConfig) and reported to `onUnreadableKept` once the change
-   * is written. A policy with the same `name` is replaced IN PLACE when no
-   * `position` is given (order preserved); WITH a `position` it is moved there
-   * — so re-issuing a rule is also how you reposition it. New policies append
-   * by default; `'prepend'` puts one at the very front (ahead of EVERYTHING,
-   * including addressed-message wake rules — see the shadow lint), and the
-   * anchored forms `{before: name}` / `{after: name}` insert relative to an
-   * existing rule, which is almost always the safer way to order a sampler
-   * or debounce against a specific catch-all.
+   * is written and traced; a throw from that callback is logged, and the change
+   * stands (afterChange). A policy with the same `name` is replaced IN PLACE
+   * when no `position` is given (order preserved); WITH a `position` it is
+   * moved there — so re-issuing a rule is also how you reposition it. New
+   * policies append by default; `'prepend'` puts one at the very front (ahead
+   * of EVERYTHING, including addressed-message wake rules — see the shadow
+   * lint), and the anchored forms `{before: name}` / `{after: name}` insert
+   * relative to an existing rule, which is almost always the safer way to order
+   * a sampler or debounce against a specific catch-all.
    *
    * Throws, writing nothing, for an invalid policy, a placement it can't make,
    * or a gate.json that can't be read or kept; and throws when the write
@@ -1117,7 +1126,6 @@ export class EventGate {
       ? { keptPath: this.keepUnreadableConfig(unreadable), reason: unreadable.error }
       : undefined;
     this.writeConfigAfterKeep({ ...current, policies }, kept);
-    if (kept) options?.onUnreadableKept?.(kept);
     this.emitTrace({
       type: 'gate:policy-added',
       configPath: this.configPath,
@@ -1125,6 +1133,7 @@ export class EventGate {
       replaced: idx >= 0,
       timestamp: Date.now(),
     });
+    if (kept) afterChange('onUnreadableKept', () => options?.onUnreadableKept?.(kept));
     return policy;
   }
 
@@ -1153,13 +1162,13 @@ export class EventGate {
     // drop timers, buckets and counters.
     this.clearPolicyState(name, { deliverPendingDebounce: true });
     this.stats.delete(name);
-    if (kept) options?.onUnreadableKept?.(kept);
     this.emitTrace({
       type: 'gate:policy-removed',
       configPath: this.configPath,
       policyName: name,
       timestamp: Date.now(),
     });
+    if (kept) afterChange('onUnreadableKept', () => options?.onUnreadableKept?.(kept));
     return true;
   }
 
