@@ -2191,8 +2191,9 @@ export class AgentFramework {
    * ephemeral agents have isolated slots and are their own only readers.
    */
   private readonly sharedSlotAgents = new Set<Agent>();
-  /** Releases asked for while the host was quiesced, by agent name; resume() runs them. */
-  private readonly releasesAfterResume = new Map<string, () => void>();
+  /** The windows of forks and runs deregistered while the host was quiesced,
+   *  by agent name; resume() releases them (releaseWindowNowOrAfterResume). */
+  private readonly releasesAfterResume = new Map<string, Agent>();
   /** The coalescing commit in flight, if any (see commitCoalescingDurable). */
   private coalescingCommit: Promise<void> | null = null;
   private inferenceRouter: InferenceRouter | null = null;
@@ -5591,9 +5592,10 @@ export class AgentFramework {
 
     this.resumeInFlight = true;
     try {
-      // Releases asked for during the window run first, each landing its
-      // agent's queued writes and passing on its unread failed replies, as at
-      // any release. Then flush context writes deferred by the quiesce window
+      // The windows of forks and runs deregistered during the window are
+      // released first, each landing its queued writes and passing on its
+      // unread failed replies, as at any release. Then flush context writes
+      // deferred by the quiesce window
       // (module events, api message.send) — with no turn alive there is no
       // other flush point. Per-message try/catch and per-message durable ack
       // (see flushDeferredWrites); nothing here may reach the plane reopen
@@ -7392,8 +7394,8 @@ export class AgentFramework {
         // is deregistered, a flush finds no agent to take it and drops it.
         // The run's namespace stays in the store for investigation, so the
         // messages stay with it. A quiesced host defers them again instead,
-        // as stop() does, and with the run gone, the flush that meets them
-        // later drops them.
+        // as stop() does, and the run's window release at resume lands them
+        // (releaseWindowNowOrAfterResume).
         const queued = this.drainDeferredFor(agent.name);
         if (queued.length > 0) {
           this.readdDrained(queued, `end of ephemeral run ${agent.name}`, { bypassDeferral: !this.quiesced });
@@ -7410,11 +7412,8 @@ export class AgentFramework {
         // The late stream finalizer intentionally refuses name-keyed cleanup once
         // deregistered, so disposal must release EventGate liveness itself.
         this.eventGate?.onInferenceEnded(agent.name);
-        this.releaseNowOrAfterResume(agent.name, () => {
-          if (this.agents.get(agent.name) !== agent) return;
-          this.releaseWindow(agent);
-          this.agents.delete(agent.name);
-        });
+        this.agents.delete(agent.name);
+        this.releaseWindowNowOrAfterResume(agent);
       }
       this.toolImageLedgers.delete(agent.name);
       // Spawn-and-dispose bookkeeping (main, d453165/fee96a7): without this,
@@ -11227,17 +11226,11 @@ export class AgentFramework {
    * forever. The fork's context stays in Chronicle for investigation.
    */
   private disposeConversationAgent(agentName: string): void {
-    if (this.quiesced) {
-      // Released by resume() (releaseNowOrAfterResume). It stays closing, so
-      // a sweep meanwhile reaches here again and waits too.
-      this.releasesAfterResume.set(agentName, () => this.disposeConversationAgent(agentName));
-      return;
-    }
     this.closingConversationAgents.delete(agentName);
     const channelId = this.conversationAgentHomes.get(agentName);
     const agent = this.agents.get(agentName);
-    if (agent) this.releaseWindow(agent);
     this.agents.delete(agentName);
+    if (agent) this.releaseWindowNowOrAfterResume(agent);
     this.turnRouting.delete(agentName);
     this.proseSpeechChains.delete(agentName);
     this.openLogical.delete(agentName);
@@ -17054,8 +17047,14 @@ export class AgentFramework {
       // this flush, and another agent's pending tools say nothing about this
       // window. addMessage judges each entry by the same rule, so the drained
       // prefix is stored in order, or goes back into the queue whole under
-      // its ids when a successor turn has already taken the agent.
-      if (frameReachedTerminal && this.deferredMessages.length > 0 && !this.pendingAssistantBlocks.has(agent.name)) {
+      // its ids when a successor turn has already taken the agent. A fork or
+      // run deregistered while the host is quiesced leaves its queue to its
+      // window's release at resume (releaseWindowNowOrAfterResume): flushed
+      // here, the entries would meet no registered agent and be dropped.
+      if (
+        frameReachedTerminal && this.deferredMessages.length > 0 && !this.pendingAssistantBlocks.has(agent.name) &&
+        !this.releasesAfterResume.has(agent.name)
+      ) {
         this.readdDrained(this.drainDeferredFor(agent.name), 'turn-end flush');
         this.ackDeferredWrites();
       }
@@ -19225,9 +19224,9 @@ export class AgentFramework {
   }
 
   /**
-   * A conversation fork or an ephemeral run is about to be deregistered. A
-   * release never runs while the host is quiesced: it waits for resume()
-   * (releaseNowOrAfterResume), since a write could land mid-surgery.
+   * A conversation fork or an ephemeral run has been deregistered. A release
+   * never runs while the host is quiesced: it waits for resume()
+   * (releaseWindowNowOrAfterResume), since a write could land mid-surgery.
    *
    * The agent never reads its window again, so every failed-reply notice it
    * never read is passed to the primary, by name, once: each one stored in
@@ -19289,26 +19288,30 @@ export class AgentFramework {
   }
 
   /**
-   * Run `release` now, or, while the host is quiesced, when it resumes. A
-   * release lands the agent's queued writes in its window, and while quiesced
-   * a write could land mid-surgery; dropping them instead would lose them
-   * from both the window and the recovery queue. The agent stays registered
-   * meanwhile, and can't start a turn while quiesced.
+   * Release a deregistered fork's or run's window (releaseWindow) now, or,
+   * while the host is quiesced, when it resumes. A release lands the agent's
+   * queued writes in its window, and while quiesced a write could land
+   * mid-surgery; dropping them instead would lose them from both the window
+   * and the recovery queue. Only the window waits: the agent is already
+   * deregistered, so its stream can't dispatch anything more and resume
+   * doesn't weigh its context, and a write addressed to it meanwhile is
+   * treated as for any agent no longer registered (dropped, or passed to the
+   * primary if it's a failed reply).
    */
-  private releaseNowOrAfterResume(agentName: string, release: () => void): void {
-    if (this.quiesced) this.releasesAfterResume.set(agentName, release);
-    else release();
+  private releaseWindowNowOrAfterResume(agent: Agent): void {
+    if (this.quiesced) this.releasesAfterResume.set(agent.name, agent);
+    else this.releaseWindow(agent);
   }
 
-  /** resume(): the releases asked for during the quiesce window, each on its own. */
+  /** resume(): the windows whose release the quiesce window postponed, each on its own. */
   private runReleasesAfterResume(): void {
-    const releases = [...this.releasesAfterResume.values()];
+    const agents = [...this.releasesAfterResume.values()];
     this.releasesAfterResume.clear();
-    for (const release of releases) {
+    for (const agent of agents) {
       try {
-        release();
+        this.releaseWindow(agent);
       } catch (err) {
-        console.error('[host-mode] resume: a release postponed by the quiesce window failed:', err);
+        console.error(`[host-mode] resume: the release of ${agent.name}'s window, postponed by the quiesce window, failed:`, err);
       }
     }
   }

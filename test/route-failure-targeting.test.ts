@@ -10,7 +10,7 @@ import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { ProcessEvent, Module, ModuleContext, ToolDefinition, ToolCall, ToolResult, EventResponse } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { ChannelRegistry } from '../src/mcpl/channel-registry.js';
-import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { HeldStream, MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 function internals(framework: AgentFramework) {
   return framework as unknown as {
@@ -683,10 +683,11 @@ describe('notices about an agent\'s own action', () => {
         state.pendingAssistantBlocks.clear();
 
         if (condition === 'quiesced') {
-          // A write while quiesced could land mid-surgery, so the release
-          // waits: the fork stays registered with its notice queued, and the
-          // primary hasn't been told.
-          assert.equal(framework.getAgent(fork.name), fork, 'released only once the host resumes');
+          // The fork is disposed when its closure turn ends, quiesced or not.
+          // Only its window's release waits for resume, since a write could
+          // land mid-surgery: its notice is still queued, and the primary
+          // hasn't been told.
+          assert.equal(framework.getAgent(fork.name), null, 'disposed at once');
           assert.equal(state.deferredMessages.length, 1);
           assert.equal(state.deferredMessages[0]!.forAgent, fork.name);
           const waiting = await framework.getAgent('primary')!.getContextManager().compile();
@@ -842,22 +843,80 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(count(primary, BOUNCED), 0);
     });
 
-    it('releases a run that ends while the host is quiesced only at resume, landing what it left queued', async () => {
+    it('deregisters a run that ends while the host is quiesced at once, and releases its window at resume, landing what it left queued', async () => {
+      // A stream that can't carry injected messages leaves the post's failure
+      // notice queued for the run's turn end, where the quiesced host defers
+      // it again.
+      runMembrane.supportsInjectedMessages = false;
       sender.quiesceOnCall = true;
       await run([
-        [{ type: 'tool_use', id: 'n1', name: 'sender--noop', input: {} }],
-        [{ type: 'text', text: 'Worker prose that bounces at the end.' }],
+        [{ type: 'tool_use', id: 'p1', name: 'sender--post', input: {} }],
+        [{ type: 'text', text: '>>skip_reply done' }],
       ]);
       const state = internals(runFramework);
       assert.equal(state.quiesced, true);
-      assert.ok(runFramework.getAgent('worker'), 'still registered while quiesced');
-      assert.ok(state.deferredMessages.some((m) => m.forAgent === 'worker'), 'its last notice is still queued');
+      assert.equal(runFramework.getAgent('worker'), null, 'deregistered at once');
+      assert.ok(state.deferredMessages.some((m) => m.forAgent === 'worker'), 'its failure notice is still queued');
+      const waiting = await runFramework.getAgent('primary')!.getContextManager().compile();
+      assert.equal(count(waiting.messages, 'A reply by worker'), 0, 'the primary isn\'t told before resume');
 
       await runFramework.resume({ force: true });
 
-      assert.equal(runFramework.getAgent('worker'), null, 'released at resume');
       assert.equal(state.deferredMessages.length, 0);
-      assert.equal(count(await archived(), BOUNCED), 1, 'what it left queued landed in its window');
+      assert.equal(count(await archived(), SEND_FAILED), 1, 'what it left queued landed in its window');
+      const { messages } = await runFramework.getAgent('primary')!.getContextManager().compile();
+      assert.equal(count(messages, 'A reply by worker'), 1, 'and, unread, it is passed on by name');
+    });
+
+    it('resumes past a run that ended while the host was quiesced: resume doesn\'t weigh its context', async (t) => {
+      sender.quiesceOnCall = true;
+      await run([
+        [{ type: 'tool_use', id: 'n1', name: 'sender--noop', input: {} }],
+        [{ type: 'text', text: '>>skip_reply done' }],
+      ]);
+      const previewed: string[] = [];
+      // The run's context, were it weighed, would not fit; nothing else gives a verdict.
+      t.mock.method(runFramework as unknown as { previewAgentRuntimeSettings(name: string): unknown }, 'previewAgentRuntimeSettings', (name: string) => {
+        previewed.push(name);
+        return name === 'worker'
+          ? { available: true, effective: { fits: false, finalTokens: 2, budgetTokens: 1 } }
+          : { available: false, reason: 'no_preview_support' };
+      });
+
+      await runFramework.resume();
+
+      assert.equal(internals(runFramework).quiesced, false, 'resumed');
+      assert.ok(!previewed.includes('worker'), 'the ended run is not weighed');
+    });
+
+    it('dispatches nothing an ended run\'s stream yields late while the host is quiesced', async (t) => {
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      runMembrane.streamYielding = (request) => {
+        runMembrane.calls.push(request);
+        // Yields nothing, cancel included, until released; then a tool call.
+        return new HeldStream(released, [createMockResponse([{ type: 'tool_use', id: 'late-1', name: 'sender--noop', input: {} }], 'tool_use')]);
+      };
+      const calls = t.mock.method(sender, 'handleToolCall');
+      const created = await runFramework.createEphemeralAgent({
+        name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all', proseRouting: 'explicit',
+      });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
+      const state = internals(runFramework);
+      runFramework.start();
+      const done = runFramework.runEphemeralToCompletion(created.agent, created.contextManager, { idleTimeoutMs: 300, idlePollMs: 50 });
+      for (let i = 0; i < 400 && !state.activeStreams.has('worker'); i++) await new Promise((resolve) => setTimeout(resolve, 5));
+      assert.ok(state.activeStreams.has('worker'), 'the run\'s stream started');
+      state.quiesced = true;
+      await assert.rejects(done, /stalled/);
+      assert.equal(runFramework.getAgent('worker'), null, 'the ended run is deregistered at once, quiesced or not');
+
+      release();
+      for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      assert.equal(calls.mock.callCount(), 0, 'its late tool call is not dispatched');
+      await runFramework.resume({ force: true });
     });
   });
 });
