@@ -397,8 +397,8 @@ function limitRemedy(limitMs: number, ceilingMs: number | undefined, background:
  * to try again. A failure before the spawn, while creating or writing the
  * runtime's files, is about those files rather than the interpreter, and
  * keeps Node's own text, which names the path for an open or a mkdtemp. An
- * interpreter that exits as it starts passes on the last LAST_WORDS_CHARS of
- * what it wrote to stderr, from the end, where a traceback says what failed,
+ * interpreter that exits as it starts passes on up to the last LAST_WORDS_CHARS
+ * of what it wrote to stderr, from the end, where a traceback says what failed,
  * and with "…" where they're cut; when the runtime itself exits so because
  * the host's channel didn't reach it (HOST_CHANNEL_MISSING_EXIT), its own
  * words say who must act and that calling again fails the same way, so they
@@ -903,7 +903,7 @@ export class PyRunner {
     if (journal) {
       const tail = journal.tail;
       // The journal, which the agent reads with its own tools, says why too,
-      // unless it reached its cap.
+      // unless it reached its cap or a write to it failed.
       journal.write(`${tail === '' || tail.endsWith('\n') ? '' : '\n'}${why}\n`);
       journal.close();
       this.settlePending({ stdout: '', stderr: why, returnCode, aborted: true, tail: onItsOwnLine(tail, why) });

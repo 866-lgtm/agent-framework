@@ -144,8 +144,8 @@ def _start():
         try:
             os.write(2, (
                 "The host's channel didn't reach this Python interpreter: " + which + ", as when the "
-                "host's pythonPath starts Python through a wrapper that doesn't pass file descriptors 3 "
-                "and 4 on, such as a container, or sudo with its default settings. code_execution can't "
+                "host's pythonPath starts Python through a wrapper that doesn't pass both file descriptors "
+                "3 and 4 on, such as a container, or sudo with its default settings. code_execution can't "
                 "run scripts here until whoever runs this host changes that, so calling it again fails "
                 "the same way.\n"
             ).encode())
@@ -292,6 +292,12 @@ def _flush_writers():
         except Exception as exc:
             # Its fd closed or broke under it, so that much can't be sent.
             _diag("some of what the script wrote couldn't be sent (" + str(exc) + ")")
+
+
+if hasattr(os, "register_at_fork"):
+    # A fork copies what the script's writers hold. Sent first, it reaches the
+    # host once, and a forked child's writers hold only what the child writes.
+    os.register_at_fork(before=_flush_writers)
 
 
 def _write_marks(mark):
@@ -562,13 +568,22 @@ def handle_init(msg):
 
 def _leave_forked(code, err):
     # A process the script forked ends on sys.exit() as Python ends: with its
-    # code, 0 for none, or 1 after writing a code that isn't a number.
+    # code, 0 for none, or 1 after writing a code that isn't a number, and with
+    # what it wrote sent. The atexit handlers are the parent's, so it skips
+    # them, as multiprocessing's children do.
     if code is None:
-        os._exit(0)
-    if isinstance(code, int):
-        os._exit(code & 0xFF)
-    _note(err, str(code) + "\n")
-    os._exit(1)
+        status = 0
+    elif isinstance(code, int):
+        status = code & 0xFF
+    else:
+        status = 1
+        try:
+            text = str(code) + "\n"
+        except BaseException:
+            text = ""
+        _note(err, text)
+    _flush_writers()
+    os._exit(status)
 
 
 async def _run_script(exec_id, code, mark, st):
@@ -628,8 +643,10 @@ async def _run_script(exec_id, code, mark, st):
     if os.getpid() != _RUNTIME_PID:
         # A process the script forked ran off the script's end: the exec, its
         # result and its marks are the runtime's, so it leaves, sending none,
-        # with the status Python gives a script that ended so. Its writers hold
-        # a copy of what the parent's held at the fork, so it doesn't flush them.
+        # with the status Python gives a script that ended so. Its writers
+        # hold only what it wrote (_flush_writers ran before the fork), so it
+        # sends that.
+        _flush_writers()
         os._exit(return_code)
     # What the script left in its writers, then the runtime's own fds, then
     # the result, then the marks: should the fds be gone, the runtime's word
@@ -691,6 +708,9 @@ async def main():
             # by name; a failure with fd 3 still the host's says what failed.
             _check_own_fd(3)
             _fatal("cannot read the host's messages any more (" + str(exc) + ")")
+        # The end of fd 3: the host closed it, unless a file a script opened
+        # took the number and has run out.
+        _check_own_fd(3)
         loop.call_soon_threadsafe(queue.put_nowait, None)
 
     # The reader thread blocks SIGINT (it inherits the mask while it starts),

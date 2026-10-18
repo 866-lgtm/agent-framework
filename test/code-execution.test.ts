@@ -202,6 +202,19 @@ describe('PyRunner (real python3)', () => {
     }
   });
 
+  it("a script's own sys.exit() ends only the script, with its traceback, and the interpreter goes on", async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      const result = await runner.exec('kept = 5\nimport sys\nsys.exit(3)', []);
+      assert.strictEqual(result.returnCode, 1);
+      assert.match(result.stderr, /SystemExit: 3\n$/);
+      const next = await runner.exec('print(kept)', []);
+      assert.strictEqual(next.stdout, '5\n');
+    } finally {
+      runner.dispose();
+    }
+  });
+
   it('reports script exceptions as a traceback with return_code 1', async () => {
     const runner = new PyRunner({ onToolCall: async () => '' });
     try {
@@ -788,7 +801,7 @@ describe('PyRunner: an abort or dispose while the interpreter starts (real pytho
           result.stderr,
           `script didn't run: the Python interpreter, ${wraps.path}, exited as it started, saying: ` +
             `The host's channel didn't reach this Python interpreter: ${which}, as when the host's pythonPath ` +
-            "starts Python through a wrapper that doesn't pass file descriptors 3 and 4 on, such as a container, or " +
+            "starts Python through a wrapper that doesn't pass both file descriptors 3 and 4 on, such as a container, or " +
             "sudo with its default settings. code_execution can't run scripts here until whoever runs this host " +
             'changes that, so calling it again fails the same way.',
           drops,
@@ -800,19 +813,29 @@ describe('PyRunner: an abort or dispose while the interpreter starts (real pytho
     }
   });
 
-  it("a wrapper's own exit 78 has its words end the result, with no claim about the channel", posix, async () => {
+  it("a wrapper's own exit 78 has its words end the result, with no claim about the channel, and a silent one gets the general text", posix, async () => {
     const own = standIn('echo "no container here" >&2\nexit 78');
+    const silent = standIn('exit 78');
     const runner = new PyRunner({ pythonPath: own.path, onToolCall: async () => '' });
+    const silentRunner = new PyRunner({ pythonPath: silent.path, onToolCall: async () => '' });
     try {
       const result = await runner.exec('print(1)', []);
       assert.strictEqual(result.stderr, `script didn't run: the Python interpreter, ${own.path}, exited as it started, saying: no container here`);
+      const quiet = await silentRunner.exec('print(1)', []);
+      assert.strictEqual(
+        quiet.stderr,
+        `script didn't run: the Python interpreter, ${silent.path}, exited as it started, so none of the script ran. `
+          + 'Run it again; if it fails the same way, ask whoever runs this host.',
+      );
     } finally {
       runner.dispose();
+      silentRunner.dispose();
       own.done();
+      silent.done();
     }
   });
 
-  it("a failed start's stderr keeps its last 2,000 characters, marked where they're cut, and a pair's half never starts it", posix, async () => {
+  it("a failed start's stderr keeps up to its last 2,000 characters, marked where they're cut, and a pair's half never starts it", posix, async () => {
     const base = (path: string) =>
       `script didn't run: the Python interpreter, ${path}, exited as it started, so none of the script ran. `
       + 'Run it again; if it fails the same way, ask whoever runs this host. It wrote to stderr: ';
@@ -824,8 +847,7 @@ describe('PyRunner: an abort or dispose while the interpreter starts (real pytho
     const splitRunner = new PyRunner({ pythonPath: split.path, onToolCall: async () => '' });
     try {
       const result = await runner.exec('print(1)', []);
-      assert.ok(result.stderr.startsWith(`${base(long.path)}…x`), result.stderr.slice(0, 300));
-      assert.ok(result.stderr.endsWith('x\nthe last line'), result.stderr.slice(-100));
+      assert.strictEqual(result.stderr, `${base(long.path)}…${`${'x'.repeat(3000)}\nthe last line\n`.slice(-2000).trim()}`);
       const cut = await splitRunner.exec('print(1)', []);
       assert.strictEqual(cut.stderr, `${base(split.path)}…${'x'.repeat(1999)}`);
     } finally {
@@ -1024,6 +1046,58 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
     }
   });
 
+  for (const [how, stop, why] of [
+    ['an abort', (runner: PyRunner) => runner.abort('test abort'), 'script aborted by host: test abort'],
+    ['a dispose', (runner: PyRunner) => runner.dispose(), 'code_execution runner disposed'],
+  ] as const) {
+    it(`${how} keeps in the result what a running script wrote before it`, async () => {
+      let calls = 0;
+      let called!: () => void;
+      const running = new Promise<void>((resolve) => {
+        called = resolve;
+      });
+      // The second call comes only after the host has answered the first, so
+      // the line printed before either has reached the host by then.
+      const runner = new PyRunner({
+        onToolCall: async () => {
+          if (++calls === 2) called();
+          return 'echo';
+        },
+      });
+      try {
+        const pending = runner.exec(
+          'print("before")\nawait test__echo({})\nawait test__echo({})\nimport asyncio\nawait asyncio.sleep(60)',
+          ECHO_TOOLS,
+        );
+        await within(
+          Promise.race([running, pending.then((r) => assert.fail(`the exec settled before its second tool call: ${r.stderr}`))]),
+          'the script to call its tool twice',
+        );
+        stop(runner);
+        const result = await pending;
+        assert.deepStrictEqual(
+          { stdout: result.stdout, stderr: result.stderr, aborted: result.aborted },
+          { stdout: 'before\n', stderr: why, aborted: true },
+        );
+      } finally {
+        runner.dispose();
+      }
+    });
+  }
+
+  it('a lone surrogate a script prints comes back escaped, as backslashreplace writes it', async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      const result = await runner.exec('import sys\nprint("a\\udcffb")\nprint("c\\udcffd", file=sys.stderr)', []);
+      assert.deepStrictEqual(
+        { stdout: result.stdout, stderr: result.stderr, returnCode: result.returnCode },
+        { stdout: 'a\\udcffb\n', stderr: 'c\\udcffd\n', returnCode: 0 },
+      );
+    } finally {
+      runner.dispose();
+    }
+  });
+
   it("a command reading its input gets its end at once, and no command holds the protocol's fds", async () => {
     const runner = new PyRunner({ onToolCall: async () => '' });
     try {
@@ -1184,13 +1258,14 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
     }
   });
 
-  it("a command left running writes to the host's log, each piece cut at 2,000 characters, not to the next script's result", async () => {
+  it("a command left running writes to the host's log between scripts, each piece cut at 2,000 characters, and into the result of a script running when it writes", async () => {
     await logging(async (logged) => {
       const dir = mkdtempSync(join(tmpdir(), 'pytc-left-'));
       const runner = new PyRunner({ onToolCall: async () => '' });
       try {
-        // The command writes when the test makes each file, after its script
-        // has returned: a long line, then half of "é".
+        // The command writes when each file appears, after its script has
+        // returned: a long line, then half of "é"; then, while a later script
+        // waits for it, a line that script's result holds.
         const command = [
           'import os, sys, time',
           'def wait(name):',
@@ -1199,6 +1274,9 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
           "sys.stdout.write('left-running ' + 'x' * 3000 + '\\n')",
           'wait("half")',
           'os.write(1, b"caf\\xc3")',
+          'wait("during")',
+          'os.write(1, b"during-line\\n")',
+          'open(os.path.join(sys.argv[1], "written"), "w").close()',
         ].join('\n');
         const first = await runner.exec(
           `import subprocess, sys\nsubprocess.Popen([sys.executable, "-c", ${JSON.stringify(command)}, ${JSON.stringify(dir)}])\nprint("started")`,
@@ -1214,6 +1292,17 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
         // The half character it left is the log's, not the next script's.
         const next = await runner.exec('print("next")', []);
         assert.strictEqual(next.stdout, 'next\n');
+        // What it writes while a script runs is that script's.
+        const during = await runner.exec(
+          [
+            'import os, time',
+            `open(os.path.join(${JSON.stringify(dir)}, "during"), "w").close()`,
+            `while not os.path.exists(os.path.join(${JSON.stringify(dir)}, "written")): time.sleep(0.05)`,
+            'print("after it")',
+          ].join('\n'),
+          [],
+        );
+        assert.strictEqual(during.stdout, 'during-line\nafter it\n');
       } finally {
         runner.dispose();
         rmSync(dir, { recursive: true, force: true });
@@ -1338,21 +1427,35 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
     }
   });
 
-  it("a script that closes fd 3 while it still waits on the host ends the interpreter when the runtime's reader fails", async () => {
+  it("a script that closes fd 3 while it still waits on the host ends the interpreter when the runtime's reader fails, or reads a file that took the number to its end", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pytc-fd3-'));
+    const file = join(dir, 'readable');
+    writeFileSync(file, 'not a message from the host\n');
     const runner = new PyRunner({ onToolCall: async () => 'echoed' });
     try {
       // The tool's result can still reach a read already waiting on fd 3; the
-      // read after it fails, while the script sleeps. The sleep outlasts
-      // within's 10 s, so the end-of-script check, which says the same, can't
-      // be what settles it.
-      const result = await within(runner.exec('import os, time\nos.close(3)\nawait test__echo({})\ntime.sleep(30)', ECHO_TOOLS), 'the reader to fail');
-      assert.strictEqual(result.aborted, true);
-      assert.match(
-        result.stderr,
-        /cannot read the host's messages any more: a script closed or replaced fd 3, where they arrive; exiting\nscript stopped: the Python interpreter exited with code 70 while it ran, [^\n]*$/,
-      );
+      // read after it fails, or reads the file that took the number to its
+      // end, while the script sleeps. The sleep outlasts within's 10 s, so the
+      // end-of-script check, which says the same, can't be what settles it.
+      // The file stays open, held by a global, so it keeps the number.
+      for (const [how, takes] of [['closed', ''], ['taken by a readable file', `\nheld = open(${JSON.stringify(file)})`]]) {
+        const result = await within(
+          runner.exec(`import os, time\nos.close(3)${takes}\nawait test__echo({})\ntime.sleep(30)`, ECHO_TOOLS),
+          `the reader to stop, fd 3 ${how}`,
+        );
+        assert.strictEqual(result.aborted, true, how);
+        assert.match(
+          result.stderr,
+          /cannot read the host's messages any more: a script closed or replaced fd 3, where they arrive; exiting\nscript stopped: the Python interpreter exited with code 70 while it ran, [^\n]*$/,
+          how,
+        );
+        // The reader names it: it isn't the runtime cancelling the script
+        // because the host's messages ended, then finding fd 3 at its end.
+        assert.doesNotMatch(result.stderr, /KeyboardInterrupt: script cancelled by host/, how);
+      }
     } finally {
       runner.dispose();
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 
@@ -1386,7 +1489,7 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
     }
   });
 
-  it("a process the script forks that runs off the script's end leaves with its script's return code, without ending the exec", async () => {
+  it("a process the script forks that runs off the script's end leaves with the exit status Python would give it, without ending the exec", async () => {
     const runner = new PyRunner({ onToolCall: async () => '' });
     try {
       // Python 3.12 on warns that the runtime's reader thread makes fork() risky.
@@ -1416,8 +1519,10 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
           [
             'import os, sys, warnings',
             'warnings.simplefilter("ignore", DeprecationWarning)',
+            'class Unprintable:',
+            '    def __str__(self): raise ValueError("no text")',
             'statuses = []',
-            'for code in (3, None):',
+            'for code in (3, None, 259, 2 ** 40, "boom", Unprintable()):',
             '    pid = os.fork()',
             '    if pid == 0:',
             '        sys.exit(code)',
@@ -1428,8 +1533,47 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
         ),
         'the sys.exit children',
       );
-      assert.deepStrictEqual(exits, { stdout: 'parent saw [3, 0]\n', stderr: '', returnCode: 0 });
+      // Python keeps an int's low byte, 3 for 259 and 0 for 2 ** 40, which is
+      // too big for os._exit; a code that isn't a number is written, then 1.
+      assert.deepStrictEqual(exits, { stdout: 'parent saw [3, 0, 3, 0, 1, 1]\n', stderr: 'boom\n', returnCode: 0 });
       assert.strictEqual((await runner.exec('print("next")', [])).stdout, 'next\n');
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it("a forked process's own partial line arrives as it leaves, and the parent's isn't sent twice", async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      // The parent's partial line is in its writer at each fork; one child
+      // leaves through sys.exit() and one runs off the script's end, each with
+      // a partial line of its own.
+      const result = await within(
+        runner.exec(
+          [
+            'import os, sys, warnings',
+            'warnings.simplefilter("ignore", DeprecationWarning)',
+            'print("partial", end="")',
+            'pid = os.fork()',
+            'if pid == 0:',
+            '    print("|exits", end="")',
+            '    sys.exit(0)',
+            'os.waitpid(pid, 0)',
+            'pid = os.fork()',
+            'if pid == 0:',
+            '    print("|runs off", end="")',
+            'else:',
+            '    os.waitpid(pid, 0)',
+            '    print("|parent")',
+          ].join('\n'),
+          [],
+        ),
+        'the forking script',
+      );
+      assert.deepStrictEqual(
+        { stdout: result.stdout, stderr: result.stderr, returnCode: result.returnCode },
+        { stdout: 'partial|exits|runs off|parent\n', stderr: '', returnCode: 0 },
+      );
     } finally {
       runner.dispose();
     }
