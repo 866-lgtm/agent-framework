@@ -4,8 +4,8 @@
   ignored SIGTERM kept running, the connection stayed connected, and each
   request waited out its timeout. The transport now sends SIGKILL after 2 s,
   as its `close()` does, in the one attempt `close()` shares, so the
-  connection closes and reconnects as after any exit, its close still naming
-  the pipe's error.
+  connection closes, and reconnects if it would after any exit, its close
+  still naming the pipe's error.
   - Nothing more is written to the child after the failure. A request made
     then is refused as not sent (`not-sent`), where it was written to the
     failed pipe and reported at its deadline as possibly executed. One
