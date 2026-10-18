@@ -1172,7 +1172,9 @@ export interface PushOptions {
   /**
    * Overwrite (or unlink) a disk copy in conflict, or one that can't be
    * verified. A disk copy nothing has evidence about is overwritten only when
-   * `named` too: a bare push can't tell it from a newer copy.
+   * `named` too: a bare push can't tell it from a newer copy. Forced or not,
+   * nothing but a regular file, or a followed symlink to one, is written over
+   * or unlinked (effects.ts).
    */
   force?: boolean;
   /**
@@ -1223,6 +1225,8 @@ export const NOT_PUSHED_IN_OTHER_MOUNT = "it lies in another mount's directory, 
  * drafts are written, agreement is left alone, conflicts and unverifiable
  * disk copies are refused unless `force`, and a workspace deletion reaches
  * disk only with `applyDeletions` (with `force` too when disk changed since).
+ * Forced or not, nothing but a regular file, or a followed symlink to one, is
+ * written over or unlinked (effects.ts).
  * A path nothing has evidence about is written only when `named`.
  * A path whose earlier push shows on disk unconfirmed is pushed again, so its
  * completion rests on barriers that succeeded.
@@ -1528,7 +1532,12 @@ export async function pushPaths(
         continue;
       }
       if (!opts.applyDeletions) {
-        result.pendingDeletions.push(path);
+        // A deletion no push makes, forced or not (inTheWay), is refused for
+        // that, as an unforced push refuses it, rather than left for
+        // applyDeletions, which couldn't make it either.
+        const lasting = inTheWay(v.note, true);
+        if (lasting !== null) result.skipped.push({ path, reason: lasting });
+        else result.pendingDeletions.push(path);
         continue;
       }
       if (d.kind === 'absent') continue;

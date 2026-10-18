@@ -6,9 +6,13 @@
   the link itself), forced or not. Where the workspace's deletion of such a
   path is refused, forced or not, the refusal says that no push unlinks it,
   and to ask whoever runs the host if it should go. Before, the refusal for a
-  pipe, socket or device offered a forced materialize to delete it. As before,
-  the unlink checks the entry as close to the unlink as Node allows, so an
-  entry swapped in at that very moment is still removed.
+  pipe, socket or device offered a forced materialize to delete it. A forced
+  materialize without `applyDeletions` now refuses such a deletion in the same
+  words, and a deletion over a directory in the directory's, rather than
+  listing it among the deletions left on disk for `applyDeletions` to
+  remove. A path whose branch intent can't be read is refused, or left, as
+  before. As before, the unlink checks the entry as close to the unlink as
+  Node allows, so an entry swapped in at that very moment is still removed.
   - **For operators:** to clear such an entry, which a forced materialize used
     to remove, remove it by hand with `unlink <path>`: it removes that one
     entry, never what a link leads to, and refuses a directory. (`rm -r` on a
