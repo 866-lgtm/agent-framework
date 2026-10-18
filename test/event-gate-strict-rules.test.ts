@@ -1312,7 +1312,7 @@ test("a rule gate.json holds keeps its name from the host's starting rules, read
   held.gate.dispose();
 });
 
-test("a later start over a gate.json with no rule list it could add to without writing over what it holds runs the starting rules it lacks beside it, under its default and unsaved, and says so until gate.json changes and loads", (t) => {
+test("a later start over a gate.json with no rule list it could add to without writing over what it holds runs the starting rules it lacks beside it, under its default and unsaved, and says so until gate.json changes and loads; where they can't run beside it, gate.json isn't used at that start, which runs as one without it does", (t) => {
   const unsaved = (rules: string, why: string, defaultBehavior: string): string =>
     `At start, the host's starting rules ${rules} couldn't be added to gate.json (${why}, so there's no list of rules to add them to `
     + `without writing over what it holds). The gate runs them under gate.json's default, "${defaultBehavior}", as if gate.json held `
@@ -1381,16 +1381,58 @@ test("a later start over a gate.json with no rule list it could add to without w
   assert.deepEqual(names(noList.gate), []);
   assert.deepEqual(noList.gate.getStatus().errors, []);
 
-  // Where, under gate.json's default, one of them left out could wake the agent, none runs, as where gate.json has a list.
-  const none = makeGate(tempDir(t), { file: object, initialConfig: { default: 'always', policies: [limited, MENTIONS] } });
-  assert.deepEqual(names(none.gate), []);
-  assert.equal(none.gate.evaluate(MENTION).trigger, false);
-  assert.ok(none.gate.getStatus().errors.some((e) => e.endsWith(notPut(
-    '"limited" and "mentions"', `${shown}, ${noListWhy}, and under its default, "skip", one of them would be left out that could wake the agent`,
-  ))), JSON.stringify(none.gate.getStatus().errors));
-  none.gate.dispose();
+  // Where, under gate.json's default, one of them left out could wake the agent, gate.json isn't used at this start, which
+  // runs the starting rules under their own default, as one without gate.json does, and as earlier releases did once what
+  // they wrote over it wouldn't load.
+  const without = makeGate(tempDir(t), { file: object, initialConfig: { default: 'always', policies: [limited, MENTIONS] } });
+  t.after(() => without.gate.dispose());
+  assert.deepEqual(onDisk(without.configPath), object, 'gate.json is as it was');
+  const withoutSaid = without.gate.getStatus().errors;
+  assert.deepEqual(names(without.gate), ['mentions']);
+  assert.equal(without.gate.evaluate(MENTION).trigger, true);
+  assert.equal(without.gate.evaluate(event(['chat:ambient'])).trigger, true, 'and the rest gets their default, "always"');
+  assert.equal(without.gate.getStatus().configSource, 'initial');
+  const fixLimited = 'Whoever runs this host can give gate.json a list of rules under "policies", or fix "limited" in the starting rules';
+  assert.equal(withoutSaid[0], `gate.json loaded. ${shown}, where a list of rules is needed, such as [{"name": "my-rule", "behavior": "always"}], `
+    + 'and it has no rules, so it isn\'t used at this start: beside it, under its default, "skip", the host\'s starting rules would '
+    + 'leave out "limited", which could wake the agent, so the gate runs them under their own default, "always", as a start '
+    + `without gate.json does. ${fixLimited}.`);
+  assert.ok(withoutSaid[1]!.startsWith('In the host\'s starting rules, Policy "limited" is left out'), withoutSaid[1]);
+  assert.equal(withoutSaid[2], 'At start, gate.json wasn\'t used: beside it, under its default, "skip", the host\'s starting rules '
+    + 'would leave out "limited", which could wake the agent. The gate runs them under their own default, "always", as a start '
+    + 'without gate.json does, but they aren\'t saved in it: once gate.json changes and loads, what it holds is in force instead. '
+    + `${fixLimited}.`);
+  assert.equal(withoutSaid.length, 3);
+  // A reload that finds gate.json unchanged keeps them, and says so still; once it changes and loads, what it holds is in force.
+  (without.gate as unknown as { lastReloadCheck: number }).lastReloadCheck = 0;
+  assert.equal(without.gate.evaluate(event(['chat:ambient'])).trigger, true);
+  assert.deepEqual(without.gate.getStatus().errors, withoutSaid);
+  writeFileSync(without.configPath, JSON.stringify({ default: 'skip', policies: [] }));
+  (without.gate as unknown as { lastReloadCheck: number }).lastReloadCheck = 0;
+  assert.equal(without.gate.evaluate(MENTION).trigger, false);
+  assert.equal(without.gate.getStatus().configSource, 'file');
+  assert.deepEqual(without.gate.getStatus().errors, [withoutSaid[1]]);
 
-  // And where every one of them is left out, or the starting rules aren't used, none runs either.
+  // Starting rules refused whole under their own "skip" leave nothing to run beside it, so gate.json, whose "skip" would hold
+  // back every event, isn't used at this start either, and it runs no rules, as one without gate.json does.
+  const neither = makeGate(tempDir(t), { file: object, initialConfig: { default: 'skip', policies: [limited, MENTIONS] } });
+  t.after(() => neither.gate.dispose());
+  assert.deepEqual(onDisk(neither.configPath), object, 'gate.json is as it was');
+  const neitherSaid = neither.gate.getStatus().errors;
+  assert.deepEqual(names(neither.gate), []);
+  assert.equal(neither.gate.evaluate(event(['chat:ambient'])).trigger, true, 'every event wakes the agent');
+  assert.equal(neither.gate.getStatus().configSource, 'default');
+  const fixStarting = 'Whoever runs this host can give gate.json a list of rules under "policies", or fix the starting rules.';
+  assert.equal(neitherSaid[0], `gate.json loaded. ${shown}, where a list of rules is needed, such as [{"name": "my-rule", "behavior": "always"}], `
+    + 'and it has no rules, so under its default, "skip", it would hold back every event: it isn\'t used at this start, and the gate '
+    + `runs no rules, as a start without gate.json does, so every event gets the default, "always". ${fixStarting}`);
+  assert.ok(neitherSaid[1]!.startsWith('At start, the host\'s starting rules weren\'t used: the starting config leaves out a rule'), neitherSaid[1]);
+  assert.ok(neitherSaid[1]!.endsWith(' gate.json, which has no rules, wasn\'t used either: under its default, "skip", it would hold back '
+    + `every event, so the gate started with no rules, as a start without gate.json does. ${fixStarting}`), neitherSaid[1]);
+  assert.equal(neitherSaid.length, 2);
+
+  // Where every one of them is left out, none runs, and where the starting rules aren't used beside a gate.json whose
+  // default is "always", which holds nothing back, gate.json's rules run.
   const allOut = makeGate(tempDir(t), { file: [{ name: 'dm', behavior: 'always' }], initialConfig: { default: 'always', policies: [limited] } });
   assert.deepEqual(names(allOut.gate), []);
   assert.ok(allOut.gate.getStatus().errors.some((e) => e.endsWith(notPut('"limited"', `gate.json is a list, ${noListWhy}`))),
