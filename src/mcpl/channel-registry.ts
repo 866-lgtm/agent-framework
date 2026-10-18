@@ -3353,9 +3353,10 @@ export class ChannelRegistry {
    * server, and a channels/changed update, a re-register or the open's own
    * answer (applyOpenAnswer) may declare the channel inbound-only meanwhile,
    * or a removal take it away, so both are checked again just before the
-   * publish, after every await. Words refused after an open leave the
-   * channel open: the agent gets the notice that it's open, which says how
-   * to close it, and the failure for the words.
+   * publish, after every await. Words refused after an open for a
+   * declaration leave the channel open: the agent gets the notice that it's
+   * open, which says how to close it, and the failure for the words. A
+   * channel removed meanwhile is gone, and the failure names the removal.
    *
    * Only the connector's `delivered: true` confirms a post. `failed` means
    * nothing was posted: the attempt stopped before the request was written,
