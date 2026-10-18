@@ -21,7 +21,9 @@
  *     inside the script instead of dropping wakes.
  *   - its stderr joined to its stdout (fd 2 onto fd 1's pipe), so the host's
  *     journal of its output (a log file the agent can read, and a tail for the
- *     crash envelope) holds their lines in the order they were written.
+ *     crash envelope) holds their lines in the order they were written. The
+ *     runtime's own lines and faulthandler's traceback go to that pipe too, so
+ *     a crash's text comes after what the script wrote before it.
  *
  * OUTPUT. The protocol has file descriptors of its own: the host opens the
  * runtime's fds 3 (host -> py) and 4 (py -> host), which the runtime makes
@@ -38,10 +40,12 @@
  * first out, so what the script and the commands it waited for wrote is ahead
  * of it. Nothing a script or a command does with fds 0, 1 or 2 reaches the
  * protocol, short of pointing them at the runtime's own fds, and the runtime
- * puts them back as the host set them at each exec's start. Its own fds (3
- * and 4, and its copies of 0, 1 and 2) it checks at each exec's start and
- * end, and fd 4 before each message: one a script closed or replaced ends the
- * interpreter, saying which (_check_own_fds).
+ * puts them back as the host set them, blocking, at each exec's start. Its own
+ * fds (3 and 4, and its copies of 0, 1 and 2) it checks at each exec's start
+ * and end, and fd 4 before each message: one a script closed or replaced ends
+ * the interpreter, saying which (_check_own_fds). So does a message or an end
+ * mark that can't be written, as after a script shuts down the socket under
+ * fd 4 or an output pipe, which leaves the fd as it was (send, _write_marks).
  *
  * Embedded as a TS string because tsc does not copy non-TS assets to dist/;
  * PyRunner materializes it to a temp file at spawn.
@@ -53,6 +57,14 @@
  *                {op:"tool_result", id, result}
  *                {op:"wake_ack", id, error?}
  *                {op:"cancel", id, reason?}
+ *                {op:"exit"}   stops the runtime: a running script is
+ *                              cancelled, and it exits 0. A host that closes
+ *                              fd 3 instead while a script runs gets exit
+ *                              code 70 and the line "cannot read the host's
+ *                              messages any more: a script closed, shut down
+ *                              or replaced fd 3, where they arrive", since the
+ *                              runtime can't tell that from a script's own
+ *                              shutdown of the socket under fd 3.
  *   py -> host : {op:"ready"}
  *                {op:"tool_call", id, exec_id, name, args}
  *                {op:"wake", id, exec_id, line, payload}
@@ -131,8 +143,13 @@ def send(obj):
         # A script can close or replace fd 4 before a tool call, as well as
         # before its end, so each message checks it first.
         _check_own_fd(4)
-        PROTO_OUT.write(line + "\n")
-        PROTO_OUT.flush()
+        try:
+            PROTO_OUT.write(line + "\n")
+            PROTO_OUT.flush()
+        except OSError as exc:
+            # fd 4 is still the host's, so the socket under it broke: a script
+            # shut it down, or the host's end is gone. Nothing more reaches it.
+            _fatal(_lost(4) + " (" + str(exc) + ")")
 
 
 def _start():
@@ -179,12 +196,16 @@ def _take_std_fds():
     _own(_STD_IN, "cannot give scripts their stdin any more", "the runtime's copy of fd 0")
     _own(_STD_OUT, "cannot reach the output pipes any more", "the runtime's copy of fd 1")
     _own(_STD_ERR, "cannot reach the output pipes any more", "the runtime's copy of fd 2")
+    _enable_faulthandler(_STD_ERR)
+
+
+def _enable_faulthandler(fd):
     # A crash's own text goes where the host reads it, a pipe that outlives the
     # process: faulthandler adds a traceback for a segfault or an abort, where
     # CPython alone writes nothing. Python 3.14 adds the C stack after it,
     # native frames a script can't act on, which would push the error's own
     # line out of the end of it that the host logs, so it's left out.
-    faulthandler.enable(file=_STD_ERR, all_threads=False,
+    faulthandler.enable(file=fd, all_threads=False,
                         **({"c_stack": False} if sys.version_info >= (3, 14) else {}))
 
 
@@ -197,19 +218,27 @@ def _own(fd, stops, which):
     _OWN_FDS[fd] = (stops, which, _identity(fd))
 
 
+def _lost(fd):
+    # The runtime's line for one of its own fds that it can't use any more, in
+    # the words the host's advice reads the fd from (fdTakenFromRuntime in
+    # py-runner.ts): a script closed or replaced it, or shut down the socket
+    # under it, which only a failed write shows.
+    stops, which, _ = _OWN_FDS[fd]
+    return stops + ": a script closed, shut down or replaced " + which
+
+
 def _check_own_fd(fd):
     # A script closed or replaced one of the runtime's own fds: say which and
     # end, before the runtime writes to a file that isn't its own any more.
     own = _OWN_FDS.get(fd)
     if own is None:
         return
-    stops, which, identity = own
     try:
-        same = _identity(fd) == identity
+        same = _identity(fd) == own[2]
     except OSError:
         same = False
     if not same:
-        _fatal(stops + ": a script closed or replaced " + which)
+        _fatal(_lost(fd))
 
 
 def _check_own_fds():
@@ -222,11 +251,13 @@ def _diag(text):
     # if a script closed or replaced that, fd 2 itself, and only while it's
     # one of the two outputs the host gave the runtime, as the runtime found
     # them at its start: a note never goes into a file a script put in its
-    # place. It waits for room on a pipe a command left non-blocking, as the
-    # marks do (_write_some).
+    # place. A background script's journal is one stream, stdout's pipe, so
+    # there the note goes through fd 1's copy first, after what the script
+    # wrote before it. It waits for room on a pipe a command left non-blocking,
+    # as the marks do (_write_some).
     data = ("[pytc-runtime] " + text + "\n").encode("utf-8", "backslashreplace")
     pipes = [_OWN_FDS[fd][2] for fd in (_STD_OUT, _STD_ERR) if fd in _OWN_FDS]
-    for fd in (_STD_ERR, 2):
+    for fd in ((_STD_OUT, 2, _STD_ERR) if BACKGROUND else (_STD_ERR, 2)):
         try:
             if fd is not None and _identity(fd) in pipes:
                 _write_all(fd, data)
@@ -291,6 +322,11 @@ def _open_streams():
     # A background script's journal is one stream: its stderr joins its stdout's
     # pipe, so their lines keep the order they were written in.
     os.dup2(_STD_OUT if BACKGROUND else _STD_ERR, 2)
+    # And blocking, as the host set them: O_NONBLOCK belongs to a pipe's open
+    # file, which dup2 doesn't touch, so one a command set would reach every
+    # later script and command.
+    os.set_blocking(_STD_OUT, True)
+    os.set_blocking(_STD_ERR, True)
     return _script_writer(1), _script_writer(2)
 
 
@@ -321,6 +357,19 @@ def _flush_writers():
             _diag("some of what the script wrote couldn't be sent (" + str(exc) + ")")
 
 
+def _flush_script_streams():
+    # What a script left in a wrapper of its own that it put in sys.stdout or
+    # sys.stderr goes out in its exec, as Python flushes them at exit. The
+    # runtime's own writers are _flush_writers', and a wrapper the script
+    # keeps anywhere else is its own.
+    for stream in (sys.stdout, sys.stderr):
+        if stream not in _script_writers:
+            try:
+                stream.flush()
+            except Exception:
+                pass
+
+
 def _drop_held(writer):
     # Empty a writer whose flush failed, and leave it usable.
     raw = writer.buffer.raw
@@ -340,9 +389,16 @@ if hasattr(os, "register_at_fork"):
 def _write_marks(mark):
     # End this exec's share of each stream with its mark: everything the
     # script wrote, and all of every command it waited for, is ahead of it.
+    # A mark that can't be written, on a fd the check before it passed, as
+    # after a script shut down the socket under fd 1 or 2, ends the
+    # interpreter, which settles the exec rather than leave it waiting out
+    # its time limit for the mark.
     data = mark.encode("utf-8")
-    _write_all(_STD_OUT, data)
-    _write_all(_STD_ERR, data)
+    for fd in (_STD_OUT, _STD_ERR):
+        try:
+            _write_all(fd, data)
+        except OSError as exc:
+            _fatal(_lost(fd) + " (" + str(exc) + ")")
 
 
 def _fatal(why):
@@ -574,6 +630,9 @@ def handle_init(msg):
     if isinstance(timeout, (int, float)) and timeout > 0:
         CALL_TIMEOUT_S = float(timeout)
     BACKGROUND = bool(msg.get("background"))
+    # A background script's stderr joins its stdout's pipe (_open_streams), so
+    # a crash's traceback goes there too, after what the script wrote first.
+    _enable_faulthandler(_STD_OUT if BACKGROUND else _STD_ERR)
 
     # Remove functions injected by a previous init that are no longer present
     # (tool list changed) without touching user-defined globals.
@@ -619,6 +678,7 @@ def _leave_forked(code, err):
         except BaseException:
             text = ""
         _note(err, text)
+    _flush_script_streams()
     _flush_writers()
     os._exit(status)
 
@@ -662,6 +722,7 @@ async def _run_script(exec_id, code, mark, st):
             _note(err, traceback.format_exc())
         return_code = 1
     finally:
+        _flush_script_streams()
         sys.stdout, sys.stderr, sys.stdin = old_out, old_err, old_in
         st.interrupt = None
         if _stop is st:
@@ -745,9 +806,14 @@ async def main():
             # by name; a failure with fd 3 still the host's says what failed.
             _check_own_fd(3)
             _fatal("cannot read the host's messages any more (" + str(exc) + ")")
-        # The end of fd 3: the host closed it, unless a file a script opened
-        # took the number and has run out.
-        _check_own_fd(3)
+        # The end of fd 3: the host closed it, unless a script shut down the
+        # socket under it, or put a file in its place that has run out. While a
+        # script runs, it's the script's doing: PyRunner closes fd 3 only as it
+        # kills the runtime, and a host that stops the runtime sends exit. An
+        # end while no script runs is a clean exit, the host's own way out.
+        task = _current_exec_task
+        if task is not None and not task.done():
+            _fatal(_lost(3))
         loop.call_soon_threadsafe(queue.put_nowait, None)
 
     # The reader thread blocks SIGINT (it inherits the mask while it starts),

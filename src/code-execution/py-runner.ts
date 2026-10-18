@@ -145,6 +145,11 @@ function onItsOwnLine(text: string, line: string): string {
   return (text === '' || text.endsWith('\n') ? text : `${text}\n`) + line;
 }
 
+/** Add a line of the runner's own to a background script's journal, on a line of its own. */
+function writeLine(journal: Journal, line: string): void {
+  journal.write(`${journal.tail === '' || journal.tail.endsWith('\n') ? '' : '\n'}${line}\n`);
+}
+
 /** Whether the child is still running: not exited, not ended by a signal, and not killed by us. */
 function alive(child: ChildProcess): boolean {
   return child.exitCode === null && child.signalCode === null && !child.killed;
@@ -467,29 +472,30 @@ function startFailure(pythonPath: string, err: unknown): string {
 function stoppedReading(background: boolean): string {
   return "script stopped: the Python interpreter stopped reading the host's messages, so the host ended it and the rest of the script didn't run"
     + `${background ? '' : ', and variables from earlier scripts are gone'}. Tool calls it had already made keep their effects, `
-    + 'so check them before you run it again in a new interpreter. If it stops the same way, check whether the script closes or '
-    + "replaces file descriptor 3, where the host's messages arrive; if not, ask whoever runs this host.";
+    + 'so check them before you run it again in a new interpreter. If it stops the same way, check whether the script closes, '
+    + "shuts down or replaces file descriptor 3, where the host's messages arrive; if not, ask whoever runs this host.";
 }
 
 /** Why a script stopped when its interpreter exited under it, and what running it again does. */
 function interpreterExit(exitCode: number | null, signal: NodeJS.Signals | null, background: boolean, said = ''): string {
   const how = signal ? `was ended by ${signal}` : `exited with code ${exitCode}`;
-  // The runtime ends itself (_fatal) with code 70 after a line saying which of its fds a script took.
-  // The line reaches the host unless the script took both the runtime's copy of fd 2 and fd 2 itself,
-  // and it's read from what the result keeps, which past the stderr cap or a journal's tail lacks it.
+  // The runtime ends itself (_fatal) with code 70 after a line saying which of its fds a script took,
+  // or shut down the socket under. The line reaches the host unless the script took both the runtime's
+  // copy of fd 2 and fd 2 itself, or shut down the socket under them, and it's read from what the result
+  // keeps, which past the stderr cap or a journal's tail lacks it.
   const taken = exitCode === RUNTIME_FATAL_EXIT ? fdTakenFromRuntime(said) : null;
   const check = taken
-    ? `check whether the script closes or replaces ${taken}, as the runtime's line above says`
+    ? `check whether the script closes, shuts down or replaces ${taken}, as the runtime's line above says`
     : `check whether the script itself ends the process, for example ${signal ? 'by using too much memory' : 'with os._exit()'}`;
   return `script stopped: the Python interpreter ${how} while it ran, so the rest of the script didn't run`
     + `${background ? '' : ', and variables from earlier scripts are gone'}. Tool calls it had already made keep their effects, `
     + `so check them before you run it again in a new interpreter. If it stops the same way, ${check}; if not, ask whoever runs this host.`;
 }
 
-/** The file descriptor the runtime's last line of its own says a script took from it (runtime-py.ts _check_own_fd), if it says so. */
+/** The file descriptor the runtime's last line of its own says a script took from it (runtime-py.ts _lost), if it says so. */
 function fdTakenFromRuntime(said: string): string | null {
   let taken: string | null = null;
-  for (const m of said.matchAll(/\[pytc-runtime\] [^\n]*: a script closed or replaced ((?:the runtime's copy of )?fd \d)[^\n]*; exiting/g)) {
+  for (const m of said.matchAll(/\[pytc-runtime\] [^\n]*: a script closed, shut down or replaced ((?:the runtime's copy of )?fd \d)[^\n]*; exiting/g)) {
     taken = m[1];
   }
   return taken;
@@ -850,6 +856,10 @@ export class PyRunner {
 
     this.reader = createInterface({ input: protoOut });
     this.reader.on('line', (line) => this.handleLine(line, child));
+    // readline passes its input's error on to the interface, where with no
+    // listener it would be thrown as an uncaught exception and end the host.
+    // protoOut's own listener above logs it.
+    this.reader.on('error', () => {});
 
     this.childReady = new Promise<void>((resolve, reject) => {
       let over = false;
@@ -968,7 +978,6 @@ export class PyRunner {
     const stderr = this.err.take();
     const journal = pending.journal;
     if (journal) {
-      journal.close();
       this.settlePending({ stdout: '', stderr: '', returnCode: pending.returnCode, tail: journal.tail });
     } else {
       this.settlePending({ stdout, stderr, returnCode: pending.returnCode });
@@ -989,14 +998,16 @@ export class PyRunner {
     const stderr = this.err?.take() ?? '';
     const returnCode = pending.returnCode ?? 1;
     const journal = pending.journal;
-    // A background script's stderr, the runtime's own lines among it, is in its journal.
-    const why = typeof reason === 'string' ? reason : reason(journal ? journal.tail : stderr);
+    // The runtime's own lines are in a background script's journal. A foreground
+    // script's are in its stderr, unless it pointed fd 2 at stdout's pipe and took
+    // the runtime's copy of fd 2 (runtime-py.ts _diag): stderr goes last, as the
+    // one the runtime writes to first, since the last line that names a fd counts.
+    const why = typeof reason === 'string' ? reason : reason(journal ? journal.tail : `${stdout}\n${stderr}`);
     if (journal) {
       const tail = journal.tail;
       // The journal, which the agent reads with its own tools, says why too,
       // unless it reached its cap or a write to it failed.
-      journal.write(`${tail === '' || tail.endsWith('\n') ? '' : '\n'}${why}\n`);
-      journal.close();
+      writeLine(journal, why);
       this.settlePending({ stdout: '', stderr: why, returnCode, aborted: true, tail: onItsOwnLine(tail, why) });
       return tail;
     }
@@ -1017,9 +1028,13 @@ export class PyRunner {
       // On a line of its own: a script's output, and the runner's own texts, such as an
       // interpreter's exit, can end without a newline.
       const withNote = (text: string) => onItsOwnLine(text, note);
-      // A background script reports its output tail, so the note goes there too.
+      // A background script reports its output tail, so the note goes there too,
+      // and into its journal, which the agent reads with its own tools.
       result = { ...result, stderr: withNote(result.stderr), ...(result.tail !== undefined ? { tail: withNote(result.tail) } : {}) };
+      if (pending.journal) writeLine(pending.journal, note.trimEnd());
     }
+    // Only now: what the stop wrote above is the journal's last.
+    pending.journal?.close();
     if (pending.deadlineTimer) clearTimeout(pending.deadlineTimer);
     if (pending.killTimer) clearTimeout(pending.killTimer);
     if (pending.interruptTimer) clearInterval(pending.interruptTimer);
