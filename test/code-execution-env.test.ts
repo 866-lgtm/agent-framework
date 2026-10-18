@@ -23,7 +23,7 @@ test('a codeExecution.inheritEnv set to anything but true, false or null is refu
     [[], 'true or false, not an array'], [{}, 'true or false, not an object'],
   ];
   for (const [inheritEnv, wanted] of kinds) {
-    assert.throws(() => validateCodeExecutionConfig({ inheritEnv }), (err: Error) => {
+    assert.throws(() => validateCodeExecutionConfig({ enabled: true, inheritEnv }), (err: Error) => {
       assert.equal(err.message, `codeExecution.inheritEnv must be ${wanted}: ` +
         "true hands the interpreter the host's whole environment, and false or leaving it out keeps the allowlist");
       return true;
@@ -31,7 +31,7 @@ test('a codeExecution.inheritEnv set to anything but true, false or null is refu
   }
   // null counts as not set, so a generated config that writes an unset
   // setting as null keeps working.
-  for (const inheritEnv of [undefined, null, true, false]) validateCodeExecutionConfig({ inheritEnv });
+  for (const inheritEnv of [undefined, null, true, false]) validateCodeExecutionConfig({ enabled: true, inheritEnv });
 });
 
 test('a codeExecution.env that is not an object of strings is refused, naming the variable and its value\'s kind but not the value', () => {
@@ -40,21 +40,21 @@ test('a codeExecution.env that is not an object of strings is refused, naming th
     [Object.create(Object.create(null)), "an object that isn't plain"],
   ];
   for (const [env, kind] of envKinds) {
-    assert.throws(() => validateCodeExecutionConfig({ env }), (err: Error) => {
+    assert.throws(() => validateCodeExecutionConfig({ enabled: true, env }), (err: Error) => {
       assert.equal(err.message, `codeExecution.env must be an object of variable names and string values, not ${kind}`);
       return true;
     }, String(kind));
   }
   const valueKinds: Array<[unknown, string]> = [[8080, 'a number'], [true, 'a boolean'], [null, 'null'], [undefined, 'undefined'], [['x'], 'an array'], [{ nested: 'y' }, 'an object']];
   for (const [value, kind] of valueKinds) {
-    assert.throws(() => validateCodeExecutionConfig({ env: { PYTHONPATH: '/opt/lib', BAD: value } }), (err: Error) => {
+    assert.throws(() => validateCodeExecutionConfig({ enabled: true, env: { PYTHONPATH: '/opt/lib', BAD: value } }), (err: Error) => {
       assert.equal(err.message, `codeExecution.env.BAD must be a string, not ${kind}: give its value as a string, or leave BAD out`);
       return true;
     }, String(kind));
   }
-  validateCodeExecutionConfig({ env: {} });
-  validateCodeExecutionConfig({ env: null });
-  validateCodeExecutionConfig({ env: { PYTHONPATH: '/opt/lib', EMPTY: '' } });
+  validateCodeExecutionConfig({ enabled: true, env: {} });
+  validateCodeExecutionConfig({ enabled: true, env: null });
+  validateCodeExecutionConfig({ enabled: true, env: { PYTHONPATH: '/opt/lib', EMPTY: '' } });
 });
 
 test('a codeExecution.env name spawn could not pass as written, or a value holding NUL, is refused, showing nothing after an = or NUL', () => {
@@ -65,12 +65,12 @@ test('a codeExecution.env name spawn could not pass as written, or a value holdi
     ['NU\0L', `starting "NU" that holds '=' or NUL`],
   ];
   for (const [name, shown] of names) {
-    assert.throws(() => validateCodeExecutionConfig({ env: { [name]: 'x' } }), (err: Error) => {
+    assert.throws(() => validateCodeExecutionConfig({ enabled: true, env: { [name]: 'x' } }), (err: Error) => {
       assert.equal(err.message, `codeExecution.env has a variable name ${shown}, and a name can't be empty or hold '=' or NUL`);
       return true;
     }, JSON.stringify(name));
   }
-  assert.throws(() => validateCodeExecutionConfig({ env: { SECRET: 'sk-\0live' } }), (err: Error) => {
+  assert.throws(() => validateCodeExecutionConfig({ enabled: true, env: { SECRET: 'sk-\0live' } }), (err: Error) => {
     assert.equal(err.message, 'codeExecution.env.SECRET holds a NUL character, which no environment variable can carry');
     return true;
   });
@@ -229,7 +229,7 @@ test('an interpreter that never starts leaves no runtime directory behind', { sk
       try {
         const r = await runner.exec('print(1)', []);
         assert.equal(r.returnCode, 1);
-        assert.match(r.stderr, /Failed to start python runtime/, r.stderr);
+        assert.match(r.stderr, /^script didn't run: this host can't start its Python interpreter, /, r.stderr);
         assert.deepEqual(readdirSync(tmp), [], 'the runtime directory went with the failed start');
       } finally {
         runner.dispose();

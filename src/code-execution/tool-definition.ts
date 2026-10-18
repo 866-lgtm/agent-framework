@@ -9,7 +9,7 @@
  */
 
 import type { ToolDefinition } from '../types/index.js';
-import { kindOf } from '../mcpl/transport.js';
+import { assertBooleanSetting, holdsSettings, kindOf } from '../config-checks.js';
 import { formatLimit, MAX_TIMER_MS } from './py-runner.js';
 
 export const CODE_EXECUTION_TOOL_NAME = 'code_execution';
@@ -109,27 +109,43 @@ export function scriptTimeLimits(opts?: {
   const defaultMs = Math.min(MAX_TIMER_MS, opts?.scriptTimeoutMs ?? 600_000);
   return {
     defaultMs,
-    // A ceiling below the default is refused when the framework is created
-    // (validateCodeExecutionConfig); never below the default here either.
+    // A ceiling below the default is refused when a framework with code
+    // execution on is created (validateCodeExecutionConfig); never below the
+    // default here either.
     maxMs: Math.min(MAX_TIMER_MS, Math.max(defaultMs, opts?.maxScriptTimeoutMs ?? defaultMs)),
     backgroundMaxMs: Math.min(MAX_TIMER_MS, opts?.backgroundMaxLifetimeMs ?? 86_400_000),
   };
 }
 
 /**
- * Refuse a configuration whose time limits contradict each other, or whose
- * interpreter environment would be misread. A recipe's `"inheritEnv": "true"`,
- * or a `${VAR}` substituted as a string, arrives untyped, and the runner passes
- * the host's environment only for `true`, so such a value would quietly keep
- * the allowlist. Anything but true, false or null is refused, a quoted "false"
- * included.
+ * Refuse a codeExecution that isn't an object, or whose switch is set to
+ * anything but true or false, and, once it's on, one whose time limits
+ * contradict each other or whose interpreter environment would be misread. A
+ * JSON config, or a `${VAR}` substituted as a string, can carry a quoted
+ * "false" where the type says boolean, and only `true` turns code execution
+ * on, so the quotes would hide what the value does; a bare
+ * `codeExecution: true` would be read as off. Likewise the runner passes the
+ * host's environment only for an `inheritEnv` of `true`, so a quoted "true"
+ * would quietly keep the allowlist. A null or false codeExecution, and a null
+ * setting, count as not set, as left-out ones do. The refusal names the
+ * value's kind, not the value. A configuration that isn't on has nothing else
+ * read.
  */
 export function validateCodeExecutionConfig(cfg: {
+  enabled?: unknown;
   scriptTimeoutMs?: number;
   maxScriptTimeoutMs?: number;
   env?: unknown;
   inheritEnv?: unknown;
 }): void {
+  if (!holdsSettings('codeExecution', cfg, '{ enabled: true }')) return;
+  assertBooleanSetting(
+    'codeExecution.enabled',
+    cfg.enabled,
+    'true gives agents the code_execution tool, which runs their scripts in a python interpreter on the host, ' +
+      'and false or leaving it out doesn\'t',
+  );
+  if (cfg.enabled !== true) return;
   const defaultMs = cfg.scriptTimeoutMs ?? 600_000;
   if (cfg.maxScriptTimeoutMs !== undefined && !(cfg.maxScriptTimeoutMs >= defaultMs)) {
     throw new Error(
@@ -141,13 +157,11 @@ export function validateCodeExecutionConfig(cfg: {
   // at most its kind: a substituted value can be a credential. null counts
   // as not set, so a generated config that writes an unset setting as null
   // keeps working.
-  if (cfg.inheritEnv !== undefined && cfg.inheritEnv !== null && typeof cfg.inheritEnv !== 'boolean') {
-    const wanted = typeof cfg.inheritEnv === 'string' ? 'true or false, unquoted,' : 'true or false,';
-    throw new Error(
-      `codeExecution.inheritEnv must be ${wanted} not ${kindOf(cfg.inheritEnv)}: ` +
-        "true hands the interpreter the host's whole environment, and false or leaving it out keeps the allowlist",
-    );
-  }
+  assertBooleanSetting(
+    'codeExecution.inheritEnv',
+    cfg.inheritEnv,
+    "true hands the interpreter the host's whole environment, and false or leaving it out keeps the allowlist",
+  );
   if (cfg.env !== undefined && cfg.env !== null) {
     if (!isPlainObject(cfg.env)) {
       throw new Error(`codeExecution.env must be an object of variable names and string values, not ${kindOf(cfg.env)}`);
