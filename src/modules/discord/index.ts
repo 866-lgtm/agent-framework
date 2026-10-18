@@ -203,7 +203,9 @@ function needsRebuild(stored: StoredMessage, message: HistoryMessage): boolean {
 
 /**
  * Whether a row holds non-blank text besides its message's own text now,
- * which may be what a file gave.
+ * which may be what a file gave. A marked row whose message's text changed
+ * counts its old text here too, which can delay its rebuild until a fetch
+ * succeeds but never loses text.
  */
 function holdsOtherText(stored: StoredMessage, message: HistoryMessage): boolean {
   const own = ownText(message.content);
@@ -212,11 +214,11 @@ function holdsOtherText(stored: StoredMessage, message: HistoryMessage): boolean
   return others.some((block) => block.type === 'text' && !isBlankText(block) && !isEmptyMarker(block));
 }
 
-/** Whether a message's conversion holds the note for an attachment of its
- *  whose text wasn't fetched. */
+/** Whether a message's conversion holds, after the message's own text, the
+ *  note for an attachment of its whose text wasn't fetched. */
 function holdsNotFetched(content: ContentBlock[], message: HistoryMessage): boolean {
   const notes = new Set((message.attachments ?? []).map((attachment) => attachmentNotFetched(attachment.filename).text));
-  return content.some((block) => block.type === 'text' && notes.has(block.text));
+  return content.slice(1).some((block) => block.type === 'text' && notes.has(block.text));
 }
 
 /**
