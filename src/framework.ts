@@ -5683,15 +5683,20 @@ export class AgentFramework {
     this.handOffDeferredWrites(flush);
     // A target no longer registered (a fork or a run gone before a crash
     // that left this write to boot recovery) has no window to land in. A
-    // failed reply it never read is passed to the primary, by name, before
-    // the rest are written; any other write is dropped, logged, by
+    // failed reply it never read becomes the primary's by-name notice, under
+    // the entry's own id and place in the queue (queuedFailedReplyForPrimary),
+    // and is written with the rest; any other write is dropped, logged, by
     // addMessage.
-    const passOn = flush.filter((msg) =>
-      msg.forAgent !== undefined && !this.agents.has(msg.forAgent) &&
-      (msg.metadata as { kind?: unknown } | undefined)?.kind === 'discord-send-failed');
-    for (const msg of passOn) this.passFailedReplyToPrimary(msg.forAgent!, msg.metadata);
-    const passed = passOn.length;
-    const stored = this.readdDrained(passed > 0 ? flush.filter((msg) => !passOn.includes(msg)) : flush, `host-mode ${label}`).length;
+    let passed = 0;
+    const batch = flush.flatMap((msg) => {
+      if (msg.forAgent === undefined || this.agents.has(msg.forAgent)) return [msg];
+      if ((msg.metadata as { kind?: unknown } | undefined)?.kind !== 'discord-send-failed') return [msg];
+      const forPrimary = this.queuedFailedReplyForPrimary(msg.forAgent, msg);
+      if (!forPrimary) return [];
+      passed++;
+      return [forPrimary];
+    });
+    const stored = this.readdDrained(batch, `host-mode ${label}`).length;
     // Ack = sync the chronicle FIRST, then rewrite the durable queue without
     // the batch. Never the other way round.
     this.ackDeferredWrites();
@@ -19243,6 +19248,7 @@ export class AgentFramework {
     const queued = this.drainDeferredFor(agent.name);
     if (queued.length === 0) return;
     const cm = agent.getContextManager();
+    const forPrimary: DeferredWrite[] = [];
     for (const msg of queued) {
       try {
         cm.addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id));
@@ -19253,8 +19259,14 @@ export class AgentFramework {
           err,
         );
       }
-      this.passFailedReplyToPrimary(agent.name, msg.metadata);
+      // A failed reply, now in a window no one reads: the entry itself goes
+      // on to the primary as its by-name notice, under its own id and seq, so
+      // a crash before the ack below replays it once, not twice.
+      if ((msg.metadata as { kind?: unknown } | undefined)?.kind !== 'discord-send-failed') continue;
+      const passed = this.queuedFailedReplyForPrimary(agent.name, msg);
+      if (passed) forPrimary.push(passed);
     }
+    if (forPrimary.length > 0) this.readdDrained(forPrimary, `release of ${agent.name}`);
     this.ackDeferredWrites();
   }
 
@@ -19318,9 +19330,10 @@ export class AgentFramework {
 
   /**
    * A fork or an ephemeral run ended before reading that its reply's delivery
-   * to a channel failed: it was released with the notice unread or still
-   * queued, its queued notice was restored at boot after it was gone, or its
-   * delivery failed after release. Tell the primary instead, naming the
+   * to a channel failed: it was released with the notice stored in its window
+   * unread, or its delivery failed after release. (A notice still queued for
+   * it, at release or restored at boot, goes on as the queue entry itself:
+   * queuedFailedReplyForPrimary.) Tell the primary instead, naming the
    * speaker, so an agent who can still act learns of it: to resend, or to
    * tell the human. The words follow the speaker's own notice
    * (onRouteFailure): a delivery that wasn't confirmed may have been posted,
@@ -19330,19 +19343,49 @@ export class AgentFramework {
    * it runs inside a release, which must complete whatever this write meets.
    */
   private passFailedReplyToPrimary(speaker: string, metadata: MessageMetadata | undefined): void {
+    const notice = this.failedReplyNoticeForPrimary(speaker, metadata);
+    if (!notice) return;
+    try {
+      this.addMessage('user', notice.content, notice.metadata);
+    } catch (err) {
+      console.error(`[route-failure] failed to tell the primary that ${speaker}'s reply to ${String(notice.metadata.channelId)} failed:`, err);
+    }
+  }
+
+  /**
+   * A queued failed-reply entry for `speaker`, who is gone, as the primary's
+   * by-name notice (passFailedReplyToPrimary's words): the same entry, under
+   * its own id and seq, now addressed to the primary. Written through the
+   * drain, it lands stamped with that id, or waits in the queue under it, so
+   * boot's exactly-once holds for it: a crash before the original's ack
+   * replays one entry, never the original and a separate notice. null when no
+   * one is told (logged): a reply that had no channel to reach, or no primary.
+   */
+  private queuedFailedReplyForPrimary(speaker: string, msg: DeferredWrite): DeferredWrite | null {
+    const notice = this.failedReplyNoticeForPrimary(speaker, msg.metadata);
+    if (!notice) return null;
+    return { id: msg.id, seq: msg.seq, participant: 'user', content: notice.content, metadata: notice.metadata };
+  }
+
+  /** The primary's by-name notice of `speaker`'s failed reply, or null when no
+   *  one is told, which is logged here (see passFailedReplyToPrimary). */
+  private failedReplyNoticeForPrimary(
+    speaker: string,
+    metadata: MessageMetadata | undefined,
+  ): { content: ContentBlock[]; metadata: MessageMetadata } | null {
     const failure = metadata as {
       kind?: unknown; channelId?: unknown; reason?: unknown; textLen?: unknown; outcome?: unknown; detail?: unknown;
     } | undefined;
-    if (failure?.kind !== 'discord-send-failed') return;
+    if (failure?.kind !== 'discord-send-failed') return null;
     if (typeof failure.channelId !== 'string' || failure.channelId === '') {
       console.error(`[route-failure] ${speaker} has ended, and its reply had no channel to reach: no one else is told`);
-      return;
+      return null;
     }
     // The default path falls back to the first registered agent when there
     // is no primary, which could be the speaker being released.
     if (!this.primaryAgentName || !this.agents.has(this.primaryAgentName)) {
       console.error(`[route-failure] ${speaker} has ended, and there is no primary to tell that its reply to ${failure.channelId} failed`);
-      return;
+      return null;
     }
     // A notice queued by an earlier build may carry none of these; say only
     // what it has.
@@ -19358,21 +19401,16 @@ export class AgentFramework {
         `It may or may not have been posted, so sending it again could post it twice. ${speaker} has ended.`
       : `[discord-send-failed] A reply by ${speaker}${size} could not be delivered to ${where}${why}. ` +
         `Nothing was posted. ${speaker} has ended.`;
-    try {
-      this.addMessage(
-        'user',
-        [{ type: 'text', text: text + (detail !== undefined ? ` Connector detail: ${detail}` : '') }],
-        {
-          system: true, kind: 'discord-send-failed', channelId: failure.channelId, speaker,
-          ...(reason !== undefined ? { reason } : {}),
-          ...(textLen !== undefined ? { textLen } : {}),
-          ...(outcome !== undefined ? { outcome } : {}),
-          ...(detail !== undefined ? { detail } : {}),
-        } as MessageMetadata,
-      );
-    } catch (err) {
-      console.error(`[route-failure] failed to tell the primary that ${speaker}'s reply to ${failure.channelId} failed:`, err);
-    }
+    return {
+      content: [{ type: 'text', text: text + (detail !== undefined ? ` Connector detail: ${detail}` : '') }],
+      metadata: {
+        system: true, kind: 'discord-send-failed', channelId: failure.channelId, speaker,
+        ...(reason !== undefined ? { reason } : {}),
+        ...(textLen !== undefined ? { textLen } : {}),
+        ...(outcome !== undefined ? { outcome } : {}),
+        ...(detail !== undefined ? { detail } : {}),
+      } as MessageMetadata,
+    };
   }
 
   /**

@@ -27,6 +27,7 @@ function internals(framework: AgentFramework) {
     deferredWritesPersisted: boolean;
     unackedDeferredWrites: unknown[];
     flushDeferredWrites(label: string): Promise<void>;
+    landedDeferredWriteIds(ids: Set<string>, scanFrom: Map<string, number>): Set<string>;
     injectScriptWake(record: { id: string; agentName: string }, envelope: string): void;
     closingConversationAgents: Set<string>;
     activeStreams: Map<string, Promise<void>>;
@@ -624,9 +625,35 @@ describe('notices about an agent\'s own action', () => {
       assert.match(told[0]!, /A reply by conversation-gone \(12 chars\) could not be delivered to missing-channel \(no registered channel\)\. Nothing was posted\. conversation-gone has ended\./);
       assert.match(told[1]!, /A reply by conversation-older could not be delivered to missing-channel\. Nothing was posted\. conversation-older has ended\./);
       assert.ok(!told.some((t) => t.includes('undefined')));
+      // Each is the entry itself, under its own id: boot's landed scan finds
+      // it, so a crash before the ack replays neither.
+      const stamped = framework.getAgent('primary')!.getContextManager().getAllMessages()
+        .filter((m) => JSON.stringify(m.content).includes('has ended'))
+        .map((m) => (m.metadata as { deferredWriteId?: unknown } | undefined)?.deferredWriteId);
+      assert.deepEqual(stamped, ['w-1', 'w-2']);
+      assert.deepEqual([...state.landedDeferredWriteIds(new Set(['w-1', 'w-2']), new Map())].sort(), ['w-1', 'w-2']);
       assert.equal(count(messages, 'an ordinary write'), 0);
       assert.ok(errors.some((e) => /"conversation-gone" is not a registered agent — message dropped \(participant=user\)/.test(e)));
       assert.equal(state.deferredMessages.length, 0);
+    });
+
+    it('passes a restored failure notice on as the same queue entry while the primary is mid-turn: it waits under its own id', async () => {
+      const state = internals(framework);
+      (state.deferredMessages as unknown as Array<Record<string, unknown>>).push({
+        id: 'w-9', seq: 9, participant: 'user', forAgent: 'conversation-gone',
+        content: [{ type: 'text', text: '[discord-send-failed] Your previous reply (12 chars) could not be delivered.' }],
+        metadata: { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', reason: 'no registered channel', textLen: 12 },
+      });
+      state.activeTurnTokens.set('primary', 1);
+
+      await state.flushDeferredWrites('resume');
+
+      assert.equal(state.deferredMessages.length, 1, 'one entry, not the original and a separate notice');
+      const entry = state.deferredMessages[0] as unknown as { id: string; forAgent?: string; content: unknown; metadata?: Record<string, unknown> };
+      assert.equal(entry.id, 'w-9');
+      assert.equal(entry.forAgent, undefined, 'now the primary\'s');
+      assert.equal(entry.metadata?.speaker, 'conversation-gone');
+      assert.match(JSON.stringify(entry.content), /A reply by conversation-gone \(12 chars\) could not be delivered/);
     });
 
     for (const condition of ['ordinary', 'other-tool-cycle', 'quiesced', 'write-fails'] as const) {
@@ -720,7 +747,17 @@ describe('notices about an agent\'s own action', () => {
           assert.match(JSON.stringify(messages[noticeIndex]!.content), /Your previous reply.*delivered:false/);
           // Every write of a drained entry carries its durable id (drainDeferredFor).
           const stored = archive.getAllMessages().find((m) => JSON.stringify(m.content).includes(SEND_FAILED));
-          assert.equal(typeof (stored?.metadata as { deferredWriteId?: unknown } | undefined)?.deferredWriteId, 'string');
+          const id = (stored?.metadata as { deferredWriteId?: unknown } | undefined)?.deferredWriteId;
+          assert.equal(typeof id, 'string');
+          if (condition === 'quiesced') {
+            // Still queued for the fork at its release, the notice goes on to
+            // the primary as that entry, under the same id. (Otherwise it was
+            // stored in the fork's window at its turn's end, and is passed on
+            // from there, as a new write.)
+            const passed = framework.getAgent('primary')!.getContextManager().getAllMessages()
+              .find((m) => JSON.stringify(m.content).includes(`A reply by ${fork.name}`));
+            assert.equal((passed?.metadata as { deferredWriteId?: unknown } | undefined)?.deferredWriteId, id);
+          }
         }
         // The fork never reads its notice again, so the primary is told, by name.
         const primary = await framework.getAgent('primary')!.getContextManager().compile();
