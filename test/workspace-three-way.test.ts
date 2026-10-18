@@ -924,6 +924,35 @@ describe('a file tool naming a path passed over by design', () => {
     });
   }
 
+  // A read names its path too, so a held file passed over by design is read
+  // as any held file is: disk's change, and disk's deletion, are taken in
+  // first.
+  for (const [kind, ignore, path] of [
+    ['beneath a directory an ignore entry covers', ['node_modules'], 'node_modules/pkg/a.txt'],
+    ['that an ignore entry covers by its own name', ['*.log'], 'build.log'],
+  ] as const) {
+    test(`a read of a held file ${kind} takes disk's change and disk's deletion in first, as a read of any held file does`, async (t) => {
+      const env = new Env(t);
+      env.writeDisk(path, 'v1\n');
+      const m = await env.open({ ignore: [...ignore] });
+      await call(m, 'sync', { path: `work/${path}` });
+      const stored = () => {
+        const entry = env.store.treeGet(TREE, path);
+        return entry ? env.store.getBlob(entry.blobHash)!.toString('utf-8') : null;
+      };
+      assert.equal(stored(), 'v1\n', 'the named sync stored it');
+      env.writeDisk(path, 'v2\n');
+      const changed = await call(m, 'read', { path: `work/${path}` });
+      assert.equal(changed.content, '     1\tv2', "the read shows disk's text");
+      assert.match(String(changed.note), /Disk's copy had changed since the workspace last agreed with it, so it was taken in first/);
+      assert.equal(stored(), 'v2\n', "and stores disk's change");
+      env.rmDisk(path);
+      const gone = await refused(m, 'read', { path: `work/${path}` });
+      assert.equal(gone, `File not found: work/${path}. Disk's copy was deleted since the workspace last agreed with it, and that was taken in first.`);
+      assert.equal(stored(), null, "and disk's deletion is stored");
+    });
+  }
+
   test('edit_many edits files passed over by design, each by its path, as a sync naming them takes them in (#276)', async (t) => {
     const env = new Env(t);
     env.writeDisk('node_modules/pkg/a.d.ts', 'a v1\n');

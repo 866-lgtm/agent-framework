@@ -2696,8 +2696,11 @@ export class WorkspaceModule implements Module {
         // A read shows the path as disk holds it now: a change on disk to a
         // file the workspace holds is taken in first, by the rule a listing
         // uses, as an edit's is. Where the stored copy is a draft and disk
-        // changed too, the read shows the draft and names the conflict.
-        const pass = await this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] });
+        // changed too, the read shows the draft and names the conflict. The
+        // pass names the path, as a file tool names the one it acts on, so a
+        // path the mount passes over by design is observed, as a sync naming
+        // it would observe it (#276).
+        const pass = await this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] }, { named: true });
         // A pass that gave up (the selected branch kept changing) decided
         // nothing and leaves no report. It's read as a copy disk couldn't be
         // checked, with its reason, so the answer says the check didn't finish.
