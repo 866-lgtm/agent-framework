@@ -4,6 +4,9 @@
  *   - a connect whose server exits before it answers initialize, or never
  *     answers it, carries the last of the server's stderr on its error, as
  *     `stderrTail`, bounded, and never in its message;
+ *   - a refusal at the server's exit takes that tail once the server's stderr
+ *     has ended, waiting at most STDERR_END_WAIT_MS for a process that shares
+ *     the stream;
  *   - a transport decodes stderr as one stream, keeps its last code units
  *     across reads, and emits a last line that has no newline once the stream
  *     ends;
@@ -227,4 +230,59 @@ test('a reconnect failure with no stderr, such as a spawn error, is traced with 
   connection.emit('reconnect-failed', { error, attempt: 5 });
   assert.equal('stderrTail' in (traces.find((event) => event.type === 'mcpl:server-connect-failed') ?? {}), false);
   assert.equal(traces.find((event) => event.type === 'ops:alert')?.message, `MCPL server unreachable (attempt 5): ${error}`);
+});
+
+test("a refusal waits for the server's stderr to end, so a line that a process sharing it writes after the exit is in its tail", { timeout: 30_000 }, async () => {
+  // The server starts a process that shares its stderr. That process writes its
+  // line only once the host has reaped the server, which the host does as it
+  // handles the exit, so a tail taken at the exit can't hold the line.
+  const sharer = "const pid = ' + process.pid + '; const t = setInterval(() => { try { process.kill(pid, 0) } catch { clearInterval(t); process.stderr.write(\\'written after the exit\\') } }, 5)";
+  const refused = await refusal('shares-stderr', [
+    "console.error('fatal: DISCORD_TOKEN is not set')",
+    `require('child_process').spawn(process.execPath, ['-e', '${sharer}'], { stdio: ['ignore', 'ignore', 'inherit'] })`,
+    "process.stdin.once('data', () => process.exit(1))",
+  ].join('; '));
+  assert.deepEqual(refused, {
+    message: 'MCPL server "shares-stderr" transport closed before handshake completed (child process exited)',
+    stderrTail: 'fatal: DISCORD_TOKEN is not set\nwritten after the exit',
+  });
+});
+
+test("a refusal waits for stderr to end only up to its bound, so a process the server left running with it doesn't hold the refusal", { timeout: 30_000 }, async (t) => {
+  // The server starts a process that inherits its stderr and outlives it, and
+  // says which, so the test can end it. An unbounded wait would leave the
+  // connect unsettled past refusal()'s 15 s.
+  const refused = await refusal('holds-stderr', [
+    "const held = require('child_process').spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: ['ignore', 'ignore', 'inherit'] })",
+    "console.error('holder ' + held.pid)",
+    "process.stdin.once('data', () => process.exit(1))",
+  ].join('; '));
+  const holder = Number(/^holder (\d+)$/.exec(refused.stderrTail ?? '')?.[1]);
+  t.after(() => { try { process.kill(holder); } catch { /* already gone */ } });
+  assert.equal(refused.message, 'MCPL server "holds-stderr" transport closed before handshake completed (child process exited)');
+  assert.ok(holder > 0, String(refused.stderrTail));
+});
+
+test('a transport resolves stderrEnded once its stderr ends, at once after that, and after its bound if it never does', async () => {
+  const { stderr, transport } = standIn();
+  let ended = false;
+  const waiting = transport.stderrEnded(60_000).then(() => { ended = true; });
+  stderr.emit('data', Buffer.from('last words'));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(ended, false, 'nothing settles it before the end');
+  stderr.emit('end');
+  assert.equal(await within(waiting.then(() => 'ended'), 'waited', 5_000), 'ended');
+  assert.equal(transport.stderrTail, 'last words');
+  assert.equal(await within(transport.stderrEnded(60_000).then(() => 'at once'), 'waited', 1_000), 'at once');
+
+  const unended = standIn();
+  assert.equal(await within(unended.transport.stderrEnded(10).then(() => 'bounded'), 'waited', 5_000), 'bounded');
+});
+
+test('a transport resolves stderrEnded when its stderr closes without ending, as an errored stream does', async () => {
+  const { stderr, transport } = standIn();
+  const waiting = transport.stderrEnded(60_000).then(() => 'closed');
+  stderr.emit('close');
+  assert.equal(await within(waiting, 'waited', 1_000), 'closed');
+  assert.equal(await within(transport.stderrEnded(60_000).then(() => 'at once'), 'waited', 1_000), 'at once');
 });

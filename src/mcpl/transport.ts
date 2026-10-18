@@ -85,6 +85,15 @@ export abstract class McplTransport extends EventEmitter {
     return '';
   }
 
+  /**
+   * Resolves once the server's diagnostic stream has ended, so that
+   * {@link stderrTail} holds all of it, or once `ms` have passed while it
+   * hasn't. At once for a transport that has none.
+   */
+  stderrEnded(_ms: number): Promise<void> {
+    return Promise.resolve();
+  }
+
   /** Deliver an inbound line, buffering it if nobody is listening yet. */
   protected pushLine(line: string): void {
     if (this.listenerCount('line') > 0) this.emit('line', line);
@@ -186,15 +195,51 @@ export function buildChildEnv(
 /** The most of a stdio child's stderr a transport keeps for {@link McplTransport.stderrTail}. */
 export const STDERR_TAIL_CHARS = 2_048;
 
+/**
+ * How long a failed handshake waits for a stdio child's stderr to end after the
+ * child's exit, so that its refusal's `stderrTail` holds what the child wrote.
+ * Node can emit a child's `exit` before it has read the last of the child's
+ * stderr. When the child held the stream alone, the stream ends with it, so the
+ * wait is over at once or within a turn of the loop. The bound binds only when
+ * another process still holds the stream, such as one the server started that
+ * inherited it. One that ends as the server does closes the stream within a
+ * fraction of a second even on a loaded host, and its last words then reach
+ * the tail. One that keeps the stream open, such as a process the server
+ * started and left running, holds the refusal up by the bound, a fifth of the
+ * reconnect's default first interval.
+ */
+export const STDERR_END_WAIT_MS = 1_000;
+
 export class StdioTransport extends McplTransport {
   readonly kind = 'stdio' as const;
   /** The first error on the child's stdin or stdout, named in the close reason. */
   private pipeError: Error | undefined;
   private stderrEnd = '';
   private stderrCut = false;
+  /** True once the child's stderr has ended or closed. */
+  private stderrDone = false;
 
   override get stderrTail(): string {
     return (this.stderrCut ? '…' : '') + this.stderrEnd;
+  }
+
+  override stderrEnded(ms: number): Promise<void> {
+    const stderr = this.child.stderr;
+    if (!stderr || this.stderrDone) return Promise.resolve();
+    return new Promise((resolve) => {
+      let timer: NodeJS.Timeout | undefined;
+      const done = () => {
+        clearTimeout(timer);
+        stderr.off('end', done);
+        stderr.off('close', done);
+        resolve();
+      };
+      // Added after the constructor's listeners, so the tail already holds the
+      // stream's last characters when these run.
+      stderr.once('end', done);
+      stderr.once('close', done);
+      timer = setTimeout(done, ms);
+    });
   }
 
   private constructor(
@@ -226,7 +271,10 @@ export class StdioTransport extends McplTransport {
     this.child.stderr?.on('end', () => {
       received(decoder.end());
       if (carry.length > 0) this.pushStderr(carry);
+      this.stderrDone = true;
     });
+    // A stream destroyed by an error closes without ending: nothing more comes.
+    this.child.stderr?.on('close', () => { this.stderrDone = true; });
 
     this.child.on('error', (err) => this.emit('error', err));
     // The child's stdin and stdout carry the protocol, so after an error on
