@@ -1497,8 +1497,6 @@ interface HostCommandParams {
 
 /** Descriptor of a single refusal-driven rewind (see shedNewestTurn). */
 interface RewindRecord {
-  /** tool = machine tool exchange; human = an ingested message; other = else. */
-  kind: 'tool' | 'human' | 'other';
   /** Content-free, safe-to-replay description of what was withheld. */
   descriptor: string;
   /** All message ids removed in this shed (a tool exchange removes 2+). */
@@ -7955,10 +7953,10 @@ export class AgentFramework {
    * message, whoever wrote it, with the rest of its exchange (the tool_use
    * turn paired with a tool result, and the whole of a body stored in
    * shards). It adds no marker; the caller keeps one consolidated marker for
-   * the episode (updateRewindMarker). The returned record describes what was
-   * removed (kind + size), never the content, while the raw record survives
-   * in the chronicle log for forensics. Returns null when only system
-   * messages remain.
+   * the episode (updateRewindMarker). The returned record's descriptor says
+   * what was removed and its size, never the content, while the raw record
+   * survives in the chronicle log for forensics. Returns null when only
+   * system messages remain.
    *
    * Shared by the refusal rewind, automatic or forced by `/unstick`, and by
    * the shed after inference exhaustion (quarantinePoisonedHistory).
@@ -8007,10 +8005,8 @@ export class AgentFramework {
     const removedIds: MessageId[] = members.map((m) => m.id).reverse();
     // Where the exchange starts: this body, or the tool_use turn paired with it.
     let from = first;
-    let kind: RewindRecord['kind'];
     let descriptor: string;
     if (toolBlocks.length > 0) {
-      kind = 'tool';
       // Pair the tool_result with the tool_use assistant turn right before
       // it, the whole of it: a turn stored as a body carries its tool_use on
       // its first shard, not its last.
@@ -8027,17 +8023,15 @@ export class AgentFramework {
       descriptor = `a tool exchange (~${Math.max(1, Math.round(sz / 1024))}KB` +
         `${images ? `, ${images} image(s)` : ''})`;
     } else if (md.messageId) {
-      kind = 'human';
       descriptor = `an incoming message from ${msg.participant} ` +
         `(${textLen} chars${images ? `, ${images} image(s)` : ''})`;
     } else {
-      kind = 'other';
       descriptor = `a ${msg.participant} turn ` +
         `(${textLen} chars${images ? `, ${images} image(s)` : ''})`;
     }
     // One removal for the whole exchange, so it is never half applied.
     removeStoredMessages(cm, all[from], msg);
-    return { kind, descriptor, removedIds };
+    return { descriptor, removedIds };
   }
 
   /**

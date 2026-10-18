@@ -54,20 +54,20 @@ test('shed: tool_result removes its paired tool_use turn too (complete exchange)
   ];
   const { fw, agent, removed, added } = makeAgentHarness(msgs);
   const rec = fw.shedNewestTurn(agent);
-  assert.equal(rec.kind, 'tool');
+  assert.equal(rec.descriptor, 'a tool exchange (~320KB)');
   assert.deepEqual([...removed].sort(), ['a1', 'r1'], 'removes the tool_result AND its tool_use turn — no orphan');
   assert.deepEqual([...rec.removedIds].sort(), ['a1', 'r1']);
   assert.equal(added.length, 0, 'shedNewestTurn must not add a marker');
 });
 
-test('shed: human message → kind=human, single removal', () => {
+test('shed: human message → described as an incoming message, single removal', () => {
   const msgs = [
     { id: 'a0', participant: 'labclaude', content: [{ type: 'text', text: 'hi' }] },
     { id: 'm2', participant: 'simulect', content: [{ type: 'text', text: 'sketchy' }], metadata: { messageId: '999', channelId: 'discord:g:c' } },
   ];
   const { fw, agent, removed } = makeAgentHarness(msgs);
   const rec = fw.shedNewestTurn(agent);
-  assert.equal(rec.kind, 'human');
+  assert.equal(rec.descriptor, 'an incoming message from simulect (7 chars)');
   assert.deepEqual(removed, ['m2']);
 });
 
