@@ -397,6 +397,25 @@ describe('a link into a nested mount\'s directory, on a mount that follows symli
     assert.equal(readFileSync(env.at('outer/a/b/x.txt'), 'utf8'), "the inner mount's\n");
   });
 
+  for (const autoMaterialize of [false, true]) test(`a draft made before a file link into it took the path's place gets the path to use from a push, unforced and forced (autoMaterialize ${autoMaterialize})`, async (t) => {
+    // anima-research/agent-framework#530's first two cases. On `main` the
+    // unforced push skipped the path with advice to force it, and the forced
+    // push wrote into the inner mount's file.
+    const env = new Env(t);
+    env.write('outer/a/b/x.txt', "the inner mount's\n");
+    const m = await env.open(t, [mount('outer', env.at('outer'), { followSymlinks: true, autoMaterialize }), mount('inner', env.at('outer/a/b'))]);
+    assert.equal((await call(m, 'write', { path: 'outer/flink.txt', content: 'outer wrote\n' })).success, true);
+    if (existsSync(env.at('outer/flink.txt'))) rmSync(env.at('outer/flink.txt'));
+    symlinkSync(env.at('outer/a/b/x.txt'), env.at('outer/flink.txt'));
+    const unforced = await call(m, 'materialize', { path: 'outer/flink.txt' });
+    assert.equal(unforced.data.count, 0);
+    assert.equal(skippedReason(unforced.data, 'flink.txt'), 'flink.txt: cannot verify disk copy ("outer/flink.txt" leads into mount "inner", nested in mount "outer": use "inner/x.txt" in its place) — fix it and materialize again');
+    const forced = await call(m, 'materialize', { path: 'outer/flink.txt', force: true });
+    assert.equal(forced.data.count, 0);
+    assert.equal(skippedReason(forced.data, 'flink.txt'), 'flink.txt: not written: "outer/flink.txt" leads into mount "inner", nested in mount "outer": use "inner/x.txt" in its place');
+    assert.equal(readFileSync(env.at('outer/a/b/x.txt'), 'utf8'), "the inner mount's\n");
+  });
+
   test('a deletion stored before a link into it took the path\'s place is refused by a forced push, through a final link and through a directory link', async (t) => {
     // anima-research/agent-framework#530's unlink side. On `main` the push
     // unlinked the final link, and through the directory link it unlinked
