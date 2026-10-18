@@ -377,10 +377,13 @@ export class SemanticIndexer {
   private detach: (() => void) | null = null;
   /**
    * Set once the service answers 404 to /delete in a pass whose /stats
-   * answered, which means a build without the route: removals are dropped
-   * from then on, until the host restarts or binds the module again, which
-   * makes a new indexer. A pass whose /stats answers 404 has no index made
-   * yet, so it doesn't call /delete, and this stays as it was.
+   * answered with stats, which shows the index is made, so the 404 means a
+   * build without the route. From then on, removals are dropped as they come
+   * and no pass calls /delete, until the host restarts or binds the module
+   * again, which makes a new indexer. A pass whose /stats answers 404 has no
+   * index made yet and makes no /delete call; a /delete 404 in a pass whose
+   * /stats answered with something that isn't stats is re-queued like any
+   * other failure, since that answer doesn't show the index is made.
    */
   private deleteUnsupported = false;
   /** Called whenever the pending edit/remove sets change. */
@@ -495,27 +498,32 @@ export class SemanticIndexer {
           if (item) toUpsert.push(item); else { toDelete.push(`msg:${id}`); blanked.push(id); }
         }
         if (this.editedIds.size > 0) report.more = true;
-        // With no index made yet, the removals and blanked edits are done
-        // without a call: an index has nothing to remove before it exists,
-        // and none of them can come into the one this pass makes, since the
-        // time walk upserts only what the store still holds and can index.
-        if (toDelete.length > 0 && !noIndex) {
+        // No /delete call in a pass with no index made yet, or once the
+        // service is known to lack the route (deleteUnsupported): the removals
+        // and blanked edits are dropped. An index has nothing to remove before
+        // it exists, and the index a pass makes takes only what the store holds
+        // and can index, so they stay out of it unless their message is back in
+        // the store. Without the route, search-time checks (on-branch, still
+        // indexable) keep them out of results.
+        if (toDelete.length > 0 && !noIndex && !this.deleteUnsupported) {
           try {
             await this.client.delete(toDelete);
           } catch (e) {
             const msg = e instanceof Error ? e.message : String(e);
-            if (e instanceof EmbedServiceError && e.status === 404) {
-              // This pass's /stats didn't answer 404, so the 404 is the
-              // route's: a service build without /delete. Drop the removals
-              // and blanked edits: search-time checks (on-branch, still
-              // indexable) keep them out of results.
+            if (e instanceof EmbedServiceError && e.status === 404 && stats !== null) {
+              // This pass's /stats answered with stats, so the index is made
+              // and the 404 is the route's: a service build without /delete.
               this.deleteUnsupported = true;
+              const dropped = `${removed.length} removal(s)`
+                + (blanked.length > 0 ? ` and ${blanked.length} edit(s) down to nothing indexable` : '');
               this.warn(
-                '/delete answered 404, so the service lacks that route; '
-                  + `dropping ${toDelete.length} removal(s), and every later one until the host restarts or binds the `
-                  + `history module again: ${msg}`,
+                `/delete answered 404, so the service lacks that route; dropping ${dropped}, and every later one until `
+                  + `the host restarts or binds the history module again: ${msg}`,
               );
             } else {
+              // Any other failure, and a 404 in a pass whose /stats answered
+              // with something that isn't stats, which doesn't show the index
+              // is made: re-queued, for a later pass.
               for (const id of removed) this.removedIds.add(id);
               for (const id of blanked) if (!this.removedIds.has(id)) this.editedIds.add(id);
               phaseErrors.push(msg);

@@ -21,9 +21,13 @@ class FakeService {
   /** When set, /delete answers this status instead of deleting. */
   deleteStatus: number | null = null;
   /** When set, /delete answers 404 while the namespace holds nothing, as
-   *  /stats does: semantic.ts's comment says a service may answer so for a
-   *  namespace not made yet. */
+   *  /stats does. The comment at semantic.ts's /delete catch said, before
+   *  F82's fix (d6593a3), that a service may answer so for a namespace that
+   *  does not exist. */
   deleteNeedsIndex = false;
+  /** When set, /stats answers 200 with JSON that isn't stats, as a page
+   *  shown while the service restarts may. */
+  statsNotStats = false;
   /** When set, /upsert answers this status instead of indexing. */
   upsertStatus: number | null = null;
   server!: Server;
@@ -38,6 +42,7 @@ class FakeService {
         const json = (code: number, o: unknown): void => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(o)); };
         if (!m) return json(404, {});
         if (m[2] === 'stats') {
+          if (this.statsNotStats) return json(200, { namespace: 'n' });
           if (this.items.size === 0) return json(404, { error: { message: 'no such namespace' } });
           const by: Record<string, { count: number; max_ts: null; min_ts: null; max_cursor: number | null }> = {};
           for (const it of this.items.values()) {
@@ -123,7 +128,7 @@ describe('semantic sync: Greptile #173 findings', () => {
   const svc = new FakeService();
   before(() => svc.start());
   after(() => svc.stop());
-  beforeEach(() => { svc.items.clear(); svc.calls.length = 0; svc.deleted.length = 0; svc.deleteStatus = null; svc.deleteNeedsIndex = false; svc.upsertStatus = null; svc.searchKs.length = 0; });
+  beforeEach(() => { svc.items.clear(); svc.calls.length = 0; svc.deleted.length = 0; svc.deleteStatus = null; svc.deleteNeedsIndex = false; svc.statsNotStats = false; svc.upsertStatus = null; svc.searchKs.length = 0; });
 
   function mod(cm: StubCm): HistoryModule {
     const m = new HistoryModule({ semantic: { url: svc.url, namespace: 'n', syncIntervalMs: 0 } });
@@ -212,27 +217,55 @@ describe('semantic sync: Greptile #173 findings', () => {
 
   it('re-review #1: a 404 from /delete (service without the route) drops the removals instead of retrying forever', async (t) => {
     const warned = t.mock.method(console, 'warn', () => {});
-    const cm = new StubCm([msg('a', T0, 'first message'), msg('b', T0 + 1, 'second message')]);
+    const cm = new StubCm([msg('a', T0, 'first message'), msg('b', T0 + 1, 'second message'), msg('d', T0 + 3, 'fourth message')]);
     const m = mod(cm);
     await m.syncSemanticIndex();
     cm.remove('a');
+    cm.edit('b', '');
     cm.messages.push(msg('c', T0 + 2, 'a new message after the removal'));
     svc.deleteStatus = 404;
     await m.syncSemanticIndex();
     assert.ok(svc.items.has('msg:c'), 'new messages still index when /delete is missing');
     assert.deepEqual(warned.mock.calls.map((c) => String(c.arguments[0])), [
-      '[history/semantic] index "n": /delete answered 404, so the service lacks that route; dropping 1 removal(s), '
-        + 'and every later one until the host restarts or binds the history module again: the semantic index service '
-        + 'answered the delete request with an error (HTTP 404: delete failed)',
+      '[history/semantic] index "n": /delete answered 404, so the service lacks that route; dropping 1 removal(s) and '
+        + '1 edit(s) down to nothing indexable, and every later one until the host restarts or binds the history module '
+        + 'again: the semantic index service answered the delete request with an error (HTTP 404: delete failed)',
     ]);
     svc.calls.length = 0;
     svc.deleteStatus = null;
+    // A later removal, and a later edit down to nothing indexable, make no call either.
+    cm.remove('c');
+    cm.edit('d', '');
     await m.syncSemanticIndex();
-    assert.ok(!svc.calls.includes('delete'), `removal retried after a 404: ${JSON.stringify(svc.calls)}`);
+    assert.ok(!svc.calls.includes('delete'), `/delete called after the route was found missing: ${JSON.stringify(svc.calls)}`);
+    assert.equal(warned.mock.calls.length, 1);
     await m.stop();
   });
 
-  it('a removal before this store\'s index is made is done without a call, and later removals still reach the index', async (t) => {
+  it('a 404 from /delete in a pass whose /stats answered with something that isn\'t stats is re-queued, not read as a missing route', async (t) => {
+    const warned = t.mock.method(console, 'warn', () => {});
+    const cm = new StubCm([msg('a', T0, 'first message'), msg('b', T0 + 1, 'second message')]);
+    const m = mod(cm);
+    await m.syncSemanticIndex();
+    cm.remove('a');
+    svc.statsNotStats = true;
+    svc.deleteStatus = 404;
+    svc.calls.length = 0;
+    await m.syncSemanticIndex();
+    assert.ok(svc.calls.includes('delete'), `a pass whose /stats wasn't 404 made no /delete call: ${JSON.stringify(svc.calls)}`);
+    assert.deepEqual(warned.mock.calls.map((c) => String(c.arguments[0])), [
+      '[history/semantic] index "n": delete failed, 1 removal(s) re-queued: the semantic index service answered the '
+        + 'delete request with an error (HTTP 404: delete failed)',
+    ]);
+    svc.statsNotStats = false;
+    svc.deleteStatus = null;
+    await m.syncSemanticIndex();
+    assert.deepEqual(svc.deleted, ['msg:a']);
+    assert.ok(!svc.items.has('msg:a'));
+    await m.stop();
+  });
+
+  it('a removal before this store\'s index is made is dropped without a call, and later removals still reach the index', async (t) => {
     const warned = t.mock.method(console, 'warn', () => {});
     svc.deleteNeedsIndex = true;
     const cm = new StubCm([msg('a', T0, 'first message'), msg('b', T0 + 1, 'second message'), msg('c', T0 + 2, 'third message')]);
@@ -242,7 +275,8 @@ describe('semantic sync: Greptile #173 findings', () => {
     cm.remove('a');
     cm.edit('b', '');
     await m.syncSemanticIndex();
-    assert.ok(!svc.calls.includes('delete'), `a pass with no index called /delete: ${JSON.stringify(svc.calls)}`);
+    // /stats answered 404, and no /delete was called.
+    assert.deepEqual(svc.calls, ['stats', 'upsert']);
     assert.deepEqual([...svc.items.keys()], ['msg:c']);
     // With the index made, a later removal reaches it, and only that one.
     cm.remove('c');
