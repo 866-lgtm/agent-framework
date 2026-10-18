@@ -475,8 +475,9 @@ const result = await framework.rollbackToMessage('cairn', {
   - `listDiscordAwareness()` lists batches and retract requests;
   - `cancelDiscordAwareness(batch | retractRequest)` stops all further sends
     and retries of a batch's marks or a retract's removals, and never removes
-    or undoes anything. Its receipt counts requests in flight or unknown,
-    including earlier attempts later answered, any of which may still land;
+    or undoes anything. Its receipt's `unresolvedAttempts` counts requests
+    on the wire or unknown, including earlier attempts later answered, any
+    of which may still land;
   - `retractDiscordAwareness(batch | 'all')` queues removal of this bot's
     reaction, through each address's configured MCPL route, for every message
     of the batch (or of every batch that isn't retired, whether prepared or
@@ -485,8 +486,8 @@ const result = await framework.rollbackToMessage('cairn', {
     authorization for those messages, it stops adds that haven't ended and
     any an earlier choice would request later (a prepared batch's
     activation); cancelling it never revives them. Its receipt discloses earlier
-    add requests whose outcome is unknown (an unknown removal can't bring a
-    mark back);
+    add requests whose outcome is unresolved, on the wire or unknown (an
+    unknown removal can't bring a mark back);
   - `checkDiscordAwarenessBranchName(name)` refuses (`invalid`) a name for
     a new branch that a suppression with pending removals names as its
     target, cancelled or not, since a start on a branch with that name

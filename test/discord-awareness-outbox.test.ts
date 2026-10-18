@@ -767,8 +767,9 @@ test('an import retires the work 0.22.x had still to do, none of it sent, and th
 }));
 
 test('replay skips a record type this build doesn\'t know and applies the records after it', withJournal((outbox, h) => {
-  // What a later build's new record type, or one a pre-release build of
-  // this journal wrote, reads as: nothing, in an entry of this format.
+  // A record type this build doesn't know, a later build's or one a
+  // pre-release build of this journal wrote, is skipped; the records around
+  // it apply as usual, in the same entry or any other.
   const batch = outbox.prepare({ agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/old', refs: [ref('m1'), ref('m2')], scope: 'all' })!;
   h.store.appendJson(DISCORD_AWARENESS_RECORD_TYPE, { v: 1, records: [
     { t: 'a-later-type', at: 2, batchId: batch.id },

@@ -550,7 +550,7 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     ['a registration', { method: 'channels/register', params: { channels: [descriptor('room', 'second')] } }],
     ['an update', { method: 'channels/changed', params: { updated: [descriptor('room', 'second')] } }],
   ] as const) {
-    it(`keeps ${what} of a channel behind a removal that adds that channel, so the server's later descriptor stands`, async () => {
+    it(`keeps ${what} of a channel behind a change that adds it and removes another, so the server's later descriptor stands`, async () => {
       const { grant, serverSends, registry } = await keptIncomingSetup();
       // The next process adds the kept message's channel in a change that
       // also removes another channel, and then writes it again.
@@ -601,6 +601,17 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     assert.deepStrictEqual(rejected(), [], 'no message is refused as an unknown channel');
     assert.deepStrictEqual(admitted.map((event) => event.messageId), ['kept-1', 'new-5']);
     assert.equal(channelOf(registry, '5'), undefined, 'and the removal took the channel at the end');
+  });
+
+  it('leaves a removal named by an object out of the admission order, since its string form can throw, and orders the rest', () => {
+    // A JSON object whose toString isn't a function makes String() throw. The
+    // order leaves that entry out rather than throwing, so a flush still
+    // orders what it holds.
+    const connectionClass = McplServerConnection as unknown as { admissionOrder(pending: unknown[]): unknown[] };
+    const kept = { event: 'channels-incoming', args: [{ messages: [{ channelId: 'room' }] }], kept: true };
+    const removal = { event: 'channels-changed', args: [JSON.parse('{"removed":[{"toString":1}]}')] };
+    const registration = { event: 'channels-register', args: [{ channels: [{ id: 'room' }] }] };
+    assert.deepStrictEqual(connectionClass.admissionOrder([kept, removal, registration]), [removal, registration, kept]);
   });
 
   it('moves a channels/changed that only adds channels ahead of a kept message, as a registration', async () => {

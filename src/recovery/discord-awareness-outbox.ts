@@ -1106,9 +1106,11 @@ export class DiscordAwarenessOutbox {
    * Remove this bot's mark (through the configured route) from a batch's refs,
    * or (`all`) from every key of every batch not retired, whether prepared
    * or active, and every key an add was requested for. That covers every
-   * mark an import may have left: an imported batch agent-framework 0.22.x
-   * activated is never retired, and 0.22.x attempted only an active batch's
-   * refs. The keys of add requests are the direct record of a mark that may
+   * mark a ledger recorded when it was imported: an imported batch
+   * agent-framework 0.22.x activated is never retired, and 0.22.x attempted
+   * only an active batch's refs. A batch it activates after its import
+   * (after a downgrade, in a copy put back later) stays as the import left
+   * it, and retracting that batch reaches its refs. The keys of add requests are the direct record of a mark that may
    * be on Discord. Each is also a key of a batch not retired, since an add
    * is requested only with its batch's activation and only a prepared batch
    * is retired; they are kept so that `all` doesn't rest on those rules. A reaction is one
