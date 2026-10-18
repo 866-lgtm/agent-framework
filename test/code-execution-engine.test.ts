@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  loadEngine, EngineError, MAX_STACK_BYTES, MIN_MEMORY_BYTES,
+  loadEngine, EngineError, MAX_MEMORY_BYTES, MAX_STACK_BYTES, MIN_MEMORY_BYTES,
 } from '../src/code-execution/engine.js';
 import type { Engine, EngineLimits, EngineSlots, RunState } from '../src/code-execution/engine.js';
 
@@ -280,7 +280,21 @@ test('limits outside their range are refused before anything loads', async () =>
   const slots: EngineSlots = { hostCall: () => {}, interrupt: () => false, output: () => {} };
   await assert.rejects(loadEngine({ memoryMaxBytes: 32 * MiB + 1 }, slots), RangeError);
   await assert.rejects(loadEngine({ memoryMaxBytes: MIN_MEMORY_BYTES - 65536 }, slots), RangeError);
+  await assert.rejects(loadEngine({ memoryMaxBytes: MAX_MEMORY_BYTES + 65536 }, slots), RangeError);
   await assert.rejects(loadEngine({ memoryMaxBytes: 32 * MiB, maxStackBytes: MAX_STACK_BYTES + 1 }, slots), RangeError);
+});
+
+test('both ends of the memory range load and run', async () => {
+  // At the least, a call settles and the limit gives a catchable error; at the most, the guest
+  // holds an array larger than any other test's whole budget.
+  const least = await engine({}, { memoryMaxBytes: MIN_MEMORY_BYTES });
+  least.e.start(PRELUDE, 'const r = await tool("t"); let a = [], caught; try { for (;;) a.push({ n: a.length }); } catch (err) { caught = err.message; } a = null; [r, caught]', 's.js');
+  assert.deepEqual(fulfilled(least.e.settle(1, true, '"ok"', UNFIT)), ['ok', 'out of memory']);
+  least.e.dispose();
+  const most = await engine({}, { memoryMaxBytes: MAX_MEMORY_BYTES });
+  most.e.start(PRELUDE, 'const r = await tool("t"); [r, new Uint8Array(192 * 1024 * 1024).length]', 's.js');
+  assert.deepEqual(fulfilled(most.e.settle(1, true, '"ok"', UNFIT)), ['ok', 192 * MiB]);
+  most.e.dispose();
 });
 
 test('dispose frees a runtime with calls still pending, and nothing is allowed after it', async () => {
