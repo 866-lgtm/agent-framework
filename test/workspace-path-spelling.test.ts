@@ -6,9 +6,10 @@
 // doesn't, since a disk that tells spellings apart has nothing to respell;
 // one needs it to fold normalization, and three to fold ß with ss, ſ with s
 // and ς with σ. A draft not yet on disk takes the spelling of a workspace
-// entry it equals in lower case, on a disk that folds case, and a path that
-// names an entry exactly keeps its spelling. Three run only where the disk
-// tells case apart, and those about starting and stopping run anywhere.
+// entry it equals in simple case folding, on a disk that folds case, and a
+// path that names an entry exactly keeps its spelling. Four run only where
+// the disk tells case apart, and those about starting and stopping run
+// anywhere.
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import fs, { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -447,6 +448,17 @@ test('on a disk that tells case apart, two hard links that differ only in case k
     assert.equal(await foldsCase(root), false);
   });
 
+test('on a disk that tells case apart, an empty directory with no letter in its name, or with a link at its flipped name, tells case apart',
+  { skip: CASE_SENSITIVE_ONLY }, async (t) => {
+    const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-own-name-'));
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    mkdirSync(join(root, '2025'));
+    assert.equal(await foldsCase(join(root, '2025')), false, 'as the directory holding it');
+    mkdirSync(join(root, 'proj'));
+    symlinkSync('proj', join(root, 'PROJ'));
+    assert.equal(await foldsCase(join(root, 'proj')), false, 'a link at the flipped name is another file');
+  });
+
 test('a second draft spelled in another case is the first one, and a push writes one file', { skip: FOLDING_ONLY }, async (t) => {
   const { dir, call, pushed } = await setup(t, drafts);
   await call('write', { path: 'work/src/New.txt', content: 'first\n' });
@@ -535,15 +547,16 @@ test('the step takes an entry\'s name where disk has nothing, keeps an entry\'s 
   assert.equal(await diskSpelling(root, 'docs/d.txt', entries), 'DOCS/d.txt', 'else the first in path order equal to it in lower case');
   assert.equal(await diskSpelling(root, 'docs/./SUB/b.txt', entriesOf(['Docs/Sub/a.txt'])), 'Docs/./Sub/b.txt', 'passing over . among entries');
   // Simple case folding, letter by letter, so a word's last Σ is σ and ς is
-  // σ, ſ is s and µ is μ; İ, whose lower case is two letters, and dotless ı
-  // stay as they are.
-  const greek = entriesOf(['src/\u039f\u0394\u039f\u03a3.txt', 'src/\u0130.txt', 'src/\u017foap.txt', 'src/\u00b5.txt', 'src/\u0131x.txt']);
+  // σ, ſ is s, µ is μ and ᾈ, whose upper case is two letters, is ᾀ; İ,
+  // whose lower case is two letters, and dotless ı stay as they are.
+  const greek = entriesOf(['src/\u039f\u0394\u039f\u03a3.txt', 'src/\u0130.txt', 'src/\u017foap.txt', 'src/\u00b5.txt', 'src/\u0131x.txt', 'src/\u1f80.txt']);
   assert.equal(await diskSpelling(root, 'src/\u03bf\u03b4\u03bf\u03c2.txt', greek), 'src/\u039f\u0394\u039f\u03a3.txt');
   assert.equal(await diskSpelling(root, 'src/\u03bf\u03b4\u03bf\u03c3.txt', greek), 'src/\u039f\u0394\u039f\u03a3.txt');
   assert.equal(await diskSpelling(root, 'src/i\u0307.txt', greek), 'src/i\u0307.txt');
   assert.equal(await diskSpelling(root, 'src/SOAP.txt', greek), 'src/\u017foap.txt');
   assert.equal(await diskSpelling(root, 'src/\u039c.txt', greek), 'src/\u00b5.txt');
   assert.equal(await diskSpelling(root, 'src/IX.txt', greek), 'src/IX.txt');
+  assert.equal(await diskSpelling(root, 'src/\u1f88.txt', greek), 'src/\u1f80.txt');
   assert.equal(await diskSpelling(root, 'DOCS/../docs/b.txt', entries), 'DOCS/../docs/b.txt', 'a `..` among entries keeps the rest');
   assert.equal(await diskSpelling(root, 'src/CAFE\u0301.txt', entries), 'src/CAFE\u0301.txt', 'no entry is equal to it in lower case without normalizing');
   assert.equal(await diskSpelling(root, 'src/NEW.txt'), 'src/NEW.txt', 'without entries, as before');
@@ -601,6 +614,7 @@ test('an entry in a nested mount\'s directory spelled otherwise than its configu
     { name: 'inner', path: join(dir, 'inner'), mode: 'read-write', watch: 'never' },
     { name: 'later', path: join(dir, 'later'), mode: 'read-write', watch: 'never' },
     { name: 'cafe', path: join(dir, 'caf\u00e9'), mode: 'read-write', watch: 'never' },
+    { name: 'deep', path: join(dir, 'proj', 'inner'), mode: 'read-write', watch: 'never' },
   ] });
   workspace.initStore(store);
   await workspace.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
@@ -608,22 +622,27 @@ test('an entry in a nested mount\'s directory spelled otherwise than its configu
   // Entries the outer mount holds from before: a file named as one nested
   // mount's directory in another case; two beneath the directory of a
   // nested mount that isn't on disk yet, one in another case and one as
-  // configured; and one beneath a nested mount's directory in the other
-  // normalization form.
+  // configured; one beneath a nested mount's directory in the other
+  // normalization form; and one beside the directory of a nested mount two
+  // levels down, in a directory spelled otherwise than its configuration.
   const entry = { blobHash: 'a'.repeat(64), size: 1, mode: 0o100644 };
   store.treeSet('workspace/outer/tree', 'Inner', entry);
   store.treeSet('workspace/outer/tree', 'Later/x.txt', entry);
   store.treeSet('workspace/outer/tree', 'later/z.txt', entry);
   store.treeSet('workspace/outer/tree', 'cafe\u0301/x.txt', entry);
+  store.treeSet('workspace/outer/tree', 'Proj/z.txt', entry);
   const call = (name: string, input: unknown) => workspace.handleToolCall({ id: name, name, input } as Parameters<WorkspaceModule['handleToolCall']>[0]);
   const read = await call('read', { path: 'outer/Inner', offsetChars: 0, limitChars: 10 });
   assert.equal(read.success, false);
   assert.match(String(read.error), /lies in mount "inner"/);
-  for (const path of ['outer/later/y.txt', 'outer/LATER/y.txt']) {
+  for (const path of ['outer/later/y.txt', 'outer/LATER/y.txt', 'outer/Later/y.txt']) {
     const write = await call('write', { path, content: 'y\n' });
     assert.equal(write.success, false, path);
     assert.match(String(write.error), /lies in mount "later"/, path);
   }
+  const deep = await call('write', { path: 'outer/proj/inner/x.txt', content: 'x\n' });
+  assert.equal(deep.success, false);
+  assert.match(String(deep.error), /lies in mount "deep"/);
   if (!NORMALIZATION_FOLDING_ONLY) {
     const nfd = await call('read', { path: 'outer/cafe\u0301/x.txt', offsetChars: 0, limitChars: 10 });
     assert.equal(nfd.success, false);

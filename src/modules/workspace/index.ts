@@ -1963,23 +1963,32 @@ export class WorkspaceModule implements Module {
   /**
    * A mount's entries on the current branch, as diskSpelling reads them when
    * it does, and whether its root folds case as the last start read it
-   * (false before the first). An entry's spelling may stand for a path
-   * (`usable`) unless it lies in a nested mount's directory, compared as
-   * loosely as the walk respells a name (foldedLoosely), in a spelling other
-   * than the configured one or disk's: the nested-mount checks compare
-   * spellings as they are, and know only those two (spellNestedDirs).
+   * (false before the first). An entry's spelling of a path, the whole of it
+   * or its first segments, may stand for a path (`usable`) unless it lies on
+   * the way to a nested mount's directory, at it or inside it, and spells the
+   * segments it shares with that directory otherwise than both the
+   * configured spelling and disk's: the nested-mount checks compare
+   * spellings as they are, and know only those two (spellNestedDirs). Which
+   * paths lie there is judged as loosely as the walk respells a name disk
+   * lists (foldedLoosely), so a spelling the walk would have respelled into
+   * one the checks know isn't kept instead.
    */
   private entriesOf(mount: MountState): WorkspaceEntries {
     const store = this.getStore();
-    const known = this.othersOf(mount.config.name);
-    const loose = known.map(foldedLoosely);
-    const within = (path: string, dir: string): boolean => path === dir || path.startsWith(`${dir}/`);
+    const nested = (this.otherMounts.get(mount.config.name) ?? []).map((o) => ({
+      loose: foldedLoosely(o.spellings[0]!.dir),
+      spellings: o.spellings.map((s) => s.dir.split('/')),
+    }));
     return {
       has: (path) => store.treeGet(mount.treeStateId, path) !== null,
       under: (prefix) => store.treeList(mount.treeStateId, prefix).map((entry) => entry.path),
       usable: (path) => {
         const name = foldedLoosely(path);
-        return !loose.some((dir) => within(name, dir)) || known.some((dir) => within(path, dir));
+        const segments = path.split('/');
+        return nested.every(({ loose, spellings }) => {
+          const onTheWay = name === loose || name.startsWith(`${loose}/`) || loose.startsWith(`${name}/`);
+          return !onTheWay || spellings.some((dir) => dir.every((segment, k) => k >= segments.length || segment === segments[k]));
+        });
       },
       rootFoldsCase: this.rootFoldsCase.get(mount.config.name) ?? false,
     };

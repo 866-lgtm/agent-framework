@@ -343,12 +343,12 @@ export interface WorkspaceEntries {
  * name it lists whose flipped spelling it doesn't list too (a name with no
  * letter to flip is its own flipped spelling, and two hard links that differ
  * only in case are one file on any disk). Where no name it lists tells, or
- * it can't be listed, its own name is looked up flipped in the directory
- * holding it, which is taken to fold as `dir` does where both are on one
- * device, each as a link to it leads; a name with no letter to flip takes
- * that directory's folding instead. A directory not there yet folds as the
- * one it would be made in. Where nothing tells, it's taken to tell case
- * apart.
+ * it can't be listed, the directory holding it is asked instead, where both
+ * are on one device, each as a link to it leads: its own name looked up
+ * flipped there, or, for a name with no letter to flip, that directory's own
+ * folding. A directory on a device of its own is taken to tell case apart. A
+ * directory not there yet folds as the one it would be made in. Where
+ * nothing tells, it's taken to tell case apart.
  */
 export async function foldsCase(dir: string): Promise<boolean> {
   const holder = dirname(dir);
@@ -366,11 +366,13 @@ export async function foldsCase(dir: string): Promise<boolean> {
     return named != null && flipped != null && sameFile(named, flipped);
   }
   if (holder === dir) return false;
-  // Looked up through links, so a root that is one, or is reached through
-  // one, is compared by the device it lies on.
+  // The directory and its holder are looked up through links, so a root
+  // that is one, or is reached through one, is compared by the device it
+  // lies on. The flipped name isn't: a link there to the directory would
+  // make a disk that tells case apart look as if it folds.
   const see = (path: string) => stat(path, { bigint: true }).catch(() => null);
   const own = basename(dir);
-  const [self, held, flipped] = await Promise.all([see(dir), see(holder), see(join(holder, flippedCase(own)))]);
+  const [self, held, flipped] = await Promise.all([see(dir), see(holder), look(join(holder, flippedCase(own)))]);
   if (self == null || held == null || self.dev !== held.dev) return false;
   if (flippedCase(own) === own) return foldsCase(holder);
   return flipped != null && sameFile(self, flipped);
@@ -379,17 +381,20 @@ export async function foldsCase(dir: string): Promise<boolean> {
 /**
  * A name in simple case folding, letter by letter: each letter as the lower
  * case of its upper case, so `Σ` and a word's last `ς` are both `σ`, `ſ` is
- * `s` and `µ` is `μ`. A letter that comes back as more than one, as `ß` and
- * `İ` do, stays as it is, and so does dotless `ı`, whose upper case `I`
- * lowers to `i`, which case folding keeps apart from it. Unicode
- * normalization is left alone, and so are letters only a fuller folding
- * joins, such as `ß` with `ss`: no listing shows two such names to be one
- * file, and a disk that folds case needn't join them.
+ * `s` and `µ` is `μ`. A letter whose upper case is more than one letter
+ * takes its own lower case instead, as the Greek `ᾈ` takes `ᾀ`. A letter
+ * that comes back as more than one either way, as `ß` and `İ` do, stays as
+ * it is, and so does dotless `ı`, whose upper case `I` lowers to `i`, which
+ * case folding keeps apart from it. Unicode normalization is left alone, and
+ * so are letters only a fuller folding joins, such as `ß` with `ss`: no
+ * listing shows two such names to be one file, and a disk that folds case
+ * needn't join them.
  */
 export const lowered = (name: string): string =>
   [...name].map((c) => {
     if (c === '\u0131') return c;
-    const lower = c.toUpperCase().toLowerCase();
+    const upper = c.toUpperCase();
+    const lower = [...upper].length === 1 ? upper.toLowerCase() : c.toLowerCase();
     return [...lower].length === 1 ? lower : c;
   }).join('');
 
@@ -397,9 +402,11 @@ export const lowered = (name: string): string =>
  * The name `segment` takes among the workspace's entries directly under the
  * directory `prefix` (its path and `/`, or `''` for the mount's root): the
  * segment itself where an entry is there under it, else the first name, in
- * the order given, equal to it in simple case folding (lowered) that may
- * stand for a path there (`usable`), else null. Entries under one name come
- * together in path order, so each name is compared once.
+ * the order given, equal to it in simple case folding (lowered), else null,
+ * taking only a name that may stand for a path there (`usable`). A name is
+ * compared again only where another name came between its entries, as
+ * `N.txt` comes between `N` and `N/x` in path order, so the step doesn't
+ * fold a name once for every entry beneath it.
  */
 function entryName(paths: readonly string[], prefix: string, segment: string, usable: (path: string) => boolean): string | null {
   const want = lowered(segment);
@@ -412,8 +419,10 @@ function entryName(paths: readonly string[], prefix: string, segment: string, us
     const name = slash === -1 ? rest : rest.slice(0, slash);
     if (name === previous) continue;
     previous = name;
+    if (name !== segment && (found !== null || lowered(name) !== want)) continue;
+    if (!usable(`${prefix}${name}`)) continue;
     if (name === segment) return segment;
-    if (found === null && lowered(name) === want && usable(`${prefix}${name}`)) found = name;
+    found = name;
   }
   return found;
 }
@@ -436,9 +445,9 @@ function entryName(paths: readonly string[], prefix: string, segment: string, us
  * (where `given` is the segment's own lookup, one that is the same file),
  * and `caseFolds` what looking the segment up with its case flipped showed
  * of `dir`: that it folds case, that it tells case apart, or nothing (null),
- * for a segment with no letter to flip. Only a segment looked up as given
- * can show folding, since otherwise any file under the flipped spelling
- * counts.
+ * for a segment with no letter to flip. For a segment not looked up as
+ * given (`given` null), it tells nothing of `dir`, since any file under the
+ * flipped spelling counts there.
  */
 async function listedName(dir: string, segment: string, given: BigIntStats | null): Promise<{ name: string; found: boolean; caseFolds: boolean | null }> {
   const flipped = flippedCase(segment);
