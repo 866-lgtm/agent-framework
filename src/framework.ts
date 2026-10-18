@@ -1367,8 +1367,9 @@ const MAINTENANCE_TICKS_PER_PASS = 8;
  *  module whose stop() never settles would turn a failed boot that exits into
  *  one that hangs. A framework create() never started has no streams, event
  *  loop, maintenance or guard annotations to wait on, so the waits that can
- *  take it are on operator operations and then on modules and MCPL servers
- *  together. */
+ *  take it are on operator operations, then on modules and MCPL servers
+ *  together, and then on awareness drains that a failed startup barrier left
+ *  running. */
 const FAILED_CREATE_TEARDOWN_TIMEOUT_MS = 30_000;
 
 /** Local per-residence provider admission (AF #114 bounded first slice). */
@@ -1881,21 +1882,25 @@ export class AgentFramework {
   private stopPromise: Promise<void> | null = null;
   private stopCompleted = false;
   private ownedStoreClosed = false;
-  /** Whether the latest stop() stopped in time everything it waits on with
-   * its deadline (an operator's operations, modules and MCPL servers),
-   * whatever failed after that. create()'s release reads it to say whether
-   * part of what a failed create() started may still be running. */
+  /** Whether the latest stop() got through its teardown with nothing failed:
+   * every step and every wait up to and including the one on awareness
+   * drains, whatever failed after that, in the storage work that finishes
+   * the stop. A step that threw may have left part of its work running, as
+   * a wait that ran out does. create()'s release reads it to say whether part
+   * of what a failed create() started may still be running. */
   private stopFinishedTeardown = false;
   /** An operator's operations in flight, and the config materializations they
    * start. stop() waits until this set is empty before it tears down, unless
    * its wait budget runs out. */
   private readonly operatorOperations = new Set<{ label: string; promise: Promise<void> }>();
   /** What a wait of stop()'s left running when its budget ran out, by its
-   * promise: a stream it cancelled or an event loop still in a call. A later
+   * promise: a stream it cancelled or an event loop still in a call; and a
+   * stream whose cancel threw, which stop() doesn't wait for. A later
    * stop() waits for each again, beside what it finds, whatever has happened
    * since to the entry it was found under (a run's end removes its stream's,
-   * a start() replaces the loop), so a budget never lets the store close
-   * under work still running. Each leaves once it settles. */
+   * a start() replaces the loop), so neither a budget nor a cancel that
+   * threw lets the store close under work still running. Each leaves once it
+   * settles. */
   private readonly leftRunning = new Map<Promise<unknown>, { label: string; kind: 'stream' | 'loop' }>();
   private membrane: Membrane;
   private queue: ProcessQueueImpl;
@@ -2462,9 +2467,10 @@ export class AgentFramework {
    * Create and start the framework. A create() that fails releases what it
    * had acquired before its error reaches the caller, so that the caller can
    * try again in the same process: the framework it had begun is stopped, as
-   * stop() stops one, but giving up after 30 s on each of stop()'s two cleanup
-   * waits, for an operator's operations already running and then for its
-   * modules and MCPL servers, and a store it opened is closed. A store the
+   * stop() stops one, but giving up after 30 s on each of stop()'s cleanup
+   * waits, for an operator's operations already running, then for its
+   * modules and MCPL servers, and then for awareness drains a failed startup
+   * barrier left running, and a store it opened is closed. A store the
    * caller passed in is left open.
    */
   static async create(config: FrameworkConfig): Promise<AgentFramework> {
@@ -2522,8 +2528,9 @@ export class AgentFramework {
         failures.push(stopError);
         // A stop can fail after everything it waits on has stopped, as stop()
         // counts it (an MCPL server once its transport has sent the kill):
-        // finishing a guard's storage work, in its final sync, or closing the
-        // store. The message then doesn't say part of it may still be running.
+        // finishing a guard's storage work, in the last flush of deferred
+        // writes, in its final sync, or closing the store. The message then
+        // doesn't say part of it may still be running.
         unfinished.push(framework.stopFinishedTeardown
           ? 'What it had started stopped, but finishing the stop failed: ' + shutdownErrorMessage(stopError)
           : 'Stopping what it had started didn\'t finish, so part of it may still be running: ' +
@@ -3045,19 +3052,29 @@ export class AgentFramework {
   }
 
   /**
-   * Stop the event loop. After a failed or timed-out wait, storage stays open
-   * and stop() can be called again. A timed-out wait lets teardown go on while
-   * what it waited for may still act on what is being torn down.
+   * Stop the event loop. Each step of the teardown runs whatever an earlier
+   * one did: one that throws, such as a host stream's cancel(), fails the
+   * stop() once the rest has run. When a step or a wait up to and including
+   * the wait on awareness drains fails or times out, storage stays open and
+   * stop() can be called again; one that fails after it, in the storage work
+   * that finishes the stop, fails the stop() without keeping storage open.
+   * A timed-out wait lets teardown go on while what it waited for may still
+   * act on what is being torn down.
    * @param teardownTimeoutMs Optional budget for each of stop()'s waits, in
    * turn: on the streams it cancels, on maintenance in flight (a pass or an
    * over-budget drain kick), on the event loop, on an operator's operations
-   * already running, then on modules and MCPL together. With a budget, a
-   * stop() can take up to five of them, besides the withheld-spill deadline
-   * of a guard's write still under way. Omit to wait until each settles, as
-   * required by existing module/child contracts. A wait whose budget runs out
-   * fails the stop() with a ShutdownTimeoutError naming what it waited for;
-   * with more than one, or beside another failure, stop() fails with an
-   * AggregateError of them all. After it:
+   * already running, on modules and MCPL together, then on Discord awareness
+   * drains, which send nothing once stop() has begun, recording the call the
+   * close ended. With a budget, a stop() can take up to six of them, besides
+   * the withheld-spill deadline of a guard's write still under way. Omit to
+   * wait until each settles, as required by existing module/child contracts.
+   * A wait whose budget runs out fails the stop() with a ShutdownTimeoutError
+   * naming what it waited for; with more than one, or beside another failure,
+   * stop() fails with an AggregateError of them all. A stream whose cancel
+   * threw is treated as one whose wait ran out, whatever the budget, and the
+   * stop() fails with the cancel's error: that stop() doesn't wait for it,
+   * even with no budget, and a later stop() waits for it as for anything an
+   * earlier one left running (the last point below). After either:
    * - an agent still registered whose stream is still running keeps its
    *   deferred writes queued, since the stream may still write. The stream's
    *   own turn-end flush takes them when it settles, if the process lives on,
@@ -3157,26 +3174,38 @@ export class AgentFramework {
 
   private async stopOwned(teardownTimeoutMs: number | undefined): Promise<void> {
     this.stopFinishedTeardown = false;
-    this.pushCoalescer?.suspend();
-    this.flushCoalescingSnapshot();
+    // Every step from here to the store's close runs whatever an earlier one
+    // did, so one that throws, such as a host's stream whose cancel() throws,
+    // can't leave the watchdog beating, modules and MCPL servers running or
+    // ephemeral runs waiting. Its error is kept and the teardown goes on;
+    // stop() then fails with it among the others, and an owned store stays
+    // open for another stop(), as after a failed module stop. A step added
+    // here goes through step(), or catches into shutdownErrors as the waits
+    // below do. step() says whether its step ran without throwing.
+    const shutdownErrors: unknown[] = [];
+    const step = (run: () => void): boolean => {
+      try { run(); return true; } catch (error) { shutdownErrors.push(error); return false; }
+    };
+    step(() => this.pushCoalescer?.suspend());
+    step(() => this.flushCoalescingSnapshot());
     this.running = false;
     // Flushed-but-unsynced deferred writes: sync and ack now, while the
     // store is still open, rather than leaving them to a reboot replay.
-    this.ackDeferredWrites();
+    step(() => this.ackDeferredWrites());
     this.providerAdmissionClosed = true;
-    for (const wake of [...this.retryWaitWakers]) wake();
+    for (const wake of [...this.retryWaitWakers]) step(wake);
     this.lifecycleGeneration++;
     // The generation this stop ends; withheld spills close for it alone, so a
     // start() made before this stop finishes reopens them for its own.
     const stoppingGeneration = this.lifecycleGeneration;
-    this.queue.close();
-    this.tuneOutCoordinator?.stop();
+    step(() => this.queue.close());
+    step(() => this.tuneOutCoordinator?.stop());
 
     // Kill running code_execution scripts before cancelling streams: a
     // zombie script must not keep firing side-effectful tool calls into a
     // framework that is shutting down.
     for (const runner of this.codeExecutionRunners.values()) {
-      runner.dispose();
+      step(() => runner.dispose());
     }
     this.codeExecutionRunners.clear();
     // Background daemons die with the process (documented limitation) —
@@ -3187,7 +3216,7 @@ export class AgentFramework {
         record.cancelled = true;
         record.status = 'cancelled';
       }
-      record.runner.dispose();
+      step(() => record.runner.dispose());
     }
     this.backgroundScripts.clear();
     // Retained tool images are per-process by design; a retained stopped
@@ -3195,7 +3224,7 @@ export class AgentFramework {
     this.toolImageLedgers.clear();
 
     // A stopped host must never hang behind its own cooldown.
-    this.cancelProviderAdmission();
+    step(() => this.cancelProviderAdmission());
     // An open logical turn doesn't survive a stop: a start after a restart
     // on this instance opens a new one rather than continuing the old turn's
     // routing (openLogical). A resume still continues its turn, with its
@@ -3211,11 +3240,13 @@ export class AgentFramework {
     // branch then settles the turn as a shutdown: no [turn-interrupted]
     // marker (nobody stopped the agent; the host went away), no
     // inference:exhausted (not a failure), one inference:aborted with reason
-    // 'shutdown'.
+    // 'shutdown'. A cancel that throws leaves its stream running, which the
+    // wait on streams below leaves running too.
+    const uncancelled = new Set<string>();
     for (const agent of this.agents.values()) {
       if ('stream' in agent.state && agent.state.stream) {
         this.frameworkCancelledStreams.set(`${agent.name}:${agent.streamId}`, 'shutdown');
-        agent.cancelStream();
+        if (!step(() => agent.cancelStream())) uncancelled.add(agent.name);
       }
     }
 
@@ -3227,20 +3258,22 @@ export class AgentFramework {
     // for a later stop() to wait for again. A rejection settles a wait here
     // as a resolution does: these are waits on work stop() has asked to end,
     // not cleanup that can fail.
-    const waitsTimedOut: unknown[] = [];
     type Running = { label: string; promise: Promise<unknown> };
+    // Each leaves leftRunning as it settles, those that already have at once.
+    const leaveRunning = (attempts: Running[], kind: 'stream' | 'loop'): void => {
+      for (const { label, promise } of attempts) {
+        this.leftRunning.set(promise, { label, kind });
+        const leave = () => { this.leftRunning.delete(promise); };
+        void promise.then(leave, leave);
+      }
+    };
     const waitFor = async (attempts: Running[], kind?: 'stream' | 'loop'): Promise<void> => {
       if (attempts.length === 0) return;
       try {
         await waitForShutdown(attempts.map(({ label, promise }) => ({ label, promise: promise.then(() => {}, () => {}) })), teardownTimeoutMs);
       } catch (error) {
-        waitsTimedOut.push(error);
-        // Each leaves leftRunning as it settles, those that already have at once.
-        if (kind) for (const { label, promise } of attempts) {
-          this.leftRunning.set(promise, { label, kind });
-          const leave = () => { this.leftRunning.delete(promise); };
-          void promise.then(leave, leave);
-        }
+        shutdownErrors.push(error);
+        if (kind) leaveRunning(attempts, kind);
       }
     };
     // What this stop() found of a kind, beside what an earlier one's budget
@@ -3264,7 +3297,16 @@ export class AgentFramework {
       const settled = () => { stillStreaming.delete(name); };
       void stream.then(settled, settled);
     }
-    await waitFor(withLeftovers('stream', [...this.activeStreams].map(([name, promise]) => ({ label: `stream:${name}`, promise }))), 'stream');
+    // A stream whose cancel threw may run on until it ends of its own accord,
+    // which a stop() with no budget would wait for, holding the rest of the
+    // teardown. So it counts as a wait that ran out: this stop() doesn't wait
+    // for it, its agent's deferred writes stay queued (stillStreaming), the
+    // cancel's error keeps the store open, and a later stop() waits for it
+    // (leftRunning). The list waited for is taken before it is left running.
+    const streams = [...this.activeStreams].map(([name, promise]) => ({ name, label: `stream:${name}`, promise }));
+    const waited = withLeftovers('stream', streams.filter(({ name }) => !uncancelled.has(name)));
+    leaveRunning(streams.filter(({ name }) => uncancelled.has(name)), 'stream');
+    await waitFor(waited, 'stream');
 
     // Stop sync timer
     if (this.syncTimer) {
@@ -3286,20 +3328,22 @@ export class AgentFramework {
 
     // Once the waits above have settled, nothing drives an ephemeral run: no
     // turn starts after stop() begins, every stream it found was cancelled
-    // and has settled, and a tool result that arrives now is dropped, since
-    // the queue is closed. So a run still registered could only wait for a
-    // watchdog, such as one whose wake was never taken up, whose turn was
-    // refused, whose retry was cancelled, or whose continuation is still
-    // queued. End each one now, while the store is open for its cleanup.
-    // After a wait whose budget ran out, a run's stream or the loop may still
-    // be running, and every run is ended all the same: the caller asked for a
-    // bounded stop(), and a run whose stream is still running would otherwise
-    // wait for its idle watchdog. Its end stores its queue, as at any run's
-    // end; that stream's late events are dropped once the run has left, and a
-    // later stop() waits for the stream itself (leftRunning). (A start()
-    // during a stop() is #315's. One made before the loop ended keeps a loop
-    // running, so this stop waits for it, up to its budget; one made just
-    // after, before this point, has its runs ended here too.)
+    // and has settled (unless its wait ran out or its cancel threw, below),
+    // and a tool result that arrives now is dropped, since the queue is
+    // closed. So a run still registered could only wait for a watchdog, such
+    // as one whose wake was never taken up, whose turn was refused, whose
+    // retry was cancelled, or whose continuation is still queued. End each one
+    // now, while the store is open for its cleanup. After a wait whose budget
+    // ran out, or a cancel that threw, a run's stream or the loop may still be
+    // running, and every run is ended all the same: the caller asked for a
+    // bounded stop(), or for one that a stream nothing could stop doesn't
+    // hold, and a run whose stream is still running would otherwise wait for
+    // its idle watchdog. Its end stores its queue, as at any run's end; that
+    // stream's late events are dropped once the run has left, and a later
+    // stop() waits for the stream itself (leftRunning). (A start() during a
+    // stop() is #315's. One made before the loop ended keeps a loop running,
+    // so this stop waits for it, up to its budget; one made just after,
+    // before this point, has its runs ended here too.)
     for (const [name, run] of this.ephemeralRuns) run.settle.reject(ephemeralRunStopped(name));
 
     // Admission closed when stop() began. What admitted operations start now,
@@ -3308,26 +3352,27 @@ export class AgentFramework {
     // a quiesce or a surgery may be waiting on. If the budget runs out,
     // teardown goes on while the operation may still act on what it tears
     // down, and the store stays open for another stop().
-    let operatorOperationsTimedOut: unknown;
     try {
       await this.waitForOperatorOperations(teardownTimeoutMs);
     } catch (error) {
-      operatorOperationsTimedOut = error;
+      shutdownErrors.push(error);
     }
 
     // Stop typing indicators
-    this.channelRegistry?.stopAll();
+    step(() => this.channelRegistry?.stopAll());
 
     // Dispose EventGate (clear debounce timers)
-    this.eventGate?.dispose();
-    this.livenessWatchdog?.stop();
+    step(() => this.eventGate?.dispose());
+    step(() => this.livenessWatchdog?.stop());
     AgentFramework.diagnosed.delete(this);
 
     // A stopping stream's batch settles as withheld, and its stub names where
     // the original went: let those writes finish while the workspace is up.
     // Tracked here rather than per agent, since an ephemeral run or a closed
     // fork leaves the agent map while its annotation can still be running.
-    while (this.guardAnnotations.size > 0) await Promise.all([...this.guardAnnotations]);
+    // An annotation never rejects (ToolResultGuard), and the wait doesn't
+    // rest on that: one that did would settle its wait, as a stream's does.
+    while (this.guardAnnotations.size > 0) await Promise.allSettled([...this.guardAnnotations]);
     // An annotation that starts after this point, such as one from a direct
     // Agent API call stop doesn't cancel, starts no write to the stopping
     // workspace: its stub names the audit record. A write that was past its
@@ -3342,12 +3387,31 @@ export class AgentFramework {
     }
     // Timed-out or failed teardown retains its context and may still write.
     // Sync available state best-effort, but leave its store open for a retry.
-    const shutdownErrors: unknown[] = [
-      ...waitsTimedOut,
-      ...(operatorOperationsTimedOut === undefined ? [] : [operatorOperationsTimedOut]),
-    ];
     for (const result of await Promise.allSettled(shutdownPromises)) {
       if (result.status === 'rejected') shutdownErrors.push(result.reason);
+    }
+
+    // A Discord awareness drain sends nothing once stop() has begun
+    // (drainDiscordAwarenessOutbox), and closing its server above ended any
+    // call it had in flight. Wait for each still running to record that call,
+    // so that none writes the ledger after stop() has returned, or after a
+    // failed create() has rejected, when its caller may already have started
+    // another. One whose wait runs out is reported, and stays in
+    // discordAwarenessDrains until it settles, so a later stop() waits for it
+    // again. A drain that rejects, such as on a ledger write that failed,
+    // settles its wait as a stream's rejection does: the barrier that started
+    // it reports the failure (failMcplDataPlaneGate, or create()'s rejection
+    // at startup).
+    const drains = [...this.discordAwarenessDrains].map(([serverId, drain]) => ({
+      label: `awareness drain:${serverId}`,
+      promise: drain.then(() => {}, () => {}),
+    }));
+    if (drains.length > 0) {
+      try {
+        await waitForShutdown(drains, teardownTimeoutMs);
+      } catch (error) {
+        shutdownErrors.push(error);
+      }
     }
 
     const teardownSucceeded = shutdownErrors.length === 0;
@@ -3355,7 +3419,7 @@ export class AgentFramework {
 
     // Those later annotations write nothing, so they finish at once; let them
     // record and edit their stubs before the store closes.
-    while (this.guardAnnotations.size > 0) await Promise.all([...this.guardAnnotations]);
+    while (this.guardAnnotations.size > 0) await Promise.allSettled([...this.guardAnnotations]);
 
     // Streams may queue storage repairs while being cancelled above. Retry
     // after their teardown, while the store is still open, before final sync:
@@ -3370,10 +3434,10 @@ export class AgentFramework {
       }
     }
 
-    // No stream is left, unless its wait above ran out: from the start of
-    // stop() none registers and no agent turn starts (providerAdmissionClosed,
-    // checked for every agent), and every stream registered before was
-    // cancelled and awaited above.
+    // No stream is left, unless its wait above ran out or its cancel threw:
+    // from the start of stop() none registers and no agent turn starts
+    // (providerAdmissionClosed, checked for every agent), and every stream
+    // registered before was cancelled and awaited above.
     // (A start() made before this stop finishes reopens admission, so a turn
     // it begins can be alive here and take one of these entries mid-stream;
     // #315 asks how start() after stop() should behave.)
@@ -3402,24 +3466,33 @@ export class AgentFramework {
     // from a persisted one, by the boot or resume flush that meets it, passed
     // to the primary if it's a failed reply, and otherwise dropped, logged.
     //
-    // A registered agent's stream that outlasted its wait may still write,
-    // so that agent's entries stay queued, said once for it: no entry lands
-    // ahead of a stream that may still write. The stream counts as running
-    // while the handle this stop() waited on for it hasn't settled
-    // (stillStreaming). When it settles in a process that lives on, its own
-    // turn-end flush takes them, as at any turn's end, and a later stop()
-    // takes what that leaves. Until then a persisted queue keeps them for
-    // boot, and a memory-only one loses them at exit.
+    // A registered agent's stream that outlasted its wait, or whose cancel
+    // threw, may still write, so that agent's entries stay queued, said once
+    // for it: no entry lands ahead of a stream that may still write. The
+    // stream counts as running while the handle this stop() found for it
+    // hasn't settled (stillStreaming). When it settles in a process that
+    // lives on, its own turn-end flush takes them, as at any turn's end, and a
+    // later stop() takes what that leaves. Until then a persisted queue keeps
+    // them for boot, and a memory-only one loses them at exit.
     // A window release the quiesce postponed (releasesAfterResume) never runs
     // once the host stops, so its unread pass runs here: each failed reply
     // stored unread in that window goes to the primary now, deferred while
     // quiesced like any write, so it waits in the queue with the rest. What
-    // was queued for that agent stays queued, as a gone agent's.
+    // was queued for that agent stays queued, as a gone agent's. Each
+    // release's pass is a step of its own: one that throws fails the stop()
+    // and leaves the others, and the flush below, to run.
     for (const agent of this.releasesAfterResume.values()) {
-      for (const metadata of this.unreadFailedReplies(agent)) this.passFailedReplyToPrimary(agent.name, metadata);
+      step(() => {
+        for (const metadata of this.unreadFailedReplies(agent)) this.passFailedReplyToPrimary(agent.name, metadata);
+      });
     }
     this.releasesAfterResume.clear();
-    if (this.deferredMessages.length > 0) {
+    // Like a guard's storage work above and the final sync below, this flush
+    // comes once everything else has stopped (teardownSucceeded): if it throws,
+    // stop() fails with that, the final sync still runs, and an owned store
+    // still closes unless something before it failed.
+    step(() => {
+      if (this.deferredMessages.length === 0) return;
       const registered = [...this.agents.keys()];
       const entries = registered
         .filter((name) => !stillStreaming.has(name))
@@ -3430,14 +3503,14 @@ export class AgentFramework {
         const held = this.deferredMessages.filter((msg) => (msg.forAgent ?? this.primaryAgentName) === name).length;
         if (held > 0) {
           console.error(
-            `[deferral] stop: ${held} deferred write(s) for ${name} stay queued: its stream outlasted stop()'s wait and may still write; ` +
+            `[deferral] stop: ${held} deferred write(s) for ${name} stay queued: its stream is still running and may still write; ` +
             (this.deferredWritesPersisted || this.quiesced
               ? 'the persisted queue keeps them for boot'
               : 'this memory-only queue loses them if the process exits before that stream settles'),
           );
         }
       }
-    }
+    });
 
     // Final sync before closing
     try {
@@ -7553,7 +7626,16 @@ export class AgentFramework {
       this.disposedEphemeralFrames.add(agent);
       // Cancel before deregistration. Adapters may still yield a queued event;
       // driveStream's Agent-identity check above discards it before dispatch.
-      agent.cancelStream();
+      // A cancel that throws leaves its stream running, and the rest of this
+      // cleanup runs all the same, so the run still leaves and its outcome
+      // still says why it ended. A stop() that found the stream has reported
+      // the failure itself, and a later stop() waits for the stream
+      // (leftRunning).
+      try {
+        agent.cancelStream();
+      } catch (error) {
+        console.error(`[ephemeral] agent=${agent.name} its stream's cancel failed at the run's end; the run leaves all the same:`, error);
+      }
       if (this.ephemeralRuns.get(agent.name) === run) this.ephemeralRuns.delete(agent.name);
       if (this.agents.get(agent.name) === agent) {
         // What is still queued for the run, such as a message held for its
@@ -9892,13 +9974,13 @@ export class AgentFramework {
    * reconnect or start delivers what is still pending.
    *
    * Like a server's drain, the delivery runs apart from the operation that
-   * started it: it isn't an operator's operation, so stop() doesn't wait for
-   * it. A drain already running when stop() begins runs on while the
-   * connections close, and what it can't deliver stays pending in the
-   * durable outbox. Once stop() has begun, none is started, since there's
-   * no point opening a drain that the teardown is about to cut off: the
-   * marks stay pending, and the next start's barrier reconciles the outbox
-   * with the branch and delivers them.
+   * started it: it isn't an operator's operation. A drain already running
+   * when stop() begins sends nothing more, and stop() waits for it to record
+   * the call it had in flight, which closing the connections ends; what it
+   * hasn't sent stays pending in the durable outbox, unrecorded. Once stop()
+   * has begun, none is started, since there's no point opening a drain that
+   * the teardown is about to cut off: the marks stay pending, and the next
+   * start's barrier reconciles the outbox with the branch and delivers them.
    *
    * @param after What moved the branch, for the log and the alert
    *   ("rollback", "branch switch", "undo" …).
@@ -20773,6 +20855,10 @@ export class AgentFramework {
    * Deliver every due ref independently. Permanent Discord failures are kept
    * in the ledger for audit but do not block later operations; retryable
    * failures remain pending for the next reconnect/list-change attempt.
+   * Once stop() has begun, a drain sends nothing more and records nothing
+   * for what it hasn't sent: that stays pending, as it was, for the next
+   * start's barrier. stop() closes the connections and then waits for each
+   * drain still running to record the call it had in flight.
    */
   private drainDiscordAwarenessOutbox(
     serverId: string,
@@ -20784,6 +20870,16 @@ export class AgentFramework {
     if (existing) return existing;
 
     const drain = (async () => {
+      // A drain started once stop() has begun sends and records nothing. This
+      // comes before the connection check, whose "not attempted" record would
+      // otherwise mark every pending operation.
+      if (this.stopHasBegun()) {
+        console.error(
+          `[discord-awareness] ${serverId}: drain not started: the framework is stopping; ` +
+            'the next start delivers what is pending',
+        );
+        return { status: 'delivered' as const, delivered: 0, failed: 0 };
+      }
       const connection = this.mcplServerRegistry?.getServer(serverId);
       if (!connection?.isConnected) {
         const operations = this.readDiscordAwarenessPending(serverId);
@@ -20816,7 +20912,16 @@ export class AgentFramework {
           return true;
         });
         if (operations.length === 0) break;
-        for (const operation of operations) {
+        for (const [index, operation] of operations.entries()) {
+          // Once stop() has begun, nothing more is sent. What this read took
+          // counts as attempted, so the loop ends once a read finds nothing new.
+          if (this.stopHasBegun()) {
+            console.error(
+              `[discord-awareness] ${serverId}: ${operations.length - index} mark(s) not sent: ` +
+                'the framework is stopping; the next start delivers them',
+            );
+            break;
+          }
           const ref = operation.ref;
           const channelId = ref.channelId.startsWith('discord:')
             ? ref.channelId.split(':').at(-1)!
@@ -20969,7 +21074,9 @@ export class AgentFramework {
    * its last read of the ledger, missing a batch activated since. So a
    * generation that finds a drain running waits for it, then drains again
    * with a fresh pass that reads the ledger anew. Two generations waiting on
-   * the same drain share the fresh pass that follows it.
+   * the same drain share the fresh pass that follows it. Once stop() has
+   * begun, a drain sends nothing more, so a gate armed then completes with
+   * what it found pending left for the next start.
    */
   private drainForGeneration(serverId: string): Promise<DiscordAwarenessDrainOutcome> {
     const running = this.discordAwarenessDrains.get(serverId);
