@@ -718,7 +718,7 @@ describe('live operator surgery', () => {
       await assert.rejects(
         framework.suppressMessages('scout', { messageIds: [s0] }),
         (e: unknown) => e instanceof OperatorActionError && e.code === 'failed'
-          && /^Suppression failed on suppress\/\S+, which is kept for diagnosis: it may be partly suppressed, so don't serve from it, and delete it once it has been looked at, since nothing refuses a switch onto it once its awareness batch is retired; active branch restored to main/.test(e.message)
+          && /^Suppression failed on suppress\/\S+, which is kept for diagnosis: it may be partly suppressed, so don't serve from it, and delete it once it has been looked at; active branch restored to main/.test(e.message)
           && /injected/.test(e.message),
       );
     } finally {

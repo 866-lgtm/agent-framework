@@ -26,7 +26,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework, DiscordAwarenessOutbox, OperatorActionError } from '../src/index.js';
-import { ApiServer } from '../src/api/server.js';
 import { DISCORD_AWARENESS_RECORD_TYPE } from '../src/recovery/discord-awareness-outbox.js';
 import type { OperatorLogEntry } from '../src/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
@@ -602,7 +601,7 @@ describe('surgery and awareness marks', () => {
     try {
       await assert.rejects(
         framework.suppressMessages('resident', { messageIds: [removed[0]], marks: { scope: 'all' } }),
-        /could not be retired \(injected retire failure\); it stays prepared, none of its marks to be sent\. Its removals stay pending for (\S+): the next start gives them up and retires the batch, since no branch has that name, and until then a branch named \1 is refused: injected fork failure$/,
+        /could not be retired \(injected retire failure\); it stays prepared, none of its marks to be sent\. Its removals stay pending for \S+: a start on a branch with that name would finish them there and retire the batch: injected fork failure$/,
       );
     } finally {
       live.fork = realFork;
@@ -620,12 +619,12 @@ describe('surgery and awareness marks', () => {
       live.fork = realFork;
     }
     assert.equal(outbox().batches().at(-1)!.status, 'discarded');
-    // The first surgery never created its branch either, so the next start
-    // gives up the suppression its failed retirement left prepared.
+    // The first surgery never created its branch either: its body waits, at
+    // the next start too, for a start on a branch with its name.
     await framework.stop();
     await start(false);
-    assert.deepEqual(outbox().batches().map((batch) => batch.status), ['discarded', 'discarded']);
-    assert.deepEqual(outbox().pendingSuppressionsFor(outbox().batches()[0].targetBranch), []);
+    assert.deepEqual(outbox().batches().map((batch) => batch.status), ['prepared', 'discarded']);
+    assert.equal(outbox().pendingSuppressionsFor(outbox().batches()[0].targetBranch).length, 1);
   });
 
   /** Run `fn` with every ops alert the framework raises recorded, from the start of a create() too. */
@@ -682,29 +681,6 @@ describe('surgery and awareness marks', () => {
     });
   });
 
-  it('a suppression that crashed after recording its batch and before its fork is given up at startup', async () => {
-    await start(false);
-    const { removed } = seed(3);
-    const live = cm();
-    const sourceBranch = live.currentBranch().name;
-    // suppressMessages records its batch, durably, before cm.fork: a crash
-    // between the two leaves a batch whose target branch doesn't exist.
-    const [target] = live.getAllMessages().filter((m) => String(m.id) === removed[1]);
-    const batch = outbox().prepare({
-      agentName: 'resident', sourceBranch, targetBranch: 'never-forked',
-      refs: [{ serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'amb-1' }], scope: 'all',
-      activationPolicy: 'explicit', suppressionIntervals: [{ fromId: String(target.id), toId: String(target.id) }],
-    })!;
-    await framework.stop();
-
-    await start(false);
-    const [after] = outbox().batches();
-    assert.equal(after.id, batch.id);
-    assert.equal(after.status, 'discarded', 'retired: none of its messages were removed');
-    assert.ok(cm().getAllMessages().some((m) => String(m.id) === removed[1]), 'its message is still there');
-    assert.equal(outbox().operations().length, 0);
-  });
-
   it('a start that imports a pre-journal ledger alerts with each batch whose undelivered marks it retires', async () => {
     // The store exists first, as for a host upgraded from 0.22.x.
     await start(false);
@@ -729,45 +705,6 @@ describe('surgery and awareness marks', () => {
     assert.equal(outbox().operations().length, 0, 'nothing is sent');
   });
 
-  it('an imported active suppression is verified on its target at startup: the old ledger does not prove its body', async () => {
-    await start(false);
-    const { removed } = seed(3);
-    const live = cm();
-    const sourceBranch = live.currentBranch().name;
-    // The old ledger's window: its batch says active, but the fork still
-    // carries the message its suppression was to remove.
-    await live.fork('partial');
-    const [target] = live.getAllMessages().filter((m) => String(m.id) === removed[1]);
-    await framework.stop();
-    mkdirSync(join(storePath, 'recovery'), { recursive: true });
-    writeFileSync(join(storePath, 'recovery', 'discord-awareness-outbox.json'), JSON.stringify({
-      version: 2,
-      batches: [{
-        id: 'legacy-sup', status: 'active', agentName: 'resident', sourceBranch, targetBranch: 'partial',
-        emoji: '💤', createdAt: 1, activationPolicy: 'explicit',
-        suppressionIntervals: [{ fromId: String(target.id), toId: String(target.id) }],
-        refs: [{
-          serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'amb-1',
-          desired: true, markerPresent: true, deliveryStatus: 'applied', attempts: 1, lastAction: 'add',
-        }],
-      }],
-    }));
-
-    await start(false); // on 'partial'
-    assert.equal(cm().currentBranch().name, 'partial');
-    assert.ok(!cm().getAllMessages().some((m) => String(m.id) === removed[1]), 'the interval was resumed');
-    const [batch] = outbox().batches();
-    assert.equal(batch.suppressionComplete, true);
-    assert.equal(batch.status, 'active');
-    assert.equal(outbox().operations().length, 0, 'its marks stay history: nothing is sent');
-
-    // Idempotent: a later startup on the target changes nothing.
-    await framework.stop();
-    await start(false);
-    assert.equal(outbox().batches()[0].suppressionComplete, true);
-    assert.equal(outbox().operations().length, 0);
-  });
-
   it('a rollback or suppression onto an existing branch is refused before any intent is prepared', async () => {
     await start(false);
     const { tail, removed } = seed(2);
@@ -783,54 +720,7 @@ describe('surgery and awareness marks', () => {
     assert.equal(outbox().batches().length, 0);
   });
 
-  it('a name a pending suppression claims is refused, cancelled or not, until a start gives it up; the next branch with it loses nothing', async () => {
-    // R1-1: the name claim and the body resume are one set.
-    await start(true);
-    const { removed } = seed(3);
-    const sourceBranch = cm().currentBranch().name;
-    // What a failed suppression whose retirement also failed leaves: its
-    // batch prepared, its removals pending for fix-1, which doesn't exist.
-    const [kept] = cm().getAllMessages().filter((m) => String(m.id) === removed[0]);
-    const first = outbox().prepare({
-      agentName: 'resident', sourceBranch, targetBranch: 'fix-1',
-      refs: [{ serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'amb-0' }], scope: 'all',
-      activationPolicy: 'explicit', suppressionIntervals: [{ fromId: String(kept.id), toId: String(kept.id) }],
-    })!;
-    const refused = (error: unknown) => error instanceof OperatorActionError && error.code === 'invalid'
-      && error.message === `Branch fix-1 is the target of suppression ${first.id}, whose removals aren't recorded as finished: a start `
-        + 'on a branch with that name would apply them there. Choose another name. fix-1 is free once a start on it '
-        + 'finishes the suppression, or a start finds no branch with that name and gives the suppression up';
-    await assert.rejects(framework.rollbackToMessage('resident', { messageId: removed[1], branchName: 'fix-1' }), refused);
-    await assert.rejects(framework.suppressMessages('resident', { messageIds: [removed[2]], branchName: 'fix-1' }), refused);
-    const api = new ApiServer(framework) as unknown as { cmdBranchCreate(params: { name: string }): Promise<unknown> };
-    await assert.rejects(api.cmdBranchCreate({ name: 'fix-1' }), refused);
-    // A cancel stops its marks, not its removals: the name stays claimed.
-    framework.cancelDiscordAwareness(first.id);
-    await assert.rejects(framework.rollbackToMessage('resident', { messageId: removed[1], branchName: 'fix-1' }), refused);
-    assert.equal(cm().currentBranch().name, sourceBranch, 'nothing moved');
-    assert.ok(!framework.getStore().listBranches().some((branch) => branch.name === 'fix-1'), 'no branch was made');
-    await framework.stop();
-
-    // A start finds no branch named fix-1 and gives the suppression up.
-    await withAlerts(async (alerts) => {
-      await start(true);
-      assert.deepEqual(alerts.map((alert) => alert.kind), ['discord-awareness-suppression-unfinished']);
-      assert.match(alerts[0]!.message, /wasn't finished: fix-1 doesn't exist .*so none of them is in effect\. To apply it, redo the surgery from /);
-    });
-    assert.equal(outbox().batches().find((batch) => batch.id === first.id)?.status, 'discarded');
-    const retry = await framework.rollbackToMessage('resident', { messageId: removed[1], branchName: 'fix-1' });
-    assert.equal(retry.targetBranch, 'fix-1');
-    await framework.stop();
-    // The next start, on the new fix-1, removes nothing of it and sends nothing.
-    await start(true);
-    assert.equal(cm().currentBranch().name, 'fix-1');
-    assert.ok(cm().getAllMessages().some((m) => String(m.id) === removed[0]), 'the old suppression\'s message is still there');
-    await framework.syncDiscordAwarenessMarkers();
-    assert.deepEqual(calls().filter((call) => call.name === 'add_reaction'), []);
-    assert.deepEqual(outbox().operations(), []);
-  });
-
-  it('an interrupted rollback\'s batch claims no name, and a start on a branch made under it sends none of its marks', async () => {
+  it('an interrupted rollback\'s batch: a start on a branch made under its name sends none of its marks', async () => {
     await start(true);
     const { tail } = seed(3);
     const sourceBranch = cm().currentBranch().name;
@@ -859,29 +749,6 @@ describe('surgery and awareness marks', () => {
     await framework.syncDiscordAwarenessMarkers();
     assert.deepEqual(calls().filter((call) => call.name === 'add_reaction'), []);
     assert.deepEqual(outbox().operations(), []);
-  });
-
-  it("when the journal can't be read, every new branch name is refused, marks or not, until it can be", async () => {
-    await start(false);
-    const { tail, removed } = seed(2);
-    const sourceBranch = cm().currentBranch().name;
-    const pendingSuppressionsFor = DiscordAwarenessOutbox.prototype.pendingSuppressionsFor;
-    DiscordAwarenessOutbox.prototype.pendingSuppressionsFor = function () { throw new Error('injected unreadable journal'); };
-    const refused = (error: unknown) => error instanceof OperatorActionError && error.code === 'failed'
-      && /^Branch fix-2 can't be made now: the Discord awareness journal can't be read \(injected unreadable journal\), so whether a suppression's pending removals claim that name can't be checked, and a branch made under a claimed name would lose messages at its next start\. Calling again changes nothing until the journal can be read: after a write that failed inside the store, a restart, which reopens the store, ends this; an entry a later build wrote stays unreadable, and stops every start too, until a build that reads its format runs, and a corrupt entry, or a pre-journal ledger that can't be read, until it is repaired; each is the host operator's to do$/.test(error.message);
-    try {
-      await assert.rejects(framework.rollbackToMessage('resident', { messageId: tail, branchName: 'fix-2' }), refused);
-      await assert.rejects(framework.suppressMessages('resident', { messageIds: [removed[0]], branchName: 'fix-2' }), refused);
-      const api = new ApiServer(framework) as unknown as { cmdBranchCreate(params: { name: string }): Promise<unknown> };
-      await assert.rejects(api.cmdBranchCreate({ name: 'fix-2' }), refused);
-    } finally {
-      DiscordAwarenessOutbox.prototype.pendingSuppressionsFor = pendingSuppressionsFor;
-    }
-    assert.equal(cm().currentBranch().name, sourceBranch, 'nothing moved');
-    assert.ok(!framework.getStore().listBranches().some((branch) => branch.name === 'fix-2'), 'no branch was made');
-    // Readable again, the same rollback goes ahead.
-    const result = await framework.rollbackToMessage('resident', { messageId: tail, branchName: 'fix-2' });
-    assert.equal(result.targetBranch, 'fix-2');
   });
 
   it('a surgery that removes nothing addressable schedules no marks even when marks are chosen', async () => {

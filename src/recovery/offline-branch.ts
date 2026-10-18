@@ -5,7 +5,6 @@ import { removeStoredInterval } from '../stored-removal.js';
 import { firstFreeBranchName } from '../branch-names.js';
 import {
   DEFAULT_DISCORD_AWARENESS_EMOJI,
-  DISCORD_AWARENESS_ENTRY_LIFT,
   DiscordAwarenessOutbox,
   boundDiscordAwarenessText,
   defaultDiscordAwarenessOutboxPath,
@@ -189,8 +188,8 @@ export async function createOfflineRecoveryBranch(
 
     const sourceBranch = store.currentBranch().name;
     const held = new Set(store.listBranches().map((branch) => branch.name));
-    const defaultName = `recovery/${options.agentName}/${Date.now()}`;
-    let targetBranch = options.branchName ?? firstFreeBranchName(defaultName, (name) => held.has(name));
+    const targetBranch = options.branchName
+      ?? firstFreeBranchName(`recovery/${options.agentName}/${Date.now()}`, (name) => held.has(name));
     if (targetBranch === sourceBranch) {
       throw new Error('Recovery branch name must differ from the active source branch');
     }
@@ -219,47 +218,6 @@ export async function createOfflineRecoveryBranch(
     const outbox = new DiscordAwarenessOutbox(store, {
       legacyPath: options.outboxPath ?? defaultDiscordAwarenessOutboxPath(options.storePath),
     });
-    // A suppression whose removals are pending for this name, left by a run
-    // that never made its branch, would have them applied to the branch made
-    // here at the next start on it (the framework's
-    // checkDiscordAwarenessBranchName refuses the same set). A journal that
-    // can't be read can't say which names are claimed, so the recovery is
-    // refused, as the host's surgeries are.
-    // A default name such a suppression claims is passed over, as the host's
-    // are (newOperatorBranchName), so it's never refused for a claim. A dry
-    // run doesn't open the journal, and its default name passes over only the
-    // branches the store holds. While the journal can't be read, a claim
-    // counts for nothing here, and the check below refuses the name.
-    if (options.branchName === undefined) {
-      targetBranch = firstFreeBranchName(defaultName, (name) => {
-        if (held.has(name)) return true;
-        try {
-          return outbox.pendingSuppressionsFor(name).length > 0;
-        } catch {
-          return false;
-        }
-      });
-      result.targetBranch = targetBranch;
-    }
-    let claimed: ReturnType<DiscordAwarenessOutbox['pendingSuppressionsFor']>;
-    try {
-      claimed = outbox.pendingSuppressionsFor(targetBranch);
-    } catch (error) {
-      throw new Error(
-        `Recovery branch ${targetBranch} can't be made: the Discord awareness journal, or the pre-journal ledger ` +
-          `it imports (--outbox), can't be read (${boundDiscordAwarenessText(error instanceof Error ? error.message : String(error))}), ` +
-          'so whether a suppression\'s pending removals claim that name can\'t be checked. Running the recovery ' +
-          `again changes nothing until both can be read: ${DISCORD_AWARENESS_ENTRY_LIFT}`,
-        { cause: error },
-      );
-    }
-    if (claimed.length > 0) {
-      throw new Error(
-        `Recovery branch ${targetBranch} is the target of suppression ${claimed[0].id}, whose removals aren't ` +
-          'recorded as finished: a start on a branch with that name would apply them there. Choose another ' +
-          '--branch. The name is free once a start finds no branch with it and gives the suppression up',
-      );
-    }
     const batch = outbox.prepare({
       agentName: options.agentName,
       sourceBranch,
@@ -339,11 +297,9 @@ export async function createOfflineRecoveryBranch(
           } catch (discardError) {
             // None of its marks is ever sent: a start retires it. A
             // suppression's removals stay pending for its target branch: a
-            // start there finishes them, and a start that finds no such branch
-            // gives them up. Until then, a recovery or surgery onto that name,
-            // from a later process that reads the batch, is refused. A
-            // retirement can land before its durable barrier fails, so what
-            // the journal holds decides, as in the host's retireAfterRestore.
+            // start on a branch with that name finishes them. A retirement
+            // can land before its durable barrier fails, so what the journal
+            // holds decides, as in the host's retireAfterRestore.
             const detail = boundDiscordAwarenessText(
               discardError instanceof Error ? discardError.message : String(discardError),
             );
@@ -366,11 +322,11 @@ export async function createOfflineRecoveryBranch(
               try {
                 forked = store.listBranches().some((branch) => branch.name === targetBranch);
               } catch { /* unknown: say what a start on an existing branch would do */ }
-              retire = `${kept}. Its removals stay pending for ${targetBranch}: ` + (forked
-                ? `a start on ${targetBranch} would finish them there and retire the batch, so delete that branch ` +
-                  'unless you want that, through the host API\'s branch.delete once the host runs'
-                : 'the next start gives them up and retires the batch, since no branch has that name') +
-                `, and until then a branch named ${targetBranch} is refused${redo}`;
+              retire = `${kept}. Its removals stay pending for ${targetBranch}: a start on a branch with that ` +
+                'name would finish them there and retire the batch' + (forked
+                ? `, and ${targetBranch} is kept, so delete it unless you want that, through the host API's ` +
+                  'branch.delete once the host runs'
+                : '') + redo;
             }
           }
         }
@@ -382,8 +338,7 @@ export async function createOfflineRecoveryBranch(
         : suppression.intervals.length === 0 ? `; branch ${createdBranch} is kept for diagnosis`
         : batch && !sourceConfirmed ? `; branch ${createdBranch} is kept: it may be partly suppressed`
         : `; branch ${createdBranch} is kept for diagnosis: it may be partly suppressed, so don't start on it, and ` +
-          'delete it once it has been looked at (the host API\'s branch.delete, once the host runs), since nothing ' +
-          'refuses a switch onto it once its awareness batch is retired';
+          'delete it once it has been looked at (the host API\'s branch.delete, once the host runs)';
       if (!restore && !retire && !kept) throw error;
       throw new Error(`${failure}${restore}${kept}${retire}`, { cause: error });
     }

@@ -11,13 +11,9 @@
   marks to apply raises a `discord-awareness-not-scheduled` ops alert that
   names the surgery and the redo that applies them. An interrupted
   suppression's removals are still finished, at the first start on its
-  branch, and one whose branch doesn't exist is given up with a
-  `discord-awareness-suppression-unfinished` alert. Each of these notices
-  comes before the start records what it reports, so a start that doesn't
-  get that record written gives the notice again at the next start. Until
-  a suppression is finished or given up, a rollback, a suppression, an
-  offline recovery or the API's `branch.create` refuses its branch name,
-  and a switch or a redo onto that branch is refused.
+  branch. Each of these notices comes before the start records what it
+  reports, so a start that doesn't get that record written gives the notice
+  again at the next start.
 - A journal record that certifies a body change (a marks activation, a
   completed suppression or a retired batch) is now written only after that
   change is synced to the store. Previously a crash could keep marks active for a

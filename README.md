@@ -478,19 +478,8 @@ const result = await framework.rollbackToMessage('cairn', {
   which surgery made it, so the alert names an offline recovery beside a
   rollback or a suppression. One with none to apply (none chosen, or its marks cancelled) is
   only logged. An interrupted suppression's removals are still finished, at
-  the first start on its branch, and its batch is retired then. A
-  suppression whose removals are pending and whose branch doesn't exist (its
-  surgery ended before it created it, or it was deleted) is given up with a
-  `discord-awareness-suppression-unfinished` alert, since its removals apply
-  only there. Until a suppression is finished or given up, a rollback, a
-  suppression, an offline recovery or the API's `branch.create` refuses its
-  branch name, cancelled or not, since a start on a branch made under it
-  would apply those removals there. While the journal can't be read, each of
-  these refuses every name (`failed`), since none can be checked. After a
-  write that failed inside the store, a restart, which reopens the store,
-  ends that; an entry a later build wrote stops the next start too, until a
-  build that reads its format runs, and a corrupt entry or a pre-journal
-  ledger that can't be read, until it is repaired.
+  the first start on its branch, and its batch is retired then. Until then
+  a start on any branch with that name would apply those removals there.
 - **Operator controls,** each that changes the journal recorded in the
   operator log (a list or a preview records nothing); once `stop()`
   has begun, cancel and retract refuse, like every operator entry
@@ -510,18 +499,7 @@ const result = await framework.rollbackToMessage('cairn', {
     any an earlier choice would request later (a prepared batch's
     activation); cancelling it never revives them. Its receipt discloses earlier
     add requests whose outcome is unresolved, on the wire or unknown (an
-    unknown removal can't bring a mark back);
-  - `checkDiscordAwarenessBranchName(name)` refuses (`invalid`) a name for
-    a new branch that a suppression with pending removals names as its
-    target, cancelled or not, since a start on a branch with that name
-    would apply them there. Rollback, suppression and the API's
-    `branch.create` call it, with marks chosen or not; a host that creates
-    branches in the store itself calls it first. The API's `branch.switch`
-    and a redo refuse such a target too, since its removals aren't recorded
-    as finished, and a turn undo's branch, whose generated name carries its
-    time, isn't checked. While the journal can't be read it refuses every
-    name, and `branch.switch` and a redo refuse every switch (`failed`),
-    each saying why and what ends that.
+    unknown removal can't bring a mark back).
 
   A request the journal won't carry out (an unknown batch, or one in the
   wrong state) is refused as `invalid`; a failure to read or write the
