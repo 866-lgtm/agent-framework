@@ -111,10 +111,14 @@ test('a line page stops before its result would pass the limit, and says where t
     const more = await read({ limit: page.toLine! + 1 }, 5_000_000);
     const withNext = { ...(result.data as object), toLine: page.toLine! + 1, content: (more.data as LinePage).content };
     assert.ok(JSON.stringify(withNext).length > limit);
-    // Continuing reads on from the next line.
+    // Continuing reads on from the next line, ends at the line its last shown
+    // line is, and says to go on after it.
     const next = (await read({ offset: page.toLine! + 1 }, limit)).data as LinePage;
     assert.equal(next.fromLine, page.toLine! + 1);
     assert.ok(next.content.startsWith(`${String(page.toLine! + 1).padStart(6)}\tline ${page.toLine! + 1}:`));
+    const lastShown = next.content.slice(next.content.lastIndexOf('\n') + 1);
+    assert.ok(lastShown.startsWith(`${String(next.toLine).padStart(6)}\tline ${next.toLine}:`), lastShown);
+    assert.equal(next.note, `Stopped at line ${next.toLine} to stay within the ${limit}-character result limit (file has 3000). Continue with offset=${next.toLine! + 1}.`);
   }
 });
 
