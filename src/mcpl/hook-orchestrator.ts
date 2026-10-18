@@ -258,8 +258,9 @@ export class HookOrchestrator {
     if (this.namespaceWarned.has(serverId)) return;
     this.namespaceWarned.add(serverId);
     console.error(
-      `[mcpl] ${serverId}: a beforeInference injection's namespace isn't a string, which §10.4 requires, ` +
-        `so it was read as its text, ${logValue(text)}; this line prints once per server while the host runs`,
+      `[mcpl] ${serverId}: a beforeInference injection's namespace isn't a string, which §10.4 requires, so it keeps the ` +
+        `injection to no channel and every agent gets it; where it names a participant, it's read as its text, ${logValue(text)}; ` +
+        'this line prints once per server while the host runs',
     );
   }
 

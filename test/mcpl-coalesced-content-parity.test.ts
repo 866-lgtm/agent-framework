@@ -484,9 +484,10 @@ test('an injection whose namespace can\'t be read as text is left out, and any o
     assert.equal(lines.filter((line) => line === unreadable('system')).length, turn, lines.join('\n'));
   }
   // A server's first namespace that isn't a string, and only that one, is
-  // named, as the text it was read as.
+  // named, with what it does: it keeps the injection to no channel, and it's
+  // read as its text where it names a participant.
   assert.deepEqual(lines.filter((line) => line.includes('namespace isn\'t a string, which')), [
-    '[mcpl] bad: a beforeInference injection\'s namespace isn\'t a string, which §10.4 requires, so it was read as its text, 5; this line prints once per server while the host runs',
+    '[mcpl] bad: a beforeInference injection\'s namespace isn\'t a string, which §10.4 requires, so it keeps the injection to no channel and every agent gets it; where it names a participant, it\'s read as its text, 5; this line prints once per server while the host runs',
   ]);
 });
 
