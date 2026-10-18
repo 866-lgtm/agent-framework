@@ -12,6 +12,8 @@ import {
 import type { Engine, EngineLimits, EngineSlots, RunState } from '../src/code-execution/engine.js';
 
 const MiB = 1024 * 1024;
+/** The child's own error for a result that doesn't fit, as settle's last argument. */
+const UNFIT = '{"name":"ResultTooLarge","message":"too large"}';
 
 /** A prelude like the child's, cut down: tools by name, and an Error made of a failed call's fields. */
 const PRELUDE = `
@@ -66,14 +68,14 @@ test('a call the script awaits is pending until settled, then gets the parsed JS
   const s = e.start(PRELUDE, 'const r = await tool("lookup", { q: "café 🌱" }); [r.answer, typeof r]', 's.js');
   assert.deepEqual(s, { kind: 'pending' });
   assert.deepEqual(rec.calls, [{ id: 1, name: 'lookup', args: '{"q":"café 🌱"}' }]);
-  assert.deepEqual(fulfilled(e.settle(1, true, '{"answer":"ünï 🌱"}')), ['ünï 🌱', 'object']);
+  assert.deepEqual(fulfilled(e.settle(1, true, '{"answer":"ünï 🌱"}', UNFIT)), ['ünï 🌱', 'object']);
   e.dispose();
 });
 
 test('settle takes the result as UTF-8 bytes as well as text', async () => {
   const { e } = await engine();
   e.start(PRELUDE, '(await tool("t")).v', 's.js');
-  assert.equal(fulfilled(e.settle(1, true, new TextEncoder().encode('{"v":"bytes ✓"}'))), 'bytes ✓');
+  assert.equal(fulfilled(e.settle(1, true, new TextEncoder().encode('{"v":"bytes ✓"}'), UNFIT)), 'bytes ✓');
   e.dispose();
 });
 
@@ -82,16 +84,16 @@ test('calls in flight settle in any order, each to its own promise', async () =>
   const s = e.start(PRELUDE, 'await Promise.all([tool("a"), tool("b"), tool("c")])', 's.js');
   assert.equal(s.kind, 'pending');
   assert.deepEqual(rec.calls.map((c) => [c.id, c.name]), [[1, 'a'], [2, 'b'], [3, 'c']]);
-  assert.equal(e.settle(3, true, '"C"').kind, 'pending');
-  assert.equal(e.settle(1, true, '"A"').kind, 'pending');
-  assert.deepEqual(fulfilled(e.settle(2, true, '"B"')), ['A', 'B', 'C']);
+  assert.equal(e.settle(3, true, '"C"', UNFIT).kind, 'pending');
+  assert.equal(e.settle(1, true, '"A"', UNFIT).kind, 'pending');
+  assert.deepEqual(fulfilled(e.settle(2, true, '"B"', UNFIT)), ['A', 'B', 'C']);
   e.dispose();
 });
 
 test('a failed call rejects with its fields, and the prelude makes an Error of them', async () => {
   const { e } = await engine();
   e.start(PRELUDE, 'try { await tool("t"); "no throw" } catch (err) { [err instanceof Error, err.name, err.message, err.code] }', 's.js');
-  assert.deepEqual(fulfilled(e.settle(1, false, '{"name":"ToolRefused","message":"not on this agent\'s list","code":7}')),
+  assert.deepEqual(fulfilled(e.settle(1, false, '{"name":"ToolRefused","message":"not on this agent\'s list","code":7}', UNFIT)),
     [true, 'ToolRefused', 'not on this agent\'s list', 7]);
   e.dispose();
 });
@@ -99,16 +101,16 @@ test('a failed call rejects with its fields, and the prelude makes an Error of t
 test('a result that doesn\'t parse rejects the call with the parse error', async () => {
   const { e } = await engine();
   e.start(PRELUDE, 'try { await tool("t") } catch (err) { [err.name, String(err.message).length > 0] }', 's.js');
-  assert.deepEqual(fulfilled(e.settle(1, true, '{"unterminated": ')), ['SyntaxError', true]);
+  assert.deepEqual(fulfilled(e.settle(1, true, '{"unterminated": ', UNFIT)), ['SyntaxError', true]);
   e.dispose();
 });
 
 test('settling an id that isn\'t pending throws, and leaves the run as it was', async () => {
   const { e } = await engine();
   e.start(PRELUDE, 'await tool("t")', 's.js');
-  assert.throws(() => e.settle(9, true, '1'), EngineError);
-  assert.equal(fulfilled(e.settle(1, true, '1')), 1);
-  assert.throws(() => e.settle(1, true, '1'), /no pending call/);
+  assert.throws(() => e.settle(9, true, '1', UNFIT), EngineError);
+  assert.equal(fulfilled(e.settle(1, true, '1', UNFIT)), 1);
+  assert.throws(() => e.settle(1, true, '1', UNFIT), /no pending call/);
   e.dispose();
 });
 
@@ -117,7 +119,7 @@ test('a call still in flight when the script returns can settle after it', async
   const s = e.start(PRELUDE, 'globalThis.late = tool("slow").then((v) => print("late", v)); "returned"', 's.js');
   assert.equal(fulfilled(s), 'returned');
   assert.equal(rec.calls.length, 1);
-  assert.equal(fulfilled(e.settle(1, true, '"done"')), 'returned');
+  assert.equal(fulfilled(e.settle(1, true, '"done"', UNFIT)), 'returned');
   assert.deepEqual(rec.output, [[1, 'late done\n']]);
   e.dispose();
 });
@@ -142,7 +144,7 @@ test('a thrown non-Error value is rejected with name \'\' and its string as the 
 test('a rejection after an await is the script\'s rejection', async () => {
   const { e } = await engine();
   e.start(PRELUDE, 'await tool("t"); throw new RangeError("after")', 's.js');
-  const s = e.settle(1, true, 'null');
+  const s = e.settle(1, true, 'null', UNFIT);
   assert.equal(s.kind, 'rejected');
   assert.equal((s as { name: string }).name, 'RangeError');
   e.dispose();
@@ -189,7 +191,7 @@ test('the interrupt reaches a script spinning in jobs, and later settles answer 
   const { e } = await engine({ interrupt: () => stop });
   e.start(PRELUDE, 'const v = await tool("t"); for (;;) { await 0 }', 's.js');
   stop = true;
-  assert.deepEqual(e.settle(1, true, '1'), { kind: 'interrupted' });
+  assert.deepEqual(e.settle(1, true, '1', UNFIT), { kind: 'interrupted' });
   e.dispose();
 });
 
@@ -197,7 +199,7 @@ test('a slot that throws ends the run with an EngineError, and the engine refuse
   const { e } = await engine({ hostCall: () => { throw new Error('the bridge is broken'); } });
   assert.throws(() => e.start(PRELUDE, 'await tool("t")', 's.js'), (err: unknown) =>
     err instanceof EngineError && /the bridge is broken/.test(err.message));
-  assert.throws(() => e.settle(1, true, '1'), EngineError);
+  assert.throws(() => e.settle(1, true, '1', UNFIT), EngineError);
   e.dispose();
 });
 
@@ -234,21 +236,35 @@ test('a script reaching the memory limit gets a catchable out-of-memory error, a
   }
 });
 
-test('a result too large for the guest\'s memory rejects the call with out of memory', async () => {
+test('a result too large for the guest\'s memory rejects the call with the child\'s own error', async () => {
   // Too large to copy in at all, and small enough to copy but too large once parsed: many small
-  // objects take several times their JSON's size. Each must reach the script as an Error, not null.
-  // With the copy outside the limit, the second case's error was null: the copy and the parse
-  // together exhausted linear memory before the limit refused anything.
+  // objects take several times their JSON's size. Neither may reach the script as an out of
+  // memory at the call's await, which would read as a failed call (Ada-1017's call): the call
+  // rejects with the child's ResultTooLarge, and settle says so. With the host's copy outside the
+  // limit, the second case's parse failed with a bare null and no refusal counted.
   const one = '{"id":123456,"name":"item-123456","ok":true}';
   for (const [shape, memoryMaxBytes, json] of [
     ['a long string', 8 * MiB, JSON.stringify({ data: 'x'.repeat(12 * MiB) })],
     ['small objects', 32 * MiB, `[${Array(Math.floor((8 * MiB) / one.length)).fill(one).join(',')}]`],
   ] as const) {
     const { e } = await engine({}, { memoryMaxBytes });
-    e.start(PRELUDE, 'try { await tool("big"); "fit" } catch (err) { err === null ? "null" : [err.name, err.message] }', 's.js');
-    assert.deepEqual(fulfilled(e.settle(1, true, json)), ['InternalError', 'out of memory'], shape);
+    e.start(PRELUDE, 'try { await tool("big"); "fit" } catch (err) { err === null ? "null" : [err.name, err.bytes] }', 's.js');
+    const s = e.settle(1, true, json, `{"name":"ResultTooLarge","message":"too large","bytes":${json.length}}`);
+    assert.equal(s.unfit, true, shape);
+    assert.deepEqual(fulfilled(s), ['ResultTooLarge', json.length], shape);
     e.dispose();
   }
+});
+
+test('a result that fits, beside one that didn\'t, settles as usual', async () => {
+  const { e } = await engine({}, { memoryMaxBytes: 8 * MiB });
+  e.start(PRELUDE, 'const a = tool("big"), b = tool("small"); [await a.catch((err) => err.name), await b]', 's.js');
+  const big = e.settle(1, true, JSON.stringify({ data: 'x'.repeat(12 * MiB) }), UNFIT);
+  assert.deepEqual(big, { kind: 'pending', unfit: true });
+  const small = e.settle(2, true, '"ok"', UNFIT);
+  assert.equal(small.unfit, undefined);
+  assert.deepEqual(fulfilled(small), ['ResultTooLarge', 'ok']);
+  e.dispose();
 });
 
 test('deep recursion throws a catchable RangeError at the stack limit', async () => {
@@ -271,5 +287,5 @@ test('dispose frees a runtime with calls still pending, and nothing is allowed a
   const { e } = await engine();
   e.start(PRELUDE, 'await Promise.all([tool("a"), tool("b")])', 's.js');
   e.dispose();
-  assert.throws(() => e.settle(1, true, '1'), /after dispose/);
+  assert.throws(() => e.settle(1, true, '1', UNFIT), /after dispose/);
 });

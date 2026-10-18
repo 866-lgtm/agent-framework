@@ -48,6 +48,9 @@ enum {
     ENGINE_NO_MEMORY = -2,   /* the engine couldn't allocate its own state */
     ENGINE_UNKNOWN_CALL = -3 /* engine_settle named no pending call */
 };
+/* Or'd into engine_settle's state when the result didn't fit and the call took the host's
+   rejection instead. */
+#define ENGINE_UNFIT 16
 
 static JSRuntime *rt;
 static JSContext *ctx;
@@ -82,6 +85,7 @@ static uint32_t next_id = 1;
 static size_t mem_limit; /* 0: no limit */
 static size_t mem_used;  /* the usable size of every live allocation */
 static bool mem_in_oom;  /* a refusal has opened the headroom */
+static uint32_t mem_refusals; /* allocations refused, or failed for want of linear memory */
 
 static size_t soft_limit(void) {
     return mem_limit > 2 * OOM_HEADROOM ? mem_limit - OOM_HEADROOM : mem_limit / 2;
@@ -102,6 +106,7 @@ static bool refuse(size_t size) {
     if (mem_in_oom && !exceeds(size, mem_limit))
         return false;
     mem_in_oom = true;
+    mem_refusals++;
     return true;
 }
 
@@ -113,6 +118,8 @@ static void *limited_calloc(void *opaque, size_t count, size_t size) {
     void *ptr = calloc(count, size);
     if (ptr)
         mem_used += malloc_usable_size(ptr);
+    else
+        mem_refusals++;
     return ptr;
 }
 
@@ -123,6 +130,8 @@ static void *limited_malloc(void *opaque, size_t size) {
     void *ptr = malloc(size);
     if (ptr)
         mem_used += malloc_usable_size(ptr);
+    else
+        mem_refusals++;
     return ptr;
 }
 
@@ -146,6 +155,8 @@ static void *limited_realloc(void *opaque, void *ptr, size_t size) {
     if (new_ptr) {
         mem_used -= old_usable <= mem_used ? old_usable : mem_used;
         mem_used += malloc_usable_size(new_ptr);
+    } else {
+        mem_refusals++;
     }
     return new_ptr;
 }
@@ -378,12 +389,17 @@ int engine_start(const char *prelude, uint32_t prelude_len, const char *script, 
 }
 
 /* Settles call `id`, then runs jobs. With ok, the call's promise resolves to the parsed JSON;
-   otherwise it rejects with it. json must end in a NUL at [json_len], as JS_ParseJSON requires.
-   A null json means the host couldn't copy the result in, and a result that doesn't parse, or
-   doesn't fit the memory limit, rejects the promise with that error instead. */
+   otherwise it rejects with it. JSON that doesn't parse rejects it with the SyntaxError. A result
+   that doesn't fit the guest's memory (a null json, which the host couldn't copy in, or a parse
+   that ran out of memory) rejects it with the parse of unfit instead, the host's own error, and
+   the state answered has ENGINE_UNFIT set. That error is small, and parses in the headroom the
+   refusal opened; if even it can't be copied in (a null unfit) or parsed, the call rejects with
+   what that failure gives. json and unfit, when not null, must end in a NUL at [len], as
+   JS_ParseJSON requires. */
 EXPORT("engine_settle")
-int engine_settle(uint32_t id, int ok, const char *json, uint32_t json_len) {
-    if (!started || (json && json[json_len] != '\0'))
+int engine_settle(uint32_t id, int ok, const char *json, uint32_t json_len, const char *unfit,
+                  uint32_t unfit_len) {
+    if (!started || (json && json[json_len] != '\0') || (unfit && unfit[unfit_len] != '\0'))
         return ENGINE_MISUSE;
     JSValue entry = JS_GetPropertyUint32(ctx, pending, id);
     if (JS_IsException(entry)) {
@@ -405,18 +421,32 @@ int engine_settle(uint32_t id, int ok, const char *json, uint32_t json_len) {
         return state();
     }
 
-    JSValue value;
+    JSValue value = JS_UNDEFINED;
     bool resolve = ok != 0;
-    if (!json) {
-        JS_ThrowOutOfMemory(ctx);
-        value = JS_GetException(ctx);
-        resolve = false;
-    } else {
+    bool too_large = !json;
+    if (json) {
+        uint32_t refusals = mem_refusals;
         value = JS_ParseJSON(ctx, json, json_len, "<result>");
         if (JS_IsException(value)) {
             value = JS_GetException(ctx);
             resolve = false;
+            if (mem_refusals != refusals) {
+                /* The parse ran out of memory, and freed what it had built. */
+                JS_FreeValue(ctx, value);
+                too_large = true;
+            }
         }
+    }
+    if (too_large) {
+        resolve = false;
+        if (unfit) {
+            value = JS_ParseJSON(ctx, unfit, unfit_len, "<unfit>");
+        } else {
+            JS_ThrowOutOfMemory(ctx);
+            value = JS_EXCEPTION;
+        }
+        if (JS_IsException(value))
+            value = JS_GetException(ctx);
     }
     JSValue fn = JS_GetPropertyUint32(ctx, entry, resolve ? 0 : 1);
     JS_FreeValue(ctx, entry);
@@ -433,7 +463,8 @@ int engine_settle(uint32_t id, int ok, const char *json, uint32_t json_len) {
     else
         JS_FreeValue(ctx, r);
     run_jobs();
-    return state();
+    int st = state();
+    return too_large && st >= 0 ? st | ENGINE_UNFIT : st;
 }
 
 /* The text of a value or an error, for engine_result. Takes v. Returns a JS string, undefined,
@@ -551,9 +582,8 @@ uint8_t *engine_result(void) {
 /* Buffers the host fills for engine_start and engine_settle, and frees after engine_result.
    They're held to the same limit as QuickJS's allocations: a result's copy and the value parsed
    from it share the guest's memory, and with the copy outside the limit, the two together could
-   exhaust the linear memory before the limit refused anything, leaving no room for the error.
-   A refused buffer opens the headroom, so the out-of-memory error engine_settle then throws can
-   be built. */
+   exhaust linear memory before the limit refused anything, so the parse's failure would look like
+   no refusal and an out-of-memory error couldn't be built. */
 EXPORT("engine_alloc")
 void *engine_alloc(uint32_t size) {
     return limited_malloc(NULL, size ? size : 1);

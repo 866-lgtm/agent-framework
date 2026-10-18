@@ -58,6 +58,12 @@ export type RunState =
   /** `interrupt()` returned true while it ran. */
   | { kind: 'interrupted' };
 
+/**
+ * What `settle` answers: the run's state, and `unfit` when the result didn't fit the guest's
+ * memory, to copy in or as it was parsed, and the call took the child's own error instead.
+ */
+export type SettleState = RunState & { unfit?: true };
+
 export interface Engine {
   /**
    * Evaluates the prelude as a global script, then the script as global code with top-level
@@ -68,11 +74,12 @@ export interface Engine {
   /**
    * Settles call `callId`, then runs pending jobs as `start` does. With `ok`, the call's promise
    * resolves to the parsed JSON; otherwise it rejects with it, and the prelude makes an Error of
-   * it. JSON that doesn't parse, or doesn't fit the guest's memory, rejects the promise with that
-   * error instead. Allowed after `fulfilled`, for calls still in flight when a script returned.
-   * Throws for an id that isn't pending.
+   * it. JSON that doesn't parse rejects the promise with the SyntaxError instead. A result that
+   * doesn't fit the guest's memory rejects it with `unfitJson` parsed, the child's own error
+   * (`ResultTooLarge`), and the answer has `unfit: true`. Allowed after `fulfilled`, for calls
+   * still in flight when a script returned. Throws for an id that isn't pending.
    */
-  settle(callId: number, ok: boolean, json: string | Uint8Array): RunState;
+  settle(callId: number, ok: boolean, json: string | Uint8Array, unfitJson: string): SettleState;
   /** Frees the engine's runtime. Nothing may be called after it. */
   dispose(): void;
 }
@@ -99,14 +106,14 @@ export const DEFAULT_STACK_BYTES = 512 * 1024;
 export const MAX_STACK_BYTES = LINK_STACK_BYTES - 256 * 1024;
 
 // interface.c's states and failures.
-const PENDING = 0, FULFILLED = 1, REJECTED = 2, INTERRUPTED = 3, HOST_FAILED = 4;
+const PENDING = 0, FULFILLED = 1, REJECTED = 2, INTERRUPTED = 3, HOST_FAILED = 4, UNFIT = 16;
 const MISUSE = -1, NO_MEMORY = -2, UNKNOWN_CALL = -3;
 
 interface Exports {
   _initialize(): void;
   engine_init(memoryLimit: number, stackSize: number): number;
   engine_start(prelude: number, preludeLen: number, script: number, scriptLen: number, filename: number): number;
-  engine_settle(id: number, ok: number, json: number, jsonLen: number): number;
+  engine_settle(id: number, ok: number, json: number, jsonLen: number, unfit: number, unfitLen: number): number;
   engine_result(): number;
   engine_alloc(size: number): number;
   engine_free(ptr: number): void;
@@ -330,17 +337,21 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
         }
       });
     },
-    settle(callId, ok, json) {
+    settle(callId, ok, json, unfitJson) {
       live('settle()');
       if (!started) throw new EngineError('settle() before start()');
       if (callId >>> 0 !== callId) throw new EngineError(`settle(): ${callId} isn't a call id`);
       return call('settle()', () => {
-        const j = put(json);
+        // The small error first, so a result that takes the last of the memory leaves it room.
+        // A copy the module can't make room for goes as a null pointer.
+        const u = put(unfitJson), j = put(json);
         try {
-          // A result the module can't make room for rejects the call with out of memory.
-          return toState(ex.engine_settle(callId, ok ? 1 : 0, j.ptr, j.len), 'settle()');
+          const code = ex.engine_settle(callId, ok ? 1 : 0, j.ptr, j.len, u.ptr, u.len);
+          if (code >= 0 && (code & UNFIT) !== 0) return { ...toState(code & ~UNFIT, 'settle()'), unfit: true };
+          return toState(code, 'settle()');
         } finally {
           if (j.ptr) ex.engine_free(j.ptr);
+          if (u.ptr) ex.engine_free(u.ptr);
         }
       });
     },
