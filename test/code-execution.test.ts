@@ -1696,6 +1696,21 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
     }
   });
 
+  it("what a kept writer couldn't send when its script ended doesn't reach a later script's result, and the writer still writes", async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      await within(runner.exec('import sys\nkept = sys.stderr', []), 'the keeping script');
+      const failed = await within(runner.exec('import os\nos.close(2)\nkept.write("unsent")', []), 'the script that closes fd 2');
+      assert.match(failed.stderr, /^\[pytc-runtime\] some of what the script wrote couldn't be sent \(\[Errno 9\] [^\n]*\)\n$/);
+      const next = await within(runner.exec('print("next")', []), 'the next script');
+      assert.deepStrictEqual({ stdout: next.stdout, stderr: next.stderr }, { stdout: 'next\n', stderr: '' });
+      const later = await within(runner.exec('kept.write("kept still writes\\n")', []), 'a script writing through the kept writer');
+      assert.deepStrictEqual({ stdout: later.stdout, stderr: later.stderr }, { stdout: '', stderr: 'kept still writes\n' });
+    } finally {
+      runner.dispose();
+    }
+  });
+
   it("a multiprocessing child doesn't send the parent's partial line again", async () => {
     const runner = new PyRunner({ onToolCall: async () => '' });
     try {
@@ -2316,6 +2331,43 @@ describe('PyRunner background mode (real python3)', () => {
     } finally {
       console.error = consoleError;
       runner.dispose();
+    }
+  });
+
+  it("a journal write that a file-size limit cuts short goes on, and its failure says so in the host's log", { skip: process.platform === 'win32' ? 'the limit is set with bash\'s ulimit' : false }, () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'pytc-fsize-'));
+    const logPath = join(tempDir, 'bg.log');
+    try {
+      // Under a 64 KiB limit, a host whose journal holds 65,000 bytes gets
+      // 1,000 more in one chunk (a pipe write under PIPE_BUF arrives whole), so
+      // the kernel cuts that write short at the limit, and the next one fails.
+      const script = [
+        'import os, sys, time',
+        'sys.stdout.write("x" * 64999 + "\\n")',
+        'for _ in range(1000):',
+        `    if os.path.getsize(${JSON.stringify(logPath)}) >= 65000:`,
+        '        break',
+        '    time.sleep(0.01)',
+        'sys.stdout.write("y" * 999 + "\\n")',
+      ].join('\n');
+      const host = [
+        `const { PyRunner } = await import(${JSON.stringify(new URL('../src/index.js', import.meta.url).href)});`,
+        'const logged = [];',
+        'console.error = (...args) => { logged.push(args.map(String).join(" ")); };',
+        'const runner = new PyRunner({ onToolCall: async () => "" });',
+        `const result = await runner.exec(${JSON.stringify(script)}, [], { logPath: ${JSON.stringify(logPath)}, lifetimeMs: 30000, onWake: async () => null });`,
+        'runner.dispose();',
+        'process.stdout.write(JSON.stringify({ returnCode: result.returnCode, logged }));',
+      ].join('\n');
+      const out = execFileSync('bash', ['-c', 'ulimit -f 64 && exec "$0" --input-type=module -e "$1"', process.execPath, host], { encoding: 'utf8' });
+      const { returnCode, logged } = JSON.parse(out) as { returnCode: number; logged: string[] };
+      assert.strictEqual(returnCode, 0, JSON.stringify(logged));
+      const journal = readFileSync(logPath, 'utf8');
+      assert.ok(journal.length >= 65000 && journal.length <= 65536, `${journal.length} bytes`);
+      assert.strictEqual(journal, `${'x'.repeat(64999)}\n${'y'.repeat(999)}\n`.slice(0, journal.length));
+      assert.strictEqual(logged.filter((l) => /cannot write the log file any more: .*EFBIG/.test(l)).length, 1, JSON.stringify(logged));
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
     }
   });
 

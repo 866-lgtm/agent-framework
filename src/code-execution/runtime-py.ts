@@ -245,6 +245,8 @@ class _FdWriter(io.RawIOBase):
     def __init__(self, fd):
         super().__init__()
         self._fd = fd
+        # Set while _drop_held empties the writer above it.
+        self.dropping = False
 
     def writable(self):
         return True
@@ -253,6 +255,8 @@ class _FdWriter(io.RawIOBase):
         return self._fd
 
     def write(self, data):
+        if self.dropping:
+            return len(data)
         return _write_some(self._fd, data)
 
 
@@ -300,7 +304,20 @@ def _flush_writers():
             continue
         except Exception as exc:
             # Its fd closed or broke under it, so that much can't be sent.
+            # Dropped, it can't go out later, once the fd is back, in another
+            # exec's output: a writer the script kept would flush it there.
+            _drop_held(writer)
             _diag("some of what the script wrote couldn't be sent (" + str(exc) + ")")
+
+
+def _drop_held(writer):
+    # Empty a writer whose flush failed, and leave it usable.
+    raw = writer.buffer.raw
+    raw.dropping = True
+    try:
+        writer.flush()
+    finally:
+        raw.dropping = False
 
 
 if hasattr(os, "register_at_fork"):

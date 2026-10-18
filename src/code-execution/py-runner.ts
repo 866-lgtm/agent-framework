@@ -137,8 +137,19 @@ function alive(child: ChildProcess): boolean {
 }
 
 /**
+ * All of `text` at the end of the file: a write the kernel cuts short, as at a
+ * file-size limit, goes on from where it stopped, and one that fails throws.
+ */
+function writeAll(fd: number, text: string): void {
+  const data = Buffer.from(text);
+  for (let at = 0; at < data.length; ) at += writeSync(fd, data, at);
+}
+
+/**
  * A background script's journal: the log file the agent can read with its own
- * tools while the script runs, and the tail its result carries.
+ * tools while the script runs, and the tail its result carries. It's written
+ * synchronously, from the host's event loop, so a workspace whose writes block
+ * holds the host while they do.
  */
 class Journal {
   private fd: number | null = null;
@@ -167,9 +178,9 @@ class Journal {
     try {
       if (this.written + bytes > LOG_FILE_CAP_BYTES) {
         this.capped = true;
-        writeSync(this.fd, `\n[log capped at ${LOG_FILE_CAP_BYTES} bytes]\n`);
+        writeAll(this.fd, `\n[log capped at ${LOG_FILE_CAP_BYTES} bytes]\n`);
       } else {
-        writeSync(this.fd, text);
+        writeAll(this.fd, text);
         this.written += bytes;
       }
     } catch (err) {
