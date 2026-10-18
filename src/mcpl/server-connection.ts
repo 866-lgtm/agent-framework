@@ -295,15 +295,24 @@ export class McplServerConnection extends EventEmitter {
   private controlPlaneReady = false;
   private dataPlaneReady = false;
   private bufferedEvents: Array<{ event: string; args: unknown[] }> = [];
-  /** Cap on buffered responder-less events during a plane pause (issue #122).
-   *  Held server→host requests are never dropped and may exceed this. */
-  private static readonly MAX_BUFFERED_EVENTS = 1000;
+  /** How many of bufferedEvents are server→host requests, each holding a
+   *  responder its server waits on. Every change to bufferedEvents keeps it. */
+  private heldRequests = 0;
+  /** Cap on held notifications (responder-less events) during a plane pause
+   *  (issue #122), counted apart from requests: past it, the oldest held
+   *  notification is dropped. */
+  private static readonly MAX_HELD_NOTIFICATIONS = 1000;
+  /** Budget of held requests during a plane pause (#387), counted apart from
+   *  notifications: past it, a request is refused at once, never dropped. It
+   *  bounds a server that pipelines requests without waiting for answers. A
+   *  server that doesn't send a refused request again loses it (discord-mcpl
+   *  doesn't), so the budget sits far above the notifications' cap, to leave
+   *  a busy server's long pause room. */
+  private static readonly MAX_HELD_REQUESTS = 10_000;
   private droppedBufferedEvents = 0;
-  /** True while ready()/readyControlPlane() re-emit a buffer snapshot. Items
-   *  re-buffering mid-flush were already admitted once — applying the cap to
-   *  them again would evict events that were legally held (the cap targets
-   *  NEW arrivals during a pause, not churn from control-plane flushes). */
-  private flushDepth = 0;
+  /** Requests refused at the budget since the planes last opened (ready()),
+   *  so each pause's first refusal is logged. */
+  private refusedHeldRequests = 0;
 
   // Reconnect state (adapted from Anarchid/agent-framework@mcpl-module-proto)
   private config: McplServerConfig | null = null;
@@ -375,22 +384,19 @@ export class McplServerConnection extends EventEmitter {
     // reports that pause's drops, and the next pause counts (and logs) its own.
     const dropped = this.droppedBufferedEvents;
     this.droppedBufferedEvents = 0;
+    this.heldRequests = 0;
+    this.refusedHeldRequests = 0;
     if (pending.length > 200) {
       console.error(
         `[mcpl] ${this.id}: flushing ${pending.length} buffered event(s) synchronously ` +
         `(long pause backlog${dropped > 0 ? `; ${dropped} dropped at cap` : ''})`,
       );
     }
-    this.flushDepth++;
-    try {
-      for (const { event, args } of pending) {
-        // Re-enter the gate for every buffered item. A control handler (notably
-        // tools/list_changed) may install a newer data-plane barrier while this
-        // snapshot is being flushed; later data items must observe that pause.
-        this.dispatchInboundEvent(event, ...args);
-      }
-    } finally {
-      this.flushDepth--;
+    for (const { event, args } of pending) {
+      // Re-enter the gate for every buffered item. A control handler (notably
+      // tools/list_changed) may install a newer data-plane barrier while this
+      // snapshot is being flushed; later data items must observe that pause.
+      this.dispatchInboundEvent(event, ...args);
     }
   }
 
@@ -406,18 +412,14 @@ export class McplServerConnection extends EventEmitter {
     this.controlPlaneReady = true;
     const pending = this.bufferedEvents;
     this.bufferedEvents = [];
-    this.flushDepth++;
-    try {
-      for (const item of pending) {
-        // Re-enter the ADMISSION gate (this.emit), never super.emit: control
-        // events include channels-register/changed, which are grant-gated —
-        // the old direct flush bypassed positive-grant enforcement entirely
-        // (PR #79 review blocker 3). Data-plane items re-buffer in order via
-        // the same call, since dataPlaneReady is still false.
-        this.dispatchInboundEvent(item.event, ...item.args);
-      }
-    } finally {
-      this.flushDepth--;
+    this.heldRequests = 0;
+    for (const item of pending) {
+      // Re-enter the ADMISSION gate (this.emit), never super.emit: control
+      // events include channels-register/changed, which are grant-gated —
+      // the old direct flush bypassed positive-grant enforcement entirely
+      // (PR #79 review blocker 3). Data-plane items re-buffer in order via
+      // the same call, since dataPlaneReady is still false.
+      this.dispatchInboundEvent(item.event, ...item.args);
     }
   }
 
@@ -501,36 +503,53 @@ export class McplServerConnection extends EventEmitter {
       }
       return super.emit(event, ...args);
     }
-    // Buffer cap (issue #122): a long data-plane pause (quiesce window) on a
-    // busy server would otherwise grow this array without bound. Only
-    // responder-LESS events are ever dropped — a buffered server→host REQUEST
-    // holds a live responder the server is blocking on, and dropping it would
-    // strand that call forever (the server timing out and reconnecting is the
-    // accepted bound there, and reconnect re-runs the barrier funnel).
-    if (this.flushDepth === 0 && this.bufferedEvents.length >= McplServerConnection.MAX_BUFFERED_EVENTS) {
-      const hasResponder = (item: { args: unknown[] }): boolean => {
-        const responder = item.args[1] as { respond?: unknown } | undefined;
-        return typeof responder?.respond === 'function';
-      };
-      if (!hasResponder({ args })) {
-        this.droppedBufferedEvents++;
-        if (this.droppedBufferedEvents % 100 === 1) {
-          console.error(
-            `[mcpl] ${this.id}: buffered-event cap (${McplServerConnection.MAX_BUFFERED_EVENTS}) — ` +
-            `dropped ${this.droppedBufferedEvents} responder-less event(s) while the plane is paused`,
-          );
-        }
-        const dropIndex = this.bufferedEvents.findIndex((item) => !hasResponder(item));
-        if (dropIndex >= 0) {
-          this.bufferedEvents.splice(dropIndex, 1); // drop-oldest non-request
-          this.bufferedEvents.push({ event: name, args });
-        }
-        // else: buffer is all held requests — drop the incoming event instead.
-        return true;
+    // Held until the plane opens. A long pause (a quiesce, say) on a busy or a
+    // runaway server would otherwise grow this array without bound, so
+    // requests and notifications each have a bound, counted apart. A request
+    // holds a responder its server waits on, and dropping it would strand that
+    // call, so past MAX_HELD_REQUESTS (#387) it's refused at once with -32000,
+    // the code of the host's other transient refusals, and its server can send
+    // it again. A notification has no one to tell, so past
+    // MAX_HELD_NOTIFICATIONS (issue #122) the oldest held notification is
+    // dropped to make room. A flush takes the whole buffer and zeroes its
+    // count, so what it holds again was admitted within these bounds and
+    // stays within them.
+    const responder = args[1] as { respond?: unknown; respondError?: (code: number, message: string) => void } | undefined;
+    const isRequest = McplServerConnection.hasResponder({ args });
+    if (isRequest && this.heldRequests >= McplServerConnection.MAX_HELD_REQUESTS) {
+      this.refusedHeldRequests++;
+      if (this.refusedHeldRequests % 100 === 1) {
+        console.error(
+          `[mcpl] ${this.id}: held-request budget (${McplServerConnection.MAX_HELD_REQUESTS}) — ` +
+          `refused ${this.refusedHeldRequests} request(s) with -32000 while the plane is paused`,
+        );
       }
+      responder?.respondError?.(
+        -32000,
+        `the host is busy: ${McplServerConnection.MAX_HELD_REQUESTS} of this server's requests are already waiting; send this one again later`,
+      );
+      return true;
+    }
+    if (!isRequest && this.bufferedEvents.length - this.heldRequests >= McplServerConnection.MAX_HELD_NOTIFICATIONS) {
+      this.droppedBufferedEvents++;
+      if (this.droppedBufferedEvents % 100 === 1) {
+        console.error(
+          `[mcpl] ${this.id}: buffered-event cap (${McplServerConnection.MAX_HELD_NOTIFICATIONS}) — ` +
+          `dropped ${this.droppedBufferedEvents} responder-less event(s) while the plane is paused`,
+        );
+      }
+      const oldest = this.bufferedEvents.findIndex((item) => !McplServerConnection.hasResponder(item));
+      if (oldest >= 0) this.bufferedEvents.splice(oldest, 1);
     }
     this.bufferedEvents.push({ event: name, args });
+    if (isRequest) this.heldRequests++;
     return true;
+  }
+
+  /** A buffered server→host request: it carries a responder its server waits on. */
+  private static hasResponder(item: { args: unknown[] }): boolean {
+    const responder = item.args[1] as { respond?: unknown } | undefined;
+    return typeof responder?.respond === 'function';
   }
 
   /** Event-name form of METHOD_TO_REQUIRED_CAPABILITY, for admission-time
