@@ -35,4 +35,6 @@
   - A wait on drains that runs out fails the `stop()` with a
     `ShutdownTimeoutError` naming `awareness drain:<server>` and keeps an
     owned store open; a later `stop()` waits for that drain again. With a
-    budget, a `stop()` can now take up to six budgets.
+    budget, a `stop()` can now take up to six budgets, where 0.22.3 took up
+    to five. A failed `create()` gives this wait 30 s too, a third cleanup
+    wait beside the two it had in 0.22.3.
