@@ -3,7 +3,8 @@
  * dereferences a reference, and it fails closed on every axis the RFC names:
  *
  *  - **origin binding (§6.1, revision 3):** authenticated fetches go only to
- *    the origin the reference's server connection was dialed to. This v1 does
+ *    the origin a server's connection was dialed to, for a reference that
+ *    server delivered, with that server's credential. This v1 does
  *    not fetch third-party origins at all (deferred with declared reference
  *    origins); the connection credential is applied as an Authorization
  *    header by this code alone and never surfaces to model, script, or URI.
@@ -35,9 +36,16 @@ import { EXPIRY_REASON, isReferenceExpired, referenceExpiry, REFERENCE_LIMITS, s
 export const DEFAULT_FETCH_MAX_BYTES = 256 * 1024 * 1024;
 /** Eager (autofetch) threshold: at most what could have shipped inline. */
 export const DEFAULT_EAGER_FETCH_MAX_BYTES = 256 * 1024;
-/** Cumulative per-server budget for this process. */
+/** Cumulative per-server budget for this process: every byte a fetch dialed
+ *  through a server reads counts against that server's, whether or not it's
+ *  kept. */
 export const DEFAULT_MAX_TOTAL_BYTES = 1024 * 1024 * 1024;
 const FETCH_TIMEOUT_MS = 60_000;
+/** What a refusal by the per-server budget adds. The total lives as long as
+ *  this fetcher, one per framework, so only someone running the host renews
+ *  it, by starting a new one, or raises the budget (the server's config's
+ *  autofetch.maxTotalBytes, which each fetch reads afresh). */
+const BUDGET_LASTS = "the budget doesn't renew on its own, so calling again won't change that unless whoever runs this host raises or renews it";
 const EAGER_FETCH_TIMEOUT_MS = 10_000;
 
 export interface ResolvedServerBinding {
@@ -102,6 +110,10 @@ export function normalizedOrigin(url: string): string | null {
 }
 
 export class ReferenceFetcher {
+  /** Bytes read through each server in this process, charged to the server a
+   *  fetch dials through as each chunk is read, kept or not. Concurrent
+   *  fetches through one server share the total, so each checks what the
+   *  others have taken. */
   private totals = new Map<string, number>();
   private inFlight = new Map<string, Promise<FetchOutcome>>();
 
@@ -113,16 +125,34 @@ export class ReferenceFetcher {
   ) {}
 
   /** Would the eager (autofetch) default fetch this record? Not one the
-   *  fetcher refuses as expired, which would only take an eager slot. */
+   *  fetcher refuses as expired, which would only take an eager slot. It
+   *  takes the eager limit of the server the fetch would dial. */
   isEagerEligible(record: ReferenceRecord): boolean {
     if (record.fetchedPath) return false;
     if (isReferenceExpired(record.testimony)) return false;
-    if (record.serverId === undefined) return false;
-    const binding = this.resolveServer(record.serverId);
-    if (!binding) return false;
-    const cap = binding.autofetch?.maxBytes ?? DEFAULT_EAGER_FETCH_MAX_BYTES;
-    if (record.testimony.sizeBytes === undefined || record.testimony.sizeBytes > cap) return false;
-    return this.originCheck(record, binding) === null;
+    const server = this.serverFor(record);
+    if ('refusal' in server) return false;
+    const cap = server.binding.autofetch?.maxBytes ?? DEFAULT_EAGER_FETCH_MAX_BYTES;
+    return record.testimony.sizeBytes !== undefined && record.testimony.sizeBytes <= cap;
+  }
+
+  /** The server to dial for a record (§6.2): the first, in the order they
+   *  delivered it, whose address is on the uri's origin. When none is, the
+   *  first server's refusal (unknown to this host, or the origin check's),
+   *  and for a record no server delivered, that it's unbound. */
+  private serverFor(record: ReferenceRecord): { serverId: string; binding: ResolvedServerBinding } | { refusal: string } {
+    let refusal: string | undefined;
+    for (const serverId of record.serverIds) {
+      const binding = this.resolveServer(serverId);
+      if (!binding) {
+        refusal ??= `unknown server: ${serverId}`;
+        continue;
+      }
+      const offOrigin = this.originCheck(record, binding);
+      if (offOrigin === null) return { serverId, binding };
+      refusal ??= offOrigin;
+    }
+    return { refusal: refusal ?? `reference ${UNBOUND_REASON}` };
   }
 
   /** §6.1/§7.1 policy check; returns a refusal reason or null. */
@@ -158,24 +188,33 @@ export class ReferenceFetcher {
 
   private async doFetch(record: ReferenceRecord, opts?: { maxBytes?: number; timeoutMs?: number }): Promise<FetchOutcome> {
     const t = record.testimony;
-    if (record.serverId === undefined) return { ok: false, error: `reference ${UNBOUND_REASON}` };
-    const binding = this.resolveServer(record.serverId);
-    if (!binding) return { ok: false, error: `unknown server: ${record.serverId}` };
-
-    const refusal = this.originCheck(record, binding);
-    if (refusal) return { ok: false, error: refusal };
+    const server = this.serverFor(record);
+    if ('refusal' in server) return { ok: false, error: server.refusal };
+    const { serverId, binding } = server;
     const expiry = referenceExpiry(t);
     if (expiry) return { ok: false, error: `reference ${EXPIRY_REASON[expiry]}` };
 
     const ceiling = opts?.maxBytes ?? DEFAULT_FETCH_MAX_BYTES;
-    // Vector 4: a claim already over the ceiling refuses without dialing.
-    if (t.sizeBytes !== undefined && t.sizeBytes > ceiling) {
-      return { ok: false, error: `claimed ${t.sizeBytes} bytes exceeds fetch ceiling ${ceiling}` };
-    }
+    // The budget is checked before the ceiling, here and while reading: a
+    // larger max_bytes lifts the ceiling, and nothing the caller does lifts
+    // the budget, so a fetch past both is told about the budget.
     const budget = binding.autofetch?.maxTotalBytes ?? DEFAULT_MAX_TOTAL_BYTES;
-    const used = this.totals.get(record.serverId) ?? 0;
+    const used = this.totals.get(serverId) ?? 0;
     if (used >= budget) {
-      return { ok: false, error: `per-server fetch budget exhausted (${used}/${budget} bytes)` };
+      return { ok: false, error: `per-server fetch budget exhausted (${used}/${budget} bytes); ${BUDGET_LASTS}` };
+    }
+    // Vector 4: a claim already over the ceiling refuses without dialing. One
+    // that's also over what's left of the budget is told about the budget,
+    // which no max_bytes lifts. A claim over what's left but within the
+    // ceiling still dials, and the budget stops it at its first chunk past.
+    if (t.sizeBytes !== undefined && t.sizeBytes > ceiling) {
+      if (t.sizeBytes > budget - used) {
+        return {
+          ok: false,
+          error: `claimed ${t.sizeBytes} bytes exceeds what's left of the per-server fetch budget (${used}/${budget} bytes); ${BUDGET_LASTS}`,
+        };
+      }
+      return { ok: false, error: `claimed ${t.sizeBytes} bytes exceeds fetch ceiling ${ceiling}` };
     }
 
     const controller = new AbortController();
@@ -198,10 +237,17 @@ export class ReferenceFetcher {
         const { done, value } = await reader.read();
         if (done) break;
         received += value.byteLength;
-        if (received > ceiling || received > budget - used) {
+        // What's read is charged at once, kept or not: other fetches from
+        // this server read the same total, so none spends what another took.
+        const total = (this.totals.get(serverId) ?? 0) + value.byteLength;
+        this.totals.set(serverId, total);
+        if (total > budget) {
           controller.abort();
-          const which = received > ceiling ? 'ceiling' : 'per-server budget';
-          return { ok: false, error: `aborted: actual bytes exceeded ${which} at ${received}` };
+          return { ok: false, error: `aborted: per-server fetch budget exhausted (${total}/${budget} bytes); ${BUDGET_LASTS}` };
+        }
+        if (received > ceiling) {
+          controller.abort();
+          return { ok: false, error: `aborted: actual bytes exceeded ceiling at ${received}` };
         }
         const buf = Buffer.from(value);
         hash.update(buf);
@@ -232,7 +278,6 @@ export class ReferenceFetcher {
       const path = await this.saveFile(`${record.refId}.${ext}`, data, observedMime);
       if (path === null) return { ok: false, error: 'no writable workspace mount to store the payload' };
 
-      this.totals.set(record.serverId, used + data.length);
       record.fetchedPath = path;
       record.verifiedBytes = data.length;
       record.verifiedMimeType = observedMime;

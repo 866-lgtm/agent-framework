@@ -389,11 +389,16 @@ export function otherReplacements(plan: FilePlan, labelled: boolean): string[] {
   return notes;
 }
 
-/** A file a receipt describes: its path as the call named it, its plan, and what the call's settling found of it. */
+/**
+ * A file a receipt describes: its path as the call named it, its plan, what
+ * the call's settling found of it, and, where its push left the file's mode as
+ * disk had it, why (commitToolChange's `modeKept`).
+ */
 export interface StoredFile {
   path: string;
   plan: FilePlan;
   notes: string[];
+  modeKept?: string | null;
 }
 
 /**
@@ -437,6 +442,7 @@ export function editReceipt(tool: EditTool, files: StoredFile[], editCount: numb
       size: file.plan.bytes.length,
       replacements: file.plan.replacements,
       ...(notes.length ? { note: notes.join(' ') } : {}),
+      ...(file.modeKept ? { modeKept: file.modeKept } : {}),
       changed: '',
     };
     const budget = { left: maxChars - JSON.stringify(data).length - RECEIPT_RESERVE };
@@ -460,7 +466,12 @@ export function editReceipt(tool: EditTool, files: StoredFile[], editCount: numb
   let editsLeftOut = 0;
   for (const [i, file] of files.entries()) {
     const notes = notesOf(file);
-    const bare = { path: file.path, size: file.plan.bytes.length, replacements: file.plan.replacements };
+    const bare = {
+      path: file.path,
+      size: file.plan.bytes.length,
+      replacements: file.plan.replacements,
+      ...(file.modeKept ? { modeKept: file.modeKept } : {}),
+    };
     const edits = file.plan.edits.map((edit) => edit.first.edit + 1).sort((a, b) => a - b);
     // The fullest entry that fits: with its notes, then without them, then
     // without its edits' numbers too, so a file is named before it's counted.

@@ -426,8 +426,8 @@ function lineFeeds(value: string): number {
  * new text is built a batch of pieces at a time, and of each edit's
  * replacements it keeps only what a receipt names. Two bounds keep a call
  * from holding more than its file: edits whose asks, past what a refusal
- * shows, come to more occurrences than the text has characters keep no
- * more starts than a refusal shows, and a file the edits would take past
+ * shows, come to more occurrences than the text is long keep no more starts
+ * than a refusal shows, and a file the edits would take past
  * `maxBytes` is refused as `tooLarge`, at least that many bytes, before its
  * new text is built.
  */
