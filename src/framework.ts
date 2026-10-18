@@ -7309,6 +7309,9 @@ export class AgentFramework {
 
     let startupWatchdog: ReturnType<typeof setTimeout> | null = null;
     let completionWatchdog: ReturnType<typeof setInterval> | null = null;
+    // Whether the completion watchdog ended the run as stalled, for a
+    // tool-result batch the run leaves behind (see the finally).
+    let stalled = false;
 
     const startupTimeout = new Promise<never>((_, reject) => {
       startupWatchdog = setTimeout(() => {
@@ -7331,6 +7334,8 @@ export class AgentFramework {
         if (!run.inferenceStarted) return;
         const idle = Date.now() - run.lastActivity;
         if (idle > COMPLETION_IDLE_TIMEOUT_MS) {
+          // During a stop() the run ends as a stop, not as a stall.
+          stalled = !this.providerAdmissionClosed;
           reject(this.providerAdmissionClosed
             ? ephemeralRunStopped(agent.name, `no stream-driver activity for ${Math.round(idle / 1000)}s after inference started`)
             : new Error(
@@ -7361,6 +7366,25 @@ export class AgentFramework {
     } finally {
       if (startupWatchdog) clearTimeout(startupWatchdog);
       if (completionWatchdog) clearInterval(completionWatchdog);
+      // A batch still pending here has nothing left to settle it: once the
+      // run is deregistered, driveStream's finally abandons nothing (it does
+      // only while the agent is registered), and no later turn comes. The
+      // stop terminals settle their batch before they settle the run, but
+      // other ways out don't, among them a failure whose stream ends after
+      // the caller has deregistered the agent, a restart or retry whose new
+      // start fails while the batch waits for it, the completion watchdog,
+      // and stop()'s sweep of the runs still registered. So settle it here,
+      // withheld, as the run ended: `run_stalled` when the completion
+      // watchdog ended it as stalled, and otherwise `aborted`, as
+      // driveStream's finally records a stream that ended without a clean
+      // round.
+      if (agent.toolResultGuard.hasPending) {
+        try {
+          agent.toolResultGuard.abandon(stalled ? 'run_stalled' : 'aborted');
+        } catch (error) {
+          console.error(`[tool-result-guard] agent=${agent.name} failed to record a batch the ephemeral run left:`, error);
+        }
+      }
       // Mark before cancellation: an adapter may synchronously settle its
       // iterator, and this physical frame still owns terminal typing/outgoing
       // closure even though the ephemeral name is about to be deregistered.
