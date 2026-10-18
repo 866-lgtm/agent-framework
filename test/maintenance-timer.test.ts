@@ -22,7 +22,7 @@ import type {
   ToolDefinition,
   ToolResult,
 } from '../src/index.js';
-import { AgentFramework } from '../src/index.js';
+import { AgentFramework, ShutdownTimeoutError } from '../src/index.js';
 import { OperatorActionError } from '../src/operator-log.js';
 import type { NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
@@ -2230,6 +2230,50 @@ describe('queued context maintenance timer', () => {
       console.error = quiet;
       strategy.release();
       if (!stopped) await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("stop(t) waits for a tick in flight until its budget runs out, then fails naming maintenance and keeps the store open for a later stop()", { timeout: 10_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-stop-budget-'));
+    const strategy = new GatedTickStrategy();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane,
+      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+    });
+    strategy.framework = framework;
+    const internals = framework as unknown as {
+      noteInferenceExhausted(agentName: string, reason: string, retryable?: boolean, errorType?: string): void;
+    };
+    const quiet = console.error;
+    console.error = () => {};
+    try {
+      framework.start();
+      internals.noteInferenceExhausted('agent', 'compile refused', false, 'over_budget');
+      await waitFor(() => strategy.ticks === 1);
+      // Bounded, so a stop() that waits on the tick fails the test rather
+      // than hanging it.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const outcome = await Promise.race([
+        framework.stop(100).then(() => 'resolved', (error: unknown) => error),
+        new Promise<string>((resolve) => { timer = setTimeout(() => resolve('still pending'), 5_000); }),
+      ]);
+      clearTimeout(timer);
+      assert.ok(outcome instanceof ShutdownTimeoutError
+        && outcome.message === 'Shutdown timed out after 100 ms; pending: maintenance', String(outcome));
+      assert.equal(framework.getStore().isClosed(), false, 'the tick may still write');
+      strategy.release();
+      await framework.stop();
+      assert.equal(strategy.storeOpenAtFirstTickEnd, true, 'the tick ended before the store closed');
+      assert.equal(framework.getStore().isClosed(), true, 'a later stop() closes the store');
+    } finally {
+      console.error = quiet;
+      strategy.release();
+      await framework.stop().catch(() => {});
       rmSync(dir, { recursive: true, force: true });
     }
   });

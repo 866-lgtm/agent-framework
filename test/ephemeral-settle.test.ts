@@ -16,7 +16,7 @@ import type {
   ToolDefinition,
   ToolResult,
 } from '../src/index.js';
-import { AgentFramework } from '../src/index.js';
+import { AgentFramework, ShutdownTimeoutError } from '../src/index.js';
 import { createMockResponse, HeldStream, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
 
 class EphemeralToolModule implements Module {
@@ -508,6 +508,53 @@ describe('runEphemeralToCompletion settle signal', () => {
       const run = framework.runEphemeralToCompletion(agent, contextManager, { idleTimeoutMs: 300, idlePollMs: 50 });
       await assert.rejects(run, /stalled: no stream-driver activity for \d+s after inference started .*Stream likely dropped/);
       assert.equal(membrane.calls.length, 1, 'the run streamed once');
+    } finally {
+      release();
+      await stopAndRemove(framework, tempDir);
+    }
+  });
+
+  it("a run whose stream outlasts stop()'s budget is ended by that stop(), while its stream still runs", { timeout: 60_000 }, async () => {
+    // The run's stream yields nothing until the test releases it, cancel
+    // included, so stop(100)'s wait on it runs out. The caller asked for a
+    // bounded stop(), so its sweep ends the run then, rather than leave it to
+    // its idle watchdog, fifteen minutes by default.
+    const { tempDir, storePath } = tempStorePath('ephemeral-stop-budget-');
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    const membrane = new MockMembrane();
+    membrane.streamYielding = (request) => {
+      membrane.calls.push(request);
+      return new HeldStream(released, [createMockResponse([{ type: 'text', text: 'too late' }])]);
+    };
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: [],
+      modules: [new EphemeralToolModule()],
+      syncIntervalMs: 0,
+    });
+    const within = <T>(promise: Promise<T>): Promise<unknown> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      return Promise.race([
+        promise.then(() => 'resolved', (error: unknown) => error),
+        new Promise<string>((resolve) => { timer = setTimeout(() => resolve('still pending'), 5_000); }),
+      ]).finally(() => clearTimeout(timer));
+    };
+    try {
+      const { agent, contextManager } = await createEphemeral(framework);
+      framework.start();
+      const run = framework.runEphemeralToCompletion(agent, contextManager);
+      const streams = (framework as unknown as { activeStreams: Map<string, unknown> }).activeStreams;
+      for (let i = 0; i < 400 && !streams.has(agent.name); i++) await new Promise((resolve) => setTimeout(resolve, 5));
+      assert.ok(streams.has(agent.name), "the run's stream started");
+      const stopped = await within(framework.stop(100));
+      assert.ok(stopped instanceof ShutdownTimeoutError
+        && stopped.message === `Shutdown timed out after 100 ms; pending: stream:${agent.name}`, String(stopped));
+      // The stream is still held: only the finally below releases it.
+      const ended = await within(run);
+      assert.ok(ended instanceof Error && /refused: the framework is stopping/.test(ended.message), String(ended));
+      assert.equal(framework.getAgent(agent.name), null, 'the run has left');
     } finally {
       release();
       await stopAndRemove(framework, tempDir);

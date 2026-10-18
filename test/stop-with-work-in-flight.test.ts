@@ -22,6 +22,11 @@
  * retry follows its inference:failed, whether its stream failed to start or
  * failed once started. A turn that continues after that start() is marked
  * inferring again.
+ * Work that outlasts stop()'s budget fails the stop, with teardown gone on
+ * and the store left open (#373): a stream whose cancel can't reach it,
+ * whose agent's deferred writes wait for its own end, and an event loop in a
+ * module's onProcess, which finishes that iteration once the call returns
+ * and exits, rather than run beside the loop of a start() made meanwhile.
  * Each test waits on the event it needs (a log line, an answer), not on a
  * fixed delay, and then one more turn, so a late rejection would be seen.
  */
@@ -47,7 +52,7 @@ import type {
   ToolDefinition,
   ToolResult,
 } from '../src/index.js';
-import { AgentFramework } from '../src/index.js';
+import { AgentFramework, ShutdownTimeoutError } from '../src/index.js';
 import { HeldStream, MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 
 /** Resolve once `cond` holds, polling each turn; fail, naming `what`, after `ms`. */
@@ -507,6 +512,148 @@ describe('stop() with work still in flight', () => {
       await framework.stop();
       store.close();
     }
+  });
+
+  describe("stop()'s budget, with work that outlasts it", () => {
+    /** What `promise` has come to after `ms`: its rejection, 'resolved', or
+     *  'still pending', so a stop() that doesn't come back fails the test
+     *  rather than hanging it. */
+    async function settledWithin(promise: Promise<unknown>, ms: number): Promise<unknown> {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const late = new Promise<string>((resolve) => { timer = setTimeout(() => resolve('still pending'), ms); });
+      try {
+        return await Promise.race([promise.then(() => 'resolved', (error: unknown) => error), late]);
+      } finally { clearTimeout(timer); }
+    }
+
+    /**
+     * A resident whose stream, once started, yields nothing until the test
+     * releases it, cancel included (HeldStream), and a module whose onProcess
+     * waits on any text that starts with "hang" until the test lets it go.
+     * Any other text is added for the resident and asks for its inference.
+     */
+    async function frameworkWithHeldWork() {
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      let streaming!: () => void;
+      const residentStreaming = new Promise<void>((resolve) => { streaming = resolve; });
+      const membrane = new MockMembrane();
+      membrane.streamYielding = (request) => {
+        membrane.calls.push(request);
+        streaming();
+        return new HeldStream(released, [createMockResponse([{ type: 'text', text: 'resident done' }] as ContentBlock[])]);
+      };
+      const entered: string[] = [];
+      const hung = new Map<string, () => void>();
+      const order: string[] = [];
+      const events: Module = {
+        name: 'events',
+        async start() {},
+        async stop() { order.push('modules stopped'); },
+        getTools: () => [],
+        async handleToolCall() { return { success: true }; },
+        async onProcess(event) {
+          if (event.type !== 'external-message') return {};
+          const text = String((event as { content?: unknown }).content);
+          if (text.startsWith('hang')) {
+            entered.push(text);
+            await new Promise<void>((resolve) => { hung.set(text, resolve); });
+            return {};
+          }
+          return { addMessages: [{ participant: 'User', content: [{ type: 'text', text }] }], requestInference: true };
+        },
+      };
+      const framework = await AgentFramework.create({
+        storePath: join(tempDir, 'store'),
+        membrane: membrane.asMembrane(),
+        agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'test' }],
+        modules: [events],
+        syncIntervalMs: 0,
+      });
+      const push = (content: string) =>
+        framework.pushEvent({ type: 'external-message', source: 'test', content, metadata: {} } as unknown as ProcessEvent);
+      const letGo = (text: string) => { hung.get(text)?.(); };
+      const internals = framework as unknown as { deferredMessages: Array<{ forAgent?: string }>; loopPromise: Promise<void> | null };
+      const storedTexts = (): string[] => framework.getAgent('assistant')!.getContextManager().getAllMessages()
+        .flatMap((m) => m.content.map((b) => (b.type === 'text' ? (b as { text: string }).text : `<${b.type}>`)));
+      return { framework, release, residentStreaming, entered, letGo, order, push, internals, storedTexts };
+    }
+
+    it("a stream that outlasts the budget fails the stop, keeps the store open, and keeps its agent's deferred write queued until its own end stores it", { timeout: 30_000 }, async () => {
+      // The deferral's rule holds through the timeout: no entry lands ahead of
+      // a stream that may still write.
+      const { framework, release, residentStreaming, order, push, internals, storedTexts } = await frameworkWithHeldWork();
+      try {
+        framework.start();
+        push('go');
+        await residentStreaming;
+        push('a note for later');
+        await until(() => internals.deferredMessages.length === 1, 'the note to be deferred behind the stream');
+        const outcome = await settledWithin(framework.stop(100), 5_000);
+        assert.ok(outcome instanceof ShutdownTimeoutError
+          && outcome.message === 'Shutdown timed out after 100 ms; pending: stream:assistant', String(outcome));
+        assert.ok(order.includes('modules stopped'), 'teardown went on');
+        assert.equal(framework.getStore().isClosed(), false, 'the stream may still write');
+        assert.equal(internals.deferredMessages.length, 1, 'the note stays queued');
+        assert.ok(!storedTexts().includes('a note for later'), 'nothing landed ahead of the stream');
+        assert.ok(logged.some((line) => line.startsWith(
+          "[deferral] stop: 1 deferred write(s) for assistant stay queued: its stream outlasted stop()'s wait")), logged.join('\n'));
+        release();
+        await until(() => internals.deferredMessages.length === 0, "the stream's own end to take the note");
+        assert.ok(storedTexts().includes('a note for later'), `its turn-end flush stored the note:\n${storedTexts().join('\n')}`);
+        await framework.stop();
+        assert.equal(framework.getStore().isClosed(), true, 'a later stop() closes the store');
+        assert.deepEqual(rejections, []);
+      } finally {
+        release();
+        await framework.stop().catch(() => {});
+      }
+    });
+
+    it("an event loop still in a module's onProcess when the budget runs out fails the stop, and teardown goes on", { timeout: 30_000 }, async () => {
+      const { framework, entered, letGo, order, push } = await frameworkWithHeldWork();
+      try {
+        framework.start();
+        push('hang');
+        await until(() => entered.includes('hang'), 'the loop to enter the call');
+        const outcome = await settledWithin(framework.stop(100), 5_000);
+        assert.ok(outcome instanceof ShutdownTimeoutError
+          && outcome.message === 'Shutdown timed out after 100 ms; pending: event loop', String(outcome));
+        assert.ok(order.includes('modules stopped'), 'teardown went on, the module whose call is still running included');
+        assert.equal(framework.getStore().isClosed(), false);
+        letGo('hang');
+        await framework.stop();
+        assert.equal(framework.getStore().isClosed(), true, 'once the call returns, the loop ends and a later stop() closes the store');
+        assert.deepEqual(rejections, []);
+      } finally {
+        letGo('hang');
+        await framework.stop().catch(() => {});
+      }
+    });
+
+    it("a loop whose stop() came back while it was in a call exits once that call returns, though a start() was made meanwhile, and the new lifecycle's loop runs on", { timeout: 30_000 }, async () => {
+      const { framework, entered, letGo, push, internals } = await frameworkWithHeldWork();
+      try {
+        framework.start();
+        push('hang');
+        await until(() => entered.includes('hang'), 'the loop to enter the call');
+        const outcome = await settledWithin(framework.stop(100), 5_000);
+        assert.ok(outcome instanceof ShutdownTimeoutError && outcome.pending.includes('event loop'), String(outcome));
+        const oldLoop = internals.loopPromise!;
+        framework.start();
+        const newLoop = internals.loopPromise!;
+        assert.notEqual(newLoop, oldLoop, 'the start() runs a loop of its own');
+        letGo('hang');
+        assert.equal(await settledWithin(oldLoop, 5_000), 'resolved', 'the old loop exits once its call returns');
+        assert.equal(await settledWithin(newLoop, 100), 'still pending', "the new lifecycle's loop runs on");
+        await framework.stop();
+        assert.equal(await settledWithin(newLoop, 5_000), 'resolved', 'and ends with its own stop()');
+        assert.deepEqual(rejections, []);
+      } finally {
+        letGo('hang');
+        await framework.stop().catch(() => {});
+      }
+    });
   });
 
   describe("tune-out's subconscious tools", () => {
