@@ -1289,7 +1289,7 @@ export class Agent {
       messages = [...messages, continueTurn()];
       continuePrompt = { turn: randomUUID(), text: CONTINUE_ROW };
     } else {
-      continuePrompt = toolLoopPrompt(messages.at(-1), index, this.name);
+      continuePrompt = toolLoopPrompt(messages.at(-1), index);
     }
 
     const request: NormalizedRequest = {

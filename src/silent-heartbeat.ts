@@ -212,9 +212,8 @@ export function indexRequestOnlyRows(stored: readonly StoredRowLike[], agentName
 export function toolLoopPrompt(
   last: NormalizedMessage | undefined,
   index: RequestOnlyRowIndex,
-  agentName: string,
 ): RequestOnlyPrompt | undefined {
-  if (!last || last.participant === agentName) return undefined;
+  if (!last) return undefined;
   for (const block of last.content) {
     if (block.type !== 'tool_result') continue;
     const prompt = index.prompts.get(toolUseKey(block.toolUseId));
