@@ -167,7 +167,8 @@ export const CHILD_ENV_ALLOWLIST = [
   'http_proxy', 'https_proxy', 'no_proxy',
   '__CF_USER_TEXT_ENCODING',
   // Windows equivalents, harmless elsewhere.
-  'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT', 'APPDATA', 'LOCALAPPDATA', 'USERPROFILE',
+  // USERNAME is Windows' USER, which Python's getpass.getuser() reads there.
+  'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT', 'APPDATA', 'LOCALAPPDATA', 'USERPROFILE', 'USERNAME',
 ];
 
 /** Environment for a stdio child: allowlisted host vars (+ LC_*), then the
