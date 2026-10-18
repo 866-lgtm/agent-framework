@@ -93,8 +93,8 @@ export type ServerResolution = ResolvedServerBinding | 'no-address';
 /** Why a fetch failed, or would be refused before dialing. */
 export interface Refusal {
   /** What happened, as a clause that completes "couldn't fetch <ref>: ",
-   *  whatever it's about: fetch_reference's sentence, save_recent_image's
-   *  and the host's log lines all read it. */
+   *  whatever it's about: fetch_reference's sentence, save_recent_image's,
+   *  and the eager and script-demand fetches' log lines read it. */
   error: string;
   /** What calling again can do, as a sentence. fetch_reference and
    *  save_recent_image show it; the eager and script-demand fetches log the
@@ -121,13 +121,14 @@ export type FetchOutcome =
 const refused = (error: string, remedy: string): { refusal: Refusal } => ({ refusal: { error, remedy } });
 const fail = (error: string, remedy: string): FetchOutcome => ({ ok: false, error, remedy });
 
-/** What calling again can do about a server's HTTP status. A timeout, a
- *  conflict or lock the server's state can clear, a request too early, a rate
- *  limit or a server's passing trouble can clear, though not 501 or 505, which
- *  say the server doesn't support the request. A 401 is about this host's
- *  credentials for the server, which a fresh reference doesn't change, and a
- *  403 can be either those or this reference. The rest of 4xx is about this
- *  reference, which a fresh one may not share. */
+/** What calling again can do about a server's HTTP status. A later try can
+ *  work after a timeout, a conflict or lock the server's state can clear, a
+ *  request it calls too early, a rate limit or a server's passing trouble,
+ *  though not after 501 or 505, which say the server doesn't support the
+ *  request. A 401 is about this host's credentials for the server, which a
+ *  fresh reference doesn't change, and a 403 can be either those or this
+ *  reference. The rest of 4xx is about this reference, which a fresh one may
+ *  not share. */
 function statusRemedy(status: number): string {
   if (status === 501 || status === 505) return NOTHING_TO_DO;
   if (status === 408 || status === 409 || status === 423 || status === 425 || status === 429 || status >= 500) return TRY_LATER;
@@ -139,14 +140,13 @@ function statusRemedy(status: number): string {
 /** What a download stopped at a call's own ceiling, below the host's, can do.
  *  Its whole size is unknown, only that it's past what arrived, and a fetch
  *  again reads it from the start, within the host's ceiling and what the
- *  server's budget has left after this one's bytes. */
+ *  server's budget has left after this one's bytes. The read loop stops a
+ *  download past the host's ceiling before it asks, so what arrived is within
+ *  it, and only the budget can be what binds. */
 function largerMaxBytes(received: number, left: number, server: string): string {
   const most = Math.min(DEFAULT_FETCH_MAX_BYTES, left);
   if (received <= most) return `It's at least ${received} bytes; a larger max_bytes, up to ${most}, may fetch it.`;
-  // Past the host's own ceiling nothing lifts it, whatever the budget has left.
-  return received <= DEFAULT_FETCH_MAX_BYTES
-    ? `It's at least ${received} bytes, more than the ${left} bytes left of this host's fetch budget for ${server}. ${BUDGET}`
-    : `It's at least ${received} bytes, more than the ${DEFAULT_FETCH_MAX_BYTES} bytes this host fetches at most. ${HOST_CEILING}`;
+  return `It's at least ${received} bytes, more than the ${left} bytes left of this host's fetch budget for ${server}. ${BUDGET}`;
 }
 
 /** What a thrown fetch says went wrong. fetch's own "fetch failed" says only
@@ -190,6 +190,15 @@ const EXT_BY_MIME = new Map<string, string>(Object.entries({
   'video/mp4': 'mp4', 'application/json': 'json', 'text/plain': 'txt',
   'application/pdf': 'pdf', 'application/zip': 'zip',
 }));
+
+/** A server's address as it's configured, its scheme and host, for a
+ *  clause: never its userinfo, path or query. URL's own origin is 'null' for
+ *  a scheme that isn't special, which normalizedOrigin accepts. The caller
+ *  has already parsed it. */
+function configuredOrigin(url: string): string {
+  const u = new URL(url);
+  return `${u.protocol}//${u.host}`;
+}
 
 /** ws→http / wss→https with default ports elided, for origin comparison. */
 export function normalizedOrigin(url: string): string | null {
@@ -262,12 +271,13 @@ export class ReferenceFetcher {
   /** Every check the fetch makes before it dials, in its order: the server
    *  (none, unknown, no address, an address of its own or the reference's
    *  that doesn't parse, a reference address carrying a user name or
-   *  password, a scheme other than http: or https:, off the uri's origin), the expiry, a claimed size over the host's own ceiling, the
-   *  server's spent budget, a claimed size over a call's ceiling. For a record
-   *  with no saved copy and no fetch under way, the fetch, `refusal()` and
-   *  the eager check all ask this, so what save_recent_image says is the
-   *  reason the fetch would refuse with, and no eager slot goes to a fetch
-   *  that would be refused. */
+   *  password, a scheme other than http: or https:, off the uri's origin),
+   *  the expiry, a claimed size over the host's own ceiling, the server's
+   *  spent budget, a claimed size over a call's ceiling. For a record with no
+   *  saved copy and no fetch under way, the fetch, `refusal()` and the eager
+   *  check all ask this, so what save_recent_image says is the reason the
+   *  fetch would refuse with, and no eager slot goes to a fetch that would be
+   *  refused. */
   private beforeDial(record: ReferenceRecord, opts?: { maxBytes?: number }):
     { refusal: Refusal } | { serverId: string; binding: ResolvedServerBinding; ceiling: number; budget: number } {
     const server = this.serverFor(record);
@@ -330,7 +340,8 @@ export class ReferenceFetcher {
     // guards other resolvers.
     const dialedOrigin = normalizedOrigin(binding.url);
     if (!dialedOrigin) {
-      return refused(`the "${serverId}" server's address doesn't parse as a URL, so there's nowhere to fetch it from`, NOTHING_TO_DO);
+      return refused(`the "${serverId}" server's address doesn't parse as a URL, so there's nowhere to fetch it from`,
+        "Calling again won't change that unless whoever runs this host corrects the server's address.");
     }
     const refUrl = new URL(record.testimony.uri);
     // A user name or password in the uri is a credential embedded in it,
@@ -351,7 +362,7 @@ export class ReferenceFetcher {
     // Origins compare with their schemes, so this also refuses an http:
     // reference from a server dialed over TLS (wss://).
     if (refOrigin !== dialedOrigin) {
-      return refused(`it points to ${refOrigin}, not to the "${serverId}" server's own address (${new URL(binding.url).origin}), ` +
+      return refused(`it points to ${refOrigin}, not to the "${serverId}" server's own address (${configuredOrigin(binding.url)}), ` +
         'and this host fetches only from the server itself', NOTHING_TO_DO);
     }
     return null;
@@ -403,6 +414,13 @@ export class ReferenceFetcher {
         // this server read the same total, so none spends what another took.
         const total = (this.totals.get(serverId) ?? 0) + value.byteLength;
         this.totals.set(serverId, total);
+        // The limit nothing lifts first, as before dialing: the host's
+        // ceiling, then the budget, then a call's own ceiling.
+        if (received > DEFAULT_FETCH_MAX_BYTES) {
+          controller.abort();
+          return fail(`the download had reached ${received} bytes, past the ${DEFAULT_FETCH_MAX_BYTES} bytes this host fetches at most, ` +
+            'so it was stopped and nothing was kept', HOST_CEILING);
+        }
         if (total > budget) {
           controller.abort();
           // The server's running total, as the next fetch's refusal gives it:
@@ -412,11 +430,8 @@ export class ReferenceFetcher {
         }
         if (received > ceiling) {
           controller.abort();
-          return ceiling >= DEFAULT_FETCH_MAX_BYTES
-            ? fail(`the download had reached ${received} bytes, past the ${DEFAULT_FETCH_MAX_BYTES} bytes this host fetches at most, ` +
-              'so it was stopped and nothing was kept', HOST_CEILING)
-            : fail(`the download had reached ${received} bytes, past the ${ceiling} bytes this call allows, ` +
-              'so it was stopped and nothing was kept', largerMaxBytes(received, budget - total, server));
+          return fail(`the download had reached ${received} bytes, past the ${ceiling} bytes this call allows, ` +
+            'so it was stopped and nothing was kept', largerMaxBytes(received, budget - total, server));
         }
         const buf = Buffer.from(value);
         hash.update(buf);

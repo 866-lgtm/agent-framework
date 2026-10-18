@@ -192,7 +192,9 @@ test('a reference whose address carries a user name or password is refused befor
   const reg = new ReferenceRegistry();
   const f = makeFetcher({ srv: { url: `ws://127.0.0.1:${port}` } });
   const clause = "its address carries a user name or password, which this host doesn't send";
-  for (const uri of [`http://user:s3cret@127.0.0.1:${port}/ok?userinfo`, `http://justauser@127.0.0.1:${port}/ok?userinfo-name`]) {
+  // A user name with a password, a user name alone, and a password alone.
+  for (const uri of [`http://user:s3cret@127.0.0.1:${port}/ok?userinfo`, `http://justauser@127.0.0.1:${port}/ok?userinfo-name`,
+    `http://:s3cret@127.0.0.1:${port}/ok?userinfo-password`]) {
     // A claimed size within the eager limit, so only the refusal keeps the eager fetch away.
     const rec = makeRecord(reg, uri, { sizeBytes: 1000 });
     assert.deepEqual(f.refusal(rec), { error: clause, remedy: NOTHING_TO_DO }, uri);
@@ -201,7 +203,7 @@ test('a reference whose address carries a user name or password is refused befor
     assert.equal(out.error, clause, uri);
     assert.equal(out.remedy, NOTHING_TO_DO, uri);
   }
-  assert.equal((hits.get('/ok?userinfo') ?? 0) + (hits.get('/ok?userinfo-name') ?? 0), 0, 'nothing dialed');
+  assert.equal(['/ok?userinfo', '/ok?userinfo-name', '/ok?userinfo-password'].reduce((n, k) => n + (hits.get(k) ?? 0), 0), 0, 'nothing dialed');
 });
 
 test('an http: reference from a server dialed over TLS is refused as another origin, with nothing dialed', async () => {
@@ -817,6 +819,8 @@ test('refusal() answers what the fetch would refuse before dialing, case by case
     srv: { url: `ws://127.0.0.1:${port}` },
     'stdio-srv': 'no-address',
     spent: { url: `ws://127.0.0.1:${port}`, autofetch: { maxTotalBytes: 0 } },
+    // A scheme that isn't special, whose URL origin is 'null', and a token in its userinfo.
+    relay: { url: 'mcpl://tok:sekrit@relay.example:9000/path?key=x' },
     // An eager limit past the fetch's own ceiling and its budget: those still decide.
     roomy: { url: `ws://127.0.0.1:${port}`, autofetch: { maxBytes: 4 * 1024 * 1024 * 1024 } },
   });
@@ -830,6 +834,9 @@ test('refusal() answers what the fetch would refuse before dialing, case by case
     ['no address', makeRecord(reg, `${ORIGIN}/ok?case=no-address`, small, 'stdio-srv'), noAddressReason('stdio-srv'), NOTHING_TO_DO],
     ['off the origin', makeRecord(reg, 'https://cdn.example.invalid/case-origin', small, 'srv'),
       `it points to https://cdn.example.invalid, not to the "srv" server's own address (ws://127.0.0.1:${port}), and this host fetches only from the server itself`, NOTHING_TO_DO],
+    // The server's address as configured, its scheme and host, without its userinfo, path or query.
+    ['off the origin of a server on another scheme', makeRecord(reg, 'https://cdn.example.invalid/case-relay', small, 'relay'),
+      'it points to https://cdn.example.invalid, not to the "relay" server\'s own address (mcpl://relay.example:9000), and this host fetches only from the server itself', NOTHING_TO_DO],
     ['expired', makeRecord(reg, `${ORIGIN}/ok?case=expired`, { ...small, expiresAt: '2001-01-01T00:00:00Z' }, 'srv'), `the reference is ${EXPIRY_REASON.passed}`, FRESH_REFERENCE],
     ['budget spent', makeRecord(reg, `${ORIGIN}/ok?case=budget`, small, 'spent'), 'this host\'s fetch budget for the "spent" server is used up (0 of 0 bytes)', BUDGET],
     ['over the ceiling', makeRecord(reg, `${ORIGIN}/ok?case=ceiling`, { sizeBytes: 512 * 1024 * 1024 }, 'roomy'),
@@ -869,6 +876,7 @@ test('a reference with two faults is refused for the first the fetch checks: the
   const huge = 512 * 1024 * 1024;
   const cases: Array<[string, ReturnType<typeof makeRecord>, string]> = [
     ['no address, expired', makeRecord(reg, `${ORIGIN}/ok?two=1`, { expiresAt: past }, 'stdio-srv'), noAddressReason('stdio-srv')],
+    ['no address, over the host ceiling', makeRecord(reg, `${ORIGIN}/ok?two=5`, { sizeBytes: huge }, 'stdio-srv'), noAddressReason('stdio-srv')],
     ['expired, budget spent, over the ceiling', makeRecord(reg, `${ORIGIN}/ok?two=2`, { expiresAt: past, sizeBytes: huge }, 'spent'), `the reference is ${EXPIRY_REASON.passed}`],
     // Nothing lifts the host's ceiling, so it comes before a budget whoever runs the host can raise.
     ['over the host ceiling, budget spent', makeRecord(reg, `${ORIGIN}/ok?two=3`, { sizeBytes: huge }, 'spent'), 'it claims 536870912 bytes, over the 268435456 bytes this host fetches at most'],
@@ -1033,13 +1041,13 @@ test('a fetch that meets no listener says the request failed, with its cause, an
 test("a save that throws is the workspace's failure, logged for whoever runs the host, not the fetch's", async (t) => {
   const errors = t.mock.method(console, 'error', () => {});
   const reg = new ReferenceRegistry();
-  // Its words take one line of the log, as the agent's text would.
-  const f = new ReferenceFetcher(() => ({ url: ORIGIN }), async () => { throw new Error('disk on fire\nand smoking'); });
+  // Its words take one line of the log, bounded as the agent's text would be.
+  const f = new ReferenceFetcher(() => ({ url: ORIGIN }), async () => { throw new Error(`disk on fire\n${'x'.repeat(300)}`); });
   const rec = makeRecord(reg, `${ORIGIN}/ok?save-throws`);
   const out = await f.fetch(rec);
   assert.equal(out.error, "it was fetched, but this host couldn't store it in its workspace, so nothing was kept");
   assert.equal(out.remedy, 'Calling again is likely to fail the same way; whoever runs this host can see why in its log.');
-  assert.deepEqual(errors.mock.calls.map((c) => String(c.arguments[0])), [`[refs] couldn't store ${rec.refId}.wav: disk on fire?and smoking`]);
+  assert.deepEqual(errors.mock.calls.map((c) => String(c.arguments[0])), [`[refs] couldn't store ${rec.refId}.wav: disk on fire?${'x'.repeat(187)}…`]);
   assert.equal(rec.fetchedPath, undefined);
 });
 
@@ -1078,14 +1086,14 @@ test("a payload fetched but not stored says so, and the host's log says why: no 
   }
 });
 
-test("an address that doesn't parse is refused before anything is dialed: the reference's, or the server's as no address", async () => {
+test("an address that doesn't parse is refused before anything is dialed: the reference's, or the server's, each saying which", async () => {
   const reg = new ReferenceRegistry();
   const bad = await makeFetcher({ srv: { url: ORIGIN } }).fetch(makeRecord(reg, 'not a url at all'));
   assert.equal(bad.error, "its address doesn't parse as a URL");
   assert.equal(bad.remedy, NOTHING_TO_DO);
   const misconfigured = await makeFetcher({ srv: { url: 'not a url either' } }).fetch(makeRecord(reg, `${ORIGIN}/ok?misconfigured`));
   assert.equal(misconfigured.error, "the \"srv\" server's address doesn't parse as a URL, so there's nowhere to fetch it from");
-  assert.equal(misconfigured.remedy, NOTHING_TO_DO);
+  assert.equal(misconfigured.remedy, "Calling again won't change that unless whoever runs this host corrects the server's address.");
   assert.equal(hits.get('/ok?misconfigured') ?? 0, 0, 'nothing dialed');
 });
 
