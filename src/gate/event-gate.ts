@@ -1299,6 +1299,9 @@ function readConfig(
   };
 }
 
+/** One of the host's starting rules: as given, with its name when it has one, and as read. */
+interface StartingRule { name: string | undefined; raw: unknown; policy: GatePolicy | undefined; quiet: boolean }
+
 /** The host's starting rules (initialConfig), read as gate.json is, for the seed and the reconcile. */
 interface StartingRules {
   /** Why none of them is used, when that's so. */
@@ -1308,8 +1311,9 @@ interface StartingRules {
   /** With `config`, the starting config as given, which a first start writes,
    *  since gate.json is read the same way. */
   given?: unknown;
-  /** Each starting rule as given, with its name when it has one, for the reconcile to add by name. */
-  rules: Array<{ name: string | undefined; raw: unknown }>;
+  /** Each starting rule as given, with its name when it has one, for the reconcile to add by name, and as read:
+   *  the rule, unless it's left out, and whether it wakes on none of what it matches (RuleReading.quiet). */
+  rules: StartingRule[];
   /** What the gate says of them, each a sentence. */
   sentences: string[];
 }
@@ -1320,7 +1324,7 @@ function readStartingRules(raw: unknown): StartingRules {
   return {
     config: read.config,
     given: raw,
-    rules: read.rules.map((rule) => ({ name: nameOf(rule.raw), raw: rule.raw })),
+    rules: read.rules.map((rule) => ({ name: nameOf(rule.raw), raw: rule.raw, policy: rule.reading.policy, quiet: rule.reading.quiet })),
     sentences: read.sentences,
   };
 }
@@ -1341,10 +1345,15 @@ type StartWrite =
   /** A later start over a gate.json with no rule list to add the ones it lacks to: `config` is gate.json's default with them, which the gate runs beside it, unsaved. */
   | { kind: 'reconcile-unsaved'; names: string[]; error: string; config: GateConfig }
   /** A later start over a gate.json with no rules of its own (no rule list, an empty one, or one holding only rules the
-   *  gate leaves out) whose default, `default`, holds events back, where the host's starting rules can't run beside it or
-   *  be added to it: under that default it would leave out `leftOut`, which could wake the agent, or they're refused whole
-   *  under their own. gate.json isn't used at that start, which runs as one without it does. */
-  | { kind: 'start-without'; default: NonNullable<GateConfig['default']>; leftOut?: string[] };
+   *  gate leaves out) whose default, `default`, holds events back, where the host's starting rules can't all be put in
+   *  force beside it or in it: some that could wake the agent are left out (`leftOut`, by name, and `nameless`, a count of
+   *  those with no name) or kept out by gate.json's rules of their names, which the gate leaves out (`heldOut`); or
+   *  they're refused whole under their own default. gate.json isn't used at that start, which runs as one without it
+   *  does. */
+  | {
+    kind: 'start-without'; default: NonNullable<GateConfig['default']>;
+    leftOut?: string[]; nameless?: number; heldOut?: string[];
+  };
 
 /**
  * What gate_status says about the start, which stays until the next one: the
@@ -1389,14 +1398,36 @@ function describeStart(starting: StartingRules, write: StartWrite, held: Readonl
  */
 function notUsedClause(write: Extract<StartWrite, { kind: 'start-without' }>, starting: StartingRules): string {
   const back = 'Whoever runs this host can give gate.json rules under "policies"';
-  if (write.leftOut) {
-    const names = quotedList(write.leftOut);
-    return `it isn't used at this start: under its default, "${write.default}", the host's starting rules would leave `
-      + `out ${names}, which could wake the agent, so the gate runs them under their own default, `
-      + `"${starting.config?.default ?? 'always'}", as a start without gate.json does. ${back}, or fix ${names} in the starting rules`;
+  const out = outOfForce(write);
+  if (out) {
+    return `it isn't used at this start: under its default, "${write.default}", ${out.said}, so the gate runs the starting `
+      + `rules under their own default, "${starting.config?.default ?? 'always'}", as a start without gate.json does. ${back}, or ${out.fix}`;
   }
   return `under its default, "${write.default}", it would hold back every event: it isn't used at this start, and the gate runs `
     + `no rules, as a start without gate.json does, so every event gets the default, "always". ${back}, or fix the starting rules`;
+}
+
+/**
+ * The starting rules a start that doesn't use gate.json couldn't put in force
+ * beside it or in it, which could wake the agent, and what would put them in
+ * force: null where the starting rules were refused whole.
+ */
+function outOfForce(write: Extract<StartWrite, { kind: 'start-without' }>): { said: string; fix: string } | null {
+  const nameless = write.nameless ?? 0;
+  const left = [...(write.leftOut ?? []).map((name) => `"${name}"`), ...(nameless === 0 ? [] : [nameless === 1 ? 'one with no name' : `${nameless} with no name`])];
+  const held = write.heldOut ?? [];
+  const said: string[] = [];
+  const fix: string[] = [];
+  if (left.length > 0) {
+    said.push(`the host's starting rules would leave out ${joinedList(left)}, which could wake the agent`);
+    fix.push(`fix ${joinedList(left)} in the starting rules`);
+  }
+  if (held.length > 0) {
+    said.push(`the host's ${quotedList(held)}, which could wake the agent, would be kept out by gate.json's `
+      + `${held.length === 1 ? 'rule of that name' : 'rules of those names'}, which the gate leaves out`);
+    fix.push(`fix gate.json's ${quotedList(held)}`);
+  }
+  return said.length > 0 ? { said: said.join(', and '), fix: fix.join(', or ') } : null;
 }
 
 /**
@@ -1419,13 +1450,12 @@ function describeUnsaved(starting: StartingRules, write: StartWrite, loaded: boo
   }
   if (write.kind === 'start-without') {
     // Starting rules refused whole put none in force, and describeStart says so.
-    if (!write.leftOut) return null;
-    const names = quotedList(write.leftOut);
-    return `At start, gate.json, which has no rules, wasn't used: under its default, "${write.default}", the host's starting rules would leave `
-      + `out ${names}, which could wake the agent. The gate runs them under their own default, `
-      + `"${starting.config?.default ?? 'always'}", as a start without gate.json does, but they aren't saved in it: once gate.json `
-      + 'changes and loads, what it holds is in force instead. Whoever runs this host can give gate.json rules under '
-      + `"policies", or fix ${names} in the starting rules.`;
+    const out = outOfForce(write);
+    if (!out) return null;
+    return `At start, gate.json, which has no rules, wasn't used: under its default, "${write.default}", ${out.said}. The gate `
+      + `runs the starting rules under their own default, "${starting.config?.default ?? 'always'}", as a start without gate.json `
+      + 'does, but they aren\'t saved in it: once gate.json changes and loads, what it holds is in force instead. Whoever runs '
+      + `this host can give gate.json rules under "policies", or ${out.fix}.`;
   }
   if (loaded) return null;
   if (write.kind === 'seed-failed') {
@@ -1608,7 +1638,9 @@ export class EventGate {
   private gateScript: GateScript;
   private compiledPolicies: CompiledPolicy[] = [];
   /** The text of gate.json whose rules are in force, from a load or a write
-   *  (or the start's reconcile, whose write failed).
+   *  (or the start's reconcile, whose write failed); or, while what's in force
+   *  is what a start ran beside gate.json or in its place (configSource not
+   *  "file"), gate.json's text as that start found it.
    *  A reload parses the file again only when its text differs; a file that
    *  holds it again after failing to load (a chmod that makes it readable,
    *  an edit undone) needs nothing applied, only its error cleared. */
@@ -1826,12 +1858,14 @@ export class EventGate {
    * the ones it lacks by name, as given, to its own rule list when it loads.
    * A rule gate.json holds holds its name, whether the gate reads it or leaves
    * it out, so an operator's rule is never swapped for the host's. Where
-   * gate.json has no rules of its own and, under its default, one of them it
-   * leaves out could wake the agent, or they're refused whole and that default
-   * holds events back, gate.json isn't used at this start, which runs as one
-   * without it does. Otherwise, where gate.json has no rule list to add them
-   * to, it writes nothing, and the gate runs beside it those of them it reads.
-   * Says what it did when that wasn't simply done or not needed.
+   * gate.json has no rules of its own and, under its default, one of them that
+   * could wake the agent can't be put in force (left out, with no name, or kept
+   * out by a rule of gate.json's of its name that the gate leaves out), or
+   * they're refused whole and that default holds events back, gate.json isn't
+   * used at this start, which runs as one without it does. Otherwise, where
+   * gate.json has no rule list to add them to, it writes nothing, and the gate
+   * runs beside it those of them it reads. Says what it did when that wasn't
+   * simply done or not needed.
    */
   private seedOrReconcile(starting: StartingRules): StartWrite {
     const read = this.readConfigFile();
@@ -1857,41 +1891,47 @@ export class EventGate {
     if (noRules && starting.refusedWhole !== undefined && fileDefault !== 'always') {
       return { kind: 'start-without', default: fileDefault };
     }
-    const missing = starting.rules.filter((rule): rule is { name: string; raw: unknown } => rule.name !== undefined && !held.has(rule.name));
+    // Nor can a start put in force, beside or in a gate.json with no rules of
+    // its own, a starting rule a load leaves out, one with no name, which it
+    // can't add by name, or one whose name gate.json holds in a rule the gate
+    // leaves out, which keeps the host's rule of that name out. Where, under
+    // gate.json's default, one of them could wake the agent, earlier releases
+    // ran the starting rules from memory: they couldn't load what they wrote
+    // over gate.json or into it, or, refusing its rule, didn't load it at all.
+    // So gate.json isn't used at this start, which runs as one without it does.
+    if (noRules && fileDefault !== 'always') {
+      const out = starting.rules.filter((rule) => !rule.quiet && (rule.policy === undefined || (rule.name !== undefined && held.has(rule.name))));
+      if (out.length > 0) {
+        const named = out.flatMap((rule) => (rule.name === undefined ? [] : [rule.name]));
+        return {
+          kind: 'start-without',
+          default: fileDefault,
+          leftOut: named.filter((name) => !held.has(name)),
+          nameless: out.length - named.length,
+          heldOut: named.filter((name) => held.has(name)),
+        };
+      }
+    }
+    const missing = starting.rules.filter((rule): rule is StartingRule & { name: string } => rule.name !== undefined && !held.has(rule.name));
     if (missing.length === 0) return { kind: 'none' };
     const names = missing.map((rule) => rule.name);
     if ('noList' in read.listed) {
       // Adding them would write over what gate.json holds. Earlier releases
       // wrote them over it and ran them under its default, so the gate runs
-      // them so, unsaved, beside it: unless, under that default, one of them
-      // left out could wake the agent. Earlier releases then couldn't load what
-      // they wrote and ran them from memory under their own default, so
-      // gate.json isn't used at this start, which runs as one without it does.
+      // them so, unsaved, beside it.
       const error = `${read.listed.noList}, so there's no list of rules to add them to without writing over what it holds`;
-      const beside = readConfig({ default: read.config.default, policies: missing.map((rule) => rule.raw) }, 'gate.json');
-      if ('refused' in beside) {
-        const leftOut = (beside.silenced ?? []).filter((name): name is string => name !== undefined);
-        return { kind: 'start-without', default: fileDefault, leftOut };
-      }
       // The ones it runs: a starting rule left out is named as the starting rules are read.
-      const running = beside.config.policies.map((policy) => policy.name);
+      const running = missing.flatMap((rule) => (rule.policy === undefined ? [] : [rule.policy]));
       if (running.length === 0) return { kind: 'reconcile-failed', names, atOpen: true, config: read.config, error };
-      return { kind: 'reconcile-unsaved', names: running, error, config: beside.config };
+      return { kind: 'reconcile-unsaved', names: running.map((policy) => policy.name), error, config: { policies: running, default: fileDefault } };
     }
     const reconciled = { ...read.listed.top, policies: [...read.listed.rules, ...missing.map((rule) => rule.raw)] };
     // What the write holds, as a load reads it, for a write that fails partway.
     const holds = readConfig(reconciled, 'gate.json');
     if ('refused' in holds) {
-      // Without them, gate.json, with no rules of its own, holds back every
-      // event under its default, where earlier releases couldn't load what they
-      // wrote and ran the starting rules from memory under their own: so it
-      // isn't used at this start, which runs as one without it does.
-      if (noRules) {
-        const leftOut = (holds.silenced ?? []).filter((name): name is string => name !== undefined);
-        return { kind: 'start-without', default: fileDefault, leftOut };
-      }
       // A write of ours doesn't take gate.json's own rules out of force:
-      // nothing is written, so it loads as it did, without them.
+      // nothing is written, so it loads as it did, without them. (With no
+      // rules of its own, gate.json isn't used at this start, above.)
       return {
         kind: 'reconcile-failed', names, atOpen: true, config: read.config,
         error: 'with them, gate.json would leave out a rule that could wake the agent, and under its default, '
@@ -1933,7 +1973,7 @@ export class EventGate {
    * Reading applies nothing: whoever applies a loaded config records its text
    * as `configText`. With `unlessUnchanged`, a file whose text is
    * `configText` comes back `unchanged`, unparsed, since the rules in force
-   * came from it.
+   * came from it, or are what a start ran beside it or in its place.
    */
   private readConfigFile(opts?: { unlessUnchanged?: boolean }):
     | { state: 'absent' }
