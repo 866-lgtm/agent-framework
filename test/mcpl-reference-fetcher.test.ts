@@ -276,11 +276,10 @@ test('a copy saved earlier is still served once its expiry has passed or reads a
 });
 
 /** The framework's eager default, autoFetchReferences, run over `content`
- *  as a tool result from server `srv`, with this file's fetcher. It
- *  registers in the process-wide referenceRegistry, so each test's uris are
- *  its own. */
-async function eagerFetch(content: unknown[]): Promise<void> {
-  const fetcher = makeFetcher({ srv: { url: ORIGIN } });
+ *  as a tool result from server `srv`, with this file's fetcher or the one
+ *  given. It registers in the process-wide referenceRegistry, so each test's
+ *  uris are its own. */
+async function eagerFetch(content: unknown[], fetcher: ReferenceFetcher = makeFetcher({ srv: { url: ORIGIN } })): Promise<void> {
   const framework = Object.create(AgentFramework.prototype) as {
     getReferenceFetcher(): ReferenceFetcher;
     autoFetchReferences(content: unknown[], serverId: string, eager: boolean): Promise<void>;
@@ -799,6 +798,49 @@ test('refusal() answers nothing while a fetch of the record is under way, which 
   assert.equal(f.refusal(record), null, 'joined, not refused');
   const out = await fetching;
   assert.equal(out.ok, true, out.error);
+});
+
+test("a reference whose fetch is under way stays eager-eligible once that fetch has spent its server's budget, so the eager fetch joins it", async (t) => {
+  const errors = t.mock.method(console, 'error', () => {});
+  let saveStarted!: () => void;
+  const saveCalled = new Promise<void>((resolve) => { saveStarted = resolve; });
+  let releaseSave!: () => void;
+  const saving = new Promise<void>((resolve) => { releaseSave = resolve; });
+  // A budget of exactly one payload, and a save held open until released.
+  const f = new ReferenceFetcher(
+    (id) => (id === 'srv' ? { url: ORIGIN, autofetch: { maxTotalBytes: PAYLOAD.length } } : undefined),
+    async (name) => { saveStarted(); await saving; return `scratch/refs/${name}`; },
+  );
+  // In the process-wide registry, where the eager pass registers a result's references.
+  const uri = `${ORIGIN}/ok?join-after-budget`;
+  const record = makeRecord(referenceRegistry, uri, { sizeBytes: PAYLOAD.length }, 'srv');
+  assert.equal(f.isEagerEligible(record), true);
+  const fetching = f.fetch(record);
+  // Bounded by the fetch itself: one that ends before its save fails here, at once.
+  await Promise.race([saveCalled, fetching.then((out) => Promise.reject(new Error(`the fetch ended before its save: ${JSON.stringify(out)}`)))]);
+  // Its bytes are read, so the budget is spent, and its save hasn't landed.
+  const another = makeRecord(referenceRegistry, `${ORIGIN}/ok?join-after-budget-other`, { sizeBytes: PAYLOAD.length }, 'srv');
+  assert.equal(f.isEagerEligible(another), false, 'a new dial is refused for the spent budget');
+  assert.equal(f.isEagerEligible(record), true, 'the fetch under way is joined');
+  // An expiry the record now claims doesn't enter either: that fetch passed the expiry check when it began.
+  const claimed = record.testimony;
+  record.testimony = { ...claimed, expiresAt: '2001-01-01T00:00:00Z' };
+  assert.equal(f.isEagerEligible(record), true, 'still joined');
+  assert.equal(f.refusal(record), null);
+  record.testimony = claimed;
+  // A later tool result carrying the reference: the eager pass asks fetch() for it, and gets the fetch under way.
+  const asked = t.mock.method(f, 'fetch');
+  const eager = eagerFetch([{ type: 'resource', uri, sizeBytes: PAYLOAD.length }], f);
+  assert.equal(asked.mock.callCount(), 1, 'the eager pass asked for the reference');
+  assert.equal(asked.mock.calls[0].arguments[0], record);
+  assert.equal(asked.mock.calls[0].result, fetching, 'and joined the fetch under way');
+  releaseSave();
+  const [out] = await Promise.all([fetching, eager]);
+  assert.equal(out.ok, true, out.error);
+  assert.equal(record.fetchedPath, out.path);
+  assert.equal(hits.get('/ok?join-after-budget'), 1, 'dialed once');
+  assert.equal(errors.mock.callCount(), 0, 'no eager failure logged');
+  assert.equal(f.isEagerEligible(record), false, 'a saved copy takes no slot');
 });
 
 test('a fetch is charged to the budget of the server it dials, not of the first to deliver the uri', async () => {

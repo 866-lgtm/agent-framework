@@ -11,4 +11,5 @@
   ahead. The eager fetch of the references in the result of an MCPL tool
   call the agent makes no longer spends one of its slots on a reference the
   fetch would refuse before dialing, such as one from a server whose fetch
-  budget is spent.
+  budget is spent, though it still joins a fetch of a reference already
+  under way.

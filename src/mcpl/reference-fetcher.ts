@@ -149,12 +149,13 @@ export class ReferenceFetcher {
   /** Would the eager (autofetch) default fetch this record? Not one the fetch
    *  would refuse before dialing, asked as the eager fetch asks it, with the
    *  default ceiling, so such a record takes no eager slot; and only one whose
-   *  claimed size is within the eager limit of the server it dials. Whether a
-   *  fetch of it is already under way doesn't enter: the eager fetch joins
-   *  one that is. */
+   *  claimed size is within the eager limit of the server it dials. For one
+   *  whose fetch is already under way, which the eager fetch would join as
+   *  fetch() does, only the server and its eager limit enter: the expiry,
+   *  the budget and the ceiling were checked when that fetch began. */
   isEagerEligible(record: ReferenceRecord): boolean {
     if (record.fetchedPath) return false;
-    const check = this.beforeDial(record);
+    const check = this.inFlight.has(record.refId) ? this.serverFor(record) : this.beforeDial(record);
     if ('refusal' in check) return false;
     const cap = check.binding.autofetch?.maxBytes ?? DEFAULT_EAGER_FETCH_MAX_BYTES;
     return record.testimony.sizeBytes !== undefined && record.testimony.sizeBytes <= cap;
@@ -186,10 +187,11 @@ export class ReferenceFetcher {
 
   /** Every check the fetch makes before it dials, in its order: the server
    *  (none, unknown, no address, off the uri's origin), the expiry, the
-   *  server's spent budget, a claimed size over the ceiling. The fetch,
-   *  `refusal()` and the eager check all ask this, so what save_recent_image
-   *  says is the reason the fetch would refuse with, and no eager slot goes
-   *  to a fetch that would be refused. */
+   *  server's spent budget, a claimed size over the ceiling. For a record
+   *  with no saved copy and no fetch under way, the fetch, `refusal()` and
+   *  the eager check all ask this, so what save_recent_image says is the
+   *  reason the fetch would refuse with, and no eager slot goes to a fetch
+   *  that would be refused. */
   private beforeDial(record: ReferenceRecord, opts?: { maxBytes?: number }):
     { refusal: Refusal } | { serverId: string; binding: ResolvedServerBinding; ceiling: number; budget: number } {
     const server = this.serverFor(record);
