@@ -162,13 +162,14 @@ const flippedCase = (name: string): string =>
     return [...other].length === 1 && otherCase(other) === c ? other : c;
   }).join('');
 
-/** Names compared as NFC in lower case: how most folding disks compare them. */
+/** Names compared as NFC in lower case. */
 const folded = (name: string): string => name.normalize('NFC').toLowerCase();
 
 /**
- * Names compared more loosely, through upper case and back, which folds `ß`
- * with `ss`, `ſ` with `s` and a word-final `ς` with `σ`, as a disk that folds
- * fully does.
+ * Names compared more loosely, through upper case and back, which also folds
+ * `ß` with `ss`, `ſ` with `s` and `ς` with `σ`, as a disk that folds fully
+ * does. It also folds dotless `ı` with `i`, which a disk may keep apart;
+ * the same-file check keeps that from naming another file.
  */
 const foldedLoosely = (name: string): string => name.normalize('NFC').toLowerCase().toUpperCase().toLowerCase();
 

@@ -676,6 +676,8 @@ export class WorkspaceModule implements Module {
   private store: JsStore | null = null;
   /** Set once stop has drained and saved, cleared by start (running()). */
   private stopped = false;
+  /** Stops begun, so a start that read disk meanwhile can tell that one came. */
+  private stopsBegun = 0;
   private config: WorkspaceConfig;
   private mounts = new Map<string, MountState>();
   private watchers = new Map<string, MountWatcher>();
@@ -919,6 +921,14 @@ export class WorkspaceModule implements Module {
   }
 
   async start(ctx: ModuleContext): Promise<void> {
+    // Each nested mount's directory as disk spells it, read before this start
+    // sets anything, so a restart takes no call and walks or watches nothing
+    // before the spellings are known. A stop begun meanwhile stands, and this
+    // start then sets nothing.
+    const stops = this.stopsBegun;
+    await this.spellNestedDirs();
+    if (this.stopsBegun !== stops) return;
+
     this.ctx = ctx;
     this.stopped = false;
 
@@ -928,9 +938,6 @@ export class WorkspaceModule implements Module {
       this.savedState = ctx.getState<WorkspaceModuleState>() ?? null;
     }
 
-    // Each nested mount's directory as disk spells it, before this start
-    // walks or watches the mounts. A stop made meanwhile still stops it.
-    await this.spellNestedDirs();
     this.applySavedState();
     this.ensureRunning();
   }
@@ -1173,6 +1180,7 @@ export class WorkspaceModule implements Module {
   }
 
   async stop(): Promise<void> {
+    this.stopsBegun++;
     // No new watcher-driven passes, then let every pass and write finish
     // before the store goes away — including any queued behind the ones in
     // flight (a tool call, a scan continuing past its deadline): drained
@@ -1793,8 +1801,8 @@ export class WorkspaceModule implements Module {
   /**
    * Adds to each nested mount's directory the spelling disk lists it by,
    * where that differs from the configuration's. On a disk that folds names,
-   * the outer mount's walks and watcher name the directory as disk does, and
-   * so does a path parsePath has respelled, while a path given as configured
+   * the outer mount's walks name the directory as disk does, and so does a
+   * path parsePath has respelled, while a path given as configured
    * still names it as configured (resolveAbsolutePath). A directory not on
    * disk keeps its configured spelling alone. Run at each start.
    */
