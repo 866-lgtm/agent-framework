@@ -55,18 +55,41 @@ function collect(
   return { watcher, batches };
 }
 
-function withChokidarBackend<T>(usePolling: boolean, start: () => T): T {
+/** Sets chokidar's backend for the instances made next, and returns what puts it back. */
+function useChokidarBackend(usePolling: boolean): () => void {
   const previousUsePolling = process.env.CHOKIDAR_USEPOLLING;
   const previousInterval = process.env.CHOKIDAR_INTERVAL;
   process.env.CHOKIDAR_USEPOLLING = String(usePolling);
   if (usePolling) process.env.CHOKIDAR_INTERVAL = '25';
-  try {
-    return start();
-  } finally {
+  return () => {
     if (previousUsePolling === undefined) delete process.env.CHOKIDAR_USEPOLLING;
     else process.env.CHOKIDAR_USEPOLLING = previousUsePolling;
     if (previousInterval === undefined) delete process.env.CHOKIDAR_INTERVAL;
     else process.env.CHOKIDAR_INTERVAL = previousInterval;
+  };
+}
+
+/** The backend for the instance `start` makes; a re-attach's later instance takes the default. */
+function withChokidarBackend<T>(usePolling: boolean, start: () => T): T {
+  const restore = useChokidarBackend(usePolling);
+  try {
+    return start();
+  } finally {
+    restore();
+  }
+}
+
+/**
+ * chokidar's polling backend for every instance made while `fn` runs,
+ * re-attaches' included. It sends no raw rename, so only the watcher's own
+ * checks re-attach it.
+ */
+async function withPollingThroughout<T>(fn: () => Promise<T>): Promise<T> {
+  const restore = useChokidarBackend(true);
+  try {
+    return await fn();
+  } finally {
+    restore();
   }
 }
 
@@ -688,6 +711,30 @@ describe('MountWatcher lifecycle', () => {
     }
   });
 
+  // chokidar removes its listeners before it closes, so a re-attach whose
+  // close of the old instance fails reports that and attaches again, here to
+  // a root that hasn't changed, which no poll would re-attach.
+  it('attaches again after a re-attach whose close of chokidar fails', async () => {
+    await withPollingThroughout(async () => {
+      let readyCount = 0;
+      const errors: Error[] = [];
+      const { watcher, batches } = collect(
+        { onReady: () => { readyCount++; }, onError: (err) => { errors.push(err); } },
+      );
+      try {
+        await waitFor(() => readyCount === 1, 'expected initial watcher ready');
+        failClose(watcher);
+        await (watcher as unknown as { reattach(): Promise<void> }).reattach();
+        assert.ok(errors.some((e) => e.message === 'close failed'), "the re-attach reported its close's failure");
+        await waitFor(() => readyCount === 2, 'expected the watcher to attach again');
+        writeFileSync(join(tmp, 'after.md'), 'x');
+        await changeFor(batches, 'after.md', 'created');
+      } finally {
+        await watcher.stop();
+      }
+    });
+  });
+
   // close(2) frees a descriptor on Linux whatever it returns, so an error
   // closing the held root is reported and the stop goes on.
   it('reports an error closing its root, and still closes chokidar at the stop', {
@@ -697,7 +744,7 @@ describe('MountWatcher lifecycle', () => {
     mkdirSync(root);
     let ready = false;
     const errors: Error[] = [];
-    const { watcher, batches } = collectWithNative(
+    const { watcher } = collectWithNative(
       { onReady: () => { ready = true; }, onError: (err) => { errors.push(err); } },
       { ...makeConfig(), path: root },
     );
@@ -721,26 +768,26 @@ describe('MountWatcher lifecycle', () => {
     }
     assert.ok(errors.some((e) => /EIO/.test(e.message)), "the close's error was reported");
     assert.strictEqual(chokidar.emit('add', join(root, 'late.md')), false, 'the stopped watcher still listens to chokidar');
-    await wait(DEBOUNCE_MS * 2);
-    assert.deepStrictEqual(batches, []);
   });
 
   // A root the watcher doesn't hold has its identity read from its path,
   // which a root made again can share with the removed one, so a rename named
   // like it forces a re-attach, as it always did. On Linux that's a root it
   // can't open, as without read permission or at the process's file limit;
-  // elsewhere it holds no root.
+  // elsewhere it holds no root. chokidar polls throughout, so the renames are
+  // the ones the test emits, and the root put in the root's place can only be
+  // found by a poll.
   it("reads a root it doesn't hold from its path: a poll finds it replaced, and a rename named like it re-attaches it", async () => {
     const root = join(tmp, 'work');
     mkdirSync(root);
     const unheld = <T>(fn: () => Promise<T>): Promise<T> => (process.platform === 'linux' ? withOpenRefused(root, fn) : fn());
-    await unheld(async () => {
+    await withPollingThroughout(() => unheld(async () => {
       let readyCount = 0;
       let reattachCount = 0;
-      const { watcher } = withPollingBackend(() => collect(
+      const { watcher } = collect(
         { onReady: () => { readyCount++; }, onReattach: () => { reattachCount++; } },
         { ...makeConfig(), path: root },
-      ));
+      );
       // Counts the root's checks, so the test waits for polls, not for a time.
       const internals = watcher as unknown as { checkRootLiveness(opts?: { force?: boolean }): Promise<void> };
       const check = internals.checkRootLiveness.bind(watcher);
@@ -769,7 +816,7 @@ describe('MountWatcher lifecycle', () => {
       } finally {
         await watcher.stop();
       }
-    });
+    }));
   });
 
   // libuv gives a rename without a name for a file whose path it can't read
@@ -846,6 +893,33 @@ describe('MountWatcher lifecycle', () => {
     }
   });
 
+  // A held root that has been removed is let go of though its path fails with
+  // another error than ENOENT, as when one of its parents becomes a file.
+  it('lets go of its removed root when its path fails with another error', {
+    skip: process.platform !== 'linux',
+  }, async () => {
+    const root = join(realpathSync(tmp), 'work');
+    mkdirSync(root);
+    let ready = false;
+    const { watcher } = collectWithNative(
+      { onReady: () => { ready = true; } },
+      { ...makeConfig(), path: root, mode: 'read-only' },
+    );
+    try {
+      await waitFor(() => ready, 'expected initial watcher ready');
+      assert.deepStrictEqual(descriptorsOf(root), [root], 'the watcher holds its root');
+      await withFs('statSync', (stat) => (file: unknown, ...rest: unknown[]) => {
+        if (String(file) === root) throw fsError('ENOTDIR', 'stat', root);
+        return stat(file, ...rest);
+      }, async () => {
+        rmdirSync(root);
+        await waitFor(() => descriptorsOf(root).length === 0, 'expected the watcher to let go of its removed root');
+      });
+    } finally {
+      await watcher.stop();
+    }
+  });
+
   // What the watcher opened of a root whose identity it then can't read isn't
   // held: the attach reports the error, and the next check attaches again.
   it("holds nothing of a root it opened but couldn't read", {
@@ -863,6 +937,41 @@ describe('MountWatcher lifecycle', () => {
         // The attach ran in start(), before chokidar's own reads begin.
         assert.ok(errors.some((e) => /EIO/.test(e.message)), "the attach reported the root's failed read");
         assert.deepStrictEqual(descriptorsOf(root), [], 'the watcher holds the root it could not read');
+      } finally {
+        await watcher.stop();
+      }
+    });
+  });
+
+  // Where a root's link count reads 0 as it's opened, the count can't tell a
+  // removed root from one in place, so the root isn't held, and its polls
+  // leave it be.
+  it('holds no root whose link count reads 0, and its polls leave it be', {
+    skip: process.platform !== 'linux',
+  }, async () => {
+    const root = join(realpathSync(tmp), 'work');
+    mkdirSync(root);
+    await withFs('fstatSync', (fstat) => (fd: unknown, ...rest: unknown[]) => Object.assign(fstat(fd, ...rest), { nlink: 0 }), async () => {
+      let readyCount = 0;
+      let reattachCount = 0;
+      const { watcher } = collectWithNative(
+        { onReady: () => { readyCount++; }, onReattach: () => { reattachCount++; } },
+        { ...makeConfig(), path: root },
+      );
+      // Counts the root's checks, so the test waits for polls, not for a time.
+      const internals = watcher as unknown as { checkRootLiveness(opts?: { force?: boolean }): Promise<void> };
+      const check = internals.checkRootLiveness.bind(watcher);
+      let checks = 0;
+      internals.checkRootLiveness = (opts) => {
+        checks++;
+        return check(opts);
+      };
+      try {
+        await waitFor(() => readyCount > 0, 'expected initial watcher ready');
+        assert.deepStrictEqual(descriptorsOf(root), [], 'the watcher holds a root whose link count reads 0');
+        const polled = checks;
+        await waitFor(() => checks >= polled + 3, 'expected three root polls');
+        assert.strictEqual(reattachCount, 0, 'a poll re-attached the watcher to its root in place');
       } finally {
         await watcher.stop();
       }
@@ -887,15 +996,16 @@ describe('MountWatcher lifecycle', () => {
 
   // A root moved away and back before its renames are handled is the
   // directory the watcher holds, so the checks find it unchanged, and its
-  // watches go on reporting.
+  // watches go on reporting. Both moves come before any event is handled.
   it('goes on reporting a root moved away and back at once', {
     skip: process.platform !== 'linux',
   }, async () => {
     const root = join(tmp, 'work');
     mkdirSync(root);
     let ready = false;
+    let reattachCount = 0;
     const { watcher, batches } = collectWithNative(
-      { onReady: () => { ready = true; } },
+      { onReady: () => { ready = true; }, onReattach: () => { reattachCount++; } },
       { ...makeConfig(), path: root, watchRootPollMs: EVENT_MS * 6 },
     );
     try {
@@ -904,6 +1014,7 @@ describe('MountWatcher lifecycle', () => {
       renameSync(`${root}.away`, root);
       writeFileSync(join(root, 'after.md'), 'x');
       await changeFor(batches, 'after.md', 'created');
+      assert.strictEqual(reattachCount, 0, 'the watcher re-attached to the root moved back');
     } finally {
       await watcher.stop();
     }

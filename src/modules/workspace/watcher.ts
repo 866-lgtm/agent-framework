@@ -319,7 +319,8 @@ export class MountWatcher {
     try {
       current = this.readRootIdentity();
     } catch (err) {
-      if (this.isErrno(err, 'ENOENT')) {
+      // A held root that has been removed is gone, whatever the path's error.
+      if (this.isErrno(err, 'ENOENT') || this.heldRootRemoved()) {
         this.detached = true;
         this.releaseRoot();
         if (this.config.mode === 'read-write') {
@@ -355,10 +356,15 @@ export class MountWatcher {
     try {
       const oldWatcher = this.watcher;
       this.watcher = null;
-      // Before the close, so a close that fails still lets go of the root.
       this.releaseRoot();
       if (oldWatcher) {
-        await oldWatcher.close();
+        try {
+          await oldWatcher.close();
+        } catch (err) {
+          // chokidar removes its listeners before it closes, so the old
+          // instance reports nothing more, and the root is attached to again.
+          this.reportError(err);
+        }
       }
       if (this.stopped) return;
 
@@ -400,7 +406,8 @@ export class MountWatcher {
    * given out. Elsewhere, or where the root can't be opened as a directory,
    * as without read permission, at the process's file limit or when the
    * path isn't a directory, it isn't held, and its identity is read from its
-   * path.
+   * path. So too where the root's link count reads 0 as it's opened, since
+   * there the count can't tell a removed root from one in place.
    */
   private holdRoot(): RootIdentity {
     if (process.platform !== 'linux') return this.readRootIdentity();
@@ -413,7 +420,12 @@ export class MountWatcher {
       return this.readRootIdentity();
     }
     this.rootFd = fd;
-    return identityOf(fstatSync(fd));
+    const stats = fstatSync(fd);
+    if (stats.nlink === 0) {
+      this.releaseRoot();
+      return this.readRootIdentity();
+    }
+    return identityOf(stats);
   }
 
   /**

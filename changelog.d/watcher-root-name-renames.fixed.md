@@ -7,3 +7,6 @@
   root open (see Changed) and checks whether the root is still the directory
   it holds. Where it can't hold the root, as on macOS and Windows or without
   read permission, such a rename still re-attaches it, as before.
+- A workspace mount's watcher whose re-attach fails to close its old chokidar
+  instance now reports that and attaches again. It used to stop watching the
+  mount until the root's identity changed.
