@@ -1124,6 +1124,14 @@ export interface Walk {
    */
   others: Map<string, string>;
   /**
+   * The regular files in `others` that the mount's include doesn't cover:
+   * present, unproven, and holding nothing beneath them. Only provenAbsent
+   * reads it, for a directory listed whole. A path beneath a name passed
+   * over by design is never decided (reconcile), so those need no such
+   * record.
+   */
+  otherFiles: Set<string>;
+  /**
    * Directories whose listing the walk read whole, and that were still the
    * directory at their path once it had: every name in one is in `files`,
    * `seen`, `dirs` or `others`, so a name in none of them is absent.
@@ -1245,6 +1253,23 @@ export function insideMount(relativePath: string, include: readonly string[] | u
   if (!parsedSpelling(relativePath)) return false;
   if (include === undefined || relativePath === '') return true;
   return coveredByInclude(relativePath, include);
+}
+
+/**
+ * Whether the include's matcher can read `pattern`: a name or an `*.ext` glob,
+ * which covers a file by its own name, or a `dir/**` glob, with no empty, `.`
+ * or `..` segment, since those name no entry a path reaches. Where `\` is the
+ * platform's separator, as on Windows, a pattern holding one can't name a
+ * file either, since every path is read with `\` as a separator
+ * (pathSegments). A pattern the matcher can't read would match nothing, and
+ * take every file out of the mount unsaid, so the module refuses it.
+ */
+export function includePatternReadable(pattern: unknown, platformSep: string = sep): boolean {
+  const segment = (s: string): boolean => s.length > 0 && s !== '.' && s !== '..' && !(platformSep === '\\' && s.includes('\\'));
+  const name = (s: string): boolean => segment(s) && !s.includes('/') &&
+    (!s.includes('*') || (s.startsWith('*.') && s.length > 2 && !s.slice(1).includes('*')));
+  return typeof pattern === 'string' &&
+    (pattern.endsWith('/**') ? pattern.length > 3 && pattern.slice(0, -3).split('/').every((s) => segment(s) && !s.includes('*')) : name(pattern));
 }
 
 /**
@@ -1422,7 +1447,7 @@ export async function walkScope(
   opts: { named?: boolean; resumeAfter?: string } = {},
 ): Promise<Walk> {
   const walk: Walk = {
-    files: new Set(), seen: new Set(), othersTaken: new Set(), dirs: new Set(), others: new Map(), complete: new Set(), missing: new Set(),
+    files: new Set(), seen: new Set(), othersTaken: new Set(), dirs: new Set(), others: new Map(), otherFiles: new Set(), complete: new Set(), missing: new Set(),
     incomplete: [],
   };
   // A walk that isn't named passes over a scope the mount passes over by
@@ -1562,6 +1587,7 @@ export async function walkScope(
     const leaves: Array<[string, boolean]> = [];
     const subdirs: string[] = [];
     const others: Array<[string, string]> = [];
+    const otherFiles: string[] = [];
     const regions: Walk['incomplete'] = [];
     for (const entry of entries) {
       const childRel = rel ? `${rel}/${entry.name}` : entry.name;
@@ -1573,9 +1599,11 @@ export async function walkScope(
       }
       // A file or link the mount's include doesn't cover is outside the
       // mount, a named scope's too. A directory is walked, since a name or an
-      // extension glob in include can match beneath it.
+      // extension glob in include can match beneath it. A regular file is
+      // noted as one, since nothing covered can lie beneath it.
       if (!entry.isDirectory() && !insideMount(childRel, view.include)) {
         others.push([childRel, OUTSIDE_INCLUDE]);
+        if (entry.isFile()) otherFiles.push(childRel);
         regions.push({ path: childRel, reason: OUTSIDE_INCLUDE, kind: 'ignored' });
         continue;
       }
@@ -1599,6 +1627,7 @@ export async function walkScope(
     for (const [p, isFile] of leaves) if (isFile) walk.seen.add(p);
     for (const d of subdirs) walk.dirs.add(d);
     for (const [p, why] of others) walk.others.set(p, why);
+    for (const p of otherFiles) walk.otherFiles.add(p);
     walk.incomplete.push(...regions);
     walk.complete.add(rel);
     const listing = { leaves, subdirs, ...dir.identity() };
@@ -1695,9 +1724,11 @@ export async function walkScope(
 
 /**
  * Whether the walk proves nothing exists at `path`: some ancestor directory
- * is missing, or a completely listed ancestor holds no entry that could lead
- * to it. Ancestors outside the walked scope are passed through, so a walk of
- * `a/b` decides paths beneath `a/b` and nothing else.
+ * is missing, a completely listed ancestor holds no entry that could lead
+ * to it, or an ancestor is a regular file the mount's include doesn't cover,
+ * which the walk passed over and which holds nothing beneath it.
+ * Ancestors outside the walked scope are passed through, so a walk of `a/b`
+ * decides paths beneath `a/b` and nothing else.
  */
 export function provenAbsent(walk: Walk, path: string): boolean {
   const parts = path.split('/');
@@ -1706,6 +1737,7 @@ export function provenAbsent(walk: Walk, path: string): boolean {
     if (walk.missing.has(dir)) return true;
     const child = dir ? `${dir}/${parts[i]}` : parts[i]!;
     if (walk.complete.has(dir)) {
+      if (i < parts.length - 1 && walk.otherFiles.has(child)) return true; // a regular file: nothing beneath it exists
       if (walk.others.has(child) || walk.seen.has(child)) return false; // present, but unproven
       if (i === parts.length - 1) return !walk.files.has(child) && !walk.dirs.has(child);
       if (!walk.dirs.has(child)) return true; // no directory there: nothing beneath can exist

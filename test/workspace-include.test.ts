@@ -3,10 +3,10 @@
  * outside the mount, for walks, the watcher's pass, materialize (even when the
  * workspace's history holds the file from before the include), sync, and the
  * agent's own reads and writes, which are refused with that reason.
- * connectome-host's `_config` mount versions the host's config files and
- * holds only those: a file saved beside them, such as a kept
- * `gate.json.unreadable-<suffix>` copy, stays out of its history and is never
- * written back (connectome-host #278).
+ * connectome-host's `_config` mount, which versions the host's config files,
+ * can name them with an include and hold only those, and a file saved beside
+ * them then stays out of its history and is never written back
+ * (connectome-host #278).
  */
 
 import { describe, test, type TestContext } from 'node:test';
@@ -17,7 +17,7 @@ import { dirname, join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework } from '../src/framework.js';
 import { WorkspaceModule, WorkspaceReadError } from '../src/modules/workspace/index.js';
-import { insideMount, parsedSpelling, pathSegments } from '../src/modules/workspace/observe.js';
+import { includePatternReadable, insideMount, parsedSpelling, pathSegments } from '../src/modules/workspace/observe.js';
 import type { MountConfig } from '../src/modules/workspace/types.js';
 import type { ModuleContext } from '../src/types/module.js';
 
@@ -591,6 +591,23 @@ describe('mount include', () => {
     assert.equal(readFileSync(join(env.dir, 'docs'), 'utf8'), 'on disk again\n');
   });
 
+  test('a covered file whose directory disk has replaced with a file the include doesn\'t cover is gone after a full sync', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('x/gate.json', '{"needle": 1}\n');
+    const m = await env.open({ include: ['gate.json'] });
+    await call(m, 'sync', {});
+    assert.deepEqual(env.tree(), ['x/gate.json']);
+    rmSync(join(env.dir, 'x'), { recursive: true, force: true });
+    writeFileSync(join(env.dir, 'x'), 'now a file\n');
+    // The walk passes over `x`, outside the include, and as a regular file it
+    // holds nothing beneath it: the sync records the covered file as gone, as
+    // it would where `x` had gone altogether.
+    await call(m, 'sync', {});
+    assert.deepEqual(env.tree(), [], 'history records the covered file as gone');
+    assert.deepEqual(await listed(m), []);
+    assert.equal((await call(m, 'grep', { path: 'work', pattern: 'needle' })).totalMatches, 0);
+  });
+
   test('a deletion the workspace holds outside the include is left alone by a materialize, and counted only by one that names its directory', async (t) => {
     const env = new Env(t);
     env.writeDisk('gate.json', '{}\n');
@@ -866,6 +883,13 @@ describe('mount include', () => {
     const only = new WorkspaceModule({ mounts: [config] });
     only.initStore(env.store);
     assert.equal(firstWritable(only), null, 'as a setup with no writable mount');
+  });
+
+  test('a pattern holding "\\" is unreadable where "\\" is the separator, and part of a name where it isn\'t', () => {
+    // Windows reads every path with `\` as a separator, so no file there is named `sub\gate.json`.
+    for (const pattern of ['sub\\gate.json', 'a\\b', '*.j\\son', 'docs\\x/**']) assert.equal(includePatternReadable(pattern, '\\'), false, pattern);
+    for (const pattern of ['gate.json', '*.json', 'docs/**']) assert.equal(includePatternReadable(pattern, '\\'), true, pattern);
+    assert.equal(includePatternReadable('sub\\gate.json', '/'), true, 'where "/" is the separator, "\\" is a character of the name');
   });
 
   test('include is checked when the module is built, and the refusal names the mount and what it refused', () => {

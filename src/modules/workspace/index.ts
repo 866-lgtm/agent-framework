@@ -40,7 +40,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
-import { IGNORED, NONBLOCK, OTHER_MOUNT, OUTSIDE_INCLUDE, beginsWithDir, type LevelFolds, checkDir, diskSpelling, filesystemTrustsCtime, foldsAtEach, inOtherMount, insideMount, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, namesHolder, nestedHolder, type NestedMount, parsedSpelling, passedOverAt, pathSegments, readPrefix, type LinkFound } from './observe.js';
+import { IGNORED, NONBLOCK, OTHER_MOUNT, OUTSIDE_INCLUDE, beginsWithDir, type LevelFolds, checkDir, diskSpelling, filesystemTrustsCtime, foldsAtEach, includePatternReadable, inOtherMount, insideMount, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, namesHolder, nestedHolder, type NestedMount, parsedSpelling, passedOverAt, pathSegments, readPrefix, type LinkFound } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
 import {
   type MountRuntime,
@@ -793,25 +793,21 @@ export class WorkspaceModule implements Module {
       }
       const include: unknown = mount.include;
       if (include !== undefined) {
-        // A pattern the matcher can't read would match nothing, and take every file out of the mount unsaid.
-        // `.` and `..` name no entry a path reaches, so a pattern holding one matches nothing either.
-        const segment = (s: string): boolean => s.length > 0 && s !== '.' && s !== '..';
-        const name = (s: string): boolean => segment(s) && !s.includes('/') &&
-          (!s.includes('*') || (s.startsWith('*.') && s.length > 2 && !s.slice(1).includes('*')));
-        const readable = (p: unknown): boolean => typeof p === 'string' &&
-          (p.endsWith('/**') ? p.length > 3 && p.slice(0, -3).split('/').every((s) => segment(s) && !s.includes('*')) : name(p));
+        // A pattern the matcher can't read would match nothing, and take every
+        // file out of the mount unsaid (includePatternReadable).
         if (!Array.isArray(include) || include.length === 0) {
           throw new Error(
             `[workspace] Mount "${mount.name}": include must be a non-empty list of names, "*.ext" globs or "dir/**" globs, not ${JSON.stringify(include) ?? String(include)}`,
           );
         }
         // By index: an entry that is itself undefined, or a hole, is unreadable too.
-        const at = include.findIndex((p) => !readable(p));
+        const at = include.findIndex((p) => !includePatternReadable(p));
         if (at >= 0) {
           const unreadable: unknown = include[at];
           throw new Error(
             `[workspace] Mount "${mount.name}": include must be a non-empty list of names, "*.ext" globs or "dir/**" globs, `
-            + `with no "." or ".." segment; ${JSON.stringify(unreadable) ?? String(unreadable)} is none of these`,
+            + `with no "." or ".." segment${sep === '\\' ? ' and no "\\", which this platform reads as a separator' : ''}; `
+            + `${JSON.stringify(unreadable) ?? String(unreadable)} is none of these`,
           );
         }
       }
