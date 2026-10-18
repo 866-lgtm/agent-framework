@@ -45,7 +45,16 @@ export interface MountConfig {
    * `^\..+\.sw[px]$`, `~$` and `\.subl.*\.tmp$`.
    */
   ignore?: string[];
-  /** Whether to follow symlinks (default: false) */
+  /**
+   * Whether to follow symlinks (default: false). Without it, no symlink on a
+   * path is followed: not one at the path itself, and not one among the
+   * directories on its way beneath the mount's root, wherever it leads. A path
+   * with a symlink among its directories is refused naming the link, and for
+   * a link inside the mount, its target. A mount root that is
+   * itself a symlink is still the root. With it, a symlink on a path is
+   * followed while what it reaches stays inside the mount. Either way, a
+   * listing or a sync's walk descends into no symlinked directory.
+   */
   followSymlinks?: boolean;
   /** Maximum file size in bytes (default: 5MB) */
   maxFileSize?: number;

@@ -6159,7 +6159,9 @@ describe('the mount boundary', () => {
     const res = await call(m, 'materialize', { force: true });
     const reasons = ((res.skipped ?? []) as Array<{ reason: string }>).map((s) => s.reason).join('\n');
     assert.match(reasons, /link\.txt: not written: a symlink, which this mount does not follow/);
-    assert.match(reasons, /linkdir\/inner\.txt: not written: a parent directory resolves outside the mount/);
+    // This mount doesn't follow symlinks, so a symlinked directory on the way
+    // is refused as such, wherever it leads.
+    assert.match(reasons, /linkdir\/inner\.txt: not written: "work\/linkdir" is a symlink leading outside the mount, which this mount does not follow/);
     assert.equal(readFileSync(outside, 'utf8'), 'outside, untouched');
     assert.throws(() => readFileSync(join(env.root, 'outdir', 'inner.txt')), /ENOENT/);
   });
@@ -6221,7 +6223,7 @@ describe('the mount boundary', () => {
       const pushed = await pushWith(env, m, ['sub/a.txt'], { force, beforeEffect: () => swapForSymlink(env, 'sub', outside) });
       assert.equal(readFileSync(join(outside, 'a.txt'), 'utf8'), 'outside, untouched');
       assert.deepEqual(pushed.written, []);
-      assert.match(pushed.skipped[0]!.reason, /^not written: a parent directory resolves outside the mount$/);
+      assert.match(pushed.skipped[0]!.reason, /^not written: "work\/sub" is a symlink leading outside the mount, which this mount does not follow$/);
       assert.deepEqual((m as any).agreement.get('work', 'sub/a.txt'), before, 'its evidence is exactly as before the intent');
       assert.equal(env.readDisk('saved/a.txt'), 'original');
     });
@@ -6239,7 +6241,7 @@ describe('the mount boundary', () => {
     const pushed = await pushWith(env, m, ['sub/gone.txt'], { applyDeletions: true, beforeEffect: () => swapForSymlink(env, 'sub', outside) });
     assert.equal(readFileSync(join(outside, 'gone.txt'), 'utf8'), 'outside, untouched');
     assert.deepEqual(pushed.deleted, []);
-    assert.match(pushed.skipped[0]!.reason, /^not unlinked: a parent directory resolves outside the mount$/);
+    assert.match(pushed.skipped[0]!.reason, /^not unlinked: "work\/sub" is a symlink leading outside the mount, which this mount does not follow$/);
   });
 
   test('a disk edit made after planning is not overwritten without force, and reads as a conflict', async (t) => {
@@ -6494,11 +6496,18 @@ describe('the mount boundary', () => {
       symlinkSync(outside, env.disk('escape'));
 
       const error = await refused(m, 'read', { path: 'work/escape/secret.txt' });
-      assert.match(error, /outside the mount/);
+      // A mount that follows symlinks finds where this one leads; one that
+      // doesn't refuses the link itself, wherever it leads.
+      assert.match(error, followSymlinks ? /outside the mount/ : /"work\/escape" is a symlink leading outside the mount, which this mount does not follow/);
       assert.doesNotMatch(error, /OUTSIDE_SENTINEL/);
       const scoped = await call(m, 'ls', { path: 'work/escape', recursive: true });
       assert.deepEqual(scoped.entries, []);
-      assert.deepEqual(scoped.incomplete, [{ path: 'escape', reason: 'the directory resolves outside the mount' }]);
+      assert.deepEqual(scoped.incomplete, [{
+        path: 'escape',
+        reason: followSymlinks
+          ? 'the directory resolves outside the mount'
+          : '"work/escape" is a symlink leading outside the mount, which this mount does not follow',
+      }]);
       const whole = await listing(m);
       assert.equal([...whole.keys()].some((p) => p.startsWith('escape/')), false);
       assert.deepEqual((await call(m, 'grep', { pattern: 'OUTSIDE_SENTINEL' })).results, []);

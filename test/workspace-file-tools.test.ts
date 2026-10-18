@@ -665,14 +665,44 @@ test("an edit of a file disk made binary answers the disk-only text, not a delet
   assert.deepEqual([...readFileSync(join(dir, 'b.txt'))], [0, 1, 2, 0, 255, 0], 'disk keeps its bytes');
 });
 
-test('a deletion of a draft that met a disk file the workspace never saw names applyDeletions', async (t) => {
+test('a deletion of a draft that met a disk file the workspace never saw completes, leaves that file alone, and says so', async (t) => {
   const { dir, call, disk } = setup(t, { autoMaterialize: true });
   writeFileSync(join(dir, 'c.txt'), 'disk text\n');
   // The workspace never read c.txt, so its write is a draft that collides.
   assert.match(errorOf(await call('write', { path: 'work/c.txt', content: 'agent text\n' })), /conflict: store-origin-collision/);
-  assert.equal(errorOf(await call('delete', { path: 'work/c.txt' })), 'The deletion of "work/c.txt" is stored in the workspace, so don\'t send it again. '
-    + "Its push to disk didn't complete: disk holds a different copy, and nothing records which is newer (conflict: store-origin-collision) — "
-    + 'sync this path to adopt the disk version, or materialize this path with force and applyDeletions to delete it.');
+  // Deleting the draft gives up the workspace's side, and disk never agreed
+  // with it: nothing is pushed, disk's file is a sync's to observe, and the
+  // answer says nothing was unlinked.
+  const deleted = await call('delete', { path: 'work/c.txt' });
+  assert.equal(deleted.success, true, String(deleted.error));
+  assert.match(String((deleted.data as { note?: string }).note), /^nothing was unlinked: /);
+  assert.equal(disk('c.txt')!.toString(), 'disk text\n');
+});
+
+test('a deletion of such a draft whose store throws after recording it says it unlinked nothing, and no push was owed', async (t) => {
+  const { dir, store, call, disk } = setup(t, { autoMaterialize: true });
+  writeFileSync(join(dir, 'c.txt'), 'disk text\n');
+  assert.match(errorOf(await call('write', { path: 'work/c.txt', content: 'agent text\n' })), /conflict: store-origin-collision/);
+  const s = store as unknown as Record<string, (...args: unknown[]) => unknown>;
+  const real = store.treeRemove;
+  let armed = true;
+  s.treeRemove = (...args) => {
+    const record = real.apply(store, args as never);
+    if (!armed) return record;
+    armed = false;
+    throw new Error('No space left on device (os error 28)');
+  };
+  try {
+    // The deletion gives up the workspace's side, so it owes disk no push:
+    // the answer doesn't say one didn't run, and keeps its note.
+    assert.equal(errorOf(await call('delete', { path: 'work/c.txt' })),
+      'The deletion of "work/c.txt" is stored in the workspace, so don\'t send it again. The store failed after recording it: No space left on device (os error 28). '
+      + 'Nothing was unlinked: when last observed, disk held a file at work/c.txt that the workspace never took in (conflict: store-origin-collision), '
+      + 'and a sync observes whatever disk holds there.');
+    assert.equal(armed, false);
+  } finally {
+    delete s.treeRemove;
+  }
   assert.equal(disk('c.txt')!.toString(), 'disk text\n');
 });
 

@@ -17,8 +17,8 @@ import type { McplContentBlock } from './types.js';
  * shows as NON_STRING_TEXT_PLACEHOLDER. `provenance` is what a reference stub
  * says the reference came on, such as 'attachment on push event'. `serverId`
  * is the server that sent the content: a reference is registered with it, as
- * a tool result's references are, so fetch_reference can fetch it from that
- * server.
+ * a tool result's references are, so fetch_reference can fetch it through that
+ * server's address, where it has one.
  */
 export function convertBlock(block: McplContentBlock, provenance: string, serverId: string): ContentBlock {
   switch (block.type) {

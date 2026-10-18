@@ -601,7 +601,7 @@ describe('stop() with work still in flight', () => {
         assert.equal(internals.deferredMessages.length, 1, 'the note stays queued');
         assert.ok(!storedTexts().includes('a note for later'), 'nothing landed ahead of the stream');
         assert.ok(logged.includes(
-          "[deferral] stop: 1 deferred write(s) for assistant stay queued: its stream outlasted stop()'s wait and may still write; " +
+          "[deferral] stop: 1 deferred write(s) for assistant stay queued: its stream is still running and may still write; " +
           'this memory-only queue loses them if the process exits before that stream settles'), logged.join('\n'));
         release();
         await until(() => internals.deferredMessages.length === 0, "the stream's own end to take the note");
@@ -679,7 +679,9 @@ describe('stop() with work still in flight', () => {
           framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
           await until(() => internals.activeStreams.has('assistant'), 'the first stream');
           const handle = internals.activeStreams.get('assistant')!;
-          (framework.getAgent('assistant') as unknown as { buildActivationRequest: () => never }).buildActivationRequest = () => {
+          // The stream path compiles through the agent's own assembler
+          // (buildActivationRequest is only its wrapper for previews).
+          (framework.getAgent('assistant') as unknown as { assembleActivationRequest: () => never }).assembleActivationRequest = () => {
             throw new Error('the compile failed');
           };
           release();
