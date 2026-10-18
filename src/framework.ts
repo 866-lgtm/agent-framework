@@ -94,7 +94,7 @@ import { parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.j
 import { ProseStreamRouter } from './mcpl/prose-stream-router.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
-import { ChannelRegistry, type ChannelToolOrigin } from './mcpl/channel-registry.js';
+import { ChannelRegistry, journalToolDescription, type ChannelToolOrigin } from './mcpl/channel-registry.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
 import { ProviderWaits, EVERY_MODEL, isReleaseModel, withoutControls, type ProviderWait } from './provider-waits.js';
@@ -354,6 +354,9 @@ const PROSE_HELP_TOOL: import('./types/index.js').ToolDefinition = {
 };
 /** Strip the `server--` MCPL prefix from a tool name. */
 const bareToolName = (n: string): string => n.split('--').pop()!;
+
+/** "1 registered utility", "2 registered utilities". */
+const registeredUtilities = (n: number): string => `${n} registered ${n === 1 ? 'utility' : 'utilities'}`;
 
 /** The single slot behind which every rarely-used capability lives. Only
  *  advertised when at least one module contributes utilities — with none
@@ -4509,8 +4512,10 @@ export class AgentFramework {
     return guards;
   }
 
+  /** `think` for one agent: its same-round policy, and `skip_reply` named only where the agent may call it. */
   private buildThinkTool(
     policy: SameRoundThinkTextPolicy,
+    canSkipReply: boolean,
   ): import('./types/index.js').ToolDefinition {
     return {
       name: 'think',
@@ -4521,7 +4526,8 @@ export class AgentFramework {
           ? 'Your current same_round_think_text_policy is private, so ordinary text emitted in the SAME native assistant round as think() is withheld from channel routing. Later rounds without think() route normally.'
           : 'Your current same_round_think_text_policy is public, so ordinary text emitted in the SAME native assistant round as think() may still be routed publicly as your speech. Later rounds without think() route normally.'
         ) +
-        ' Use think() to work things out privately. To inspect or change this policy, use agent_settings get/update on same_round_think_text_policy. To deliberately not reply this turn, call skip_reply instead.',
+        ' Use think() to work things out privately. To inspect or change this policy, use agent_settings get/update on same_round_think_text_policy.' +
+        (canSkipReply ? ' To deliberately not reply this turn, call skip_reply instead.' : ''),
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -4579,7 +4585,7 @@ export class AgentFramework {
         || this.emptyUtilityPermissionWarnings.has(agent)) return;
     const utilities = this.moduleRegistry.getAllUtilities();
     if (utilities.length === 0 || utilities.some(tool => agent.canUseTool(tool.name))) return;
-    console.warn(`[utils] Agent '${agent.name}': ${utilities.length} registered utilities, 0 permitted; none permitted by this agent's allowedTools. Add each required module--utility name to allowedTools.`);
+    console.warn(`[utils] Agent '${agent.name}': ${registeredUtilities(utilities.length)}, 0 permitted; none permitted by this agent's allowedTools. Add each required module--utility name to allowedTools.`);
     this.emptyUtilityPermissionWarnings.add(agent);
   }
 
@@ -4587,6 +4593,10 @@ export class AgentFramework {
     agentName: string,
     snapshot?: InferenceToolSnapshot,
   ): import('./types/index.js').ToolDefinition[] {
+    const agent = this.agents.get(agentName);
+    // Model-facing advice names skip_reply only where this agent may call it:
+    // a refused skip_reply leaves the turn going on.
+    const canSkipReply = !agent || agent.canUseTool('skip_reply');
     // The subconscious gets its own small surface (plus think/skip_reply/
     // end_turn), not the residents' tool board: no channel lifecycle, no
     // gate rules, no workspace — it observes, judges, and reports.
@@ -4597,11 +4607,11 @@ export class AgentFramework {
           ? this.buildThinkTool(
               snapshot?.sameRoundThinkTextPolicy
                 ?? this.getAgentRuntimeSettings(agentName).sameRoundThinkTextPolicy,
+              canSkipReply,
             )
           : t);
       return [...SUBCONSCIOUS_TOOLS, ...basics];
     }
-    const agent = this.agents.get(agentName);
     if (agent) this.warnEmptyUtilityPermissions(agent);
     const hasPermittedUtility = !agent || this.moduleRegistry.getAllUtilities().some(tool => agent.canUseTool(tool.name));
     return [...this.getAllTools(), ...(this.toolPresentations.has(agentName) ? presentationTools(this.toolPresentations.get(agentName)!.config.cataloguePath) : [])]
@@ -4610,8 +4620,10 @@ export class AgentFramework {
         return this.buildThinkTool(
           snapshot?.sameRoundThinkTextPolicy
             ?? this.getAgentRuntimeSettings(agentName).sameRoundThinkTextPolicy,
+          canSkipReply,
         );
       }
+      if (tool.name === 'journal' && !canSkipReply) return { ...tool, description: journalToolDescription(false) };
       return tool;
     });
   }
@@ -20118,7 +20130,7 @@ export class AgentFramework {
     const input = (call.input ?? {}) as { action?: unknown; name?: unknown; args?: unknown };
     const allUtilities = this.moduleRegistry.getAllUtilities();
     const utilities = allUtilities.filter(def => options.trustedModule || this.canAgentUseTool(agentName, def.name));
-    const counts = `${allUtilities.length} registered utilities, ${utilities.length} permitted`;
+    const counts = `${registeredUtilities(allUtilities.length)}, ${utilities.length} permitted`;
     const available = (): string => utilities.length
       ? `Available: ${utilities.map((u) => u.name).join(', ')} (${counts})`
       : allUtilities.length

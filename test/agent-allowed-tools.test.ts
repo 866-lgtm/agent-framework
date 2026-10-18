@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { AgentFramework } from '../src/framework.js';
 import type { AgentConfig, Module, ModuleContext, ToolCall, ToolResult } from '../src/types/index.js';
 import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
+import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
 import { ToolLifecycleEmitter, type ToolLifecycleParams } from '../src/mcpl/tool-lifecycle.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
 
@@ -317,6 +318,26 @@ for (const fallback of [false, true]) {
   }
 }
 
+for (const fallback of [false, true]) {
+  test(`${fallback ? 'fallback' : 'native'}: a refused skip_reply another module names (probe--skip_reply) keeps its round private by its bare name, and silences nothing after it`, async () => {
+    const h = await harness({ allowedTools: [] });
+    try {
+      const routed = captureRouting(h.framework);
+      const call = { type: 'tool_use' as const, id: 'namespaced', name: 'probe--skip_reply', input: { reason: 'test' } };
+      if (fallback) asXmlTurn(h.membrane, call);
+      h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public round prose' }, call], 'tool_use'));
+      h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public trailing prose' }]));
+      h.framework.pushEvent({ type: 'external-message', source: 'probe', content: 'Run probe', metadata: {} });
+      await h.framework.runUntilIdle();
+      const results = h.membrane.lastStream!.receivedToolResults[0] as Array<{ isError?: boolean; content: string }>;
+      assert.equal(results[0].isError, true);
+      assert.match(results[0].content, /not permitted.*allowedTools/);
+      assert.ok(!routed.includes('Public round prose'), 'the round that calls it stays private, as for skip_reply');
+      assert.ok(routed.includes('Public trailing prose'), 'and what follows goes out');
+    } finally { await h.close(); }
+  });
+}
+
 
 test("XML tool mode: a refused think's round goes as a permitted think's does", async () => {
   const dispositions: string[][] = [];
@@ -338,7 +359,7 @@ test("XML tool mode: a refused think's round goes as a permitted think's does", 
   assert.deepEqual(dispositions[1], dispositions[0], 'the refusal changes nothing about which prose goes out');
 });
 
-test("explicit prose routing: a refused skip_reply's round stays private, and what follows goes on as unprefixed prose does", async () => {
+for (const skipName of ['skip_reply', 'probe--skip_reply']) test(`explicit prose routing: a refused ${skipName}'s round stays private, and what follows goes on as unprefixed prose does`, async () => {
   const h = await harness({ allowedTools: [], proseRouting: 'explicit' });
   try {
     const routed = captureRouting(h.framework);
@@ -349,7 +370,7 @@ test("explicit prose routing: a refused skip_reply's round stays private, and wh
     });
     h.membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'Private round prose' },
-      { type: 'tool_use', id: 'skip', name: 'skip_reply', input: { reason: 'quiet' } },
+      { type: 'tool_use', id: 'skip', name: skipName, input: { reason: 'quiet' } },
     ], 'tool_use'));
     h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Unprefixed trailing prose' }]));
     // A bounce wakes the agent again, and a stream takes the responses queued
@@ -540,6 +561,29 @@ for (const permitted of [false, true]) {
   });
 }
 
+for (const permitted of [false, true]) {
+  test(`think's and journal's descriptions point at skip_reply only where the list permits it: ${permitted}`, async () => {
+    const h = await harness({ allowedTools: permitted ? ['think', 'journal', 'skip_reply'] : ['think', 'journal'] });
+    const slot = h.framework as unknown as { channelRegistry: unknown };
+    const original = slot.channelRegistry;
+    try {
+      // A host with channel servers has the registry, whose think and journal these are.
+      const registry = new ChannelRegistry({} as never, {} as never, () => {}, () => {}, {});
+      slot.channelRegistry = registry;
+      const surface = h.internal.getToolsForAgent('assistant');
+      for (const name of ['think', 'journal']) {
+        const tool = surface.find((t) => t.name === name);
+        assert.ok(tool, `${name} is on the surface`);
+        assert.equal(tool.description.includes('skip_reply'), permitted, `${name}'s description names skip_reply only where the agent may call it`);
+      }
+      // The result's handler can't see the caller's list, so it names no tool to end the turn with.
+      const result = await registry.handleChannelToolCall('think', { content: 'working it out' });
+      assert.equal(result.success, true);
+      assert.ok(!JSON.stringify(result.data).includes('skip_reply'), `think's result names no skip_reply: ${JSON.stringify(result.data)}`);
+    } finally { slot.channelRegistry = original; await h.close(); }
+  });
+}
+
 test('script in flight cannot gain legacy permissions when its ephemeral run disposes', async () => {
   let enter!: () => void, release!: () => void;
   const entered = new Promise<void>(resolve => { enter = resolve; });
@@ -673,6 +717,32 @@ test('zero-module snapshots do not consume the later utility migration warning',
     assert.ok(!h.internal.getToolsForAgent('assistant').some(tool => tool.name === 'utils'));
     h.internal.getToolsForAgent('assistant');
     assert.equal(warnings.length, 1); assert.match(warnings[0], /assistant.*2 registered/);
+  } finally { await h.close(); console.warn = warn; }
+});
+
+test('one registered utility is counted as one utility', async () => {
+  const warnings: string[] = [];
+  const warn = console.warn;
+  console.warn = (...args) => {
+    const line = args.join(' ');
+    if (!line.startsWith('[deprecated]')) warnings.push(line);
+  };
+  const h = await harness({ allowedTools: ['utils'] }, undefined, true);
+  try {
+    await h.framework.addModule({
+      name: 'single',
+      async start() {}, async stop() {},
+      getTools: () => [],
+      getUtilities: () => [{ name: 'only', description: 'Inert utility', inputSchema: { type: 'object', properties: {} } }],
+      async handleToolCall() { return { success: true, data: 'executed' }; },
+      async onProcess() { return {}; },
+    });
+    h.internal.getToolsForAgent('assistant');
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /: 1 registered utility, 0 permitted;/);
+    const listed = await h.framework.executeToolCall({ id: 'one-utility', name: 'utils', input: { action: 'list' }, callerAgentName: 'assistant' });
+    assert.equal(listed.isError, true);
+    assert.match(listed.error!, /\b1 registered utility, 0 permitted;/);
   } finally { await h.close(); console.warn = warn; }
 });
 
