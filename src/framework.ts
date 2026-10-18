@@ -8927,13 +8927,13 @@ export class AgentFramework {
           // A newly injected CONVERSATIONAL message begins a new
           // conversational round inside the same provider inference. Remember
           // that boundary for driveStream: an explicit send in the preceding
-          // round must not silence the reply. Routing is deliberately NOT
-          // affected — the turn locus is frozen at turn start, so ambient
-          // chatter, reactions, and system markers injected mid-turn can no
-          // longer hijack where the agent's prose lands. Non-conversational
-          // injections (`system: true` markers, and reaction, reaction
-          // removal, edit and deletion markers) don't even clear the send
-          // suppression: nothing new was said to the agent.
+          // round must not silence the reply. The signal itself never moves
+          // routing; the boundary re-pins by repinChannel's rule (below).
+          // Non-conversational injections (`system: true` markers, and
+          // reaction, reaction removal, edit and deletion markers) don't even
+          // clear the send suppression: nothing new was said to the agent.
+          // An edit the agent sees first is the message it replaced, so it
+          // does (isConversationalInjection).
           if (midTurnInjections.some((inj) => isConversationalInjection(inj.metadata))) {
             this.midTurnInputSignals.add(agent.name);
           }
@@ -12365,7 +12365,8 @@ export class AgentFramework {
 
       // A new conversational message, not merely a tool result, means any
       // earlier explicit delivery has completed its conversational job.
-      // Routing is NOT touched: the turn locus stays frozen.
+      // The signal itself never moves routing; the boundary re-pins by
+      // repinChannel's rule.
       turnSilenced = trigger?.suppressProse === true;
     };
 

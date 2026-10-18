@@ -1829,11 +1829,8 @@ describe('present while acting', () => {
     assert.deepEqual(routed, [], 'post-send prose stayed suppressed after a reaction');
     // That verdict counts only if the reaction was in the round: one that
     // missed it would leave the suppression set as well.
-    const texts = framework.getAgent('assistant')!.getContextManager().getAllMessages()
-      .map((m) => m.content.map((b) => (b as { text?: string }).text ?? '').join(''));
-    const markerAt = texts.findIndex((t) => t.includes('[reaction] @someone reacted'));
-    const replyAt = texts.findIndex((t) => t.includes('Sent it.'));
-    assert.ok(markerAt >= 0 && markerAt < replyAt, 'the reaction reached the turn before its reply');
+    const injected = JSON.stringify(membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? []);
+    assert.ok(injected.includes('[reaction] @someone reacted'), 'the reaction was injected at the send\'s tool boundary');
 
     await framework.stop();
   });
@@ -1865,11 +1862,8 @@ describe('present while acting', () => {
       assert.deepEqual(routed, [], `post-send prose stayed suppressed after a ${tag} marker`);
       // That verdict counts only if the marker was in the round: a marker that
       // missed it would leave the suppression set as well.
-      const texts = framework.getAgent('assistant')!.getContextManager().getAllMessages()
-        .map((m) => m.content.map((b) => (b as { text?: string }).text ?? '').join(''));
-      const markerAt = texts.findIndex((t) => t.includes(`[${tag}] marker about an earlier message`));
-      const replyAt = texts.findIndex((t) => t.includes('Sent it.'));
-      assert.ok(markerAt >= 0 && markerAt < replyAt, `the ${tag} marker reached the turn before its reply`);
+      const injected = JSON.stringify(membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? []);
+      assert.ok(injected.includes(`[${tag}] marker about an earlier message`), `the ${tag} marker was injected at the send's tool boundary`);
 
       await framework.stop();
     });

@@ -566,6 +566,13 @@ test('non-conversational markers do not retarget the default publish locus (#157
   const after = registry.buildChannelContext()?.incoming;
   assert.equal(after?.messageId, 'm2', 'a real message becomes the reply anchor');
   assert.equal(after?.threadId, 'thread-B', 'with its own thread');
+  // One with no thread leaves none behind.
+  const unthreaded = incoming('chanA', 'real message on A, no thread');
+  unthreaded.messages[0]!.messageId = 'm3';
+  registry.handleIncoming('discord', unthreaded);
+  const last = registry.buildChannelContext()?.incoming;
+  assert.equal(last?.messageId, 'm3', 'a real message with no thread becomes the reply anchor');
+  assert.equal(last?.threadId, undefined, 'and takes no thread from the one before it');
 });
 
 test('a marker on a NEVER-conversed channel leaves the locus null, not marker-anchored (#157)', async () => {

@@ -390,11 +390,11 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'channel_publish',
-    description: "Publish a message to a channel. If channelId is omitted, publishes to the channel of the most recent incoming message that isn't a reaction, reaction removal, edit or deletion.",
+    description: "Publish a message to a channel. If channelId is omitted, publishes to your conversation's channel if you are bound to one; otherwise to the channel of the most recent incoming message that isn't a reaction, reaction removal, edit or deletion.",
     inputSchema: {
       type: 'object' as const,
       properties: {
-        channelId: { type: 'string', description: "ID of the channel to publish to (defaults to the channel of the most recent incoming message that isn't a reaction, reaction removal, edit or deletion)" },
+        channelId: { type: 'string', description: "ID of the channel to publish to (defaults to your conversation's channel if you are bound to one; otherwise the channel of the most recent incoming message that isn't a reaction, reaction removal, edit or deletion)" },
         content: { type: 'string', description: 'Text content to publish' },
         text: { type: 'string', description: 'Alias for content' },
       },
