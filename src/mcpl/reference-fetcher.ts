@@ -3,7 +3,8 @@
  * dereferences a reference, and it fails closed on every axis the RFC names:
  *
  *  - **origin binding (§6.1, revision 3):** authenticated fetches go only to
- *    the origin the reference's server connection was dialed to. This v1 does
+ *    the origin a server's connection was dialed to, for a reference that
+ *    server delivered, with that server's credential. This v1 does
  *    not fetch third-party origins at all (deferred with declared reference
  *    origins); the connection credential is applied as an Authorization
  *    header by this code alone and never surfaces to model, script, or URI.
@@ -29,14 +30,14 @@
  */
 import { createHash } from 'node:crypto';
 import type { ReferenceRecord } from './references.js';
-import { EXPIRY_REASON, isReferenceExpired, referenceExpiry, REFERENCE_LIMITS, sanitizeLabel, UNBOUND_REASON } from './references.js';
+import { EXPIRY_REASON, noAddressReason, referenceExpiry, REFERENCE_LIMITS, sanitizeLabel, UNBOUND_REASON } from './references.js';
 
 /** Per-fetch hard ceiling on actual bytes (overridable per server / call). */
 export const DEFAULT_FETCH_MAX_BYTES = 256 * 1024 * 1024;
 /** Eager (autofetch) threshold: at most what could have shipped inline. */
 export const DEFAULT_EAGER_FETCH_MAX_BYTES = 256 * 1024;
-/** Cumulative per-server budget for this process: every byte the fetcher
- *  reads from a server's references counts against it, whether or not it's
+/** Cumulative per-server budget for this process: every byte a fetch dialed
+ *  through a server reads counts against that server's, whether or not it's
  *  kept. */
 export const DEFAULT_MAX_TOTAL_BYTES = 1024 * 1024 * 1024;
 const FETCH_TIMEOUT_MS = 60_000;
@@ -48,11 +49,33 @@ const BUDGET_LASTS = "the budget doesn't renew on its own, so calling again won'
 const EAGER_FETCH_TIMEOUT_MS = 10_000;
 
 export interface ResolvedServerBinding {
-  /** The url the connection was dialed to (ws/wss/http/https). */
+  /** The url the host dials the server at. The framework's resolver gives only
+   *  a ws:// or wss:// url its WebSocket transport dials; the origin check
+   *  reads ws as http and wss as https. */
   url: string;
   /** Connection credential, applied host-side as Authorization: Bearer. */
   token?: string;
   autofetch?: { maxBytes?: number; maxTotalBytes?: number };
+}
+
+/** What the host knows of a server a reference came from: its binding, or
+ *  'no-address' for one the host doesn't reach over a network, such as a
+ *  stdio server, which has no address to dial. A server the host doesn't
+ *  know resolves to undefined. */
+export type ServerResolution = ResolvedServerBinding | 'no-address';
+
+/** Why the fetcher would refuse a reference without dialing. `ofReference`
+ *  marks one of the reference's own phrases that its stub shares (unbound,
+ *  expired), which fetch_reference words as "reference <reason>"; it gives
+ *  the others as they are. */
+export interface Refusal {
+  reason: string;
+  ofReference: boolean;
+}
+
+/** fetch_reference's words for a refusal. */
+function refusalText(refusal: Refusal): string {
+  return refusal.ofReference ? `reference ${refusal.reason}` : refusal.reason;
 }
 
 export interface FetchOutcome {
@@ -109,30 +132,111 @@ export function normalizedOrigin(url: string): string | null {
 }
 
 export class ReferenceFetcher {
-  /** Bytes read from each server's references in this process, charged as
-   *  each chunk is read, kept or not. Concurrent fetches from one server share
-   *  the total, so each checks what the others have taken. */
+  /** Bytes read through each server in this process, charged to the server a
+   *  fetch dials through as each chunk is read, kept or not. Concurrent
+   *  fetches through one server share the total, so each checks what the
+   *  others have taken. */
   private totals = new Map<string, number>();
   private inFlight = new Map<string, Promise<FetchOutcome>>();
 
   constructor(
-    private readonly resolveServer: (serverId: string) => ResolvedServerBinding | undefined,
+    private readonly resolveServer: (serverId: string) => ServerResolution | undefined,
     /** Persist the payload; returns a mount-prefixed path or null when no
      *  writable workspace exists. File name is host-generated (§7.3). */
     private readonly saveFile: (fileName: string, data: Buffer, mimeType: string) => Promise<string | null>,
   ) {}
 
-  /** Would the eager (autofetch) default fetch this record? Not one the
-   *  fetcher refuses as expired, which would only take an eager slot. */
+  /** Would the eager (autofetch) default fetch this record? Not one the fetch
+   *  would refuse before dialing, asked as the eager fetch asks it, with the
+   *  default ceiling, so such a record takes no eager slot; and only one whose
+   *  claimed size is within the eager limit of the server it dials. For one
+   *  whose fetch is already under way, which the eager fetch would join as
+   *  fetch() does, only the server and its eager limit enter: the expiry,
+   *  the budget and the ceiling were checked when that fetch began. */
   isEagerEligible(record: ReferenceRecord): boolean {
     if (record.fetchedPath) return false;
-    if (isReferenceExpired(record.testimony)) return false;
-    if (record.serverId === undefined) return false;
-    const binding = this.resolveServer(record.serverId);
-    if (!binding) return false;
-    const cap = binding.autofetch?.maxBytes ?? DEFAULT_EAGER_FETCH_MAX_BYTES;
-    if (record.testimony.sizeBytes === undefined || record.testimony.sizeBytes > cap) return false;
-    return this.originCheck(record, binding) === null;
+    const check = this.inFlight.has(record.refId) ? this.serverFor(record) : this.beforeDial(record);
+    if ('refusal' in check) return false;
+    const cap = check.binding.autofetch?.maxBytes ?? DEFAULT_EAGER_FETCH_MAX_BYTES;
+    return record.testimony.sizeBytes !== undefined && record.testimony.sizeBytes <= cap;
+  }
+
+  /** The server to dial for a record (§6.2): the first, in the order they
+   *  delivered it, whose address is on the uri's origin. When none is, the
+   *  first server's refusal (unknown to this host, with no address to dial,
+   *  or the origin check's), and for a record no server delivered, that it's
+   *  unbound. */
+  private serverFor(record: ReferenceRecord): { serverId: string; binding: ResolvedServerBinding } | { refusal: Refusal } {
+    let refusal: Refusal | undefined;
+    for (const serverId of record.serverIds) {
+      const binding = this.resolveServer(serverId);
+      if (!binding) {
+        refusal ??= { reason: `unknown server: ${serverId}`, ofReference: false };
+        continue;
+      }
+      if (binding === 'no-address') {
+        refusal ??= { reason: noAddressReason(serverId), ofReference: false };
+        continue;
+      }
+      const offOrigin = this.originCheck(record, binding);
+      if (offOrigin === null) return { serverId, binding };
+      refusal ??= { reason: offOrigin, ofReference: false };
+    }
+    return { refusal: refusal ?? { reason: UNBOUND_REASON, ofReference: true } };
+  }
+
+  /** Every check the fetch makes before it dials, in its order: the server
+   *  (none, unknown, no address, off the uri's origin), the expiry, the
+   *  server's spent budget, a claimed size over the ceiling. For a record
+   *  with no saved copy and no fetch under way, the fetch, `refusal()` and
+   *  the eager check all ask this, so what save_recent_image says is the
+   *  reason the fetch would refuse with, and no eager slot goes to a fetch
+   *  that would be refused. */
+  private beforeDial(record: ReferenceRecord, opts?: { maxBytes?: number }):
+    { refusal: Refusal } | { serverId: string; binding: ResolvedServerBinding; ceiling: number; budget: number } {
+    const server = this.serverFor(record);
+    if ('refusal' in server) return server;
+    const { serverId, binding } = server;
+    const t = record.testimony;
+    const expiry = referenceExpiry(t);
+    if (expiry) return { refusal: { reason: EXPIRY_REASON[expiry], ofReference: true } };
+
+    const ceiling = opts?.maxBytes ?? DEFAULT_FETCH_MAX_BYTES;
+    // The budget is checked before the ceiling, here and while reading: a
+    // larger max_bytes lifts the ceiling, and nothing the caller does lifts
+    // the budget, so a fetch past both is told about the budget.
+    const budget = binding.autofetch?.maxTotalBytes ?? DEFAULT_MAX_TOTAL_BYTES;
+    const used = this.totals.get(serverId) ?? 0;
+    if (used >= budget) {
+      return { refusal: { reason: `per-server fetch budget exhausted (${used}/${budget} bytes); ${BUDGET_LASTS}`, ofReference: false } };
+    }
+    // Vector 4: a claim already over the ceiling refuses without dialing. One
+    // that's also over what's left of the budget is told about the budget,
+    // which no max_bytes lifts. A claim over what's left but within the
+    // ceiling still dials, and the budget stops it at its first chunk past.
+    if (t.sizeBytes !== undefined && t.sizeBytes > ceiling) {
+      if (t.sizeBytes > budget - used) {
+        return {
+          refusal: {
+            reason: `claimed ${t.sizeBytes} bytes exceeds what's left of the per-server fetch budget (${used}/${budget} bytes); ${BUDGET_LASTS}`,
+            ofReference: false,
+          },
+        };
+      }
+      return { refusal: { reason: `claimed ${t.sizeBytes} bytes exceeds fetch ceiling ${ceiling}`, ofReference: false } };
+    }
+    return { serverId, binding, ceiling, budget };
+  }
+
+  /** Why a fetch of this record would be refused before dialing, with the
+   *  default ceiling, which a fetch_reference call naming no max_bytes has.
+   *  Null where the fetch would serve a saved copy, join a fetch of it
+   *  already under way, or dial (where it can still fail), the same three
+   *  steps fetch() takes. */
+  refusal(record: ReferenceRecord): Refusal | null {
+    if (record.fetchedPath || this.inFlight.has(record.refId)) return null;
+    const check = this.beforeDial(record);
+    return 'refusal' in check ? check.refusal : null;
   }
 
   /** §6.1/§7.1 policy check; returns a refusal reason or null. */
@@ -168,38 +272,9 @@ export class ReferenceFetcher {
 
   private async doFetch(record: ReferenceRecord, opts?: { maxBytes?: number; timeoutMs?: number }): Promise<FetchOutcome> {
     const t = record.testimony;
-    if (record.serverId === undefined) return { ok: false, error: `reference ${UNBOUND_REASON}` };
-    const binding = this.resolveServer(record.serverId);
-    if (!binding) return { ok: false, error: `unknown server: ${record.serverId}` };
-
-    const refusal = this.originCheck(record, binding);
-    if (refusal) return { ok: false, error: refusal };
-    const expiry = referenceExpiry(t);
-    if (expiry) return { ok: false, error: `reference ${EXPIRY_REASON[expiry]}` };
-
-    const ceiling = opts?.maxBytes ?? DEFAULT_FETCH_MAX_BYTES;
-    // The budget is checked before the ceiling, here and while reading: a
-    // larger max_bytes lifts the ceiling, and nothing the caller does lifts
-    // the budget, so a fetch past both is told about the budget.
-    const serverId = record.serverId;
-    const budget = binding.autofetch?.maxTotalBytes ?? DEFAULT_MAX_TOTAL_BYTES;
-    const used = this.totals.get(serverId) ?? 0;
-    if (used >= budget) {
-      return { ok: false, error: `per-server fetch budget exhausted (${used}/${budget} bytes); ${BUDGET_LASTS}` };
-    }
-    // Vector 4: a claim already over the ceiling refuses without dialing. One
-    // that's also over what's left of the budget is told about the budget,
-    // which no max_bytes lifts. A claim over what's left but within the
-    // ceiling still dials, and the budget stops it at its first chunk past.
-    if (t.sizeBytes !== undefined && t.sizeBytes > ceiling) {
-      if (t.sizeBytes > budget - used) {
-        return {
-          ok: false,
-          error: `claimed ${t.sizeBytes} bytes exceeds what's left of the per-server fetch budget (${used}/${budget} bytes); ${BUDGET_LASTS}`,
-        };
-      }
-      return { ok: false, error: `claimed ${t.sizeBytes} bytes exceeds fetch ceiling ${ceiling}` };
-    }
+    const check = this.beforeDial(record, opts);
+    if ('refusal' in check) return { ok: false, error: refusalText(check.refusal) };
+    const { serverId, binding, ceiling, budget } = check;
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), opts?.timeoutMs ?? FETCH_TIMEOUT_MS);

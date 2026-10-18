@@ -80,7 +80,7 @@ const attempts: Array<{
     name: 'a send refused by the rate limit',
     rateLimitPerMinute: 1,
     attempt: async ({ tool }, agent, turnId) => {
-      assert.equal((await tool(agent, turnId, 'send', { channelId: 'c1', content: 'second' })).error, 'Rate limited');
+      assert.match((await tool(agent, turnId, 'send', { channelId: 'c1', content: 'second' })).error ?? '', /^Nothing was sent: channel c1 has reached this host's limit/);
     },
   },
   {
@@ -94,14 +94,14 @@ const attempts: Array<{
     name: 'a reply refused by the rate limit',
     rateLimitPerMinute: 1,
     attempt: async ({ tool }, agent, turnId) => {
-      assert.equal((await tool(agent, turnId, 'reply', { content: 'second' })).error, 'Rate limited');
+      assert.match((await tool(agent, turnId, 'reply', { content: 'second' })).error ?? '', /^Nothing was sent: this conversation's channel \(c1\) has reached this host's limit/);
     },
   },
   {
     name: 'a reply refused for want of a conversation context',
     attempt: async ({ tool, replyContexts }, agent, turnId) => {
       replyContexts.delete('default');
-      assert.equal((await tool(agent, turnId, 'reply', { content: 'second' })).error, 'No conversation context');
+      assert.match((await tool(agent, turnId, 'reply', { content: 'second' })).error ?? '', /^Nothing was sent: there's no conversation to reply in\./);
     },
   },
   {

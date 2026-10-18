@@ -44,6 +44,7 @@ import { RefusalLines } from './refusal-lines.js';
 import { CapabilityGrant } from './capability-grant.js';
 import type { InboundSource } from './inbound-source.js';
 import { McplRequestError } from './server-connection.js';
+import { readSkipReplyWake } from './skip-reply-wake.js';
 
 // ============================================================================
 // Typing indicator interval (Discord typing lasts ~10s, so 7s keeps it alive)
@@ -227,22 +228,6 @@ function isInboundOnly(entry: ChannelEntry): boolean {
   return entry.descriptor.direction === 'inbound';
 }
 
-/** What a failed request to a server says to the agent: a server's error
- *  response in its own words (McplRequestError's serverMessage), naming the
- *  server, and any other failure as its message, or as text when it has none,
- *  bounded (connectorText). */
-function failureText(err: unknown, serverId: string): string {
-  if (err instanceof McplRequestError && err.outcome === 'error-response' && err.serverMessage !== undefined) {
-    return `server "${serverId}" answered with an error: ${err.serverMessage}`;
-  }
-  try {
-    const message = (err as { message?: unknown } | null | undefined)?.message;
-    return connectorText(typeof message === 'string' && message !== '' ? message : String(err));
-  } catch {
-    return 'a failure that could not be printed';
-  }
-}
-
 /** Why the host sends nothing into an inbound-only channel, as the resident
  *  reads it in a send-failure marker or a tool error. */
 function inboundOnlyReason(entry: ChannelEntry): string {
@@ -287,6 +272,20 @@ interface McplChannelIncomingEvent {
 // ============================================================================
 // Channel Tool Definitions
 // ============================================================================
+
+/**
+ * `journal`'s description. It tells the model to call `skip_reply` to end the
+ * turn only where the agent may call it: the framework builds each agent's
+ * surface with that agent's permission, and a refused `skip_reply` leaves the
+ * turn going on.
+ */
+export function journalToolDescription(canSkipReply: boolean): string {
+  return 'Write an entry in your private journal. The entry stays in your own context and ' +
+    'memory and is NOT sent to any channel, surface or person. Use it for anything longer ' +
+    'than a line that you want to keep for yourself — reflections, what you decided and ' +
+    'why, notes for later. It does not end your turn and does not affect where ordinary ' +
+    'text is routed' + (canSkipReply ? '; to end the turn without replying, call skip_reply afterwards.' : '.');
+}
 
 const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
@@ -365,6 +364,9 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'think',
+    // No agent's surface shows this description: getToolsForAgent gives every
+    // agent its own think (buildThinkTool), which names skip_reply only where
+    // that agent may call it.
     description:
       'Reason privately. The content stays in your own context and is NOT sent to any ' +
       'channel or surface. Same-round routing of ordinary text beside think() depends on ' +
@@ -384,12 +386,7 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'journal',
-    description:
-      'Write an entry in your private journal. The entry stays in your own context and ' +
-      'memory and is NOT sent to any channel, surface or person. Use it for anything longer ' +
-      'than a line that you want to keep for yourself — reflections, what you decided and ' +
-      'why, notes for later. It does not end your turn and does not affect where ordinary ' +
-      'text is routed; to end the turn without replying, call skip_reply afterwards.',
+    description: journalToolDescription(true),
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -419,8 +416,9 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
           type: 'number',
           description:
             'Optional self-wake: if nothing else wakes you first, you wake again after this ' +
-            'many seconds (1 = go again almost immediately; clamped to 1–3600). Any other ' +
-            'wake before then cancels it. Omit to stay idle until the next external wake.',
+            'many seconds, from 1 to 3600; a larger number waits 3600 (1 = go again almost ' +
+            'immediately). Any other wake before then cancels it. Omit to stay idle until the ' +
+            'next external wake.',
         },
       },
       required: [],
@@ -492,7 +490,12 @@ export interface PublishOutcome {
  * a failed request this way.
  */
 function publishErrorOutcome(err: unknown, destination: PublishDestination, at: number): PublishOutcome {
-  const message = failureText(err, destination.serverId);
+  // This host's own words for a request that wasn't sent or wasn't answered
+  // are sentences, and every composition of the reason adds its own ending,
+  // so one final period comes off them. A server's error answer keeps its
+  // words as they came.
+  const text = connectorText(err instanceof Error ? err.message : String(err));
+  const message = err instanceof McplRequestError && err.outcome !== 'error-response' ? text.replace(/(?<!\.)\.$/, '') : text;
   const notSent = err instanceof McplRequestError && err.outcome === 'not-sent';
   const detail = err instanceof McplRequestError ? err.data : undefined;
   return {
@@ -1135,7 +1138,7 @@ export class ChannelRegistry {
         }
       }
       if (message.tags) message.tags = expandCoreTags(message.tags);
-      const convertedContent: ContentBlock[] = message.content.map((block) => convertBlock(block, 'attachment on channel message'));
+      const convertedContent: ContentBlock[] = message.content.map((block) => convertBlock(block, 'attachment on channel message', serverId));
       if (!emptyAllowed && isVisiblyEmptyConversion(message.content, convertedContent)) {
         rejectEmpty();
         continue;
@@ -1553,7 +1556,7 @@ export class ChannelRegistry {
         return this.handleToolJournal(input as { content?: string });
 
       case 'skip_reply':
-        return this.handleToolSkipReply(input as { reason?: string; wake_in_seconds?: number });
+        return this.handleToolSkipReply(input as { reason?: string; wake_in_seconds?: unknown });
 
       default:
         return { success: false, error: `Unknown channel tool: ${toolName}`, isError: true };
@@ -2932,7 +2935,7 @@ export class ChannelRegistry {
     } catch (err) {
       return {
         success: false,
-        error: `Failed to open channel: ${failureText(err, entry.serverId)}`,
+        error: `Failed to open channel: ${(err as Error).message}`,
         isError: true,
       };
     }
@@ -3046,7 +3049,7 @@ export class ChannelRegistry {
     } catch (err) {
       return {
         success: false,
-        error: `Failed to close channel: ${failureText(err, entry.serverId)}`,
+        error: `Failed to close channel: ${(err as Error).message}`,
         isError: true,
       };
     }
@@ -3099,7 +3102,7 @@ export class ChannelRegistry {
               'The channel integration could not post the acknowledgment.';
           }
         } catch (error) {
-          acknowledgmentError = failureText(error, entry.serverId);
+          acknowledgmentError = (error as Error).message;
         }
       }
     }
@@ -3128,7 +3131,8 @@ export class ChannelRegistry {
    * Handle the synthesized `think` tool — a private reasoning scratchpad. It
    * sends nothing, and (unlike before) does NOT silence the turn: trailing
    * plain text is still routed as the reply. The thought stays in the agent's
-   * own context/chronicle. To deliberately not reply, the agent uses skip_reply.
+   * own context/chronicle. To deliberately not reply, an agent that may call
+   * skip_reply uses it.
    */
   private handleToolThink(input: { content?: string }): ToolResult {
     return {
@@ -3137,10 +3141,12 @@ export class ChannelRegistry {
       // tool_use block; don't duplicate it in the result.
       data: {
         noted: true,
+        // No tool to end the turn with: this handler can't see whether the
+        // caller may call skip_reply, and think's own description says so
+        // where it may.
         note:
           'Thought recorded (private — not sent anywhere). Same-round text routing depends on ' +
-          'your current same_round_think_text_policy; use agent_settings get to inspect it, or ' +
-          'call skip_reply to end the turn without replying.',
+          'your current same_round_think_text_policy; use agent_settings get to inspect it.',
       },
     };
   }
@@ -3174,14 +3180,15 @@ export class ChannelRegistry {
    * tool, so any trailing prose this turn is NOT posted. Replaces the old
    * overloaded use of `think` for staying silent.
    */
-  private handleToolSkipReply(input: { reason?: string; wake_in_seconds?: number }): ToolResult {
+  private handleToolSkipReply(input: { reason?: string; wake_in_seconds?: unknown }): ToolResult {
     // The self-wake itself is armed by the framework (which owns the
-    // EventGate) BEFORE this dispatch. Without a gate, a positive timer request
-    // is refused before this successful end-turn handler is reached.
-    const wakeSecs = Number(input.wake_in_seconds);
-    const selfWake = Number.isFinite(wakeSecs) && wakeSecs > 0
-      ? Math.max(1, Math.min(3600, Math.floor(wakeSecs)))
-      : undefined;
+    // EventGate) BEFORE its dispatch reaches this handler, from the same
+    // reading, and the framework refuses a wake the host can't set before
+    // dispatching. A caller of this registry's handleChannelToolCall
+    // (AgentFramework.channels) goes past both, so its note names a wake
+    // nothing armed.
+    const wake = readSkipReplyWake(input);
+    const selfWake = wake.kind === 'wake' ? wake.seconds : undefined;
     return {
       success: true,
       // The note says "ended the turn" — make it TRUE. Without endTurn the
@@ -3345,9 +3352,10 @@ export class ChannelRegistry {
    * included: it's refused before anything opens. The open awaits the
    * server, and a channels/changed update, a re-register or the open's own
    * answer (applyOpenAnswer) may declare the channel inbound-only meanwhile,
-   * or a removal take it away, so both are checked again after the open.
-   * Words refused then leave the channel open: the agent gets the notice that
-   * it's open, which says how to close it, and the failure for the words.
+   * or a removal take it away, so both are checked again just before the
+   * publish, after every await. Words refused after an open leave the
+   * channel open: the agent gets the notice that it's open, which says how
+   * to close it, and the failure for the words.
    *
    * Only the connector's `delivered: true` confirms a post. `failed` means
    * nothing was posted: the attempt stopped before the request was written,
@@ -3431,19 +3439,21 @@ export class ChannelRegistry {
         return {
           status: 'failed',
           destination,
-          reason: `channel is closed and open failed: ${failureText(err, entry.serverId)}`,
+          reason: `channel is closed and open failed: ${connectorText(err instanceof Error ? err.message : String(err))}`,
           at: at(),
         };
       }
-      // The open awaited the server: nothing is published to a channel that
-      // was removed meanwhile, or declared inbound-only.
-      const current = this.channels.get(`${entry.serverId}:${entry.descriptor.id}`);
-      if (!current) {
-        return { status: 'failed', destination, reason: 'the channel was removed while it was opening', at: at() };
-      }
-      if (isInboundOnly(current)) {
-        return { status: 'failed', destination, reason: inboundOnlyReason(current), at: at() };
-      }
+    }
+
+    // Checked again here, after every await above, the open's or any other:
+    // nothing is published to a channel removed meanwhile, or declared
+    // inbound-only.
+    const current = this.channels.get(`${entry.serverId}:${entry.descriptor.id}`);
+    if (!current) {
+      return { status: 'failed', destination, reason: 'the channel was removed before the words were published', at: at() };
+    }
+    if (isInboundOnly(current)) {
+      return { status: 'failed', destination, reason: inboundOnlyReason(current), at: at() };
     }
 
     let result: unknown;
