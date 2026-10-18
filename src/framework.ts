@@ -9764,10 +9764,15 @@ export class AgentFramework {
             this.midTurnInputSignals.add(agent.name);
           }
 
-          // The next round is handed these messages after the results, so it
-          // follows them, not the tool loop of a reply to [Continue]: its rows
-          // carry no prompt. (The routing notice below rides only an
-          // injection already here.)
+          // A live stream handed these messages after the results follows
+          // them in its next round, not the tool loop of a reply to
+          // [Continue]: that round's rows carry no prompt. One that doesn't
+          // say whether it carries them (membrane 0.5.87) counts as carrying
+          // them here, as at the drain above. A boundary that ends the turn,
+          // restarts the stream or falls back to a new start below hands
+          // them to no live stream, and a new start reads its own prompt from
+          // what it sends. (The routing notice below rides only an injection
+          // already here.)
           if (midTurnInjections.length > 0) {
             const turnTrigger = this.activeTurnTriggers.get(agent.name);
             if (turnTrigger) this.turnPrompts.delete(turnTrigger);
@@ -11732,16 +11737,17 @@ export class AgentFramework {
    * stores (a delivery receipt, a routing notice, a deferred flush) aren't the
    * reply's, and carry none.
    * - A silent heartbeat tick stamps each of them for the whole turn, with the
-   *   separator text its request rendered. Request builds render the
-   *   separator before the first of the tick's assistant rows that survives,
-   *   and the stamps keep every row of the tick identifiable after the turn,
-   *   for a later retention policy to find or collapse. The stamp names the
-   *   agent: residents share one message slot, and a broadcast tick reaches
-   *   each of them with the same eventId.
+   *   separator text its request rendered. The stamps keep every row of the
+   *   tick identifiable after the turn, for a later retention policy to find
+   *   or collapse. The stamp names the agent: residents share one message
+   *   slot, and a broadcast tick reaches each of them with the same eventId.
    * - A `[Continue]` prompt stamps the rows of each round that follows it
-   *   (`turnPrompts`). Request builds render it before the first of its
-   *   assistant rows that survives. On the round's tool_result rows it marks
-   *   them as the reply's, as the tick stamp does.
+   *   (`turnPrompts`).
+   * Request builds render each turn before the first surviving assistant row
+   * that carries its stamp and that they can recognise: one with a tool call,
+   * or with signed or redacted thinking (see silent-heartbeat.ts). The
+   * tool_result rows and the wrapper row are stored as `user`, so their
+   * stamps place nothing: they mark each row as the reply's.
    * Undefined for ordinary turns, whose rows are stored exactly as before.
    * (Named for its first use, the silent tick.)
    */

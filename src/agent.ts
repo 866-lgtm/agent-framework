@@ -1277,8 +1277,8 @@ export class Agent {
     // request itself: a new one when it ends on [Continue]; else, when it
     // ends on tool results, the prompt of the reply that called those tools,
     // whose tool loop this reply continues; else none. A request that ends
-    // on anything else (a message that arrived during a cooldown, say)
-    // prompts a reply that follows that.
+    // on anything else (a message that arrived during a cooldown, say) gets
+    // a reply that follows that message and carries no prompt.
     let continuePrompt: RequestOnlyPrompt | undefined;
     if (openingTick) {
       messages = [...messages, silentHeartbeatSeparatorTurn()];
