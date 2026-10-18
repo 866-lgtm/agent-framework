@@ -150,9 +150,9 @@ const treated = (report: string, big: string, old: string) => [
   { type: 'text', text: INLINE_WITHHELD_TEXT },
   { type: 'text', text: INLINE_WITHHELD_TEXT },
   { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png' },
-  { type: 'text', text: '[unrecognized content block: uri exceeds schema maximum]' },
-  { type: 'text', text: '[unrecognized content block: reference without string uri]' },
-  { type: 'text', text: '[unrecognized content block: unknown block type: resource_link]' },
+  { type: 'text', text: '[Reference not shown: its link is longer than this host accepts.]' },
+  { type: 'text', text: '[Reference not shown: it arrived without a link.]' },
+  { type: 'text', text: `[Content not shown: this host can't display "resource_link" content.]` },
   { type: 'text', text: 'two attachments' },
   { type: 'image', refId: old, mimeType: 'image/png', expiresAt: '2027-01-01T00:00:00Z', savedTo: null, expired: EXPIRY_REASON.unparseable },
 ];

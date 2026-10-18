@@ -24,6 +24,8 @@ import WebSocket from 'ws';
 
 import type { McplServerConfig } from './types.js';
 import { describeCredentialError, noteDialSent, redactUrl, resolveServerBinding, urlAsDialed } from './protocol-family.js';
+import { assertBooleanSetting } from '../config-checks.js';
+import { logDetail } from './log-value.js';
 
 /** Why/how a transport closed. `code`/`signal` are populated for stdio child
  *  exits; `reason` carries a WebSocket close reason or an error message. */
@@ -59,7 +61,10 @@ export abstract class McplTransport extends EventEmitter {
   private lineBuffer: string[] = [];
   private stderrBuffer: string[] = [];
 
-  protected constructor() {
+  /** The server's id from its config, so a line the transport logs names it.
+   *  The stdio and WebSocket transports always give it; a test's stand-in
+   *  transport may leave it out. */
+  protected constructor(protected readonly serverId?: string) {
     super();
     // Flush buffered inbound lines the moment a consumer subscribes.
     this.on('newListener', (event) => {
@@ -100,6 +105,15 @@ export abstract class McplTransport extends EventEmitter {
     return undefined;
   }
 
+  /**
+   * Resolves once the server's diagnostic stream has ended or closed, so that
+   * {@link stderrTail} holds what arrived on it, or once `ms` have passed while
+   * it hasn't. At once for a transport that has none.
+   */
+  stderrEnded(_ms: number): Promise<void> {
+    return Promise.resolve();
+  }
+
   /** Deliver an inbound line, buffering it if nobody is listening yet. */
   protected pushLine(line: string): void {
     if (this.listenerCount('line') > 0) this.emit('line', line);
@@ -110,6 +124,23 @@ export abstract class McplTransport extends EventEmitter {
   protected pushStderr(line: string): void {
     if (this.listenerCount('stderr') > 0) this.emit('stderr', line);
     else this.stderrBuffer.push(line);
+  }
+
+  /**
+   * Report a transport error: to the 'error' listeners if there are any, else
+   * as a log line. EventEmitter throws an 'error' that nothing listens for,
+   * and a transport reports its errors from I/O callbacks, where nothing
+   * catches that throw, so it would end the process. A transport has no
+   * listener from its creation until the handshake attaches one, and a
+   * WebSocket server that sends a malformed frame with its upgrade response
+   * makes ws raise an 'error' in that window.
+   */
+  protected reportError(err: Error): void {
+    if (this.listenerCount('error') > 0) this.emit('error', err);
+    else {
+      const server = this.serverId === undefined ? '' : `${this.serverId}: `;
+      console.error(`[mcpl] ${server}a ${this.kind} transport error, with nothing listening for it: ${logDetail(err.message)}`);
+    }
   }
 
   /** Emit 'close' exactly once. */
@@ -151,7 +182,8 @@ export const CHILD_ENV_ALLOWLIST = [
   'http_proxy', 'https_proxy', 'no_proxy',
   '__CF_USER_TEXT_ENCODING',
   // Windows equivalents, harmless elsewhere.
-  'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT', 'APPDATA', 'LOCALAPPDATA', 'USERPROFILE',
+  // USERNAME is Windows' USER, which Python's getpass.getuser() reads there.
+  'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT', 'APPDATA', 'LOCALAPPDATA', 'USERPROFILE', 'USERNAME',
 ];
 
 /** Environment for a stdio child: allowlisted host vars (+ LC_*), then the
@@ -201,12 +233,28 @@ export function buildChildEnv(
 /** The most of a stdio child's stderr a transport keeps for {@link McplTransport.stderrTail}. */
 export const STDERR_TAIL_CHARS = 2_048;
 
+/**
+ * How long a refusal at a stdio child's exit waits for the child's stderr to
+ * end, so that its `stderrTail` holds what the child wrote. Node can emit a
+ * child's `exit` before it has read the last of the child's stderr. When the
+ * child held the stream alone, the stream ends with it, and the wait is short.
+ * The bound binds when another process still holds the stream, such as one the
+ * server started that inherited it, or when the host's loop stalls past it
+ * before reading an end that is waiting. The tail then holds what had arrived.
+ * A process that keeps the stream open, such as one the server started and
+ * left running, holds the refusal up by the bound, a fifth of the reconnect's
+ * default first interval.
+ */
+export const STDERR_END_WAIT_MS = 1_000;
+
 export class StdioTransport extends McplTransport {
   readonly kind = 'stdio' as const;
   /** The first error on the child's stdin or stdout, named in the close reason. */
   private pipeError: Error | undefined;
   private stderrEnd = '';
   private stderrCut = false;
+  /** True once the child's stderr has ended or closed. */
+  private stderrDone = false;
 
   override get stderrTail(): string {
     return (this.stderrCut ? '…' : '') + this.stderrEnd;
@@ -216,13 +264,33 @@ export class StdioTransport extends McplTransport {
     return this.pipeError;
   }
 
+  override stderrEnded(ms: number): Promise<void> {
+    const stderr = this.child.stderr;
+    if (!stderr || this.stderrDone) return Promise.resolve();
+    return new Promise((resolve) => {
+      let timer: NodeJS.Timeout | undefined;
+      const done = () => {
+        clearTimeout(timer);
+        stderr.off('end', done);
+        stderr.off('close', done);
+        resolve();
+      };
+      // Added after the constructor's listeners, so the tail already holds the
+      // stream's last characters when these run.
+      stderr.once('end', done);
+      stderr.once('close', done);
+      timer = setTimeout(done, ms);
+    });
+  }
+
   private constructor(
-    /** The server this child serves, named in what its reaping reports. */
-    private readonly serverId: string,
     private readonly child: ChildProcess,
     private readonly rl: ReadlineInterface,
+    /** The server this child serves, named in its stderr lines and in what
+     *  its reaping reports. */
+    serverId: string,
   ) {
-    super();
+    super(serverId);
 
     this.rl.on('line', (line: string) => this.pushLine(line));
 
@@ -247,9 +315,12 @@ export class StdioTransport extends McplTransport {
     this.child.stderr?.on('end', () => {
       received(decoder.end());
       if (carry.length > 0) this.pushStderr(carry);
+      this.stderrDone = true;
     });
+    // A stream destroyed by an error closes without ending: nothing more comes.
+    this.child.stderr?.on('close', () => { this.stderrDone = true; });
 
-    this.child.on('error', (err) => this.emit('error', err));
+    this.child.on('error', (err) => this.reportError(err));
     // The child's stdin and stdout carry the protocol, so after an error on
     // either, a write's EPIPE or a read error, this transport can't reach the
     // child even if it's still running. The handler ends the child as close()
@@ -280,13 +351,11 @@ export class StdioTransport extends McplTransport {
     // listener absorbs that copy.
     this.child.stdout?.on('error', endOnPipeError);
     this.rl.on('error', () => { /* readline's copy of a stdout error, handled above */ });
-    // stderr carries diagnostics only: a read error on it is reported if
-    // anyone listens and never thrown. It ends nothing once the connection
-    // is wired; during a handshake the listener is the handshake's, which
-    // fails it.
-    this.child.stderr?.on('error', (err) => {
-      if (this.listenerCount('error') > 0) this.emit('error', err);
-    });
+    // stderr carries diagnostics only: a read error on it is reported, to the
+    // listeners or else in the log, and never thrown. It ends nothing once
+    // the connection is wired; during a handshake the listener is the
+    // handshake's, which fails it.
+    this.child.stderr?.on('error', (err) => this.reportError(err));
     this.child.on('exit', (code, signal) => this.markClosed({
       code,
       signal,
@@ -326,7 +395,7 @@ export class StdioTransport extends McplTransport {
       });
     });
     const rl = createInterface({ input: child.stdout! });
-    return new StdioTransport(config.id, child, rl);
+    return new StdioTransport(child, rl, config.id);
   }
 
   writeLine(json: string): void {
@@ -435,8 +504,8 @@ function raceAbort<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
 export class WebSocketTransport extends McplTransport {
   readonly kind = 'websocket' as const;
 
-  private constructor(private readonly ws: WebSocket) {
-    super();
+  private constructor(private readonly ws: WebSocket, serverId: string) {
+    super(serverId);
 
     this.ws.on('message', (data: WebSocket.RawData, isBinary: boolean) => {
       // MCPL frames are UTF-8 JSON text. A frame MAY contain multiple
@@ -448,7 +517,7 @@ export class WebSocketTransport extends McplTransport {
       }
     });
 
-    this.ws.on('error', (err: Error) => this.emit('error', err));
+    this.ws.on('error', (err: Error) => this.reportError(err));
     this.ws.on('close', (code: number, reason: Buffer) => {
       const text = reason?.toString('utf8');
       this.markClosed(text ? { code, reason: text, reasonFromPeer: true } : { code, reason: 'websocket closed' });
@@ -533,7 +602,7 @@ export class WebSocketTransport extends McplTransport {
         clearTimeout(timer);
         signal?.removeEventListener('abort', onAbort);
         ws.removeAllListeners('error'); // the instance re-attaches its own handlers
-        resolve(new WebSocketTransport(ws));
+        resolve(new WebSocketTransport(ws, config.id));
       });
 
       ws.once('error', (err: Error) => {
@@ -567,8 +636,9 @@ export class WebSocketTransport extends McplTransport {
 }
 
 /**
- * Build the dial URL: validate it's a ws(s):// URL and append the auth token as
- * a `token` query param when provided (preserving any existing query).
+ * Build the dial URL: validate it's a ws(s):// URL the ws library will dial,
+ * which refuses one with a fragment, and append the auth token as a `token`
+ * query param when provided (preserving any existing query).
  */
 export function buildWebSocketUrl(config: McplServerConfig, tokenOverride?: string | null): string {
   if (!config.url) {
@@ -585,6 +655,9 @@ export function buildWebSocketUrl(config: McplServerConfig, tokenOverride?: stri
     throw new Error(
       `MCPL server "${config.id}": websocket url must be ws:// or wss://, got "${parsed.protocol}"`,
     );
+  }
+  if (parsed.hash) {
+    throw new Error(`MCPL server "${config.id}": websocket url must not have a fragment, got "${parsed.hash}"`);
   }
   const token = tokenOverride !== undefined ? tokenOverride : config.token;
   return urlAsDialed(parsed, token).toString();
@@ -644,23 +717,8 @@ const SERVER_CONFIG_BOOLEANS: Record<BooleanSetting, string> = {
 export function assertServerConfigBooleans(config: McplServerConfig): void {
   for (const [setting, whatTrueDoes] of Object.entries(SERVER_CONFIG_BOOLEANS) as Array<[BooleanSetting, string]>) {
     if (setting === 'inheritEnv' && dialsNetwork(config)) continue;
-    const value: unknown = config[setting];
-    if (value === undefined || value === null || typeof value === 'boolean') continue;
-    const wanted = typeof value === 'string' ? 'true or false, unquoted,' : 'true or false,';
-    throw new Error(`MCPL server "${config.id}" ${setting} must be ${wanted} not ${kindOf(value)}: ${whatTrueDoes}`);
+    assertBooleanSetting(`MCPL server "${config.id}" ${setting}`, config[setting], whatTrueDoes);
   }
-}
-
-/** The kind of a value that isn't undefined, null or a boolean, as a refusal
- *  names it in place of the value. */
-function kindOf(value: unknown): string {
-  if (Array.isArray(value)) return 'an array';
-  if (typeof value !== 'object') return `a ${typeof value}`;
-  const prototype = Object.getPrototypeOf(value) as { constructor?: { name?: string } } | null;
-  if (prototype === null || prototype === Object.prototype) return 'an object';
-  const name = prototype.constructor?.name;
-  if (!name) return 'an object that isn\'t plain';
-  return `${/^[aeiou]/i.test(name) ? 'an' : 'a'} ${name}`;
 }
 
 /**

@@ -64,12 +64,32 @@ Chronicle's audit history.
   model: 'claude-opus-4-20250514',
   systemPrompt: '...',
   strategy: new AutobiographicalStrategy({ recentWindowTokens: 30000 }),
-  allowedTools: ['search', 'read', 'write'],   // or 'all'
+  allowedTools: ['search--query', 'utils', 'files--archive'], // or 'all'
   triggerSources: ['discord'],                   // or 'all'
   maxTokens: 8192,
   maxStreamTokens: 150_000,  // input token budget before stream restart
 }
 ```
+
+`allowedTools` is enforced at dispatch for registered agents. Omission or
+`'all'` permits all tools; an explicit list matches exact names, including
+`module--utility` names. Utilities aren't tools of their own: an agent's model
+and its scripts are offered them only through `utils`, whose `run` checks the
+utility's own name. An agent that should use a utility lists both `utils` and
+`module--utility`. The name alone passes the dispatch check for any call by
+that name, whether the host makes it with `executeToolCall` on the agent's
+behalf or the model or a script makes it without being offered it. The slot
+is hidden when the agent can use no registered utility. If utilities exist
+but none are permitted, `list` returns a failed `ToolResult` with the registered
+and permitted counts and migration advice, and a list containing `utils`
+logs one warning per Agent instance after registration.
+An empty registry still returns a successful empty list.
+
+Trusted module calls are exempt from agent allowlists. Genuinely unidentified
+public callers, including unknown legacy caller names, remain unrestricted.
+Framework-created ephemeral and conversation identities fail closed while
+unregistered. Hosts using `createEphemeralAgent` must register and run the
+returned agent through `runEphemeralToCompletion` for tool authority.
 
 **Inference modes:**
 - **Streaming** (default in framework): `startStreamWithInjections()` returns a `YieldingStream` that emits tokens, tool calls, and completion events. The framework drives the stream, dispatches tools, and resumes automatically.
@@ -255,6 +275,17 @@ defaults to `mcpl--<serverId>`: server `search` with no `toolPrefix` offers
 `mcpl--search--query`, and with `toolPrefix: 'search'` it offers
 `search--query`.
 
+No two servers' prefixes may meet, since their servers could then give one
+tool name. Two prefixes meet when one is the other's followed by `-`, or
+begins with the other's followed by `--`: server `foo` listing `bar--echo` and
+server `foo--bar` listing `echo` would both give `foo--bar--echo`. `create()`
+refuses such a pair, and so do a runtime connect and a restart (before it
+disconnects anything), naming both servers and the rule. `foo` beside
+`foo-bar` or `foobar` is fine. A server that lists one tool more than once has
+its first listing offered to the model and the rest left out, and each tool
+refresh that finds it raises an `mcpl-tool-duplicate` ops alert naming the
+tools. Its webhook post goes out at most once per server in 15 minutes.
+
 These settings take RFC-007 §6.2 patterns (`*` matches any run of characters)
 over that full model-facing name, so they need the prefix:
 
@@ -399,6 +430,8 @@ framework.abortInference('assistant', 'user requested stop');
 
 The non-streaming path uses `AbortSignal` forwarded to `membrane.stream()`, which returns an `AbortedResponse` with partial content. The streaming path cancels the `YieldingStream` directly.
 
+A turn whose stream is cancelled this way, or by `agent.cancelStream()`, ends as a stop, whether the stream reports the cancel as `aborted`, as an `error`, or by just closing: one `inference:aborted` carrying the caller's reason (`user` when none was given), a `[turn-interrupted]` note in the agent's context, and never `inference:exhausted`, which is for failed inferences. A stream that membrane aborts on its own, at a deadline or on an error (reason `timeout` or `error`), is a failed inference. `stop()` and an operator's quiesce abandon end a turn as a stop too, with their own reasons, `shutdown` and `quiesce_abandoned`, and write no note. A stopped stream still writes its inference-log row, with `success: false`.
+
 ## API Server
 
 WebSocket server for external clients (UIs, scripts, other agents).
@@ -421,7 +454,7 @@ persists across restarts; `resume` gates on a fresh per-agent feasibility
 preview of the current runtime settings (`force` overrides).
 
 ```typescript
-await framework.quiesce({ reason: 'refold', timeoutMs: 120_000, abandon: false });
+await framework.quiesce({ reason: 'refold', timeoutMs: 120_000, abandon: false });  // throws QuiesceBlockedError if the deferred writes can't reach disk
 await framework.maintenanceTick();   // drain quarantine / advance merges
 await framework.resume();            // throws ResumeBlockedError if the layout won't compile
 ```

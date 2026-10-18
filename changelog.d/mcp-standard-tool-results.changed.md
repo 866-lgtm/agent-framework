@@ -43,9 +43,9 @@
   the script (`null` when it couldn't; `fetch_reference` takes the id as its
   `ref_id` argument). An unsaved reference that counts as expired also
   carries `expired`, the reason the model's stub gives, and isn't fetched.
-  A block the classifier rejects arrives as the model's
-  `[unrecognized content block: …]` notice, and inline data that also claims
-  a bulk disposition as the withheld notice. #181, by @Meganeuridae, first
+  A block the classifier rejects arrives as the notice the model reads in
+  its place, and inline data that also claims a bulk disposition as the
+  withheld notice. #181, by @Meganeuridae, first
   found scripts losing `structuredContent`, and it kept the saved paths of
   RFC-005 payloads for them by falling back to the text rendering. Here the
   paths are in the structured object, as `savedTo`.
@@ -66,11 +66,11 @@
   above, with references and the oversized form. These two changes, and an
   end-to-end test with real Python adapted from #181's, come from
   @Meganeuridae's review of this change against #181.
-- The direct tool path (`executeToolCall`, `ModuleContext.callTool`) now
-  treats an MCP tool error (`isError: true`) as a failure, with
-  `success: false` and the error text; before, every answer counted as
-  success. `data` is still the raw content array, and `structured` is added
-  when the server sent one.
+- The direct tool path (`executeToolCall`, `ModuleContext.callTool`) adds
+  `structured` to an MCP tool's result, success or failure, when the server
+  sent `structuredContent`. A modern server's result reaches it as an MCPL
+  server's does: an error result is a failure with its text, and a success
+  is the server's content array as `data`.
 - Closing a stdio MCP/MCPL server now waits for the child to exit, sending
   SIGKILL after 2 s. A child still alive 2 s after SIGKILL fails `close()`
   with an explicit error. Before, close returned as soon as a signal was
@@ -114,14 +114,15 @@
   `restartMcplServer` refuses, before it tears the running server down, what
   its connect would refuse: whatever the configuration check refuses (such as
   an unusable binding, userinfo on an http(s) url, or MCPL policy that asks
-  for what a modern server lacks), a new id another server holds, a tool prefix another server or a
-  module holds, a framework whose `stop()` has begun, and a connect or
-  disconnect of the server in flight. Before, a restart disconnected first,
+  for what a modern server lacks), a new id another server holds, a tool
+  prefix another server or a module holds or that meets another server's, a
+  framework whose `stop()` has begun, and a connect or disconnect of the
+  server in flight. Before, a restart disconnected first,
   so a refused connect left the server gone; now the server keeps running.
   From those checks through its connect, the restart holds the id and the
   tool prefix it moves the server to: a connect or a restart started
-  meanwhile is refused them, and a module added meanwhile is refused that
-  prefix, each naming the restart, rather than taking them while the old
+  meanwhile is refused them, or a prefix that meets that one, and a module
+  added meanwhile is refused that prefix, each naming the restart, rather than taking them while the old
   server is torn down. The id and prefix it moves the server from are free
   once its disconnect is done. A disconnect of the id it moves the server
   to (its own, for a restart under the same id), or a `stop()`, that begins

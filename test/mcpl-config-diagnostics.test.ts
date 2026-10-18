@@ -604,7 +604,7 @@ for (const queuedBehind of ['the fetch floor', 'a run in flight'] as const) {
         assert.match(String(await first), /it could not be reaped$/, 'the first run rejects with its failed close');
       }
       await waitFor(
-        () => capture.lines.some((l) => l.includes('srv manifest refresh failed') && l.includes('it could not be reaped')),
+        () => capture.lines.some((l) => l.includes('srv manifest-changed handler failed') && l.includes('it could not be reaped')),
         'the queued run to log its failed close',
       );
     } finally {

@@ -57,18 +57,18 @@ const rejectsWith = async (promise: Promise<unknown>, outcome: McplRequestError[
   return caught as McplRequestError;
 };
 
-test('an error response is error-response, with its code and data kept', async () => {
+test('an error response is error-response, with its data kept and the server\'s words in the message', async () => {
   connection = await McplServerConnection.connect(config(), HOST_CAPS);
   const err = await rejectsWith(connection.sendToolsCall('fail', {}), 'error-response');
-  assert.equal(err.code, -32001);
   assert.deepEqual(err.data, { posted: ['111'] });
-  assert.match(err.message, /returned error for tools\/call: \[-32001\] POSTED: part 1 of 2/);
+  // The method, id and code are the operator's, in the log (mcpl-agent-words).
+  assert.equal(err.message, 'The "outcome" server answered with an error: POSTED: part 1 of 2');
 });
 
-test('a request nobody answers is no-response, and the message is unchanged', async () => {
+test('a request nobody answers is no-response', async () => {
   connection = await McplServerConnection.connect(config({ requestTimeoutMs: 200 }), HOST_CAPS);
   const err = await rejectsWith(connection.sendToolsCall('stuck', {}), 'no-response');
-  assert.match(err.message, /did not respond to tools\/call/);
+  assert.match(err.message, /^The "outcome" server didn't answer within 0\.2 seconds, so whether the request took effect is unknown/);
 });
 
 test('a connection lost while awaiting is no-response', async () => {
@@ -76,11 +76,30 @@ test('a connection lost while awaiting is no-response', async () => {
   await rejectsWith(connection.sendToolsCall('exit', {}), 'no-response');
 });
 
+test('closing the connection while a request awaits its answer rejects it as no-response', async () => {
+  connection = await McplServerConnection.connect(config({ requestTimeoutMs: 10_000 }), HOST_CAPS);
+  const pending = connection.sendToolsCall('stuck', {});
+  // The request fails as the close begins, and the close resolves once the
+  // child has exited, so the rejection is observed before the close is awaited.
+  const rejected = rejectsWith(pending, 'no-response');
+  await connection.close();
+  await rejected;
+  connection = null;
+});
+
+test('channels/open keeps a deadline when requestTimeoutMs is 0, as channels/publish does', { timeout: 10_000 }, async () => {
+  connection = await McplServerConnection.connect(config({ requestTimeoutMs: 0 }), HOST_CAPS);
+  (connection as unknown as { publishDeadlineMs: number }).publishDeadlineMs = 200;
+  const err = await rejectsWith(connection.sendChannelsOpen({ type: 'channel', address: { id: 'nowhere' } } as never), 'no-response');
+  assert.match(err.message, /^The "outcome" server didn't answer within 0\.2 seconds/);
+});
+
 test('a request on a closed connection is not-sent', async () => {
   connection = await McplServerConnection.connect(config(), HOST_CAPS);
   await connection.close();
   const err = await rejectsWith(connection.sendToolsCall('fail', {}), 'not-sent');
-  assert.match(err.message, /Cannot send request: connection to "outcome" is closed/);
+  assert.equal(err.message, 'The request wasn\'t sent: this host closed its connection to the "outcome" server, so nothing ran. ' +
+    'If calling it again fails, ask whoever runs this host.');
   connection = null;
 });
 
@@ -89,4 +108,37 @@ test('McplRequestError is an Error that keeps its message and name', () => {
   assert.ok(err instanceof Error);
   assert.equal(err.name, 'McplRequestError');
   assert.equal(err.message, 'boom');
+});
+
+test('a synchronous write rejection is not-sent, leaves no pending request, and does not poison the next request', async (t) => {
+  const errors = t.mock.method(console, 'error', () => {});
+  connection = await McplServerConnection.connect(config(), HOST_CAPS);
+  const state = connection as unknown as {
+    transport: { writeLine(json: string): void; emit(event: string, line: string): boolean };
+    pendingRequests: Map<unknown, unknown>;
+  };
+  const write = state.transport.writeLine.bind(state.transport);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let unwrittenId: unknown;
+  const lateRenders: unknown[] = [];
+  connection.on('orphaned-render-response', (event) => lateRenders.push(event));
+  // connect() buffers data-plane events until the caller has wired listeners.
+  connection.ready();
+  connection.emit('orphaned-render-response', { params: { featureSet: 'test', key: 'observer-probe', eventId: 'probe' }, result: { content: [] } });
+  assert.equal(lateRenders.length, 1, 'the observer is armed, so absence of a later event is meaningful');
+  lateRenders.length = 0;
+  state.transport.writeLine = (json) => { unwrittenId = JSON.parse(json).id; throw new Error('synthetic write rejection'); };
+  const err = await rejectsWith(connection.sendPushRender({ featureSet: 'test', key: 'unwritten', eventId: 'e1', notices: [], dropped: 0 }), 'not-sent');
+  assert.equal(err.message, 'The request wasn\'t sent: this host couldn\'t write it to the "outcome" server, so nothing ran. Try again later.');
+  // The method, id and the transport's words go to the log.
+  assert.ok(errors.mock.calls.some((call) => /^MCPL server "outcome": writing push\/render \(id=\d+\) failed: "synthetic write rejection"$/.test(String(call.arguments[0]))),
+    errors.mock.calls.map((call) => String(call.arguments[0])).join('\n'));
+  assert.equal(state.pendingRequests.size, 0, 'nothing remains awaiting an unwritten request');
+  t.mock.timers.tick(5000);
+  state.transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: unwrittenId, result: { content: [] } }));
+  assert.deepEqual(lateRenders, [], 'an unwritten render cannot surface a late-response event after its old watchdog deadline');
+  t.mock.timers.reset();
+  state.transport.writeLine = write;
+  const next = await rejectsWith(connection.sendToolsCall('fail', {}), 'error-response');
+  assert.deepEqual(next.data, { posted: ['111'] }, 'a subsequent written request still reaches the real server');
 });

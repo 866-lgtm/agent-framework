@@ -375,7 +375,7 @@ test('a WebSocket dial whose connection is closed meanwhile ends at once, not at
 test("a write to a stdio child that has just exited is never thrown, and isn't reported as an error: the exit's close names it", (t) => {
   const child = Object.assign(new EventEmitter(), { stdin: new EventEmitter(), stderr: new EventEmitter(), killed: false, exitCode: null });
   const rl = new EventEmitter();
-  const transport = new (StdioTransport as unknown as new (id: string, c: unknown, r: unknown) => StdioTransport)('legacy', child, rl);
+  const transport = new (StdioTransport as unknown as new (c: unknown, r: unknown, id: string) => StdioTransport)(child, rl, 'legacy');
   const logged: unknown[] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args); });
   const epipe = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });

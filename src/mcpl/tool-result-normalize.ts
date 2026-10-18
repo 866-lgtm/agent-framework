@@ -133,12 +133,15 @@ export interface StandardToolResult {
  * A payload that can't be retained (no `save`, or saving failed) makes the
  * result a failure to materialize, never a success with part of it lost.
  * Content that is present but isn't a list of blocks makes it a malformed
- * result, never an empty success.
+ * result, never an empty success. A tool's error result with no words, or
+ * only whitespace, reads as `noWords`, which the framework words for its
+ * server and tool.
  */
 export async function normalizeStandardToolResult(
   result: StandardToolResult,
   label: string,
   save: SaveToolPayload | null,
+  noWords = 'Tool call failed',
 ): Promise<ToolResult> {
   const malformed = result.content !== undefined && !Array.isArray(result.content);
   const raw: unknown[] = Array.isArray(result.content) ? result.content : [];
@@ -258,7 +261,7 @@ export async function normalizeStandardToolResult(
   const text = blocks.filter((b): b is Extract<Block, { type: 'text' }> => b.type === 'text').map((b) => b.text).join('\n');
   const structured = hasStructured ? { structured: result.structuredContent } : {};
   if (result.isError) {
-    return { success: false, error: text || 'Tool call failed', isError: true, ...structured };
+    return { success: false, error: text.trim() ? text : noWords, isError: true, ...structured };
   }
   if (malformed) {
     return {

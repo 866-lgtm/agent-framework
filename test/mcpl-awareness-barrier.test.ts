@@ -264,8 +264,8 @@ test('mandatory awareness deadline survives requestTimeoutMs: 0 and durably rele
     const entry = outbox.batches()[0]!.refs[0]!;
     assert.equal(entry.deliveryStatus, 'pending');
     assert.equal(entry.attempts, 1);
-    assert.match(entry.lastError ?? '', /did not respond to tools\/call/);
-    assert.match(entry.lastError ?? '', /outcome is unknown/i);
+    assert.match(entry.lastError ?? '', /didn't answer within/);
+    assert.match(entry.lastError ?? '', /took effect is unknown/i);
     assert.equal(records(statusPath).filter((record) => record.event === 'reaction-call').length, 1);
     const push = records(statusPath).find((record) => record.event === 'push-response');
     assert.equal(push?.ledgerStatus, 'pending', 'failure was durable before inference release');
@@ -1187,6 +1187,10 @@ test('an inbound handler waiting on a generation that fails refuses its request 
   // its marks were not all attempted: nothing that waited behind it may run,
   // and each request is answered with the failure rather than left waiting.
   const framework = Object.create(AgentFramework.prototype) as any;
+  // Each refused request is reported as a handler failure, through
+  // emitTrace, which iterates the trace listeners a constructed framework
+  // always has (#318's registrations, which onTrace makes).
+  framework.traceListeners = [];
   const failing = deferred<any>();
   framework.discordAwarenessBarrier = { generation: 1, requiresBarrier: true, promise: failing.promise };
   const handled: string[] = [];

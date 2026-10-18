@@ -92,14 +92,13 @@ test('a result that fails its outputSchema was answered: a plain error, not a se
   assert.equal(calls(log, 'op'), 1);
 });
 
-test('a JSON-RPC error on the wire is error-response with its code and data', async () => {
+test('a JSON-RPC error on the wire is error-response with its data, and its code in the message', async () => {
   const log = scratchLog();
   const connection = await connect('', log);
   await connection.listTools();
   await assert.rejects(connection.callTool('err', {}), (err: unknown) => {
     assert.ok(err instanceof McplRequestError);
     assert.equal(err.outcome, 'error-response');
-    assert.equal(err.code, -32603);
     assert.deepEqual(err.data, { why: 'on purpose' });
     assert.match(err.message, /returned error for tools\/call "err": \[-32603\] boom/);
     return true;
@@ -354,7 +353,7 @@ test('an input_required continuation keeps its evidence: the second leg decides 
   await assert.rejects(connection.callTool('cont', { leg2: 'error' }), (err: unknown) => {
     assert.ok(err instanceof McplRequestError, String(err));
     assert.equal(err.outcome, 'error-response');
-    assert.equal(err.code, -32603);
+    assert.match(err.message, /\[-32603\]/);
     assert.deepEqual(err.data, { leg: 2, state: 'state-for-error' });
     return true;
   });

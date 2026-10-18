@@ -148,7 +148,6 @@ test('HTTP: an auth wall on a call is an error-response with the status in data'
     assert.ok(err instanceof McplRequestError);
     assert.equal(err.outcome, 'error-response');
     // The status is HTTP's, not a JSON-RPC code: it rides in data.
-    assert.equal(err.code, undefined);
     assert.equal((err.data as { httpStatus?: number }).httpStatus, 401);
     return true;
   });

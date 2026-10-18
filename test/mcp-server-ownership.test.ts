@@ -166,7 +166,7 @@ test('a modern connect is refused while a legacy connect for the same id is stil
     const modernLog = join(dir, 'raw.jsonl');
     const pending = framework.connectMcplServer(legacy('same', 'slow', legacyLog, { SLOW_INIT_MS: '800' }));
     await until(() => launches(legacyLog).length === 1, 'the legacy launch, handshaking');
-    await assert.rejects(framework.connectMcplServer(modern('same', '', modernLog)), /MCPL server "same" is already registered/);
+    await assert.rejects(framework.connectMcplServer(modern('same', '', modernLog)), /MCPL server "same" has a connect in flight; try again once it settles/);
     assert.equal(launches(modernLog).length, 0, 'the modern server was never launched');
     await pending;
     const served = status(framework, 'same')!;

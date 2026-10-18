@@ -4,7 +4,9 @@
   `http://`/`https://` is modern MCP over Streamable HTTP. A stdio server
   stays legacy unless its config sets `protocol: 'modern'`. A modern server's
   tools use the same prefix, tool policy, RFC-008 class hints and dispatch
-  paths as any MCPL server's. It has no MCPL surface: no grant, push,
+  paths as any MCPL server's, and its tool prefix meets the same rules: it
+  can't be a module's name or another server's prefix, or meet another
+  server's, whichever family either server is. It has no MCPL surface: no grant, push,
   channels, inference requests, quiesce plane or awareness gate. MCPL policy
   that asks for that surface on one is a configuration error, such as
   `allowHostCommands: true` or a scope's non-empty `whitelist`. Policy that

@@ -210,8 +210,12 @@ const sizedObject = (pad: number, isError = false) => ({
   content: [],
   structuredContent: { pad: 'x'.repeat(pad) },
   isError,
-  // A tool error with no text carries the framework's own error text.
-  ...(isError ? { error: 'Tool call failed' } : {}),
+  // A tool error with no text carries the framework's own error text, as
+  // the model's dispatch words it.
+  ...(isError ? {
+    error: 'The "modern" server reported an error for mcpl--modern--sized without saying what went wrong. ' +
+      'Whether it did anything is unknown: check before calling it again.',
+  } : {}),
 });
 /** The pad that makes the script's JSON exactly `chars` long. */
 const padFor = (chars: number, isError = false) => chars - JSON.stringify(sizedObject(0, isError)).length;

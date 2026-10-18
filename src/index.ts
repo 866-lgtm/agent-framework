@@ -2,7 +2,7 @@
 export * from './types/index.js';
 
 // Core classes
-export { AgentFramework, BudgetPreflightError, ProviderWaitNotSleptError, ResumeBlockedError } from './framework.js';
+export { AgentFramework, BudgetPreflightError, ProviderWaitNotSleptError, QuiesceBlockedError, ResumeBlockedError } from './framework.js';
 export type { RuntimeSettingsPreview, HostModeStatus } from './framework.js';
 export { Agent } from './agent.js';
 export type { StartStreamResult } from './agent.js';
@@ -83,6 +83,15 @@ export type { GateConfig, GateOptions, GatePolicy, GatePolicyMatch, GateBehavior
 
 // MCPL channel registry (exposed for modules that need channel-level operations)
 export { ChannelRegistry } from './mcpl/index.js';
+
+// Where each accepted inbound item came from (`metadata.inboundSource`)
+export { INBOUND_SOURCE_KEY, readInboundSource, conversationKey } from './mcpl/index.js';
+export type {
+  InboundSource,
+  InboundChannelSource,
+  InboundUnscopedSource,
+  InboundSurfaceSource,
+} from './mcpl/index.js';
 
 // MCPL server config (exposed for hosts that manage servers at runtime via
 // connectMcplServer / disconnectMcplServer / restartMcplServer)
@@ -172,6 +181,7 @@ export * from "./tool-presentation.js";
 export {
   SILENT_HEARTBEAT_SEPARATOR,
   silentHeartbeatOf,
+  type RequestOnlyPrompt,
   type SilentHeartbeatStamp,
   type SilentHeartbeatTick,
 } from './silent-heartbeat.js';

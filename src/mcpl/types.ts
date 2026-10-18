@@ -414,9 +414,11 @@ export interface McplServerConfig {
    * are also the only bound for one that closes its stdin, since Bun emits no
    * 'error' event for the writes to it. requestTimeoutMs is the timeout of
    * every request that names none; the handshake's initialize has its own.
-   * Set 0 to disable. Default: 60000 (60 seconds). A value above
-   * 2^31−1 is refused: Node runs a longer timer after about 1 ms, so every
-   * request would time out at once.
+   * Set 0 to disable, except for channels/publish and the channels/open a
+   * delivery may send first, which keep the 60 s default: a publish's outcome
+   * is reported to the resident and recorded for its draft, so it must end.
+   * Default: 60000 (60 seconds). A value above 2^31−1 is refused: Node runs a
+   * longer timer after about 1 ms, so every request would time out at once.
    *
    * For a modern server it is one deadline per tool call, across every leg
    * of the call, and must be an integer from 1 to 2^31−1. It can't be
@@ -451,7 +453,10 @@ export interface McplServerConfig {
    * `toolLifecycle.*.tools`) match these full names; `enabledTools` /
    * `disabledTools` use the bare server-side names.
    *
-   * Must not collide with any module name or another server's prefix.
+   * Must not equal any module name or another server's prefix, nor meet
+   * another server's prefix: two prefixes meet when one is the other
+   * followed by `-`, or begins with the other followed by `--`, as `foo-`
+   * and `foo--bar` each meet `foo` (prefixesMeet, #265).
    */
   toolPrefix?: string;
 

@@ -365,7 +365,7 @@ test('a server that closes its stdin is ended: a request fails with the disconne
   const answer = connection.sendManifestRequest(30_000).then(() => 'answered', (error: Error) => error.message);
   assert.match(
     await within(answer, 'still waiting after 15 s', 15_000),
-    /^MCPL server "deaf-after-initialize" disconnected unexpectedly \(code=n\/a, signal=SIGTERM, reason=child process exited, and its pipe failed with write EPIPE\) while awaiting mcpl\/manifest/,
+    /^The connection to the "deaf-after-initialize" server closed before it answered, so whether the request took effect is unknown\. Check its effect before trying again; this host is reconnecting to it\.$/,
   );
   assert.equal((await within(closed, null, 15_000))?.reason, 'child process exited, and its pipe failed with write EPIPE');
   assert.equal(await within(reconnected.then(() => 'reconnected'), 'no reconnect within 15 s', 15_000), 'reconnected');
@@ -435,7 +435,7 @@ test("a server that stops reading its stdin without closing it stays connected, 
 
   // Nothing fails the write, so only the request's own 500 ms timeout ends it.
   const answer = connection.sendManifestRequest(500).then(() => 'answered', (error: Error) => error.message);
-  assert.match(await within(answer, 'still waiting after 5 s'), /^MCPL server "stops-reading" did not respond to mcpl\/manifest \(id=\d+\) within 500ms/);
+  assert.match(await within(answer, 'still waiting after 5 s'), /^The "stops-reading" server didn't answer within 0\.5 seconds, so whether the request took effect is unknown/);
   assert.equal(closed, false, 'nothing closed the connection');
   assert.equal(connection.isConnected, true, 'the connection is still up');
 });
@@ -603,7 +603,7 @@ test('a legacy request made after a stdin failure is refused as not sent, and th
     { version: '0.5' },
   );
   t.after(() => connection.close());
-  captureConsoleError(t);
+  const logged = captureConsoleError(t);
   const stderr: string[] = [];
   connection.on('stderr', ({ line }: { line: string }) => { stderr.push(line); });
   const closed = new Promise<{ reason?: string; signal?: string | null }>((resolve) => {
@@ -619,16 +619,22 @@ test('a legacy request made after a stdin failure is refused as not sent, and th
   // From here on nothing is written: a request is refused at once.
   await assert.rejects(connection.sendManifestRequest(30_000), (error: unknown) => {
     assert.ok(error instanceof Error && (error as { outcome?: string }).outcome === 'not-sent', String(error));
-    assert.match((error as Error).message, /^Cannot send request: the stdio pipe of "deaf-and-stubborn" failed with write EPIPE$/);
+    assert.equal((error as Error).message, 'The request wasn\'t sent: this host can no longer write to the "deaf-and-stubborn" server, ' +
+      'so nothing ran. This host is reconnecting to it; try again later.');
     return true;
   });
+  // The pipe's error is the operator's, in the log.
+  assert.ok(logged.some((line) => /^MCPL server "deaf-and-stubborn": \S+ not sent, since its stdio pipe failed: .*write EPIPE/.test(line)), logged.join('\n'));
   const info = await within(closed, null, 10_000);
   assert.equal(info?.signal, 'SIGKILL', 'SIGKILL ended it');
   assert.equal(info?.reason, 'child process exited, and its pipe failed with write EPIPE');
   const outcome = await within(first, 'still waiting', 10_000);
   assert.ok(outcome instanceof McplRequestError, `the written request failed with the close: ${String(outcome)}`);
   assert.equal(outcome.outcome, 'no-response', 'it went out, so it may have run');
-  assert.match(outcome.message, /disconnected unexpectedly .*while awaiting mcpl\/manifest/);
+  assert.equal(outcome.message, 'The connection to the "deaf-and-stubborn" server closed before it answered, so whether the request ' +
+    'took effect is unknown. Check its effect before trying again; this host is reconnecting to it.');
+  // How it closed, and the request it left unanswered, are the operator's, in the log.
+  assert.ok(logged.some((line) => /^MCPL server "deaf-and-stubborn" disconnected \(.*signal=SIGKILL, reason=child process exited, and its pipe failed with write EPIPE\) with 1 request\(s\) unanswered: mcpl\/manifest/.test(line)), logged.join('\n'));
   assert.equal(await within(reconnected.then(() => 'reconnected'), 'no reconnect within 15 s', 15_000), 'reconnected');
 });
 

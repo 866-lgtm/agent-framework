@@ -992,7 +992,7 @@ export class ModernMcpConnection extends EventEmitter {
    *   Connectome's stdio line refused before writing, an HTTP refusal before
    *   any request went out);
    * - the most recent leg answered with a JSON-RPC error: `error-response`
-   *   with that error's code and data;
+   *   with that error's data, and its code in the message;
    * - the most recent leg answered with a complete result: the server
    *   finished, but what it returned can't be used (output validation).
    *   That's a plain error, not a request outcome;
@@ -1005,8 +1005,8 @@ export class ModernMcpConnection extends EventEmitter {
    *   result of a type this client doesn't recognize ends the call where it
    *   is;
    * - an HTTP 401/403 refusal of the current leg: `error-response`, the
-   *   status in `data.httpStatus` with `code` absent (the server answered at
-   *   the HTTP layer, outside the JSON-RPC code space). After an earlier leg
+   *   status in `data.httpStatus` (the server answered at the HTTP layer,
+   *   outside the JSON-RPC code space). After an earlier leg
    *   asked for another round it is `no-response` instead: the server may
    *   already have acted on the call;
    * - handed off and unanswered: `no-response`. At the deadline, cancellation
@@ -1025,7 +1025,7 @@ export class ModernMcpConnection extends EventEmitter {
     }
     if (record.answer === 'error' && record.error) {
       const { code, message: wireMessage, data } = record.error;
-      return new McplRequestError(`${prefix} returned error for ${what}: [${code}] ${wireMessage}`, 'error-response', code, data);
+      return new McplRequestError(`${prefix} returned error for ${what}: [${code}] ${wireMessage}`, 'error-response', data);
     }
     if (record.answer === 'complete') {
       return new Error(`${prefix} answered ${what}, but the result can't be used: ${message}`);
@@ -1063,7 +1063,7 @@ export class ModernMcpConnection extends EventEmitter {
       // The response body (the SDK's `text`) is the server's text and can
       // echo the request's url, so it's left out of the data; the status stays.
       const { text: _body, ...data } = (error instanceof SdkHttpError && error.data && typeof error.data === 'object' ? error.data : {}) as Record<string, unknown>;
-      return new McplRequestError(`${prefix} refused ${what}: HTTP ${refusedWith} (${message})`, 'error-response', undefined, { ...data, httpStatus: refusedWith });
+      return new McplRequestError(`${prefix} refused ${what}: HTTP ${refusedWith} (${message})`, 'error-response', { ...data, httpStatus: refusedWith });
     }
     if (deadline) {
       const outcome = record.method === 'tools/list'
