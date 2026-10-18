@@ -40,7 +40,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
-import { IGNORED, NONBLOCK, OTHER_MOUNT, checkDir, diskSpelling, filesystemTrustsCtime, inOtherMount, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, nestedHolder, passedOverAt, readPrefix, type LinkFound } from './observe.js';
+import { IGNORED, NONBLOCK, OTHER_MOUNT, checkDir, diskSpelling, filesystemTrustsCtime, inOtherMount, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, nestedHolder, passedOverAt, readPrefix, foldsCase, type LinkFound, type WorkspaceEntries } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
 import {
   type MountRuntime,
@@ -738,6 +738,8 @@ export class WorkspaceModule implements Module {
    * Each spelling is mount-relative and `/`-separated, with its resolved root.
    */
   private otherMounts = new Map<string, Array<{ name: string; spellings: Array<{ dir: string; root: string }> }>>();
+  /** Whether each mount's root folds case (foldsCase), as the last start read it. */
+  private rootFoldsCase = new Map<string, boolean>();
   /**
    * Whether a file's mode is observed, taken in and applied (MountRuntime's
    * `modesObserved`): not on Windows, which reports no POSIX modes. A test
@@ -907,14 +909,14 @@ export class WorkspaceModule implements Module {
   }
 
   /**
-   * Where a search's walk starts: `base`, its path as disk spells it, then each
-   * segment of `beneath` while disk lists it, in the directory reached so
-   * far, as a directory with exactly that spelling. The walk names what it
-   * finds from its start's spelling, and a case-insensitive disk would let
-   * it go on under a spelling disk doesn't list, taking files in under that
-   * spelling beside their own. So the start stops before a segment spelled
-   * any other way, not there, or not a directory, and before a link, which
-   * a walk of the whole mount doesn't go through either. It lists only
+   * Where a search's walk starts: `base`, its path as parsePath spells it,
+   * then each segment of `beneath` while disk lists it, in the directory
+   * reached so far, as a directory with exactly that spelling. The walk names
+   * what it finds from its start's spelling, and a case-insensitive disk
+   * would let it go on under a spelling disk doesn't list, taking files in
+   * under that spelling beside their own. So the start stops before a segment
+   * spelled any other way, not there, or not a directory, and before a link,
+   * which a walk of the whole mount doesn't go through either. It lists only
    * directories it has checked lie inside the mount, and none the mount
    * passes over by design, which the walk then answers for.
    */
@@ -962,13 +964,17 @@ export class WorkspaceModule implements Module {
   }
 
   async start(ctx: ModuleContext): Promise<void> {
-    // Each nested mount's directory as disk spells it, read before this start
-    // sets anything, so a restart takes no call and walks or watches nothing
-    // before the spellings are known. A stop begun meanwhile stands, and this
-    // start then sets nothing.
+    // Each nested mount's directory as disk spells it, and whether each
+    // mount's root folds case, read before this start sets anything, so a
+    // restart takes no call and walks or watches nothing before the
+    // spellings are known. A stop begun meanwhile stands, and this start then
+    // sets nothing.
     const stops = this.stopsBegun;
     await this.spellNestedDirs();
+    const rootFoldsCase = new Map<string, boolean>();
+    for (const mount of this.config.mounts) rootFoldsCase.set(mount.name, await foldsCase(resolve(mount.path)));
     if (this.stopsBegun !== stops) return;
+    this.rootFoldsCase = rootFoldsCase;
 
     this.ctx = ctx;
     this.stopped = false;
@@ -1936,17 +1942,34 @@ export class WorkspaceModule implements Module {
    * disk spells it (diskSpelling), with `path` the mount-prefixed path so
    * spelled. On a disk that folds names, a path spelled otherwise reaches
    * disk's file, so every tool takes it by disk's name: one name per file,
-   * and the names its answers give are disk's. A handler that must read
-   * something at the moment it's asked, as handleSync reads the branch a path
-   * sync adopts on, reads it before calling this, since this awaits disk.
+   * and the names its answers give are disk's. The workspace's entries
+   * (entriesOf) stand in for disk where it has nothing yet, so a draft has
+   * one name too, and a path that names an entry exactly keeps that spelling.
+   * A handler that must read something at the moment it's asked, as
+   * handleSync reads the branch a path sync adopts on, reads it before
+   * calling this, since this awaits disk.
    */
   private async parsePath(path: string): Promise<{ mount: MountState; relativePath: string; path: string }> {
     const given = this.parsePathAsGiven(path);
-    const relativePath = await diskSpelling(resolve(given.mount.config.path), given.relativePath);
+    const relativePath = await diskSpelling(resolve(given.mount.config.path), given.relativePath, this.entriesOf(given.mount));
     return {
       mount: given.mount,
       relativePath,
       path: relativePath === given.relativePath ? path : `${given.mount.config.name}/${relativePath}`,
+    };
+  }
+
+  /**
+   * A mount's entries on the current branch, and whether its root folds case
+   * as the last start read it (false before the first), as diskSpelling
+   * reads them.
+   */
+  private entriesOf(mount: MountState): WorkspaceEntries {
+    const store = this.getStore();
+    return {
+      has: (path) => store.treeGet(mount.treeStateId, path) !== null,
+      under: (prefix) => store.treeList(mount.treeStateId, prefix).map((entry) => entry.path),
+      rootFoldsCase: this.rootFoldsCase.get(mount.config.name) ?? false,
     };
   }
 
