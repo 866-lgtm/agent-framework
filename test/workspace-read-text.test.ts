@@ -171,6 +171,21 @@ test('a page with notes holds to the result limit with its notes', async t => {
   }
 });
 
+test('a generated file reads under the call\'s result limit too', async t => {
+  const { workspace } = await setup(t, 'unused');
+  const catalogue = Array.from({ length: 500 }, (_, i) => `tool ${i + 1}: a description long enough to fill a page`).join('\n');
+  workspace.registerGeneratedTextFile('work/tools.md', () => catalogue, 'ada');
+  const read = (resultMaxChars?: number) => workspace.handleToolCall({
+    id: 'generated', name: 'read', input: { path: 'work/tools.md' }, callerAgentName: 'ada', ...(resultMaxChars !== undefined ? { resultMaxChars } : {}),
+  });
+  const limited = await read(1_000);
+  assert.ok(stored(limited) <= 1_000, `${stored(limited)}`);
+  const page = limited.data as LinePage;
+  assert.equal(page.note, `Stopped at line ${page.toLine} to stay within the 1000-character result limit (file has 500). Continue with offset=${page.toLine! + 1}.`);
+  // A call made in process takes it whole.
+  assert.equal(((await read()).data as LinePage).toLine, 500);
+});
+
 test('a first line that alone would pass the limit is cut where it fits', async t => {
   // Each quote takes two characters as JSON.
   const { read } = await setup(t, '"'.repeat(1500) + '\nnext\n');

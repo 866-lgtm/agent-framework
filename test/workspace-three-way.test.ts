@@ -5090,7 +5090,7 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
     env.writeDisk('a.txt', 'edited before the wrap');
     await call(m, 'sync', {});
     assert.deepEqual(syncedNames(env), ['a.txt', 'b/x.txt', 'b/y.txt', 'm.txt', 'z.txt']);
-    assert.equal(await contentOf(m, 'a.txt'), 'edited before the wrap', 'the third sync wrapped to a.txt');
+    assert.equal(storedOf(env, 'a.txt'), 'edited before the wrap', 'the third sync wrapped to a.txt');
   });
 
   test('the walk takes files by name, whatever order they were written in', async (t) => {
@@ -5129,7 +5129,7 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
     env.writeDisk('c.txt', 'edited past the cap');
     await call(m, 'sync', {});
     await call(m, 'sync', {});
-    assert.equal(await contentOf(m, 'c.txt'), 'edited past the cap');
+    assert.equal(storedOf(env, 'c.txt'), 'edited past the cap');
   });
 
   test('a deletion in a directory larger than the cap is proven by a listing read whole', async (t) => {
@@ -5244,7 +5244,7 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
     env.writeDisk('a/1.txt', 'edited before the wrap');
     await call(m, 'sync', {});
     assert.deepEqual(syncedNames(env), ['a/1.txt', 'a/2.txt', 'a/3.txt', 'm/1.txt', 'm/2.txt']);
-    assert.equal(await contentOf(m, 'a/1.txt'), 'edited before the wrap');
+    assert.equal(storedOf(env, 'a/1.txt'), 'edited before the wrap');
   });
 
   test('once the cap is reached no further directory is listed, so a deletion there waits for a pass that lists it', async (t) => {
@@ -5710,7 +5710,7 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
       return readdir(path, ...rest);
     }, () => call(m, 'sync', {}));
     assert.ok(removed && restored);
-    assert.equal(await contentOf(m, 'm/1.txt'), 'm/1.txt edited while it was gone');
+    assert.equal(storedOf(env, 'm/1.txt'), 'm/1.txt edited while it was gone');
   });
 
   test('a directory sync whose own directory is gone when the after stretch lists it, and another by the wrap, proves nothing absent', async (t) => {
@@ -6705,6 +6705,18 @@ describe('grep', () => {
     assert.deepEqual((one.results as Array<{ file: string }>).map((r) => r.file), ['work/draft.txt']);
   });
 
+  test("a conflict's disk version with CRLF ends is searched and shown as read shows its lines, and says so", async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'v1');
+    env.writeDisk('a.txt', 'disk says ALPHA\r\nsecond\r\n');
+    await call(m, 'write', { path: 'work/a.txt', content: 'workspace says GAMMA\n' });
+    assert.equal((await entryOf(m, 'a.txt'))?.conflict?.diskCopy, 'stored');
+    const data = await call(m, 'grep', { pattern: 'ALPHA$' });
+    assert.deepEqual(data.results.map((r: { version: string; lineEndings?: string; matches: Array<{ text: string }> }) => [r.version, r.lineEndings, r.matches[0]!.text]),
+      [['conflicting-disk', 'CRLF', 'disk says ALPHA']]);
+  });
+
   test("once disk changes again, a conflict's stored disk version is labelled as recorded, and what disk holds now as not searched", async (t) => {
     const env = new Env(t);
     const m = await env.open();
@@ -7034,6 +7046,17 @@ describe('on-agent-action', () => {
       () => call(m, 'read', { path: 'work/a.txt' }));
     assert.equal(data.content, '     1\tA');
     assert.equal(data.note, "The path couldn't be checked against disk (the selected branch kept changing while the scan ran), so this read shows the workspace's copy.");
+    // A character page and a line page under a result limit say so too,
+    // each read starting on main, as the first did.
+    const switching = (n: number) => env.store.switchBranch(n % 2 === 1 ? 'other' : main);
+    env.store.switchBranch(main);
+    const chars = await withReadHook(switching, () => call(m, 'read', { path: 'work/a.txt', offsetChars: 0, limitChars: 10 }));
+    assert.equal(chars.content, 'A');
+    assert.equal(chars.note, data.note);
+    env.store.switchBranch(main);
+    const limited = await withReadHook(switching, () => m.handleToolCall({ id: 't', name: 'read', input: { path: 'work/a.txt' }, resultMaxChars: 1_000 }));
+    assert.equal(limited.success, true, String(limited.error));
+    assert.equal((limited.data as { note?: string }).note, data.note);
   });
 
   test("a read of a file the workspace doesn't hold, whose disk check gives up, says disk couldn't be checked", async (t) => {
@@ -7468,7 +7491,7 @@ describe('a bare materialize after a restart', () => {
     await call(m, 'materialize', {});
     env.writeDisk('a.txt', 'v2 from a shell');
     await call(m, 'sync', {});
-    assert.equal(await contentOf(m, 'a.txt'), 'v2 from a shell', 'disk adopted: a tree change disk already holds');
+    assert.equal(storedOf(env, 'a.txt'), 'v2 from a shell', 'disk adopted: a tree change disk already holds');
     // An entry from before the evidence is unchecked, not unpushed.
     env.legacyEntry('legacy.txt', 'never checked');
     assert.equal((await call(m, 'status', {})).work.pendingChanges, 0);
