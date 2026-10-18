@@ -95,7 +95,8 @@ test('a request on a closed connection is not-sent', async () => {
   connection = await McplServerConnection.connect(config(), HOST_CAPS);
   await connection.close();
   const err = await rejectsWith(connection.sendToolsCall('fail', {}), 'not-sent');
-  assert.equal(err.message, 'The request wasn\'t sent: this host closed its connection to the "outcome" server, so nothing ran.');
+  assert.equal(err.message, 'The request wasn\'t sent: this host closed its connection to the "outcome" server, so nothing ran. ' +
+    'If calling it again fails, ask whoever runs this host.');
   connection = null;
 });
 

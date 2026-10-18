@@ -216,7 +216,8 @@ test('a call pending when this host closes the connection says the outcome is un
   await Promise.all(pending);
   // A request after the close isn't told whether the server comes back either.
   await assert.rejects(connection.sendToolsCall('refuse', {}), {
-    message: `The request wasn't sent: this host closed its connection to the "words" server, so nothing ran.`,
+    message: `The request wasn't sent: this host closed its connection to the "words" server, so nothing ran. ` +
+      'If calling it again fails, ask whoever runs this host.',
   });
   assert.ok(logged(errors.mock.calls, /^MCPL server "words": this host closed its connection with 2 request\(s\) unanswered: tools\/call \(id=(\d+)\), tools\/call \(id=(?!\1\))\d+\)$/),
     'the operator log has both requests');

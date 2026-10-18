@@ -1283,9 +1283,12 @@ export class McplServerConnection extends EventEmitter {
   ): Promise<unknown> {
     if (this.closed) {
       // After this host's own close, which a restart makes before connecting
-      // again and a removal makes for good, only that this host closed it holds.
+      // again and a removal makes for good, only that this host closed it
+      // holds, and one next step holds for both: calling again reaches the
+      // restarted server, or fails where it's gone.
       return Promise.reject(new McplRequestError(this.closedByThisHost
-        ? `The request wasn't sent: this host closed its connection to the "${this.id}" server, so nothing ran.`
+        ? `The request wasn't sent: this host closed its connection to the "${this.id}" server, so nothing ran. ` +
+          'If calling it again fails, ask whoever runs this host.'
         : `The request wasn't sent: the connection to the "${this.id}" server is closed, so nothing ran. ` +
           (this.willReconnect
             ? 'This host is reconnecting to it; try again later.'
