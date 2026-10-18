@@ -484,6 +484,12 @@ function nestedWorkspace(t: TestContext, watch?: 'never'): { workspace: Workspac
   return { workspace, ls };
 }
 
+test('before its first start, resolveAbsolutePath takes a nested mount\'s directory in another case as that mount\'s', (t) => {
+  // Nothing has told the levels yet, so each is taken to fold.
+  const { workspace } = nestedWorkspace(t, 'never');
+  for (const path of ['outer/inner/x.txt', 'outer/INNER/x.txt']) assert.equal(workspace.resolveAbsolutePath(path), null, path);
+});
+
 test('a stop made while start reads a nested mount\'s directory leaves the workspace stopped, watching nothing', async (t) => {
   // Both mounts watch by default, so a start that went on after the stop
   // would start their watchers and announce the mounts.

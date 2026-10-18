@@ -766,7 +766,7 @@ export class WorkspaceModule implements Module {
    * `folds` gives, for each segment of the directory, how the directory
    * holding it compares names (spellNestedDirs), which holderOf uses to take
    * a path judged as given into that mount's directory in a spelling disk
-   * folds to it.
+   * folds to it. Until a start tells them, every level is taken to fold.
    */
   private otherMounts = new Map<string, Array<{ name: string; spellings: Array<{ dir: string; root: string }>; folds: LevelFolds[] }>>();
   /**
@@ -836,7 +836,7 @@ export class WorkspaceModule implements Module {
           // directory, read against `/`-separated paths, whatever the
           // platform's.
           const relPath = rel.split(sep).join('/');
-          this.otherMounts.set(outer.name, [...(this.otherMounts.get(outer.name) ?? []), { name: inner.name, spellings: [{ dir: relPath, root: innerPath }], folds: [] }]);
+          this.otherMounts.set(outer.name, [...(this.otherMounts.get(outer.name) ?? []), { name: inner.name, spellings: [{ dir: relPath, root: innerPath }], folds: relPath.split('/').map(() => ({ case: true, normalization: true })) }]);
           console.warn(
             `[workspace] Mount "${outer.name}" contains mount "${inner.name}" ` +
             `at ${relPath}/ — passing over it as another mount's directory`,
