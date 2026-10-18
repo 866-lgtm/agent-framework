@@ -5542,6 +5542,215 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
   });
 });
 
+describe('a search starts at the directory its pattern names', () => {
+  const matchesOf = async (m: WorkspaceModule, input: Record<string, unknown>): Promise<string[]> =>
+    ((await call(m, 'glob', input)).matches as Array<{ path: string }>).map((match) => match.path);
+  const grepped = async (m: WorkspaceModule, input: Record<string, unknown>): Promise<string[]> =>
+    ((await call(m, 'grep', input)).results as Array<{ file: string }>).map((result) => result.file);
+  /**
+   * At a walk cap of 2, a walk of the whole mount takes a's first two files
+   * and stops before z, and a walk of z takes its own two and stops before
+   * z/deep.
+   */
+  const pastTheCap = (env: Env): void => {
+    for (const f of ['a/1.txt', 'a/2.txt', 'a/3.txt', 'z/1.txt', 'z/2.txt']) env.writeDisk(f, 'filler');
+    env.writeDisk('z/deep/x.ts', 'a needle');
+    env.writeDisk('z/deep/y.ts', 'nothing here');
+  };
+
+  // Each search runs on a mount of its own: one before it would have taken
+  // z/deep's files in, and a walk reports what the store holds wherever it
+  // stopped.
+  test('past the walk cap, glob finds the files in the directory its pattern names', async (t) => {
+    const cases: Array<[Record<string, unknown>, string[]]> = [
+      [{ pattern: '**/*.ts' }, []],
+      [{ pattern: 'z/deep/*.ts' }, ['work/z/deep/x.ts', 'work/z/deep/y.ts']],
+      [{ path: 'work/z', pattern: 'deep/*.ts' }, ['work/z/deep/x.ts', 'work/z/deep/y.ts']],
+      // A pattern with no literal directory starts at the path.
+      [{ path: 'work/z/deep', pattern: '*.ts' }, ['work/z/deep/x.ts', 'work/z/deep/y.ts']],
+    ];
+    for (const [input, want] of cases) {
+      const env = new Env(t);
+      pastTheCap(env);
+      const m = await env.open({ walkCap: 2 });
+      assert.deepEqual(await matchesOf(m, input), want, JSON.stringify(input));
+    }
+  });
+
+  test('past the walk cap, grep searches what its filter names, from the deeper of the filter\'s directory and its path', async (t) => {
+    const cases: Array<[Record<string, unknown>, string[]]> = [
+      [{ pattern: 'needle' }, []],
+      [{ pattern: 'needle', glob: 'z/deep/*.ts' }, ['work/z/deep/x.ts']],
+      [{ pattern: 'needle', path: 'work/z', glob: 'z/deep/**' }, ['work/z/deep/x.ts']],
+      [{ pattern: 'needle', path: 'work/z/deep', glob: 'z/**' }, ['work/z/deep/x.ts']],
+      [{ pattern: 'needle', path: 'work/z/deep', glob: 'z/deep/*.ts' }, ['work/z/deep/x.ts']],
+    ];
+    for (const [input, want] of cases) {
+      const env = new Env(t);
+      pastTheCap(env);
+      const m = await env.open({ walkCap: 2 });
+      assert.deepEqual(await grepped(m, input), want, JSON.stringify(input));
+    }
+  });
+
+  // Each list is what a walk of the whole mount finds: the test passes on
+  // the code before searches started at their pattern's directory too.
+  test('within the cap, each pattern finds what a walk of the whole mount finds, and leaves nothing incomplete', async (t) => {
+    const env = new Env(t);
+    for (const f of ['README.md', 'src/a.ts', 'src/lib/b.ts', 'src/lib/c.js', 'test/a.test.ts']) env.writeDisk(f, 'a needle');
+    const m = await env.open();
+    const cases: Array<[string, string[]]> = [
+      ['**/*.ts', ['src/a.ts', 'src/lib/b.ts', 'test/a.test.ts']],
+      ['src/*.ts', ['src/a.ts']],
+      ['src/lib/b.ts', ['src/lib/b.ts']],
+      ['src/{lib,x}/*.js', ['src/lib/c.js']],
+      ['src/l?b/*', ['src/lib/b.ts', 'src/lib/c.js']],
+      ['README.md', ['README.md']],
+      // A segment that's empty, `.` or `..` ends the directory, and none matches.
+      ['./src/*.ts', []],
+      ['../work/src/*.ts', []],
+      ['src//a.ts', []],
+      // A directory that isn't there, and one beneath a file.
+      ['nowhere/*.ts', []],
+      ['README.md/*.ts', []],
+    ];
+    for (const [pattern, expected] of cases) {
+      const want = expected.map((p) => `work/${p}`);
+      const found = await call(m, 'glob', { pattern });
+      assert.deepEqual(found.matches.map((match: { path: string }) => match.path), want, `glob ${pattern}`);
+      assert.deepEqual(found.incomplete ?? [], [], `glob ${pattern}`);
+      const searched = await call(m, 'grep', { pattern: 'needle', glob: pattern });
+      assert.deepEqual(searched.results.map((result: { file: string }) => result.file), want, `grep's filter ${pattern}`);
+      assert.deepEqual(searched.incomplete ?? [], [], `grep's filter ${pattern}`);
+    }
+  });
+
+  test('a wildcard segment walks from above it, even where a directory has its name', async (t) => {
+    const env = new Env(t);
+    for (const dir of ['lib', 'l?b', 'a', 'b', '{a,b}', '*']) env.writeDisk(`${dir}/x.ts`, 'a needle');
+    const m = await env.open();
+    const cases: Array<[string, string[]]> = [
+      ['l?b/x.ts', ['l?b', 'lib']],
+      ['{a,b}/x.ts', ['a', 'b']],
+      ['*/x.ts', ['lib', 'l?b', 'a', 'b', '{a,b}', '*']],
+    ];
+    for (const [pattern, dirs] of cases) {
+      const want = dirs.map((dir) => `work/${dir}/x.ts`).sort();
+      assert.deepEqual((await matchesOf(m, { pattern })).sort(), want, `glob ${pattern}`);
+      assert.deepEqual((await grepped(m, { pattern: 'needle', glob: pattern })).sort(), want, `grep's filter ${pattern}`);
+    }
+  });
+
+  test('grep with a path and a filter whose directories don\'t overlap searches nothing, and takes nothing in', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('src/a.ts', 'a needle');
+    env.writeDisk('test/a.test.ts', 'a needle');
+    env.writeDisk('testing/a.ts', 'a needle');
+    const m = await env.open();
+    assert.deepEqual(await grepped(m, { pattern: 'needle', path: 'work/test', glob: 'src/**' }), []);
+    // A sibling whose name starts with the path's lies outside it.
+    assert.deepEqual(await grepped(m, { pattern: 'needle', path: 'work/test', glob: 'testing/**' }), []);
+    for (const path of ['test/a.test.ts', 'src/a.ts', 'testing/a.ts']) {
+      assert.equal(env.store.treeGet(TREE, path), null, `no pass took in ${path}`);
+    }
+  });
+
+  // On a case-insensitive disk, as macOS's is by default, a walk started at
+  // `SRC` would name src's files `SRC/…` and take them in beside their own.
+  // Elsewhere there's no `SRC` to walk, and this holds either way.
+  test('a pattern that spells its directory in another case walks from where disk lists it, finds nothing, and takes nothing in under that spelling', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('src/a.ts', 'a needle');
+    const m = await env.open();
+    assert.deepEqual(await matchesOf(m, { pattern: 'SRC/*.ts' }), []);
+    assert.deepEqual(await grepped(m, { pattern: 'needle', glob: 'SRC/*.ts' }), []);
+    assert.equal(env.store.treeGet(TREE, 'SRC/a.ts'), null);
+    assert.ok(!env.eventsOf('workspace:created').flatMap((e) => e.paths).includes('work/SRC/a.ts'));
+    // The walk started from the root, where disk lists `src`, and took the
+    // file in under its own spelling.
+    assert.notEqual(env.store.treeGet(TREE, 'src/a.ts'), null);
+  });
+
+  test('a pattern whose directory disk doesn\'t list walks from the deepest directory it does', async (t) => {
+    const env = new Env(t);
+    pastTheCap(env);
+    const m = await env.open({ walkCap: 2 });
+    // From z, the walk stops before z/deep.
+    const found = await call(m, 'glob', { pattern: 'z/nowhere/*.ts' });
+    assert.deepEqual(found.matches, []);
+    assert.deepEqual(found.incomplete?.map((r: { path: string }) => r.path), ['work/z/deep'], JSON.stringify(found));
+    const searched = await call(m, 'grep', { pattern: 'needle', glob: 'z/nowhere/*.ts' });
+    assert.deepEqual(searched.results, []);
+    assert.deepEqual(searched.incomplete?.map((r: { path: string }) => r.path), ['work/z/deep'], JSON.stringify(searched));
+  });
+
+  test('a search that starts lower takes in and announces only what lies beneath its start, and doesn\'t count as the first whole sync', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('src/a.ts', 'one');
+    env.writeDisk('docs/b.md', 'two');
+    const m = await env.open();
+    await call(m, 'glob', { pattern: 'src/*.ts' });
+    assert.notEqual(env.store.treeGet(TREE, 'src/a.ts'), null, 'beneath the start: taken in');
+    assert.equal(env.store.treeGet(TREE, 'docs/b.md'), null, 'elsewhere: left to a pass that covers it');
+    assert.deepEqual(env.eventsOf('workspace:created').flatMap((e) => e.paths), ['work/src/a.ts']);
+    assert.equal((await call(m, 'status', {})).work.initialSyncDone, false);
+    await call(m, 'grep', { pattern: 'one', glob: 'src/*.ts' });
+    assert.equal((await call(m, 'status', {})).work.initialSyncDone, false, 'nor a grep whose filter names a directory');
+    await call(m, 'glob', { pattern: '**/*.md' });
+    assert.notEqual(env.store.treeGet(TREE, 'docs/b.md'), null);
+    assert.equal((await call(m, 'status', {})).work.initialSyncDone, true, 'a pattern with no literal directory walks the whole mount');
+  });
+
+  test('a pattern into a directory the mount passes over by design names that directory, as a search given it as its path does', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('vendor/lib/x.js', 'x');
+    env.writeDisk('a/b/sub/y.js', 'y');
+    const m = await env.open({}, { mounts: [
+      { name: 'work', path: env.dir, mode: 'read-write', watch: 'never', ignore: ['vendor'] },
+      { name: 'deep', path: env.disk('a/b'), mode: 'read-write', watch: 'never' },
+    ] });
+    // An ignored directory, and another mount's: nothing beneath either is
+    // listed to choose the start.
+    for (const [dir, beneath] of [['vendor', 'lib'], ['a/b', 'sub']]) {
+      const viaPath = await call(m, 'glob', { path: `work/${dir}`, pattern: '**' });
+      assert.equal(viaPath.incomplete?.length, 1, JSON.stringify(viaPath));
+      assert.equal(viaPath.incomplete[0].path, `work/${dir}`);
+      const found = await call(m, 'glob', { pattern: `${dir}/${beneath}/*.js` });
+      assert.deepEqual(found.matches, [], dir);
+      assert.deepEqual(found.incomplete, viaPath.incomplete, `glob ${dir}`);
+      const searched = await call(m, 'grep', { pattern: '.', glob: `${dir}/${beneath}/*.js` });
+      assert.deepEqual(searched.results, [], dir);
+      assert.deepEqual(searched.incomplete, viaPath.incomplete, `grep's filter ${dir}`);
+    }
+  });
+
+  test('a pattern through a symlinked directory reaches nothing past the link, as a walk of the whole mount does', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('real/x.ts', 'x');
+    symlinkSync('real', env.disk('link'));
+    const outside = mkdtempSync(join(tmpdir(), 'ws-outside-'));
+    t.after(() => rmSync(outside, { recursive: true, force: true }));
+    mkdirSync(join(outside, 'sub'));
+    writeFileSync(join(outside, 'sub', 'y.ts'), 'y');
+    symlinkSync(outside, env.disk('out'));
+    const m = await env.open();
+    // A link inside the mount, one leading out of it, and a directory
+    // beyond one: each is passed over, as a walk from the root passes it.
+    for (const pattern of ['link/*.ts', 'out/sub/*.ts']) {
+      assert.deepEqual(await matchesOf(m, { pattern }), [], `glob ${pattern}`);
+      assert.deepEqual(await grepped(m, { pattern: '.', glob: pattern }), [], `grep's filter ${pattern}`);
+    }
+    for (const path of ['link/x.ts', 'out/sub/y.ts']) {
+      assert.equal(env.store.treeGet(TREE, path), null, `nothing taken in at ${path}`);
+    }
+    // A path through the link that leads out is refused, naming the link,
+    // and nothing past it is listed to choose a deeper start.
+    const viaPath = await call(m, 'glob', { path: 'work/out', pattern: 'sub/*.ts' });
+    assert.deepEqual(viaPath.matches, []);
+    assert.deepEqual(viaPath.incomplete?.map((r: { path: string }) => r.path), ['work/out'], JSON.stringify(viaPath));
+  });
+});
+
 describe('the mount boundary', () => {
   test('a root replaced during an absence proof proves nothing: the replacement lacks what the original still holds', async (t) => {
     const env = new Env(t);
