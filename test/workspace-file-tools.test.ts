@@ -11,13 +11,16 @@ import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import type { ToolResult } from '../src/types/events.js';
 
-function setup(t: TestContext, opts: { autoMaterialize?: boolean } = {}) {
+function setup(t: TestContext, opts: { autoMaterialize?: boolean; maxFileSize?: number } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'workspace-file-tools-'));
   const dir = join(root, 'mount');
   mkdirSync(dir);
   const store = JsStore.openOrCreate({ path: join(root, 'store') });
   const workspace = new WorkspaceModule({
-    mounts: [{ name: 'work', path: dir, mode: 'read-write', watch: 'never', autoMaterialize: opts.autoMaterialize ?? false }],
+    mounts: [{
+      name: 'work', path: dir, mode: 'read-write', watch: 'never', autoMaterialize: opts.autoMaterialize ?? false,
+      ...(opts.maxFileSize !== undefined ? { maxFileSize: opts.maxFileSize } : {}),
+    }],
   });
   workspace.initStore(store);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -265,13 +268,13 @@ test('an edit of a draft whose disk copy also changed applies to the draft and n
 
   // A miss says so too: the text the agent sought may be disk's.
   assert.equal(errorOf(await call('edit', { path: 'work/k.txt', oldString: 'another', newString: 'x' })),
-    "String not found in work/k.txt. The path is in conflict with disk (both-changed): the edit looked in the workspace's copy. Sync the path to take disk's copy instead, or materialize it with force to write the workspace's over disk's.");
+    "String not found in work/k.txt. The path is in conflict with disk (both-changed): the edit looked in the workspace's copy. Sync the path to keep disk's copy and give up the workspace's, or materialize it with force to write the workspace's over disk's.");
   assert.equal(errorOf(await call('edit', { path: 'work/k.txt', oldString: 'a', newString: 'x' })),
-    "String found 2 times in work/k.txt. Use replaceAll: true or provide more context. The path is in conflict with disk (both-changed): the edit looked in the workspace's copy. Sync the path to take disk's copy instead, or materialize it with force to write the workspace's over disk's.");
+    "String found 2 times in work/k.txt. Use replaceAll: true or provide more context. The path is in conflict with disk (both-changed): the edit looked in the workspace's copy. Sync the path to keep disk's copy and give up the workspace's, or materialize it with force to write the workspace's over disk's.");
   const edit = await call('edit', { path: 'work/k.txt', oldString: 'draft', newString: 'draft, edited' });
   assert.equal(edit.success, true, edit.error);
   assert.equal((edit.data as { note: string }).note,
-    "The path is in conflict with disk (both-changed): the edit is in the workspace's copy. Sync the path to take disk's copy instead, or materialize it with force to write the workspace's over disk's.");
+    "The path is in conflict with disk (both-changed): the edit is in the workspace's copy. Sync the path to keep disk's copy and give up the workspace's, or materialize it with force to write the workspace's over disk's.");
   assert.equal(await stored('k.txt'), 'agent draft, edited\n');
   assert.equal(disk('k.txt')!.toString(), 'another writer\n');
 });
@@ -284,7 +287,7 @@ test("an edit refused for a workspace copy that isn't valid UTF-8 names the path
   store.treeSet('workspace/work/tree', 'c.txt', { blobHash: store.storeBlob(latin1, 'text/plain'), size: latin1.byteLength, mode: 0o644 });
   writeFileSync(join(dir, 'c.txt'), 'disk copy\n');
   assert.match(errorOf(await call('edit', { path: 'work/c.txt', oldString: 'caf', newString: 'tea' })),
-    /^The edit did nothing: work\/c\.txt isn't valid UTF-8, .* The path is in conflict with disk \(unknown-provenance\): the edit looked in the workspace's copy\. Sync the path to take disk's copy instead, or materialize it with force to write the workspace's over disk's\.$/);
+    /^The edit did nothing: work\/c\.txt isn't valid UTF-8, .* The path is in conflict with disk \(unknown-provenance\): the edit looked in the workspace's copy\. Sync the path to keep disk's copy and give up the workspace's, or materialize it with force to write the workspace's over disk's\.$/);
 });
 
 // ---------------------------------------------------------------------------
@@ -586,11 +589,15 @@ test("a path whose branch intent can't be read is told to sync the path, which r
   assert.match(JSON.stringify(blind.data), /"path":"w\.txt","reason":"disk could not be checked: a symlink, which this mount does not follow"/);
   assert.match(JSON.stringify((await call('materialize', { path: 'work/w.txt' })).data), unseen, "a sync that can't see disk's copy leaves the intent");
   rmSync(join(dir, 'w.txt'));
-  // Absent is a copy a sync sees, so the reason names the sync alone.
+  // Absent is a copy a sync sees, so the reason names the sync alone, and
+  // says that it takes disk's deletion.
   assert.match(JSON.stringify((await call('materialize', { path: 'work/w.txt' })).data),
-    /w\.txt: its branch intent can't be read: its record is not a branch intent — sync this path to adopt the disk version, which replaces the intent"/);
+    /w\.txt: its branch intent can't be read: its record is not a branch intent — sync this path to take disk's deletion, which removes the workspace's copy and replaces the intent"/);
   const seen = await call('sync', { path: 'work/w.txt' });
   assert.equal(seen.success, true, seen.error);
+  const removed = await call('read', { path: 'work/w.txt' });
+  assert.equal(removed.success, false, "the sync took disk's deletion");
+  assert.equal(removed.error, 'File not found: work/w.txt');
   assert.doesNotMatch(JSON.stringify((await call('materialize', { path: 'work/w.txt' })).data), /branch intent/, 'once it sees disk, the sync replaces it');
 });
 
@@ -630,3 +637,106 @@ test("an edit of a file disk lacks whose push is refused doesn't say the file we
   assert.equal(await stored('f.txt/l.txt'), 'edited line\n');
   assert.equal(disk('f.txt')!.toString(), 'file\n', "the refused push left disk's file as it was");
 });
+
+// ---------------------------------------------------------------------------
+// Where disk has deleted the file, a sync takes the deletion
+// ---------------------------------------------------------------------------
+
+const DELETION_WAYS = "Sync the path to take disk's deletion, which removes the workspace's copy, or materialize it with force to write the workspace's copy back to disk.";
+
+test("an edit of a draft whose disk copy was deleted says what a sync and a forced materialize do", async (t) => {
+  const { dir, call, disk } = setup(t);
+  for (const name of ['s.txt', 'f.txt']) {
+    writeFileSync(join(dir, name), 'base\n');
+    assert.equal((await call('read', { path: `work/${name}` })).success, true);
+    assert.equal((await call('write', { path: `work/${name}`, content: 'agent draft\n' })).success, true);
+    rmSync(join(dir, name));
+  }
+  assert.equal(errorOf(await call('edit', { path: 'work/s.txt', oldString: 'missing', newString: 'x' })),
+    `String not found in work/s.txt. The path is in conflict with disk (deleted-on-disk): the edit looked in the workspace's copy. ${DELETION_WAYS}`);
+  const edit = await call('edit', { path: 'work/f.txt', oldString: 'draft', newString: 'draft, edited' });
+  assert.equal(edit.success, true, edit.error);
+  assert.equal((edit.data as { note?: string }).note,
+    `The path is in conflict with disk (deleted-on-disk): the edit is in the workspace's copy. ${DELETION_WAYS}`);
+  // Each way out does what the note says.
+  assert.equal((await call('sync', { path: 'work/s.txt' })).success, true);
+  assert.equal((await call('read', { path: 'work/s.txt' })).success, false, "the sync took disk's deletion");
+  const forced = await call('materialize', { path: 'work/f.txt', force: true });
+  assert.equal(forced.success, true, forced.error);
+  assert.equal(disk('f.txt')!.toString(), 'agent draft, edited\n', "the forced materialize wrote the workspace's copy back");
+});
+
+test('a recorded conflict whose disk copy has since been deleted is answered for what disk holds now', async (t) => {
+  const { store, dir, call, disk } = setup(t);
+  writeFileSync(join(dir, 'k.txt'), 'base\n');
+  assert.equal((await call('read', { path: 'work/k.txt' })).success, true);
+  assert.equal((await call('write', { path: 'work/k.txt', content: 'agent draft\n' })).success, true);
+  writeFileSync(join(dir, 'k.txt'), 'another writer\n');
+  // The edit's pass records the conflict as both-changed.
+  assert.match(errorOf(await call('edit', { path: 'work/k.txt', oldString: 'missing', newString: 'x' })),
+    / \(both-changed\): the edit looked in the workspace's copy\. Sync the path to keep disk's copy and give up the workspace's/);
+  rmSync(join(dir, 'k.txt'));
+  assert.equal(errorOf(await call('edit', { path: 'work/k.txt', oldString: 'missing', newString: 'x' })),
+    `String not found in work/k.txt. The path is in conflict with disk (both-changed): the edit looked in the workspace's copy. ${DELETION_WAYS}`);
+  assert.match(JSON.stringify((await call('materialize', { path: 'work/k.txt' })).data),
+    /k\.txt: disk has no copy of this file \(conflict: both-changed\) — sync this path to take disk's deletion, which removes the workspace's copy, or materialize it with force to write the workspace's copy back"/);
+
+  // A conflict with nothing to say which side is newer still needs its push
+  // named: an entry from before the evidence, beside a different disk copy.
+  const bytes = Buffer.from('legacy line\n');
+  store.treeSet('workspace/work/tree', 'n.txt', { blobHash: store.storeBlob(bytes, 'text/plain'), size: bytes.byteLength, mode: 0o644 });
+  writeFileSync(join(dir, 'n.txt'), 'disk copy\n');
+  assert.match(errorOf(await call('edit', { path: 'work/n.txt', oldString: 'missing', newString: 'x' })), / \(unknown-provenance\): /);
+  rmSync(join(dir, 'n.txt'));
+  assert.match(JSON.stringify((await call('materialize', { path: 'work/n.txt' })).data),
+    /n\.txt: disk has no copy of this file \(conflict: unknown-provenance\) — sync this path to take disk's deletion, which removes the workspace's copy, or materialize this path with force to write the workspace's copy back"/);
+  const forced = await call('materialize', { path: 'work/n.txt', force: true });
+  assert.equal(forced.success, true, forced.error);
+  assert.equal(disk('n.txt')!.toString(), 'legacy line\n', "the forced materialize of the named path wrote the workspace's copy back");
+});
+
+test("a push where disk has deleted the file says what a sync and a forced materialize do", async (t) => {
+  const { dir, call, disk, stored } = setup(t, { autoMaterialize: true });
+  // Disk deleted a file the workspace holds unchanged.
+  writeFileSync(join(dir, 'u.txt'), 'v1\n');
+  assert.equal((await call('read', { path: 'work/u.txt' })).success, true);
+  rmSync(join(dir, 'u.txt'));
+  assert.match(JSON.stringify((await call('materialize', { path: 'work/u.txt' })).data),
+    /u\.txt: stale copy: disk changed since it last agreed with the workspace, which did not — sync this path to take disk's deletion, which removes the workspace's copy, or materialize it with force to write the workspace's copy back"/);
+  // A write over a file disk deleted since the workspace read it.
+  writeFileSync(join(dir, 'w.txt'), 'v1\n');
+  assert.equal((await call('read', { path: 'work/w.txt' })).success, true);
+  rmSync(join(dir, 'w.txt'));
+  assert.equal(errorOf(await call('write', { path: 'work/w.txt', content: 'v2\n' })),
+    'The write of "work/w.txt" is stored in the workspace, so don\'t send it again. '
+    + "Its push to disk didn't complete: disk has no copy of this file (conflict: deleted-on-disk) — sync this path to take disk's deletion, which removes the workspace's copy, or materialize it with force to write the workspace's copy back.");
+  assert.equal(await stored('w.txt'), 'v2\n');
+  const forced = await call('materialize', { path: 'work/w.txt', force: true });
+  assert.equal(forced.success, true, forced.error);
+  assert.equal(disk('w.txt')!.toString(), 'v2\n', "the forced materialize wrote the workspace's copy back");
+});
+
+// The workspace doesn't store a disk copy with a null byte (binary), or one
+// past the mount's maxFileSize.
+for (const [kind, limit, copy] of [
+  ['binary', undefined, Buffer.from('bin\0ary\n')],
+  ['past the size limit', 16, Buffer.from(`${'x'.repeat(40)}\n`)],
+] as const) {
+  test(`an edit of a draft whose disk copy the workspace can't hold (${kind}) says a sync keeps disk's copy and gives up the workspace's`, async (t) => {
+    const { dir, call, disk } = setup(t, { maxFileSize: limit });
+    writeFileSync(join(dir, 'b.txt'), 'base\n');
+    assert.equal((await call('read', { path: 'work/b.txt' })).success, true);
+    assert.equal((await call('write', { path: 'work/b.txt', content: 'agent draft\n' })).success, true);
+    writeFileSync(join(dir, 'b.txt'), copy);
+    assert.equal(errorOf(await call('edit', { path: 'work/b.txt', oldString: 'missing', newString: 'x' })),
+      "String not found in work/b.txt. The path is in conflict with disk (both-changed): the edit looked in the workspace's copy. "
+      + "Sync the path to keep disk's copy and give up the workspace's, or materialize it with force to write the workspace's over disk's.");
+    assert.equal((await call('sync', { path: 'work/b.txt' })).success, true);
+    const after = await call('read', { path: 'work/b.txt' });
+    assert.equal(after.success, false, "the sync gave up the workspace's copy");
+    assert.equal(after.error, 'work/b.txt is on disk but not stored in the workspace (binary or over the size limit).');
+    const listed = (await call('ls', { path: 'work' })).data as { entries: Array<{ name: string; state: string }> };
+    assert.equal(listed.entries.find((e) => e.name === 'b.txt')?.state, 'disk-only', 'the listing shows it disk-only');
+    assert.deepEqual(disk('b.txt'), copy, 'disk keeps its copy');
+  });
+}

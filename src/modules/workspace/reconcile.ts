@@ -1342,7 +1342,13 @@ export async function pushPaths(
     // The ways out a refusal names, as materialize takes them: a deletion
     // reaches disk only with applyDeletions.
     const again = s ? 'materialize again' : 'materialize again with applyDeletions';
-    const forced = s ? 'materialize it with force to overwrite it' : 'materialize it with force and applyDeletions to delete it';
+    // Where disk has deleted a file the workspace holds, a sync takes the
+    // deletion, which removes the workspace's copy, and a forced push writes
+    // the workspace's copy back: there is no disk copy to adopt or overwrite.
+    const gone = s !== null && d.kind === 'absent';
+    const forced = !s ? 'materialize it with force and applyDeletions to delete it'
+      : gone ? "materialize it with force to write the workspace's copy back" : 'materialize it with force to overwrite it';
+    const takeDisk = gone ? "sync this path to take disk's deletion, which removes the workspace's copy" : 'sync this path to adopt the disk version';
     // What the effect may find: what this observation saw, unless forced.
     const expect: Expect = opts.force || d.kind === 'unobserved' || d.kind === 'unhashed'
       ? { kind: 'any' }
@@ -1356,7 +1362,7 @@ export async function pushPaths(
         result.skipped.push({
           path,
           reason: 'stale copy: disk changed since it last agreed with the workspace, which did not — ' +
-            `sync this path to adopt the disk version, or ${forced}`,
+            `${takeDisk}, or ${forced}`,
         });
         continue;
       }
@@ -1440,8 +1446,11 @@ export async function pushPaths(
         // replaces it (decide()), and a sync replaces it only where it sees
         // disk's copy, so a copy it can't see is named first. For the rest,
         // fixing what the note names holds, and forcedWay says where force
-        // does too.
-        const sync = 'sync this path to adopt the disk version, which replaces the intent';
+        // does too. Where disk has deleted the file, that sync takes the
+        // deletion.
+        const sync = gone
+          ? "sync this path to take disk's deletion, which removes the workspace's copy and replaces the intent"
+          : 'sync this path to adopt the disk version, which replaces the intent';
         result.skipped.push({
           path,
           reason: bi?.unreadable !== undefined
@@ -1469,7 +1478,12 @@ export async function pushPaths(
       }
       result.skipped.push({
         path,
-        reason: noEvidence
+        // Whatever was recorded, a disk with no copy now is answered for what
+        // it holds; a path with no evidence still needs its push named.
+        reason: gone
+          ? `disk has no copy of this file (conflict: ${kind}) — ${takeDisk}, or ` +
+            `materialize ${noEvidence ? 'this path' : 'it'} with force to write the workspace's copy back`
+          : noEvidence
           ? `disk holds a different copy, and nothing records which is newer (conflict: ${kind}) — ` +
             `sync this path to adopt the disk version, or materialize this path with force ${s ? 'to overwrite it' : 'and applyDeletions to delete it'}`
           : kind === 'interrupted'
