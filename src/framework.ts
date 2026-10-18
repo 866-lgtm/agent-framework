@@ -2166,6 +2166,10 @@ export class AgentFramework {
    * guessing from the newest message in the window.
    */
   private activeTurnTriggers: Map<string, InferenceRequest | undefined> = new Map();
+  /** Triggers whose turn has passed the batch gate (beginAgentTurn): a
+   *  provider hold keeps such a trigger as a retry of its turn
+   *  (retainedForRetry). */
+  private readonly gatedTurnTriggers = new WeakSet<InferenceRequest>();
 
   /** The trigger of `agentName`'s turn in progress, if a turn is running. */
   getActiveTurnTrigger(agentName: string): InferenceRequest | undefined {
@@ -3569,9 +3573,23 @@ export class AgentFramework {
     }
     return { delayMs: ownMs, ownMs, stated: false };
   }
+  /** Two wakes that a withdrawal of a subject's wakes would treat differently
+   *  aren't the same request, as at the quiesce park: a coalesced wake must
+   *  not absorb another subject's wake, or a wake to read a queued render. */
   private sameInferenceRequest(a: InferenceRequest, b: InferenceRequest): boolean {
     return a.agentName === b.agentName && a.reason === b.reason && a.source === b.source &&
-      a.timestamp === b.timestamp && a.channelId === b.channelId;
+      a.timestamp === b.timestamp && a.channelId === b.channelId &&
+      a.coalescingSubject === b.coalescingSubject && !!a.coalescingRead === !!b.coalescingRead;
+  }
+  /** The request a provider hold keeps for `request`. A trigger whose turn
+   *  passed its batch gate is a retry of that turn, which has read its
+   *  batches, rather than a coalesced wake: neither a withdrawal of its
+   *  subject's wakes (§4.2 withdraws a wake whose sole cause is the subject)
+   *  nor the gate, finding the batches consumed, may drop it. */
+  private retainedForRetry(request: InferenceRequest): InferenceRequest {
+    if (!this.gatedTurnTriggers.has(request)) return request;
+    const { coalescingSubject: _subject, coalescingBatch: _batch, coalescingBatchSubjects: _subjects, coalescingRead: _read, ...retry } = request;
+    return retry;
   }
   private consultProviderHold(error: Error, agentName: string): { holdMs: number; reason: string } | undefined {
     if (!this.providerHoldHook) return undefined;
@@ -3631,7 +3649,8 @@ export class AgentFramework {
     const delayMs = hostHold ? hostHold.holdMs : pacing!.delayMs;
     const existing = this.providerAccelerationCooldowns.get(agent.name);
     const held = existing?.heldRequests ?? [];
-    if (trigger && !held.some((r) => this.sameInferenceRequest(r, trigger))) held.push(trigger);
+    const retry = trigger && this.retainedForRetry(trigger);
+    if (retry && !held.some((r) => this.sameInferenceRequest(r, retry))) held.push(retry);
     if (existing) clearTimeout(existing.timer);
     const timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agent.name), Math.min(delayMs, MAX_TIMER_DELAY_MS)); timer.unref?.();
     this.providerAccelerationCooldowns.set(agent.name, { startedAt: existing?.startedAt ?? now,
@@ -3828,7 +3847,7 @@ export class AgentFramework {
     if (until <= now) return false;
     const existing = this.providerAccelerationCooldowns.get(agent.name);
     const held = existing?.heldRequests ?? [];
-    for (const request of requests) {
+    for (const request of requests.map((r) => this.retainedForRetry(r))) {
       if (!held.some((r) => this.sameInferenceRequest(r, request))) held.push(request);
     }
     // An acceleration or host hold already parks the whole agent; its release
@@ -12164,30 +12183,41 @@ export class AgentFramework {
     }
   }
 
+  /** Unread and replaceable in place: queued, or stored, unread and not a
+   *  body-group shard, which the store never edits or removes alone. */
   private isUnreadPlacement(p: CoalescingPlacement): boolean {
     this.resolvePlacement(p);
     if (p.deferredId) return this.deferredMessages.some((m) => m.id === p.deferredId);
     if (!p.messageId) return false;
     const agent = this.agents.get(p.agent);
+    return !!agent && !this.isShard(agent, p.messageId) && this.isUnreadStoredMessage(agent, p.messageId);
+  }
+
+  /** Stored, a deferred entry once its flush has stored it, and unread. A
+   *  render stored as shards counts: whether a message can be replaced in
+   *  place says nothing about whether anyone has read it. */
+  private isStoredUnreadPlacement(p: CoalescingPlacement): boolean {
+    this.resolvePlacement(p);
+    if (p.deferredId || !p.messageId) return false;
+    const agent = this.agents.get(p.agent);
     return !!agent && this.isUnreadStoredMessage(agent, p.messageId);
   }
 
-  /** Stored, a deferred entry once its flush has stored it, and unread. */
-  private isStoredUnreadPlacement(p: CoalescingPlacement): boolean {
-    this.resolvePlacement(p);
-    return !p.deferredId && this.isUnreadPlacement(p);
+  /** A shard of a body group; conservative when the store can't say. */
+  private isShard(agent: Agent, messageId: MessageId): boolean {
+    try { return agent.getContextManager().getMessage(messageId)?.bodyGroupId !== undefined; } catch { return true; }
   }
 
   /**
    * Unread = stored, above the agent's consumed watermark on the current
-   * branch, not a body-group shard (immutable), and not folded into any
-   * summary (compression is consumption, §3.3). Conservative on every doubt.
+   * branch, and not folded into any summary (compression is consumption,
+   * §3.3). Conservative on every doubt.
    */
   private isUnreadStoredMessage(agent: Agent, messageId: MessageId): boolean {
     const cm = agent.getContextManager();
     let message: ReturnType<ContextManager['getMessage']>;
     try { message = cm.getMessage(messageId); } catch { return false; }
-    if (!message || message.bodyGroupId) return false;
+    if (!message) return false;
     // Every agent that can read this message must not have compiled past it.
     // Residents share one message slot, so a message one of them read is
     // history for all of them (the never-rewrite rule is about the message,
@@ -12698,6 +12728,9 @@ export class AgentFramework {
       await this.startAgentStream(agent, {
         ...trigger,
         coalescingBatch: batchOnly || undefined,
+        // Likewise for the whole batch: a merged wake that holds a wake to
+        // read a queued render outlives its subject's withdrawal, requeued too.
+        coalescingRead: requests.some((r) => r.coalescingRead === true) || undefined,
         coalescingBatchSubjects: batchOnly
           ? [...new Set(requests.flatMap((r) => r.coalescingBatchSubjects ?? [r.coalescingSubject!]))]
           : undefined,
@@ -14816,6 +14849,7 @@ export class AgentFramework {
       }
       return false;
     }
+    if (trigger) this.gatedTurnTriggers.add(trigger);
 
     // Record turn checkpoint before inference (only on first attempt, not retries)
     if (attempt === 0 && trigger?.reason !== 'tool_result_guard_retry') {

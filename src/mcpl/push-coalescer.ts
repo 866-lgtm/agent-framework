@@ -701,7 +701,8 @@ export class PushCoalescer<E = unknown> {
    * by now, or another assembly's render, settles and gives the turn nothing
    * of it. The exception is a render no request consumed, placed in this
    * agent's deferred queue: this agent was woken to read it, and once the
-   * flush has stored it, the turn reads it as its own.
+   * flush has stored it, this request consumes it, as it would a render it
+   * materialized.
    */
   async assemble(agentName: string, causes: readonly string[] = []): Promise<AssemblyResult> {
     const result: AssemblyResult = { settled: new Set(), materialized: new Set() };
@@ -712,11 +713,11 @@ export class PushCoalescer<E = unknown> {
       const cause = wanted.has(subject);
       // The handle is wrapped: a bare promise returned through `locked` would
       // be flattened by `then`, holding the lock until the render settled —
-      // and the settlement itself needs the lock. The queued render is read
+      // and the settlement itself needs the lock. The queued render is taken
       // under the same lock, before any render this freeze starts can settle
       // and take the occupant's place.
       const { queued, started } = await this.locked(async () => ({
-        queued: cause && this.queuedFor(subject, agentName),
+        queued: cause && this.takeQueued(subject, agentName),
         started: await this.freeze(subject, agentName, cause),
       }));
       if (queued) { result.settled.add(subject); result.materialized.add(subject); }
@@ -735,13 +736,21 @@ export class PushCoalescer<E = unknown> {
   }
 
   /**
-   * A render of `subject` that no request consumed, placed in `agentName`'s
-   * deferred queue, which the flush has stored and nothing has read yet:
-   * `agentName` was woken to read it.
+   * Under the lock: whether a render of `subject` that no request consumed
+   * waits in `agentName`'s context, placed in its deferred queue, stored by
+   * the flush and read by nothing yet. `agentName` was woken to read it, and
+   * the request being assembled consumes it, as the settlement records a
+   * materialized render, so a retraction or a replacement from here on
+   * appends rather than taking it away from that request.
    */
-  private queuedFor(subject: string, agentName: string): boolean {
-    const occupant = this.subjects.get(subject)?.occupant;
-    return occupant?.reader === agentName && this.host.isStoredUnread(occupant.placement);
+  private takeQueued(subject: string, agentName: string): boolean {
+    const state = this.subjects.get(subject);
+    const occupant = state?.occupant;
+    if (!state || occupant?.reader !== agentName || !this.host.isStoredUnread(occupant.placement)) return false;
+    state.history = 'some';
+    state.consumedEventId = occupant.eventId;
+    state.occupant = undefined;
+    return true;
   }
 
   /**

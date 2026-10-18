@@ -12,7 +12,9 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createMockResponse } from './helpers/mock-membrane.js';
+import { MembraneError } from '@animalabs/membrane';
+import type { StreamEvent, YieldingStream } from '@animalabs/membrane';
+import { createMockResponse, MockYieldingStream } from './helpers/mock-membrane.js';
 import { fixture, eventually, settles, crash, ok, TS, REPLY_DEADLINE_MS } from './helpers/coalescing-fixture.js';
 
 // ---------------------------------------------------------------------------
@@ -1008,11 +1010,16 @@ test('an assembly for an agent outside the audience of a batch another assembly 
 // another agent's queue (a turn with nothing to read never reaches the model)
 // ---------------------------------------------------------------------------
 
+type Wake = { agentName: string; reason?: string; source?: string; timestamp?: number; coalescingSubject?: string; coalescingBatch?: boolean; coalescingRead?: boolean };
+
 type TurnInternals = {
   startAgentStream: (...a: unknown[]) => Promise<unknown>;
   processInferenceRequests: () => Promise<void>;
   activeTurnTokens: Map<string, number>;
-  pendingRequests: Array<{ agentName: string; coalescingSubject?: string; coalescingBatch?: boolean }>;
+  pendingRequests: Wake[];
+  cancelCoalescedWakes(subject: string): void;
+  providerAccelerationCooldowns: Map<string, { startedAt: number; until: number; timer: ReturnType<typeof setTimeout>; heldRequests: Wake[]; reason: string; failures: number }>;
+  releaseProviderAccelerationCooldown(agent: string): void;
   providerGate(agent: string): { auxiliaryInFlight: number; idleWaiters: Array<() => void> };
   drainDeferredFor(agent: string): unknown[];
   readdDrained(entries: unknown[], where: string, opts?: { bypassDeferral?: boolean }): unknown[];
@@ -1438,6 +1445,163 @@ test("a batch consumed by one resident's request gives another resident's batch-
   assert.equal(f.membrane.calls.length, 1, 'one call for the batch');
   assert(f.lastRequest().includes('document_diff'));
   assert.deepEqual(withdrawn, ['other']);
+});
+
+/** A stream that fails with `error` before any content. */
+class FailingStream implements YieldingStream {
+  isWaitingForTools = false;
+  pendingToolCallIds: string[] = [];
+  toolDepth = 0;
+  isCancelled = false;
+  constructor(private readonly error: Error) {}
+  provideToolResults(): void { throw new Error('not waiting'); }
+  cancel(): void { this.isCancelled = true; }
+  async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+    yield { type: 'error', error: this.error } as StreamEvent;
+  }
+}
+
+test("a batch-only turn whose call a provider's capacity limit held is retried when the hold ends, not withdrawn", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const withdrawn = withdrawals(f);
+  // The first call meets an organization acceleration 429, which holds the
+  // turn's trigger for one fresh compile once the cooldown ends.
+  let calls = 0;
+  (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: unknown) => {
+    f.membrane.calls.push(request as never);
+    if (++calls > 1) return new MockYieldingStream([ok()]);
+    return new FailingStream(new MembraneError({
+      type: 'rate_limit', retryable: true, httpStatus: 429,
+      message: "This request would exceed your organization's maximum usage increase rate for input tokens per minute",
+      rawError: { status: 429 }, rawRequest: request,
+    } as ConstructorParameters<typeof MembraneError>[0]));
+  };
+  await f.send('push/event', f.params('1', 'held_fallback', { deferred: true, initial: true }));
+  const internals = f.framework as unknown as TurnInternals;
+  await settles(f.framework.runUntilIdle(), 'the turn that meets the limit');
+  assert.equal(f.membrane.calls.length, 1);
+  const hold = internals.providerAccelerationCooldowns.get('agent');
+  assert.equal(hold?.heldRequests.length, 1, "the turn's trigger is held");
+  // The cooldown's time is up, and its timer's work runs now (a release
+  // before its time only sets the timer again).
+  hold!.until = Date.now();
+  internals.releaseProviderAccelerationCooldown('agent');
+  await settles(f.framework.runUntilIdle(), 'the retry');
+  assert.equal(f.membrane.calls.length, 2, 'the held turn was retried');
+  assert(f.lastRequest().includes('document_diff'), 'and the retry read the render');
+  assert.deepEqual(withdrawn, []);
+});
+
+test("a render placed in a live turn's deferred queue that its flush stores as shards is still the woken agent's to read", async (t) => {
+  const f = await fixture({ agents: TWO_RESIDENTS }); t.after(f.close);
+  f.alwaysRespond();
+  const withdrawn = withdrawals(f);
+  f.renderer(async () => ({ content: [{ type: 'text', text: 'long_render_part_one' }, { type: 'text', text: 'long_render_part_two' }] }));
+  // The store shards the render on ingest, one shard per block, as the
+  // autobiographical strategy's chunking shards a long message.
+  const cm = f.framework.getAgent('agent')!.getContextManager() as unknown as { strategy: Record<string, unknown> };
+  cm.strategy.chunkIngressMessage = (_participant: string, content: Array<{ text?: string }>) =>
+    content[0]?.text === 'long_render_part_one'
+      ? { bodyGroupId: 'body-render', shards: content.map((block, shardIndex) => ({ content: [block], shardIndex })) }
+      : null;
+  await f.send('push/event', f.params('1', 'queued_fallback', { deferred: true, initial: true }));
+  const internals = f.framework as unknown as TurnInternals;
+  // As above: 'other''s assembly renders the batch into the primary's queue
+  // while the primary's turn is alive, and the primary is woken for it.
+  internals.activeTurnTokens.set('agent', -1);
+  try {
+    await settles(internals.processInferenceRequests(), 'one scheduler pass');
+    assert.deepEqual(internals.pendingRequests.map((r) => r.agentName), ['agent'], 'the primary is woken for the render');
+  } finally {
+    endStandInTurn(internals);
+  }
+  assert(f.context().includes('"bodyGroupId":"body-render"'), 'the flush stored the render as shards');
+  await settles(f.framework.runUntilIdle(), "the primary's turn");
+  assert.equal(f.membrane.calls.length, 1);
+  assert(f.lastRequest().includes('long_render_part_two'), "the primary's turn read the sharded render");
+  assert.deepEqual(withdrawn, ['other']);
+});
+
+test('a wake to read a queued render keeps its protection when the scheduler merges it with a batch wake and requeues the merged wake', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const internals = f.framework as unknown as TurnInternals;
+  const subject = 'a-subject';
+  // A newer batch's wake, then a wake to read a render queued for the agent,
+  // both for one subject: the scheduler merges them into one trigger.
+  const wake: Wake = { agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), coalescingSubject: subject, coalescingBatch: true };
+  internals.pendingRequests.push(wake, { ...wake, coalescingRead: true });
+  // The merged wake parks behind an auxiliary call, and another turn takes
+  // the agent meanwhile, so the parked wake is requeued rather than started.
+  const gate = internals.providerGate('agent');
+  gate.auxiliaryInFlight = 1;
+  await settles(internals.processInferenceRequests(), 'the pass that parks the wake');
+  internals.activeTurnTokens.set('agent', -1);
+  try {
+    gate.auxiliaryInFlight = 0;
+    for (const resolve of gate.idleWaiters.splice(0)) resolve();
+    await eventually(() => internals.pendingRequests.length === 1, 'the requeued wake');
+    // Another agent's freeze of the newer batch withdraws the subject's wakes.
+    internals.cancelCoalescedWakes(subject);
+    assert.deepEqual(internals.pendingRequests.map((r) => r.agentName), ['agent'], "the merged wake kept the read wake's protection");
+  } finally {
+    internals.activeTurnTokens.delete('agent');
+  }
+});
+
+test("a provider cooldown holds a wake to read a queued render, and another subject's wake, apart from a batch wake of the same moment", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const internals = f.framework as unknown as TurnInternals;
+  const timer = setTimeout(() => {}, 60_000);
+  internals.providerAccelerationCooldowns.set('agent', { startedAt: Date.now(), until: Date.now() + 60_000, timer, heldRequests: [], reason: 'a test hold', failures: 1 });
+  try {
+    const wake: Wake = { agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), coalescingSubject: 'a-subject', coalescingBatch: true };
+    internals.pendingRequests.push(wake, { ...wake, coalescingRead: true }, { ...wake, coalescingSubject: 'another-subject' });
+    await settles(internals.processInferenceRequests(), 'the pass that holds the wakes');
+    // A freeze of the first subject's newer batch withdraws its wakes.
+    internals.cancelCoalescedWakes('a-subject');
+    assert.deepEqual(internals.providerAccelerationCooldowns.get('agent')!.heldRequests.map((r) => `${r.coalescingSubject}${r.coalescingRead ? ' (read)' : ''}`),
+      ['a-subject (read)', 'another-subject'], 'the read wake and the other subject\'s wake are still held');
+  } finally {
+    clearTimeout(timer);
+    internals.providerAccelerationCooldowns.delete('agent');
+  }
+});
+
+test("a render queued for an agent is that agent's once its assembly takes it: a retraction while the assembly waits on another render doesn't take it away", async (t) => {
+  const f = await fixture({ agents: TWO_RESIDENTS }); t.after(f.close);
+  f.alwaysRespond();
+  let release!: (value: unknown) => void;
+  let began!: () => void;
+  const started = new Promise<void>((resolve) => { began = resolve; });
+  f.renderer((params) => {
+    if (params.key !== 'other_document') return Promise.resolve({ content: [{ type: 'text', text: 'queued_render' }] });
+    began();
+    return new Promise((resolve) => { release = resolve; });
+  });
+  await f.send('push/event', f.params('1', 'queued_fallback', { deferred: true, initial: true }));
+  const internals = f.framework as unknown as TurnInternals;
+  // As above, a render of the first subject waits in the primary's queue,
+  // and the primary is woken for it. A batch of a second subject then wakes
+  // both residents, so the primary's next turn has both as causes.
+  internals.activeTurnTokens.set('agent', -1);
+  try {
+    await settles(internals.processInferenceRequests(), 'one scheduler pass');
+    await f.send('push/event', { featureSet: 'doc', eventId: '2', timestamp: TS, coalesce: { key: 'other_document', deferred: true, initial: true },
+      payload: { content: [{ type: 'text', text: 'other_fallback' }] } });
+    assert.deepEqual(internals.pendingRequests.map((r) => r.agentName), ['agent', 'agent', 'other']);
+  } finally {
+    endStandInTurn(internals);
+  }
+  // The primary's assembly takes the queued render and renders the second
+  // batch, held. The first subject is retracted meanwhile.
+  const pass = internals.processInferenceRequests();
+  await settles(started, 'the render of the second batch');
+  await f.send('push/event', f.params('3', '', { retract: true }));
+  release({ content: [] });
+  await settles(pass, 'the scheduler pass');
+  await settles(f.framework.runUntilIdle(), 'the drain');
+  assert.equal(f.membrane.calls.length, 1);
+  assert(f.lastRequest().includes('queued_render'), "the primary's turn read the render its assembly took");
 });
 
 test('R14: two consecutive crash windows with an acceptance in between keep both recovered batches', async (t) => {
