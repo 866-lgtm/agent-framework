@@ -36,7 +36,7 @@ import type {
 import type { McplServerRegistry } from './server-registry.js';
 import type { FeatureSetManager } from './feature-set-manager.js';
 import type { ToolDefinition, ToolResult, ProcessEvent } from '../types/index.js';
-import { expandCoreTags, hasNonConversationalTag } from './tags.js';
+import { expandCoreTags, isMarkerTagged } from './tags.js';
 import { coalesceRejectionReason, EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
 import { isVisiblyEmptyConversion } from './visible-content.js';
 import { logDetail, logValue } from './log-value.js';
@@ -394,13 +394,16 @@ interface ChannelRegistryOptions {
    * RFC-006: an admitted `channels/incoming` message carrying `coalesce`, with
    * the event the ordinary path would have queued. The handler decides
    * replace / append / withdraw and returns the per-message result. Throws a
-   * `CoalesceError` for a malformed or unauthorized occurrence.
+   * `CoalesceError` for a malformed or unauthorized occurrence. `firstView`
+   * says the coalescer delivered the message as the agent's first view of it
+   * (`replacesUnread`); it is the host's own, and isn't in the answer to the
+   * server.
    */
   handleCoalescedIncoming?: (
     serverId: string,
     message: ChannelIncomingMessage,
     event: McplChannelIncomingEvent,
-  ) => Promise<ChannelIncomingMessageResult>;
+  ) => Promise<ChannelIncomingMessageResult & { firstView?: true }>;
   /** Chronicle store used for durable desired channel lifecycle state. */
   store?: JsStore;
   /** Callback to determine whether an incoming message should trigger inference. */
@@ -987,12 +990,13 @@ export class ChannelRegistry {
       // exactly the authority a self-attested channel would be stealing).
       // A coalesced item is "accepted" only once the coalescer admits it, so
       // for those this runs after the hook (below).
-      const markAccepted = () => {
+      const markAccepted = (firstView = false) => {
         // Non-conversational markers (a reaction added or removed, an edit, a
         // deletion) are ABOUT a message, not one the agent replies to: they
         // must not retarget the default publish locus or become
-        // `context.incoming`'s reply anchor.
-        if (!hasNonConversationalTag(message.tags)) {
+        // `context.incoming`'s reply anchor. An edit the coalescer delivered
+        // as the agent's first view counts as the message it replaced.
+        if (!isMarkerTagged(message.tags, firstView)) {
           this.defaultPublishChannel = message.channelId;
           this.defaultPublishMessageId = message.messageId;
           this.defaultPublishThreadId = message.threadId;
@@ -1051,8 +1055,8 @@ export class ChannelRegistry {
         // the coalescer, which replaces, appends or withdraws. Malformed
         // `coalesce` is a per-message failure; siblings are unaffected.
         try {
-          const result = await this.handleCoalescedIncoming!(serverId, message, event);
-          if (result.accepted) markAccepted();
+          const { firstView, ...result } = await this.handleCoalescedIncoming!(serverId, message, event);
+          if (result.accepted) markAccepted(firstView === true);
           results.push(result);
         } catch (error) {
           const err = error as Error & { code?: number; field?: string };

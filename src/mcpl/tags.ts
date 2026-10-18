@@ -42,6 +42,16 @@ export function hasNonConversationalTag(tags: unknown): boolean {
 }
 
 /**
+ * True when a message is a marker by its tags. `firstView` is the host's own
+ * mark that the coalescer delivered the message as the agent's first view of
+ * it (`replacesUnread`), never a server's claim: an edit so delivered counts
+ * as the message it replaced, while a reaction or deletion stays a notice.
+ */
+export function isMarkerTagged(tags: unknown, firstView: boolean): boolean {
+  return hasNonConversationalTag(firstView && Array.isArray(tags) ? tags.filter((t) => t !== 'chat:edited') : tags);
+}
+
+/**
  * Expand a raw tag list over the normative core closure, then resolve the
  * §16.2 mutual exclusion: `chat:addressed` and `chat:ambient` cannot both
  * stand after expansion, and addressed wins — a message that is both

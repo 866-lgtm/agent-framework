@@ -876,8 +876,9 @@ export class Agent {
    * does, and sooner: when a committing compile takes its value, before it
    * awaits, and at every tool boundary that injects, whether or not the
    * stream says it carries injected messages. So nothing above it can have
-   * been shown. A scalar counts a prefix, so a message stored below it
-   * without having been shown counts as shown, which errs toward a marker.
+   * been shown. A compile that throws assembled nothing, and gives its move
+   * back. A scalar counts a prefix, so a message stored below it without
+   * having been shown counts as shown, which errs toward a marker.
    */
   private shownWatermark: { branch: string; sequence: number } | null = null;
 
@@ -901,9 +902,21 @@ export class Agent {
   }
 
   /** Mark everything currently stored as possibly shown (a tool boundary
-   *  that injected messages, whatever its stream says it carries). */
+   *  that injected messages, whatever its stream says it carries). Without
+   *  a watermark everything counts as shown, as markContextConsumed counts
+   *  it read. */
   markContextShown(): void {
-    this.shownWatermark = this.pendingWatermark() ?? this.shownWatermark;
+    this.shownWatermark = this.pendingWatermark();
+  }
+
+  /** A committing compile that threw assembled nothing, so its own move of
+   *  the shown watermark goes back, unless a boundary or another compile has
+   *  moved the watermark since. */
+  private unshowFailedCompile(
+    watermark: { branch: string; sequence: number } | null,
+    before: { branch: string; sequence: number } | null,
+  ): void {
+    if (watermark && this.shownWatermark === watermark) this.shownWatermark = before;
   }
 
   /**
@@ -951,9 +964,16 @@ export class Agent {
     // fails assembled nothing, so the watermark moves only on success.
     const watermark = this.pendingWatermark();
     const marksBefore = this.watermarkMarks;
+    const shownBefore = this.shownWatermark;
     if (watermark) this.shownWatermark = watermark;
     const compile = () => this.contextManager.compile(this.compileBudget(budget));
-    const result = budget ? await compile() : await this.compileAtLiveBudget(compile);
+    let result: CompileResult;
+    try {
+      result = budget ? await compile() : await this.compileAtLiveBudget(compile);
+    } catch (error) {
+      this.unshowFailedCompile(watermark, shownBefore);
+      throw error;
+    }
     if (watermark) this.applyCompileWatermark(watermark, marksBefore);
     return result;
   }
@@ -996,9 +1016,16 @@ export class Agent {
     const marksBefore = this.watermarkMarks;
     // Shown from the compile's start: what it assembles is in front of the
     // agent before the consumed watermark moves, once it returns.
+    const shownBefore = this.shownWatermark;
     if (watermark) this.shownWatermark = watermark;
     const compile = () => this.contextManager.compile(this.compileBudget(budget), injections, opts as never);
-    const result = budget || opts?.dryRun ? await compile() : await this.compileAtLiveBudget(compile);
+    let result: CompileResult;
+    try {
+      result = budget || opts?.dryRun ? await compile() : await this.compileAtLiveBudget(compile);
+    } catch (error) {
+      this.unshowFailedCompile(watermark, shownBefore);
+      throw error;
+    }
     if (watermark) this.applyCompileWatermark(watermark, marksBefore);
     return result;
   }

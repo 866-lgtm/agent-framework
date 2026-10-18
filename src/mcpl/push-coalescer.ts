@@ -96,11 +96,12 @@ export interface CoalescedOccurrence<E = unknown> {
   /** Set by the coalescer: deliver into this agent only (§3.2 audience may
    *  narrow, never widen — a replacement or notice follows the prior delivery). */
   deliverTo?: string;
-  /** Set by the coalescer when a plain occurrence replaces one that was the
-   *  agent's first view of the subject (its `initial` birth, or a
-   *  replacement so marked) and that the agent may never have been shown
-   *  (CoalescerHost.isUnshown). The replacement is then the agent's first
-   *  view. No other path sets it. */
+  /** Set by the coalescer when the delivery is the agent's first view of
+   *  the subject: a plain occurrence that replaces one that was the agent's
+   *  first view (its `initial` birth, or a replacement so marked) and that
+   *  the agent may never have been shown (CoalescerHost.isUnshown), or the
+   *  first delivery of a batch that opened on a first view (its render, or
+   *  a plain occurrence that drops it). No other path sets it. */
   replacesUnread?: boolean;
 }
 
@@ -123,6 +124,11 @@ interface DeferredBatch<E> {
   dropped: number;
   /** Set on a batch restored from a snapshot whose render may have started. */
   noRender?: boolean;
+  /** The batch opened on the agent's first view of its subject: a fresh
+   *  `initial` birth, or a first-view occupant it displaced that nothing had
+   *  shown. Its first delivery is a first view too, while nothing of the
+   *  subject has been read since and no other version of it is placed. */
+  firstView?: true;
 }
 
 interface Rendering<E> {
@@ -169,7 +175,9 @@ export interface CoalescingSnapshot {
     identity?: CoalescedOccurrence['identity'];
     occupant?: { eventId: string; placement: CoalescingPlacement };
     audienceAgent?: string;
-    batch?: { latest: CoalescedOccurrence<unknown>; notices: DeferredNotice[]; dropped: number; rendering?: boolean };
+    /** `firstView` only on a batch that wasn't rendering: one that was may
+     *  have been shown. */
+    batch?: { latest: CoalescedOccurrence<unknown>; notices: DeferredNotice[]; dropped: number; rendering?: boolean; firstView?: true };
   }>;
 }
 /** One receipt, written synchronously at acceptance (bridges the snapshot throttle). */
@@ -614,6 +622,9 @@ export class PushCoalescer<E = unknown> {
   }
 
   private async acceptPlain(subject: string, state: SubjectState<E>, occurrence: CoalescedOccurrence<E>, occupantUnread: boolean): Promise<CoalesceOutcome> {
+    // A batch this occurrence drops delivered nothing, so when it opened on
+    // the agent's first view, this occurrence takes that view.
+    const batchFirstView = (state.batch ?? state.rendering?.batch)?.firstView === true;
     const hadBatch = this.dropBatches(subject, state);
     if (occupantUnread && state.occupant) {
       const prior = state.occupant;
@@ -641,24 +652,32 @@ export class PushCoalescer<E = unknown> {
       state.occupant = undefined;
     }
     if (hadBatch) this.host.cancelWake(subject);
-    const placement = await this.host.deliver(occurrence);
     const outcome: CoalesceOutcome = hadBatch ? 'replaced' : state.consumedEventId || state.history !== 'none' ? 'appended' : 'first';
-    // The subject's `initial` birth is the agent's first view of it.
-    state.occupant = placement ? { eventId: occurrence.eventId, placement, ...(outcome === 'first' ? { firstView: true as const } : {}) } : undefined;
+    // The subject's `initial` birth is the agent's first view of it, and so
+    // is an occurrence that takes a first-view batch's place.
+    const firstView = hadBatch ? batchFirstView && state.history === 'none' : outcome === 'first';
+    const placement = await this.host.deliver(hadBatch && firstView ? { ...occurrence, replacesUnread: true } : occurrence);
+    state.occupant = placement ? { eventId: occurrence.eventId, placement, ...(firstView ? { firstView: true as const } : {}) } : undefined;
     if (placement) state.audienceAgent = placement.agent;
     return outcome;
   }
 
   private async acceptDeferred(subject: string, state: SubjectState<E>, occurrence: CoalescedOccurrence<E>, occupantUnread: boolean): Promise<CoalesceOutcome> {
     let outcome: CoalesceOutcome = 'first';
+    // Whether a batch this notice opens is the agent's first view of the
+    // subject: a fresh `initial` birth with nothing read, or a first-view
+    // occupant it displaces that nothing has shown. A render still under way
+    // is weighed when this batch's first delivery is.
+    let firstView = state.history === 'none';
     if (occupantUnread && state.occupant) {
       // §5.1: a notice displaces an unread plain occurrence and opens a batch
       // — in the audience that held the plain occurrence (§3.2).
+      firstView = state.occupant.firstView === true && this.host.isUnshown(state.occupant.placement);
       this.host.audit({ kind: 'displaced', subject, eventId: state.occupant.eventId });
       if (this.host.remove(state.occupant.placement)) {
         outcome = 'replaced';
         occurrence = { ...occurrence, deliverTo: state.occupant.placement.agent };
-      } else { this.host.audit({ kind: 'remove-failed', subject, eventId: state.occupant.eventId }); state.history = 'unknown'; }
+      } else { this.host.audit({ kind: 'remove-failed', subject, eventId: state.occupant.eventId }); state.history = 'unknown'; firstView = false; }
       this.host.cancelWake(subject);
       state.occupant = undefined;
     } else if (state.batch?.latest.deliverTo) {
@@ -673,7 +692,7 @@ export class PushCoalescer<E = unknown> {
       outcome = 'replaced';
     } else {
       // Rule 1: a notice during a render opens a NEW batch ("first").
-      state.batch = { latest: occurrence, notices: [notice], dropped: 0 };
+      state.batch = { latest: occurrence, notices: [notice], dropped: 0, ...(firstView ? { firstView: true as const } : {}) };
     }
     await this.host.wakeForBatch(occurrence);
     return outcome;
@@ -820,12 +839,15 @@ export class PushCoalescer<E = unknown> {
         const empty = isVisiblyEmptyContent(content);
         this.host.audit({ kind: 'rendered', subject, eventId: occurrence.eventId, source, empty });
         if (empty) return; // §5.2: nothing happened (blank text included)
-        const placement = await this.host.deliver({ ...occurrence, timestamp, content }, content, assemblingFor);
+        // The batch's first delivery is the agent's first view while nothing
+        // of the subject has been read and no other version of it is placed.
+        const firstView = batch.firstView === true && state.history === 'none' && !state.occupant;
+        const placement = await this.host.deliver({ ...occurrence, timestamp, content, ...(firstView ? { replacesUnread: true } : {}) }, content, assemblingFor);
         rendering.materialized = true;
         if (placement?.deferredId) {
           // Landed in another agent's deferred queue (its turn is alive): still
           // unread there, so it stays replaceable and withdrawable.
-          state.occupant = { eventId: occurrence.eventId, placement };
+          state.occupant = { eventId: occurrence.eventId, placement, ...(firstView ? { firstView: true as const } : {}) };
           state.audienceAgent = placement.agent;
           return;
         }
@@ -864,7 +886,10 @@ export class PushCoalescer<E = unknown> {
         // An interrupted render is not replayed (§3.2): a batch that was
         // RENDERING keeps its fallback; a batch that was only pending renders
         // normally at the next assembly.
-        state.batch = { latest: s.batch.latest as CoalescedOccurrence<E>, notices: s.batch.notices, dropped: s.batch.dropped, ...(s.batch.rendering ? { noRender: true } : {}) };
+        state.batch = {
+          latest: s.batch.latest as CoalescedOccurrence<E>, notices: s.batch.notices, dropped: s.batch.dropped,
+          ...(s.batch.rendering ? { noRender: true } : s.batch.firstView ? { firstView: true as const } : {}),
+        };
       }
       this.subjects.set(s.subject, state);
     }
@@ -931,7 +956,7 @@ export class PushCoalescer<E = unknown> {
         subject, history: s.history, consumedEventId: s.consumedEventId, identity: s.identity,
         ...(s.audienceAgent ? { audienceAgent: s.audienceAgent } : {}),
         ...(s.occupant ? { occupant: { eventId: s.occupant.eventId, placement: s.occupant.placement } } : {}),
-        ...(s.batch ? { batch: { latest: s.batch.latest as CoalescedOccurrence<unknown>, notices: s.batch.notices, dropped: s.batch.dropped, ...(s.batch.noRender ? { rendering: true } : {}) } }
+        ...(s.batch ? { batch: { latest: s.batch.latest as CoalescedOccurrence<unknown>, notices: s.batch.notices, dropped: s.batch.dropped, ...(s.batch.noRender ? { rendering: true } : s.batch.firstView ? { firstView: true as const } : {}) } }
           : s.rendering ? { batch: { latest: s.rendering.batch.latest as CoalescedOccurrence<unknown>, notices: s.rendering.batch.notices, dropped: s.rendering.batch.dropped, rendering: true } }
           : {}),
       })),

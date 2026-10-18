@@ -78,7 +78,7 @@ import { Agent } from './agent.js';
 import { ModuleRegistry, checkedToolResult, ensureStateRegistered, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { logValue } from './mcpl/log-value.js';
-import { hasNonConversationalTag } from './mcpl/tags.js';
+import { isMarkerTagged } from './mcpl/tags.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './mcpl/capability-grant.js';
 import { maskNegotiatedCapabilities } from './mcpl/capability-mask.js';
@@ -218,12 +218,14 @@ const requestedSelfWakeSeconds = (input: unknown): number | undefined => {
  * — MCPL RFC-001) don't count: they are about an existing message, so they
  * neither clear explicit-send suppression nor re-pin a turn's locus at a tool
  * boundary. An edit can also be the first version of a message the agent
- * sees: when the coalescer replaced a message of which the agent had been
- * shown no version, still waiting in the deferred queue or stored at once
- * outside it, the host marks the replacement (`replacesUnread`), and an edit
- * so marked counts as the message it replaced. A reaction or deletion so
- * marked is still a notice about that message and stays a marker. An edit of
- * a message the host never received looks like any other edit and stays a
+ * sees: when the coalescer delivers a version of a message of which no
+ * version may have been shown to the agent (still queued, or stored above
+ * every reader's shown watermark), the host marks the delivery
+ * (`replacesUnread`), and an edit so marked counts as the message it
+ * replaced. A doubt counts as shown, so a message a scalar watermark covers
+ * without having been shown gets no mark. A reaction or deletion so marked
+ * is still a notice about that message and stays a marker. An edit of a
+ * message the host never received looks like any other edit and stays a
  * marker too. A marker that wakes the agent can still set that turn's speech
  * channel (agent-framework#189).
  */
@@ -231,8 +233,7 @@ const isConversationalInjection = (metadata?: MessageMetadata): boolean => {
   if (!metadata) return true;
   const m = metadata as Record<string, unknown>;
   if (m.system === true) return false;
-  const tags = m.replacesUnread === true && Array.isArray(m.tags) ? m.tags.filter((t) => t !== 'chat:edited') : m.tags;
-  if (hasNonConversationalTag(tags)) return false;
+  if (isMarkerTagged(m.tags, m.replacesUnread === true)) return false;
   return true;
 };
 
@@ -2155,6 +2156,10 @@ export class AgentFramework {
   /** Both lanes are admitted in arrival order: a create, edit and delete of
    *  one subject must not overtake one another while routing awaits. */
   private coalescingAdmission: Promise<unknown> = Promise.resolve();
+  /** The event of the channel message the admission under way delivered as
+   *  the agent's first view (`replacesUnread`), for the registry's anchor.
+   *  Admissions are serialized, so it is only ever the current one's. */
+  private coalescedFirstView: string | undefined;
   private coalescingSaveTimer: ReturnType<typeof setTimeout> | null = null;
   private coalescingSnapshotDirty: (() => CoalescingSnapshot) | null = null;
   private coalescingRecentReceipts: CoalescingReceiptRecord[] = [];
@@ -10259,12 +10264,14 @@ export class AgentFramework {
             // the watermark of the turn's compile and read as unread, so a
             // coalesced replacement could remove a message the agent heard
             // and answered (and that its later replies were minted after).
-            // Only a stream that declares it carries them is marked
+            // Only a stream that declares it carries them is marked read
             // (supportsInjectedMessages true: membrane's native path). One
             // that doesn't say may be membrane 0.5.87's XML path, which
             // drops them with a warning, and a message marked read there
             // could no longer be replaced though the agent never saw it. So
             // without the declaration they stay unread, as before this mark.
+            // The shown mark moves at every boundary that injects, declared
+            // or not, since there a doubt counts as shown.
             // The mark is the store's head, a scalar, as a compile's is: it
             // also covers what was stored since the compile without being
             // carried, such as another slot's messages, and a write that
@@ -11338,6 +11345,7 @@ export class AgentFramework {
       if (typeof message.timestamp !== 'string') throw new CoalesceError('timestamp', 'timestamp is required');
       validateCoalescedContent(message.content, { allowEmpty: message.coalesce.retract === true });
       const c = message.coalesce;
+      this.coalescedFirstView = undefined;
       const result = await this.pushCoalescer.accept({
         serverId,
         binding: this.coalescingBinding(serverId),
@@ -11353,7 +11361,11 @@ export class AgentFramework {
         identity: { messageId: message.messageId, author: message.author, threadId: message.threadId },
         event: { lane: 'channel', event: { ...event, eventId: message.eventId } },
       });
-      return { messageId: message.messageId, accepted: true, coalesce: result.coalesce };
+      // The registry's anchor follows a delivery the coalescer marked as the
+      // agent's first view, as the turn's locus does.
+      const firstView = this.coalescedFirstView === message.eventId;
+      this.coalescedFirstView = undefined;
+      return { messageId: message.messageId, accepted: true, coalesce: result.coalesce, ...(firstView ? { firstView: true as const } : {}) };
     });
   }
 
@@ -11467,6 +11479,7 @@ export class AgentFramework {
     const narrowing = occ.deliverTo ? { deliverTo: occ.deliverTo } : {};
     const firstView = occ.replacesUnread ? { replacesUnread: true } : {};
     if (occ.event.lane === 'channel') {
+      if (occ.replacesUnread) this.coalescedFirstView = occ.eventId;
       const event = { ...occ.event.event, coalescingSubject, ...narrowing, ...firstView, ...(assemblingFor ? { assemblingFor } : {}) };
       const placement = await this.handleMcplChannelIncoming(event);
       await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
