@@ -21,16 +21,15 @@
   grant, since the next process won't send them again. A channel
   registration the next process sends while they are still held is
   admitted ahead of them, so a kept message isn't refused as an unknown
-  channel, unless the next process removed that channel before
-  registering it: a registration passes a removal only of another
-  channel, so one channel's removal and its re-registration stay in
-  order. A removal stays where it was held, so when both planes open
+  channel, unless it names a channel that an earlier removal, or an
+  earlier registration kept in place, names: then it's kept in place too,
+  so the writes to one channel stay in order. A removal stays where it was
+  held, with whatever else it adds or updates, so when both planes open
   together, what the next process sent before one is admitted before it.
-  While the
-  host is quiesced its control plane opens first, so a removal is admitted
-  then, ahead of the incoming messages still held, as live traffic is during
-  a quiesce, and a message held for a channel it removed is refused when the
-  data plane opens. A registration that arrives once the kept messages are
+  While the host is quiesced its control plane opens first, so a removal
+  is admitted then, ahead of the incoming messages still held, as live
+  traffic is during a quiesce, and a message held for a channel it removed
+  is refused when the data plane opens. A registration that arrives once the kept messages are
   admitted is too late for them, and a kept message for a channel the
   registry doesn't know is refused. An answer to a request from
   a closed transport is never written to the next one, whether the request

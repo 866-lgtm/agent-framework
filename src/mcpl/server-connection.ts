@@ -482,7 +482,9 @@ export class McplServerConnection extends EventEmitter {
    * The order a flush admits a held snapshot in: as it was held, except that
    * when it holds items a transport boundary kept, the current transport's
    * channel registrations (`channels-register`, `channels-changed`) go
-   * first. The registry refuses a message for a channel it doesn't know
+   * first, each unless it names a channel that something the transport sent
+   * before it, and that stays where it was held, also names (below). The
+   * registry refuses a message for a channel it doesn't know
    * (§14.5). It keeps a server's channels across a reconnect, but a
    * registration the old process sent that was still held at the boundary
    * was dropped with it (keepAcrossBoundary), so the next process registers
@@ -491,13 +493,14 @@ export class McplServerConnection extends EventEmitter {
    * Nothing else moves, so a snapshot with nothing kept is flushed as it was
    * held. A registration also passes whatever its own transport sent before
    * it, which a server that announces its channels first, as a bridge does,
-   * never has. A registration passes a removal only of another channel: one
-   * that names a channel the transport removed before it stays where it was
-   * held, so one channel's removal and its re-registration keep their order.
-   * A removal stays where it was held, as everything does that isn't a
-   * registration, so in a flush that opens both planes, what the transport
-   * sent before a removal is admitted before it, its messages for that
-   * channel included. A flush that opens only the control
+   * never has. A removal stays where it was held, with whatever else it adds
+   * or updates, as everything does that isn't a registration. A registration
+   * that names a channel which an earlier removal, or an earlier registration
+   * that stays, names stays where it was held too, so the writes to one
+   * channel keep their order: a channel's removal and its re-registration,
+   * and two registrations or updates of it. In a flush that opens both
+   * planes, what the transport sent before a removal is admitted before it,
+   * its messages for that channel included. A flush that opens only the control
    * plane, as during a quiesce, admits the control traffic, a removal
    * included, and holds the data plane's again until that plane opens, as
    * live traffic is during a quiesce: a message held for a channel a removal
@@ -506,27 +509,34 @@ export class McplServerConnection extends EventEmitter {
   private static admissionOrder(pending: HeldItem[]): HeldItem[] {
     if (!pending.some((item) => item.kept)) return pending;
     const registrations = new Set<HeldItem>();
-    // The channels a removal the transport sent so far names.
-    const removed = new Set<string>();
+    // The channels named so far by a removal or registration that stays
+    // where it was held.
+    const staying = new Set<string>();
     for (const item of pending) {
       if (item.kept) continue;
       if (item.event !== 'channels-register' && item.event !== 'channels-changed') continue;
       const removes = McplServerConnection.removedChannelIds(item);
-      if (removes.length === 0
-        && !McplServerConnection.registeredChannelIds(item).some((id) => removed.has(id))) {
+      const registers = McplServerConnection.registeredChannelIds(item);
+      if (removes.length === 0 && !registers.some((id) => staying.has(id))) {
         registrations.add(item);
+        continue;
       }
-      for (const id of removes) removed.add(id);
+      for (const id of [...removes, ...registers]) staying.add(id);
     }
     if (registrations.size === 0) return pending;
     return [...registrations, ...pending.filter((item) => !registrations.has(item))];
   }
 
-  /** The channels a held `channels-changed` removes. */
+  /** The channels a held `channels-changed` removes. The registry takes any
+   *  entry of `removed` as a channel id, by its string form, so a number
+   *  removes the channel of its digits; an object is left out here, since
+   *  its string form can throw. */
   private static removedChannelIds(item: HeldItem): string[] {
     if (item.event !== 'channels-changed') return [];
     const params = item.args[0] as { removed?: unknown } | null | undefined;
-    return Array.isArray(params?.removed) ? params.removed.filter((id): id is string => typeof id === 'string') : [];
+    return Array.isArray(params?.removed)
+      ? params.removed.filter((id) => typeof id !== 'object' || id === null).map((id) => String(id))
+      : [];
   }
 
   /** The channels a held `channels-register` registers, or a held

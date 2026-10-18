@@ -440,8 +440,29 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     await waitFor(() => reconnected === 1, 5000, 'reconnect after crash');
     registered.length = 0;
     const rejected = () => traces.filter((trace) => trace.type === 'mcpl:channel-incoming-rejected');
-    return { grant, admitted, rejected, register, incoming, removeRoom, removeChannel, addRoom, registered, registry };
+    return { grant, admitted, rejected, register, incoming, removeRoom, removeChannel, addRoom, registered, registry, serverSends };
   }
+
+  // Opens both planes under the grant, as a reconnect's settled exchange
+  // does, and lets the registry's handlers run.
+  async function openBothPlanes(grant: () => CapabilityGrant) {
+    const consoleError = console.error;
+    console.error = () => {};
+    try {
+      connection!.establishGrant(grant());
+      connection!.ready();
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      console.error = consoleError;
+    }
+  }
+
+  // The descriptor the registry holds for one of the server's channels.
+  function channelOf(registry: ChannelRegistry, id: string): { label?: unknown } | undefined {
+    return registry.listChannelsRaw().find((entry) => entry.serverId === 'flaky' && entry.descriptor.id === id)?.descriptor;
+  }
+
+  const descriptor = (id: string, label: string) => ({ id, type: 'text', direction: 'bidirectional', label });
 
   it("lets a registration pass what its own transport sent before it, once a kept message is held", async () => {
     const { grant, admitted, rejected, register, incoming } = await keptIncomingSetup();
@@ -523,6 +544,63 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     );
     assert.deepStrictEqual(admitted, [], 'the kept message went ahead of both');
     assert.equal(rejected().length, 1, 'and was refused as an unknown channel');
+  });
+
+  for (const [what, later] of [
+    ['a registration', { method: 'channels/register', params: { channels: [descriptor('room', 'second')] } }],
+    ['an update', { method: 'channels/changed', params: { updated: [descriptor('room', 'second')] } }],
+  ] as const) {
+    it(`keeps ${what} of a channel behind a removal that adds that channel, so the server's later descriptor stands`, async () => {
+      const { grant, serverSends, registry } = await keptIncomingSetup();
+      // The next process adds the kept message's channel in a change that
+      // also removes another channel, and then writes it again.
+      serverSends({
+        id: 3,
+        method: 'channels/changed',
+        params: { added: [descriptor('room', 'first')], removed: ['elsewhere'] },
+      });
+      serverSends({ id: 4, ...later });
+      await openBothPlanes(grant);
+      assert.equal(channelOf(registry, 'room')?.label, 'second', 'the later write is the one that stands');
+    });
+  }
+
+  it('keeps a channels/changed that adds a channel back behind the removal of that channel', async () => {
+    const { grant, removeRoom, addRoom, registry } = await keptIncomingSetup();
+    removeRoom(3);
+    addRoom(4);
+    await openBothPlanes(grant);
+    assert.ok(channelOf(registry, 'room'), 'the channel is registered at the end, as the server last said');
+  });
+
+  it("keeps a registration behind an earlier registration held back that names its channel, so the later descriptor stands", async () => {
+    const { grant, removeRoom, serverSends, registry } = await keptIncomingSetup();
+    // The second registration stays behind the removal of the kept
+    // message's channel, which it names, and so does the third, which
+    // names another channel the second names.
+    removeRoom(3);
+    serverSends({ id: 4, method: 'channels/register', params: { channels: [descriptor('room', 'first'), descriptor('other', 'first')] } });
+    serverSends({ id: 5, method: 'channels/register', params: { channels: [descriptor('other', 'second')] } });
+    await openBothPlanes(grant);
+    assert.equal(channelOf(registry, 'other')?.label, 'second', 'the later registration is the one that stands');
+  });
+
+  it('keeps a removal that names its channel as a number where it was held, as the registry removes that channel', async () => {
+    const { grant, admitted, rejected, register, serverSends, registry } = await keptIncomingSetup();
+    // The next process registers two channels, sends a message in one, and
+    // then removes it, naming it as a number.
+    register(3);
+    serverSends({ id: 4, method: 'channels/register', params: { channels: [descriptor('5', 'five')] } });
+    serverSends({
+      id: 5,
+      method: 'channels/incoming',
+      params: { messages: [{ channelId: '5', messageId: 'new-5', content: [{ type: 'text', text: 'hello' }] }] },
+    });
+    serverSends({ id: 6, method: 'channels/changed', params: { removed: [5] } });
+    await openBothPlanes(grant);
+    assert.deepStrictEqual(rejected(), [], 'no message is refused as an unknown channel');
+    assert.deepStrictEqual(admitted.map((event) => event.messageId), ['kept-1', 'new-5']);
+    assert.equal(channelOf(registry, '5'), undefined, 'and the removal took the channel at the end');
   });
 
   it('moves a channels/changed that only adds channels ahead of a kept message, as a registration', async () => {
