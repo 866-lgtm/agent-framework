@@ -120,6 +120,33 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 const MCP_PROTOCOL_VERSION = '2024-11-05';
 
 /**
+ * Why a request to an MCPL server produced no result, as far as the host can
+ * know it. Messages are unchanged from plain errors; the `outcome` makes the
+ * difference between "never left the host" and "left, and no answer came
+ * back" a fact a caller can act on instead of a string to match:
+ * - `not-sent`: the request was refused before anything was written (the
+ *   connection was already closed);
+ * - `error-response`: the server answered with a JSON-RPC error (it may have
+ *   acted before failing; the error alone does not say);
+ * - `no-response`: the request was handed to the transport and no answer
+ *   came back (timeout, or the connection closed while awaiting). It does
+ *   not prove the request reached the server — the transport can decline or
+ *   drop a write — only that the host can no longer say it didn't.
+ */
+export class McplRequestError extends Error {
+  constructor(
+    message: string,
+    readonly outcome: 'not-sent' | 'error-response' | 'no-response',
+    /** The JSON-RPC error's `data`, verbatim, when the server supplied one
+     *  (e.g. which parts of a multi-part send were posted). */
+    readonly data?: unknown,
+  ) {
+    super(message);
+    this.name = 'McplRequestError';
+  }
+}
+
+/**
  * Represents a pending JSON-RPC request awaiting a response.
  */
 interface PendingRequest {
@@ -290,6 +317,9 @@ export class McplServerConnection extends EventEmitter {
 
   /** Per-request timeout in ms (0 disables). See McplServerConfig.requestTimeoutMs. */
   private requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS;
+  /** The deadline a channels/publish or channels/open request keeps when
+   *  requestTimeoutMs is 0 (see sendChannelsPublish). */
+  private publishDeadlineMs = DEFAULT_REQUEST_TIMEOUT_MS;
 
   // Event buffering: control-plane traffic can be released independently from
   // inference-bearing data-plane traffic. This lets a server finish its own
@@ -914,9 +944,13 @@ export class McplServerConnection extends EventEmitter {
     return this.sendRequest(McplMethod.StateRollback, params as unknown as Record<string, unknown>) as Promise<StateRollbackResult>;
   }
 
-  /** Send `channels/open` request and await result. */
+  /** Send `channels/open` request and await result. It keeps a deadline as
+   *  channels/publish does: a delivery opens a closed channel before it
+   *  publishes, so an open that is never answered would hold the delivery,
+   *  and the turn that waits for it, for good. */
   sendChannelsOpen(params: ChannelsOpenParams): Promise<ChannelsOpenResult> {
-    return this.sendRequest(McplMethod.ChannelsOpen, params as unknown as Record<string, unknown>) as Promise<ChannelsOpenResult>;
+    const timeoutMs = this.requestTimeoutMs > 0 ? this.requestTimeoutMs : this.publishDeadlineMs;
+    return this.sendRequest(McplMethod.ChannelsOpen, params as unknown as Record<string, unknown>, { timeoutMs }) as Promise<ChannelsOpenResult>;
   }
 
   /** Send `channels/close` request and await result. */
@@ -941,13 +975,20 @@ export class McplServerConnection extends EventEmitter {
    * Send `channels/publish`.
    * May be sent as a request (if an ACK is desired) or notification.
    * When `params.stream` is true, sends as a notification (no ACK).
+   *
+   * A request always has a deadline: the server's requestTimeoutMs, or
+   * publishDeadlineMs when that is 0 (disabled). A publish is a side effect
+   * whose outcome the resident is told and a held draft's attempt records,
+   * so one that is never answered would hold both open for good. Its expiry
+   * is a no-response, which the caller reads as unknown.
    */
   sendChannelsPublish(params: ChannelsPublishParams): Promise<ChannelsPublishResult | void> {
     if (params.stream) {
       this.sendNotification(McplMethod.ChannelsPublish, params as unknown as Record<string, unknown>);
       return Promise.resolve();
     }
-    return this.sendRequest(McplMethod.ChannelsPublish, params as unknown as Record<string, unknown>) as Promise<ChannelsPublishResult>;
+    const timeoutMs = this.requestTimeoutMs > 0 ? this.requestTimeoutMs : this.publishDeadlineMs;
+    return this.sendRequest(McplMethod.ChannelsPublish, params as unknown as Record<string, unknown>, { timeoutMs }) as Promise<ChannelsPublishResult>;
   }
 
   /** Send `channels/outgoing/chunk` notification. */
@@ -1040,7 +1081,7 @@ export class McplServerConnection extends EventEmitter {
     // Reject all pending requests
     for (const [id, pending] of this.pendingRequests) {
       if (pending.timer) clearTimeout(pending.timer);
-      pending.reject(new Error(`Connection to MCPL server "${this.id}" closed while awaiting response for ${pending.method} (id=${id})`));
+      pending.reject(new McplRequestError(`Connection to MCPL server "${this.id}" closed while awaiting response for ${pending.method} (id=${id})`, 'no-response'));
     }
     this.pendingRequests.clear();
     this.orphanedRequests.clear();
@@ -1216,7 +1257,7 @@ export class McplServerConnection extends EventEmitter {
     options: RequestOptions = {},
   ): Promise<unknown> {
     if (this.closed) {
-      return Promise.reject(new Error(`Cannot send request: connection to "${this.id}" is closed`));
+      return Promise.reject(new McplRequestError(`Cannot send request: connection to "${this.id}" is closed`, 'not-sent'));
     }
 
     const id = this.nextRequestId++;
@@ -1249,20 +1290,32 @@ export class McplServerConnection extends EventEmitter {
             });
             if (this.orphanedRequests.size > 4096) this.orphanedRequests.delete(this.orphanedRequests.keys().next().value!);
           }
-          reject(new Error(
+          reject(new McplRequestError(
             `MCPL server "${this.id}" did not respond to ${method} (id=${id}) ` +
             `within ${timeoutMs}ms — the server may be hung. The response ` +
             `outcome is unknown: the request was abandoned locally but was not ` +
             `cancelled, so the tool may still have completed server-side; verify ` +
             `state before retrying; a blind retry of a stateful/side-effecting ` +
             `tool may duplicate it.`,
+            'no-response',
           ));
         }, timeoutMs);
         // Don't hold the event loop open for the watchdog alone.
         pending.timer.unref?.();
       }
       this.pendingRequests.set(id, pending);
-      this.transport!.writeLine(JSON.stringify(request));
+      try {
+        this.transport!.writeLine(JSON.stringify(request));
+      } catch (err) {
+        // A synchronous write rejection sent no request. Remove its pending
+        // state and watchdog before reporting that it is safe to retry.
+        this.pendingRequests.delete(id);
+        if (pending.timer) clearTimeout(pending.timer);
+        reject(new McplRequestError(
+          `Cannot send ${method} to MCPL server "${this.id}": ${err instanceof Error ? err.message : String(err)}`,
+          'not-sent',
+        ));
+      }
     });
   }
 
@@ -1577,7 +1630,11 @@ export class McplServerConnection extends EventEmitter {
       // code as much as a message, since a server can send a string, so both
       // are bounded as errors.ts says.
       pending.reject(
-        new Error(`MCPL server "${this.id}" returned error for ${pending.method}: [${boundedForLog(describeCause(response.error.code))}] ${boundedForLog(describeCause(response.error.message))}`),
+        new McplRequestError(
+          `MCPL server "${this.id}" returned error for ${pending.method}: [${boundedForLog(describeCause(response.error.code))}] ${boundedForLog(describeCause(response.error.message))}`,
+          'error-response',
+          (response.error as { data?: unknown }).data,
+        ),
       );
     } else {
       pending.resolve(response.result);
@@ -1631,8 +1688,9 @@ export class McplServerConnection extends EventEmitter {
         for (const [id, pending] of this.pendingRequests) {
           if (pending.timer) clearTimeout(pending.timer);
           pending.reject(
-            new Error(
+            new McplRequestError(
               `MCPL server "${this.id}" disconnected unexpectedly (code=${info.code ?? 'n/a'}, signal=${info.signal ?? 'n/a'}, reason=${closeReasonText(info)}) while awaiting ${pending.method} (id=${id})`,
+              'no-response',
             ),
           );
         }
