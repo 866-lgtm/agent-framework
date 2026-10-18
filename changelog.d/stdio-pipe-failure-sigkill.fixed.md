@@ -16,3 +16,6 @@
     until a disconnect or `stop()` retries the reap and confirms the exit.
     During a connect, that happens when the connect times out, and the
     connect fails with it.
+  - Under Bun, a child that closes its stdin isn't reported at all, since
+    Bun emits no error for the writes to it, so request timeouts still
+    bound it, as they do a child that stops reading.

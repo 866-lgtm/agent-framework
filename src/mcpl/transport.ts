@@ -262,7 +262,10 @@ export class StdioTransport extends McplTransport {
     // transport's: 'unreaped' says so, unless the host is closing it, whose
     // close() reports the failure itself. A child that stops reading without
     // closing its stdin raises no error: the writes are buffered, and only
-    // request timeouts bound it (McplServerConfig.requestTimeoutMs).
+    // request timeouts bound it (McplServerConfig.requestTimeoutMs). Under
+    // Bun a child that closes its stdin isn't reported either: Bun emits no
+    // 'error' for the writes to it (checked on 1.3.10, 1.4.3 and 1.4.4's
+    // canary), so request timeouts are its only bound too.
     const endOnPipeError = (err: Error) => {
       if (this.pipeError) return;
       this.pipeError = err;
