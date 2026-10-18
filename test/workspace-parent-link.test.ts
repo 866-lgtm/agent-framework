@@ -698,21 +698,22 @@ describe('a deletion whose evidence holds no agreed disk copy', () => {
     assert.equal(agreement.get('work', 'pushed.txt')?.kind, 'pending');
   });
 
-  test('a deletion over a pending push whose bytes never reached disk leaves nothing pending once a sync observes the path', async (t) => {
+  test('a deletion over a pending push whose bytes never reached disk leaves nothing pending once a sync of the mount passes over it', async (t) => {
     // A push of a draft, with no prior, that left no file never created one.
     // While it's recorded as pending, the deletion reads it as a push that may
     // have landed; a pass over the path finds disk holding nothing there,
-    // which settles the deletion and forgets the push.
+    // which settles the deletion and the push. A sync of the mount, not of the
+    // path, which would take disk's state whatever the evidence.
     const env = new Env(t);
     const m = await env.open(t);
     const agreement = (m as any).agreement;
     await call(m, 'write', { path: 'work/unlanded.txt', content: 'v1\n' });
     agreement.intend('work', 'unlanded.txt', { effect: 'disk', prior: null, expect: { kind: 'content', hash: env.store.treeGet(TREE, 'unlanded.txt')!.blobHash }, branchId: env.store.currentBranch().id });
     await call(m, 'delete', { path: 'work/unlanded.txt' });
-    await call(m, 'sync', { path: 'work/unlanded.txt' });
+    await call(m, 'sync', {});
     const { pendingChanges, conflicts, pendingWorkspaceDeletions } = (await call(m, 'status', {})).work;
     assert.deepEqual({ pendingChanges, conflicts, pendingWorkspaceDeletions }, { pendingChanges: 0, conflicts: 0, pendingWorkspaceDeletions: 0 });
-    assert.equal(agreement.get('work', 'unlanded.txt'), undefined, 'the push is forgotten');
+    assert.notEqual(agreement.get('work', 'unlanded.txt')?.kind, 'pending', 'the push is settled');
     assert.equal(existsSync(join(env.dir, 'unlanded.txt')), false);
   });
 
