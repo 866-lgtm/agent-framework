@@ -1359,6 +1359,10 @@ test("a later start over a gate.json with no rule list it could add to without w
     unsaved('"mentions"', shown, 'skip'),
   ];
   assert.deepEqual(noList.gate.getStatus().errors, said);
+  // A change, refused for want of a list, leaves gate.json's entry saying what's in force, and a listing names the rules in force.
+  assert.throws(() => noList.gate.addPolicy({ name: 'dm', behavior: 'always' }), /so a change has no list of rules to edit/);
+  assert.deepEqual(noList.gate.getStatus().errors, said);
+  assert.deepEqual(noList.gate.listPolicyNames(), ['mentions']);
   // A reload that finds gate.json unchanged keeps them, and says so still.
   (noList.gate as unknown as { lastReloadCheck: number }).lastReloadCheck = 0;
   assert.equal(noList.gate.evaluate(MENTION).trigger, true);

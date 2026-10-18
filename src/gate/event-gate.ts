@@ -635,7 +635,9 @@ interface RuleReading {
   policy?: GatePolicy;
   /** It wakes on none of what it matches, even where it can't be read: it
    *  skips or defers, or it's a rate limit whose tokens are a number not over
-   *  0. Left out, such a rule holds back nothing it was written to wake on. */
+   *  0. Left out, such a rule holds back nothing it was written to wake on,
+   *  though what it matches goes on to the rules after it, as for any rule
+   *  left out. */
   quiet: boolean;
   /** Every problem it has, in the order its fields are read. */
   problems: RuleProblem[];
@@ -837,7 +839,8 @@ function readDebounce(r: Reader, ms: unknown): GateBehavior | undefined {
  * check refused it. Tokens that are a number not over 0, which ran unchecked
  * from the starting rules, woke the agent on nothing the rule matched, so that
  * rule is quiet (noTokens): leaving it out holds back nothing it was written
- * to wake on.
+ * to wake on, though what it matches goes on to the rules after it, as for any
+ * rule left out.
  */
 function readRateLimit(r: Reader, value: unknown): GateBehavior | undefined {
   if (!isPlainObject(value)) {
@@ -1701,7 +1704,7 @@ export class EventGate {
     // failed write of ours shouldn't take rules out of force. Over a gate.json
     // with no rule list to add them to, it runs gate.json's default with the
     // starting rules it lacks, as earlier releases did once they had written
-    // them over it.
+    // them over it, where seedOrReconcile gives them (reconcile-unsaved).
     const read = this.readConfigFile();
     if (read.state === 'loaded') {
       // Beside a gate.json with no rule list, the host's starting rules it
@@ -1749,19 +1752,15 @@ export class EventGate {
   // Config loading
   // =========================================================================
 
-  private loadConfig(): GateConfig | null {
-    const read = this.readConfigFile();
-    return read.state === 'loaded' ? read.config : null; // Caller keeps previous config
-  }
-
   /**
    * Write the starting rules to gate.json, as given, when it's absent, or add
    * the ones it lacks by name, as given, to its own rule list when it loads.
    * A rule gate.json holds holds its name, whether the gate reads it or leaves
    * it out, so an operator's rule is never swapped for the host's. Where
    * gate.json has no rule list to add them to, it writes nothing, and the gate
-   * runs them beside it. Says what it did when that wasn't simply done or not
-   * needed.
+   * runs beside it those of them it reads, unless, under gate.json's default,
+   * one it leaves out could wake the agent. Says what it did when that wasn't
+   * simply done or not needed.
    */
   private seedOrReconcile(starting: StartingRules): StartWrite {
     const read = this.readConfigFile();
@@ -1865,9 +1864,11 @@ export class EventGate {
       return { state: 'absent' };
     }
     const raw = bytes.toString('utf-8');
-    if (opts?.unlessUnchanged && raw === this.configText) {
-      // The file holds the text in force, so its error is that text's notes,
-      // whatever a failed read or a look at other text since left there.
+    // A file holding the text in force has that text's notes as its error,
+    // whatever a failed read or a look at other text since left there: beside
+    // the host's starting rules, they say those run beside it.
+    const inForce = raw === this.configText;
+    if (opts?.unlessUnchanged && inForce) {
       this.configError = this.configNote;
       this.configUnused = false;
       return { state: 'unchanged' };
@@ -1886,7 +1887,7 @@ export class EventGate {
     // A field the gate doesn't read does nothing, and a rule is read past a
     // problem or left out, so the file loads, and each is named.
     const note = loadNote(read.sentences);
-    this.configError = note;
+    this.configError = inForce ? this.configNote : note;
     this.configUnused = false;
     return { state: 'loaded', config: read.config, text: raw, note, listed: read.listed };
   }
@@ -1919,8 +1920,9 @@ export class EventGate {
     if (this.configError === null || !this.configUnused) return this.configError;
     // Rules from a gate.json text, with the start's unsaved: only a start
     // whose reconcile write left gate.json unable to load runs those, since a
-    // write of gate.json that lands, or a reload that finds it holding the text
-    // in force or a text that loads, clears startUnsaved.
+    // write of gate.json that lands, a reload that finds it holding a text
+    // that loads, or, while gate.json's rules are in force, one that finds it
+    // holding the text in force, clears startUnsaved.
     const runs = this.configSource === 'file'
       ? this.startUnsaved !== null
         ? 'the rules it read from gate.json at start and the ones it was adding'
@@ -2323,11 +2325,14 @@ export class EventGate {
   }
 
   /**
-   * List the current policy names (freshest on-disk view). Cheap helper for
+   * List the current policy names: those of a newer gate.json that loads (the
+   * freshest on-disk view), and otherwise the rules in force, which beside a
+   * gate.json with no rule list are the host's starting rules. Cheap helper for
    * tools/UX that want to show what's active without the full status payload.
    */
   listPolicyNames(): string[] {
-    const current = this.loadConfig() ?? this.config;
+    const read = this.readConfigFile({ unlessUnchanged: true });
+    const current = read.state === 'loaded' ? read.config : this.config;
     return current.policies.map((p) => p.name);
   }
 
