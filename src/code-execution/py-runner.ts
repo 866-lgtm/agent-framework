@@ -27,6 +27,7 @@ import { dirname, join } from 'node:path';
 import { createInterface, type Interface } from 'node:readline';
 import type { Readable, Writable } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
+import { boundedErrorMessage } from '../error-message.js';
 import { PYTHON_RUNTIME_SOURCE } from './runtime-py.js';
 
 export interface InjectedTool {
@@ -106,6 +107,8 @@ const EXIT_OUTPUT_GRACE_MS = 200;
 const UNREACHABLE_GRACE_MS = 200;
 /** How much of what an interpreter wrote before it failed to start, or crashed, goes into the message and the host's log, and how much of each piece of output with no script running goes into the log. */
 const LAST_WORDS_CHARS = 2000;
+/** The runtime's exit when the host's channel, fds 3 and 4, didn't reach it: the host's configuration, which calling again doesn't change. 78 is sysexits' EX_CONFIG, which Python itself never exits with. */
+const HOST_CHANNEL_MISSING_EXIT = 78;
 
 /** The longest delay Node's timers honour (~24.8 days); a longer one fires after ~1 ms. */
 export const MAX_TIMER_MS = 2_147_483_647;
@@ -358,6 +361,73 @@ function afterOutputEnds(stdout: OutputStream, stderr: OutputStream, messages: R
   stdout.whenEnded(() => stderr.whenEnded(() => (messages ? whenReadableEnded(messages, finish) : finish())));
 }
 
+/**
+ * What a script stopped at its time limit is told after why: that the tool
+ * calls it made keep their effects, and whether a longer limit can help,
+ * which only the deployment's ceiling for its kind of script can say. A
+ * foreground script at its ceiling is offered background mode too, when its
+ * caller passes `backgroundCeilingMs` (the framework does for an agent that
+ * could start a background script as the script starts) and a background
+ * script may run longer.
+ */
+function limitRemedy(limitMs: number, ceilingMs: number | undefined, background: boolean, backgroundCeilingMs?: number): string {
+  const effects = 'Tool calls it had already made keep their effects, so check them before running it again.';
+  if (ceilingMs === undefined) return effects;
+  if (limitMs < ceilingMs) return `${effects} To give it longer, ${background ? 'start it with' : 'pass'} time_limit_ms up to ${ceilingMs} (${formatLimit(ceilingMs)}).`;
+  if (background) return `${effects} ${formatLimit(limitMs)} is the longest a background script runs here; starting it again runs it from the top.`;
+  const inBackground = backgroundCeilingMs !== undefined && backgroundCeilingMs > limitMs
+    ? `, or run it with background: true, where a script can run up to ${formatLimit(backgroundCeilingMs)}` : '';
+  return `${effects} ${formatLimit(limitMs)} is the longest a script can run here, so split the work across shorter scripts${inBackground}.`;
+}
+
+/**
+ * Why a script didn't run when its interpreter didn't start. A spawn that
+ * found nothing it could run (ENOENT, EACCES) fails the same way until the
+ * host changes, so that one says code_execution can't run here rather than
+ * to try again. A failure before the spawn, while creating or writing the
+ * runtime's files, is about those files rather than the interpreter, and
+ * keeps Node's own text, which names the path for an open or a mkdtemp. An
+ * interpreter that exits as it starts passes on what it wrote to stderr; when
+ * the runtime itself exits so because the host's channel didn't reach it
+ * (HOST_CHANNEL_MISSING_EXIT), its own words say who must act and that
+ * calling again fails the same way, so they end the text.
+ */
+function startFailure(pythonPath: string, err: unknown): string {
+  const { code, syscall, exitCode, said } = (err ?? {}) as { code?: unknown; syscall?: unknown; exitCode?: unknown; said?: unknown };
+  const spawning = typeof syscall === 'string' && syscall.startsWith('spawn');
+  if (spawning && (code === 'ENOENT' || code === 'EACCES')) {
+    const until = code === 'ENOENT' ? 'installs it or points this host at one' : 'makes it executable or points this host at another';
+    return `script didn't run: this host can't start its Python interpreter, ${pythonPath} (${code}), so code_execution can't run scripts here until whoever runs this host ${until}. Calling it again before then fails the same way.`;
+  }
+  if (typeof syscall === 'string' && !spawning) {
+    return `script didn't run: this host couldn't create or write the files its Python runtime starts from (${boundedErrorMessage(err)}), so none of the script ran. Run it again; if it fails the same way, ask whoever runs this host.`;
+  }
+  const wrote = typeof said === 'string' ? said : '';
+  // The runtime's own words say who must act, and that calling again fails the same way.
+  if (exitCode === HOST_CHANNEL_MISSING_EXIT && wrote !== '') {
+    return `script didn't run: the Python interpreter, ${pythonPath}, exited as it started, saying: ${wrote}`;
+  }
+  const why = typeof code === 'string' ? `couldn't be started (${code})` : boundedErrorMessage(err);
+  return `script didn't run: the Python interpreter, ${pythonPath}, ${why}, so none of the script ran. Run it again; if it fails the same way, ask whoever runs this host.`
+    + (wrote === '' ? '' : ` It wrote to stderr: ${wrote}`);
+}
+
+/** Why a script stopped when its interpreter stopped reading the host's messages, so that the host ended it. */
+function stoppedReading(background: boolean): string {
+  return "script stopped: the Python interpreter stopped reading the host's messages, so the host ended it and the rest of the script didn't run"
+    + `${background ? '' : ', and variables from earlier scripts are gone'}. Tool calls it had already made keep their effects, `
+    + 'so check them before you run it again in a new interpreter. If it stops the same way, ask whoever runs this host.';
+}
+
+/** Why a script stopped when its interpreter exited under it, and what running it again does. */
+function interpreterExit(exitCode: number | null, signal: NodeJS.Signals | null, background: boolean): string {
+  const how = signal ? `was ended by ${signal}` : `exited with code ${exitCode}`;
+  return `script stopped: the Python interpreter ${how} while it ran, so the rest of the script didn't run`
+    + `${background ? '' : ', and variables from earlier scripts are gone'}. Tool calls it had already made keep their effects, `
+    + 'so check them before you run it again in a new interpreter. If it stops the same way, check whether the script itself '
+    + `ends the process, for example ${signal ? 'by using too much memory' : 'with os._exit()'}; if not, ask whoever runs this host.`;
+}
+
 interface PendingExec {
   id: string;
   resolve: (result: ExecResult) => void;
@@ -368,6 +438,12 @@ interface PendingExec {
   settled: boolean;
   /** Set once the deadline fired: the result then says the script ran out of time. */
   deadlineMs: number | null;
+  /** The longest limit this exec could have had (exec's opts): whether a longer one would help. */
+  ceilingMs: number | undefined;
+  /** For a foreground exec, the longest a background script may run (exec's opts): whether background mode would help. */
+  backgroundCeilingMs: number | undefined;
+  /** A background exec has its interpreter to itself, so no earlier script's state is lost with it. */
+  background: boolean;
   /** Set once the script went to the interpreter. Before that, the exec is
    *  waiting for the interpreter to start, and an interpreter that exits then
    *  failed to start (see exec). */
@@ -432,12 +508,18 @@ export class PyRunner {
    *
    * `opts.deadlineMs` replaces the runner's scriptTimeoutMs for this exec (a
    * per-call time limit); a background exec uses its `lifetimeMs` instead.
+   * `opts.ceilingMs` is the longest limit the deployment allows this kind of
+   * script: a script stopped at its limit is offered a longer one only below
+   * it. Without it, the stop doesn't say whether a longer limit would help.
+   * `opts.backgroundCeilingMs`, for a foreground exec, is the longest a
+   * background script may run: one stopped at its ceiling is offered
+   * background mode when that is longer.
    */
   async exec(
     code: string,
     tools: InjectedTool[],
     background?: BackgroundExecOptions,
-    opts?: { deadlineMs?: number },
+    opts?: { deadlineMs?: number; ceilingMs?: number; backgroundCeilingMs?: number },
   ): Promise<ExecResult> {
     if (this.disposed) {
       return { stdout: '', stderr: 'code_execution runner disposed', returnCode: 1, aborted: true };
@@ -445,7 +527,8 @@ export class PyRunner {
     if (this.busy) {
       return {
         stdout: '',
-        stderr: 'RuntimeError: another code_execution script is already running for this agent',
+        stderr: "script didn't run: another code_execution script of yours is already running, and they run one at a time. "
+          + 'Run this one again once that one has finished, or combine the two into one script.',
         returnCode: 1,
         aborted: true,
       };
@@ -466,6 +549,9 @@ export class PyRunner {
       killTimer: null,
       settled: false,
       deadlineMs: null,
+      ceilingMs: opts?.ceilingMs,
+      backgroundCeilingMs: opts?.backgroundCeilingMs,
+      background: background !== undefined,
       sent: false,
       journal: null,
       returnCode: null,
@@ -477,10 +563,9 @@ export class PyRunner {
       // Settled already when an abort or dispose reclaimed the interpreter
       // as it started; another exec may have claimed the runner since.
       if (!pending.settled) {
-        const message = err instanceof Error ? err.message : String(err);
         this.settlePending({
           stdout: '',
-          stderr: `Failed to start python runtime (${this.pythonPath}): ${message}`,
+          stderr: startFailure(this.pythonPath, err),
           returnCode: 1,
           aborted: true,
         });
@@ -510,8 +595,9 @@ export class PyRunner {
       pending.killTimer = setTimeout(() => {
         pending.deadlineMs = null; // this message already says why
         this.stopPending(
-          `script stopped: it reached its ${formatLimit(deadlineMs)} time limit and did not respond, ` +
-            'so it was killed and the interpreter restarted (variables from earlier scripts are gone)',
+          `script stopped: it reached its ${formatLimit(deadlineMs)} time limit and did not respond, so it was killed` +
+            (pending.background ? '. ' : ' and the interpreter restarted (variables from earlier scripts are gone). ') +
+            limitRemedy(deadlineMs, pending.ceilingMs, pending.background, pending.backgroundCeilingMs),
         );
         this.reclaim('deadline-kill');
       }, this.cancelGraceMs);
@@ -639,11 +725,12 @@ export class PyRunner {
         if (this.child === child) this.teardownChild();
         return;
       }
-      const why =
-        inputFailed && signal === 'SIGKILL'
-          ? "python runtime stopped reading the host's messages, so it was killed and the interpreter restarted " +
-            '(variables from earlier scripts are gone)'
-          : `python runtime exited unexpectedly (code=${exitCode}, signal=${signal ?? 'none'})`;
+      const killedDeaf = inputFailed && signal === 'SIGKILL';
+      const why = killedDeaf ? stoppedReading(pending.background) : interpreterExit(exitCode, signal, pending.background);
+      // The host's log keeps the short form, with the exit's own code and signal.
+      const logged = killedDeaf
+        ? "python runtime stopped reading the host's messages, so it was killed"
+        : `python runtime exited unexpectedly (code=${exitCode}, signal=${signal ?? 'none'})`;
       // What it wrote last, such as a fatal error's own text or an exec's
       // result, is already on its way through its pipes: settle once they've
       // ended, or after a short grace while a command it started still holds
@@ -653,7 +740,7 @@ export class PyRunner {
           const last = this.stopPending(why).trim();
           // A background script's last output is its journal's, both streams.
           const what = pending.journal ? 'the last it wrote' : 'the last it wrote to stderr';
-          this.log(last ? `${why}; ${what}: ${last.slice(-LAST_WORDS_CHARS)}` : why);
+          this.log(last ? `${logged}; ${what}: ${last.slice(-LAST_WORDS_CHARS)}` : logged);
         }
         if (this.child === child) this.teardownChild();
       });
@@ -676,20 +763,17 @@ export class PyRunner {
         outcome();
       };
       const onReady = () => finish(resolve);
-      const onExit = () => {
+      const onExit = (exitCode: number | null) => {
         // Why it ended, such as a traceback, is on its way through its stderr.
         // Its messages' pipe doesn't matter here, and the exit's teardown has
         // stopped reading it.
         afterOutputEnds(stdout, stderr, null, () => {
           const said = stderr.lastIdle.trim();
-          finish(() => reject(new Error(`python runtime exited before becoming ready${said ? `, saying: ${said}` : ''}`)));
+          finish(() => reject(Object.assign(new Error('exited as it started'), { exitCode, said })));
         });
       };
       const onError = (e: Error) => finish(() => reject(e));
-      const timeout = setTimeout(
-        () => finish(() => reject(new Error('python runtime did not become ready within 15s'))),
-        15_000,
-      );
+      const timeout = setTimeout(() => finish(() => reject(new Error("didn't start within 15 seconds"))), 15_000);
       this.readyResolver = onReady;
       this.readyFailer = onError;
       child.on('exit', onExit);
@@ -822,7 +906,8 @@ export class PyRunner {
     // Only a script that ended unsuccessfully was stopped: one that caught the cancellation
     // and finished its work returns 0, and must not read as stopped.
     if (pending.deadlineMs !== null && result.returnCode !== 0) {
-      const note = `script stopped: it reached its ${formatLimit(pending.deadlineMs)} time limit\n`;
+      const note = `script stopped: it reached its ${formatLimit(pending.deadlineMs)} time limit. `
+        + `${limitRemedy(pending.deadlineMs, pending.ceilingMs, pending.background, pending.backgroundCeilingMs)}\n`;
       // On a line of its own: a script's output, and the runner's own texts, such as an
       // interpreter's exit, can end without a newline.
       const withNote = (text: string) => onItsOwnLine(text, note);
@@ -891,8 +976,8 @@ export class PyRunner {
     // An interpreter killed as it starts never says it's ready: fail its
     // readiness now, so an exec waiting on it returns at once rather than at
     // the 15 s timeout. Here rather than in teardownChild, which an
-    // interpreter's own exit also runs, so that one still reads "exited
-    // before becoming ready".
+    // interpreter's own exit also runs, so that one still reads "exited as
+    // it started".
     this.readyFailer?.(new Error(`python runtime reclaimed (${reason}) before it was ready`));
     this.teardownChild();
     this.clearIdleTimer();
