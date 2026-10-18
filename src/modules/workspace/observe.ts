@@ -64,22 +64,25 @@ export interface MountView {
    */
   others: readonly string[];
   /**
-   * The same mounts, each by its directory, its name and its canonical root,
-   * for a refusal that names the mount a path leads into: through a symlink
-   * this mount doesn't follow (linkWords), or through one it follows, or a
-   * root configured through one (nestedAtReal). Without it, no path is
-   * refused for where its links lead, and a link's refusal names no mount.
+   * The same mounts, each by its directory, its name and, where it has one,
+   * its real root (NestedMount), for a refusal that names the mount a path
+   * leads into: through a symlink this mount doesn't follow (linkWords), or
+   * through one it follows, or a root configured through one (nestedAtReal).
+   * Without it, no path is refused for where its links lead, and a link's
+   * refusal names no mount.
    */
   nested?: readonly NestedMount[];
 }
 
 /**
  * A mount nested in another: its directory in one of its spellings,
- * mount-relative and `/`-separated, its name, and its root as realpath
- * resolves it (the nearest existing directory's, where the root isn't made
- * yet), which every spelling shares. No real root where it's this mount's
- * own or holds it: the mount is nested by its configured path alone, since
- * through its real root it would claim this mount's every path.
+ * mount-relative and `/`-separated, its name, and its real root, which
+ * every spelling shares. The real root is the root as realpath resolves it
+ * (the nearest existing directory's, where the root isn't made yet) once
+ * the module's start has read it, and the root as configured until then.
+ * There's none where it's this mount's own or holds it: the mount is nested
+ * by its configured path alone, since through its real root it would claim
+ * this mount's every path.
  */
 export type NestedMount = { dir: string; name: string; real?: string };
 

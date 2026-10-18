@@ -9,7 +9,7 @@ import { isUtf8 } from 'node:buffer';
 import { constants as fsConstants } from 'node:fs';
 import type { Stats } from 'node:fs';
 import { open, readdir, readlink, stat, lstat, realpath } from 'node:fs/promises';
-import { basename, dirname, isAbsolute, join, resolve, relative, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, parse, resolve, relative, sep } from 'node:path';
 import type { JsStore } from '@animalabs/chronicle';
 import type { Module, ModuleContext, ProcessState, EventResponse } from '../../types/module.js';
 import type { ProcessEvent, ToolDefinition, ToolCall, ToolResult } from '../../types/events.js';
@@ -331,11 +331,15 @@ const LINKS_FOLLOWED = 40;
  * real path, with the rest as given. A link's target is read from the
  * link's directory as it is on disk, and nothing is resolved lexically on
  * the way, so a `..` is taken from where the links before it lead, as the
- * kernel takes it. Where a directory can't be resolved for any other
- * reason, such as a loop or a lack of permission, the path as resolved
- * lexically from there.
+ * kernel takes it. Where realpath fails for any other reason, such as a
+ * loop or a lack of permission, the whole path as path.resolve reads it.
  */
-async function realBeneath(absolute: string, links = 0): Promise<string> {
+async function realBeneath(given: string, links = 0): Promise<string> {
+  // A trailing separator, as a link to a directory is often written, names
+  // the same place, but readlink would then follow the link it names.
+  const { root } = parse(given);
+  let absolute = given;
+  while (absolute.length > root.length && (absolute.endsWith('/') || absolute.endsWith(sep))) absolute = absolute.slice(0, -1);
   try {
     return await realpath(absolute);
   } catch (err) {
@@ -1943,7 +1947,10 @@ export class WorkspaceModule implements Module {
         const real = reals.get(inner.name)!;
         const configured = nestedDir(outerPath, resolve(inner.path));
         const fromRoots: Array<{ dir: string; root: string }> = [];
-        for (const dir of [configured, nestedDir(outerReal, real)]) {
+        // Its directory as configured, read against this mount's root as
+        // configured and as it really is, and its real root against this
+        // mount's.
+        for (const dir of [configured, nestedDir(outerReal, resolve(inner.path)), nestedDir(outerReal, real)]) {
           if (dir !== undefined && !fromRoots.some((s) => s.dir === dir)) fromRoots.push({ dir, root: join(outerPath, ...dir.split('/')) });
         }
         if (fromRoots.length === 0) continue;
@@ -1966,7 +1973,7 @@ export class WorkspaceModule implements Module {
     return nesting;
   }
 
-  /** The mounts nested in `mountName`, by directory, name and real root (MountView's `nested`), in each spelling known. */
+  /** The mounts nested in `mountName`, by directory, name and real root where it has one (MountView's `nested`), in each spelling known. */
   private nestedOf(mountName: string): NestedMount[] {
     return (this.otherMounts.get(mountName) ?? []).flatMap((o) => o.spellings.map((s) => ({ dir: s.dir, name: o.name, real: o.real })));
   }
