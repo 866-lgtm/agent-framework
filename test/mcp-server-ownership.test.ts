@@ -617,6 +617,27 @@ test("stop()'s teardown budget bounds a modern server's close too, and the serve
   assert.equal(modernServers.has('m'), false, 'removed once its close completed');
 });
 
+test("a modern server's tool prefix meets another server's under #469's rule, at a runtime connect and a restart, whichever family is first", async () => {
+  await withFramework(async ({ framework, dir }) => {
+    const modernLog = join(dir, 'raw.jsonl');
+    // A modern server first, under `foo`.
+    await framework.connectMcplServer({ ...modern('m', '', modernLog), toolPrefix: 'foo' });
+    await assert.rejects(framework.connectMcplServer({ ...legacy('l', 'ok', join(dir, 'legacy.log')), toolPrefix: 'foo--bar' }),
+      /toolPrefix "foo--bar" meets server "m"'s toolPrefix "foo"/, 'a legacy server whose prefix meets it');
+    await assert.rejects(framework.connectMcplServer({ ...modern('m2', '', join(dir, 'raw2.jsonl')), toolPrefix: 'foo-' }),
+      /toolPrefix "foo-" meets server "m"'s toolPrefix "foo"/, 'a modern server whose prefix meets it');
+    // A legacy server first, under `bar`.
+    await framework.connectMcplServer({ ...legacy('l2', 'ok', join(dir, 'legacy2.log')), toolPrefix: 'bar' });
+    await assert.rejects(framework.connectMcplServer({ ...modern('m3', '', join(dir, 'raw3.jsonl')), toolPrefix: 'bar--baz' }),
+      /toolPrefix "bar--baz" meets server "l2"'s toolPrefix "bar"/, 'a modern server whose prefix meets a legacy one');
+    // A restart that would move the modern server to a prefix meeting the legacy one's is refused before its teardown.
+    await assert.rejects(framework.restartMcplServer('m', { ...modern('m', '', modernLog), toolPrefix: 'bar-' }),
+      /toolPrefix "bar-" meets server "l2"'s toolPrefix "bar"/, 'a restart into a prefix that meets another');
+    assert.equal(status(framework, 'm')?.connected, true, 'the refused restart left the server up');
+    for (const id of ['l', 'm2', 'm3']) assert.equal(status(framework, id), undefined, `${id} was never connected`);
+  });
+});
+
 test('a restart whose new configuration is refused leaves the running server as it was', async () => {
   await withFramework(async ({ framework, dir }) => {
     const log = join(dir, 'raw.jsonl');
