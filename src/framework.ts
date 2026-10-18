@@ -12026,7 +12026,7 @@ export class AgentFramework {
         messageId: identity.messageId ?? str(origin.messageId) ?? occ.eventId,
         threadId: identity.threadId ?? str(origin.threadId),
         author: identity.author ?? { id: str(origin.authorId) ?? '', name: str(origin.authorName) ?? str(origin.authorId) ?? 'Someone' },
-        content: materialized ? materialized.map((block) => convertBlock(block, 'attachment on push event')) : push.content,
+        content: materialized ? materialized.map((block) => convertBlock(block, 'attachment on push event', occ.serverId)) : push.content,
         timestamp: occ.timestamp,
         metadata: origin,
         tags: push.tags,
@@ -12046,7 +12046,7 @@ export class AgentFramework {
       ...occ.event.event,
       eventId: occ.eventId,
       timestamp: occ.timestamp,
-      ...(materialized ? { content: materialized.map((block) => convertBlock(block, 'attachment on push event')) } : {}),
+      ...(materialized ? { content: materialized.map((block) => convertBlock(block, 'attachment on push event', occ.serverId)) } : {}),
       coalescingSubject,
       // §5.2: the materialized occurrence is consumed by the request being
       // assembled; the wake that started it is not repeated.
@@ -17328,6 +17328,15 @@ export class AgentFramework {
       // reads it. A success is the server's own blocks, for the caller to
       // use in process.
       if (result.isError) return mcplToolFailure(result.content);
+      // RFC-005 §6.2: register the result's references with this server, so
+      // a stub later made of them is bound and fetch_reference can fetch
+      // them. Nothing is fetched here: an in-process caller may never show
+      // them to an agent, and an eager fetch would spend the server's fetch
+      // budget, which the agent's own fetch_reference needs, on bytes nobody
+      // asked for. A failure keeps only its text (mcplToolFailure), so no
+      // stub is made of its references and they aren't registered.
+      await this.autoFetchReferences(result.content, serverId, false)
+        .catch((e) => console.error('[rfc005] reference registration error:', (e as Error).message));
       return {
         success: true,
         data: result.content,
@@ -18124,10 +18133,11 @@ export class AgentFramework {
     // not browse) — materialize the references of a content array now, so
     // the stub the script receives carries a workspace path it can open
     // directly. Only a reference registered against its server can be
-    // fetched: an MCPL server's result content is, on arrival. An in-process
-    // module's reference has no server, so its fetch is refused (and logged
-    // here) and the script gets its stub, as it does for a reference nested
-    // in other data, which isn't fetched.
+    // fetched: an MCPL server's result content is, on arrival, including
+    // content a module got from a call of its own (ctx.callTool) and returns.
+    // A reference a module makes itself has no server, so its fetch is
+    // refused (and logged here) and the script gets its stub, as it does for
+    // a reference nested in other data, which isn't fetched.
     if (Array.isArray(result.data)) {
       const fetcher = this.getReferenceFetcher();
       for (const block of result.data) {
