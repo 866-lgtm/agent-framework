@@ -66,12 +66,13 @@ class Env {
     });
   }
 
-  async open(mount: Partial<MountConfig> = {}, config: Partial<WorkspaceConfig> = {}): Promise<WorkspaceModule> {
+  async open(mount: Partial<MountConfig> = {}, config: Partial<WorkspaceConfig> = {}, beforeStart?: (m: WorkspaceModule) => void): Promise<WorkspaceModule> {
     const m = new WorkspaceModule({
       mounts: [{ name: 'work', path: this.dir, mode: 'read-write', watch: 'never', ...mount }],
       ...config,
     });
     m.initStore(this.store);
+    beforeStart?.(m);
     await m.start({
       isRestart: false,
       getState: () => null,
@@ -1370,6 +1371,208 @@ describe("an editor's save by rename, with the watcher running", () => {
     const v2 = blob();
     env.writeDisk('gate.json', 'v3');
     await until(() => blob() !== v2, 'a later edit of the new file is taken in');
+  });
+});
+
+describe('the catch-up pass at start', () => {
+  /**
+   * Run `fn` with chokidar's own directory reads (chokidar's and readdirp's) made to wait first, as `wait` says.
+   * `reads.delayed` counts the reads that waited, so a test can show the delay reached chokidar.
+   */
+  async function withChokidarReaddir<T>(wait: () => Promise<void>, fn: (reads: { delayed: number }) => Promise<T>): Promise<T> {
+    const fromChokidar = () => /node_modules\/(chokidar|readdirp)\//.test(new Error().stack ?? '');
+    const reads = { delayed: 0 };
+    return withFsPromises('readdir', (original) => async function (this: unknown, ...args: any[]) {
+      if (fromChokidar()) {
+        reads.delayed++;
+        await wait();
+      }
+      return original.apply(this, args);
+    }, () => fn(reads));
+  }
+  /** A wait that ends when `open` is called. */
+  const gate = () => {
+    let open!: () => void;
+    const opened = new Promise<void>((r) => { open = r; });
+    return { wait: () => opened, open };
+  };
+  const storedText = (env: Env, f: string) => {
+    const e = env.store.treeGet(TREE, f);
+    return e ? env.store.getBlob(e.blobHash)?.toString('utf8') : undefined;
+  };
+  /** Counts the catch-up passes `m` starts, from before it starts. */
+  const countPasses = (m: WorkspaceModule) => {
+    const counted = { passes: 0 };
+    const initialScan = (m as any).initialScan.bind(m);
+    (m as any).initialScan = (name: string) => { counted.passes++; return initialScan(name); };
+    return counted;
+  };
+  const ctxFor = (env: Env) => ({
+    isRestart: false,
+    getState: () => null,
+    setState: () => {},
+    pushEvent: (e: ProcessEvent) => env.events.push(e),
+  } as unknown as ModuleContext);
+  /** Let real time pass while setTimeout may be mocked. */
+  const elapse = async (ms: number) => {
+    for (const end = performance.now() + ms; performance.now() < end;) await new Promise((r) => setImmediate(r));
+  };
+  const reattached = (env: Env) => env.events.some((e) => e.type === 'workspace:watcher-reattached');
+
+  // On macOS a write made right after ready can fall before libuv's FSEventStream exists and go unreported until a
+  // later change in its directory, which this change doesn't close, so the two tests that write then and wait for
+  // the watcher run on Linux.
+  test("starts once the watcher is ready, so a change made after the pass took a file in reaches the store while chokidar's scan lags", { skip: process.platform !== 'linux' }, async (t) => {
+    const env = new Env(t);
+    for (let i = 0; i < 20; i++) env.writeDisk(`d${i % 4}/f${i}.txt`, 'v1');
+    // Each of chokidar's directory reads waits a second, so its scan reaches d0's files long after a pass started
+    // beside it would have taken them in.
+    await withChokidarReaddir(() => new Promise((r) => setTimeout(r, 1000)), async (reads) => {
+      await env.open({ watch: 'always', watchDebounceMs: 50 });
+      await until(() => storedText(env, 'd0/f0.txt') === 'v1', 'the catch-up pass took d0/f0.txt in', 15_000);
+      assert.ok(reads.delayed > 0, "chokidar's directory reads waited");
+      env.writeDisk('d0/f0.txt', 'v2');
+      await until(() => storedText(env, 'd0/f0.txt') === 'v2', 'the change made after the pass reached the store', 10_000);
+    });
+  });
+
+  test('a re-attached watcher runs its pass at its own ready, so a change after that pass reaches the store', { skip: process.platform !== 'linux' }, async (t) => {
+    const env = new Env(t);
+    env.writeDisk('gate.json', 'v1');
+    // The root poll is past the test's deadline, so only the root's rename event re-attaches the watcher.
+    const m = await env.open({ watch: 'always', watchDebounceMs: 50, watchRootPollMs: 60_000 });
+    const mount = (m as any).mounts.get('work');
+    await until(() => !!mount.watcherReadyAt && storedText(env, 'gate.json') === 'v1', 'the first pass took gate.json in');
+    // The root is moved away, its file changed, and moved back, so the watcher re-attaches to the same directory,
+    // which the module still agrees with. chokidar's directory reads each wait a second meanwhile, so the
+    // re-attached watcher's scan reaches gate.json long after a pass started at the re-attach would have run.
+    await withChokidarReaddir(() => new Promise((r) => setTimeout(r, 1000)), async (reads) => {
+      renameSync(env.dir, `${env.dir}.away`);
+      writeFileSync(join(`${env.dir}.away`, 'gate.json'), 'v2');
+      renameSync(`${env.dir}.away`, env.dir);
+      await until(() => reattached(env), 'the watcher re-attached');
+      await until(() => storedText(env, 'gate.json') === 'v2', 'gate.json\'s v2 was taken in', 15_000);
+      env.writeDisk('gate.json', 'v3');
+      await until(() => storedText(env, 'gate.json') === 'v3', "the change made after the re-attach reached the store", 15_000);
+      assert.ok(reads.delayed > 0, "chokidar's directory reads waited");
+    });
+  });
+
+  test('starts at the bound when the watcher is not ready by then, and again at the ready that comes later', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('gate.json', 'v1');
+    const scan = gate();
+    await withChokidarReaddir(scan.wait, async () => {
+      let counted = { passes: 0 };
+      t.mock.timers.enable({ apis: ['setTimeout'] });
+      try {
+        const m = await env.open({ watch: 'always', watchDebounceMs: 50 }, {}, (m) => { counted = countPasses(m); });
+        await elapse(200);
+        assert.equal(counted.passes, 0, 'no pass before the watcher is ready or the bound comes');
+        t.mock.timers.tick(29_999);
+        assert.equal(counted.passes, 0, 'no pass a millisecond before the bound');
+        t.mock.timers.tick(1);
+        assert.equal(counted.passes, 1, 'a pass at the bound');
+        t.mock.timers.reset();
+        await until(() => storedText(env, 'gate.json') === 'v1', "the bound's pass took gate.json in");
+        // chokidar's scan ends: its ready runs the pass again, for what changed while the first ran beside the scan.
+        scan.open();
+        const mount = (m as any).mounts.get('work');
+        await until(() => !!mount.watcherReadyAt, 'the watcher became ready');
+        assert.equal(counted.passes, 2, 'a second pass at ready');
+      } finally {
+        t.mock.timers.reset();
+      }
+    });
+  });
+
+  test("an error before ready doesn't start the pass; the watcher's ready does", async (t) => {
+    const env = new Env(t);
+    env.writeDisk('gate.json', 'v1');
+    const scan = gate();
+    await withChokidarReaddir(scan.wait, async () => {
+      let counted = { passes: 0 };
+      const m = await env.open({ watch: 'always', watchDebounceMs: 50 }, {}, (m) => { counted = countPasses(m); });
+      // An error chokidar reports while its scan goes on, through the path its 'error' event takes.
+      (m as any).watchers.get('work').reportError(Object.assign(new Error("EACCES: permission denied, scandir 'sub'"), { code: 'EACCES' }));
+      assert.ok(env.events.some((e) => e.type === 'workspace:watcher-error'), 'the error was reported');
+      assert.equal(counted.passes, 0, 'no pass at the error');
+      scan.open();
+      const mount = (m as any).mounts.get('work');
+      await until(() => !!mount.watcherReadyAt && storedText(env, 'gate.json') === 'v1', 'the pass ran at ready');
+      assert.equal(counted.passes, 1);
+    });
+  });
+
+  test('a re-attach before the first ready restarts the bound, so the new watcher gets its own', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('gate.json', 'v1');
+    // No chokidar scan ends here, so neither watcher becomes ready, and the root poll (an interval, not mocked) finds
+    // the replaced root. The old root is moved aside, not removed, so the new one can't take its inode: the first
+    // watcher's scan never reached the root's own watch, so no rename event would tell it.
+    await withChokidarReaddir(() => new Promise(() => {}), async (reads) => {
+      let counted = { passes: 0 };
+      t.mock.timers.enable({ apis: ['setTimeout'] });
+      try {
+        await env.open({ watch: 'always', watchDebounceMs: 50, watchRootPollMs: 50 }, {}, (m) => { counted = countPasses(m); });
+        // The root is replaced only once the first watcher's scan is held at its first read. Before that, chokidar's
+        // stat of the root could land between the rename and the mkdir, and chokidar becomes ready at once on that
+        // error, which would start a pass here.
+        for (const end = performance.now() + 10_000; reads.delayed === 0 && performance.now() < end;) await elapse(5);
+        assert.ok(reads.delayed > 0, "the first watcher's scan reached its held read");
+        t.mock.timers.tick(20_000);
+        renameSync(env.dir, `${env.dir}.old`);
+        mkdirSync(env.dir, { recursive: true });
+        for (const end = performance.now() + 10_000; !reattached(env) && performance.now() < end;) await elapse(25);
+        assert.ok(reattached(env), 'the watcher re-attached');
+        t.mock.timers.tick(10_000);
+        assert.equal(counted.passes, 0, "no pass at the first watcher's bound");
+        t.mock.timers.tick(19_999);
+        assert.equal(counted.passes, 0, "no pass a millisecond before the re-attached watcher's bound");
+        t.mock.timers.tick(1);
+        assert.equal(counted.passes, 1, "a pass at the re-attached watcher's bound");
+      } finally {
+        t.mock.timers.reset();
+      }
+    });
+  });
+
+  test('a module stopping before its watcher is ready starts no pass at the bound, during the stop or after it', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('gate.json', 'v1');
+    await withChokidarReaddir(() => new Promise(() => {}), async () => {
+      let counted = { passes: 0 };
+      t.mock.timers.enable({ apis: ['setTimeout'] });
+      try {
+        const m = await env.open({ watch: 'always', watchDebounceMs: 50 }, {}, (m) => { counted = countPasses(m); });
+        // The bound comes while stop() waits on the watcher's own stop.
+        const stopping = m.stop();
+        t.mock.timers.tick(30_000);
+        await stopping;
+        t.mock.timers.tick(30_000);
+        assert.equal(counted.passes, 0, 'no pass while the module stopped, or after');
+      } finally {
+        t.mock.timers.reset();
+      }
+    });
+  });
+
+  test("a module started again before its first watcher is ready runs only the new watcher's pass", async (t) => {
+    const env = new Env(t);
+    env.writeDisk('gate.json', 'v1');
+    await withChokidarReaddir(() => new Promise(() => {}), async () => {
+      let counted = { passes: 0 };
+      t.mock.timers.enable({ apis: ['setTimeout'] });
+      try {
+        const m = await env.open({ watch: 'always', watchDebounceMs: 50 }, {}, (m) => { counted = countPasses(m); });
+        await m.stop();
+        await m.start(ctxFor(env));
+        t.mock.timers.tick(30_000);
+        assert.equal(counted.passes, 1, "the old watcher's bound starts no pass, the new one's does");
+      } finally {
+        t.mock.timers.reset();
+      }
+    });
   });
 });
 
