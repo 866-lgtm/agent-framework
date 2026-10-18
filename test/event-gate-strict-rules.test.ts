@@ -1312,20 +1312,67 @@ test("a rule gate.json holds keeps its name from the host's starting rules, read
   held.gate.dispose();
 });
 
-test("a later start adds nothing to a gate.json with no rule list it could edit without writing over what it holds, and says so", (t) => {
+test("a later start over a gate.json with no rule list it could add to without writing over what it holds runs the starting rules it lacks beside it, under its default and unsaved, and says so until gate.json changes", (t) => {
+  const unsaved = (rules: string, why: string, defaultBehavior: string): string =>
+    `At start, the host's starting rules ${rules} couldn't be added to gate.json (${why}, so there's no list of rules to add them to `
+    + `without writing over what it holds). The gate runs them under gate.json's default, "${defaultBehavior}", as if gate.json held `
+    + "them, but they aren't saved in it: once gate.json changes and loads, what it holds is in force instead. Whoever runs this "
+    + 'host can give gate.json a list of rules under "policies", and the next start adds them to it.';
+
+  // A list, read as no rules under "always": the starting rule that skips ambient chat runs, as it did once written over the file.
+  const quietAmbient = { name: 'quiet-ambient', match: { tagsAny: ['chat:ambient'] }, behavior: 'skip' };
   const { gate, configPath } = makeGate(tempDir(t), {
     file: [{ name: 'dm', behavior: 'always' }],
-    initialConfig: { default: 'skip', policies: [{ name: 'user-input', match: {}, behavior: 'always' }] },
+    initialConfig: { default: 'skip', policies: [quietAmbient] },
   });
   assert.deepEqual(onDisk(configPath), [{ name: 'dm', behavior: 'always' }], 'gate.json is as it was');
-  assert.deepEqual(names(gate), []);
+  assert.deepEqual(names(gate), ['quiet-ambient']);
+  assert.equal(gate.evaluate(event(['chat:ambient'])).trigger, false, 'ambient chat is skipped');
+  assert.equal(gate.evaluate(MENTION).trigger, true, 'and the rest gets gate.json\'s default, "always"');
+  assert.equal(gate.getStatus().configSource, 'file');
   assert.deepEqual(gate.getStatus().errors, [
     'gate.json loaded. gate.json is a list, where an object is needed, such as {"policies": [{"name": "my-rule", "behavior": "always"}]}, so '
     + 'none of it is read, and every event gets the default, "always".',
-    'At start, the host\'s starting rules "user-input" couldn\'t be added to gate.json (gate.json is a list, so there\'s no list of rules '
-    + 'to add them to without writing over what it holds), so they weren\'t put in force.',
+    unsaved('"quiet-ambient"', 'gate.json is a list', 'always'),
   ]);
   gate.dispose();
+
+  // A "policies" that isn't a list, under "skip": the mention rule wakes the agent, as it did once written over the file.
+  const object = { default: 'skip', policies: { name: 'dm', behavior: 'always' } };
+  const noList = makeGate(tempDir(t), { file: object, initialConfig: { default: 'skip', policies: [MENTIONS] } });
+  t.after(() => noList.gate.dispose());
+  assert.deepEqual(onDisk(noList.configPath), object, 'gate.json is as it was');
+  assert.equal(noList.gate.evaluate(MENTION).trigger, true);
+  const said = unsaved('"mentions"', 'gate.json\'s "policies" is {"name":"dm","behavior":"always"}', 'skip');
+  assert.equal(noList.gate.getStatus().errors.at(-1), said);
+  // A reload that finds gate.json unchanged keeps them, and says so still.
+  (noList.gate as unknown as { lastReloadCheck: number }).lastReloadCheck = 0;
+  assert.equal(noList.gate.evaluate(MENTION).trigger, true);
+  assert.equal(noList.gate.getStatus().errors.at(-1), said);
+  // Once gate.json changes and loads, what it holds is in force instead.
+  writeFileSync(noList.configPath, JSON.stringify({ default: 'skip', policies: [] }));
+  (noList.gate as unknown as { lastReloadCheck: number }).lastReloadCheck = 0;
+  assert.equal(noList.gate.evaluate(MENTION).trigger, false);
+  assert.deepEqual(names(noList.gate), []);
+  assert.ok(!noList.gate.getStatus().errors.includes(said), JSON.stringify(noList.gate.getStatus().errors));
+
+  // Where, under gate.json's default, one of them left out could wake the agent, none runs, as where gate.json has a list.
+  const limited = { name: 'limited', match: {}, behavior: { rate_limit: { refillIntervalMs: 60000 } } };
+  const none = makeGate(tempDir(t), { file: object, initialConfig: { default: 'always', policies: [limited, MENTIONS] } });
+  assert.deepEqual(names(none.gate), []);
+  assert.equal(none.gate.evaluate(MENTION).trigger, false);
+  assert.ok(none.gate.getStatus().errors.some((e) => e.endsWith(
+    'At start, the host\'s starting rules "limited" and "mentions" couldn\'t be added to gate.json (gate.json\'s "policies" is '
+    + '{"name":"dm","behavior":"always"}, so there\'s no list of rules to add them to without writing over what it holds, and under its '
+    + 'default, "skip", one of them would be left out that could wake the agent), so they weren\'t put in force.',
+  )), JSON.stringify(none.gate.getStatus().errors));
+  none.gate.dispose();
+
+  // And where the starting rules aren't used, none runs either, though under gate.json's "always" they'd read.
+  const unused = makeGate(tempDir(t), { file: { policies: object.policies }, initialConfig: { default: 'skip', policies: [limited, MENTIONS] } });
+  assert.deepEqual(names(unused.gate), []);
+  assert.ok(unused.gate.getStatus().errors.some((e) => e.includes("The gate started with gate.json's rules.")), JSON.stringify(unused.gate.getStatus().errors));
+  unused.gate.dispose();
 
   // Beside rules under a name it doesn't read, which stay as written, it adds them in a "policies" list, as to a file with none.
   const theirs = { rules: [{ name: 'dm', behavior: 'always' }] };
@@ -1851,18 +1898,23 @@ test("a batch whose delivery throws is named in the log and dropped, whether its
   const quiet = { name: 'quiet', match: {}, behavior: { debounce: 1000 } };
   writeFileSync(configPath, JSON.stringify({ default: 'always', policies: [quiet] }));
   let fails = true;
+  let attempts = 0;
   const wakes: string[] = [];
+  const delivered: string[] = [];
   const gate = new EventGate({
-    configPath, emitTrace: () => {}, getAgentNames: () => ['agent'],
-    addMessage: () => { if (fails) throw new Error('no agent to deliver to'); return ''; },
+    configPath, getAgentNames: () => ['agent'],
+    emitTrace: (e) => { if (e.type === 'gate:debounce-delivered') delivered.push(String(e.policyName)); },
+    addMessage: () => { attempts++; if (fails) throw new Error('no agent to deliver to'); return ''; },
     requestInference: (agent) => { wakes.push(agent); },
   });
   t.after(() => gate.dispose());
 
-  // Its timer sends it: thrown there, it would be uncaught.
+  // Its timer sends it: thrown there, it would be uncaught. A batch that's dropped isn't traced as delivered.
   assert.equal(gate.evaluate(MENTION).trigger, false, 'the event waits in the debounce batch');
+  gate.evaluate(MENTION);
   t.mock.timers.tick(1000);
-  assert.deepEqual(logged, ['[gate] Policy "quiet": its pending batch couldn\'t be delivered (no agent to deliver to), so its events are dropped']);
+  assert.deepEqual(logged, ['[gate] Policy "quiet": its pending batch of 2 events couldn\'t be delivered (no agent to deliver to), so the batch is dropped']);
+  assert.deepEqual(delivered, []);
 
   // Held for the turn of the agent whose wake_add_rule changed the rule, and sent once it ends.
   logged.length = 0;
@@ -1876,6 +1928,12 @@ test("a batch whose delivery throws is named in the log and dropped, whether its
     '[gate] 2 events held for an agent\'s turn or the host\'s quiesce couldn\'t be delivered (no agent to deliver to), so they\'re dropped',
   ]);
   assert.deepEqual(wakes, []);
+  // Dropped, not kept: the end of the next turn sends nothing.
+  const tried = attempts;
+  gate.onInferenceStarted('agent');
+  gate.onInferenceEnded('agent');
+  await new Promise((resolve) => queueMicrotask(() => resolve(undefined)));
+  assert.equal(attempts, tried, 'nothing held is sent again');
 
   // Held while the host was quiesced, and sent once it resumes: one event, named so.
   logged.length = 0;
@@ -1889,11 +1947,12 @@ test("a batch whose delivery throws is named in the log and dropped, whether its
     '[gate] 1 event held for an agent\'s turn or the host\'s quiesce couldn\'t be delivered (no agent to deliver to), so it\'s dropped',
   ]);
 
-  // Once delivery works, the next batch goes out.
+  // Once delivery works, the next batch goes out, and is traced as delivered.
   fails = false;
   gate.evaluate(MENTION);
   t.mock.timers.tick(1000);
   assert.deepEqual(wakes, ['agent']);
+  assert.deepEqual(delivered, ['quiet']);
 });
 
 test('a behavior holding two kinds names the problems of the kind it doesn\'t read too, and loads as before', (t) => {
@@ -2023,7 +2082,7 @@ test("a write clears every rule's state before it sends a batch, and sends each 
   assert.deepEqual(names(gate), ['mentions'], 'and is in force');
   assert.deepEqual(
     logged.mock.calls.map((c) => String(c.arguments[0])).filter((line) => line.includes('pending batch')),
-    ['[gate] Policy "quiet": its pending batch couldn\'t be delivered (no agent to deliver to), so its events are dropped'],
+    ['[gate] Policy "quiet": its pending batch of 1 event couldn\'t be delivered (no agent to deliver to), so the batch is dropped'],
   );
   const state = gate as unknown as { rateLimitBuckets: Map<string, unknown>; debounceTimers: Map<string, unknown> };
   assert.equal(state.rateLimitBuckets.has('limited'), false, "limited's spent bucket is cleared, though quiet's batch came first");
@@ -2053,7 +2112,7 @@ test("a reload whose pending batch can't be delivered still puts the new rules i
   assert.deepEqual(names(gate), ['mentions']);
   assert.deepEqual(
     logged.mock.calls.map((c) => String(c.arguments[0])).filter((line) => line.includes('pending batch')),
-    ['[gate] Policy "quiet": its pending batch couldn\'t be delivered (no agent to deliver to), so its events are dropped'],
+    ['[gate] Policy "quiet": its pending batch of 1 event couldn\'t be delivered (no agent to deliver to), so the batch is dropped'],
   );
   assert.equal((gate as unknown as { debounceTimers: Map<string, unknown> }).debounceTimers.has('quiet'), false, 'nothing is left behind');
 });

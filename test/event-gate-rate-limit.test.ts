@@ -51,13 +51,10 @@ function makeFakeClockGate(initialConfig: GateConfig, startTime = 1_000_000): Ha
   };
 }
 
-/** Force the next evaluate() to do a fresh file-mtime check. */
+/** Rewrite gate.json so the next evaluate() reloads it: the gate compares its text, whatever its mtime. */
 async function rewriteConfig(h: Harness, next: GateConfig): Promise<void> {
   // Bypass the 1s reload-check throttle (existing test pattern).
   (h.gate as unknown as { lastReloadCheck: number }).lastReloadCheck = 0;
-  // Wait long enough for the on-disk mtime to actually advance — fs
-  // resolution is millisecond-level on most platforms.
-  await new Promise((r) => setTimeout(r, 20));
   writeFileSync(h.configPath, JSON.stringify(next, null, 2));
 }
 

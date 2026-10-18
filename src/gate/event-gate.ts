@@ -320,8 +320,8 @@ function behaviorFingerprint(b: import('./types.js').GateBehavior): string {
 // "policies" holding nothing writes no rules, as one left out does. A null is a
 // field left out, and so is "", with a note: earlier releases read most fields
 // that way, and none narrows anything by them. Where they refused a rule or a
-// file for one (a passthrough, a behavior's kind, gate.json's default), it now
-// loads without it.
+// file for a null or a "" (a passthrough, a behavior's kind, gate.json's
+// default), it now loads without it.
 
 const CONFIG_FIELDS = ['default', 'policies'];
 const POLICY_FIELDS = ['name', 'match', 'behavior', 'resets', 'passthrough'];
@@ -832,8 +832,11 @@ function readDebounce(r: Reader, ms: unknown): GateBehavior | undefined {
  * waking on its first tokens and then on none of what the rule matched, and
  * is read so. One of 0 refilled the bucket once and then never, its clock left
  * at NaN; it's read as refilling at once, every time, so the rule limits
- * nothing, which holds back nothing it woke the agent on (applyRateLimit). No
- * tokens woke on none of it, so such a rule is left out.
+ * nothing, which holds back nothing it woke the agent on (applyRateLimit). A
+ * rule whose tokens aren't a positive number is left out, as earlier releases
+ * refused it. Tokens that are a number not over 0 ran waking the agent on
+ * nothing the rule matched, so that rule is quiet (noTokens): leaving it out
+ * holds back nothing.
  */
 function readRateLimit(r: Reader, value: unknown): GateBehavior | undefined {
   if (!isPlainObject(value)) {
@@ -1302,7 +1305,9 @@ type StartWrite =
     text?: string;
     note?: string | null;
     sentences?: readonly string[];
-  };
+  }
+  /** A later start over a gate.json with no rule list to add the ones it lacks to: `config` is gate.json's default with them, which the gate runs beside it, unsaved. */
+  | { kind: 'reconcile-unsaved'; names: string[]; error: string; config: GateConfig };
 
 /**
  * What gate_status says about the start, which stays until the next one: the
@@ -1337,12 +1342,22 @@ function describeStart(starting: StartingRules, write: StartWrite, held: Readonl
 }
 
 /**
- * What gate_status says when a start's own write left the rules in force
- * unsaved: a first start's seed that failed, or a reconcile whose write left
- * gate.json unable to load. It goes once gate.json is written, or a reload
- * applies its text or finds it holding the text in force.
+ * What gate_status says when the start left rules in force unsaved: a first
+ * start's seed that failed, a reconcile whose write left gate.json unable to
+ * load (`loaded` false), or the starting rules a gate.json with no rule list
+ * lacks, run beside it (`loaded` true). It goes once gate.json is written, or
+ * a reload applies its text or, but beside such a gate.json, finds it holding
+ * the text in force.
  */
-function describeUnsaved(starting: StartingRules, write: StartWrite): string | null {
+function describeUnsaved(starting: StartingRules, write: StartWrite, loaded: boolean): string | null {
+  if (write.kind === 'reconcile-unsaved') {
+    if (!loaded) return null;
+    return `At start, the host's starting rules ${quotedList(write.names)} couldn't be added to gate.json (${write.error}). `
+      + `The gate runs them under gate.json's default, "${write.config.default ?? 'always'}", as if gate.json held them, but `
+      + "they aren't saved in it: once gate.json changes and loads, what it holds is in force instead. Whoever runs this "
+      + 'host can give gate.json a list of rules under "policies", and the next start adds them to it.';
+  }
+  if (loaded) return null;
   if (write.kind === 'seed-failed') {
     return write.atOpen
       ? `At start, gate.json couldn't be created (${write.error}), so the host's starting rules are in force but aren't saved in it.`
@@ -1547,6 +1562,10 @@ export class EventGate {
   /** The rules in force that the start couldn't save (describeUnsaved),
    *  until gate.json is written or a reload applies its text. */
   private startUnsaved: string | null = null;
+  /** Whether the start ran those rules beside the gate.json that loaded,
+   *  which has no rule list to add them to, so a reload finding it unchanged
+   *  leaves them unsaved. */
+  private startRunsBeside = false;
 
   // Debounce state
   private debounceTimers = new Map<string, DebounceState>();
@@ -1677,10 +1696,14 @@ export class EventGate {
     // none of them is used; and otherwise no rules, as a host without any has. When a
     // reconcile's own write left gate.json unable to load, the gate runs what
     // that write held, the rules it read plus the ones it was adding, since a
-    // failed write of ours shouldn't take rules out of force.
+    // failed write of ours shouldn't take rules out of force. Over a gate.json
+    // with no rule list to add them to, it runs gate.json's default with the
+    // starting rules it lacks, as earlier releases did once they had written
+    // them over it.
     const read = this.readConfigFile();
     if (read.state === 'loaded') {
-      this.config = read.config;
+      this.startRunsBeside = write.kind === 'reconcile-unsaved';
+      this.config = write.kind === 'reconcile-unsaved' ? write.config : read.config;
       this.configText = read.text;
       this.configNote = read.note;
       this.configSource = 'file';
@@ -1699,7 +1722,7 @@ export class EventGate {
     // load above can't clear it when it succeeds.
     if (starting) {
       this.startNotice = describeStart(starting, write, read.state === 'loaded' ? heldNames(read.listed) : null);
-      this.startUnsaved = read.state === 'loaded' ? null : describeUnsaved(starting, write);
+      this.startUnsaved = describeUnsaved(starting, write, read.state === 'loaded');
     }
     for (const said of [this.startNotice, this.startUnsaved]) {
       if (said) console.error(`[gate] ${said}`);
@@ -1729,8 +1752,10 @@ export class EventGate {
    * Write the starting rules to gate.json, as given, when it's absent, or add
    * the ones it lacks by name, as given, to its own rule list when it loads.
    * A rule gate.json holds holds its name, whether the gate reads it or leaves
-   * it out, so an operator's rule is never swapped for the host's. Says what
-   * it did when that wasn't simply done or not needed.
+   * it out, so an operator's rule is never swapped for the host's. Where
+   * gate.json has no rule list to add them to, it writes nothing, and the gate
+   * runs them beside it. Says what it did when that wasn't simply done or not
+   * needed.
    */
   private seedOrReconcile(starting: StartingRules): StartWrite {
     const read = this.readConfigFile();
@@ -1750,11 +1775,20 @@ export class EventGate {
     if (missing.length === 0) return { kind: 'none' };
     const names = missing.map((rule) => rule.name);
     if ('noList' in read.listed) {
-      // Nothing was written, so gate.json loads as it did, without them.
-      return {
-        kind: 'reconcile-failed', names, atOpen: true, config: read.config,
-        error: `${read.listed.noList}, so there's no list of rules to add them to without writing over what it holds`,
-      };
+      // Adding them would write over what gate.json holds. Earlier releases
+      // wrote them over it and ran them under its default, so the gate runs
+      // them so, unsaved, beside it: unless, under that default, one of them
+      // left out could wake the agent, when nothing is written and gate.json
+      // loads as it did, without them.
+      const error = `${read.listed.noList}, so there's no list of rules to add them to without writing over what it holds`;
+      const beside = readConfig({ default: read.config.default, policies: missing.map((rule) => rule.raw) }, 'gate.json');
+      if ('refused' in beside) {
+        return {
+          kind: 'reconcile-failed', names, atOpen: true, config: read.config,
+          error: `${error}, and under its default, "${read.config.default ?? 'always'}", one of them would be left out that could wake the agent`,
+        };
+      }
+      return { kind: 'reconcile-unsaved', names, error, config: beside.config };
     }
     const reconciled = { ...read.listed.top, policies: [...read.listed.rules, ...missing.map((rule) => rule.raw)] };
     // What the write holds, as a load reads it, for a write that fails partway.
@@ -1874,10 +1908,11 @@ export class EventGate {
    */
   private configErrorShown(): string | null {
     if (this.configError === null || !this.configUnused) return this.configError;
-    // Rules from a gate.json text, with the start's unsaved: only a start
-    // whose reconcile write left gate.json unable to load runs those, since a
-    // write of gate.json that lands, or a reload that finds it holding the text
-    // in force or a text that loads, clears startUnsaved.
+    // Rules from a gate.json text, with the start's unsaved: a start whose
+    // reconcile write left gate.json unable to load runs those, or one that ran
+    // the starting rules a gate.json with no rule list lacks beside it, since a
+    // write of gate.json that lands, or a reload that applies a text, clears
+    // startUnsaved.
     const runs = this.configSource === 'file'
       ? this.startUnsaved !== null
         ? 'the rules it read from gate.json at start and the ones it was adding'
@@ -1979,7 +2014,8 @@ export class EventGate {
         }
         throw new Error(
           `gate.json couldn't be used (${reason}), and keeping a copy of it at ${kept} failed (${e.message ?? String(err)}), `
-          + 'so nothing was written.',
+          + 'so nothing was written. Whoever runs this host can fix gate.json, or what kept the copy from being made; '
+          + 'until then, a change is refused the same way.',
         );
       }
       console.error(`[gate] ${this.configPath} couldn't be used (${reason}); kept a copy at ${kept} before writing the rules in force`);
@@ -2100,8 +2136,9 @@ export class EventGate {
     try {
       // Missing, unchanged or unreadable: the rules in force stay.
       const read = this.readConfigFile({ unlessUnchanged: true });
-      // gate.json holds the text in force, so none the start ran is unsaved.
-      if (read.state === 'unchanged') this.startUnsaved = null;
+      // gate.json holds the text in force, so none the start ran is unsaved,
+      // unless the start ran rules beside it that it has no list to hold.
+      if (read.state === 'unchanged' && !this.startRunsBeside) this.startUnsaved = null;
       if (read.state !== 'loaded') return;
       const newConfig = read.config;
 
@@ -2158,9 +2195,9 @@ export class EventGate {
    * gate.json the gate doesn't use, only a change after which it loads is
    * written, such as one replacing or removing the rule that keeps it out; any
    * other is refused, naming what does, and the file stays as written. When
-   * gate.json is absent, or can't be read or isn't JSON, the change edits the
+   * gate.json is absent, or could be read but isn't JSON, the change edits the
    * text whose rules are in force the same way, or the rules in force where
-   * there's none; over a file that can't be read or isn't JSON, after a copy of
+   * there's none; over a file that isn't JSON, after a copy of
    * it is kept beside it (keepUnreadableConfig) and reported to
    * `onUnreadableKept` once the change is written and traced. A policy with the
    * same `name` is replaced IN PLACE when no `position` is given (order
@@ -2912,7 +2949,11 @@ export class EventGate {
     try {
       this.deliverEvents(events);
     } catch (err) {
-      console.error(`[gate] Policy "${policyName}": its pending batch couldn't be delivered (${errorText(err)}), so its events are dropped`);
+      const one = events.length === 1;
+      console.error(
+        `[gate] Policy "${policyName}": its pending batch of ${events.length} ${one ? 'event' : 'events'} couldn't be delivered `
+        + `(${errorText(err)}), so the batch is dropped`,
+      );
       return;
     }
 

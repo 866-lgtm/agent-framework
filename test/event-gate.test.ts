@@ -765,11 +765,8 @@ describe('config hot-reload', () => {
 
     assert.strictEqual(gate.evaluate(event()).trigger, true);
 
-    // Force throttle to expire
+    // Force throttle to expire; the gate compares gate.json's text, whatever its mtime
     (gate as any).lastReloadCheck = 0;
-
-    // Wait for mtime to differ
-    await new Promise(r => setTimeout(r, 50));
 
     // Rewrite config — now skip everything
     writeFileSync(path, JSON.stringify({ policies: [], default: 'skip' }));
@@ -787,7 +784,6 @@ describe('config hot-reload', () => {
 
     // Force throttle to expire
     (gate as any).lastReloadCheck = 0;
-    await new Promise(r => setTimeout(r, 50));
 
     // Write invalid JSON
     writeFileSync(path, 'not valid json{{{');

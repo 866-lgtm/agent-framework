@@ -6114,9 +6114,10 @@ export class AgentFramework {
    * actually wants. Every rule the change doesn't touch is written back as it
    * was written. Over a gate.json the gate doesn't use, the change is written
    * only if gate.json then loads, as when it replaces or removes the rule that
-   * keeps it out. When gate.json can't be read or isn't JSON, a copy of its
+   * keeps it out. When gate.json could be read but isn't JSON, a copy of its
    * bytes is kept beside it, and `onUnreadableKept` says where; the change is
-   * then written over it as an edit of the last text that loaded. Fields the gate
+   * then written over it as an edit of the text whose rules are in force, or
+   * of the rules in force where there's none. Fields the gate
    * reads nowhere, and that aren't a slip of one it does, are left out, and
    * named to `onIgnoredFields`. Each callback is called once the change is
    * made, and a throw from it is logged, not thrown. Throws if no gate is
@@ -6140,7 +6141,7 @@ export class AgentFramework {
 
   /**
    * Remove a gate policy by name at runtime. Returns false if it didn't exist.
-   * A copy of a gate.json that can't be read or isn't JSON is kept first, as
+   * A copy of a gate.json that could be read but isn't JSON is kept first, as
    * for addGatePolicy. Throws if no gate is configured, gate.json has no rule
    * list a change could edit, it isn't used and the removal doesn't mend it,
    * or it can't be read, kept or written (EventGate.removePolicy); the rule

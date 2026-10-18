@@ -375,7 +375,7 @@ test('when a copy of the unreadable gate.json cannot be kept, nothing is written
 
   assert.match(
     thrown,
-    /^gate\.json couldn't be used \(.*\), and keeping a copy of it at .*gate\.json\.unreadable-20261015T025905Z failed \(EACCES: .*\), so nothing was written\.$/,
+    /^gate\.json couldn't be used \(.*\), and keeping a copy of it at .*gate\.json\.unreadable-20261015T025905Z failed \(EACCES: .*\), so nothing was written\. Whoever runs this host can fix gate\.json, or what kept the copy from being made; until then, a change is refused the same way\.$/,
   );
   assert.equal(readFileSync(configPath, 'utf-8'), BROKEN);
   assert.deepEqual(keptFiles(dir), []);
@@ -383,6 +383,35 @@ test('when a copy of the unreadable gate.json cannot be kept, nothing is written
   assert.equal(quiet?.name, 'quiet', 'the rule stays in force');
   assert.equal(quiet?.debounceState?.pendingCount, 1, 'its batch is still pending');
   assert.deepEqual(wakes, [], 'and was not delivered');
+});
+
+test('a copy whose write fails once it is made is removed, so nothing is left beside gate.json', (t) => {
+  const dir = tempDir(t);
+  const { gate, configPath } = makeGate(dir, { config: RULES });
+  writeFileSync(configPath, BROKEN);
+  // The copy is made, some of its bytes land, and the disk fills: a write fails, not the open.
+  const realWrite = fs.writeFileSync;
+  const write = t.mock.method(fs, 'writeFileSync', (...args: Parameters<typeof fs.writeFileSync>) => {
+    if (!String(args[0]).includes('.unreadable-')) return realWrite(...args);
+    realWrite(args[0], Buffer.from(args[1] as Uint8Array).subarray(0, 8), args[2]);
+    throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC', syscall: 'write' });
+  });
+  syncBuiltinESMExports();
+  let thrown: string;
+  try {
+    thrown = thrownBy(() => gate.addPolicy({ name: 'ambient', behavior: 'defer' }));
+  } finally {
+    write.mock.restore();
+    syncBuiltinESMExports();
+  }
+
+  assert.match(
+    thrown,
+    /^gate\.json couldn't be used \(.*\), and keeping a copy of it at .*gate\.json\.unreadable-20261015T025905Z failed \(ENOSPC: no space left on device, write\), so nothing was written\./,
+  );
+  assert.deepEqual(keptFiles(dir), [], 'the copy cut short is removed');
+  assert.equal(readFileSync(configPath, 'utf-8'), BROKEN, 'gate.json is as it was');
+  assert.deepEqual(gate.getStatus().policies.map((p) => p.name), ['mentions'], 'the rules in force stay');
 });
 
 test('a write that fails after the copy is kept names the copy', {
