@@ -63,6 +63,12 @@ export interface MountView {
    * pass passes over them, named or not, as another mount's directory.
    */
   others: readonly string[];
+  /**
+   * The same mounts, each by its directory and its name, for a refusal that
+   * names the mount a symlink leads into. Without it, that refusal names no
+   * mount.
+   */
+  nested?: readonly { dir: string; name: string }[];
 }
 
 export type StatFingerprint = Omit<Fingerprint, 'hashedAt'>;
@@ -245,23 +251,34 @@ export async function linkLeads(root: string, rootReal: string, link: string): P
  * directory there, the setting the mount's host can change (the link stands
  * among the path's directories, so following a link to a file can't make the
  * path beneath it exist); for one leading outside the mount, that it does;
- * for one that can't be resolved, nothing more. For a directory the walk
+ * for one that can't be resolved, nothing more. A target in a nested mount's
+ * directory (`nested`) is that mount's: the refusal names the mount and the
+ * path to use there, and offers no setting, since following the link would
+ * only reach into another mount's directory. For a directory the walk
  * couldn't ask, which one, and the answer it got. Paths are spelled as the
  * tools take them, from the mount's name.
  */
-export function linkWords(name: string, found: LinkFound, leads: LinkLeads | null): string {
+export function linkWords(name: string, found: LinkFound, leads: LinkLeads | null, nested: readonly { dir: string; name: string }[] = []): string {
   const spell = (rel: string) => `"${rel === '' ? name : `${name}/${rel}`}"`;
   if (!('link' in found)) return `${UNSURE_PREFIX}${name}/${found.unsure}" is a symlink (${found.code})`;
   const link = `${spell(found.link)} is a symlink`;
   if (leads === null || leads.kind === 'nowhere') return `${link}, which this mount does not follow`;
   if (leads.kind === 'outside') return `${link} leading outside the mount, which this mount does not follow`;
+  const holder = nested
+    .filter((n) => leads.target === n.dir || leads.target.startsWith(`${n.dir}/`))
+    .sort((a, b) => b.dir.length - a.dir.length)[0];
+  if (holder) {
+    const rest = leads.target.slice(holder.dir.length + 1);
+    return `${link} to ${spell(leads.target)}, which this mount does not follow; it lies in mount "${holder.name}", ` +
+      `nested in mount "${name}": use "${rest ? `${holder.name}/${rest}` : holder.name}"`;
+  }
   const setting = leads.directory ? "; the mount's host can set followSymlinks: true" : '';
   return `${link} to ${spell(leads.target)}, which this mount does not follow${setting}`;
 }
 
 /** Why a path is refused for what linkOnTheWay found (linkWords, with where the link leads). */
-export async function linkReason(view: Pick<MountView, 'root' | 'name'>, rootReal: string, found: LinkFound): Promise<string> {
-  return linkWords(view.name, found, 'link' in found ? await linkLeads(view.root, rootReal, found.link) : null);
+export async function linkReason(view: Pick<MountView, 'root' | 'name' | 'nested'>, rootReal: string, found: LinkFound): Promise<string> {
+  return linkWords(view.name, found, 'link' in found ? await linkLeads(view.root, rootReal, found.link) : null, view.nested);
 }
 
 // ===========================================================================

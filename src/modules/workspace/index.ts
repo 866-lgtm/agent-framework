@@ -254,13 +254,18 @@ function matchesPartialPrefix(buffer: Buffer, prefix: Buffer): boolean {
  * leading outside the mount, the code of any path that resolves outside it,
  * and `symlink` for any other.
  */
-async function linkReadError(mount: { config: { name: string; path: string } }, found: LinkFound, mountPrefixedPath: string): Promise<WorkspaceReadError> {
+async function linkReadError(
+  mount: { config: { name: string; path: string } },
+  found: LinkFound,
+  mountPrefixedPath: string,
+  nested: readonly { dir: string; name: string }[],
+): Promise<WorkspaceReadError> {
   if (!('link' in found)) {
     return new WorkspaceReadError('not_found', `Unable to read file: ${mountPrefixedPath}: ${linkWords(mount.config.name, found, null)}`, 'readlink', found.code);
   }
   const rootReal = await realpath(mount.config.path).catch(() => resolve(mount.config.path));
   const leads = await linkLeads(mount.config.path, rootReal, found.link);
-  const reason = `${mountPrefixedPath}: ${linkWords(mount.config.name, found, leads)}`;
+  const reason = `${mountPrefixedPath}: ${linkWords(mount.config.name, found, leads, nested)}`;
   return new WorkspaceReadError(leads.kind === 'outside' ? 'escape' : 'symlink', reason, 'readlink');
 }
 
@@ -858,6 +863,7 @@ export class WorkspaceModule implements Module {
         maxFileSize: mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE,
         ignore: mount.config.ignore ?? [],
         others: this.othersOf(mount.config.name),
+        nested: this.nestedOf(mount.config.name),
       },
       rootReal,
       ctimeTrustedDev: trustedDev,
@@ -1711,6 +1717,11 @@ export class WorkspaceModule implements Module {
     return (this.otherMounts.get(mountName) ?? []).map((o) => o.dir);
   }
 
+  /** The mounts nested in `mountName`, by directory and name (MountView's `nested`). */
+  private nestedOf(mountName: string): { dir: string; name: string }[] {
+    return (this.otherMounts.get(mountName) ?? []).map(({ dir, name }) => ({ dir, name }));
+  }
+
   /**
    * The innermost mount nested in `mountName` whose directory holds a path
    * of that mount, judged lexically where the path lands (`.`, `..` and
@@ -1883,7 +1894,7 @@ export class WorkspaceModule implements Module {
     // resolution after the open, below.
     const linkView = { root: mount.config.path, followSymlinks: follow };
     const onTheWay = await linkOnTheWay(linkView, relativePath, 'parents');
-    if (onTheWay !== null) throw await linkReadError(mount, onTheWay, mountPrefixedPath);
+    if (onTheWay !== null) throw await linkReadError(mount, onTheWay, mountPrefixedPath, this.nestedOf(mount.config.name));
 
     let fileInfo: Awaited<ReturnType<typeof lstat>>;
     try {
@@ -1979,7 +1990,7 @@ export class WorkspaceModule implements Module {
       // A directory swapped for a link since the walk above is caught here, by
       // what the path resolved to after the open.
       const resolvedThrough = await linkRefusal(linkView, realMountRoot, relativePath, realFilePath);
-      if (resolvedThrough !== null) throw await linkReadError(mount, resolvedThrough, mountPrefixedPath);
+      if (resolvedThrough !== null) throw await linkReadError(mount, resolvedThrough, mountPrefixedPath, this.nestedOf(mount.config.name));
 
       if (!isContainedPath(realMountRoot, realFilePath)) {
         throw new WorkspaceReadError('escape', `Symlink escape detected: ${mountPrefixedPath}`, 'realpath');

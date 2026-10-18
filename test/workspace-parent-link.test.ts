@@ -347,6 +347,31 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
     assert.equal(shown(seen), 'unobserved: "work/l" is a symlink to "work", which this mount does not follow; the mount\'s host can set followSymlinks: true');
   });
 
+  test('a link into a nested mount\'s directory names the path to use in that mount, and not the setting, which would only reach into it', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('nested/sub/x.txt', 'inner\n');
+    symlinkSync('nested/sub', join(env.dir, 'l'));
+    const m = new WorkspaceModule({ mounts: [
+      { name: 'work', path: env.dir, mode: 'read-write', watch: 'never', autoMaterialize: true },
+      { name: 'inner', path: join(env.dir, 'nested'), mode: 'read-write', watch: 'never', autoMaterialize: true },
+    ] });
+    m.initStore(env.store);
+    await m.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
+    t.after(() => m.stop().catch(() => {}));
+    const reason = '"work/l" is a symlink to "work/nested/sub", which this mount does not follow; it lies in mount "inner", nested in mount "work": use "inner/sub"';
+    await assert.rejects(m.readFileFromDisk('work/l/x.txt'), (err: unknown) => {
+      assert.ok(err instanceof WorkspaceReadError, String(err));
+      assert.equal(err.code, 'symlink');
+      assert.equal(err.message, `work/l/x.txt: ${reason}`);
+      return true;
+    });
+    const res = await m.handleToolCall({ id: 't', name: 'write', input: { path: 'work/l/new.txt', content: 'via work\n' } });
+    assert.equal(res.success, false);
+    assert.ok(String(res.error).includes(reason), String(res.error));
+    assert.ok(!String(res.error).includes('followSymlinks'), String(res.error));
+    assert.equal(existsSync(join(env.dir, 'nested', 'sub', 'new.txt')), false);
+  });
+
   test('a path that resolves to another spelling of itself, with no link on its way, is reached by each primitive', async (t) => {
     // On macOS or Windows, realpath spells a name as disk does, its case or
     // its Unicode normalization, where the path may spell it otherwise. That
