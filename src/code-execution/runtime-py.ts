@@ -21,7 +21,7 @@
  *     inside the script instead of dropping wakes.
  *   - its stderr joined to its stdout (fd 2 onto fd 1's pipe), so the host's
  *     journal of its output (a log file the agent can read, and a tail for the
- *     crash envelope) holds the two in the order they were written.
+ *     crash envelope) holds their lines in the order they were written.
  *
  * OUTPUT. The protocol has file descriptors of its own: the host opens the
  * runtime's fds 3 (host -> py) and 4 (py -> host), which the runtime makes
@@ -210,14 +210,15 @@ def _check_own_fds():
 def _diag(text):
     # A note of the runtime's own for the host's log, through fd 2's copy or,
     # if a script closed or replaced that, fd 2 itself, and only while it's
-    # one of the host's output pipes: a note never goes into a file a script
-    # put in its place. It waits for room on a pipe a command left
-    # non-blocking, as the marks do (_write_some).
+    # one of the two outputs the host gave the runtime, as the runtime found
+    # them at its start: a note never goes into a file a script put in its
+    # place. It waits for room on a pipe a command left non-blocking, as the
+    # marks do (_write_some).
     data = ("[pytc-runtime] " + text + "\n").encode("utf-8", "backslashreplace")
     pipes = [_OWN_FDS[fd][2] for fd in (_STD_OUT, _STD_ERR) if fd in _OWN_FDS]
     for fd in (_STD_ERR, 2):
         try:
-            if fd is not None and (not pipes or _identity(fd) in pipes):
+            if fd is not None and _identity(fd) in pipes:
                 _write_all(fd, data)
                 return
         except OSError:
@@ -278,7 +279,7 @@ def _open_streams():
     os.dup2(_STD_IN, 0)
     os.dup2(_STD_OUT, 1)
     # A background script's journal is one stream: its stderr joins its stdout's
-    # pipe, so the two keep the order they were written in.
+    # pipe, so their lines keep the order they were written in.
     os.dup2(_STD_OUT if BACKGROUND else _STD_ERR, 2)
     return _script_writer(1), _script_writer(2)
 
@@ -299,8 +300,8 @@ def _flush_writers():
             writer.flush()
         except ValueError:
             # A script closed or detached it, or the stream under it: nothing
-            # more goes through it. Closing or detaching the writer itself
-            # sent what it held first.
+            # more goes through it. A script that closed or detached the writer
+            # itself flushed it then, and saw any failure of that flush.
             continue
         except Exception as exc:
             # Its fd closed or broke under it, so that much can't be sent.

@@ -11,7 +11,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { ChildProcess, execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, mkdtempSync, openSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type {
@@ -1519,6 +1519,32 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
     }
   });
 
+  it("a script that replaces both the runtime's copy of fd 2 and fd 2 with files gets nothing of the runtime's in either, and the general advice", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pytc-both2-'));
+    const copy = join(dir, 'copy');
+    const two = join(dir, 'two');
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      const result = await within(
+        runner.exec([
+          'import __main__, os',
+          `os.dup2(os.open(${JSON.stringify(copy)}, os.O_WRONLY | os.O_CREAT), __main__._STD_ERR)`,
+          `os.dup2(os.open(${JSON.stringify(two)}, os.O_WRONLY | os.O_CREAT), 2)`,
+          'print("replaced")',
+        ].join('\n'), []),
+        'the replacing script',
+      );
+      assert.strictEqual(result.aborted, true);
+      assert.strictEqual(result.stdout, 'replaced\n');
+      assert.strictEqual(result.stderr, exitedUnder('exited with code 70'));
+      assert.deepStrictEqual({ copy: readFileSync(copy, 'utf8'), two: readFileSync(two, 'utf8') }, { copy: '', two: '' });
+      assert.strictEqual((await within(runner.exec('print("fresh")', []), 'the next script')).stdout, 'fresh\n');
+    } finally {
+      runner.dispose();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("a script that closes fd 3 while it still waits on the host ends the interpreter when the runtime's reader fails, or reads a file that took the number to its end", async () => {
     const dir = mkdtempSync(join(tmpdir(), 'pytc-fd3-'));
     const file = join(dir, 'readable');
@@ -2357,16 +2383,45 @@ describe('PyRunner background mode (real python3)', () => {
         'const runner = new PyRunner({ onToolCall: async () => "" });',
         `const result = await runner.exec(${JSON.stringify(script)}, [], { logPath: ${JSON.stringify(logPath)}, lifetimeMs: 30000, onWake: async () => null });`,
         'runner.dispose();',
-        'process.stdout.write(JSON.stringify({ returnCode: result.returnCode, logged }));',
+        'process.stdout.write(JSON.stringify({ returnCode: result.returnCode, tail: result.tail, logged }));',
       ].join('\n');
       const out = execFileSync('bash', ['-c', 'ulimit -f 64 && exec "$0" --input-type=module -e "$1"', process.execPath, host], { encoding: 'utf8' });
-      const { returnCode, logged } = JSON.parse(out) as { returnCode: number; logged: string[] };
+      const { returnCode, tail, logged } = JSON.parse(out) as { returnCode: number; tail: string; logged: string[] };
       assert.strictEqual(returnCode, 0, JSON.stringify(logged));
+      const written = `${'x'.repeat(64999)}\n${'y'.repeat(999)}\n`;
       const journal = readFileSync(logPath, 'utf8');
       assert.ok(journal.length >= 65000 && journal.length <= 65536, `${journal.length} bytes`);
-      assert.strictEqual(journal, `${'x'.repeat(64999)}\n${'y'.repeat(999)}\n`.slice(0, journal.length));
+      assert.strictEqual(journal, written.slice(0, journal.length));
+      assert.strictEqual(tail, written.slice(-4000));
       assert.strictEqual(logged.filter((l) => /cannot write the log file any more: .*EFBIG/.test(l)).length, 1, JSON.stringify(logged));
     } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('a journal stops at its 50 MB cap with one line saying so, and its tail goes on', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'pytc-cap-'));
+    const logPath = join(tempDir, 'bg.log');
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      const result = await runner.exec(
+        'import sys\nfor i in range(51):\n    sys.stdout.write("x" * 999999 + "\\n")\nprint("done")',
+        [],
+        { logPath, lifetimeMs: 60_000, onWake: async () => null },
+      );
+      assert.strictEqual(result.returnCode, 0, result.tail ?? '');
+      const capLine = '\n[log capped at 50000000 bytes]\n';
+      const size = statSync(logPath).size;
+      // The piece that would pass the cap isn't written, and a piece is one read of the pipe.
+      assert.ok(size > 49_900_000 && size <= 50_000_000 + capLine.length, `${size} bytes`);
+      const fd = openSync(logPath, 'r');
+      const end = Buffer.alloc(capLine.length + 4);
+      readSync(fd, end, 0, end.length, size - end.length);
+      closeSync(fd);
+      assert.match(end.toString('utf8'), /^[x\n]{4}\n\[log capped at 50000000 bytes\]\n$/);
+      assert.strictEqual(result.tail, `${'x'.repeat(999999)}\ndone\n`.slice(-4000));
+    } finally {
+      runner.dispose();
       rmSync(tempDir, { recursive: true, force: true });
     }
   });

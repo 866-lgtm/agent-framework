@@ -142,7 +142,13 @@ function alive(child: ChildProcess): boolean {
  */
 function writeAll(fd: number, text: string): void {
   const data = Buffer.from(text);
-  for (let at = 0; at < data.length; ) at += writeSync(fd, data, at);
+  for (let at = 0; at < data.length; ) {
+    const n = writeSync(fd, data, at);
+    // POSIX has a regular file take at least a byte of a write or fail it; a
+    // write that took none would otherwise hold the host's event loop here.
+    if (n === 0) throw new Error('the file took none of a write');
+    at += n;
+  }
 }
 
 /**
