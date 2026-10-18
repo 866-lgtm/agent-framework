@@ -2,13 +2,12 @@ import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-gr
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
-import { McplErrorResponse } from '../src/mcpl/errors.js';
-import { McplServerConnection } from '../src/mcpl/server-connection.js';
+import { McplRequestError, McplServerConnection } from '../src/mcpl/server-connection.js';
 import { parseProsePrefix } from '../src/mcpl/prose-grammar.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 
-type RouteFailure = { conversationId: string; channelId: string | null; reason: string; textLen: number; outcome: 'failed' | 'unknown' };
+type RouteFailure = { conversationId: string; channelId: string | null; reason: string; textLen: number; outcome?: 'failed' | 'unknown'; detail?: string };
 
 /**
  * Build a registry with a mock server whose publish result is configurable,
@@ -384,7 +383,7 @@ test('routeSpeech does NOT deliver when the open-on-delivery fails', async () =>
   assert.equal(res, null, 'no delivery into a channel that could not be opened');
   assert.equal(publishCalls.length, publishesBefore, 'publish must not be attempted');
   assert.equal(failures.length, 1);
-  assert.match(failures[0]!.reason, /^the channel was closed, and opening it failed: /);
+  assert.match(failures[0]!.reason, /closed and open failed/);
   assert.equal(failures[0]!.outcome, 'failed', 'nothing was published');
 });
 
@@ -654,6 +653,21 @@ test('plain speech into a channel its server declared inbound-only is refused be
   assert.ok(traces.some((t) => t.type === 'mcpl:speech-route-failed' && t.channelId === 'body:ears'));
 });
 
+test('publish() itself refuses an inbound-only channel, so a drafts resend, which names the server, is refused before anything opens', async () => {
+  const { registry, failures, publishCalls, openCalls } = makeRegistry({ delivered: true });
+  await registerInboundOnly(registry);
+
+  // As a drafts resend calls it: an exact destination, no speech routing.
+  const outcome = await registry.publish('linn', 'held words', { serverId: 'body', channelId: 'body:ears' });
+
+  assert.equal(outcome.status, 'failed', 'nothing was posted');
+  assert.deepEqual(outcome.destination, { serverId: 'body', channelId: 'body:ears', label: 'Body · ears' });
+  assert.match(outcome.reason ?? '', /^inbound-only: server "body" declared this channel's direction "inbound"/);
+  assert.deepEqual(openCalls, [], 'the closed channel was not opened');
+  assert.deepEqual(publishCalls, []);
+  assert.deepEqual(failures, [], "the caller reports it: publish() writes no marker of its own");
+});
+
 test('channel_publish into an inbound-only channel is refused, naming the declaration, and publishes nothing', async () => {
   const { registry, publishCalls } = makeRegistry({ delivered: true });
   await registerInboundOnly(registry);
@@ -796,11 +810,11 @@ test('publishForAgent traces a publish the server reports undelivered as failed,
   assert.deepEqual(traces.filter((t) => t.type === 'mcpl:speech-routed'), []);
   assert.deepEqual(
     traces.filter((t) => t.type === 'mcpl:speech-route-failed').map((t) => [t.conversationId, t.channelId, t.reason, t.outcome]),
-    [['Subconscious', 'body:home', 'the server reported delivered:false', 'failed']],
+    [['Subconscious', 'body:home', 'server "body" reported delivered:false', 'failed']],
   );
 });
 
-test("publishForAgent traces a server's error response as unknown, and another rejection with no outcome", async () => {
+test("publishForAgent traces what a rejected publish may have done: unknown after an error response or a timeout, failed when the request never left", async () => {
   const { registry, traces, setOnPublish } = makeRegistry({ delivered: true });
   await registry.handleChanged('body', {
     added: [{ id: 'body:home', type: 'chat', label: 'Body · home', direction: 'bidirectional' }],
@@ -809,20 +823,28 @@ test("publishForAgent traces a server's error response as unknown, and another r
 
   // An error response may follow a partial post.
   setOnPublish(async () => {
-    throw new McplErrorResponse('MCPL server "body" returned error for channels/publish: [-32000] Rate limited after part 1', 'Rate limited after part 1');
+    throw new McplRequestError('MCPL server "body" returned error for channels/publish: [-32000] Rate limited after part 1', 'error-response', undefined, 'Rate limited after part 1');
   });
   const unconfirmed = await registry.publishForAgent('body:home', 'a long thought', 'Subconscious');
-  assert.equal(unconfirmed.error, 'Publish to body:home wasn\'t confirmed: server "body" answered with an error: Rate limited after part 1. It may or may not have been posted, so sending it again could post it twice.');
-  assert.equal(failed().length, 1);
-  assert.equal(failed()[0]!.outcome, 'unknown');
+  assert.equal(unconfirmed.error, 'Publish to body:home wasn\'t confirmed: server "body" answered with an error: Rate limited after part 1 (delivery uncertain). It may or may not have been posted, so sending it again could post it twice.');
+  assert.deepEqual(failed().map((t) => [t.reason, t.outcome]),
+    [['server "body" answered with an error: Rate limited after part 1 (delivery uncertain)', 'unknown']]);
 
-  // A timeout, a lost connection and a closed connection are plain Errors,
-  // which the host can't tell apart: the trace says neither.
-  setOnPublish(async () => { throw new Error('channels/publish timed out after 30000ms'); });
-  const timedOut = await registry.publishForAgent('body:home', 'a thought', 'Subconscious');
-  assert.equal(timedOut.error, 'Failed to publish to channel: channels/publish timed out after 30000ms');
-  assert.equal(failed().length, 2);
-  assert.equal('outcome' in failed()[1]!, false, JSON.stringify(failed()[1]));
+  // So may a request that went out and got no answer.
+  setOnPublish(async () => {
+    throw new McplRequestError('MCPL server "body" did not respond to channels/publish within 30000ms', 'no-response');
+  });
+  await registry.publishForAgent('body:home', 'a thought', 'Subconscious');
+  assert.equal(failed()[1]!.outcome, 'unknown');
+
+  // Only a request that never left proves nothing was posted.
+  setOnPublish(async () => {
+    throw new McplRequestError('Cannot send request: connection to "body" is closed', 'not-sent');
+  });
+  const notSent = await registry.publishForAgent('body:home', 'another', 'Subconscious');
+  assert.match(notSent.error ?? '', /^Publish to body:home failed: .*is closed\. Nothing was posted\./);
+  assert.equal(failed()[2]!.outcome, 'failed');
+  assert.equal(traces.filter((t) => t.type === 'mcpl:speech-routed').length, 0);
 });
 
 test('buildChannelContext names no defaultOutgoing for a locus its server declared inbound-only', async () => {
@@ -908,7 +930,7 @@ test("publishForAgent's routed trace names the server it published through, thou
   assert.equal(routed[0]!.serverId, 'body');
 });
 
-test("a server's error response to a request rejects with McplErrorResponse, carrying the server's words, with the code in the operator's message", async () => {
+test("a server's error response to a request rejects with McplRequestError, an error-response carrying the server's words and data, with the code in the operator's message", async () => {
   const connection = new (McplServerConnection as any)('body', null, null) as McplServerConnection;
   const internals = connection as unknown as {
     pendingRequests: Map<number, { resolve(r: unknown): void; reject(e: Error): void; method: string }>;
@@ -919,9 +941,11 @@ test("a server's error response to a request rejects with McplErrorResponse, car
   });
   internals.handleResponse({ jsonrpc: '2.0', id: 7, error: { code: -32017, message: 'Channel not permitted', data: { channelId: 'body:ears' } } });
   await assert.rejects(answer, (err: Error) => {
-    assert.ok(err instanceof McplErrorResponse);
+    assert.ok(err instanceof McplRequestError);
+    assert.equal(err.outcome, 'error-response');
     assert.equal(err.message, 'MCPL server "body" returned error for channels/publish: [-32017] Channel not permitted');
-    assert.equal((err as McplErrorResponse).serverMessage, 'Channel not permitted');
+    assert.equal(err.serverMessage, 'Channel not permitted');
+    assert.deepEqual(err.data, { channelId: 'body:ears' });
     return true;
   });
 });
@@ -933,7 +957,8 @@ test("an error response with no message, or one that isn't text, still settles i
     handleResponse(response: unknown): void;
   };
   // Each error, what the agent reads as the server's words, and the operator's
-  // message, which shows the code as it came.
+  // message, which adds the code: a number or text as it came, anything else
+  // as JSON.
   const deep = JSON.parse('['.repeat(100_000) + ']'.repeat(100_000));
   const cases: Array<[unknown, string, string]> = [
     [{ code: -32000 }, 'an error with no message', '[-32000] an error with no message'],
@@ -943,19 +968,21 @@ test("an error response with no message, or one that isn't text, still settles i
     [{ code: -32000, message: { toString: 1, valueOf: 1 } }, 'an error whose message isn\'t text: {"toString":1,"valueOf":1}', '[-32000] an error whose message isn\'t text: {"toString":1,"valueOf":1}'],
     [{ message: 'no code' }, 'no code', '[none] no code'],
     [{ code: { toString: 1 }, message: 'odd code' }, 'odd code', '[{"toString":1}] odd code'],
+    [{ code: 'E1', message: 'a code in text' }, 'a code in text', '[E1] a code in text'],
     [{ code: 1.5, message: 'half a code' }, 'half a code', '[1.5] half a code'],
     // Text sent in place of an error object is still the server's words.
     ['Channel not permitted', 'Channel not permitted', '[none] Channel not permitted'],
     // Anything else in its place is shown as it came.
     [[1, 2], 'an error that came as [1,2]', '[none] an error that came as [1,2]'],
-    // A long value, or a long message, is cut at 200 characters for the
-    // agent; the operator's message keeps a text message whole.
+    // Control, format and line characters are replaced in both texts.
+    [{ code: -32000, message: 'line one\nline two\u202e' }, 'line one?line two?', '[-32000] line one?line two?'],
+    // A long value, or a long message, is cut after 200 code points in both texts.
     [{ code: -32000, message: { text: 'x'.repeat(500) } }, `an error whose message isn't text: ${JSON.stringify({ text: 'x'.repeat(500) }).slice(0, 200)}…`, `[-32000] an error whose message isn't text: ${JSON.stringify({ text: 'x'.repeat(500) }).slice(0, 200)}…`],
-    [{ code: -32000, message: 'y'.repeat(500) }, `${'y'.repeat(200)}…`, `[-32000] ${'y'.repeat(500)}`],
-    ['w'.repeat(500), `${'w'.repeat(200)}…`, `[none] ${'w'.repeat(500)}`],
+    [{ code: -32000, message: 'y'.repeat(500) }, `${'y'.repeat(200)}…`, `[-32000] ${'y'.repeat(200)}…`],
+    ['w'.repeat(500), `${'w'.repeat(200)}…`, `[none] ${'w'.repeat(200)}…`],
     // Exactly 200 stays whole; characters past the BMP count once and are never split.
     [{ code: -32000, message: 'z'.repeat(200) }, 'z'.repeat(200), `[-32000] ${'z'.repeat(200)}`],
-    [{ code: -32000, message: '\u{1F600}'.repeat(300) }, `${'\u{1F600}'.repeat(200)}…`, `[-32000] ${'\u{1F600}'.repeat(300)}`],
+    [{ code: -32000, message: '\u{1F600}'.repeat(300) }, `${'\u{1F600}'.repeat(200)}…`, `[-32000] ${'\u{1F600}'.repeat(200)}…`],
   ];
   for (const [i, [error, serverMessage, operator]] of cases.entries()) {
     const id = 100 + i;
@@ -964,8 +991,9 @@ test("an error response with no message, or one that isn't text, still settles i
     });
     internals.handleResponse({ jsonrpc: '2.0', id, error });
     await assert.rejects(answer, (err: Error) => {
-      assert.ok(err instanceof McplErrorResponse);
-      assert.equal((err as McplErrorResponse).serverMessage, serverMessage, JSON.stringify(error));
+      assert.ok(err instanceof McplRequestError);
+      assert.equal(err.outcome, 'error-response');
+      assert.equal(err.serverMessage, serverMessage, JSON.stringify(error));
       assert.equal(err.message, `MCPL server "body" returned error for channels/publish: ${operator}`);
       return true;
     });
@@ -984,8 +1012,8 @@ test("an error response with no message, or one that isn't text, still settles i
   });
   internals.handleResponse({ jsonrpc: '2.0', id: 200, error: { code: -32000, message: deep } });
   await assert.rejects(answer, (err: Error) => {
-    assert.ok(err instanceof McplErrorResponse);
-    const text = (err as McplErrorResponse).serverMessage;
+    assert.ok(err instanceof McplRequestError);
+    const text = err.serverMessage ?? '';
     assert.ok(
       text === "an error whose message isn't text: (a value nested too deeply to show)" || text.startsWith("an error whose message isn't text: [[["),
       text.slice(0, 120),
@@ -995,31 +1023,18 @@ test("an error response with no message, or one that isn't text, still settles i
   });
 });
 
-test('a request on a connection already closed rejects with a plain Error, since nothing was sent (R1-2)', async () => {
-  const connection = new (McplServerConnection as any)('body', null, null) as McplServerConnection;
-  (connection as unknown as { closed: boolean }).closed = true;
-  await assert.rejects(
-    connection.sendChannelsPublish({ conversationId: 'linn', channelId: 'body:home', content: [{ type: 'text', text: 'hello' }] }),
-    (err: Error) => {
-      assert.equal(err instanceof McplErrorResponse, false, `a plain Error, not ${err.name}`);
-      assert.match(err.message, /is closed/);
-      return true;
-    },
-  );
-});
-
 test("a server's error response to the publish goes through fail() as unconfirmed: a trace and the send-failure marker (R1-2)", async () => {
   const { registry, failures, traces, publishCalls, setOnPublish } = makeRegistry({ delivered: true });
   await registry.handleRegister('body', {
     channels: [{ id: 'body:home', type: 'chat', label: 'Body · home', direction: 'bidirectional' }],
   } as never);
   setOnPublish(async () => {
-    throw new McplErrorResponse('MCPL server "body" returned error for channels/publish: [-32017] Channel not permitted', 'Channel not permitted');
+    throw new McplRequestError('MCPL server "body" returned error for channels/publish: [-32017] Channel not permitted', 'error-response', undefined, 'Channel not permitted');
   });
 
   assert.equal(await registry.routeSpeech('linn', 'hello', 'body:home'), null);
   assert.equal(publishCalls.length, 1, 'the publish was sent, and the server answered with an error');
-  assert.deepEqual(failures.map((f) => f.reason), ['server "body" answered the publish with an error: Channel not permitted'],
+  assert.deepEqual(failures.map((f) => f.reason), ['server "body" answered with an error: Channel not permitted (delivery uncertain)'],
     "the marker gives the server's own words, without the method or the code");
   // An error response may follow a partial post, so whether it was posted is unknown.
   assert.deepEqual(failures.map((f) => f.outcome), ['unknown']);
@@ -1028,18 +1043,6 @@ test("a server's error response to the publish goes through fail() as unconfirme
   assert.equal(failed[0]!.channelId, 'body:home');
   assert.equal(failed[0]!.outcome, 'unknown');
   assert.equal(traces.filter((t) => t.type === 'mcpl:speech-routed').length, 0);
-});
-
-test('a publish that times out or loses its connection still rejects, with no marker claiming it went undelivered (R1-2)', async () => {
-  const { registry, failures, traces, setOnPublish } = makeRegistry({ delivered: true });
-  await registry.handleRegister('body', {
-    channels: [{ id: 'body:home', type: 'chat', label: 'Body · home', direction: 'bidirectional' }],
-  } as never);
-  setOnPublish(async () => { throw new Error('Request channels/publish to MCPL server "body" timed out after 30000ms'); });
-
-  await assert.rejects(registry.routeSpeech('linn', 'hello', 'body:home'), /timed out/);
-  assert.equal(failures.length, 0, 'whether the server posted it is unknown');
-  assert.equal(traces.filter((t) => t.type === 'mcpl:speech-route-failed').length, 0);
 });
 
 test("a lazily registered channel whose open answers inbound-only is refused before the publish, and stays refused (R1-3)", async () => {
@@ -1103,21 +1106,21 @@ test('a channel removed while the host opens it for speech is refused, and nothi
 });
 
 test("a server's refusal of an open or a tool's publish reaches the agent in its own words", async () => {
-  const refusal = () => new McplErrorResponse('MCPL server "body" returned error for channels/open: [-32024] Channel unavailable', 'Channel unavailable');
+  const refusal = () => new McplRequestError('MCPL server "body" returned error for channels/open: [-32024] Channel unavailable', 'error-response', undefined, 'Channel unavailable');
   const { registry, failures, setOnOpen, setOnPublish } = makeRegistry({ delivered: true });
   await registry.handleRegister('body', {
     channels: [{ id: 'body:home', type: 'chat', label: 'Body · home', direction: 'bidirectional' }],
   } as never);
   setOnOpen(async () => { throw refusal(); });
   assert.equal(await registry.routeSpeech('linn', 'hello', 'body:home'), null);
-  assert.deepEqual(failures.map((f) => f.reason), ['the channel was closed, and opening it failed: server "body" answered with an error: Channel unavailable']);
+  assert.deepEqual(failures.map((f) => f.reason), ['channel is closed and open failed: server "body" answered with an error: Channel unavailable']);
   const opened = await registry.handleChannelToolCall('channel_open', { channelId: 'body:home' }, { kind: 'agent', agentName: 'linn' });
   assert.equal(opened.error, 'Failed to open channel: server "body" answered with an error: Channel unavailable');
 
   setOnOpen(undefined);
-  setOnPublish(async () => { throw new McplErrorResponse('MCPL server "body" returned error for channels/publish: [-32017] Channel not permitted', 'Channel not permitted'); });
+  setOnPublish(async () => { throw new McplRequestError('MCPL server "body" returned error for channels/publish: [-32017] Channel not permitted', 'error-response', undefined, 'Channel not permitted'); });
   const published = await registry.handleChannelToolCall('channel_publish', { channelId: 'body:home', content: 'hi' }, { kind: 'agent', agentName: 'linn' });
-  assert.equal(published.error, 'Publish to body:home wasn\'t confirmed: server "body" answered with an error: Channel not permitted. It may or may not have been posted, so sending it again could post it twice.');
+  assert.equal(published.error, 'Publish to body:home wasn\'t confirmed: server "body" answered with an error: Channel not permitted (delivery uncertain). It may or may not have been posted, so sending it again could post it twice.');
 });
 
 test("a failure that isn't an Error reaches the agent as its text", async () => {
@@ -1137,7 +1140,7 @@ test("every failed open, publish, close and acknowledgement reaches the agent as
   } as never);
   const agent = { kind: 'agent', agentName: 'linn' } as const;
   const long = 'w'.repeat(300);
-  const refusal = (method: string) => new McplErrorResponse(`MCPL server "body" returned error for ${method}: [-32017] ${long}`, `${'w'.repeat(200)}…`);
+  const refusal = (method: string) => new McplRequestError(`MCPL server "body" returned error for ${method}: [-32017] ${long}`, 'error-response', undefined, `${'w'.repeat(200)}…`);
   const unprintable = { get message(): string { throw new Error('getter'); } };
   for (const [thrown, words] of [
     [{ message: 'channel full' }, 'channel full'],
@@ -1146,11 +1149,12 @@ test("every failed open, publish, close and acknowledgement reaches the agent as
   ] as const) {
     setOnOpen(async () => { throw thrown; });
     assert.equal(await registry.routeSpeech('linn', 'hello', 'body:home'), null);
-    assert.equal(failures.at(-1)!.reason, `the channel was closed, and opening it failed: ${words}`);
+    assert.equal(failures.at(-1)!.reason, `channel is closed and open failed: ${words}`);
     assert.equal((await registry.handleChannelToolCall('channel_open', { channelId: 'body:home' }, agent)).error, `Failed to open channel: ${words}`);
     setOnOpen(undefined);
     setOnPublish(async () => { throw thrown; });
-    assert.equal((await registry.handleChannelToolCall('channel_publish', { channelId: 'body:home', content: 'hi' }, agent)).error, `Failed to publish to channel: ${words}`);
+    assert.equal((await registry.handleChannelToolCall('channel_publish', { channelId: 'body:home', content: 'hi' }, agent)).error,
+      `Publish to body:home wasn't confirmed: ${words} (delivery uncertain). It may or may not have been posted, so sending it again could post it twice.`);
     setOnPublish(undefined);
   }
   // A server's refusal of a close, cut as the agent reads it.
