@@ -27,8 +27,11 @@ class ProbeModule implements Module {
   ctx: ModuleContext | null = null;
   /** What onProcess answers to the next probe event. */
   answer: EventResponse = {};
+  /** Runs inside start(), with the context. */
+  onStart?: (ctx: ModuleContext) => void;
   async start(ctx: ModuleContext): Promise<void> {
     this.ctx = ctx;
+    this.onStart?.(ctx);
   }
   async stop(): Promise<void> {
     this.ctx = null;
@@ -57,8 +60,13 @@ interface Probe {
   module: ProbeModule;
 }
 
-async function open(storePath: string, extra: { agents?: AgentConfig[]; subconscious?: unknown } = {}): Promise<Probe> {
+async function open(
+  storePath: string,
+  extra: { agents?: AgentConfig[]; subconscious?: unknown } = {},
+  onStart?: (ctx: ModuleContext) => void,
+): Promise<Probe> {
   const module = new ProbeModule();
+  module.onStart = onStart;
   const framework = await AgentFramework.create({
     storePath,
     membrane: new MockMembrane().asMembrane(),
@@ -246,7 +254,7 @@ test('a handle whose write is gone names nothing, as an unknown id does', async 
   });
 });
 
-test("an external id's entry of '' that a release before handles left is looked up in the store and repaired, and one with nothing stored is dropped", async () => {
+test("an external id's entry of '' that a release before handles left is looked up in the store and repaired, and one with nothing stored answers null", async () => {
   const dir = mkdtempSync(join(tmpdir(), 'module-held-writes-'));
   const storePath = join(dir, 'store');
   let probe = await open(storePath);
@@ -277,14 +285,40 @@ test("an external id's entry of '' that a release before handles left is looked 
     assert.equal(ctx.findMessageByExternalId('probe', 'gone'), null);
     assert.deepEqual(
       ctx.getState<{ externalIdMap: Record<string, string> }>()!.externalIdMap,
-      { 'probe:e1': stored, 'probe:e2': '' },
-      'set to the stored id, kept as \'\' while held, and dropped with nothing stored',
+      { 'probe:e1': stored, 'probe:e2': '', 'probe:gone': '' },
+      'set to the stored id, and kept as \'\' while held or with nothing found',
     );
 
     await probe.framework.resume();
     const landed = ctx.findMessageByExternalId('probe', 'e2');
     assert.ok(landed && !landed.startsWith('held:'));
     assert.equal(textOf(ctx.getMessage(landed)!), 'still held');
+  } finally {
+    await probe.framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("in a module's start(), a write the last process held doesn't show yet, so a lookup there answers null and keeps its entry, and finds the write once create() is done", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'module-held-writes-'));
+  const storePath = join(dir, 'store');
+  let probe = await open(storePath);
+  try {
+    await probe.framework.quiesce({ reason: 'test' });
+    const handle = probe.ctx.addMessage('user', text('held at the stop'), external('b1'));
+    await probe.framework.stop();
+
+    const inStart: { found?: string | null; entry?: string } = {};
+    probe = await open(storePath, {}, (ctx) => {
+      inStart.found = ctx.findMessageByExternalId('probe', 'b1');
+      inStart.entry = ctx.getState<{ externalIdMap: Record<string, string> }>()!.externalIdMap['probe:b1'];
+    });
+    assert.deepEqual(inStart, { found: null, entry: '' }, 'create() restores the queue after start(), and the entry stays');
+    assert.equal(probe.ctx.findMessageByExternalId('probe', 'b1'), handle, 'the held write, once create() is done');
+    await probe.framework.resume();
+    const landed = probe.ctx.findMessageByExternalId('probe', 'b1');
+    assert.ok(landed && !landed.startsWith('held:'), 'its stored id once it lands');
+    assert.equal(textOf(probe.ctx.getMessage(landed)!), 'held at the stop');
   } finally {
     await probe.framework.stop();
     rmSync(dir, { recursive: true, force: true });

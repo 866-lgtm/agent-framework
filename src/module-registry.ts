@@ -771,21 +771,22 @@ class ModuleContextImpl implements ModuleContext {
     // the store by its external id, held rows included, and the first row
     // found is taken, as context-manager's findByExternalId takes it: a held
     // row answers by its handle and leaves the entry as it is, and a stored
-    // row's id becomes the entry. With nothing found, the entry goes.
+    // row's id becomes the entry. With nothing found, '' stays, as earlier
+    // releases kept it: in a module's start(), the writes the last process
+    // held don't show yet, since create() restores them after the modules
+    // start, and a write that shows later finds its entry.
     if (entry !== '') {
       if (this.getMessageFn(entry)) return entry;
-    } else {
-      const row = this.queryMessagesFn({ source, externalIds: [externalId] }).messages[0];
-      if (row?.held) return row.id;
-      if (row) {
-        this.externalIdMap.set(key, row.id);
-        this.persistExternalIdMap();
-        return row.id;
-      }
+      this.externalIdMap.delete(key);
+      this.persistExternalIdMap();
+      return null;
     }
-    this.externalIdMap.delete(key);
+    const row = this.queryMessagesFn({ source, externalIds: [externalId] }).messages[0];
+    if (row?.held) return row.id;
+    if (!row) return null;
+    this.externalIdMap.set(key, row.id);
     this.persistExternalIdMap();
-    return null;
+    return row.id;
   }
 
   getMessage(id: MessageId): ModuleMessage | null {

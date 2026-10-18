@@ -278,7 +278,9 @@ export interface ModuleContext {
    * quiesced), the id is a handle, `held:` and the write's id, which
    * getMessage, editMessage and removeMessage take as they take a stored
    * id, and which names the stored row once the write lands
-   * (ModuleMessage.held).
+   * (ModuleMessage.held). The writes a process held, and keeps across a
+   * restart, show to the next process's modules once create() has restored
+   * them, which is after every module's start().
    */
   addMessage(
     participant: string,
@@ -304,7 +306,8 @@ export interface ModuleContext {
    * held, whose id this context doesn't keep, the first row the store shows
    * under that external ID, held rows included, a held row by its handle.
    * Null when this context added none under it, when the row it added is
-   * gone, or when the store shows none for a held write.
+   * gone, or when the store shows none for a held write, such as one the
+   * last process held, looked up in start().
    */
   findMessageByExternalId(source: string, externalId: string): MessageId | null;
 
@@ -318,7 +321,8 @@ export interface ModuleContext {
    * Useful for finding messages from external sources, by participant, etc.
    * The rows of writes the framework holds come after the stored rows, as
    * the newest, or before them in a reversed query, marked `held`
-   * (ModuleMessage).
+   * (ModuleMessage). Those the last process held show once create() has
+   * restored them, after every module's start() (addMessage).
    */
   queryMessages(filter: MessageQuery): MessageQueryResult;
 
