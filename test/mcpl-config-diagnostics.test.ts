@@ -536,7 +536,7 @@ test('manifest change: a refused policy is traced with phase manifest-change, fo
   ]);
 });
 
-test("a policy refusal's 'close' fallback whose close fails reports that failure, not an unanswered policy, and the server's tools leave the list", async () => {
+test("a policy refusal's 'close' fallback whose close fails reports that failure, not an unanswered policy, and asks for the tool list to be refreshed", async () => {
   const unreaped = () => new Error('stdio child 7 of MCP server "srv" did not exit within 2000ms of SIGKILL; it could not be reaped');
   // At the initial policy.
   const fw = Object.create(AgentFramework.prototype) as any;
@@ -562,7 +562,7 @@ test("a policy refusal's 'close' fallback whose close fails reports that failure
   } finally {
     initial.stop();
   }
-  assert.deepEqual(refreshed, ['srv'], 'its tools leave the list');
+  assert.deepEqual(refreshed, ['srv'], 'a refresh of the tool list was asked for');
   assert.equal(registry.getServer('srv'), connection, 'it stays registered, holding its id');
   assert.ok(!initial.lines.some((l) => l.includes('did not answer')), initial.lines.join('\n'));
 
@@ -577,9 +577,41 @@ test("a policy refusal's 'close' fallback whose close fails reports that failure
   } finally {
     later.stop();
   }
-  assert.deepEqual(changed, ['srv'], 'its tools leave the list');
+  assert.deepEqual(changed, ['srv'], 'a refresh of the tool list was asked for');
   assert.ok(!later.lines.some((l) => l.includes('did not answer')), later.lines.join('\n'));
 });
+
+for (const queuedBehind of ['the fetch floor', 'a run in flight'] as const) {
+  test(`a manifest refresh queued behind ${queuedBehind}, whose 'close' fallback fails to close, logs that failure`, async () => {
+    const h = manifestHarness({ accepted: false, fallback: 'close', reason: 'too narrow' });
+    h.connection.close = () => Promise.reject(new Error('stdio child 7 of MCP server "srv" did not exit within 2000ms of SIGKILL; it could not be reaped'));
+    const announce = { revision: 'r2', domains: ['capabilities'] };
+    const capture = captureConsoleError();
+    try {
+      if (queuedBehind === 'the fetch floor') {
+        // The last refresh finished just inside the floor, so this one is
+        // queued, and runs on its own a few milliseconds later.
+        const floor = (AgentFramework as unknown as { MANIFEST_FETCH_FLOOR_MS: number }).MANIFEST_FETCH_FLOOR_MS;
+        h.fw.manifestRefreshState.set('srv', { inFlight: false, queued: false, lastCompletedAt: Date.now() - floor + 20 });
+        await h.fw.handleManifestChanged(h.connection, announce);
+        assert.equal(h.fw.manifestRefreshState.get('srv').queued, true, 'queued, not run yet');
+      } else {
+        // The second announcement comes while the first run is in flight, so
+        // it's queued, and runs once the fetch floor has passed after it.
+        const first = h.fw.handleManifestChanged(h.connection, announce).then(() => null, (error: unknown) => error);
+        await h.fw.handleManifestChanged(h.connection, announce);
+        assert.equal(h.fw.manifestRefreshState.get('srv').queued, true, 'queued behind the first');
+        assert.match(String(await first), /it could not be reaped$/, 'the first run rejects with its failed close');
+      }
+      await waitFor(
+        () => capture.lines.some((l) => l.includes('srv manifest refresh failed') && l.includes('it could not be reaped')),
+        'the queued run to log its failed close',
+      );
+    } finally {
+      capture.stop();
+    }
+  });
+}
 
 test('policy-refused traces report the branch the host took, not raw receipt fields', async () => {
   // Anything but `close` takes the mcp-only branch; a non-string reason is dropped.

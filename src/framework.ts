@@ -18743,6 +18743,13 @@ export class AgentFramework {
     const config = this.mcplServerConfigs.get(connection.id);
     if (!config) return;
     const recorded = serverTextRedactor(config);
+    // A queued run's failure is logged as the announcement's own run's is
+    // (wireMcplEvents), such as a 'close' fallback whose close failed.
+    const runQueued = () => {
+      void this.handleManifestChanged(connection, announce).catch((err) => {
+        console.error(`[mcpl] ${connection.id} manifest refresh failed:`, recorded(err instanceof Error ? err.message : err));
+      });
+    };
     // The announcement's params are the server's hints, which a notification
     // may leave out: read the one the receipt reports here, before anything
     // is applied, so no later step can throw on them.
@@ -18765,7 +18772,7 @@ export class AgentFramework {
           const cur = this.manifestRefreshState.get(connection.id);
           if (cur?.queued && !cur.inFlight) {
             cur.queued = false;
-            void this.handleManifestChanged(connection, announce).catch(() => {});
+            runQueued();
           }
         }, AgentFramework.MANIFEST_FETCH_FLOOR_MS - sinceLast).unref?.();
       }
@@ -18915,7 +18922,7 @@ export class AgentFramework {
       st.lastCompletedAt = Date.now();
       if (st.queued) {
         st.queued = false;
-        setTimeout(() => { void this.handleManifestChanged(connection, announce).catch(() => {}); },
+        setTimeout(runQueued,
           AgentFramework.MANIFEST_FETCH_FLOOR_MS).unref?.();
       }
     }

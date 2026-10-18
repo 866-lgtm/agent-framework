@@ -14,8 +14,9 @@
     reaped, as a reconnect holds one: reconnecting halts, the `mcpl-down`
     alert is raised, its tools leave the agents' list, and its id stays held
     until a disconnect or `stop()` retries the reap and confirms the exit.
-    During a connect, that happens when the connect times out, and the
-    connect fails with it.
+    During a connect, the connect's own cleanup holds it once the connect
+    fails, at the latest when the connect times out, and the connect fails
+    with it.
   - Under Bun, a child that closes its stdin isn't reported at all, since
     Bun emits no error for the writes to it, so request timeouts still
     bound it, as they do a child that stops reading.

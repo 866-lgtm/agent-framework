@@ -585,10 +585,11 @@ export class McplServerConnection extends EventEmitter {
 
   /**
    * A connection closed for good still says how it ended. Its own buffered
-   * connect-failed and reconnect-failed, such as a launch held as unreaped
-   * before the first gate released it, are the framework's records of it:
-   * they need no grant, and its listeners act on them (an alert, and its
-   * tools leaving the list). What the server sent stays held.
+   * connect-failed and reconnect-failed, such as the permanent failure of a
+   * launch held as unreaped before the first gate released it, are the
+   * framework's records of it: they need no grant, and its listeners act on
+   * them (a trace, and for a permanent failure an alert and its tools leaving
+   * the list). What the server sent stays held.
    */
   private deliverOwnReports(): void {
     const own = (item: { event: string }) => item.event === 'connect-failed' || item.event === 'reconnect-failed';

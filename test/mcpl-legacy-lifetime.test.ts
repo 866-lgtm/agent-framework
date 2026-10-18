@@ -196,6 +196,29 @@ test('a reconnect launch that cannot be reaped halts reconnecting; close() settl
   await connection.close();
 });
 
+test("a reconnect stub held as unreaped before its first ready() still delivers its connect-failed and its permanent failure there", async () => {
+  const log = scratchLog();
+  // The first launch fails its handshake and is reaped, so a stub reconnects;
+  // the second fails too, and its cleanup can't reap it.
+  const stuck = unreapableFrom(2);
+  const connection = await McplServerConnection.connectWithReconnect(config('error', log, RECONNECT), HOST_CAPS);
+  cleanups.push(() => connection.close().catch(() => {}));
+  const reports: Array<{ event: string; attempt: number; permanent?: boolean }> = [];
+  connection.on('connect-failed', (f: { attempt: number }) => reports.push({ event: 'connect-failed', ...f }));
+  connection.on('reconnect-failed', (f: { attempt: number; permanent?: boolean }) => reports.push({ event: 'reconnect-failed', ...f }));
+  await until(() => connection.holdsUnreapedChild, 'the reconnect launch held');
+  assert.equal(connection.willReconnect, false);
+  assert.equal(reports.length, 0, 'held until the first release');
+  connection.ready();
+  assert.deepEqual(
+    reports.map((r) => [r.event, r.event === 'connect-failed' ? r.attempt : r.permanent === true]),
+    [['connect-failed', 0], ['reconnect-failed', true]],
+  );
+  await assert.rejects(connection.close(), /could not be reaped/);
+  await killAndWait(stuck[0]!);
+  await connection.close();
+});
+
 test('close() during a reconnect handshake ends that launch before resolving, and nothing is adopted', async () => {
   const log = scratchLog();
   const connection = await McplServerConnection.connectWithReconnect(config('ok-then-hang', log, RECONNECT), HOST_CAPS);

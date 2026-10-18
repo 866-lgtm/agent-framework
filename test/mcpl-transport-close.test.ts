@@ -704,12 +704,18 @@ for (const release of ['ready', 'readyControlPlane'] as const) {
     await waitFor(() => connection.holdsUnreapedChild, 'the launch held', 10_000);
     assert.equal(connection.willReconnect, false);
     assert.equal(failures.length, 0, 'held until the first release');
+    // The server's stderr line came before its pipe failed, and is held too.
+    const heldStderr = () => (connection as unknown as { bufferedEvents: Array<{ event: string; args: unknown[] }> }).bufferedEvents
+      .filter((item) => item.event === 'stderr')
+      .map((item) => (item.args[0] as { line: string }).line);
+    assert.ok(heldStderr().includes('closed stdin'), heldStderr().join('\n'));
     connection[release]();
     assert.equal(failures.length, 1, `${release}() delivered the permanent failure`);
     assert.equal(failures[0]!.permanent, true);
     assert.match(failures[0]!.error, /could not be reaped/);
     // The server's own traffic, its stderr among it, stays held.
     assert.deepEqual(delivered, [], 'nothing the server sent was delivered');
+    assert.ok(heldStderr().includes('closed stdin'), 'its stderr line is still held');
     assert.equal((connection as unknown as { dataPlaneReady: boolean }).dataPlaneReady, false, 'and no plane was readied');
   });
 }

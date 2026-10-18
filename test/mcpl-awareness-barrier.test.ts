@@ -948,7 +948,7 @@ test('a runtime connect whose policy registration throws and whose close then fa
     assert.ok(refused, 'the connection whose close failed is still registered');
     assert.equal(refused.willReconnect, false, 'its close had disarmed it before the transport close failed');
     assert.equal(refused.dataPlaneReady, false, 'the gate\'s completion left the refused connection paused');
-    assert.ok(failed.refreshed.includes(failed.discord.id), 'its tools leave the list though its close failed');
+    assert.ok(failed.refreshed.includes(failed.discord.id), 'a refresh of the tool list was asked for though its close failed');
     await failed.framework.syncDiscordAwarenessMarkers();
     assert.equal(refused.dataPlaneReady, false, 'a later gate\'s completion leaves it paused too');
     assert.ok(
