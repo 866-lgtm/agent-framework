@@ -171,10 +171,12 @@ function mcplToolDeniedText(serverId: string, toolName: string): string {
     "and calling it again won't change that. If you need it, ask whoever runs this host.";
 }
 
-/** A runtime connect or restart refused because a connect of the server's id
- *  is in flight, in either engine (mcpServerIdTaken). A disconnect isn't
- *  refused: it ends that connect. Whoever asked reads it: an operator, or an
- *  agent through a host's tool that passes it on. */
+/** A runtime connect or restart refused because a legacy connect of the
+ *  server's id is still in its handshake, before its server is registered
+ *  (mcpServerIdTaken). A modern connect registers its connection first, so an
+ *  id it holds reads as already registered. A disconnect isn't refused: it
+ *  ends the connect in flight, in either engine. Whoever asked reads it: an
+ *  operator, or an agent through a host's tool that passes it on. */
 function mcplConnectInFlightText(serverId: string): string {
   return `MCPL server "${serverId}" has a connect in flight; try again once it settles`;
 }
@@ -24124,10 +24126,12 @@ export class AgentFramework {
     }
   }
 
-  /** The refusal of a tool call whose server, of either engine, isn't
-   *  registered, for the model's call and a script's alike: "connecting"
-   *  while a connect of its id is in flight (mcpServerOps) or a restart holds
-   *  the id, and "gone" otherwise. */
+  /** The refusal of a tool call whose server isn't registered, for the
+   *  model's call and a script's alike: "connecting" while a connect of its
+   *  id is in flight (mcpServerOps) or a restart holds the id, and "gone"
+   *  otherwise. A legacy connect registers its server once its handshake is
+   *  done; a modern connect registers its connection first, so a call during
+   *  it reads that connection's own refusal. */
   private mcplServerAbsentText(serverId: string, toolName: string): string {
     return this.mcpServerOps?.get(serverId)?.kind === 'connect' || this.restartClaims().ids.has(serverId)
       ? mcplServerConnectingText(serverId, toolName)
