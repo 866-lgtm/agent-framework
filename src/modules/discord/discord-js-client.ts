@@ -78,16 +78,18 @@ export class DiscordJsClient implements DiscordClientInterface {
       }
     });
 
-    this.client.on('messageUpdate', (_oldMessage, newMessage) => {
+    this.client.on('messageUpdate', (oldMessage, newMessage) => {
       // content is null for a partial message, one discord.js hadn't cached
       // and whose update carried no text, so there's no text to compare; a
       // cached message keeps the text it had. An edit that leaves no text,
       // beside an attachment, is '' and is still an edit.
       if (typeof newMessage.content !== 'string' || !this.editHandler) return;
-      // Its attachments as the edit left them, which discord.js patches in
-      // from the update's payload. A partial message's list can be empty for
-      // want of them, so it passes none, and the row's blocks stay.
-      this.editHandler(newMessage.id, newMessage.content, newMessage.partial ? undefined : newMessage.attachments?.map(toAttachment));
+      // Its attachments as the edit left them, for a message discord.js had
+      // cached: it takes the update's list when the update carries one and
+      // keeps the cached list when it doesn't. A message it hadn't cached
+      // starts with an empty list, so one whose update carried none would read
+      // as having none; it passes none, and the row's blocks stay.
+      this.editHandler(newMessage.id, newMessage.content, oldMessage.partial ? undefined : newMessage.attachments?.map(toAttachment));
     });
 
     this.client.on('messageDelete', (message) => {

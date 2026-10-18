@@ -376,7 +376,8 @@ export interface DiscordEditEvent {
   discordMessageId: string;
   newContent: string;
   /** The message's attachments as the edit left them, when the client knows
-   *  them: a stored row drops the blocks of those it no longer has. */
+   *  them: a stored row whose text comes first drops the blocks of those it
+   *  no longer has. */
   attachments?: DiscordAttachment[];
   [key: string]: unknown;
 }

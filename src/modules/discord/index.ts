@@ -267,7 +267,7 @@ function withoutGoneAttachments(content: ContentBlock[], attachments: readonly D
     return named === null || ('url' in named ? urls.has(named.url) : filenames.has(named.filename));
   });
   if (kept.length === rest.length) return content;
-  return textFirst(first.text, kept.filter((block) => !isEmptyMarker(block)));
+  return textFirst(first.text, kept);
 }
 
 /** The ids to remove for a message's rows: each row once, and a body stored
@@ -289,7 +289,8 @@ function oncePerBody(rows: readonly StoredMessage[]): string[] {
 interface LiveCreate {
   /** converting: the live path fetches its attachments; queued: its event
    *  waits in the queue; handled: onProcess answered it, and the framework
-   *  writes that answer before the next Discord event reaches onProcess. */
+   *  writes that answer before the next Discord event reaches onProcess, or a
+   *  delete dropped it once it had converted. */
   phase: 'converting' | 'queued' | 'handled';
   /** A delete for the message came before its create was handled. */
   deleted: boolean;
@@ -344,8 +345,9 @@ export class DiscordModule implements Module {
   // which it has by the next Discord event's onProcess, since its loop applies
   // every module's answer to an event before it takes the next. A history
   // sync stores none of them, so no message is stored twice. A delete before
-  // the create is handled drops it: nothing is stored and nobody is woken. An
-  // edit while it converts is folded into it.
+  // the create is handled drops it: nothing is stored and nobody is woken, and
+  // its entry stays until the next Discord event all the same. An edit while
+  // it converts is folded into it.
   private readonly creating = new Map<string, LiveCreate>();
 
   // Typing keepalive: agentName -> { interval, deadline }. Started on
@@ -434,12 +436,14 @@ export class DiscordModule implements Module {
     }
     this.typingLoops.clear();
 
-    // No create still on its way is written now: one converting sees the
-    // context gone, and a queued one's event is never handled.
+    // From here the module writes nothing, though the framework may dispatch
+    // to it until stop() resolves: the live path takes nothing up, a create
+    // still converting finds the context gone, and onProcess answers nothing.
+    // The record of creates on their way goes with the context.
+    this.ctx = null;
     this.creating.clear();
 
     await this.client.disconnect();
-    this.ctx = null;
   }
 
   /**
@@ -696,9 +700,13 @@ export class DiscordModule implements Module {
   }
 
   async onProcess(event: ProcessEvent, state: ProcessState): Promise<EventResponse> {
+    // A stopped module answers nothing (stop()).
+    if (!this.ctx) return {};
+
     // By a Discord event, the framework has written every answer onProcess
-    // gave before it, so the creates handled until now are in the store.
-    // Only Discord events count: they come through the queue alone.
+    // gave before it, so a create handled until now is in the store if its
+    // answer held a row. Only Discord events count: they come through the
+    // queue alone.
     if (event.type.startsWith('discord:')) {
       for (const [id, live] of this.creating) if (live.phase === 'handled') this.creating.delete(id);
     }
@@ -1223,7 +1231,9 @@ export class DiscordModule implements Module {
     // Determine if this message should trigger inference
     const shouldTrigger = this.shouldTriggerInference(message, isDM);
 
-    // From here the message is the live path's to store (creating).
+    // From here the message is the live path's to store (creating). A second
+    // delivery of a message whose create is already on its way is ignored.
+    if (this.creating.has(message.id)) return;
     const live: LiveCreate = { phase: 'converting', deleted: false };
     this.creating.set(message.id, live);
     const drop = () => { if (this.creating.get(message.id) === live) this.creating.delete(message.id); };
@@ -1236,10 +1246,17 @@ export class DiscordModule implements Module {
       drop();
       throw error;
     }
-    // A delete that came meanwhile drops the create, and so does a module
-    // stopped or started again meanwhile: nothing is stored, nobody is woken.
-    if (live.deleted || this.ctx !== ctx) {
+    // A module stopped or started again meanwhile writes nothing.
+    if (this.ctx !== ctx) {
       drop();
+      return;
+    }
+    // A delete that came meanwhile drops the create: nothing is stored,
+    // nobody is woken. Its entry stays, as handled, until the next Discord
+    // event reaches onProcess, so no sync stores the message before the
+    // delete is handled.
+    if (live.deleted) {
+      live.phase = 'handled';
       return;
     }
     // An edit that came meanwhile: its text, and the blocks of the
@@ -1370,10 +1387,11 @@ export class DiscordModule implements Module {
     if (!this.ctx) return;
 
     // An edit while the message's create converts is folded into that
-    // create, which would otherwise store the text it was sent with. Its
-    // event still goes, for a row a history sync stored first.
+    // create, which would otherwise store the text it was sent with; one that
+    // comes after follows the create through the queue. Its event still goes,
+    // for a row a history sync stored first.
     const live = this.creating.get(messageId);
-    if (live?.phase === 'converting') {
+    if (live) {
       live.text = newContent;
       if (attachments) live.attachments = attachments;
     }
@@ -1390,10 +1408,10 @@ export class DiscordModule implements Module {
   private handleDiscordMessageDelete(messageId: string): void {
     if (!this.ctx) return;
 
-    // A delete before the message's create was handled drops that create.
+    // A delete before the message's create is handled drops that create.
     // Its event still goes, for a row a history sync stored first.
     const live = this.creating.get(messageId);
-    if (live && live.phase !== 'handled') live.deleted = true;
+    if (live) live.deleted = true;
 
     // Only queue the event - state writes happen in onProcess()
     this.ctx.pushEvent({
