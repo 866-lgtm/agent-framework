@@ -1016,6 +1016,41 @@ test("a save that throws is the workspace's failure, logged for whoever runs the
   assert.equal(rec.fetchedPath, undefined);
 });
 
+test("a payload fetched but not stored says so, and the host's log says why: no workspace, no writable mount, or the write's error", async (t) => {
+  const errors = t.mock.method(console, 'error', () => {});
+  type Answer = { result: { success: boolean; error?: string } };
+  const cases: Array<[string, Record<string, unknown>, (file: string) => string]> = [
+    ['no workspace', { getWorkspaceModule: () => undefined }, (file) => `[refs] couldn't store ${file}: this host has no workspace`],
+    ['no writable mount', { getWorkspaceModule: () => ({}), firstWritableMountName: () => null },
+      (file) => `[refs] couldn't store ${file}: no workspace mount is writable`],
+    ['a failed write', {
+      getWorkspaceModule: () => ({ writeBinary: async () => ({ success: false, error: 'EROFS: read-only file system' }) }),
+      firstWritableMountName: () => 'scratch',
+    }, (file) => `[refs] couldn't store scratch/refs/${file}: EROFS: read-only file system`],
+  ];
+  for (const [what, workspace, logLine] of cases) {
+    // The framework's own fetcher and save hook, with this file's server as an MCPL server's address.
+    const framework = Object.create(AgentFramework.prototype) as {
+      pushEvent(event: unknown): void;
+      dispatchFetchReferenceToolCall(agentName: string, call: { id: string; name: string; input: unknown }): void;
+    };
+    Object.assign(framework, {
+      mcplServerConfigs: new Map([['srv', { id: 'srv', url: `ws://127.0.0.1:${port}` }]]),
+      emitTrace: () => {},
+      ...workspace,
+    });
+    // Bytes no sniffer knows, with no type, so the file is saved as .bin.
+    const record = makeRecord(referenceRegistry, `${ORIGIN}/untyped?unstored=${encodeURIComponent(what)}`);
+    const answered = new Promise<Answer>((resolve) => { framework.pushEvent = (event) => resolve(event as Answer); });
+    framework.dispatchFetchReferenceToolCall('prime', { id: `call_${what}`, name: 'fetch_reference', input: { ref_id: record.refId } });
+    const { result } = await answered;
+    assert.equal(result.error, `fetch_reference couldn't fetch "${record.refId}": it was fetched, but this host couldn't store it in its workspace, `
+      + 'so nothing was kept. Calling again is likely to fail the same way; whoever runs this host can see why in its log.', what);
+    const logged = errors.mock.calls.map((c) => String(c.arguments[0]));
+    assert.ok(logged.includes(logLine(`${record.refId}.bin`)), `${what}: ${logged.join('\n')}`);
+  }
+});
+
 test("an address that doesn't parse is refused before anything is dialed: the reference's, or the server's as no address", async () => {
   const reg = new ReferenceRegistry();
   const bad = await makeFetcher({ srv: { url: ORIGIN } }).fetch(makeRecord(reg, 'not a url at all'));

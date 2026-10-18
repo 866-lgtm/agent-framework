@@ -145,15 +145,13 @@ function largerMaxBytes(received: number, left: number, server: string): string 
 /** What a thrown fetch says went wrong. fetch's own "fetch failed" says only
  *  that, so its cause's words come first. A cause from trying each of a
  *  host's addresses (an AggregateError) has no words of its own, so its
- *  attempts' stand in, then its code. */
+ *  attempts' stand in. */
 function whyFetchFailed(e: unknown): string {
   const source = (e as { cause?: unknown } | null | undefined)?.cause ?? e;
   const own = describeCause(source);
   if (own !== '') return own;
   const attempts = (source as { errors?: unknown } | null | undefined)?.errors;
-  if (Array.isArray(attempts) && attempts.length > 0) return attempts.map(describeCause).join('; ');
-  const code = (source as { code?: unknown } | null | undefined)?.code;
-  return typeof code === 'string' ? code : describeCause(e);
+  return Array.isArray(attempts) && attempts.length > 0 ? attempts.map(describeCause).join('; ') : describeCause(e);
 }
 
 /** Magic-byte sniff for the formats this pipeline actually moves. The
