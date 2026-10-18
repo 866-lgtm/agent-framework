@@ -40,7 +40,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
-import { IGNORED, NONBLOCK, OTHER_MOUNT, checkDir, diskSpelling, filesystemTrustsCtime, inOtherMount, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, nestedHolder, passedOverAt, readPrefix, foldsCase, foldedLoosely, type LinkFound, type WorkspaceEntries } from './observe.js';
+import { IGNORED, NONBLOCK, OTHER_MOUNT, checkDir, diskSpelling, filesystemTrustsCtime, inOtherMount, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, nestedHolder, passedOverAt, readPrefix, foldsCase, type LinkFound, type WorkspaceEntries } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
 import {
   type MountRuntime,
@@ -1943,9 +1943,10 @@ export class WorkspaceModule implements Module {
    * spelled. On a disk that folds names, a path spelled otherwise reaches
    * disk's file, so every tool takes it by disk's name: one name per file,
    * and the names its answers give are disk's, except that a path that
-   * names a workspace entry exactly keeps that spelling. The workspace's
-   * entries (entriesOf) stand in for disk where it has nothing yet, so a
-   * draft has one name too.
+   * names a workspace entry exactly keeps that spelling, unless that would
+   * take it out of a nested mount's directory that holds it as disk spells
+   * it. The workspace's entries (entriesOf) stand in for disk where it has
+   * nothing yet, so a draft has one name too.
    * A handler that must read something at the moment it's asked, as
    * handleSync reads the branch a path sync adopts on, reads it before
    * calling this, since this awaits disk. The entries are read when the
@@ -1963,38 +1964,19 @@ export class WorkspaceModule implements Module {
 
   /**
    * A mount's entries on the current branch, as diskSpelling reads them when
-   * it does, and whether its root folds case as the last start read it
-   * (false before the first). An entry's spelling may stand for a path
-   * (`usable`, asked of the whole path it would make) unless that path lies
-   * on the way to a nested mount's directory, at it or inside it, and spells
-   * the segments it shares with that directory otherwise than both the
-   * configured spelling and disk's: the nested-mount checks compare
-   * spellings as they are, and know only those two (spellNestedDirs). So a
-   * path beside that directory, such as a sibling of it, still takes an
-   * entry's spelling. Which paths lie there is judged as loosely as the walk
-   * respells a name disk lists (foldedLoosely), so a spelling the walk would
-   * have respelled into one the checks know isn't kept instead. That errs
-   * toward refusing: on a disk that keeps them apart, an entry in `dır/` is
-   * refused where a nested mount owns `dir/`, which leaves main's two
-   * entries.
+   * it does, whether its root folds case as the last start read it (false
+   * before the first), and which nested mount's directory holds a path, by
+   * holderOf, as the nested-mount checks read it. diskSpelling keeps a path
+   * in disk's spelling where the entries' spelling would take it out of the
+   * nested mount that holds disk's, so the checks refuse what they would
+   * refuse without the entries.
    */
   private entriesOf(mount: MountState): WorkspaceEntries {
     const store = this.getStore();
-    const nested = (this.otherMounts.get(mount.config.name) ?? []).map((o) => ({
-      loose: foldedLoosely(o.spellings[0]!.dir),
-      spellings: o.spellings.map((s) => s.dir.split('/')),
-    }));
     return {
       has: (path) => store.treeGet(mount.treeStateId, path) !== null,
       under: (prefix) => store.treeList(mount.treeStateId, prefix).map((entry) => entry.path),
-      usable: (path) => {
-        const name = foldedLoosely(path);
-        const segments = path.split('/');
-        return nested.every(({ loose, spellings }) => {
-          const onTheWay = name === loose || name.startsWith(`${loose}/`) || loose.startsWith(`${name}/`);
-          return !onTheWay || spellings.some((dir) => dir.every((segment, k) => k >= segments.length || segment === segments[k]));
-        });
-      },
+      holder: (path) => this.holderOf(mount.config.name, path)?.name,
       rootFoldsCase: this.rootFoldsCase.get(mount.config.name) ?? false,
     };
   }

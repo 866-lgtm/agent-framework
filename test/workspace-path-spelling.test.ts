@@ -8,9 +8,10 @@
 // one needs it to fold normalization, and three to fold ß with ss, ſ with s
 // and ς with σ. A draft not yet on disk takes the spelling of a workspace
 // entry it equals in simple case folding, on a disk that folds case, and a
-// path that names an entry exactly keeps its spelling. Four run only where
-// the disk tells case apart, and those about starting and stopping run
-// anywhere.
+// path that names an entry exactly keeps its spelling, except where disk's
+// spelling puts it in a nested mount's directory and the entry's doesn't.
+// Four run only where the disk tells case apart, and those about starting
+// and stopping run anywhere.
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import fs, { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -64,7 +65,7 @@ const drafts = (dir: string): MountConfig[] => [{ name: 'work', path: dir, mode:
 const entriesOf = (paths: string[], rootFoldsCase = true) => ({
   has: (path: string) => paths.includes(path),
   under: (prefix: string) => paths.filter((path) => path.startsWith(prefix)).sort(),
-  usable: () => true,
+  holder: () => undefined,
   rootFoldsCase,
 });
 
@@ -611,7 +612,7 @@ test('a mount whose root is empty, or not there yet, at start takes a draft\'s s
   }
 });
 
-test('an entry in a nested mount\'s directory spelled otherwise than its configuration or disk gives no path its spelling', { skip: FOLDING_ONLY }, async (t) => {
+test('an entry\'s spelling takes no path out of a nested mount\'s directory that holds it as disk spells it', { skip: FOLDING_ONLY }, async (t) => {
   const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-nested-entries-'));
   const dir = join(root, 'mount');
   mkdirSync(join(dir, 'inner'), { recursive: true });
@@ -627,44 +628,39 @@ test('an entry in a nested mount\'s directory spelled otherwise than its configu
   workspace.initStore(store);
   await workspace.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
   t.after(async () => { await workspace.stop(); store.close(); rmSync(root, { recursive: true, force: true }); });
-  // Entries the outer mount holds from before: a file named as one nested
-  // mount's directory in another case; two beneath the directory of a
-  // nested mount that isn't on disk yet, one in another case and one as
-  // configured; one beneath a nested mount's directory in the other
-  // normalization form; and one beside the directory of a nested mount two
-  // levels down, in a directory spelled otherwise than its configuration.
+  // Entries the outer mount holds from before: a file named as the nested
+  // mount inner's directory in another case; one beneath the directory of
+  // the nested mount later, which isn't on disk, spelled as configured; one
+  // beneath cafe's directory in the other normalization form; and one in
+  // another spelling of proj, the directory that holds deep's, which isn't
+  // on disk either.
   const entry = { blobHash: 'a'.repeat(64), size: 1, mode: 0o100644 };
   store.treeSet('workspace/outer/tree', 'Inner', entry);
-  store.treeSet('workspace/outer/tree', 'Later/x.txt', entry);
   store.treeSet('workspace/outer/tree', 'later/z.txt', entry);
   store.treeSet('workspace/outer/tree', 'cafe\u0301/x.txt', entry);
   store.treeSet('workspace/outer/tree', 'Proj/z.txt', entry);
-  store.treeSet('workspace/outer/tree', 'proj/w.txt', entry);
   const call = (name: string, input: unknown) => workspace.handleToolCall({ id: name, name, input } as Parameters<WorkspaceModule['handleToolCall']>[0]);
-  const read = await call('read', { path: 'outer/Inner', offsetChars: 0, limitChars: 10 });
-  assert.equal(read.success, false);
-  assert.match(String(read.error), /lies in mount "inner"/);
-  for (const path of ['outer/later/y.txt', 'outer/LATER/y.txt', 'outer/Later/y.txt']) {
-    const write = await call('write', { path, content: 'y\n' });
-    assert.equal(write.success, false, path);
-    assert.match(String(write.error), /lies in mount "later"/, path);
-  }
-  for (const path of ['outer/proj/inner/x.txt', 'outer/Proj/inner/x.txt']) {
-    const deep = await call('write', { path, content: 'x\n' });
-    assert.equal(deep.success, false, path);
-    assert.match(String(deep.error), /lies in mount "deep"/, path);
-  }
-  // Beside that directory, an entry's spelling stands: a sibling takes the
-  // draft's directory, and the directory itself, the configured spelling.
+  const refusedAs = async (tool: string, input: { path: string; [field: string]: unknown }, mount: string) => {
+    const result = await call(tool, input);
+    assert.equal(result.success, false, input.path);
+    assert.match(String(result.error), new RegExp(`lies in mount "${mount}"`), input.path);
+  };
+  // Disk's spelling puts each in a nested mount's directory, and the
+  // entry's spelling wouldn't.
+  await refusedAs('read', { path: 'outer/Inner', offsetChars: 0, limitChars: 10 }, 'inner');
+  await refusedAs('write', { path: 'outer/proj/inner/x.txt', content: 'x\n' }, 'deep');
+  await refusedAs('write', { path: 'outer/proj/other/../inner/x.txt', content: 'x\n' }, 'deep');
+  if (!NORMALIZATION_FOLDING_ONLY) await refusedAs('read', { path: 'outer/cafe\u0301/x.txt', offsetChars: 0, limitChars: 10 }, 'cafe');
+  // As configured, a path is later's, and so is one the entry spelled as
+  // configured gives that spelling.
+  await refusedAs('write', { path: 'outer/later/y.txt', content: 'y\n' }, 'later');
+  await refusedAs('write', { path: 'outer/LATER/y.txt', content: 'y\n' }, 'later');
+  // Outside deep's directory, the entry's spelling stands: beside it, and
+  // for the directory that holds it.
   const sibling = await call('write', { path: 'outer/PROJ/z.txt', content: 'z\n' });
   assert.equal((sibling.data as { path: string }).path, 'outer/Proj/z.txt');
   const listed = await call('ls', { path: 'outer/PROJ' });
-  assert.equal((listed.data as { path: string }).path, 'outer/proj');
-  if (!NORMALIZATION_FOLDING_ONLY) {
-    const nfd = await call('read', { path: 'outer/cafe\u0301/x.txt', offsetChars: 0, limitChars: 10 });
-    assert.equal(nfd.success, false);
-    assert.match(String(nfd.error), /lies in mount "cafe"/);
-  }
+  assert.equal((listed.data as { path: string }).path, 'outer/Proj');
 });
 
 test('a stop made while start reads whether a mount\'s root folds case leaves the workspace stopped', async (t) => {

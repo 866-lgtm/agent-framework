@@ -329,12 +329,11 @@ export interface WorkspaceEntries {
   /** The paths of the entries under `prefix`, a directory's path and `/`, or `''` for every entry. */
   under(prefix: string): string[];
   /**
-   * Whether an entry's spelling may stand for this path, the whole path it
-   * would make: false where the path lies on the way to a nested mount's
-   * directory, or inside it, in a spelling the nested-mount checks don't
-   * know.
+   * The nested mount whose directory holds this path, by the nested-mount
+   * checks' own reading of it, or undefined where the path is the mount's
+   * own.
    */
-  usable(path: string): boolean;
+  holder(path: string): string | undefined;
   /** Whether the mount's root folds case (foldsCase). */
   rootFoldsCase: boolean;
 }
@@ -403,15 +402,14 @@ export const lowered = (name: string): string =>
 
 /**
  * The name `segment` takes among the workspace's entries directly under the
- * directory `prefix` (its path and `/`, or `''` for the mount's root), of
- * the names `usable` allows there: the segment itself where an entry is
- * there under it, else the first name, in the order given, equal to it in
- * simple case folding (lowered), else null. A name is compared again only
- * where another name came between its entries, as `N.txt` comes between `N`
- * and `N/x` in path order, so the step doesn't fold a name once for every
- * entry beneath it.
+ * directory `prefix` (its path and `/`, or `''` for the mount's root): the
+ * segment itself where an entry is there under it, else the first name, in
+ * the order given, equal to it in simple case folding (lowered), else null.
+ * A name is compared again only where another name came between its entries,
+ * as `N.txt` comes between `N` and `N/x` in path order, so the step doesn't
+ * fold a name once for every entry beneath it.
  */
-function entryName(paths: readonly string[], prefix: string, segment: string, usable: (name: string) => boolean): string | null {
+function entryName(paths: readonly string[], prefix: string, segment: string): string | null {
   const want = lowered(segment);
   let found: string | null = null;
   let previous: string | null = null;
@@ -422,10 +420,8 @@ function entryName(paths: readonly string[], prefix: string, segment: string, us
     const name = slash === -1 ? rest : rest.slice(0, slash);
     if (name === previous) continue;
     previous = name;
-    if (name !== segment && (found !== null || lowered(name) !== want)) continue;
-    if (!usable(name)) continue;
     if (name === segment) return segment;
-    found = name;
+    if (found === null && lowered(name) === want) found = name;
   }
   return found;
 }
@@ -509,18 +505,20 @@ async function listedName(dir: string, segment: string, given: BigIntStats | nul
  * where the directory reached folds case, each segment disk has nothing for
  * takes the name of an entry it equals in simple case folding (entryName),
  * as the disk will once that entry is written: a second draft spelled in
- * another case is the first one. An entry's spelling stands for a path only
- * where the entries allow it for the whole path it makes (`usable`), which
- * they don't on the way to a nested mount's directory, or inside it, in a
- * spelling the nested-mount checks wouldn't know. The root's folding is read
- * at start (`rootFoldsCase`), and a directory beneath it is taken to fold as
+ * another case is the first one. The entries' spelling never takes a path
+ * out of the nested mount whose directory holds it as disk spells it, by the
+ * nested-mount checks' own reading (`holder`): there the path keeps disk's
+ * spelling, which they refuse as that mount's. The root's folding is read at
+ * start (`rootFoldsCase`), and a directory beneath it is taken to fold as
  * the directory holding it did when its name was looked up with its case
  * flipped, or, for a name with no letter to flip, as the nearest directory
  * above that told, so the step reads nothing more of disk for this.
  */
 export async function diskSpelling(root: string, relativePath: string, entries?: WorkspaceEntries): Promise<string> {
-  if (relativePath === '' || isAbsolute(relativePath) || (entries?.has(relativePath) && entries.usable(relativePath))) return relativePath;
+  if (relativePath === '' || isAbsolute(relativePath)) return relativePath;
+  // The path as disk spells it, and as the workspace's entries spell it.
   const segments = relativePath.split('/');
+  const spelled = [...segments];
   // The directories walked into, the mount's root first; their names below
   // the root, as returned; and whether each folds case: the root's as read at
   // start, and beneath it, whether looking its name up with its case flipped
@@ -540,19 +538,12 @@ export async function diskSpelling(root: string, relativePath: string, entries?:
     if (!entries || !folds) return;
     let prefix = names.length === 0 ? '' : `${names.join('/')}/`;
     const paths = entries.under(prefix);
-    for (let j = from; j < segments.length; j++) {
-      const segment = segments[j]!;
+    for (let j = from; j < spelled.length; j++) {
+      const segment = spelled[j]!;
       if (segment === '' || segment === '.') continue;
-      // The path a name would make: the segments before it as taken so far,
-      // the name, and the rest as given, up to a `..`.
-      const rest: string[] = [];
-      for (const later of segments.slice(j + 1)) {
-        if (later === '..') break;
-        if (later !== '' && later !== '.') rest.push(later);
-      }
-      const name = entryName(paths, prefix, segment, (candidate) => entries.usable([`${prefix}${candidate}`, ...rest].join('/')));
+      const name = entryName(paths, prefix, segment);
       if (name === null) return;
-      segments[j] = name;
+      spelled[j] = name;
       prefix = `${prefix}${name}/`;
     }
   };
@@ -568,11 +559,12 @@ export async function diskSpelling(root: string, relativePath: string, entries?:
     }
     const dir = dirs[dirs.length - 1]!;
     if (i === segments.length - 1) {
-      const exact = [...names, segment].join('/');
-      if (entries?.has(exact) && entries.usable(exact)) break;
       const { name, found } = await listedName(dir, segment, null);
       segments[i] = name;
-      if (!found) fromEntries(i);
+      if (!entries?.has([...names, segment].join('/'))) {
+        spelled[i] = name;
+        if (!found) fromEntries(i);
+      }
       break;
     }
     const given = await lstat(join(dir, segment), { bigint: true }).catch(() => null);
@@ -582,12 +574,17 @@ export async function diskSpelling(root: string, relativePath: string, entries?:
     }
     const { name, caseFolds } = await listedName(dir, segment, given);
     segments[i] = name;
+    spelled[i] = name;
     if (!given.isDirectory()) break;
     dirs.push(join(dir, name));
     names.push(name);
     folding.push(caseFolds);
   }
-  return segments.join('/');
+  const asDisk = segments.join('/');
+  if (!entries) return asDisk;
+  const asEntries = entries.has(relativePath) ? relativePath : spelled.join('/');
+  const holder = entries.holder(asDisk);
+  return holder === undefined || entries.holder(asEntries) === holder ? asEntries : asDisk;
 }
 
 // ===========================================================================
