@@ -17,6 +17,7 @@ import { appendFileSync, chmodSync, constants as fsConstants, existsSync, linkSy
 import { open, statfs } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
@@ -4085,6 +4086,26 @@ describe('restarts and faults', () => {
       assert.deepEqual((m as any).agreement.get('work', 'gone.txt'), pending, 'still owed, as before');
     });
 
+    test('confirming an unlink names a pipe that appeared since as what it is, and leaves it', { skip: process.platform === 'win32' ? 'no FIFOs' : false }, async (t) => {
+      const env = new Env(t);
+      const m = await env.open();
+      await seedSynced(env, m, 'gone.txt', 'v1');
+      await call(m, 'delete', { path: 'work/gone.txt' });
+      await withSyncs(env, (_id, isDirectory) => isDirectory, () => call(m, 'materialize', { applyDeletions: true }));
+      const pending = (m as any).agreement.get('work', 'gone.txt');
+      assert.equal(pending.kind, 'pending');
+
+      const mount = (m as any).mounts.get('work');
+      const pushed = await pushPaths(env.store, (m as any).agreement, await (m as any).runtime(mount), ['gone.txt'], {
+        force: true,
+        beforeEffect: () => assert.equal(spawnSync('mkfifo', [env.disk('gone.txt')]).status, 0, 'mkfifo'),
+      });
+      assert.deepEqual(pushed.deleted, []);
+      assert.match(pushed.skipped[0]!.reason, /^not unlinked: a pipe, socket or device appeared at this path since it was checked$/);
+      assert.ok(lstatSync(env.disk('gone.txt')).isFIFO(), 'the pipe stays');
+      assert.deepEqual((m as any).agreement.get('work', 'gone.txt'), pending, 'still owed, as before');
+    });
+
     test('an unlink whose directory is gone is confirmed by syncing the directory that lacks it', async (t) => {
       const env = new Env(t);
       const m = await env.open();
@@ -4342,6 +4363,66 @@ describe('trust and identity at the point of use', () => {
     assert.ok(replaced, 'the swap ran');
     assert.ok(err instanceof EffectFailed, `refused: ${err}`);
     assert.equal(readFileSync(target, 'utf8'), 'new', 'the file now at the path is untouched');
+  });
+
+  test('a deletion leaves a pipe, a socket, or a link to a directory or a pipe, forced or not, and none is left for applyDeletions; a forced one removes a followed link to a regular file', { skip: process.platform === 'win32' ? 'no FIFOs' : false }, async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ followSymlinks: true });
+    for (const path of ['p', 's', 'd', 'f', 'r', 'x']) {
+      await seedSynced(env, m, path, 'v1');
+      await call(m, 'delete', { path: `work/${path}` });
+      rmSync(env.disk(path));
+    }
+    assert.equal(spawnSync('mkfifo', [env.disk('p')]).status, 0, 'mkfifo');
+    // A listening socket is a socket file; closing the server removes it.
+    const server = createServer();
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(env.disk('s'), resolve);
+    });
+    t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+    mkdirSync(env.disk('target'));
+    symlinkSync(env.disk('target'), env.disk('d'));
+    assert.equal(spawnSync('mkfifo', [env.disk('fifo')]).status, 0, 'mkfifo');
+    symlinkSync(env.disk('fifo'), env.disk('f'));
+    env.writeDisk('file', 'a regular file');
+    symlinkSync(env.disk('file'), env.disk('r'));
+    mkdirSync(env.disk('x'));
+
+    const noPush = (what: string) => `disk has ${what}, and no push unlinks it, forced or not — ask whoever runs this host if it should go`;
+    const pipe = noPush('a pipe, socket or device at this path, or a symlink to one');
+    const toDirectory = noPush('a symlink to a directory at this path');
+    const directory = 'disk has a directory at this path, and no push unlinks one, forced or not — if it should go, move or remove it on disk';
+    const reasons = (data: Record<string, unknown>, paths: string[]) => ((data.skipped as Array<{ reason: string }> | undefined) ?? [])
+      .map((s) => s.reason).filter((reason) => paths.some((p) => reason.startsWith(`${p}: `))).sort();
+
+    // Before any force, the push refuses each in the same words, offering no force.
+    const unforced = await call(m, 'materialize', { applyDeletions: true });
+    assert.deepEqual(reasons(unforced, ['d', 'f', 'p', 's', 'x']), [`d: ${toDirectory}`, `f: ${pipe}`, `p: ${pipe}`, `s: ${pipe}`, `x: ${directory}`]);
+
+    // Forced without applyDeletions, they're refused in the same words, not
+    // left for applyDeletions, which wouldn't unlink them either.
+    const forcedAlone = await call(m, 'materialize', { force: true });
+    assert.deepEqual(reasons(forcedAlone, ['d', 'f', 'p', 's', 'r', 'x']), [`d: ${toDirectory}`, `f: ${pipe}`, `p: ${pipe}`, `s: ${pipe}`, `x: ${directory}`]);
+    assert.deepEqual(forcedAlone.workspaceDeletionsLeftOnDisk, [{ mount: 'work', path: 'r' }], 'only the link to a regular file waits for applyDeletions');
+
+    const data = await call(m, 'materialize', { applyDeletions: true, force: true });
+    assert.deepEqual(reasons(data, ['d', 'f', 'p', 's', 'r', 'x']), [
+      `d: not unlinked: ${toDirectory}`,
+      `f: not unlinked: ${pipe}`,
+      `p: not unlinked: ${pipe}`,
+      `s: not unlinked: ${pipe}`,
+      `x: not unlinked: ${directory}`,
+    ]);
+    assert.deepEqual(data.deleted, [{ mount: 'work', path: 'r' }], 'the followed link to a regular file is removed');
+    assert.throws(() => lstatSync(env.disk('r')), { code: 'ENOENT' }, 'the link itself is gone');
+    assert.equal(env.readDisk('file'), 'a regular file', 'and the file it led to stays');
+    assert.ok(lstatSync(env.disk('p')).isFIFO(), 'the pipe is still there');
+    assert.ok(lstatSync(env.disk('s')).isSocket(), 'the socket is still there');
+    for (const link of ['d', 'f']) assert.ok(lstatSync(env.disk(link)).isSymbolicLink(), `the link ${link} is still there`);
+    assert.ok(lstatSync(env.disk('target')).isDirectory(), 'and the directory one leads to');
+    assert.ok(lstatSync(env.disk('fifo')).isFIFO(), 'and the pipe the other leads to');
+    assert.ok(lstatSync(env.disk('x')).isDirectory(), 'the directory is still there');
   });
 
   test('an unlink refused outright touched nothing, so its evidence goes back at once', { skip: IS_ROOT ? 'root unlinks anywhere' : false }, async (t) => {
