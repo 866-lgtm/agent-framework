@@ -1099,15 +1099,8 @@ export class Agent {
       return {
         messages: this.toolResultGuard.prepareRequest(messages, true),
         system: this.buildSystemPrompt(systemInjections),
-        config: {
-          model: this.model,
-          maxTokens: this.maxTokens,
-          ...(this.temperature !== undefined && { temperature: this.temperature }),
-          ...(this.thinking !== undefined && { thinking: this.thinking }),
-        },
         tools: tools.length > 0 ? tools : undefined,
-        ...(this.providerParams && { providerParams: this.providerParams }),
-        assistantParticipant: this.name,
+        ...this.requestSettings(),
       };
     };
     const request = await assemble();
@@ -1211,9 +1204,12 @@ export class Agent {
    * Build the membrane-normalized request that WOULD be emitted for this
    * agent's next activation, given the supplied tools and injections.
    *
-   * This is the single source of truth for request assembly, shared by the
-   * real activation path (`startStreamWithInjections`) and debug/preview
-   * tooling (`Framework.previewActivation`). It does not call the membrane.
+   * This is the single source of truth for a framework turn's request,
+   * shared by the real activation path (`startStreamWithInjections`) and
+   * debug/preview tooling (`Framework.previewActivation`). It does not call
+   * the membrane. The direct API (`runInferenceWithInjections`) assembles its
+   * own messages, system prompt and tools, and both take the agent's
+   * settings from `requestSettings()`.
    * A compile that is sent commits what the context manager commits for it
    * (fold resolutions, the compression its fold plan calls for, the consumed
    * watermark); a preview passes `options.dryRun`, so its compile commits
@@ -1317,15 +1313,30 @@ export class Agent {
     return {
       messages: this.toolResultGuard.prepareRequest(messages),
       system: this.buildSystemPrompt(systemInjections),
+      tools: availableTools.length > 0 ? availableTools : undefined,
+      ...this.requestSettings(),
+      ...(kvUnified ? { cacheMarkers: 'cm-owned' as const } : {}),
+    };
+  }
+
+  /**
+   * The request fields that come from this agent's own settings: its model
+   * config, prompt caching and cache TTL, prefill message, provider
+   * parameters and participant name. Every request the agent sends takes
+   * them from here, a framework turn's (buildActivationRequest) and the
+   * direct API's (runInferenceWithInjections), so a setting reaches both or
+   * neither.
+   */
+  private requestSettings(): Pick<NormalizedRequest,
+    'config' | 'promptCaching' | 'cacheTtl' | 'prefillUserMessage' | 'providerParams' | 'assistantParticipant'> {
+    return {
       config: {
         model: this.model,
         maxTokens: this.maxTokens,
         ...(this.temperature !== undefined && { temperature: this.temperature }),
         ...(this.thinking !== undefined && { thinking: this.thinking }),
       },
-      tools: availableTools.length > 0 ? availableTools : undefined,
       promptCaching: this.promptCaching,
-      ...(kvUnified ? { cacheMarkers: 'cm-owned' as const } : {}),
       cacheTtl: this.cacheTtl,
       ...(this.prefillUserMessage && { prefillUserMessage: this.prefillUserMessage }),
       ...(this.providerParams && { providerParams: this.providerParams }),
