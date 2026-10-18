@@ -489,7 +489,7 @@ test("a resume() during another resume()'s flush leaves the record to it, and it
   }
 });
 
-test("store only, a host-mode change whose sync fails rejects; with a recovery file, the file is the record and a failed sync is only logged", async () => {
+test("store only, a host-mode change whose sync fails rejects; with a recovery file, the file is the record and a failed sync of the store is only logged", async () => {
   const logged = captureErrors();
   try {
     const slot = await hostModeFixture('store only');
