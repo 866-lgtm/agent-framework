@@ -3278,6 +3278,19 @@ describe("a file's mode is kept with its bytes", () => {
     assert.match(keptReasons(pushed), /blob\.bin: written, keeping disk's mode \(0600\)/);
   });
 
+  test('a read of a held file whose mode alone changed on disk takes the mode in, and says nothing of its text', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    env.writeDisk('tool.sh', 'echo tool\n');
+    chmodSync(env.disk('tool.sh'), 0o644);
+    await call(m, 'sync', {});
+    chmodSync(env.disk('tool.sh'), 0o755);
+    const data = await call(m, 'read', { path: 'work/tool.sh' });
+    assert.equal(data.content, '     1\techo tool');
+    assert.equal(data.note, undefined, "a mode taken in alone isn't a change to the text");
+    assert.equal(storedMode(env, 'tool.sh'), 0o100755, 'the read took the mode in');
+  });
+
   test('a chmod on disk is taken in as a change on the same bytes, and makes no event', async (t) => {
     const env = new Env(t);
     const m = await env.open({ wakeOnChange: true });

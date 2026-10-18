@@ -2989,7 +2989,9 @@ export class WorkspaceModule implements Module {
         // checked, with its reason, so the answer says the check didn't finish.
         const report = pass.reports.get(relativePath)
           ?? (pass.incomplete.length > 0 ? { path: relativePath, state: 'unverified' as const, note: pass.incomplete[0]!.reason } : undefined);
-        const took = (op: TreeOp) => pass.ops.some((o) => o.path === relativePath && o.op === op);
+        // A mode taken in alone isn't a change to the text, so it leaves the
+        // read nothing to say, as it leaves an edit nothing.
+        const took = (op: TreeOp) => pass.ops.some((o) => o.path === relativePath && o.op === op && !o.modeOnly);
         const entry = store.treeGet(mount.treeStateId, relativePath);
         if (!entry) {
           // A pass also drops a copy disk made binary or too large, which
