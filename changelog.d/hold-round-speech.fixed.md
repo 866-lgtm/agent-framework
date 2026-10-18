@@ -37,8 +37,8 @@
   allowedTools doesn't name it or because this host can't set the
   `wake_in_seconds` it asks for, counts as a refused direct one: it keeps
   only its own round private, and the turn goes on. An inner send the
-  allowedTools refuses silences nothing, as a refused direct one doesn't.
-  On the fallback without `roundContent`, as in XML tool mode, an inner
+  allowedTools refuses, like a refused direct one, silences nothing. On
+  the fallback without `roundContent`, as in XML tool mode, an inner
   call counts only as a direct one does there. Nothing is routed until the
   turn ends, so a silencing send holds the whole turn's prose as drafts,
   the rounds before it included. The private `think` hold and an explicit
