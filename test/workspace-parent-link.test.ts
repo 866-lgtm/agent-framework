@@ -240,6 +240,21 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
       assert.equal(image.error, `work/l/img.png: ${linkedReason(target)}`);
     });
 
+    test(`read_image gives the link's refusal, not the workspace copy's failure, where that copy can't be read as an image (${target})`, async (t) => {
+      // read_image tries the workspace's copy first. Where that read throws,
+      // a disk refusal that came back as not_found would give way to the
+      // copy's error, so the refusal keeps its own code.
+      const env = new Env(t);
+      env.writeDisk('l/x.txt', 'v1\n');
+      const m = await env.open(t);
+      await call(m, 'write', { path: 'work/l/img.png', content: 'not an image\n' });
+      const away = env.swapLForLink(target);
+      writeFileSync(join(away, 'img.png'), 'not read');
+      const image = await m.handleToolCall({ id: 'i', name: 'read_image', input: { path: 'work/l/img.png' } });
+      assert.equal(image.success, false);
+      assert.equal(image.error, `work/l/img.png: ${linkedReason(target)}`);
+    });
+
     test(`a listing of the directory the link stands at says so instead of walking it (${target})`, async (t) => {
       const env = new Env(t);
       env.writeDisk('l/x.txt', 'v1\n');
@@ -348,7 +363,7 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
     assert.equal(shown(seen), 'unobserved: "work/l" is a symlink to "work", which this mount does not follow; the mount\'s host can set followSymlinks: true');
   });
 
-  test('a link into a nested mount\'s directory names the path to use in that mount, and not the setting, which would only reach into it', async (t) => {
+  test('a link into a nested mount\'s directory names the path to use in that mount, as other_mount, and not the setting, which would only reach into it', async (t) => {
     const env = new Env(t);
     env.writeDisk('nested/sub/x.txt', 'inner\n');
     symlinkSync('nested/sub', join(env.dir, 'l'));
@@ -362,7 +377,9 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
     const reason = '"work/l" is a symlink to "work/nested/sub", which this mount does not follow; it lies in mount "inner", nested in mount "work": use "inner/sub"';
     await assert.rejects(m.readFileFromDisk('work/l/x.txt'), (err: unknown) => {
       assert.ok(err instanceof WorkspaceReadError, String(err));
-      assert.equal(err.code, 'parent_symlink');
+      // The code a path in the nested mount's directory gets (#460), so a host
+      // that maps parent_symlink to the setting can't offer it here.
+      assert.equal(err.code, 'other_mount');
       assert.equal(err.message, `work/l/x.txt: ${reason}`);
       return true;
     });
@@ -371,6 +388,12 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
     assert.ok(String(res.error).includes(reason), String(res.error));
     assert.ok(!String(res.error).includes('followSymlinks'), String(res.error));
     assert.equal(existsSync(join(env.dir, 'nested', 'sub', 'new.txt')), false);
+    // read_image, where the workspace's own copy can't be read as an image,
+    // gives the refusal, not that copy's failure.
+    await m.handleToolCall({ id: 't', name: 'write', input: { path: 'work/l/img.png', content: 'not an image\n' } });
+    const image = await m.handleToolCall({ id: 'i', name: 'read_image', input: { path: 'work/l/img.png' } });
+    assert.equal(image.success, false);
+    assert.equal(image.error, `work/l/img.png: ${reason}`);
   });
 
   test('a path that resolves to another spelling of itself, with no link on its way, is reached by each primitive', async (t) => {

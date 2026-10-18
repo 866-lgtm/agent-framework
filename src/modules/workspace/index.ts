@@ -40,7 +40,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
-import { IGNORED, NONBLOCK, OTHER_MOUNT, filesystemTrustsCtime, inOtherMount, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, passedOverAt, readPrefix, type LinkFound } from './observe.js';
+import { IGNORED, NONBLOCK, OTHER_MOUNT, filesystemTrustsCtime, inOtherMount, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, nestedHolder, passedOverAt, readPrefix, type LinkFound } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
 import {
   type MountRuntime,
@@ -94,6 +94,7 @@ class WorkspaceImageReadError extends Error {
       | 'directory'
       | 'symlink'
       | 'parent_symlink'
+      | 'other_mount'
       | 'escape'
       | 'changed'
       | 'empty'
@@ -116,13 +117,15 @@ class WorkspaceImageReadError extends Error {
  * (`mount_unavailable`), an ordinary missing file (`not_found`), a directory
  * (`directory`), a file that is itself a symlink, refused by the mount's
  * `followSymlinks` policy (`symlink`), a symlink among the path's directories
- * on a mount that doesn't follow symlinks, wherever it leads but out of the
- * mount (`parent_symlink`), whose message names the link and where it leads,
- * a symlink whose canonical target lands outside the canonical mount root, or
- * one among the path's directories leading out of it (`escape`), a file
- * swapped underneath the read (`changed`), and a
- * path in another mount's directory nested in the one named (`other_mount`),
- * whose message names the mount that holds it and the path to use there.
+ * on a mount that doesn't follow symlinks, leading to a directory or a file
+ * inside the mount, or nowhere (`parent_symlink`), whose message names the
+ * link and, where it leads somewhere, its target, a symlink whose canonical
+ * target lands outside the canonical mount root, or one among the path's
+ * directories leading out of it (`escape`), a file swapped underneath the read
+ * (`changed`), and a path in another mount's directory nested in the one
+ * named, or reached through a symlink among the path's directories leading
+ * there (`other_mount`), whose message names the mount that holds it and the
+ * path to use there.
  */
 export type WorkspaceReadErrorCode =
   | 'unknown_mount'
@@ -259,8 +262,9 @@ function matchesPartialPrefix(buffer: Buffer, prefix: Buffer): boolean {
  * the readlink's errno, as every failed lookup is. A link's code follows
  * where it leads, so a caller choosing advice by code gets advice that fits:
  * `escape` for a link leading outside the mount, the code a path resolving
- * outside it gets too, and `parent_symlink` for any other, which `symlink`, a
- * file that is itself a link, leaves apart.
+ * outside it gets too; `other_mount` for one into a nested mount's directory,
+ * the code that mount's own paths get; and `parent_symlink` for any other,
+ * which `symlink`, a file that is itself a link, leaves apart.
  */
 async function linkReadError(
   mount: { config: { name: string; path: string } },
@@ -274,7 +278,10 @@ async function linkReadError(
   const rootReal = await realpath(mount.config.path).catch(() => resolve(mount.config.path));
   const leads = await linkLeads(mount.config.path, rootReal, found.link);
   const reason = `${mountPrefixedPath}: ${linkWords(mount.config.name, found, leads, nested)}`;
-  return new WorkspaceReadError(leads.kind === 'outside' ? 'escape' : 'parent_symlink', reason, 'readlink');
+  const code = leads.kind === 'outside' ? 'escape'
+    : leads.kind === 'inside' && nestedHolder(leads.target, nested) ? 'other_mount'
+    : 'parent_symlink';
+  return new WorkspaceReadError(code, reason, 'readlink');
 }
 
 function isContainedPath(root: string, candidate: string): boolean {
@@ -1869,7 +1876,8 @@ export class WorkspaceModule implements Module {
    * 0. On a mount that does not `followSymlinks`, refuse a path with a symlink
    *    among the directories on its way beneath the mount's root, wherever it
    *    leads (linkOnTheWay), before anything resolves it: as `escape` for a
-   *    link leading outside the mount, and as `symlink` for any other.
+   *    link leading outside the mount, as `other_mount` for one into a nested
+   *    mount's directory, and as `parent_symlink` for any other.
    * 1. `lstat` the lexical path — refuse directories; refuse a final-component
    *    symlink when the mount does not `followSymlinks`; refuse anything else
    *    that isn't a regular file, such as a FIFO, without opening it.
@@ -2113,6 +2121,11 @@ export class WorkspaceModule implements Module {
         // The core reader's own words for a link on its way: which link and
         // where it leads, with the setting for a link to a directory.
         return new WorkspaceImageReadError('parent_symlink', err.message);
+      case 'other_mount':
+        // The core reader's own words for a link on its way into a nested
+        // mount's directory: that mount and the path to use there. (#460's own
+        // other_mount, a path in that directory, is refused at parse.)
+        return new WorkspaceImageReadError('other_mount', err.message);
       case 'escape':
         // The core reader's own words: "Symlink escape detected: <path>" for a
         // followed link that resolves outside the mount, and for a link on the

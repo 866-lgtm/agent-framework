@@ -258,15 +258,24 @@ export async function linkLeads(root: string, rootReal: string, link: string): P
  * couldn't ask, which one, and the answer it got. Paths are spelled as the
  * tools take them, from the mount's name.
  */
+/**
+ * The nested mount whose directory holds `target` (mount-relative), the
+ * innermost where nested mounts nest, as #460 picks one; undefined when none
+ * does.
+ */
+export function nestedHolder(target: string, nested: readonly { dir: string; name: string }[]): { dir: string; name: string } | undefined {
+  return nested
+    .filter((n) => target === n.dir || target.startsWith(`${n.dir}/`))
+    .sort((a, b) => b.dir.length - a.dir.length)[0];
+}
+
 export function linkWords(name: string, found: LinkFound, leads: LinkLeads | null, nested: readonly { dir: string; name: string }[] = []): string {
   const spell = (rel: string) => `"${rel === '' ? name : `${name}/${rel}`}"`;
   if (!('link' in found)) return `${UNSURE_PREFIX}${name}/${found.unsure}" is a symlink (${found.code})`;
   const link = `${spell(found.link)} is a symlink`;
   if (leads === null || leads.kind === 'nowhere') return `${link}, which this mount does not follow`;
   if (leads.kind === 'outside') return `${link} leading outside the mount, which this mount does not follow`;
-  const holder = nested
-    .filter((n) => leads.target === n.dir || leads.target.startsWith(`${n.dir}/`))
-    .sort((a, b) => b.dir.length - a.dir.length)[0];
+  const holder = nestedHolder(leads.target, nested);
   if (holder) {
     const rest = leads.target.slice(holder.dir.length + 1);
     return `${link} to ${spell(leads.target)}, which this mount does not follow; it lies in mount "${holder.name}", ` +
