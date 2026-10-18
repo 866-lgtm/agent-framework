@@ -7,7 +7,7 @@
 
 import { watch, type FSWatcher } from 'chokidar';
 import { closeSync, constants, fstatSync, mkdirSync, openSync, statSync, type Stats } from 'node:fs';
-import { basename, sep } from 'node:path';
+import { basename, resolve, sep } from 'node:path';
 import { passedOverAt } from './observe.js';
 import { type MountConfig } from './types.js';
 
@@ -67,6 +67,13 @@ export class MountWatcher {
   private stopped = true;
   private readonly debounceMs: number;
   private readonly config: MountConfig;
+  /**
+   * The root as the watcher makes, watches and checks it, and as each
+   * event's path is read against: the configured path resolved (a link in it
+   * kept), since chokidar hands back the paths it reports normalized, and
+   * those of a root configured as `./m` matched none of them.
+   */
+  private readonly root: string;
   private readonly onChangeCallback: (changes: FsChange[]) => void;
   private readonly lifecycle: WatcherLifecycle;
 
@@ -78,6 +85,7 @@ export class MountWatcher {
     private readonly others: readonly string[] = [],
   ) {
     this.config = config;
+    this.root = resolve(config.path);
     this.debounceMs = config.watchDebounceMs ?? 300;
     this.onChangeCallback = onChange;
     this.lifecycle = lifecycle;
@@ -104,7 +112,7 @@ export class MountWatcher {
     // directories a user asked us only to read would be surprising.
     if (this.config.mode === 'read-write') {
       try {
-        mkdirSync(this.config.path, { recursive: true });
+        mkdirSync(this.root, { recursive: true });
       } catch (err) {
         this.lifecycle.onError?.(err instanceof Error ? err : new Error(String(err)));
       }
@@ -112,7 +120,7 @@ export class MountWatcher {
 
     const ignore = this.config.ignore ?? [];
 
-    this.watcher = watch(this.config.path, {
+    this.watcher = watch(this.root, {
       // What a walk passes over by design, by the path relative to the mount:
       // another mount's directory, the mount's ignore list and editors' swap
       // and backup files. chokidar 4
@@ -180,7 +188,7 @@ export class MountWatcher {
       // so there the rename forces a re-attach. A rename without a name, as
       // libuv gives for a file whose path it can't read, is passed over.
       if (event !== 'rename' || typeof rawPath !== 'string') return;
-      if (basename(rawPath) !== basename(this.config.path)) return;
+      if (basename(rawPath) !== basename(this.root)) return;
       void this.checkRootLiveness({ force: this.rootFd === null });
     });
 
@@ -416,7 +424,7 @@ export class MountWatcher {
     try {
       // A directory only, so a FIFO at the path fails at once rather than
       // blocking until a writer opens it.
-      fd = openSync(this.config.path, constants.O_RDONLY | constants.O_DIRECTORY);
+      fd = openSync(this.root, constants.O_RDONLY | constants.O_DIRECTORY);
     } catch {
       return this.readRootIdentity();
     }
@@ -461,7 +469,7 @@ export class MountWatcher {
   }
 
   private readRootIdentity(): RootIdentity {
-    return identityOf(statSync(this.config.path));
+    return identityOf(statSync(this.root));
   }
 
   private sameIdentity(a: RootIdentity, b: RootIdentity): boolean {
@@ -486,9 +494,7 @@ export class MountWatcher {
     // Chokidar hands back platform-separated absolute paths; compare with
     // the platform separator and normalize the result to the '/'-separated
     // logical form the rest of the workspace uses. No-op on POSIX.
-    const base = this.config.path.endsWith(sep)
-      ? this.config.path
-      : this.config.path + sep;
+    const base = this.root.endsWith(sep) ? this.root : this.root + sep;
     if (absolutePath.startsWith(base)) {
       return absolutePath.slice(base.length).split(sep).join('/');
     }
@@ -496,9 +502,7 @@ export class MountWatcher {
   }
 
   private isRootPath(absolutePath: string): boolean {
-    const root = this.config.path.endsWith(sep)
-      ? this.config.path.slice(0, -1)
-      : this.config.path;
+    const root = this.root.endsWith(sep) ? this.root.slice(0, -1) : this.root;
     const candidate = absolutePath.endsWith(sep)
       ? absolutePath.slice(0, -1)
       : absolutePath;
