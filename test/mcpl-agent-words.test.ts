@@ -214,6 +214,10 @@ test('a call pending when this host closes the connection says the outcome is un
   const pending = [assert.rejects(connection.sendToolsCall('hang', {}), unknown), assert.rejects(connection.sendToolsCall('hang', {}), unknown)];
   await connection.close();
   await Promise.all(pending);
+  // A request after the close isn't told whether the server comes back either.
+  await assert.rejects(connection.sendToolsCall('refuse', {}), {
+    message: `The request wasn't sent: this host closed its connection to the "words" server, so nothing ran.`,
+  });
   assert.ok(logged(errors.mock.calls, /^MCPL server "words": this host closed its connection with 2 request\(s\) unanswered: tools\/call \(id=(\d+)\), tools\/call \(id=(?!\1\))\d+\)$/),
     'the operator log has both requests');
 });
@@ -245,7 +249,7 @@ function frameworkWith(server: unknown, config: Record<string, unknown> = {}) {
 test("an MCPL tool call refused before it runs says it didn't run, and whether anything can change that", async () => {
   const gone = frameworkWith(null);
   gone.framework.dispatchMcplToolCall('agent', { id: 'c1', name: 'words--lookup', input: {} }, 'words', 'words');
-  // A server missing from the registry was closed for good, removed, or never connected.
+  // A server missing from the registry was closed for good, removed, or its connect failed without reconnect.
   assert.equal(gone.events[0]?.result?.error, `The "words" server that provides words--lookup isn't connected, ` +
     "and this host won't reconnect to it on its own, so the call didn't run. If you need it, ask whoever runs this host.");
   assert.equal((await gone.framework.executeMcplToolCall({ id: 'c2', name: 'words--lookup', input: {} }, 'words', 'words')).error,
@@ -300,20 +304,28 @@ test("a call while this host connects to the tool's server says so, and after a 
   const connectingText = 'This host is connecting to the "words" server that provides words--lookup, so the call didn\'t run. Try again in a moment.';
   assert.equal(events[0]?.result?.error, connectingText);
   assert.equal((await framework.executeMcplToolCall(call('c2'), 'words', 'words')).error, connectingText, "a script's call reads the same");
+  // Only the server being connected to reads so: another one missing is gone.
+  framework.dispatchMcplToolCall('agent', { id: 'c3', name: 'other--lookup', input: {} }, 'other', 'other');
+  assert.equal(events[1]?.result?.error, 'The "other" server that provides other--lookup isn\'t connected, ' +
+    "and this host won't reconnect to it on its own, so the call didn't run. If you need it, ask whoever runs this host.");
   handshakes[0]!(true);
   await connecting;
 
-  // A connect that fails leaves the server unregistered, which nothing brings back.
+  // The mark goes when the connect succeeds: once the server is gone, a call reads so.
   servers.clear();
+  const goneText = 'The "words" server that provides words--lookup isn\'t connected, ' +
+    "and this host won't reconnect to it on its own, so the call didn't run. If you need it, ask whoever runs this host.";
+  framework.dispatchMcplToolCall('agent', call('c4'), 'words', 'words');
+  assert.equal(events[2]?.result?.error, goneText, 'after a connect that succeeded');
+
+  // A connect that fails without reconnect leaves the server unregistered, which nothing brings back.
   const failing = connect({ id: 'words', url: 'ws://127.0.0.1:9', toolPrefix: 'words' }, true);
   await settle();
   handshakes[1]!(false);
   await assert.rejects(failing, /handshake refused/);
-  const goneText = 'The "words" server that provides words--lookup isn\'t connected, ' +
-    "and this host won't reconnect to it on its own, so the call didn't run. If you need it, ask whoever runs this host.";
-  framework.dispatchMcplToolCall('agent', call('c3'), 'words', 'words');
-  assert.equal(events[1]?.result?.error, goneText);
-  assert.equal((await framework.executeMcplToolCall(call('c4'), 'words', 'words')).error, goneText, "a script's call reads the same");
+  framework.dispatchMcplToolCall('agent', call('c5'), 'words', 'words');
+  assert.equal(events[3]?.result?.error, goneText, 'after a connect that failed');
+  assert.equal((await framework.executeMcplToolCall(call('c6'), 'words', 'words')).error, goneText, "a script's call reads the same");
 });
 
 test("an MCPL tool's error result with no words says so, and that its effect is unknown", async () => {

@@ -282,6 +282,10 @@ export class McplServerConnection extends EventEmitter {
   /** Set by `reconnectAfterFailure()` before it closes a live transport, so
    *  the transport close handler reports that teardown as `byHost: true`. */
   private hostCloseRequested = false;
+  /** Set by `close()`: this host has stopped the connection, as a removal and
+   *  a restart both do, so a request after it can't say whether the server
+   *  comes back. */
+  private closedByThisHost = false;
   private closePromise: Promise<void> | null = null;
   private closeIncomplete = false;
   private reconnectPromise: Promise<void> | null = null;
@@ -994,6 +998,7 @@ export class McplServerConnection extends EventEmitter {
   async close(): Promise<void> {
     // Disable reconnect before closing — explicit close means stop retrying
     this.reconnectEnabled = false;
+    this.closedByThisHost = true;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -1195,11 +1200,14 @@ export class McplServerConnection extends EventEmitter {
     options: RequestOptions = {},
   ): Promise<unknown> {
     if (this.closed) {
-      return Promise.reject(new Error(
-        `The request wasn't sent: the connection to the "${this.id}" server is closed, so nothing ran. ` +
-        (this.willReconnect
-          ? 'This host is reconnecting to it; try again later.'
-          : "This host won't reconnect to it on its own. If you need it, ask whoever runs this host."),
+      // After this host's own close, which a restart makes before connecting
+      // again and a removal makes for good, only that this host closed it holds.
+      return Promise.reject(new Error(this.closedByThisHost
+        ? `The request wasn't sent: this host closed its connection to the "${this.id}" server, so nothing ran.`
+        : `The request wasn't sent: the connection to the "${this.id}" server is closed, so nothing ran. ` +
+          (this.willReconnect
+            ? 'This host is reconnecting to it; try again later.'
+            : "This host won't reconnect to it on its own. If you need it, ask whoever runs this host."),
       ));
     }
 

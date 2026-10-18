@@ -19,6 +19,8 @@ const ANSWERS: Record<string, unknown> = {
   noText: { isError: true, content: [] },
   // Whitespace alone is no words, as a server's error answer reads it.
   blankText: { isError: true, content: [{ type: 'text', text: '  ' }, { type: 'text', text: '\n' }] },
+  // Words with whitespace around them are the server's, as they came.
+  padded: { isError: true, content: [{ type: 'text', text: '  no such row\n' }] },
   // A nonconformant server's: no content, or content that isn't a list.
   noContent: { isError: true },
   notList: { isError: true, content: 'not a list' },
@@ -41,6 +43,7 @@ const ERRORS: Record<string, string> = {
   notString: NON_STRING_TEXT_PLACEHOLDER,
   noText: NO_WORDS,
   blankText: NO_WORDS,
+  padded: '  no such row\n',
   noContent: NO_WORDS,
   notList: NO_WORDS,
   blank: 'after a blank',

@@ -137,18 +137,19 @@ import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 
 /** An MCPL tool call refused because its server isn't in the registry: one
- *  closed for good, one removed, or one whose connect failed, which this host
- *  doesn't bring back on its own. A server that's reconnecting stays
- *  registered, and its closed connection answers the call instead. One this
- *  host is connecting to isn't registered yet, and mcplServerConnectingText
- *  answers for it. */
+ *  closed for good, one removed, or one whose connect failed without
+ *  reconnect, which this host doesn't bring back on its own. A server that's
+ *  reconnecting stays registered, as does the stub a failed connect with
+ *  reconnect leaves, and its closed connection answers the call instead. One
+ *  this host is connecting to isn't registered yet, and
+ *  mcplServerConnectingText answers for it. */
 function mcplServerGoneText(serverId: string, toolName: string): string {
   return `The "${serverId}" server that provides ${toolName} isn't connected, and this host won't reconnect to it on its own, ` +
     "so the call didn't run. If you need it, ask whoever runs this host.";
 }
 
-/** An MCPL tool call refused while this host connects to its server, as a
- *  runtime connect or a restart does: the server's prefix routes calls to it
+/** An MCPL tool call refused while this host connects to its server, in a
+ *  runtime connect or a restart's: the server's prefix routes calls to it
  *  before the registry holds it, which it does once the handshake is done. */
 function mcplServerConnectingText(serverId: string, toolName: string): string {
   return `This host is connecting to the "${serverId}" server that provides ${toolName}, so the call didn't run. ` +
@@ -2250,7 +2251,9 @@ export class AgentFramework {
   private mcplServerConfigs: Map<string, import('./mcpl/types.js').McplServerConfig> = new Map();
   /** Servers whose connect is in flight (connectMcplServerInternal), from the
    *  registry's handshake until it settles: a call their prefix routes then
-   *  finds no server registered, and is told this host is connecting to it. */
+   *  finds no server registered, and is told this host is connecting to it.
+   *  One mark per id: the registry holds one connection per id, and two
+   *  connects of one id at once aren't supported. */
   private mcplConnecting: Set<string> = new Set();
   /** Host capabilities advertised during the MCP handshake — stored so servers
    *  can be connected at runtime (connectMcplServer) after initialization. */
@@ -18959,7 +18962,8 @@ export class AgentFramework {
     // The prefix above routes this server's tool calls already, and addServer
     // registers the server only once its handshake is done, so until it
     // settles a call is told this host is connecting to it. A connect that
-    // fails leaves it unregistered, and a call is told it's gone.
+    // fails without reconnect leaves it unregistered, and a call is told it's
+    // gone; with reconnect, the stub it leaves is registered and answers.
     this.mcplConnecting.add(config.id);
     let connection: McplServerConnection;
     try {
