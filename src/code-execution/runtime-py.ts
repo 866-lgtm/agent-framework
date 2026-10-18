@@ -387,12 +387,16 @@ def _flush_script_streams():
 
 def _said(exc):
     # An exception's text, or its type's name when it has none, as SystemExit()
-    # hasn't, or when a script's own exception class refuses to give it.
+    # hasn't, or when a script's own exception class refuses to give it. None
+    # of the script's code runs past the try: the text is taken as an exact str,
+    # since a str subclass's own methods run on truth and concatenation, and the
+    # name comes through type's own descriptor, as _brief's does, so a
+    # metaclass's doesn't run.
     try:
-        text = str(exc)
+        text = str.__str__(str(exc))
     except BaseException:
         text = ""
-    return text or type(exc).__name__
+    return text or type.__dict__["__name__"].__get__(type(exc))
 
 
 def _flush(writer):

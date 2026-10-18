@@ -1907,6 +1907,20 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
         ['a flush that is a raising property', 'class Out:\n    def write(self, s): return len(s)\n    @property\n    def flush(self): raise RuntimeError("no flush")', 'no flush'],
         ['SystemExit', 'class Out:\n    def write(self, s): return len(s)\n    def flush(self): raise SystemExit(3)', '3'],
         ['a SystemExit with no code', 'class Out:\n    def write(self, s): return len(s)\n    def flush(self): raise SystemExit()', 'SystemExit'],
+        [
+          "an error with no text whose type's metaclass refuses its name",
+          'class Meta(type):\n    @property\n    def __name__(cls): raise RuntimeError("no name")\n'
+            + 'class Nameless(Exception, metaclass=Meta):\n    pass\n'
+            + 'class Out:\n    def write(self, s): return len(s)\n    def flush(self): raise Nameless()',
+          'Nameless',
+        ],
+        [
+          'an error whose text is a str of its own that refuses truth and joining',
+          'class Hostile(str):\n    def __bool__(self): raise RuntimeError("no truth")\n    def __radd__(self, other): raise RuntimeError("no joining")\n'
+            + 'class Odd(Exception):\n    def __str__(self): return Hostile("odd text")\n'
+            + 'class Out:\n    def write(self, s): return len(s)\n    def flush(self): raise Odd()',
+          'odd text',
+        ],
       ];
       for (const [what, defines, said] of cases) {
         const result = await within(runner.exec(`import sys\n${defines}\nsys.stdout = Out()\nkept = "${what}"`, []), what);
