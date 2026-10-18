@@ -93,6 +93,7 @@ class WorkspaceImageReadError extends Error {
       | 'not_found'
       | 'directory'
       | 'symlink'
+      | 'parent_symlink'
       | 'escape'
       | 'changed'
       | 'empty'
@@ -113,9 +114,13 @@ class WorkspaceImageReadError extends Error {
  * peer needs to react to differently: a path that never resolved inside the
  * mount (`unknown_mount`, `traversal`), a mount whose root is gone
  * (`mount_unavailable`), an ordinary missing file (`not_found`), a directory
- * (`directory`), a symlink refused by the mount's `followSymlinks` policy
- * (`symlink`), a symlink whose canonical target lands outside the canonical
- * mount root (`escape`), a file swapped underneath the read (`changed`), and a
+ * (`directory`), a file that is itself a symlink, refused by the mount's
+ * `followSymlinks` policy (`symlink`), a symlink among the path's directories
+ * on a mount that doesn't follow symlinks, wherever it leads but out of the
+ * mount (`parent_symlink`), whose message names the link and where it leads,
+ * a symlink whose canonical target lands outside the canonical mount root, or
+ * one among the path's directories leading out of it (`escape`), a file
+ * swapped underneath the read (`changed`), and a
  * path in another mount's directory nested in the one named (`other_mount`),
  * whose message names the mount that holds it and the path to use there.
  */
@@ -127,6 +132,7 @@ export type WorkspaceReadErrorCode =
   | 'not_found'
   | 'directory'
   | 'symlink'
+  | 'parent_symlink'
   | 'escape'
   | 'changed';
 
@@ -253,7 +259,8 @@ function matchesPartialPrefix(buffer: Buffer, prefix: Buffer): boolean {
  * the readlink's errno, as every failed lookup is. A link's code follows
  * where it leads, so a caller choosing advice by code gets advice that fits:
  * `escape` for a link leading outside the mount, the code a path resolving
- * outside it gets too, and `symlink` for one inside.
+ * outside it gets too, and `parent_symlink` for any other, which `symlink`, a
+ * file that is itself a link, leaves apart.
  */
 async function linkReadError(
   mount: { config: { name: string; path: string } },
@@ -267,7 +274,7 @@ async function linkReadError(
   const rootReal = await realpath(mount.config.path).catch(() => resolve(mount.config.path));
   const leads = await linkLeads(mount.config.path, rootReal, found.link);
   const reason = `${mountPrefixedPath}: ${linkWords(mount.config.name, found, leads, nested)}`;
-  return new WorkspaceReadError(leads.kind === 'outside' ? 'escape' : 'symlink', reason, 'readlink');
+  return new WorkspaceReadError(leads.kind === 'outside' ? 'escape' : 'parent_symlink', reason, 'readlink');
 }
 
 function isContainedPath(root: string, candidate: string): boolean {
@@ -2099,10 +2106,13 @@ export class WorkspaceModule implements Module {
       case 'directory':
         return new WorkspaceImageReadError('directory', `Path is a directory: ${p}`);
       case 'symlink':
-        // The core reader's own words: "Symlinks are not allowed: <path>" for a
-        // link at the path, and for one on its way, which link and its target,
-        // with the setting for a link to a directory.
+        // The core reader's own words for a link at the path: "Symlinks are not
+        // allowed: <path>".
         return new WorkspaceImageReadError('symlink', err.message);
+      case 'parent_symlink':
+        // The core reader's own words for a link on its way: which link and
+        // where it leads, with the setting for a link to a directory.
+        return new WorkspaceImageReadError('parent_symlink', err.message);
       case 'escape':
         // The core reader's own words: "Symlink escape detected: <path>" for a
         // followed link that resolves outside the mount, and for a link on the

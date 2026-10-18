@@ -46,10 +46,11 @@ function linkedReason(target: 'inside' | 'outside'): string {
 /**
  * The code a disk reader gives a path through the link at "work/l": as on
  * main, `escape` for a link leading outside the mount, so a caller choosing
- * advice by code gets the outside advice; `symlink` for one inside it.
+ * advice by code gets the outside advice; `parent_symlink` for one inside it,
+ * apart from `symlink`, a file that is itself a link.
  */
-function linkedCode(target: 'inside' | 'outside'): 'symlink' | 'escape' {
-  return target === 'inside' ? 'symlink' : 'escape';
+function linkedCode(target: 'inside' | 'outside'): 'parent_symlink' | 'escape' {
+  return target === 'inside' ? 'parent_symlink' : 'escape';
 }
 
 /**
@@ -310,7 +311,7 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
     assert.equal(shown(seen), `unobserved: ${reason}`);
     await assert.rejects(m.readFileFromDisk('work/l/x.txt'), (err: unknown) => {
       assert.ok(err instanceof WorkspaceReadError, String(err));
-      assert.equal(err.code, 'symlink');
+      assert.equal(err.code, 'parent_symlink');
       assert.equal(err.message, `work/l/x.txt: ${reason}`);
       return true;
     });
@@ -332,7 +333,7 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
     for (const [path, reason] of reasons) {
       await assert.rejects(m.readFileFromDisk(path), (err: unknown) => {
         assert.ok(err instanceof WorkspaceReadError, String(err));
-        assert.equal(err.code, 'symlink', path);
+        assert.equal(err.code, 'parent_symlink', path);
         assert.equal(err.message, reason);
         return true;
       });
@@ -361,7 +362,7 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
     const reason = '"work/l" is a symlink to "work/nested/sub", which this mount does not follow; it lies in mount "inner", nested in mount "work": use "inner/sub"';
     await assert.rejects(m.readFileFromDisk('work/l/x.txt'), (err: unknown) => {
       assert.ok(err instanceof WorkspaceReadError, String(err));
-      assert.equal(err.code, 'symlink');
+      assert.equal(err.code, 'parent_symlink');
       assert.equal(err.message, `work/l/x.txt: ${reason}`);
       return true;
     });
@@ -451,6 +452,7 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
       assert.equal(skippedReason(forced, `${name}/new.txt`), `${name}/new.txt: not written: ${reason}`, `${name}, forced`);
       await assert.rejects(m.readFileFromDisk(`work/${name}/x.txt`), (err: unknown) => {
         assert.ok(err instanceof WorkspaceReadError, String(err));
+        assert.equal(err.code, 'parent_symlink');
         assert.equal(err.message, `work/${name}/x.txt: "work/${name}" is a symlink, which this mount does not follow`);
         return true;
       });
@@ -476,7 +478,7 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
     }, async () => {
       await assert.rejects(m.readFileFromDisk('work/l/x.txt'), (err: unknown) => {
         assert.ok(err instanceof WorkspaceReadError, String(err));
-        assert.equal(err.code, 'symlink');
+        assert.equal(err.code, 'parent_symlink');
         assert.equal(err.message, `work/l/x.txt: ${linkedReason('inside')}`);
         return true;
       });
