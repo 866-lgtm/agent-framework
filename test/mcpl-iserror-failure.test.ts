@@ -27,14 +27,19 @@ const ANSWERS: Record<string, unknown> = {
   okEmpty: { content: [] },
 };
 
-/** What each error answer reads as: its text, or `Tool call failed` with none. */
+/** What an error answer with no text reads as. */
+const NO_WORDS =
+    'The "editor" server reported an error for mcpl--editor--lookup without saying what went wrong. ' +
+    'Whether it did anything is unknown: check before calling it again.';
+
+/** What each error answer reads as: its text, or NO_WORDS with none. */
 const ERRORS: Record<string, string> = {
   one: 'no such row',
   two: 'first\nsecond',
   notString: NON_STRING_TEXT_PLACEHOLDER,
-  noText: 'Tool call failed',
-  noContent: 'Tool call failed',
-  notList: 'Tool call failed',
+  noText: NO_WORDS,
+  noContent: NO_WORDS,
+  notList: NO_WORDS,
   blank: 'after a blank',
   image: 'see the image',
 };
@@ -82,7 +87,7 @@ const fields = (r: ToolResult) => ({ success: r.success, data: r.data, error: r.
 
 const lookup = (id: string, c: string) => ({ id, name: 'mcpl--editor--lookup', input: { case: c } });
 
-test('a server\'s error reaches an in-process caller as the failure the model\'s call reads, its text joined, a text that isn\'t a string as the placeholder, and none as "Tool call failed"', { timeout: 20_000 }, async (t) => {
+test('a server\'s error reaches an in-process caller as the failure the model\'s call reads, its text joined, a text that isn\'t a string as the placeholder, and none as a failure whose effect is unknown', { timeout: 20_000 }, async (t) => {
   const { f, ctx, viaModel } = await setup(t);
   for (const [c, error] of Object.entries(ERRORS)) {
     const failure = { success: false, data: undefined, error, isError: true };
@@ -124,7 +129,7 @@ test('a server\'s error through the model\'s call is traced as tool:failed with 
   await viaModel('d-one', 'mcpl--editor--lookup', { case: 'one' });
   assert.deepEqual(terminal('d-one'), [{ type: 'tool:failed', module: 'mcpl:editor', error: 'no such row' }]);
   await viaModel('d-noText', 'mcpl--editor--lookup', { case: 'noText' });
-  assert.deepEqual(terminal('d-noText'), [{ type: 'tool:failed', module: 'mcpl:editor', error: 'Tool call failed' }]);
+  assert.deepEqual(terminal('d-noText'), [{ type: 'tool:failed', module: 'mcpl:editor', error: NO_WORDS }]);
   await viaModel('d-ok', 'mcpl--editor--lookup', { case: 'ok' });
   assert.deepEqual(terminal('d-ok'), [{ type: 'tool:completed', module: 'mcpl:editor' }]);
 });

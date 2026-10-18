@@ -373,7 +373,8 @@ test("a server's close reason stays out of the error a pending request is reject
     await assert.rejects(
       withDeadline(conn.sendToolsCall('echo', { text: 'hello' }), 10_000, 'the call to be rejected'),
       (error: Error) => {
-        assert.match(error.message, /^MCPL server "editor" disconnected unexpectedly \(code=4001, signal=n\/a, reason=websocket closed\) while awaiting tools\/call \(id=\d+\)$/);
+        assert.equal(error.message, 'The connection to the "editor" server closed before it answered, so whether the request took effect is unknown. ' +
+          "Check its effect before trying again; this host won't reconnect to it on its own.");
         return true;
       },
     );

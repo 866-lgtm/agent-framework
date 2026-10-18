@@ -563,7 +563,7 @@ describe('save_recent_image provenance (issue #104)', () => {
           toolUseId: 'call_cam',
           toolName: 'mcpl--vst--camera',
           content: `[${kept.refId}] kept.png — image/png — from tool result — saved: files/refs/kept.png\n`
-            + `[${expired.refId}] expired.png — image/png — from tool result — expired: its expiresAt has passed`,
+            + `[${expired.refId}] expired.png — image/png — from tool result — expired`,
           isError: false,
         }] as ContentBlock[]);
       },
@@ -572,7 +572,7 @@ describe('save_recent_image provenance (issue #104)', () => {
       const refused = await waitForToolResult(h.framework, 'call_save0');
       assert.strictEqual(refused.isError, true);
       assert.match(refused.content, new RegExp(`index 0 is a reference \\(${expired.refId}, image/png, from`));
-      assert.match(refused.content, /It can't be fetched either — expired: its expiresAt has passed\./);
+      assert.match(refused.content, /It can't be fetched either — expired\./);
       assert.ok(!refused.content.includes('fetch_reference'), refused.content);
       const keptRefusal = await waitForToolResult(h.framework, 'call_save1');
       assert.strictEqual(keptRefusal.isError, true);

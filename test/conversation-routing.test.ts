@@ -789,7 +789,7 @@ describe('Conversation routing', () => {
     fw.dispatchChannelToolCall(forkName, { id: 't2', name: 'channel_close', input: { channelId: 'slack:C8' } });
 
     assert.equal(failures.length, 2, 'both foreign channel operations should be rejected');
-    assert.ok(failures[0]!.error.includes('cannot open channels'), 'channel_open is rejected outright');
+    assert.ok(failures[0]!.error.includes("so it can't open other channels, and nothing was opened"), 'channel_open is rejected outright');
     assert.ok(failures[1]!.error.includes('closing slack:C8 is not allowed'), 'foreign channel_close is rejected');
 
     await framework.stop();

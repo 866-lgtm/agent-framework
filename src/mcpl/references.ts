@@ -26,6 +26,8 @@
  * code-execution materialization hook possible.
  */
 
+import { NON_STRING_TEXT_PLACEHOLDER } from './visible-content.js';
+
 export const REFERENCE_LIMITS = { uri: 4096, mimeType: 255, name: 255, expiresAt: 64 } as const;
 export const DIGEST_PATTERN = /^sha256:[A-Za-z0-9_-]{43}$/;
 const MAX_SAFE = 9007199254740991; // 2^53 - 1
@@ -53,7 +55,8 @@ export type BlockClassification =
   | { kind: 'text' }
   | { kind: 'inline'; contradiction: boolean }
   | { kind: 'reference'; testimony: ReferenceTestimony }
-  | { kind: 'invalid'; reason: string };
+  /** `shown` is what the model-visible lanes put in the block's place. */
+  | { kind: 'invalid'; shown: string };
 
 function isRecord(x: unknown): x is Record<string, unknown> {
   return typeof x === 'object' && x !== null && !Array.isArray(x);
@@ -80,13 +83,13 @@ function takeString(
 
 export function classifyBlock(block: unknown): BlockClassification {
   if (!isRecord(block) || typeof block.type !== 'string') {
-    return { kind: 'invalid', reason: 'not a content block' };
+    return { kind: 'invalid', shown: unknownBlockText(block) };
   }
   switch (block.type) {
     case 'text':
       return typeof block.text === 'string'
         ? { kind: 'text' }
-        : { kind: 'invalid', reason: 'text block without string text' };
+        : { kind: 'invalid', shown: NON_STRING_TEXT_PLACEHOLDER };
     case 'image':
     case 'audio': {
       const hasData = typeof block.data === 'string';
@@ -96,30 +99,23 @@ export function classifyBlock(block: unknown): BlockClassification {
         // the data) is the vector-2 contradiction: fail closed, withhold.
         return { kind: 'inline', contradiction: block.disposition !== undefined || hasUri };
       }
-      if (hasUri) return parseReferenceFields(block);
-      return { kind: 'invalid', reason: `${block.type} block ${mediaWithoutStringReason(block)}` };
+      // An empty uri is no link, as the push lane's converter reads it.
+      if (hasUri && block.uri !== '') return parseReferenceFields(block);
+      return { kind: 'invalid', shown: block.type === 'image' ? IMAGE_NO_DATA_TEXT : AUDIO_NO_DATA_TEXT };
     }
     case 'resource':
       return parseReferenceFields(block);
     default:
-      return { kind: 'invalid', reason: `unknown block type: ${block.type}` };
+      return { kind: 'invalid', shown: unknownBlockText(block) };
   }
-}
-
-/** What a media block with neither string data nor a string uri has instead:
- *  nothing, or a field that isn't a string. */
-function mediaWithoutStringReason(block: Record<string, unknown>): string {
-  const notString = (['data', 'uri'] as const).filter((f) => block[f] !== undefined && block[f] !== null);
-  if (notString.length === 0) return 'with neither data nor uri';
-  return notString.length === 2 ? "whose data and uri aren't strings" : `whose ${notString[0]} isn't a string`;
 }
 
 function parseReferenceFields(block: Record<string, unknown>): BlockClassification {
   if (typeof block.uri !== 'string' || block.uri.length === 0) {
-    return { kind: 'invalid', reason: 'reference without string uri' };
+    return { kind: 'invalid', shown: REFERENCE_NO_LINK_TEXT };
   }
   if (block.uri.length > REFERENCE_LIMITS.uri) {
-    return { kind: 'invalid', reason: 'uri exceeds schema maximum' };
+    return { kind: 'invalid', shown: REFERENCE_LINK_TOO_LONG_TEXT };
   }
   const out = { rejected: [] as string[], truncated: [] as string[] };
   const t: ReferenceTestimony = { uri: block.uri, rejectedFields: out.rejected, truncatedFields: out.truncated };
@@ -152,7 +148,36 @@ export function isInlineContradiction(block: unknown): boolean {
 }
 
 export const INLINE_WITHHELD_TEXT =
-  '[inline content withheld: inline data that also claims a uri or a bulk disposition]';
+  '[Content not shown: its inline data arrived marked as a reference too, so this host withheld it.]';
+
+/*
+ * What the model-visible lanes (push, channel, context injection and tool
+ * results) put in place of a block they can't show as itself. Each says what
+ * kind of thing was there and why it can't be seen, in the host's words, so
+ * the agent doesn't read the content as complete; there's nothing for the
+ * agent to do about any of them. The text marker is NON_STRING_TEXT_PLACEHOLDER
+ * (visible-content.ts).
+ */
+export const IMAGE_NO_MEDIA_TYPE_TEXT = '[Image not shown: its data arrived without a media type.]';
+export const IMAGE_NO_DATA_TEXT = '[Image not shown: it arrived with no usable data or link.]';
+export const AUDIO_NO_MEDIA_TYPE_TEXT = '[Audio not shown: its data arrived without a media type.]';
+/** Audio shows only as inline data, so a link alone isn't enough either. */
+export const AUDIO_NO_DATA_TEXT = '[Audio not shown: it arrived with no usable inline data.]';
+export const REFERENCE_NO_LINK_TEXT = '[Reference not shown: it arrived without a link.]';
+export const REFERENCE_LINK_TOO_LONG_TEXT = '[Reference not shown: its link is longer than this host accepts.]';
+const UNREADABLE_BLOCK_TEXT = "[Content not shown: a part arrived in a form this host can't read.]";
+
+/** A block of a type the host doesn't show, of no type at all, or no block.
+ *  The type is the sender's word, so it's shown as a label is: bounded, with
+ *  its controls removed. One that isn't a string is no type, and is never
+ *  converted to one. */
+export function unknownBlockText(block: unknown): string {
+  if (!isRecord(block)) return UNREADABLE_BLOCK_TEXT;
+  const label = typeof block.type === 'string' ? sanitizeLabel(block.type, STUB_FIELD_CHARS) : '';
+  return label
+    ? `[Content not shown: this host can't display "${label}" content.]`
+    : '[Content not shown: a part arrived with no type.]';
+}
 
 /**
  * Why a reference counts as expired, or null when it doesn't: its expiresAt
@@ -177,17 +202,18 @@ export function isReferenceExpired(t: Pick<ReferenceTestimony, 'expiresAt' | 're
   return referenceExpiry(t, nowMs) !== null;
 }
 
-/** Each expiry case as the stub and the fetcher's refusal both say it. */
+/** Each expiry case in the agent's words, as the stub, the fetcher's refusal
+ *  and save_recent_image's refusal all say it. */
 export const EXPIRY_REASON = {
-  passed: 'expired: its expiresAt has passed',
-  unparseable: 'treated as expired: its expiresAt does not parse (fail closed)',
-  rejected: `treated as expired: its expiresAt was rejected as a field, over ${REFERENCE_LIMITS.expiresAt} characters or not a string (fail closed)`,
+  passed: 'expired',
+  unparseable: "treated as expired, since its expiry time can't be read",
+  rejected: "treated as expired, since its expiry time isn't in a form this host accepts",
 } as const;
 
-/** A reference registered with no server, as the stub, the fetcher's refusal
- *  and save_recent_image's all say it: the fetcher dials only through the
- *  server a reference was registered against. */
-export const UNBOUND_REASON = 'unbound: no server is recorded to fetch it from';
+/** A reference registered with no server, in the agent's words, as the stub,
+ *  the fetcher's refusal and save_recent_image's all say it: the fetcher dials
+ *  only through the server a reference was registered against. */
+export const UNBOUND_REASON = "not tied to any server, so there's nowhere to fetch it from";
 
 /** Strip control characters (C0, DEL, C1) and every bidi control (marks,
  *  embeddings, overrides, isolates, and the Arabic letter mark), trim the
@@ -387,6 +413,6 @@ export function referenceStubOrNull(block: unknown, provenance?: string, serverI
     case 'inline':
       return c.contradiction ? INLINE_WITHHELD_TEXT : null;
     case 'reference': return buildReferenceStub(c.testimony, provenance, serverId);
-    case 'invalid': return `[unrecognized content block: ${sanitizeLabel(c.reason, STUB_FIELD_CHARS)}]`;
+    case 'invalid': return c.shown;
   }
 }

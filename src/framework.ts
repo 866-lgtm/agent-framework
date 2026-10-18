@@ -139,6 +139,23 @@ import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 /** Detect a supported image media type from magic bytes (the model API
  *  rejects mislabeled media types, so trust bytes over extensions).
  *  Returns undefined for non-image content. */
+/** An MCPL tool call refused because its server isn't in the registry: one
+ *  closed for good, one removed, or one never connected, which this host
+ *  doesn't bring back on its own. A server that's reconnecting stays
+ *  registered, and its closed connection answers the call instead. */
+function mcplServerGoneText(serverId: string, toolName: string): string {
+  return `The "${serverId}" server that provides ${toolName} isn't connected, and this host won't reconnect to it on its own, ` +
+    "so the call didn't run. If you need it, ask whoever runs this host.";
+}
+
+/** An MCPL tool call its server's tool policy denies. The policy hides the
+ *  tool from the list it's offered in, so this is a call to a tool the agent
+ *  wasn't offered. */
+function mcplToolDeniedText(serverId: string, toolName: string): string {
+  return `${toolName} isn't allowed by this host's policy for the "${serverId}" server, so the call didn't run, ` +
+    "and calling it again won't change that. If you need it, ask whoever runs this host.";
+}
+
 function sniffImageMediaType(data: Buffer): string | undefined {
   if (data.length >= 4 && data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4e && data[3] === 0x47) {
     return 'image/png';
@@ -312,13 +329,20 @@ function mcplResultText(content: McpToolResultContent[] | undefined): string {
 
 /**
  * An MCPL tools/call result the server marked `isError`, as a failure: its
- * text is the error, or `Tool call failed` when it has none, and its other
- * blocks aren't kept. The model's dispatch and an in-process caller
- * (`executeToolCall`, `ModuleContext.callTool`) both take a server's error
- * from here, so it reads the same on each path.
+ * text is the error, and with none, the error says the server gave no words
+ * and that whether the call did anything is unknown. Its other blocks aren't
+ * kept. The model's dispatch and an in-process caller (`executeToolCall`,
+ * `ModuleContext.callTool`) both take a server's error from here, so it reads
+ * the same on each path. `callName` is the tool's name as it was called.
  */
-function mcplToolFailure(content: McpToolResultContent[] | undefined): ToolResult {
-  return { success: false, error: mcplResultText(content) || 'Tool call failed', isError: true };
+function mcplToolFailure(content: McpToolResultContent[] | undefined, serverId: string, callName: string): ToolResult {
+  return {
+    success: false,
+    error: mcplResultText(content) ||
+      `The "${serverId}" server reported an error for ${callName} without saying what went wrong. ` +
+      'Whether it did anything is unknown: check before calling it again.',
+    isError: true,
+  };
 }
 
 /**
@@ -15712,22 +15736,18 @@ export class AgentFramework {
     }
     const server = this.mcplServerRegistry.getServer(serverId);
     if (!server) {
-      return { success: false, error: `MCPL server ${serverId} not found`, isError: true };
+      return { success: false, error: mcplServerGoneText(serverId, call.name), isError: true };
     }
     const toolName = call.name.slice(prefix.length + 2); // Strip prefix + '--'
     if (!isToolAllowed(toolName, this.mcplServerConfigs.get(serverId))) {
-      return {
-        success: false,
-        error: `Tool '${call.name}' is not permitted by this server's tool policy.`,
-        isError: true,
-      };
+      return { success: false, error: mcplToolDeniedText(serverId, call.name), isError: true };
     }
     try {
       const result = await server.sendToolsCall(toolName, call.input as Record<string, unknown>);
       // A server's error is a failure here too, as the model's dispatch
       // reads it. A success is the server's own blocks, for the caller to
       // use in process.
-      if (result.isError) return mcplToolFailure(result.content);
+      if (result.isError) return mcplToolFailure(result.content, serverId, call.name);
       return {
         success: true,
         data: result.content,
@@ -20408,7 +20428,7 @@ export class AgentFramework {
         toolName: call.name,
         agentName,
         moduleName: `mcpl:${serverId}`,
-        result: { success: false, error: `MCPL server not found: ${serverId}`, isError: true },
+        result: { success: false, error: mcplServerGoneText(serverId, call.name), isError: true },
       });
       return;
     }
@@ -20423,11 +20443,7 @@ export class AgentFramework {
         toolName: call.name,
         agentName,
         moduleName: `mcpl:${serverId}`,
-        result: {
-          success: false,
-          error: `Tool '${call.name}' is not permitted by this server's tool policy.`,
-          isError: true,
-        },
+        result: { success: false, error: mcplToolDeniedText(serverId, call.name), isError: true },
       });
       return;
     }
@@ -20505,7 +20521,7 @@ export class AgentFramework {
         // string for backward compatibility with callers that expect data to
         // be string-ish.
         const converted: ToolResult = result.isError
-          ? mcplToolFailure(result.content)
+          ? mcplToolFailure(result.content, serverId, call.name)
           : {
               success: true,
               data: result.content?.some((c) => c.type !== 'text')
@@ -20638,7 +20654,7 @@ export class AgentFramework {
       };
 
       if (call.name === 'channel_open') {
-        reject(`This conversation is bound to channel ${home}; conversation agents cannot open channels.`);
+        reject(`This conversation is bound to channel "${home}", so it can't open other channels, and nothing was opened. Reply in "${home}".`);
         return;
       }
       if (call.name === 'channel_publish' || call.name === 'channel_close') {

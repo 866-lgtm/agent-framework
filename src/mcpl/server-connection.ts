@@ -982,6 +982,13 @@ export class McplServerConnection extends EventEmitter {
   // Lifecycle
   // ==========================================================================
 
+  /** The requests still waiting for an answer, for the operator's log line
+   *  when the connection goes: their methods and ids. */
+  private unansweredRequests(): string {
+    const list = [...this.pendingRequests].map(([id, pending]) => `${pending.method} (id=${id})`).join(', ');
+    return `${this.pendingRequests.size} request(s) unanswered: ${list}`;
+  }
+
   /** Close the connection: disable reconnect, kill the child process, and clean up resources. */
   async close(): Promise<void> {
     // Disable reconnect before closing — explicit close means stop retrying
@@ -997,10 +1004,20 @@ export class McplServerConnection extends EventEmitter {
     this.closeIncomplete = true;
     this.resetPolicyForTransportBoundary();
 
-    // Reject all pending requests
-    for (const [id, pending] of this.pendingRequests) {
+    // Reject all pending requests. Each message is the whole of what an
+    // agent reads for a tools/call, and reads after a channel tool's own
+    // words for the requests those make, so it names no method; the log line
+    // does. It doesn't say whether this host reconnects: a restart closes the
+    // connection and then connects again.
+    if (this.pendingRequests.size > 0) {
+      console.error(`MCPL server "${this.id}": this host closed its connection with ${this.unansweredRequests()}`);
+    }
+    for (const pending of this.pendingRequests.values()) {
       if (pending.timer) clearTimeout(pending.timer);
-      pending.reject(new Error(`Connection to MCPL server "${this.id}" closed while awaiting response for ${pending.method} (id=${id})`));
+      pending.reject(new Error(
+        `The "${this.id}" server didn't answer before this host closed its connection, so whether the request took effect is unknown. ` +
+        'Check its effect before trying again.',
+      ));
     }
     this.pendingRequests.clear();
     this.orphanedRequests.clear();
@@ -1176,7 +1193,12 @@ export class McplServerConnection extends EventEmitter {
     options: RequestOptions = {},
   ): Promise<unknown> {
     if (this.closed) {
-      return Promise.reject(new Error(`Cannot send request: connection to "${this.id}" is closed`));
+      return Promise.reject(new Error(
+        `The request wasn't sent: the connection to the "${this.id}" server is closed, so nothing ran. ` +
+        (this.willReconnect
+          ? "This host is reconnecting to it; try again once it's back."
+          : "This host won't reconnect to it on its own."),
+      ));
     }
 
     const id = this.nextRequestId++;
@@ -1197,13 +1219,17 @@ export class McplServerConnection extends EventEmitter {
             this.orphanedRequests.set(id, { method, ...(method === 'push/render' ? { renderParams: { featureSet: params.featureSet, key: params.key, eventId: params.eventId } } : {}) });
             if (this.orphanedRequests.size > 4096) this.orphanedRequests.delete(this.orphanedRequests.keys().next().value!);
           }
+          // The method and id are the operator's, so they go to the log.
+          console.error(
+            `MCPL server "${this.id}" did not respond to ${method} (id=${id}) within ${timeoutMs}ms; ` +
+            'the request was abandoned here, not cancelled',
+          );
+          const seconds = timeoutMs / 1000;
           reject(new Error(
-            `MCPL server "${this.id}" did not respond to ${method} (id=${id}) ` +
-            `within ${timeoutMs}ms — the server may be hung. The response ` +
-            `outcome is unknown: the request was abandoned locally but was not ` +
-            `cancelled, so the tool may still have completed server-side; verify ` +
-            `state before retrying; a blind retry of a stateful/side-effecting ` +
-            `tool may duplicate it.`,
+            `The "${this.id}" server didn't answer within ${seconds} second${seconds === 1 ? '' : 's'}, ` +
+            'so whether the request took effect is unknown: ' +
+            'it was abandoned here, not cancelled, and may still complete on the server. ' +
+            'Check its effect before trying again, since repeating something that changes state may do it twice.',
           ));
         }, timeoutMs);
         // Don't hold the event loop open for the watchdog alone.
@@ -1478,16 +1504,19 @@ export class McplServerConnection extends EventEmitter {
     if (pending.timer) clearTimeout(pending.timer);
 
     if (response.error) {
-      // describeCause rather than the template's own conversion, as for an
-      // initialize error: the server's code and message can be any JSON
-      // value, and one with no primitive form, such as {"toString":1}, would
-      // throw here, after the request has left pendingRequests and its timer
-      // is cleared, so it would never settle. Both are the server's text, a
-      // code as much as a message, since a server can send a string, so both
-      // are bounded as errors.ts says.
-      pending.reject(
-        new Error(`MCPL server "${this.id}" returned error for ${pending.method}: [${boundedForLog(describeCause(response.error.code))}] ${boundedForLog(describeCause(response.error.message))}`),
+      // The server's own words, after a word on whose they are, bounded as
+      // errors.ts says, since they're the server's text. Only a string is
+      // words: a message of any other JSON value reads as none. The method,
+      // id and JSON-RPC code are the operator's, so they go to the log, which
+      // prints any value a server can send without throwing (logValue).
+      const said = typeof response.error.message === 'string' ? boundedForLog(response.error.message.trim()) : '';
+      console.error(
+        `MCPL server "${this.id}" answered ${pending.method} (id=${response.id}) with error ${logValue(response.error.code)}: ` +
+        logValue(response.error.message),
       );
+      pending.reject(new Error(said
+        ? `The "${this.id}" server answered with an error: ${said}`
+        : `The "${this.id}" server answered with an error without saying what went wrong.`));
     } else {
       pending.resolve(response.result);
     }
@@ -1534,13 +1563,27 @@ export class McplServerConnection extends EventEmitter {
       if (!this.closed) {
         this.closed = true;
         this.resetPolicyForTransportBoundary();
+        // A teardown the host asked for via reconnectAfterFailure() arrives
+        // here too; it's reported as such below.
+        const byHost = this.hostCloseRequested;
+        this.hostCloseRequested = false;
 
-        // Reject all pending requests
-        for (const [id, pending] of this.pendingRequests) {
+        // Reject all pending requests. The words hold whether the server
+        // dropped or this host closed the transport to recover; how it closed
+        // is the operator's, so it goes to the log, not into the messages.
+        if (this.pendingRequests.size > 0) {
+          const how = byHost
+            ? 'closed by this host'
+            : `code=${info.code ?? 'n/a'}, signal=${info.signal ?? 'n/a'}, reason=${closeReasonText(info)}`;
+          console.error(`MCPL server "${this.id}" disconnected (${how}) with ${this.unansweredRequests()}`);
+        }
+        for (const pending of this.pendingRequests.values()) {
           if (pending.timer) clearTimeout(pending.timer);
           pending.reject(
             new Error(
-              `MCPL server "${this.id}" disconnected unexpectedly (code=${info.code ?? 'n/a'}, signal=${info.signal ?? 'n/a'}, reason=${closeReasonText(info)}) while awaiting ${pending.method} (id=${id})`,
+              `The connection to the "${this.id}" server closed before it answered, so whether the request took effect is unknown. ` +
+              'Check its effect before trying again; ' +
+              (this.reconnectEnabled ? 'this host is reconnecting to it.' : "this host won't reconnect to it on its own."),
             ),
           );
         }
@@ -1549,10 +1592,7 @@ export class McplServerConnection extends EventEmitter {
 
         // Forward the transport's close info so listeners can tell a server
         // that refused the credential (WebSocket 4001) from a crash, and act
-        // before the reconnect below redials. A teardown the host asked for
-        // via reconnectAfterFailure() arrives here too; report it as such.
-        const byHost = this.hostCloseRequested;
-        this.hostCloseRequested = false;
+        // before the reconnect below redials.
         const closeInfo: McplConnectionCloseInfo = {
           transport: transport.kind,
           code: info.code ?? null,

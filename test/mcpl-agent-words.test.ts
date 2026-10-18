@@ -1,0 +1,224 @@
+/**
+ * What the MCPL lanes tell an agent, from the error-wording sweep: an MCPL
+ * request that fails says whether it took effect, the framework's refusals of
+ * an MCPL tool call say whether the call ran and what can change that, and a
+ * block the host can't show says what kind of thing it was and why.
+ *
+ * Run: node --import tsx --test test/mcpl-agent-words.test.ts
+ */
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+
+import { AgentFramework } from '../src/framework.js';
+import {
+  AUDIO_NO_DATA_TEXT,
+  AUDIO_NO_MEDIA_TYPE_TEXT,
+  IMAGE_NO_DATA_TEXT,
+  IMAGE_NO_MEDIA_TYPE_TEXT,
+  INLINE_WITHHELD_TEXT,
+  REFERENCE_LIMITS,
+  REFERENCE_LINK_TOO_LONG_TEXT,
+  REFERENCE_NO_LINK_TEXT,
+  referenceStubOrNull,
+} from '../src/mcpl/references.js';
+import { convertBlock } from '../src/mcpl/convert-block.js';
+import { McplServerConnection } from '../src/mcpl/server-connection.js';
+import type { McplHostCapabilities, McplServerConfig } from '../src/mcpl/types.js';
+
+// ---------------------------------------------------------------------------
+// Blocks the host can't show
+// ---------------------------------------------------------------------------
+
+test("the words that stand in for a block the host can't show, which other tests take from the constants", () => {
+  assert.deepEqual(
+    [IMAGE_NO_MEDIA_TYPE_TEXT, IMAGE_NO_DATA_TEXT, AUDIO_NO_MEDIA_TYPE_TEXT, AUDIO_NO_DATA_TEXT, REFERENCE_NO_LINK_TEXT, REFERENCE_LINK_TOO_LONG_TEXT, INLINE_WITHHELD_TEXT],
+    [
+      '[Image not shown: its data arrived without a media type.]',
+      '[Image not shown: it arrived with no usable data or link.]',
+      '[Audio not shown: its data arrived without a media type.]',
+      '[Audio not shown: it arrived with no usable inline data.]',
+      '[Reference not shown: it arrived without a link.]',
+      '[Reference not shown: its link is longer than this host accepts.]',
+      '[Content not shown: its inline data arrived marked as a reference too, so this host withheld it.]',
+    ],
+  );
+});
+
+test("a reference block that can't be read says which part is missing, and what isn't a block says it can't be read", () => {
+  assert.equal(referenceStubOrNull({ type: 'resource', uri: 'u'.repeat(REFERENCE_LIMITS.uri + 1) }), REFERENCE_LINK_TOO_LONG_TEXT);
+  assert.equal(referenceStubOrNull({ type: 'resource' }), REFERENCE_NO_LINK_TEXT);
+  assert.equal(referenceStubOrNull(424242), "[Content not shown: a part arrived in a form this host can't read.]");
+  assert.equal(referenceStubOrNull({ type: 'hologram\u0007' }), `[Content not shown: this host can't display "hologram" content.]`);
+  assert.equal(referenceStubOrNull({ type: '\u0007' }), '[Content not shown: a part arrived with no type.]');
+  // An empty link is no link: the tool-result lane says what the push lane's
+  // converter says for the same block.
+  for (const [block, text] of [[{ type: 'image', uri: '' }, IMAGE_NO_DATA_TEXT], [{ type: 'audio', uri: '' }, AUDIO_NO_DATA_TEXT]] as const) {
+    assert.equal(referenceStubOrNull(block), text);
+    assert.deepEqual(convertBlock(block as never, 'test'), { type: 'text', text });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// An MCPL request that fails
+// ---------------------------------------------------------------------------
+
+// Stdio server: answers initialize and tools/list; tools/call "refuse" gets a
+// JSON-RPC error, "mute" one with an empty message, "exit" ends the process
+// with the call pending, and "hang" is never answered.
+const SERVER = `
+let buf = '';
+process.stdin.on('data', (c) => {
+  buf += c.toString('utf8');
+  let i;
+  while ((i = buf.indexOf('\\n')) >= 0) {
+    const line = buf.slice(0, i); buf = buf.slice(i + 1);
+    if (!line.trim()) continue;
+    let m; try { m = JSON.parse(line); } catch { continue; }
+    const send = (o) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, ...o }) + '\\n');
+    if (m.method === 'initialize') send({ result: { capabilities: {} } });
+    else if (m.method === 'tools/list') send({ result: { tools: [] } });
+    else if (m.method === 'tools/call' && m.params.name === 'refuse') send({ error: { code: -32000, message: 'Missing Access' } });
+    else if (m.method === 'tools/call' && m.params.name === 'mute') send({ error: { code: -32000, message: '  ' } });
+    else if (m.method === 'tools/call' && m.params.name === 'exit') process.exit(3);
+  }
+});
+setInterval(() => {}, 1 << 30);
+`;
+
+const HOST_CAPS: McplHostCapabilities = { version: '0.4', pushEvents: true, contextHooks: { beforeInference: true }, featureSets: true };
+const config = (overrides: Partial<McplServerConfig> = {}): McplServerConfig =>
+  ({ id: 'words', command: process.execPath, args: ['-e', SERVER], ...overrides });
+
+/** Whether some console.error line matches. */
+const logged = (calls: ReadonlyArray<{ arguments: unknown[] }>, line: RegExp): boolean =>
+  calls.some((call) => line.test(String(call.arguments[0])));
+
+test("a server's error answer is shown as the server's, and its method, id and code go to the log", async (t) => {
+  const errors = t.mock.method(console, 'error', () => {});
+  const connection = await McplServerConnection.connect(config(), HOST_CAPS);
+  t.after(() => connection.close());
+  connection.ready();
+  await assert.rejects(connection.sendToolsCall('refuse', {}),
+    { message: 'The "words" server answered with an error: Missing Access' });
+  assert.ok(logged(errors.mock.calls, /^MCPL server "words" answered tools\/call \(id=\d+\) with error -32000: /), 'the operator log has the answer');
+  // An answer with no words says so, rather than ending on a colon.
+  await assert.rejects(connection.sendToolsCall('mute', {}),
+    { message: 'The "words" server answered with an error without saying what went wrong.' });
+});
+
+test("a server that drops with a call pending says the outcome is unknown, and whether it's coming back", async (t) => {
+  const errors = t.mock.method(console, 'error', () => {});
+  const once = await McplServerConnection.connect(config(), HOST_CAPS);
+  t.after(() => once.close());
+  once.ready();
+  await assert.rejects(once.sendToolsCall('exit', {}), {
+    message: 'The connection to the "words" server closed before it answered, so whether the request took effect is unknown. ' +
+      "Check its effect before trying again; this host won't reconnect to it on its own.",
+  });
+  // The close's details are the operator's: they go to the log.
+  assert.ok(logged(errors.mock.calls, /^MCPL server "words" disconnected \(code=.*\) with 1 request\(s\) unanswered: tools\/call \(id=\d+\)$/),
+    'the operator log has the close');
+  await assert.rejects(once.sendToolsCall('refuse', {}), {
+    message: `The request wasn't sent: the connection to the "words" server is closed, so nothing ran. This host won't reconnect to it on its own.`,
+  });
+
+  const again = await McplServerConnection.connectWithReconnect(config({ reconnect: true, reconnectIntervalMs: 600_000 }), HOST_CAPS);
+  t.after(() => again.close());
+  again.ready();
+  await assert.rejects(again.sendToolsCall('exit', {}), {
+    message: 'The connection to the "words" server closed before it answered, so whether the request took effect is unknown. ' +
+      'Check its effect before trying again; this host is reconnecting to it.',
+  });
+  await assert.rejects(again.sendToolsCall('refuse', {}), {
+    message: `The request wasn't sent: the connection to the "words" server is closed, so nothing ran. This host is reconnecting to it; try again once it's back.`,
+  });
+});
+
+test('a call pending when this host recycles the connection reads as a closed connection, and the log says the host closed it', async (t) => {
+  const errors = t.mock.method(console, 'error', () => {});
+  const connection = await McplServerConnection.connectWithReconnect(config({ reconnect: true, reconnectIntervalMs: 600_000 }), HOST_CAPS);
+  t.after(() => connection.close());
+  connection.ready();
+  const pending = assert.rejects(connection.sendToolsCall('hang', {}), {
+    message: 'The connection to the "words" server closed before it answered, so whether the request took effect is unknown. ' +
+      'Check its effect before trying again; this host is reconnecting to it.',
+  });
+  await connection.reconnectAfterFailure();
+  await pending;
+  assert.ok(logged(errors.mock.calls, /^MCPL server "words" disconnected \(closed by this host\) with 1 request\(s\) unanswered: tools\/call \(id=\d+\)$/),
+    'the operator log says the host closed it');
+});
+
+test('a call pending when this host closes the connection says the outcome is unknown, and the log names it', async (t) => {
+  const errors = t.mock.method(console, 'error', () => {});
+  const connection = await McplServerConnection.connect(config(), HOST_CAPS);
+  connection.ready();
+  // No word on reconnecting: a restart closes the connection, then connects again.
+  const pending = assert.rejects(connection.sendToolsCall('hang', {}), {
+    message: `The "words" server didn't answer before this host closed its connection, so whether the request took effect is unknown. ` +
+      'Check its effect before trying again.',
+  });
+  await connection.close();
+  await pending;
+  assert.ok(logged(errors.mock.calls, /^MCPL server "words": this host closed its connection with 1 request\(s\) unanswered: tools\/call \(id=\d+\)$/),
+    'the operator log has the request');
+});
+
+// ---------------------------------------------------------------------------
+// The framework's MCPL tool calls, and a conversation's channel guard
+// ---------------------------------------------------------------------------
+
+type ToolResultEvent = { type: string; result?: { success: boolean; error?: string; isError?: boolean } };
+
+/** A framework with only what dispatching an MCPL tool call reads. */
+function frameworkWith(server: unknown, config: Record<string, unknown> = {}) {
+  const events: ToolResultEvent[] = [];
+  let resolve!: () => void;
+  const delivered = new Promise<void>((r) => { resolve = r; });
+  const framework = Object.create(AgentFramework.prototype) as Record<string, unknown> & {
+    dispatchMcplToolCall(agentName: string, call: { id: string; name: string; input: unknown }, serverId: string, prefix: string): void;
+    executeMcplToolCall(call: { id: string; name: string; input: unknown }, serverId: string, prefix: string): Promise<{ error?: string }>;
+    dispatchChannelToolCall(agentName: string, call: { id: string; name: string; input: unknown }): void;
+  };
+  framework.mcplServerRegistry = { getServer: () => server };
+  framework.mcplServerConfigs = new Map([['words', { id: 'words', ...config }]]);
+  framework.emitTrace = () => {};
+  framework.pushEvent = (event: ToolResultEvent) => { events.push(event); if (event.type === 'tool-result') resolve(); };
+  return { framework, events, delivered };
+}
+
+test("an MCPL tool call refused before it runs says it didn't run, and whether anything can change that", async () => {
+  const gone = frameworkWith(null);
+  gone.framework.dispatchMcplToolCall('agent', { id: 'c1', name: 'words--lookup', input: {} }, 'words', 'words');
+  // A server missing from the registry was closed for good, removed, or never connected.
+  assert.equal(gone.events[0]?.result?.error, `The "words" server that provides words--lookup isn't connected, ` +
+    "and this host won't reconnect to it on its own, so the call didn't run. If you need it, ask whoever runs this host.");
+  assert.equal((await gone.framework.executeMcplToolCall({ id: 'c2', name: 'words--lookup', input: {} }, 'words', 'words')).error,
+    gone.events[0]?.result?.error, "a script's call reads the same");
+
+  const denied = frameworkWith({}, { disabledTools: ['lookup'] });
+  denied.framework.dispatchMcplToolCall('agent', { id: 'c3', name: 'words--lookup', input: {} }, 'words', 'words');
+  const deniedText = `words--lookup isn't allowed by this host's policy for the "words" server, so the call didn't run, ` +
+    "and calling it again won't change that. If you need it, ask whoever runs this host.";
+  assert.equal(denied.events[0]?.result?.error, deniedText);
+  assert.equal((await denied.framework.executeMcplToolCall({ id: 'c4', name: 'words--lookup', input: {} }, 'words', 'words')).error, deniedText);
+});
+
+test("an MCPL tool's error result with no words says so, and that its effect is unknown", async () => {
+  const silent = frameworkWith({ sendToolsCall: async () => ({ isError: true, content: [] }) });
+  silent.framework.dispatchMcplToolCall('agent', { id: 'c1', name: 'words--lookup', input: {} }, 'words', 'words');
+  await silent.delivered;
+  const result = silent.events.find((event) => event.type === 'tool-result')!.result!;
+  assert.equal(result.isError, true);
+  assert.equal(result.error, `The "words" server reported an error for words--lookup without saying what went wrong. ` +
+    'Whether it did anything is unknown: check before calling it again.');
+});
+
+test("a conversation bound to its channel is told it can't open another, and where to reply", () => {
+  const { framework, events } = frameworkWith(null);
+  framework.conversationAgentHomes = new Map([['fork', 'home-1']]);
+  framework.toolLifecycleEmitter = undefined;
+  framework.dispatchChannelToolCall('fork', { id: 'c1', name: 'channel_open', input: { channelId: 'elsewhere' } });
+  assert.equal(events[0]?.result?.error,
+    `This conversation is bound to channel "home-1", so it can't open other channels, and nothing was opened. Reply in "home-1".`);
+});
