@@ -167,7 +167,8 @@ export const CHILD_ENV_ALLOWLIST = [
   'http_proxy', 'https_proxy', 'no_proxy',
   '__CF_USER_TEXT_ENCODING',
   // Windows equivalents, harmless elsewhere.
-  'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT', 'APPDATA', 'LOCALAPPDATA', 'USERPROFILE',
+  // USERNAME is Windows' USER, which Python's getpass.getuser() reads there.
+  'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT', 'APPDATA', 'LOCALAPPDATA', 'USERPROFILE', 'USERNAME',
 ];
 
 /** Environment for a stdio child: allowlisted host vars (+ LC_*), then the
@@ -514,8 +515,9 @@ export class WebSocketTransport extends McplTransport {
 }
 
 /**
- * Build the dial URL: validate it's a ws(s):// URL and append the auth token as
- * a `token` query param when provided (preserving any existing query).
+ * Build the dial URL: validate it's a ws(s):// URL the ws library will dial,
+ * which refuses one with a fragment, and append the auth token as a `token`
+ * query param when provided (preserving any existing query).
  */
 export function buildWebSocketUrl(config: McplServerConfig, tokenOverride?: string | null): string {
   if (!config.url) {
@@ -531,6 +533,9 @@ export function buildWebSocketUrl(config: McplServerConfig, tokenOverride?: stri
     throw new Error(
       `MCPL server "${config.id}": websocket url must be ws:// or wss://, got "${parsed.protocol}"`,
     );
+  }
+  if (parsed.hash) {
+    throw new Error(`MCPL server "${config.id}": websocket url must not have a fragment, got "${parsed.hash}"`);
   }
   const token = tokenOverride !== undefined ? tokenOverride : config.token;
   if (token) {

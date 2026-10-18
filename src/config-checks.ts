@@ -8,9 +8,11 @@
  * pasted into the wrong field.
  */
 
-/** The kind of a value that isn't undefined, null or a boolean, as a refusal
- *  names it in place of the value. */
+/** The kind of a value, as a refusal names it in place of the value, which
+ *  can be a credential. */
 export function kindOf(value: unknown): string {
+  if (value === null) return 'null';
+  if (value === undefined) return 'undefined';
   if (Array.isArray(value)) return 'an array';
   if (typeof value !== 'object') return `a ${typeof value}`;
   const prototype = Object.getPrototypeOf(value) as { constructor?: { name?: string } } | null;
