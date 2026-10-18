@@ -54,13 +54,19 @@ import {
 } from './disk-agreement.js';
 import type { BranchIntent, BranchIntents, ConflictKind, ConflictRecord, DiskCounterpart } from './branch-intent.js';
 import {
+  IGNORED,
   type MountView,
+  OTHER_MOUNT,
   ROOT_REPLACED,
   type Walk,
   fingerprintVouches,
+  ignoreBeneath,
+  inOtherMount,
   locateRoot,
   looksBinary,
   observePath,
+  passedOverAt,
+  passedOverBetween,
   provenAbsent,
   readHead,
   readPath,
@@ -120,9 +126,11 @@ export interface PassResult {
   incomplete: Array<{ path: string; reason: string }>;
   /**
    * What the walk passed over by design and reported nowhere else, counted by
-   * reason: entries the mount's ignore list covers, when nothing beneath them
-   * is tracked (a tracked one is reported under `incomplete`). An ignored
-   * directory counts once, everything in it included. Only listings the walk
+   * reason: another mount's directory nested in this one, entries the mount's
+   * ignore list covers, and entries with an editor's swap or backup file
+   * name, when nothing beneath them is tracked (a tracked one is reported
+   * under `incomplete`). Such a directory counts
+   * once, everything in it included. Only listings the walk
    * kept count: a directory changed during the walk, or one past the file
    * cap, is reported under `incomplete` instead.
    */
@@ -182,8 +190,10 @@ export interface PassOptions {
    */
   resume?: boolean;
   /**
-   * The scope was named by a path sync: ignore patterns that cover it don't
-   * apply beneath it (see walkScope). A listing's scope keeps them.
+   * The scope was named, by a path sync or by a file tool's pass on the path
+   * it acts on: what the mount passes over by design that covers the scope,
+   * at it or above it, doesn't apply there (see walkScope). A listing's scope
+   * keeps it.
    */
   named?: boolean;
   /**
@@ -338,6 +348,47 @@ function settleAdoption(p: Pending, s: { hash: string; size: number } | null): A
     return p.expect.kind === 'absent' ? { kind: 'absent' } : { kind: 'content', hash: p.expect.hash, size: s!.size };
   }
   return p.prior ?? 'forget';
+}
+
+/**
+ * What's in the way, and the way out, when disk's shape keeps a push from a
+ * path: no push writes a file over a directory or unlinks one, or writes
+ * below a file or a symlink the walk won't take (`writeContained`,
+ * `unlinkContained`), forced or not. Null for any other reason, which is
+ * passed on as it is.
+ */
+function inTheWay(reason: string | undefined, deletion: boolean): string | null {
+  if (reason === 'a directory') {
+    return deletion
+      ? 'disk has a directory at this path, and no push unlinks one, forced or not — if it should go, move or remove it on disk'
+      : 'disk has a directory at this path, and no push writes a file over one, forced or not — ' +
+        'move or remove that directory on disk and materialize again, or write the file under another path';
+  }
+  // A deletion below a file finds nothing there to unlink, so only a write
+  // meets this one.
+  if (reason === 'a parent path is not a directory') {
+    return 'disk has a file or a symlink where this path needs a directory, and no push writes below one, forced or not — ' +
+      'move or remove it on disk and materialize again, or write the file under another path';
+  }
+  return null;
+}
+
+/**
+ * The forced way out the refusal of a disk copy that couldn't be verified
+ * names, if any. A forced push skips the verification, so it gets past the
+ * note only where its effect can go on. A file the module can't read (EACCES)
+ * is overwritten, or unlinked, where disk lets the workspace write it, or
+ * unlink it, which a read's EACCES doesn't show: force is named on that
+ * condition. What isn't a regular file is unlinked by a forced deletion. No
+ * other note names force: a forced push stops at some (a symlink the mount
+ * doesn't follow, a FIFO for a write, a parent it can't use); another writer
+ * still at the file ("the file changed while it was read") is answered by
+ * materializing again; and the rest aren't known to pass.
+ */
+function forcedWay(note: string | undefined, deletion: boolean, forced: string): string {
+  if (note === 'cannot open (EACCES)') return `, or, if disk lets the workspace ${deletion ? 'unlink' : 'write'} the file, ${forced}`;
+  if (deletion && note === 'not a regular file') return `, or ${forced}`;
+  return '';
 }
 
 /**
@@ -655,12 +706,41 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
       gathered.facts.set(path, { kind: 'unobserved', reason: rootUnavailable });
       continue;
     }
+    // What the mount passes over by design stays unobserved by a pass that
+    // names no path, however it reaches it, so no listing's absence proves a
+    // copy there gone. In another mount's directory, no pass of this mount
+    // observes anything, named or not.
+    // Beneath a directory a by-design rule covers, a pass that isn't named
+    // observes nothing. A path a rule covers by its own name is observed as a
+    // walk observes it: passed over where the walk lists it, and absent where
+    // the walk lists its directory without it; a pass that reaches it by its
+    // path alone, as a listing, glob or grep naming it does, passes over it.
+    // A pass that names its scope, as a sync naming a path and a file tool's
+    // pass on the path it acts on do, sets aside only what covers the scope,
+    // at it or above it, as its walk does (#276): a directory passed over by
+    // design beneath a named directory stays passed over, and so does what
+    // lies beneath it.
+    let byDesign: string | undefined;
+    if (inOtherMount(path, mount.view.others)) {
+      byDesign = OTHER_MOUNT;
+    } else if (!opts.named) {
+      const slash = path.lastIndexOf('/');
+      const above = slash < 0 ? undefined : passedOverAt(path.slice(0, slash), mount.view.ignore, mount.view.others);
+      const own = above === undefined && !walk ? passedOverAt(path, mount.view.ignore, mount.view.others) : undefined;
+      byDesign = above ?? own;
+    } else if (scope.kind === 'dir') {
+      byDesign = passedOverBetween(scope.dir, path, ignoreBeneath(scope.dir, mount.view.ignore), mount.view.others);
+    }
+    if (byDesign !== undefined) {
+      gathered.facts.set(path, { kind: 'unobserved', reason: byDesign });
+      continue;
+    }
     if (walk && provenAbsent(walk, path)) {
       gathered.facts.set(path, { kind: 'absent' });
       continue;
     }
-    if (walk?.others.get(path) === 'ignored by the mount') {
-      gathered.facts.set(path, { kind: 'unobserved', reason: 'ignored by the mount' });
+    if (walk?.others.get(path) === IGNORED) {
+      gathered.facts.set(path, { kind: 'unobserved', reason: IGNORED });
       continue;
     }
     if (walk && !walk.files.has(path) && !walk.othersTaken.has(path)) {
@@ -874,8 +954,16 @@ export async function reconcilePass(
       // A link's own region hides only what lies beneath it: the link itself
       // is reported by path, with its own reason.
       const hides = tracked.some((p) => (region.kind !== 'symlink' && p === region.path) || p.startsWith(region.path + '/'));
-      if (region.kind === 'error' || region.kind === 'cap' || hides) result.incomplete.push({ path: region.path, reason: region.reason });
-      // An ignored name that hides nothing tracked is reported nowhere else:
+      // A scope passed over whole is the answer to the pass that asked for
+      // it, so it's always named. Another mount's directory met beneath the
+      // scope is passed over by design even where this mount's tree holds
+      // copies there: no tool of this mount syncs, pushes or clears them
+      // (listings show them, naming their holder), so naming the directory
+      // as unreached would never clear.
+      const wholeScope = scope.kind === 'dir' && scope.dir !== '' && region.path === scope.dir;
+      const unreached = hides && region.reason !== OTHER_MOUNT;
+      if (region.kind === 'error' || region.kind === 'cap' || unreached || wholeScope) result.incomplete.push({ path: region.path, reason: region.reason });
+      // A name passed over by design that hides nothing tracked is reported nowhere else:
       // counted, so a sync that says 0 also says what it didn't look at
       // (agent-framework #276). A symlink region isn't counted: a link the
       // walk took is a candidate the pass reports by path, taken through the
@@ -934,6 +1022,9 @@ export interface PushResult {
   sequence?: number;
 }
 
+/** Why a push skips a path in another mount's directory nested in its own. */
+export const NOT_PUSHED_IN_OTHER_MOUNT = "it lies in another mount's directory, which no push of this mount writes";
+
 /**
  * Make disk hold the store's version of each path, under the same rule:
  * drafts are written, agreement is left alone, conflicts and unverifiable
@@ -971,6 +1062,18 @@ export async function pushPaths(
   if ('reason' in root) {
     for (const path of paths) result.skipped.push({ path, reason: root.reason });
     return result;
+  }
+  // Another mount's directory nested in this one is that mount's: no push
+  // of this mount writes or deletes a path in it, forced or not. (On a mount
+  // that follows links, a link of this mount's that leads there is read as
+  // this mount's own path; on one that doesn't, the link is refused.)
+  if (mount.view.others.length > 0) {
+    const own: string[] = [];
+    for (const path of paths) {
+      if (inOtherMount(path, mount.view.others)) result.skipped.push({ path, reason: NOT_PUSHED_IN_OTHER_MOUNT });
+      else own.push(path);
+    }
+    paths = own;
   }
 
   type Plan = {
@@ -1020,6 +1123,10 @@ export async function pushPaths(
     const p = agreement.get(mount.name, path);
     const bi = mount.intents.get(path);
     const v = decide(d, s, p, bi, branchId, false);
+    // The ways out a refusal names, as materialize takes them: a deletion
+    // reaches disk only with applyDeletions.
+    const again = s ? 'materialize again' : 'materialize again with applyDeletions';
+    const forced = s ? 'materialize it with force to overwrite it' : 'materialize it with force and applyDeletions to delete it';
     // What the effect may find: what this observation saw, unless forced.
     const expect: Expect = opts.force || d.kind === 'unobserved' || d.kind === 'unhashed'
       ? { kind: 'any' }
@@ -1033,7 +1140,7 @@ export async function pushPaths(
         result.skipped.push({
           path,
           reason: 'stale copy: disk changed since it last agreed with the workspace, which did not — ' +
-            'sync this path to adopt the disk version, or pass force to overwrite it',
+            `sync this path to adopt the disk version, or ${forced}`,
         });
         continue;
       }
@@ -1065,7 +1172,22 @@ export async function pushPaths(
     }
     if (v.state === 'unverified') {
       if (!opts.force) {
-        result.skipped.push({ path, reason: `cannot verify disk copy (${v.note ?? 'not observed'}) — fix it and materialize again, or pass force to overwrite it` });
+        // An intent that can't be read is the one note fixing doesn't
+        // answer: nothing is decided over it until a sync of the path
+        // replaces it (decide()), and a sync replaces it only where it sees
+        // disk's copy, so a copy it can't see is named first. For the rest,
+        // fixing what the note names holds, and forcedWay says where force
+        // does too.
+        const sync = 'sync this path to adopt the disk version, which replaces the intent';
+        result.skipped.push({
+          path,
+          reason: bi?.unreadable !== undefined
+            ? d.kind === 'absent' || d.kind === 'file'
+              ? `${v.note} — ${sync}`
+              : `${v.note}, and disk's copy can't be verified (${d.kind === 'unobserved' ? d.reason : 'not hashed'}) — once it can be, ${sync}`
+            : inTheWay(v.note, !s) ??
+              `cannot verify disk copy (${v.note ?? 'not observed'}) — fix it and ${again}${forcedWay(v.note, !s, forced)}`,
+        });
         continue;
       }
     }
@@ -1086,13 +1208,13 @@ export async function pushPaths(
         path,
         reason: noEvidence
           ? `disk holds a different copy, and nothing records which is newer (conflict: ${kind}) — ` +
-            'sync this path to adopt the disk version, or materialize this path with force to overwrite it'
+            `sync this path to adopt the disk version, or materialize this path with force ${s ? 'to overwrite it' : 'and applyDeletions to delete it'}`
           : kind === 'interrupted'
             ? 'disk holds bytes that match neither what was being written there nor what disk last agreed with ' +
               '(conflict: interrupted), as a write that failed or was cut off partway leaves — check the file, then ' +
-              'pass force to write the workspace copy over it, or sync this path to adopt the disk copy as it is'
+              `${forced}, or sync this path to adopt the disk copy as it is`
             : `stale copy: disk changed since it last agreed with the workspace (conflict: ${kind}) — ` +
-              'sync this path to adopt the disk version, or pass force to overwrite it',
+              `sync this path to adopt the disk version, or ${forced}`,
       });
       continue;
     }
@@ -1167,7 +1289,8 @@ export async function pushPaths(
         // exactly what it was, whatever kind that was.
         agreement.restore(mount.name, step.path, step.before);
         recorded = true;
-        result.skipped.push({ path: step.path, reason: `not ${step.kind === 'write' ? 'written' : 'unlinked'}: ${failure.message}` });
+        const why = inTheWay(failure.message, step.kind === 'unlink') ?? failure.message;
+        result.skipped.push({ path: step.path, reason: `not ${step.kind === 'write' ? 'written' : 'unlinked'}: ${why}` });
       } else {
         // No completion: the intent stays pending, and the next observation
         // resolves it from whatever disk then holds.

@@ -44,11 +44,12 @@ function makeConfig(): MountConfig {
 function collect(
   lifecycle?: WatcherLifecycle,
   config: MountConfig = makeConfig(),
+  others: readonly string[] = [],
 ): { watcher: MountWatcher; batches: FsChange[][] } {
   const batches: FsChange[][] = [];
   const watcher = new MountWatcher(config, (changes) => {
     batches.push(changes);
-  }, lifecycle);
+  }, lifecycle, others);
   watcher.start();
   return { watcher, batches };
 }
@@ -86,8 +87,9 @@ function collectWithPolling(lifecycle?: WatcherLifecycle): {
 function collectWithNative(
   lifecycle?: WatcherLifecycle,
   config?: MountConfig,
+  others?: readonly string[],
 ): { watcher: MountWatcher; batches: FsChange[][] } {
-  return withNativeBackend(() => collect(lifecycle, config));
+  return withNativeBackend(() => collect(lifecycle, config, others));
 }
 
 async function wait(ms: number) {
@@ -409,5 +411,57 @@ describe('MountWatcher lifecycle', () => {
     } finally {
       await watcher.stop();
     }
+  });
+});
+
+describe('MountWatcher ignores what a walk passes over by design (connectome-host #278)', () => {
+  // The mount sits under a directory with a dot in its name, as one under
+  // ~/.local does: chokidar's own filter for editors' files tested the whole
+  // path, so there it hid every `*.swp` beneath the root.
+  async function reported(
+    collectOn: (lifecycle?: WatcherLifecycle, config?: MountConfig, others?: readonly string[]) => { watcher: MountWatcher; batches: FsChange[][] },
+    ignore: string[],
+    files: string[],
+    expected: string[],
+    others: readonly string[] = [],
+  ): Promise<string[]> {
+    const root = join(tmp, '.local', 'work');
+    mkdirSync(join(root, 'cache'), { recursive: true });
+    mkdirSync(join(root, 'drafts~'), { recursive: true });
+    for (const other of others) mkdirSync(join(root, other), { recursive: true });
+    let ready = false;
+    const { watcher, batches } = collectOn({ onReady: () => { ready = true; } }, { ...makeConfig(), path: root, ignore }, others);
+    try {
+      await waitFor(() => ready, 'expected the watcher to be ready', 10_000);
+      for (const f of files) writeFileSync(join(root, f), 'x');
+      // What must be reported, then time for anything that mustn't be.
+      const seen = (p: string) => batches.flat().some((c) => c.path === p);
+      await waitFor(() => expected.every(seen), `expected ${expected.join(', ')} to be reported`, 10_000);
+      await wait(SETTLE_MS);
+    } finally {
+      await watcher.stop();
+    }
+    return [...new Set(batches.flat().map((c) => c.path))].sort();
+  }
+
+  const EDITORS = ['.gate.json.swp', '.gate.json.swx', 'gate.json~', '.x.subl3f9.tmp', 'drafts~/x.txt'];
+  const PLAIN = ['notes.swp', 'report.v2.swp', 'notes.sublime.tmpl', 'backup.txt.bak', 'kept.txt'];
+
+  for (const [backend, collectOn] of [
+    ['native', collectWithNative],
+    ['polling', (l?: WatcherLifecycle, c?: MountConfig, o?: readonly string[]) => withPollingBackend(() => collect(l, c, o))],
+  ] as const) {
+    it(`reports a plain name and passes over editors' files, by their own name (${backend})`, async () => {
+      assert.deepEqual(await reported(collectOn, [], [...EDITORS, ...PLAIN], PLAIN), [...PLAIN].sort());
+    });
+
+    it(`passes over another mount's directory nested in this one, and reports what lies beside it (${backend})`, async () => {
+      const files = ['inner/mount/x.txt', 'inner/kept.txt', 'kept.txt'];
+      assert.deepEqual(await reported(collectOn, [], files, ['inner/kept.txt', 'kept.txt'], ['inner/mount']), ['inner/kept.txt', 'kept.txt']);
+    });
+  }
+
+  it("passes over what the mount's ignore list covers, by the path relative to the mount", async () => {
+    assert.deepEqual(await reported(collectWithNative, ['*.log', 'cache/**'], ['new.log', 'cache/blob.txt', 'kept.txt'], ['kept.txt']), ['kept.txt']);
   });
 });
