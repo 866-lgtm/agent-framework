@@ -2,7 +2,10 @@ import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogu
 import { dirname, join } from 'node:path';
 import { INLINE_WITHHELD_TEXT, REFERENCE_LIMITS, classifyBlock, isInlineContradiction, isReferenceExpired, referenceRegistry, referenceStubOrNull, referenceTypeLabel, sanitizeLabel, unfetchableReason } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStream, DetailedUsage, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
@@ -415,7 +418,7 @@ function validateUtilityArgs(
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
 import { EventGate, formatShadowWarning } from './gate/event-gate.js';
-import { UsageTracker, type PersistedUsageState } from './usage/usage-tracker.js';
+import { UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import { stderrTailOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
 import { assertServerConfigBooleans, isWebSocketTransport } from './mcpl/transport.js';
@@ -716,6 +719,22 @@ interface ProseRound {
   /** The routing state of the turn that queued the round. */
   routing: TurnRouting;
 }
+
+/** What an ephemeral run ends with once stop() has begun, whatever ends it:
+ *  stop()'s sweep or one of the run's watchdogs. A watchdog adds what it saw
+ *  but names no cause. While stop() waits, a run whose turn it refused looks
+ *  the same as one whose stream, or whose event loop, never settles, and
+ *  only the latter two are faults: what the watchdog saw may or may not be
+ *  why stop() is slow. */
+function ephemeralRunStopped(name: string, observed?: string): Error {
+  return new Error(`Ephemeral agent "${name}" refused: the framework is stopping${observed ? ` (${observed})` : ''}`);
+}
+
+/** The reason on the inference:aborted that ends a turn whose retry stop()
+ *  cancelled, whichever frame was waiting to retry: beginAgentTurn's, when
+ *  the stream couldn't start, or driveStream's, when it failed once started.
+ *  Its inference:failed came first, and this says no retry follows it. */
+const RETRY_CANCELLED_BY_STOP = 'a retry waiting while the framework was stopping is dropped before it sends anything';
 
 function isTurnContinuation(reason: string): boolean {
   return reason === 'context_budget_restart' || reason === 'tool_results_ready'
@@ -1644,6 +1663,20 @@ function thrownText(error: unknown): string {
     text = '(a value that could not be read)';
   }
   return text.length <= THROWN_TEXT_LIMIT ? text : `${text.slice(0, THROWN_TEXT_LIMIT)}… (${text.length} characters)`;
+}
+
+/** A stored value that read but isn't in a form this code takes, as against
+ *  a read that failed: starting again changes nothing until it's repaired,
+ *  so the refusal that quotes it says so instead of "once it can be read". */
+class StoredFormError extends Error {}
+
+/** A stored JSON value's kind, for a refusal that names what it found
+ *  without its content. */
+function jsonKind(value: unknown): string {
+  return value === null ? 'null'
+    : Array.isArray(value) ? 'an array'
+      : typeof value === 'object' ? 'an object'
+        : `a ${typeof value}`;
 }
 
 /**
@@ -3016,6 +3049,18 @@ export class AgentFramework {
     if (this.loopPromise) {
       await this.loopPromise;
     }
+
+    // Nothing drives an ephemeral run once the loop has ended: no turn starts
+    // after stop() begins, every stream it found was cancelled and has
+    // settled, and a tool result that arrives now is dropped, since the queue
+    // is closed. So a run still registered could only wait for a watchdog,
+    // such as one whose wake was never taken up, whose turn was refused,
+    // whose retry was cancelled, or whose continuation is still queued. End
+    // each one now, while the store is open for its cleanup. (A start()
+    // during a stop() is #315's. One made before the loop ended keeps a loop
+    // running, so this stop waits for it; one made just after, before this
+    // point, has its runs ended here too.)
+    for (const [name, run] of this.ephemeralRuns) run.settle.reject(ephemeralRunStopped(name));
 
     // Admission closed when stop() began. What admitted operations start now,
     // such as a surgery's config materialization, joins the set, so wait until
@@ -4498,11 +4543,34 @@ export class AgentFramework {
 
   /** A new agent's guard: its persisted setting, the tool-results spill its
    *  withheld originals are written to, and the set stop() waits on
-   *  (agent-framework #277). */
+   *  (agent-framework #277). The setting is read from framework/state's
+   *  toolResultGuards by the agent's own name. A read that fails, or a
+   *  toolResultGuards that isn't an object, throws, naming the state: taken
+   *  as no setting, the agent would take its recipe's guard, and the next
+   *  guard change would store over a toolResultGuards that isn't an object. */
   private adoptToolResultGuard(agent: Agent): void {
-    const enabled = (this.store.getStateJson(FRAMEWORK_STATE_ID) as {
-      toolResultGuards?: Record<string, unknown>;
-    } | null)?.toolResultGuards?.[agent.name];
+    const refuse = (problem: string, cause?: unknown): Error => new Error(
+      `the tool-result guards (${FRAMEWORK_STATE_ID}, toolResultGuards) ${problem}. Agent "${agent.name}" isn't ` +
+        `created, since without them it would take its recipe's guard` +
+        (cause === undefined
+          ? ` and the next guard change would store over them. They're unchanged, and creating it again won't help until the host's operator repairs them.`
+          : `. They're unchanged, and it's created once they can be read.`),
+      cause === undefined ? undefined : { cause },
+    );
+    let data: unknown;
+    try {
+      data = this.store.getStateJson(FRAMEWORK_STATE_ID);
+    } catch (error) {
+      throw refuse(`could not be read: ${thrownText(error)}`, error);
+    }
+    const guards = data && typeof data === 'object' ? (data as Record<string, unknown>).toolResultGuards : undefined;
+    if (guards !== undefined && (!guards || typeof guards !== 'object' || Array.isArray(guards))) {
+      throw refuse(`are ${jsonKind(guards)}, not an object of agents' guards`);
+    }
+    // Own keys only: an agent named "constructor" has no inherited override.
+    const enabled = guards !== undefined && Object.prototype.hasOwnProperty.call(guards, agent.name)
+      ? (guards as Record<string, unknown>)[agent.name]
+      : undefined;
     if (enabled !== undefined && typeof enabled !== 'boolean') {
       throw new Error(`Invalid persisted tool_result_guard for ${agent.name}: expected a boolean`);
     }
@@ -4642,14 +4710,12 @@ export class AgentFramework {
     for (const tool of this.moduleRegistry.getAllTools()) {
       sources.set(tool.name, `Module: ${tool.name.split('--')[0]}`);
     }
-    // Use registered server prefixes, not a guess from a conventional mcpl-- name.
+    // An MCPL tool's source is the server a call of it reaches (resolveMcplTool),
+    // not the first configured prefix it begins with: prefixes can nest.
     for (const tool of tools) {
-      for (const config of this.mcplServerConfigs.values()) {
-        if (tool.name.startsWith((config.toolPrefix ?? `mcpl--${config.id}`) + '--')) {
-          sources.set(tool.name, `MCPL server: ${config.id}`); break;
-        }
-      }
-      if (!sources.has(tool.name)) sources.set(tool.name, 'Framework');
+      const mcpl = this.resolveMcplTool(tool.name);
+      if (mcpl) sources.set(tool.name, `MCPL server: ${mcpl[0]}`);
+      else if (!sources.has(tool.name)) sources.set(tool.name, 'Framework');
     }
     return presentation.resolve(tools, sources);
   }
@@ -5316,7 +5382,9 @@ export class AgentFramework {
    * Which of `ids` already exist in some agent's store as a landed deferred
    * write (`metadata.deferredWriteId`). Scans each context manager's recent
    * tail blob-free — an interrupted flush is always within the last few
-   * hundred slots — and tolerates facades without windowed reads.
+   * hundred slots — and tolerates facades without windowed reads. A context
+   * that can't be read throws, naming its agent: counted as holding none, a
+   * write that landed there before its ack would land a second time.
    */
   private landedDeferredWriteIds(ids: Set<string>, scanFrom: Map<string, number>): Set<string> {
     const landed = new Set<string>();
@@ -5346,25 +5414,101 @@ export class AgentFramework {
         } else {
           for (const m of cm.getAllMessages()) consider(m);
         }
-      } catch (err) {
-        console.error(`[host-mode] could not scan ${agent.name} for landed deferred writes:`, err);
+      } catch (error) {
+        throw new Error(`${agent.name}'s context could not be read: ${thrownText(error)}`, { cause: error });
       }
     }
     return landed;
   }
 
-  /** Atomic JSON write for the recovery files (tmp + rename, 0600) — the
-   *  same idiom as the Discord awareness outbox. */
+  /** Atomic, durable JSON write for the recovery files. The document goes to
+   *  a temp file at 0600, which is synced and renamed over the record, so
+   *  the new record's data is asked to reach the disk before the rename
+   *  publishes it. Then the directory is synced, for the record's entry in
+   *  it, and its parent, for the directory's own entry, which is new when a
+   *  write, this one or an earlier one, had to make the directory; levels
+   *  above are left to the filesystem. Directories aren't synced on win32,
+   *  which syncs the file alone, or where the filesystem can't sync one
+   *  (syncRecoveryDirectory). A failure before the rename removes the temp
+   *  file, if it was made, and throws an error saying the record was left as
+   *  it was, with the original as its cause and its code kept. A directory
+   *  sync that fails, other than where the filesystem can't sync one, is
+   *  raised as an ops alert, not thrown: the new record is in place, and the
+   *  callers go on to record it as written. */
   private writeRecoveryFile(path: string, document: unknown): void {
-    mkdirSync(dirname(path), { recursive: true });
+    const directory = dirname(path);
     const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-    writeFileSync(temporary, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600 });
-    renameSync(temporary, path);
+    let opened = false;
+    try {
+      mkdirSync(directory, { recursive: true });
+      const fd = openSync(temporary, 'w', 0o600);
+      opened = true;
+      try {
+        writeFileSync(fd, `${JSON.stringify(document, null, 2)}\n`);
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      renameSync(temporary, path);
+    } catch (err) {
+      if (opened) {
+        try {
+          unlinkSync(temporary);
+        } catch (unlinkErr) {
+          console.error(`[host-mode] couldn't remove ${temporary} after a failed write:`, unlinkErr);
+        }
+      }
+      const cause = err as NodeJS.ErrnoException;
+      throw Object.assign(new Error(`${path} was left as it was: ${cause.message}`, { cause }), cause.code ? { code: cause.code } : {});
+    }
+    this.syncRecoveryDirectory(directory, path);
+    this.syncRecoveryDirectory(dirname(directory), path);
   }
 
+  /** Syncs the directory a recovery file is in, or that directory's parent,
+   *  so its entries reach the disk. win32 is left out. So is a sync refused
+   *  with EINVAL or EBADF, the answer where the filesystem or system can't
+   *  sync a directory: that refusal would come again on every write, and
+   *  PostgreSQL's fsync_fname_ext lets the same two go. Any other failure is
+   *  raised as an ops alert naming the record. */
+  private syncRecoveryDirectory(directory: string, record: string): void {
+    if (process.platform === 'win32') return;
+    try {
+      const fd = openSync(directory, 'r');
+      try {
+        fsyncSync(fd);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== 'EINVAL' && code !== 'EBADF') throw err;
+      } finally {
+        closeSync(fd);
+      }
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      this.opsAlert('recovery-sync', 'framework',
+        `syncing ${directory} failed, so ${record} may not survive a crash: ${reason}`,
+        { data: { record, directory, code: (err as NodeJS.ErrnoException).code } });
+    }
+  }
+
+  /** A recovery file's document, or undefined when there's no file. Only a
+   *  missing file means none was written: any other failure to read it
+   *  (EACCES, ENOTDIR, EIO, which existsSync would answer false for)
+   *  throws, and text that isn't JSON throws a StoredFormError carrying
+   *  the parser's reason, since reading it again won't change it. */
   private readRecoveryFile(path: string): unknown {
-    if (!existsSync(path)) return undefined;
-    return JSON.parse(readFileSync(path, 'utf8'));
+    let text: string;
+    try {
+      text = readFileSync(path, 'utf8');
+    } catch (error) {
+      if ((error as { code?: unknown } | null)?.code === 'ENOENT') return undefined;
+      throw error;
+    }
+    try {
+      return JSON.parse(text);
+    } catch (error) {
+      throw new StoredFormError(thrownText(error), { cause: error });
+    }
   }
 
   private warnRecoveryFallbackOnce(): void {
@@ -5433,137 +5577,181 @@ export class AgentFramework {
     }
   }
 
+  /**
+   * Restore the deferred-write queue a crash or a stop left durable. Nothing
+   * stored is an empty queue. A queue that can't be read, or that reads as
+   * anything but a queue, throws, since taken as empty the next deferral
+   * would replace the stored one; so does a context that can't be checked
+   * for writes that already landed (see landedDeferredWriteIds).
+   */
   private restorePersistedDeferredWrites(): number {
+    // The recovery file wins whenever it exists. Stores that predate it (or
+    // store-only configs) keep the queue in the store's slot.
+    let file = this.deferredWritesPath;
+    const refuse = (problem: string, cause?: unknown): Error => new Error(
+      `the deferred context writes (${file ?? DEFERRED_WRITES_ID}) ${problem}. The framework doesn't start without them, ` +
+        `since the next deferral would replace the stored queue. ` +
+        (file
+          ? `The file is unchanged, and the framework starts once ${cause === undefined
+            ? 'it holds a queue of writes, such as {"version":1,"pending":[]} for none. Removing it reads the queue ' +
+              `from ${DEFERRED_WRITES_ID} instead, which the file's writes don't keep, so it restores whatever older ` +
+              `queue is there, or none`
+            : 'it can be read'}.`
+          : cause === undefined
+            ? `They're unchanged, and starting again won't help until they're repaired.`
+            : `They're unchanged, and the framework starts once they can be read.`),
+      cause === undefined ? undefined : { cause },
+    );
+    let raw: unknown;
     try {
-      let raw: unknown;
-      if (this.deferredWritesPath && existsSync(this.deferredWritesPath)) {
-        raw = this.readRecoveryFile(this.deferredWritesPath);
-      } else {
-        // Stores that predate the recovery file (or store-only configs).
+      raw = file ? this.readRecoveryFile(file) : undefined;
+      if (raw === undefined) {
+        file = undefined;
         raw = this.store.getStateJson(DEFERRED_WRITES_ID);
       }
-      // v1 slot payloads were a bare array; v1/v2 files and v2 slots are
-      // `{ pending, scanFrom? }`.
-      const doc = Array.isArray(raw) ? { pending: raw } : (raw as { pending?: unknown; scanFrom?: unknown } | undefined);
-      const data = doc?.pending;
-      if (!Array.isArray(data) || data.length === 0) return 0;
-      const scanFrom = new Map<string, number>();
-      if (doc?.scanFrom && typeof doc.scanFrom === 'object') {
-        for (const [k, v] of Object.entries(doc.scanFrom as Record<string, unknown>)) {
-          if (typeof v === 'number' && Number.isFinite(v)) scanFrom.set(k, Math.max(0, Math.floor(v)));
-        }
-      }
-      // An entry the queue's readers can't handle has no place in it: one whose
-      // participant isn't text, whose content isn't an array, that holds a
-      // block that isn't an object, or whose `forAgent` is present but not a
-      // name, is dropped here with a line naming it, rather than held. Reading
-      // a null block's type throws, at the tool boundary and in the store. The
-      // store keeps a string or number block as given, but the context
-      // manager's token estimate keys a WeakMap on each block, which such a
-      // value can't be: once one is stored, every compile for that agent
-      // throws, and a restart doesn't clear it. What a block holds, such as a
-      // tool result's content, isn't checked here, as it isn't for a fresh
-      // write. The framework writes `forAgent` only as a non-empty name, so
-      // another value comes from damage or a hand edit, and the agent it
-      // meant can't be known: sent to the primary, as a falsy one would be, it
-      // could put another agent's message in the primary's window.
-      const wellFormed = (m: unknown): m is Omit<DeferredWrite, 'id' | 'seq'> & { id?: unknown; seq?: unknown } => {
-        if (!m || typeof m !== 'object') return false;
-        const { participant, content, forAgent } = m as { participant?: unknown; content?: unknown; forAgent?: unknown };
-        return typeof participant === 'string'
-          && Array.isArray(content) && content.every((b) => !!b && typeof b === 'object')
-          && (forAgent === undefined || (typeof forAgent === 'string' && forAgent !== ''));
-      };
-      const malformed = data.filter((m) => !wellFormed(m));
-      for (const m of malformed) {
-        // What the entry holds there: a value that isn't text by its type.
-        const field = (key: string): string => {
-          const value = m && typeof m === 'object' ? (m as Record<string, unknown>)[key] : undefined;
-          if (typeof value === 'string') return value;
-          if (value === undefined) return `no ${key}`;
-          return `${key} ${value === null ? 'null' : `of type ${typeof value}`}`;
-        };
-        console.error(
-          `[host-mode] a recovered deferred context write is malformed and was dropped: ` +
-          `${field('id')} (${field('participant')})`,
-        );
-      }
-      // One entry per id: the boot dedup and the ack each take an id as one
-      // write, so an id that comes again is dropped with a line, and the first
-      // entry with it is kept. An entry with no id is given a fresh one, with
-      // a line: a copy of it that already landed carries the id it lost, so
-      // the boot dedup can't find it, and it may be stored again.
-      const seen = new Set<string>();
-      const kept: Array<Omit<DeferredWrite, 'id' | 'seq'> & { id: string; seq?: unknown }> = [];
-      let duplicates = 0;
-      for (const m of data.filter(wellFormed)) {
-        const hasId = typeof m.id === 'string' && m.id !== '';
-        const id = hasId ? (m.id as string) : randomUUID();
-        if (!hasId) {
-          console.error(`[host-mode] a recovered deferred context write (${m.participant}) has no id; it is given ${id}`);
-        }
-        if (seen.has(id)) {
-          duplicates++;
-          console.error(
-            `[host-mode] a recovered deferred context write repeats id ${id} (${m.participant}) and was dropped; ` +
-            `the first entry with that id is kept`,
-          );
-          continue;
-        }
-        seen.add(id);
-        kept.push({ ...m, id });
-      }
-      // A seq is a positive whole number no larger than
-      // Number.MAX_SAFE_INTEGER, the entry's place in arrival order.
-      // An entry without one (a file that predates seq, which is in write
-      // order already) or with any other value (damage or a hand edit:
-      // JSON's 1e400 reads as Infinity) is numbered after every valid seq, in
-      // file order, so the counter stays finite and the rest keep their order.
-      const validSeq = (seq: unknown): seq is number => Number.isSafeInteger(seq) && (seq as number) > 0;
-      let lastSeq = 0;
-      for (const m of kept) if (validSeq(m.seq)) lastSeq = Math.max(lastSeq, m.seq);
-      let renumbered = 0;
-      const candidates: DeferredWrite[] = kept
-        .map((m) => {
-          if (validSeq(m.seq)) return { ...m, seq: m.seq };
-          renumbered++;
-          if (m.seq !== undefined) {
-            // A value that isn't a number is named by its type: it could be
-            // any size.
-            const seq = typeof m.seq === 'number' ? String(m.seq) : m.seq === null ? 'null' : `of type ${typeof m.seq}`;
-            console.error(
-              `[host-mode] a recovered deferred context write (${m.id}) has seq ${seq}, not a positive ` +
-              `whole number up to Number.MAX_SAFE_INTEGER; it is queued after the others`,
-            );
-          }
-          return { ...m, seq: ++lastSeq };
-        })
-        .sort(bySeq);
-      this.deferredSeq = Math.max(this.deferredSeq, lastSeq);
-      // Exactly-once: a message that landed before its ack was written is
-      // already in the store under its deferredWriteId — do not replay it.
-      // The scan covers every slot the interrupted batch could occupy (from
-      // the receipt's per-agent position), or the whole store when the
-      // receipt predates the position field.
-      const landed = this.landedDeferredWriteIds(new Set(candidates.map((m) => m.id)), scanFrom);
-      const restored = candidates.filter((m) => !landed.has(m.id));
-      if (landed.size > 0) {
-        console.error(
-          `[host-mode] ${landed.size} deferred context write(s) had already landed before their ack ` +
-          `(interrupted flush) — skipped, not replayed`,
-        );
-      }
-      this.deferredMessages.push(...restored);
-      this.deferredWritesPersisted = true;
-      // Rewrite the durable queue without the already-landed entries so a
-      // second interrupted boot does not re-scan them, without the malformed
-      // and repeated ones, and with the seqs given here.
-      if (landed.size > 0 || malformed.length > 0 || duplicates > 0 || renumbered > 0) this.persistDeferredWrites();
-      return restored.length;
-    } catch (err) {
-      console.error('[host-mode] failed to restore persisted deferred context writes:', err);
-      return 0;
+    } catch (error) {
+      throw error instanceof StoredFormError
+        ? refuse(`hold text that isn't JSON: ${error.message}`)
+        : refuse(`could not be read: ${thrownText(error)}`, error);
     }
+    // Nothing stored is an empty queue: no file, and nothing in the slot. A
+    // file that holds null isn't a queue (no release writes one).
+    if (!file && (raw === null || raw === undefined)) return 0;
+    // v1 slot payloads were a bare array; v1/v2 files and v2 slots are
+    // `{ pending, scanFrom? }`.
+    const doc = (Array.isArray(raw) ? { pending: raw } : raw !== null && typeof raw === 'object' ? raw : undefined) as
+      { pending?: unknown; scanFrom?: unknown } | undefined;
+    if (!doc || !Array.isArray(doc.pending)) {
+      throw refuse(doc
+        ? `hold an object whose pending is ${doc.pending === undefined ? 'missing' : jsonKind(doc.pending)}, not a list of writes`
+        : `hold ${jsonKind(raw)}, not a queue of writes`);
+    }
+    const data = doc.pending;
+    if (data.length === 0) return 0;
+    const scanFrom = new Map<string, number>();
+    if (doc.scanFrom && typeof doc.scanFrom === 'object') {
+      for (const [k, v] of Object.entries(doc.scanFrom as Record<string, unknown>)) {
+        if (typeof v === 'number' && Number.isFinite(v)) scanFrom.set(k, Math.max(0, Math.floor(v)));
+      }
+    }
+    // An entry the queue's readers can't handle has no place in it: one whose
+    // participant isn't text, whose content isn't an array, that holds a
+    // block that isn't an object, or whose `forAgent` is present but not a
+    // name, is dropped here with a line naming it, rather than held. Reading
+    // a null block's type throws, at the tool boundary and in the store. The
+    // store keeps a string or number block as given, but the context
+    // manager's token estimate keys a WeakMap on each block, which such a
+    // value can't be: once one is stored, every compile for that agent
+    // throws, and a restart doesn't clear it. What a block holds, such as a
+    // tool result's content, isn't checked here, as it isn't for a fresh
+    // write. The framework writes `forAgent` only as a non-empty name, so
+    // another value comes from damage or a hand edit, and the agent it
+    // meant can't be known: sent to the primary, as a falsy one would be, it
+    // could put another agent's message in the primary's window.
+    const wellFormed = (m: unknown): m is Omit<DeferredWrite, 'id' | 'seq'> & { id?: unknown; seq?: unknown } => {
+      if (!m || typeof m !== 'object') return false;
+      const { participant, content, forAgent } = m as { participant?: unknown; content?: unknown; forAgent?: unknown };
+      return typeof participant === 'string'
+        && Array.isArray(content) && content.every((b) => !!b && typeof b === 'object')
+        && (forAgent === undefined || (typeof forAgent === 'string' && forAgent !== ''));
+    };
+    const malformed = data.filter((m) => !wellFormed(m));
+    for (const m of malformed) {
+      // What the entry holds there: a value that isn't text by its type.
+      const field = (key: string): string => {
+        const value = m && typeof m === 'object' ? (m as Record<string, unknown>)[key] : undefined;
+        if (typeof value === 'string') return value;
+        if (value === undefined) return `no ${key}`;
+        return `${key} ${value === null ? 'null' : `of type ${typeof value}`}`;
+      };
+      console.error(
+        `[host-mode] a recovered deferred context write is malformed and was dropped: ` +
+        `${field('id')} (${field('participant')})`,
+      );
+    }
+    // One entry per id: the boot dedup and the ack each take an id as one
+    // write, so an id that comes again is dropped with a line, and the first
+    // entry with it is kept. An entry with no id is given a fresh one, with
+    // a line: a copy of it that already landed carries the id it lost, so
+    // the boot dedup can't find it, and it may be stored again.
+    const seen = new Set<string>();
+    const kept: Array<Omit<DeferredWrite, 'id' | 'seq'> & { id: string; seq?: unknown }> = [];
+    let duplicates = 0;
+    for (const m of data.filter(wellFormed)) {
+      const hasId = typeof m.id === 'string' && m.id !== '';
+      const id = hasId ? (m.id as string) : randomUUID();
+      if (!hasId) {
+        console.error(`[host-mode] a recovered deferred context write (${m.participant}) has no id; it is given ${id}`);
+      }
+      if (seen.has(id)) {
+        duplicates++;
+        console.error(
+          `[host-mode] a recovered deferred context write repeats id ${id} (${m.participant}) and was dropped; ` +
+          `the first entry with that id is kept`,
+        );
+        continue;
+      }
+      seen.add(id);
+      kept.push({ ...m, id });
+    }
+    // A seq is a positive whole number no larger than
+    // Number.MAX_SAFE_INTEGER, the entry's place in arrival order.
+    // An entry without one (a file that predates seq, which is in write
+    // order already) or with any other value (damage or a hand edit:
+    // JSON's 1e400 reads as Infinity) is numbered after every valid seq, in
+    // file order, so the counter stays finite and the rest keep their order.
+    const validSeq = (seq: unknown): seq is number => Number.isSafeInteger(seq) && (seq as number) > 0;
+    let lastSeq = 0;
+    for (const m of kept) if (validSeq(m.seq)) lastSeq = Math.max(lastSeq, m.seq);
+    let renumbered = 0;
+    const candidates: DeferredWrite[] = kept
+      .map((m) => {
+        if (validSeq(m.seq)) return { ...m, seq: m.seq };
+        renumbered++;
+        if (m.seq !== undefined) {
+          // A value that isn't a number is named by its type: it could be
+          // any size.
+          const seq = typeof m.seq === 'number' ? String(m.seq) : m.seq === null ? 'null' : `of type ${typeof m.seq}`;
+          console.error(
+            `[host-mode] a recovered deferred context write (${m.id}) has seq ${seq}, not a positive ` +
+            `whole number up to Number.MAX_SAFE_INTEGER; it is queued after the others`,
+          );
+        }
+        return { ...m, seq: ++lastSeq };
+      })
+      .sort(bySeq);
+    this.deferredSeq = Math.max(this.deferredSeq, lastSeq);
+    // Exactly-once: a message that landed before its ack was written is
+    // already in the store under its deferredWriteId — do not replay it.
+    // The scan covers every slot the interrupted batch could occupy (from
+    // the receipt's per-agent position), or the whole store when the
+    // receipt predates the position field.
+    let landed: Set<string>;
+    try {
+      landed = this.landedDeferredWriteIds(new Set(candidates.map((m) => m.id)), scanFrom);
+    } catch (error) {
+      throw new Error(
+        `the deferred context writes (${file ?? DEFERRED_WRITES_ID}) can't be checked for writes that already landed: ` +
+          `${thrownText(error)}. The framework doesn't start without that check, since a write that landed ` +
+          `before its ack would land a second time. The queue is unchanged, and the framework starts once ` +
+          `that context can be read.`,
+        { cause: error },
+      );
+    }
+    const restored = candidates.filter((m) => !landed.has(m.id));
+    if (landed.size > 0) {
+      console.error(
+        `[host-mode] ${landed.size} deferred context write(s) had already landed before their ack ` +
+        `(interrupted flush) — skipped, not replayed`,
+      );
+    }
+    this.deferredMessages.push(...restored);
+    this.deferredWritesPersisted = true;
+    // Rewrite the durable queue without the already-landed entries so a
+    // second interrupted boot does not re-scan them, without the malformed
+    // and repeated ones, and with the seqs given here.
+    if (landed.size > 0 || malformed.length > 0 || duplicates > 0 || renumbered > 0) this.persistDeferredWrites();
+    return restored.length;
   }
 
   /**
@@ -5962,19 +6150,47 @@ export class AgentFramework {
     return this.usageTracker.getSnapshot();
   }
 
+  /** Restore the usage totals a prior session stored. None stored starts
+   *  fresh (the constructor's tracker). Totals that can't be read, or that
+   *  read as anything but totals, throw: taken as none, the next inference's
+   *  persistUsageState would store fresh totals over them.
+   *
+   *  This is create()'s first read of framework/state, so it also refuses a
+   *  framework/state that isn't an object: every reader of that state would
+   *  take it as holding nothing, and its first write would replace it. */
   private restoreUsageState(): void {
+    const refuse = (problem: string, cause?: unknown): Error => new Error(
+      `the usage totals (${FRAMEWORK_STATE_ID}, usage) ${problem}. The framework doesn't start without them, ` +
+        `since the next inference would store fresh totals over them. ` +
+        (cause === undefined
+          ? `They're unchanged, and starting again won't help until they're repaired.`
+          : `They're unchanged, and the framework starts once they can be read.`),
+      cause === undefined ? undefined : { cause },
+    );
+    let data: unknown;
     try {
-      const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
-      if (data && typeof data === 'object' && (data as any).usage) {
-        const restored = (data as any).usage as PersistedUsageState;
-        this.usageTracker = new UsageTracker({
-          emitTrace: (e: UsageUpdatedEvent) => this.emitTrace({ ...e }),
-          restored,
-        });
-      }
-    } catch {
-      // No prior state or corrupt — start fresh (already initialized in constructor)
+      data = this.store.getStateJson(FRAMEWORK_STATE_ID);
+    } catch (error) {
+      throw refuse(`could not be read: ${thrownText(error)}`, error);
     }
+    if (data === null || data === undefined) return;
+    if (typeof data !== 'object' || Array.isArray(data)) {
+      throw new Error(
+        `${FRAMEWORK_STATE_ID} holds ${jsonKind(data)}, not an object. The framework doesn't start on it, since its ` +
+          `first write would replace it and everything it keeps, such as the usage totals and each agent's settings. ` +
+          `It's unchanged, and starting again won't help until it's repaired.`,
+      );
+    }
+    const usage = (data as Record<string, unknown>).usage;
+    if (usage === undefined) return;
+    const problem = persistedUsageProblem(usage);
+    if (problem === 'not a record') throw refuse(`are ${jsonKind(usage)}, not a usage record`);
+    if (problem === 'totals') throw refuse(`are a record whose totals aren't token counts`);
+    if (problem === 'byAgent') throw refuse(`are a record whose byAgent isn't a list`);
+    this.usageTracker = new UsageTracker({
+      emitTrace: (e: UsageUpdatedEvent) => this.emitTrace({ ...e }),
+      restored: usage as PersistedUsageState,
+    });
   }
 
   private persistUsageState(): void {
@@ -5988,13 +6204,25 @@ export class AgentFramework {
     }
   }
 
-  /** An agent's persisted record, or null when it has none; throws when the store can't be read. */
+  /** An agent's persisted record, or null when it has none. Throws the
+   *  store's error when it can't be read, and a StoredFormError when what's
+   *  stored for the agent, or the map that holds every agent's, isn't a record. */
   private readAgentRuntimeSettings(agentName: string): AgentRuntimeSettingsOverrides | null {
-    const data = this.store.getStateJson(FRAMEWORK_STATE_ID) as {
-      agentRuntimeSettings?: Record<string, AgentRuntimeSettingsOverrides>;
-    } | null;
-    const stored = data?.agentRuntimeSettings?.[agentName];
-    return stored ? { ...stored } : null;
+    const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
+    const map = data && typeof data === 'object' ? (data as Record<string, unknown>).agentRuntimeSettings : undefined;
+    if (map === undefined) return null;
+    if (!map || typeof map !== 'object' || Array.isArray(map)) {
+      throw new StoredFormError(`the map that holds every agent's settings is ${jsonKind(map)}, not an object`);
+    }
+    // Own keys only: an agent named "constructor" has no inherited record.
+    const stored = Object.prototype.hasOwnProperty.call(map, agentName)
+      ? (map as Record<string, unknown>)[agentName]
+      : undefined;
+    if (stored === undefined) return null;
+    if (!stored || typeof stored !== 'object' || Array.isArray(stored)) {
+      throw new StoredFormError(`what's stored for the agent is ${jsonKind(stored)}, not a settings record`);
+    }
+    return { ...(stored as AgentRuntimeSettingsOverrides) };
   }
 
   private validatePersistedAgentRuntimeSettings(
@@ -6036,27 +6264,38 @@ export class AgentFramework {
   }
 
   /** Load resident-set inline caps from framework state, dropping (loudly)
-   *  anything that fails the same validation the live update enforces. */
+   *  anything that fails the same validation the live update enforces. A
+   *  failed read is logged and boot goes on without them: nothing is lost,
+   *  since persistToolResultInlineCap reads the stored caps again before it
+   *  writes one. */
   private readPersistedToolResultInlineCaps(): Record<string, number> {
+    let data: { toolResultInlineCaps?: Record<string, unknown> } | null;
     try {
-      const data = this.store.getStateJson(FRAMEWORK_STATE_ID) as {
-        toolResultInlineCaps?: Record<string, unknown>;
-      } | null;
-      const out: Record<string, number> = {};
-      for (const [name, value] of Object.entries(data?.toolResultInlineCaps ?? {})) {
-        const n = Number(value);
-        if (Number.isFinite(n) && n >= 1000) {
-          out[name] = Math.floor(n);
-        } else {
-          console.error(
-            `[agent-settings] dropping invalid persisted tool_result_inline_max_chars for '${name}': ${JSON.stringify(value)}`,
-          );
-        }
-      }
-      return out;
-    } catch {
+      data = this.store.getStateJson(FRAMEWORK_STATE_ID) as typeof data;
+    } catch (error) {
+      console.error(
+        `[agent-settings] the persisted tool_result_inline_max_chars caps (${FRAMEWORK_STATE_ID}) could not be read: ` +
+          `${thrownText(error)}; they don't apply until a restart, and setting one keeps the others stored`,
+      );
       return {};
     }
+    const out: Record<string, number> = {};
+    for (const [name, value] of Object.entries(data?.toolResultInlineCaps ?? {})) {
+      // Number() throws for an object it can't make a primitive of, such as
+      // {"toString":null}: that entry is invalid like any other, and dropped.
+      let n = Number.NaN;
+      try {
+        n = Number(value);
+      } catch { /* not a number: dropped below */ }
+      if (Number.isFinite(n) && n >= 1000) {
+        out[name] = Math.floor(n);
+      } else {
+        console.error(
+          `[agent-settings] dropping invalid persisted tool_result_inline_max_chars for '${name}': ${JSON.stringify(value)}`,
+        );
+      }
+    }
+    return out;
   }
 
   /** Write (cap) or clear (null) one agent's resident-set inline cap. */
@@ -6274,29 +6513,52 @@ export class AgentFramework {
   }
 
   /** The recovery file wins whenever it exists; the branch-local slot is
-   *  read only for stores that predate it (or store-only configs). */
+   *  read only for stores that predate it (or store-only configs). No record
+   *  is a host that was never quiesced. A record that can't be read, or that
+   *  reads as anything but a host-mode record, throws: taken as "not
+   *  quiesced", a host that stopped mid-maintenance would boot serving. */
   private readHostMode(): { quiesced: boolean; reason?: string; since?: number } | null {
+    let file = this.hostModePath;
+    const refuse = (problem: string, cause?: unknown): Error => new Error(
+      `the host mode (${file ?? `${FRAMEWORK_STATE_ID}, hostMode`}) ${problem}. The framework doesn't start without it, ` +
+        `since a host quiesced for maintenance would boot serving. ` +
+        (file
+          ? `The file is unchanged, and the framework starts once ${cause === undefined
+            ? 'it holds a host-mode record, such as {"version":1,"quiesced":true} to boot quiesced or ' +
+              `{"version":1,"quiesced":false} to serve. Removing it doesn't help: without the file, host mode is read ` +
+              `from ${FRAMEWORK_STATE_ID}, which a quiesce doesn't write, so a quiesced host would boot serving`
+            : 'it can be read'}.`
+          : cause === undefined
+            ? `It's unchanged, and starting again won't help until it's repaired.`
+            : `It's unchanged, and the framework starts once it can be read.`),
+      cause === undefined ? undefined : { cause },
+    );
+    let record: unknown;
     try {
-      let record: Record<string, unknown> | null = null;
-      if (this.hostModePath && existsSync(this.hostModePath)) {
-        const doc = this.readRecoveryFile(this.hostModePath);
-        if (doc && typeof doc === 'object') record = doc as Record<string, unknown>;
-      } else {
+      record = file ? this.readRecoveryFile(file) : undefined;
+      if (record === undefined) {
+        file = undefined;
         const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
-        if (!data || typeof data !== 'object') return null;
-        const mode = (data as Record<string, unknown>).hostMode;
-        if (!mode || typeof mode !== 'object') return null;
-        record = mode as Record<string, unknown>;
+        record = data && typeof data === 'object' ? (data as Record<string, unknown>).hostMode : undefined;
       }
-      if (!record) return null;
-      return {
-        quiesced: record.quiesced === true,
-        ...(typeof record.reason === 'string' ? { reason: record.reason } : {}),
-        ...(typeof record.since === 'number' ? { since: record.since } : {}),
-      };
-    } catch {
-      return null;
+    } catch (error) {
+      throw error instanceof StoredFormError
+        ? refuse(`holds text that isn't JSON: ${error.message}`)
+        : refuse(`could not be read: ${thrownText(error)}`, error);
     }
+    if (record === undefined) return null;
+    const isRecord = !!record && typeof record === 'object' && !Array.isArray(record);
+    const { quiesced, reason, since } = (isRecord ? record : {}) as Record<string, unknown>;
+    if (typeof quiesced !== 'boolean') {
+      throw refuse(isRecord
+        ? `is a record whose quiesced is ${quiesced === undefined ? 'missing' : jsonKind(quiesced)}, not true or false`
+        : `holds ${jsonKind(record)}, not a host-mode record`);
+    }
+    return {
+      quiesced,
+      ...(typeof reason === 'string' ? { reason } : {}),
+      ...(typeof since === 'number' ? { since } : {}),
+    };
   }
 
   /**
@@ -6349,15 +6611,6 @@ export class AgentFramework {
     } catch (error) {
       this.usedEphemeralAgentNames.delete(config.name);
       throw error;
-    }
-  }
-
-  /** A turn refused because stop() has begun: an ephemeral run waiting on it
-   *  ends now, rather than when its startup watchdog fires. */
-  private endEphemeralRunRefused(agent: Agent): void {
-    const run = this.ephemeralRuns.get(agent.name);
-    if (run && this.agents.get(agent.name) === agent) {
-      run.settle.reject(new Error(`Ephemeral agent "${agent.name}" refused: the framework is stopping`));
     }
   }
 
@@ -6485,7 +6738,7 @@ export class AgentFramework {
       );
     }
     // Once stop() has begun no turn starts (startAgentStream), so a run
-    // admitted now could only wait out its startup watchdog.
+    // admitted now could never run.
     if (this.providerAdmissionClosed) {
       throw new Error(`framework is stopping: refusing new ephemeral run for ${agent.name}`);
     }
@@ -6533,11 +6786,15 @@ export class AgentFramework {
     const startupTimeout = new Promise<never>((_, reject) => {
       startupWatchdog = setTimeout(() => {
         if (!run.inferenceStarted) {
-          reject(new Error(
-            `Ephemeral agent "${agent.name}" failed to start inference within ` +
-            `${STARTUP_TIMEOUT_MS}ms — zombie detected. The event loop may have ` +
-            `stalled or the inference request was dropped.`
-          ));
+          // A stop() slower than this watchdog leaves a run waiting for its
+          // sweep past it, and the run ends because the framework is stopping.
+          reject(this.providerAdmissionClosed
+            ? ephemeralRunStopped(agent.name, `inference not started within ${STARTUP_TIMEOUT_MS}ms`)
+            : new Error(
+              `Ephemeral agent "${agent.name}" failed to start inference within ` +
+              `${STARTUP_TIMEOUT_MS}ms — zombie detected. The event loop may have ` +
+              `stalled or the inference request was dropped.`
+            ));
         }
       }, STARTUP_TIMEOUT_MS);
     });
@@ -6547,12 +6804,14 @@ export class AgentFramework {
         if (!run.inferenceStarted) return;
         const idle = Date.now() - run.lastActivity;
         if (idle > COMPLETION_IDLE_TIMEOUT_MS) {
-          reject(new Error(
-            `Ephemeral agent "${agent.name}" stalled: no stream-driver activity for ` +
-            `${Math.round(idle / 1000)}s after inference started (threshold ` +
-            `${Math.round(COMPLETION_IDLE_TIMEOUT_MS / 1000)}s). Stream likely ` +
-            `dropped or terminal event was lost.`
-          ));
+          reject(this.providerAdmissionClosed
+            ? ephemeralRunStopped(agent.name, `no stream-driver activity for ${Math.round(idle / 1000)}s after inference started`)
+            : new Error(
+              `Ephemeral agent "${agent.name}" stalled: no stream-driver activity for ` +
+              `${Math.round(idle / 1000)}s after inference started (threshold ` +
+              `${Math.round(COMPLETION_IDLE_TIMEOUT_MS / 1000)}s). Stream likely ` +
+              `dropped or terminal event was lost.`
+            ));
         }
       }, IDLE_POLL_MS);
     });
@@ -9095,13 +9354,21 @@ export class AgentFramework {
     this.adoptToolResultGuard(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
     this.sharedSlotAgents.add(agent);
-    let restoredSettings: AgentRuntimeSettingsOverrides | null = null;
+    let restoredSettings: AgentRuntimeSettingsOverrides | null;
     try {
       restoredSettings = this.readAgentRuntimeSettings(config.name);
     } catch (error) {
-      console.error(
-        `[agent-settings] ${config.name}: its persisted settings can't be read ` +
-          `(${error instanceof Error ? error.message : String(error)}); it boots at the recipe's`,
+      // Booted at the recipe's, the agent would serve settings it didn't
+      // choose (a private think-text policy as public), and its next
+      // persisting change would store over the record this read skipped.
+      throw new Error(
+        `the persisted settings of agent "${config.name}" (${FRAMEWORK_STATE_ID}, agentRuntimeSettings) can't be ` +
+          `restored: ${thrownText(error)}. The framework doesn't start without them, since the agent would boot at ` +
+          `its recipe's settings and the next settings change would store over them. ` +
+          (error instanceof StoredFormError
+            ? `They're unchanged, and starting again won't help until they're repaired.`
+            : `They're unchanged, and the framework starts once they can be read.`),
+        { cause: error },
       );
     }
     if (restoredSettings) {
@@ -10454,7 +10721,60 @@ export class AgentFramework {
     return createHash('sha256').update(JSON.stringify([serverId, config?.url ?? null, config?.command ?? null, config?.args ?? null])).digest('hex').slice(0, 16);
   }
 
-  private initializePushCoalescer(): void {
+  /**
+   * The push coalescer, built and restored from its stored receipts and
+   * batches. initializeMcpl calls this before it builds anything else, so a
+   * refusal here leaves the MCPL subsystem as it was. Nothing stored is a
+   * coalescer with no history. What can't be read, reads as anything but
+   * this version's snapshot and receipts, or can't be restored, throws, and
+   * so does an agent's context that can't be checked for an occurrence
+   * already delivered (wasPublished): taken as no history, the next
+   * acceptance's receipt and the next flush would replace what's stored, and
+   * taken as undelivered, an occurrence would be delivered again.
+   */
+  private restorePushCoalescer(): { coalescer: PushCoalescer<CoalescedDelivery>; recent?: CoalescingReceiptRecord[] } {
+    const what = (stateId: string): string =>
+      `the coalescing ${stateId === COALESCING_STATE_ID ? 'receipts and batches' : 'receipts since the last snapshot'} (${stateId})`;
+    const stops = `MCPL doesn't start without them, and neither does create() with MCPL servers configured, nor a ` +
+      `first connectMcplServer(), since the next coalesced push or message would replace them.`;
+    const unchanged = `They're unchanged, and starting again won't help until they're repaired.`;
+    const refuse = (stateId: string, problem: string, remedy: string, cause?: unknown): Error =>
+      new Error(`${what(stateId)} ${problem}. ${stops} ${remedy}`, cause === undefined ? undefined : { cause });
+    const read = (stateId: string): unknown => {
+      try {
+        return this.store.getStateJson(stateId);
+      } catch (error) {
+        throw refuse(stateId, `could not be read: ${thrownText(error)}`, `They're unchanged, and MCPL starts once they can be read.`, error);
+      }
+    };
+    const snapshot = read(COALESCING_STATE_ID);
+    const recent = read(COALESCING_RECENT_ID);
+    if (snapshot !== null && snapshot !== undefined) {
+      const version = typeof snapshot === 'object' && !Array.isArray(snapshot)
+        ? (snapshot as { version?: unknown }).version
+        : undefined;
+      if (version !== 1) {
+        throw typeof version === 'number'
+          ? refuse(
+            COALESCING_STATE_ID,
+            `are a version ${version} snapshot, which this version of agent-framework doesn't read`,
+            `They're unchanged, and the version that wrote them reads them.`,
+          )
+          : refuse(
+            COALESCING_STATE_ID,
+            version === undefined
+              ? `are ${jsonKind(snapshot)} with no snapshot version`
+              : `are a snapshot whose version is ${jsonKind(version)}, not 1`,
+            unchanged,
+          );
+      }
+    }
+    if (recent !== null && recent !== undefined && !Array.isArray(recent)) {
+      throw refuse(COALESCING_RECENT_ID, `are ${jsonKind(recent)}, not a list of receipts`, unchanged);
+    }
+    // Set when wasPublished can't read an agent's context, so the restore that
+    // asked refuses with what couldn't be checked rather than as malformed.
+    let unreadable: { agent: string; error: unknown } | undefined;
     const coalescer = new PushCoalescer<CoalescedDelivery>({
       isUnread: (p) => this.isUnreadPlacement(p),
       remove: (p) => this.removePlacement(p),
@@ -10492,13 +10812,18 @@ export class AgentFramework {
         this.store.setStateJson(COALESCING_RECENT_ID, this.coalescingRecentReceipts);
       },
       wasPublished: (subject, eventId) => {
-        // Boot-time only: the occurrence's durable delivery identity
-        // (subject + eventId in message metadata) in any agent's context.
+        // Restore-time only: the occurrence's durable delivery identity
+        // (subject + eventId in message metadata) in any agent's context. A
+        // context that can't be read can't say, so the restore refuses.
         for (const agent of this.agents.values()) {
+          let messages: ReturnType<ContextManager['getAllMessages']>;
           try {
-            if (agent.getContextManager().getAllMessages().some((m) =>
-              m.metadata?.coalescingSubject === subject && m.metadata?.eventId === eventId)) return true;
-          } catch { /* a context that cannot be read cannot prove publication */ }
+            messages = agent.getContextManager().getAllMessages();
+          } catch (error) {
+            unreadable = { agent: agent.name, error };
+            throw error;
+          }
+          if (messages.some((m) => m.metadata?.coalescingSubject === subject && m.metadata?.eventId === eventId)) return true;
         }
         return false;
       },
@@ -10511,22 +10836,38 @@ export class AgentFramework {
         this.store.setStateJson(COALESCING_RECENT_ID, []);
       },
     });
-    try {
-      coalescer.restore(this.store.getStateJson(COALESCING_STATE_ID) as CoalescingSnapshot | null);
-      const recent = this.store.getStateJson(COALESCING_RECENT_ID) as CoalescingReceiptRecord[] | null;
-      if (Array.isArray(recent)) {
-        coalescer.restoreReceipts(recent);
-        // Until the next snapshot flush checkpoints the recovered state, these
-        // records are its only durable form: keep them in the writable buffer
-        // so the next acceptance appends to them instead of replacing them.
-        this.coalescingRecentReceipts = recent;
+    const restore = (stateId: string, run: () => void): void => {
+      try {
+        run();
+      } catch (error) {
+        if (unreadable) {
+          throw new Error(
+            `${what(stateId)} can't be checked for occurrences already delivered: ${unreadable.agent}'s context ` +
+              `could not be read: ${thrownText(unreadable.error)}. MCPL doesn't start without that check, and neither ` +
+              `does create() with MCPL servers configured, nor a first connectMcplServer(), since an occurrence ` +
+              `delivered before the restart would be delivered again. They're unchanged, and MCPL starts once that ` +
+              `context can be read.`,
+            { cause: unreadable.error },
+          );
+        }
+        throw refuse(stateId, `could not be restored: ${thrownText(error)}`, unchanged, error);
       }
-    } catch (err) {
-      console.error('[coalescing] could not restore coalescing state; starting with unknown history:', err);
-    }
-    this.pushCoalescer = coalescer;
+    };
+    restore(COALESCING_STATE_ID, () => coalescer.restore(snapshot as CoalescingSnapshot | null | undefined));
+    if (!Array.isArray(recent)) return { coalescer };
+    restore(COALESCING_RECENT_ID, () => coalescer.restoreReceipts(recent as CoalescingReceiptRecord[]));
+    return { coalescer, recent: recent as CoalescingReceiptRecord[] };
+  }
+
+  /** Install a coalescer restorePushCoalescer built: none of this can fail. */
+  private installPushCoalescer(restored: { coalescer: PushCoalescer<CoalescedDelivery>; recent?: CoalescingReceiptRecord[] }): void {
+    // Until the next snapshot flush checkpoints the recovered state, these
+    // records are its only durable form: keep them in the writable buffer
+    // so the next acceptance appends to them instead of replacing them.
+    if (restored.recent) this.coalescingRecentReceipts = restored.recent;
+    this.pushCoalescer = restored.coalescer;
     // Batches restored from a snapshot still owe the agent a wake (§14 v41).
-    for (const occ of coalescer.pendingBatchOccurrences()) void this.wakeForCoalescedBatch(occ);
+    for (const occ of restored.coalescer.pendingBatchOccurrences()) void this.wakeForCoalescedBatch(occ);
   }
 
   /**
@@ -12043,12 +12384,9 @@ export class AgentFramework {
     const ownsProviderGate =
       !this.ephemeralRuns.has(agent.name) && !this.conversationAgentHomes.has(agent.name);
     // A stopping framework starts no turn, whoever owns provider admission
-    // (conversation agents and ephemeral runs do not take the gate). An
-    // ephemeral run waiting on the turn ends now, as at every refusal of
-    // stop()'s.
+    // (conversation agents and ephemeral runs do not take the gate).
     if (this.providerAdmissionClosed) {
       if (ownsProviderGate && providerGateAlreadyHeld) this.releasePrimaryProviderGate(agent.name);
-      this.endEphemeralRunRefused(agent);
       return;
     }
     if (ownsProviderGate && !providerGateAlreadyHeld) {
@@ -12425,9 +12763,16 @@ export class AgentFramework {
       ...(trigger?.suppressProse ? { silent: true } : {}),
     });
     // A budget restart continues the same logical inference window. The
-    // predecessor keeps EventGate liveness until its successor terminates.
+    // predecessor keeps EventGate liveness until its successor terminates,
+    // and the successor takes it again if it ended in between: at a stop()
+    // (a restart left queued, which a start() then takes up), or at a
+    // provider hold that kept the successor from starting (a stated wait at
+    // its last admission check, or a cooldown after its own call failed),
+    // whose end queues it again.
     if (!resumesTurn) {
       this.eventGate?.onInferenceStarted(agent.name);
+    } else {
+      this.eventGate?.onInferenceResumed(agent.name);
     }
     this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), startedAt: turnStartedAt });
 
@@ -12511,7 +12856,6 @@ export class AgentFramework {
         this.channelRegistry?.stopTyping();
         this.eventGate?.onInferenceEnded(agent.name);
         this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt);
-        if (this.providerAdmissionClosed) this.endEphemeralRunRefused(agent);
         return false;
       }
 
@@ -12562,7 +12906,6 @@ export class AgentFramework {
         this.channelRegistry?.stopTyping();
         this.eventGate?.onInferenceEnded(agent.name);
         this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt);
-        if (stopping) this.endEphemeralRunRefused(agent);
         return false;
       }
       // A conversation agent takes no provider gate, so its own compression
@@ -12638,14 +12981,15 @@ export class AgentFramework {
         await this.waitForRetry(action.delayMs);
         if (this.providerAdmissionClosed) {
           // stop() ended the wait: that cancels the retry, it does not hasten
-          // it. Nothing is written (the store is closing); this frame still
-          // owns its token, since no retry frame replaced it. An ephemeral
-          // run waiting on the turn ends now, as at every refusal of stop()'s.
+          // it. The turn ends as one dropped before it sends anything does:
+          // a terminal event saying why, after the inference:failed above,
+          // and its record's end. Nothing is written (the store is closing);
+          // this frame still owns its token, since no retry frame replaced it.
+          this.abortDroppedTurn(agent.name, turnToken, RETRY_CANCELLED_BY_STOP, turnStartedAt);
           if (this.activeTurnTokens.get(agent.name) === turnToken) {
             this.activeTurnTokens.delete(agent.name);
             this.activeTurnTriggers.delete(agent.name);
           }
-          this.endEphemeralRunRefused(agent);
           return false;
         }
         // The retry re-enters startAgentStream, which replaces this frame's
@@ -13956,9 +14300,22 @@ export class AgentFramework {
               await this.waitForRetry(action.delayMs);
               // stop() ending the wait cancels the retry (this frame's finally
               // clears the token); it is never permission to retry at once.
-              // An ephemeral run waiting on the turn ends now.
               if (!this.providerAdmissionClosed) await this.startAgentStream(agent, trigger, attempt + 1);
-              else this.endEphemeralRunRefused(agent);
+              else {
+                // The turn ends here, and its inference:failed doesn't say so,
+                // since a retry usually follows one: an inference:aborted
+                // says why none does, as beginAgentTurn's cancelled retry
+                // gives. The finally ends its gate entry and its record. As
+                // in abortDroppedTurn, nothing when another turn of this name
+                // holds the token, whose bracket the event would end.
+                const owner = this.activeTurnTokens.get(agent.name);
+                if (owner === undefined || owner === myTurnToken) {
+                  this.emitTrace({
+                    type: 'inference:aborted', agentName: agent.name,
+                    durationMs: Date.now() - startTime, reason: RETRY_CANCELLED_BY_STOP,
+                  });
+                }
+              }
             } else {
               this.settleAgent(agent.name, {
                 stopReason: 'exhausted',
@@ -14635,17 +14992,12 @@ export class AgentFramework {
       return this.runCodeExecution(call.callerAgentName ?? '__ephemeral__', call);
     }
 
-    // MCPL tools are dispatched via the MCPL subsystem
+    // MCPL tools go where the model's own call of the name goes, by the same
+    // resolver and with the prefix it matched: to the server whose listing
+    // offers the name, else the longest matching prefix.
     if (this.mcplServerRegistry) {
-      // Check if this is an MCPL-prefixed tool
-      const prefix = call.name.split('--').slice(0, -1).join('--');
-      const serverConfigs = this.mcplServerConfigs;
-      for (const [, config] of serverConfigs) {
-        const toolPrefix = config.toolPrefix ?? `mcpl--${config.id}`;
-        if (call.name.startsWith(toolPrefix + '--')) {
-          return this.executeMcplToolCall(call, config);
-        }
-      }
+      const mcpl = this.resolveMcplTool(call.name);
+      if (mcpl) return this.executeMcplToolCall(call, mcpl[0], mcpl[1]);
     }
 
     // Synthesized channel tools. This route was missing: when
@@ -14674,17 +15026,17 @@ export class AgentFramework {
     return this.moduleRegistry.handleToolCall(call);
   }
 
-  private async executeMcplToolCall(call: ToolCall, config: McplServerConfig): Promise<ToolResult> {
+  /** A programmatic call of an MCPL tool: `serverId` and `prefix` as resolveMcplTool matched them. */
+  private async executeMcplToolCall(call: ToolCall, serverId: string, prefix: string): Promise<ToolResult> {
     if (!this.mcplServerRegistry) {
       return { success: false, error: 'MCPL not initialized', isError: true };
     }
-    const server = this.mcplServerRegistry.getServer(config.id);
+    const server = this.mcplServerRegistry.getServer(serverId);
     if (!server) {
-      return { success: false, error: `MCPL server ${config.id} not found`, isError: true };
+      return { success: false, error: `MCPL server ${serverId} not found`, isError: true };
     }
-    const prefix = config.toolPrefix ?? `mcpl--${config.id}`;
     const toolName = call.name.slice(prefix.length + 2); // Strip prefix + '--'
-    if (!isToolAllowed(toolName, config)) {
+    if (!isToolAllowed(toolName, this.mcplServerConfigs.get(serverId))) {
       return {
         success: false,
         error: `Tool '${call.name}' is not permitted by this server's tool policy.`,
@@ -15516,7 +15868,7 @@ export class AgentFramework {
     });
   }
 
-  /** Abort a running script when the agent's turn dies underneath it. */
+  /** Abort the agent's script, running or still starting, when the turn it belongs to ends or is reset to run again. */
   private abortAgentScript(agentName: string, reason: string): void {
     const runner = this.codeExecutionRunners.get(agentName);
     if (runner?.busy) {
@@ -15783,9 +16135,10 @@ export class AgentFramework {
     // Tolerate partially-constructed frameworks (tests build them with
     // Object.create): nothing cached means nothing to forget.
     if (!this.mcplToolClasses?.size) return;
-    const prefix = this.mcplServerConfigs?.get(serverId)?.toolPrefix ?? `mcpl--${serverId}`;
-    for (const name of [...this.mcplToolClasses.keys()]) {
-      if (name.startsWith(`${prefix}--`)) this.mcplToolClasses.delete(name);
+    // The names the listing gives this server: its prefix alone would also
+    // take a nested prefix's (`foo` beside `foo--bar`).
+    for (const [name, owner] of this.mcplToolServers ?? []) {
+      if (owner === serverId) this.mcplToolClasses.delete(name);
     }
   }
 
@@ -15850,9 +16203,12 @@ export class AgentFramework {
   /**
    * Find the MCPL server for a tool: [serverId, prefix], or null.
    * Prefixes can nest (`foo` and `foo--bar`), so `foo--bar--x` can match
-   * both. The server whose tools/list produced the name decides; a name no
-   * live server listed (stale, or invented by the model) goes to the longest
-   * matching prefix. Never prefix-map insertion order.
+   * both. The tool listing decides: the server whose tools/list offered the
+   * name, after its tool policy, as of the last tool refresh (a server that
+   * closed since keeps its names until the next one). Where two servers list
+   * the same name, the listing holds the one listed last (#265). A name the
+   * listing doesn't hold (invented by the model, or no longer listed) goes to
+   * the longest matching prefix. Never prefix-map insertion order.
    */
   private resolveMcplTool(toolName: string): [string, string] | null {
     const listedBy = this.mcplToolServers?.get(toolName);
@@ -17099,6 +17455,19 @@ export class AgentFramework {
     serverConfigs: McplServerConfig[],
     inferenceRouting?: import('./mcpl/types.js').InferenceRoutingPolicy,
   ): Promise<void> {
+    // First, before anything is built: a coalescing state or checkpoint trees
+    // that can't be taken refuse here and leave the subsystem as it was, so a
+    // first connectMcplServer() refused for them leaves nothing for the guards
+    // that test mcplServerRegistry. Each configured server's restored
+    // host-managed state is read here too, so a boot refused for one connects
+    // no server; a runtime connect reads its server's in
+    // runConnectMcplServer, once MCPL is up.
+    const coalescing = this.restorePushCoalescer();
+    const checkpoints = new CheckpointManager(
+      this.store,
+      (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
+    );
+    for (const config of serverConfigs) checkpoints.loadHostStates(config.id);
     this.mcplServerRegistry = new McplServerRegistry();
     this.featureSetManager = new FeatureSetManager(
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
@@ -17123,7 +17492,7 @@ export class AgentFramework {
       ?? (this.eventGate ? this.eventGate.asShouldTriggerCallback() : undefined);
 
     // Push events handler (Step 6)
-    this.initializePushCoalescer();
+    this.installPushCoalescer(coalescing);
     this.pushHandler = new PushHandler(
       this.featureSetManager,
       (event) => this.pushEvent(event as unknown as ProcessEvent),
@@ -17145,11 +17514,8 @@ export class AgentFramework {
       },
     );
 
-    // Checkpoint manager (Step 8)
-    this.checkpointManager = new CheckpointManager(
-      this.store,
-      (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
-    );
+    // Checkpoint manager (Step 8), built and loaded at the top
+    this.checkpointManager = checkpoints;
 
     // Channel registry (Step 7)
     this.channelRegistry = new ChannelRegistry(
@@ -17695,7 +18061,8 @@ export class AgentFramework {
     // would start reconnects only for stop() to close them again. Release the
     // barrier instead, as a completed one is released: nothing waits on a
     // rejected barrier, and unless the host is quiesced, what the pause held
-    // back reaches the listeners' stopping refusal.
+    // back reaches the listeners' stopping refusal, except what a connection
+    // closed for good held, which stays held.
     if (this.queue?.isClosed) {
       this.completeMcplDataPlaneGate(barrier);
       return;
@@ -17708,6 +18075,25 @@ export class AgentFramework {
         );
       });
     }));
+  }
+
+  /**
+   * Close a runtime connect's new connection for good, through the registry,
+   * after a step of that connect failed. A close that fails keeps the entry,
+   * so a later disconnect, restart or shutdown can close it again, and is
+   * logged here rather than replacing the failure the connect reports.
+   */
+  private async closeFailedRuntimeConnect(
+    connection: McplServerConnection,
+    failedStep: string,
+  ): Promise<void> {
+    await this.mcplServerRegistry!.closeServer(connection.id, connection).catch((closeError) => {
+      console.error(
+        `[mcpl] could not close MCPL server "${connection.id}" after its ${failedStep} failed; ` +
+          'it stays registered until a disconnect, restart or shutdown closes it:',
+        closeError instanceof Error ? closeError.message : closeError,
+      );
+    });
   }
 
   /**
@@ -17802,13 +18188,27 @@ export class AgentFramework {
       // the runtime connect or restart that asked for it. (A startup connect
       // defers awareness and returns before this gate; a startup that fails
       // ends in create()'s release, which closes its servers.)
+      // That close goes through the registry, which drops the entry itself
+      // rather than waiting for a 'close' event: close() emits none for a
+      // connection that's down between retries, such as a stub waiting for
+      // its next retry, and a stub left registered would refuse a later
+      // connect of its id as already registered.
+      // Then fail the gate, as every other runtime gate does when its
+      // accounting fails. Installing it paused every registered server's
+      // data plane, and left standing it would hold their data until some
+      // other gate completed. While serving, failMcplDataPlaneGate recycles
+      // those servers, so a server without `reconnect: true` stays closed;
+      // while stopping, it releases the gate. It runs after the close, which
+      // has taken this connection out of the registry unless the close
+      // failed, which closeFailedRuntimeConnect logs.
       // Ordering matters: awareness accounting settles BEFORE the §5.3
       // policy round-trip below, so an accounting failure aborts with the
       // grant still empty and every buffered event still behind the gate —
       // a failed connect never reports a released data plane. (The reverse
       // order let a push arrive during the policy await and get flushed by
       // teardown.)
-      await connection.close().catch(() => {});
+      await this.closeFailedRuntimeConnect(connection, 'awareness accounting');
+      await this.failMcplDataPlaneGate(awarenessBarrier, `connect of MCPL server "${config.id}"`, error);
       throw error;
     }
 
@@ -17816,7 +18216,22 @@ export class AgentFramework {
     // completes: the grant is established (or knowingly left empty) before
     // ANY buffered traffic (control or data) flows. complete() then
     // ready()s both planes through the admission gate.
-    await this.registerMcplServerFeatures(config, connection);
+    try {
+      await this.registerMcplServerFeatures(config, connection);
+    } catch (error) {
+      // A policy registration that throws would leave the new connection
+      // live and half registered, and the gate standing over every other
+      // server's data. So close the connection for good through the
+      // registry, as the catch above does, then complete the gate rather
+      // than fail it: accounting succeeded, so nothing calls for a recycle.
+      // A close that fails keeps the connection registered, but a connection
+      // closed for good readies nothing, so this completion, and any later
+      // one, leaves it paused.
+      // Every exit of a runtime connect settles the gate it installed.
+      await this.closeFailedRuntimeConnect(connection, 'policy registration');
+      this.completeMcplDataPlaneGate(awarenessBarrier);
+      throw error;
+    }
     this.completeMcplDataPlaneGate(awarenessBarrier);
 
     this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
@@ -17972,7 +18387,7 @@ export class AgentFramework {
             ...AgentFramework.policyRefusalFields(receipt),
           });
           if (fallback === 'close') {
-            await connection.close();
+            await this.mcplServerRegistry!.closeServer(connection.id, connection);
             return;
           }
           connection.establishGrant(CapabilityGrant.empty());
@@ -18090,7 +18505,7 @@ export class AgentFramework {
           ...AgentFramework.policyRefusalFields(receipt),
         });
         if (fallback === 'close') {
-          await connection.close();
+          await this.mcplServerRegistry!.closeServer(connection.id, connection);
           return;
         }
         // mcp-only (§3.2): grant stays empty, MCPL privileged surface stays
@@ -18273,6 +18688,13 @@ export class AgentFramework {
       );
     }
 
+    // The server's restored host-managed trees are read before the server is
+    // added, so a read that fails leaves it unconnected; MCPL itself stays
+    // up, even when this connect brought it up. A feature set with no
+    // restored tree, as after a disconnect removed it, is read when it
+    // registers. A server already connected is refused by addServer below,
+    // so its trees are left as they are.
+    if (!this.mcplServerRegistry?.getServer(config.id)) this.checkpointManager?.loadHostStates(config.id);
     const oldToolNames = new Set(this.mcplTools.map(t => t.name));
     await this.connectMcplServerInternal(config);
     await this.refreshMcplTools();
