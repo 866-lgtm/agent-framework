@@ -13092,6 +13092,15 @@ export class AgentFramework {
           stopReason: 'exhausted', speech: '', error: error instanceof Error ? error.message : String(error),
         }, this.openLogical.get(agent.name));
       }
+      // The agent's window at the event gate ends here too, while this start
+      // still holds the turn token, as at the provider-wait hold above. A
+      // start that resumes a turn (a budget restart, a tool-result-guard
+      // retry) arrives with the window its predecessor kept open for it, and
+      // a start that got as far as the typing indicator has taken the window
+      // itself. No frame would close it otherwise, and while it is open every
+      // gate event buffers, for every agent. A newer start holding the token
+      // owns the window now, so it's left alone.
+      if (this.activeTurnTokens.get(agent.name) === turnToken) this.eventGate?.onInferenceEnded(agent.name);
       throw error;
     } finally {
       if (!tokenHandedOff && this.activeTurnTokens.get(agent.name) === turnToken) {

@@ -600,4 +600,34 @@ for (const reports of ['aborted', 'error', 'close', 'throw', 'error-then-throw']
       await teardown();
     }
   });
+
+  it("a budget restart whose new start fails before its stream exists ends the event gate's window", async () => {
+    // The first stream leaves the window open for the new stream. A new start
+    // that throws before it has a stream, here at its turn checkpoint's store
+    // write, has to end it: left open, every gate event buffers, for every
+    // agent.
+    const { framework, traces, teardown, terminals } = await toolTurn('fetch', reports);
+    const internals = framework as unknown as {
+      recordTurnCheckpoint: (name: string) => void;
+      eventGate: { inferenceDiagnostics(): { inferring: string[] } };
+    };
+    const record = internals.recordTurnCheckpoint.bind(framework);
+    let threw = 0;
+    internals.recordTurnCheckpoint = (name: string) => {
+      if (types(traces, 'inference:stream_restarted').length > 0) {
+        threw++;
+        throw new Error('ENOSPC: no space left on device');
+      }
+      record(name);
+    };
+    try {
+      await waitFor(() => threw > 0 && terminals().length > 0, 10_000);
+      // The failed start's catch runs a few microtasks after the throw.
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(threw, 1, "the restart's new start threw at its checkpoint");
+      assert.deepEqual(internals.eventGate.inferenceDiagnostics().inferring, [], 'no agent is left inferring at the event gate');
+    } finally {
+      await teardown();
+    }
+  });
 });

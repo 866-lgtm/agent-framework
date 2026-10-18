@@ -11,3 +11,6 @@
   on the console. A stream that reports its cancel as an `error` and then throws ends
   once. membrane's yielding stream reports a cancel as `aborted`, so this reaches other
   stream implementations.
+- A budget restart whose new start fails before its stream exists, such as on a store
+  write, no longer leaves the agent's window open at the event gate, which kept every
+  gate event buffered, for every agent. This happened with membrane's `aborted` restarts.
