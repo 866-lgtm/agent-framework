@@ -78,6 +78,7 @@ import { Agent, assertAgentSwitches } from './agent.js';
 import { assertBooleanSetting, holdsSettings } from './config-checks.js';
 import { ModuleRegistry, checkedToolResult, ensureStateRegistered, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
+import { prefixesMeet, prefixesMeetError } from './mcpl/prefix-rule.js';
 import { logDetail, logValue } from './mcpl/log-value.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './mcpl/capability-grant.js';
@@ -2291,8 +2292,8 @@ export class AgentFramework {
   private mcplToolRefreshPending = false;
   /** Maps tool prefix → serverId for dispatch routing. */
   private mcplPrefixMap: Map<string, string> = new Map();
-  /** Namespaced tool name → the server whose tools/list produced it. Prefixes
-   *  can nest (`foo`, `foo--bar`), so a prefix match alone can name two. */
+  /** Namespaced tool name → the server whose tools/list produced it, from
+   *  its first listing of the name. resolveMcplTool reads it first. */
   private mcplToolServers: Map<string, string> = new Map();
   /** Servers whose tools/list answered in the latest refresh. */
   private mcplListedServers: Set<string> = new Set();
@@ -2843,6 +2844,10 @@ export class AgentFramework {
           throw new Error(
             `MCPL server "${serverConfig.id}" toolPrefix "${prefix}" collides with server "${existing}"`
           );
+        }
+        // Nor may two prefixes meet, giving two servers one tool name (#265).
+        for (const [other, otherId] of prefixesSeen) {
+          if (prefixesMeet(prefix, other)) throw prefixesMeetError(serverConfig.id, prefix, otherId, other);
         }
         prefixesSeen.set(prefix, serverConfig.id);
       }
@@ -5090,8 +5095,8 @@ export class AgentFramework {
     for (const tool of this.moduleRegistry.getAllTools()) {
       sources.set(tool.name, `Module: ${tool.name.split('--')[0]}`);
     }
-    // An MCPL tool's source is the server a call of it reaches (resolveMcplTool),
-    // not the first configured prefix it begins with: prefixes can nest.
+    // An MCPL tool's source is the server a call of it reaches, by the one
+    // rule that picks a tool's server (resolveMcplTool).
     for (const tool of tools) {
       const mcpl = this.resolveMcplTool(tool.name);
       if (mcpl) sources.set(tool.name, `MCPL server: ${mcpl[0]}`);
@@ -18545,8 +18550,7 @@ export class AgentFramework {
     // Tolerate partially-constructed frameworks (tests build them with
     // Object.create): nothing cached means nothing to forget.
     if (!this.mcplToolClasses?.size) return;
-    // The names the listing gives this server: its prefix alone would also
-    // take a nested prefix's (`foo` beside `foo--bar`).
+    // The names the listing gives this server, as resolveMcplTool reads them.
     for (const [name, owner] of this.mcplToolServers ?? []) {
       if (owner === serverId) this.mcplToolClasses.delete(name);
     }
@@ -18612,13 +18616,14 @@ export class AgentFramework {
 
   /**
    * Find the MCPL server for a tool: [serverId, prefix], or null.
-   * Prefixes can nest (`foo` and `foo--bar`), so `foo--bar--x` can match
-   * both. The tool listing decides: the server whose tools/list offered the
+   * The tool listing decides: the server whose tools/list offered the
    * name, after its tool policy, as of the last tool refresh (a server that
-   * closed since keeps its names until the next one). Where two servers list
-   * the same name, the listing holds the one listed last (#265). A name the
-   * listing doesn't hold (invented by the model, or no longer listed) goes to
-   * the longest matching prefix. Never prefix-map insertion order.
+   * closed since keeps its names until the next one). A name the listing
+   * doesn't hold (invented by the model, or no longer listed) goes to the
+   * longest matching prefix. Prefixes that meet, such as `foo` and
+   * `foo--bar`, are refused at configuration (prefixesMeet, #265), so a name
+   * fits at most one configured server's prefix; this rule doesn't rely on
+   * that. Never prefix-map insertion order.
    */
   private resolveMcplTool(toolName: string): [string, string] | null {
     const listedBy = this.mcplToolServers?.get(toolName);
@@ -20605,8 +20610,13 @@ export class AgentFramework {
     this.getPlacedReactionBaseline();
 
     // Register prefix + config for tool dispatch routing (idempotent with
-    // the pre-registration pass in initializeMcpl).
+    // the pre-registration pass in initializeMcpl). One config gives an id
+    // one prefix: an entry left from a failed connect under another prefix
+    // goes, or the runtime refusal would keep reading it.
     const prefix = config.toolPrefix ?? `mcpl--${config.id}`;
+    for (const [other, owner] of this.mcplPrefixMap) {
+      if (owner === config.id && other !== prefix) this.mcplPrefixMap.delete(other);
+    }
     this.mcplPrefixMap.set(prefix, config.id);
     this.mcplServerConfigs.set(config.id, config);
 
@@ -21172,8 +21182,39 @@ export class AgentFramework {
       await this.initializeMcpl([], this.mcplInferenceRoutingConfig ?? undefined);
     }
 
-    // Same collision rules create() enforces at startup: the tool prefix must
-    // not shadow a module name or another server's prefix.
+    this.refuseMcplConnect(config);
+
+    // The server's restored host-managed trees are read before the server is
+    // added, so a read that fails leaves it unconnected; MCPL itself stays
+    // up, even when this connect brought it up. A feature set with no
+    // restored tree, as after a disconnect removed it, is read when it
+    // registers. A server already registered was refused just above, so
+    // the read never reaches a connected server's trees.
+    this.checkpointManager?.loadHostStates(config.id);
+    const oldToolNames = new Set(this.mcplTools.map(t => t.name));
+    await this.connectMcplServerInternal(config);
+    await this.refreshMcplTools();
+    this.emitMcplToolDiff(oldToolNames, config.id);
+  }
+
+  /**
+   * Refuse a runtime connect, or a restart, before it writes anything: an id
+   * already registered, or a tool prefix that equals a module name or another
+   * server's prefix, or meets another server's (prefixesMeet, #265). create()
+   * applies the same prefix rules at startup. The connecting id's own entries
+   * don't count, nor, for a restart, those of the server it replaces
+   * (`replacing`), which it disconnects first.
+   */
+  private refuseMcplConnect(
+    config: import('./mcpl/types.js').McplServerConfig,
+    replacing?: string,
+  ): void {
+    // The registry refuses a second server under one id too, but only once
+    // the connect has written its config and prefix over the live server's.
+    if (config.id !== replacing && this.mcplServerRegistry?.getServer(config.id)) {
+      throw new Error(`MCPL server "${config.id}" is already registered`);
+    }
+    const own = (id: string) => id === config.id || id === replacing;
     const prefix = config.toolPrefix ?? `mcpl--${config.id}`;
     if (this.moduleRegistry.getAllModules().some(m => m.name === prefix)) {
       throw new Error(
@@ -21181,23 +21222,14 @@ export class AgentFramework {
       );
     }
     const prefixOwner = this.mcplPrefixMap.get(prefix);
-    if (prefixOwner && prefixOwner !== config.id) {
+    if (prefixOwner && !own(prefixOwner)) {
       throw new Error(
         `MCPL server "${config.id}" toolPrefix "${prefix}" collides with server "${prefixOwner}"`,
       );
     }
-
-    // The server's restored host-managed trees are read before the server is
-    // added, so a read that fails leaves it unconnected; MCPL itself stays
-    // up, even when this connect brought it up. A feature set with no
-    // restored tree, as after a disconnect removed it, is read when it
-    // registers. A server already connected is refused by addServer below,
-    // so its trees are left as they are.
-    if (!this.mcplServerRegistry?.getServer(config.id)) this.checkpointManager?.loadHostStates(config.id);
-    const oldToolNames = new Set(this.mcplTools.map(t => t.name));
-    await this.connectMcplServerInternal(config);
-    await this.refreshMcplTools();
-    this.emitMcplToolDiff(oldToolNames, config.id);
+    for (const [other, otherId] of this.mcplPrefixMap) {
+      if (!own(otherId) && prefixesMeet(prefix, other)) throw prefixesMeetError(config.id, prefix, otherId, other);
+    }
   }
 
   /**
@@ -21229,8 +21261,10 @@ export class AgentFramework {
     this.featureSetManager?.removeServer(id);
     this.checkpointManager?.removeServer(id);
 
+    // Only `id`'s own entry: an id with no config falls back to the default
+    // prefix, which another server may have set as its own.
     const prefix = config?.toolPrefix ?? `mcpl--${id}`;
-    this.mcplPrefixMap.delete(prefix);
+    if (this.mcplPrefixMap.get(prefix) === id) this.mcplPrefixMap.delete(prefix);
     this.mcplServerConfigs.delete(id);
 
     await this.refreshMcplTools();
@@ -21262,8 +21296,7 @@ export class AgentFramework {
       throw new Error(`MCPL server "${id}" is not configured`);
     }
     // Checked before the running server is disconnected, so a config this
-    // refuses leaves it up. (A colliding toolPrefix is refused only by the
-    // connect below, once the server is down.)
+    // refuses leaves it up, as refuseMcplConnect below does for its prefix.
     assertServerConfigBooleans(config);
     // Every connect reads the awareness ledger: its awareness barrier
     // reconciles it, and a stdio child taking the protective default derives
@@ -21271,6 +21304,10 @@ export class AgentFramework {
     // refuses the restart and leaves the running child up, whatever the
     // server's baseline or transport. (No outbox configured: nothing to read.)
     this.getPlacedReactionBaseline();
+    // What the connect would refuse refuses the restart the same way, before
+    // anything is disconnected. `id`'s own entries don't count, since the
+    // disconnect removes them whatever id the new config carries.
+    this.refuseMcplConnect(config, id);
     await this.runDisconnectMcplServer(id);
     await this.runConnectMcplServer(config);
   }
@@ -21340,8 +21377,8 @@ export class AgentFramework {
       const prefix = config.toolPrefix ?? `mcpl--${id}`;
       const connection = this.mcplServerRegistry?.getServer(id) ?? null;
       const connected = connection?.isConnected ?? false;
-      // Attribute through the dispatch resolver: a bare prefix match would
-      // also count a nested prefix's tools (`foo` vs `foo--bar`) as ours.
+      // Attribute through the dispatch resolver, the one rule that picks a
+      // tool's server.
       const ownTools = (this.mcplTools ?? []).flatMap((t) => {
         const hit = this.resolveMcplTool(t.name);
         return hit && hit[0] === id ? [{ tool: t.name, serverTool: t.name.slice(hit[1].length + 2) }] : [];
@@ -21951,6 +21988,12 @@ export class AgentFramework {
   /**
    * Discover tools from all connected MCPL servers and cache them.
    * Tools are namespaced as `{toolPrefix}--{toolName}` per server config.
+   * No two servers' prefixes meet (prefixesMeet, refused at create(), a
+   * runtime connect and a restart), so no two servers give one name. A
+   * server that lists one name more than once keeps its first listing, and
+   * an ops alert at each refresh that finds it says so (#265): a tool list
+   * holding one name twice is refused by membrane's native formatter and by
+   * Anthropic's API.
    */
   private async refreshMcplTools(): Promise<void> {
     if (!this.mcplServerRegistry) return;
@@ -21960,6 +22003,7 @@ export class AgentFramework {
     const toolClasses = new Map<string, ToolClass[]>();
     const toolServers = new Map<string, string>();
     const listedServers = new Set<string>();
+    const repeats: Array<{ serverId: string; tools: string[] }> = [];
 
     for (const server of this.mcplServerRegistry.getAllServers()) {
       const config = this.mcplServerConfigs.get(server.id);
@@ -21967,9 +22011,16 @@ export class AgentFramework {
       try {
         const result = await server.sendToolsList();
         listedServers.add(server.id);
+        const listed = new Set<string>();
+        const repeated: string[] = [];
         for (const tool of result.tools) {
           if (!isToolAllowed(tool.name, config)) continue;
           const namespacedName = `${prefix}--${tool.name}`;
+          if (listed.has(namespacedName)) {
+            if (!repeated.includes(tool.name)) repeated.push(tool.name);
+            continue;
+          }
+          listed.add(namespacedName);
           toolServers.set(namespacedName, server.id);
           const attributedTool = tool as typeof tool & {
             featureSet?: unknown;
@@ -21995,6 +22046,7 @@ export class AgentFramework {
             toolFeatureSets.set(namespacedName, featureSet);
           }
         }
+        if (repeated.length > 0) repeats.push({ serverId: server.id, tools: repeated });
       } catch {
         // Server may not support tools/list — skip silently. A live server
         // whose handshake advertised no MCP `tools` has, in effect, listed
@@ -22010,6 +22062,18 @@ export class AgentFramework {
     this.mcplToolClasses = toolClasses;
     this.mcplToolServers = toolServers;
     this.mcplListedServers = listedServers;
+    for (const { serverId, tools: repeatedTools } of repeats) {
+      const one = repeatedTools.length === 1;
+      const listed = repeatedTools.map((name) => logValue(name)).join(', ');
+      this.opsAlert(
+        'mcpl-tool-duplicate',
+        serverId,
+        `MCPL server "${serverId}" lists ${one ? 'the tool' : 'the tools'} ${listed} more than once. ` +
+          `The model is offered the first listing of ${one ? 'it' : 'each'}, and the rest are left out. ` +
+          'A server should list each tool once, so this is for its maintainer to change.',
+        { data: { tools: repeatedTools } },
+      );
+    }
     if (this.toolPatternChecksArmed) this.checkToolPatterns();
   }
 
