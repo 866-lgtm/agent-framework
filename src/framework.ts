@@ -2445,10 +2445,10 @@ export class AgentFramework {
 
     // The conversation router's generation counters (see the routing setup
     // below) are read now, before anything starts, so a read that fails
-    // leaves nothing running: create() closes a store it opened and fails
-    // with the read error. No persisted state yet reads as null. A read that
-    // fails is not that: taken as no counters, it would do what the routing
-    // setup's comment warns of.
+    // leaves nothing running: create() fails with the read error, and its
+    // release closes a store it opened. No persisted state yet reads as null.
+    // A read that fails is not that: taken as no counters, it would do what
+    // the routing setup's comment warns of.
     let routerGenerations: Record<string, number> | undefined;
     if (config.conversations) {
       ensureStateRegistered(store, { id: CONVERSATION_ROUTER_STATE_ID, strategy: 'snapshot' });
@@ -2456,7 +2456,6 @@ export class AgentFramework {
         routerGenerations = (store.getStateJson(CONVERSATION_ROUTER_STATE_ID) as
           { generations?: Record<string, number> } | null)?.generations;
       } catch (error) {
-        if (ownsStore) store.close();
         throw new Error(
           `the conversation router's generation counters (${CONVERSATION_ROUTER_STATE_ID}) could not be read: ${thrownText(error)}`,
           { cause: error },
