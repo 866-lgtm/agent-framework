@@ -19262,9 +19262,12 @@ export class AgentFramework {
    * queued would wait for a boundary it never reaches, and the flush that
    * finds it gone would drop them, so they land in its own window now, which
    * Chronicle keeps for investigation. Its stream is over or cancelled, so it
-   * compiles nothing more; a run that a watchdog ends while its stream awaits
-   * the spill of its last tool results still stores those results, after
-   * these writes.
+   * compiles nothing more. One path still stores after these writes: a
+   * `complete` that arrived while the agent still waited for tools awaits
+   * the spill of its last tool results, and stores them once that resolves,
+   * even if a watchdog has ended the run meanwhile. A tool boundary stores
+   * nothing for a round whose turn was stopped while its results were
+   * prepared.
    */
   private releaseWindow(agent: Agent): void {
     for (const metadata of this.unreadFailedReplies(agent)) this.passFailedReplyToPrimary(agent.name, metadata);

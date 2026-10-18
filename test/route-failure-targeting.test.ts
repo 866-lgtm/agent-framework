@@ -1246,9 +1246,13 @@ describe('notices about an agent\'s own action', () => {
       assert.ok((state as unknown as { releasesAfterResume: Map<string, unknown> }).releasesAfterResume.has('worker'), 'it ended while quiesced');
 
       release();
-      await Promise.race([held!.finished, new Promise((resolve) => setTimeout(resolve, 5_000))]);
+      const left = await Promise.race([
+        held!.finished.then(() => true),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 5_000)),
+      ]);
 
-      assert.equal(held!.yielded, 1, 'its stream yielded the late tool call, and was left there');
+      assert.ok(left, 'its stream was left, before the 5 s bound');
+      assert.equal(held!.yielded, 1, 'it yielded the late tool call first');
       assert.equal(calls.mock.callCount(), 0, 'its late tool call is not dispatched');
       await runFramework.resume({ force: true });
     });
