@@ -919,8 +919,6 @@ export class WorkspaceModule implements Module {
   }
 
   async start(ctx: ModuleContext): Promise<void> {
-    // Before anything walks or watches a mount with another nested in it.
-    await this.spellNestedDirs();
     this.ctx = ctx;
     this.stopped = false;
 
@@ -930,6 +928,9 @@ export class WorkspaceModule implements Module {
       this.savedState = ctx.getState<WorkspaceModuleState>() ?? null;
     }
 
+    // Each nested mount's directory as disk spells it, before this start
+    // walks or watches the mounts. A stop made meanwhile still stops it.
+    await this.spellNestedDirs();
     this.applySavedState();
     this.ensureRunning();
   }
@@ -1182,11 +1183,13 @@ export class WorkspaceModule implements Module {
     for (const watcher of stopping) {
       await watcher.stop();
     }
+    // A call under way can await disk (parsePath) before it takes its turn,
+    // so the calls are waited for as well as the turns.
     for (;;) {
       const tails = [...this.mountTurns.values()];
-      await Promise.all(tails);
+      await Promise.allSettled([...this.callsUnderWay, ...tails]);
       const now = [...this.mountTurns.values()];
-      if (now.length === tails.length && now.every((tail, i) => tail === tails[i])) break;
+      if (this.callsUnderWay.size === 0 && now.length === tails.length && now.every((tail, i) => tail === tails[i])) break;
     }
     // Nothing is queued now, and nothing more is taken: what follows saves
     // the pins and watermarks as the last work left them.
@@ -1464,6 +1467,25 @@ export class WorkspaceModule implements Module {
 
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
     if (!this.running()) return { success: false, isError: true, error: NOT_RUNNING };
+    return this.underWay(this.runToolCall(call));
+  }
+
+  /**
+   * Tool calls, and the public reads and writes that take a mount's turn,
+   * under way. Each can await disk (parsePath) before it takes its turn, so
+   * stop waits for these as well as for the turns.
+   */
+  private callsUnderWay = new Set<Promise<unknown>>();
+
+  /** `work`, recorded as under way until it settles (callsUnderWay). */
+  private underWay<T>(work: Promise<T>): Promise<T> {
+    this.callsUnderWay.add(work);
+    const done = (): void => { this.callsUnderWay.delete(work); };
+    work.then(done, done);
+    return work;
+  }
+
+  private async runToolCall(call: ToolCall): Promise<ToolResult> {
     try {
       // Every handler reads its input as its schema describes it; a call
       // that sends something else is refused here, before anything is read.
@@ -1625,6 +1647,15 @@ export class WorkspaceModule implements Module {
     options: { branch?: string } = {},
   ): Promise<ToolResult> {
     if (!this.running()) return { success: false, isError: true, error: NOT_RUNNING };
+    return this.underWay(this.writeBinaryUnderWay(mountPrefixedPath, data, mimeType, options));
+  }
+
+  private async writeBinaryUnderWay(
+    mountPrefixedPath: string,
+    data: Buffer,
+    mimeType: string,
+    options: { branch?: string },
+  ): Promise<ToolResult> {
     let mount: MountState;
     let relativePath: string;
     try {
@@ -1689,6 +1720,12 @@ export class WorkspaceModule implements Module {
     mountPrefixedPath: string,
   ): Promise<{ data: Buffer } | { error: string }> {
     if (!this.running()) return { error: NOT_RUNNING };
+    return this.underWay(this.readBinaryUnderWay(mountPrefixedPath));
+  }
+
+  private async readBinaryUnderWay(
+    mountPrefixedPath: string,
+  ): Promise<{ data: Buffer } | { error: string }> {
     let mount: MountState;
     let relativePath: string;
     try {
@@ -1829,9 +1866,9 @@ export class WorkspaceModule implements Module {
    * disk spells it (diskSpelling), with `path` the mount-prefixed path so
    * spelled. On a disk that folds names, a path spelled otherwise reaches
    * disk's file, so every tool takes it by disk's name: one name per file,
-   * and the names its answers give are disk's. A handler reads what it reads
-   * at the moment it was asked, such as handleSync's branch, before calling
-   * this, since this awaits disk.
+   * and the names its answers give are disk's. A handler that must read
+   * something at the moment it's asked, as handleSync reads the branch a path
+   * sync adopts on, reads it before calling this, since this awaits disk.
    */
   private async parsePath(path: string): Promise<{ mount: MountState; relativePath: string; path: string }> {
     const given = this.parsePathAsGiven(path);
