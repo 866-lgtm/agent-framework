@@ -422,8 +422,8 @@ export interface InferenceLogEntry {
   durationMs: number;
   /** The stream's usage: its final response's, or, for a stream that ended
    *  without one, the provider rounds it finished before it ended. Exactly
-   *  one entry of a stream carries it, the one its end wrote; a stream whose
-   *  end writes none (a quiesce-abandoned turn, a superseded stream, a
+   *  one entry of a stream carries it, the one its end wrote, a stop's
+   *  included; a stream whose end writes none (a superseded stream, a
    *  disposed agent's stream) gets a failure entry that carries it, when it
    *  had finished a round. One that hadn't has nothing to carry and gets no
    *  entry. */

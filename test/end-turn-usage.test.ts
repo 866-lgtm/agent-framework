@@ -780,47 +780,98 @@ class HeldTools implements Module {
   }
 }
 
-describe('a stream that ends without writing its own entry is logged once, in finally', () => {
-  async function residentWith(stream: YieldingStream, tools: Module) {
-    const dir = mkdtempSync(join(tmpdir(), 'af-end-turn-usage-'));
-    const membrane = new MockMembrane();
-    let made = false;
-    membrane.streamYielding = (request: NormalizedRequest): YieldingStream => {
-      membrane.calls.push(request);
-      if (made) return new MockYieldingStream([createMockResponse([{ type: 'text', text: 'done' }])]);
-      made = true;
-      return stream;
-    };
-    const framework = await AgentFramework.create({
-      storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
-      agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system', allowedTools: 'all' }],
-      modules: [new InputModule(), tools], syncIntervalMs: 0, maintenanceIntervalMs: 0,
-    });
-    const traces: TraceEvent[] = [];
-    framework.onTrace((event) => traces.push(event));
-    framework.start();
-    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
-    return { dir, membrane, framework, traces };
-  }
+type WrittenEntry = { agentName?: string; success?: boolean; error?: string; tokenUsage?: unknown };
 
-  function loggedOnce(framework: AgentFramework, traces: TraceEvent[], error: RegExp) {
-    assert.equal(traces.filter((e) => e.type === 'usage:updated').length, 1, 'counted once');
-    assert.deepEqual(framework.getSessionUsage().totals, expectedTotals(firstUsage));
-    const logs = framework.queryInferenceLogs({ agentName: 'resident' }).entries.map((e) => e.entry);
-    assert.equal(logs.length, 1, 'one entry');
-    assert.equal(logs[0].success, false);
-    assert.match(String(logs[0].error), error);
-    assert.deepEqual(logs[0].tokenUsage, expectedTokens(firstUsage), 'the entry carries what was counted');
-  }
+/** A resident whose first stream is `stream`, with `tools`, started on one
+ *  message. `written` holds every inference-log entry as it's written, which
+ *  outlasts stop() closing the store the log query reads. */
+async function residentWith(stream: YieldingStream, tools: Module) {
+  const dir = mkdtempSync(join(tmpdir(), 'af-end-turn-usage-'));
+  const membrane = new MockMembrane();
+  let made = false;
+  membrane.streamYielding = (request: NormalizedRequest): YieldingStream => {
+    membrane.calls.push(request);
+    if (made) return new MockYieldingStream([createMockResponse([{ type: 'text', text: 'done' }])]);
+    made = true;
+    return stream;
+  };
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
+    agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system', allowedTools: 'all' }],
+    modules: [new InputModule(), tools], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+  });
+  const traces: TraceEvent[] = [];
+  framework.onTrace((event) => traces.push(event));
+  const written: WrittenEntry[] = [];
+  const internal = framework as unknown as { logInference: (entry: WrittenEntry) => void };
+  const write = internal.logInference.bind(framework);
+  internal.logInference = (entry) => {
+    written.push(entry);
+    write(entry);
+  };
+  framework.start();
+  framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+  return { dir, membrane, framework, traces, written };
+}
 
-  it('a turn abandoned by an operator quiesce after a finished round', async () => {
+function loggedOnce(framework: AgentFramework, traces: TraceEvent[], error: RegExp) {
+  assert.equal(traces.filter((e) => e.type === 'usage:updated').length, 1, 'counted once');
+  assert.deepEqual(framework.getSessionUsage().totals, expectedTotals(firstUsage));
+  const logs = framework.queryInferenceLogs({ agentName: 'resident' }).entries.map((e) => e.entry);
+  assert.equal(logs.length, 1, 'one entry');
+  assert.equal(logs[0].success, false);
+  assert.match(String(logs[0].error), error);
+  assert.deepEqual(logs[0].tokenUsage, expectedTokens(firstUsage), 'the entry carries what was counted');
+}
+
+/** Whether the stream's driver has ended: it releases the stream and its turn
+ *  at the end of finally, after its accounting. */
+function tornDown(framework: AgentFramework): boolean {
+  const internal = framework as unknown as { activeTurnTokens: Map<string, unknown>; activeStreams: Map<string, unknown> };
+  return !internal.activeTurnTokens.has('resident') && !internal.activeStreams.has('resident');
+}
+
+describe("a stop's own entry carries the rounds its stream finished, once", () => {
+  it("a caller's stop after a finished round", async () => {
+    const tools = new HeldTools();
+    const r = await residentWith(new RoundThenEnd(firstUsage, unseenCompletion()), tools);
+    try {
+      assert.ok(await pollUntil(() => tools.calledWith.length === 1), 'the round finished and its tool is running');
+      assert.ok(r.framework.abortInference('resident'), 'the stream was cancelled');
+      assert.ok(await pollUntil(() => tornDown(r.framework)), 'its teardown ran');
+      loggedOnce(r.framework, r.traces, /^Stream cancelled \(user\)$/);
+    } finally {
+      tools.release();
+      await r.framework.stop();
+      rmSync(r.dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a shutdown after a finished round', async () => {
+    const tools = new HeldTools();
+    const r = await residentWith(new RoundThenEnd(firstUsage, unseenCompletion()), tools);
+    try {
+      assert.ok(await pollUntil(() => tools.calledWith.length === 1), 'the round finished and its tool is running');
+      const stopping = r.framework.stop();
+      tools.release();
+      await stopping;
+      assert.equal(r.traces.filter((e) => e.type === 'usage:updated').length, 1, 'counted once');
+      const entries = r.written.filter((entry) => entry.agentName === 'resident');
+      assert.deepEqual(entries.map((entry) => entry.error), ['Stream aborted: shutdown'], "one entry, the shutdown's own");
+      assert.deepEqual(entries[0].tokenUsage, expectedTokens(firstUsage), 'it carries the round the stream finished');
+    } finally {
+      rmSync(r.dir, { recursive: true, force: true });
+    }
+  });
+
+  it('an operator quiesce after a finished round', async () => {
     const tools = new HeldTools();
     const r = await residentWith(new RoundThenEnd(firstUsage, unseenCompletion()), tools);
     try {
       assert.ok(await pollUntil(() => tools.calledWith.length === 1), 'the round finished and its tool is running');
       await r.framework.quiesce({ timeoutMs: 50, abandon: true });
-      assert.ok(await pollUntil(() => r.framework.queryInferenceLogs({ agentName: 'resident' }).total > 0), 'logged');
-      loggedOnce(r.framework, r.traces, /^Turn abandoned by operator quiesce$/);
+      assert.ok(await pollUntil(() => tornDown(r.framework)), 'its teardown ran');
+      loggedOnce(r.framework, r.traces, /^Stream aborted: quiesce_abandoned$/);
     } finally {
       // Let the held tool finish while the framework's queue is still open.
       tools.release();
@@ -831,6 +882,27 @@ describe('a stream that ends without writing its own entry is logged once, in fi
     }
   });
 
+  it('an operator quiesce before the first round returns: its entry has nothing to carry', async () => {
+    const stream = new FirstRoundHeld();
+    const r = await residentWith(stream, new TurnTools());
+    try {
+      assert.ok(await pollUntil(() => stream.started), 'the stream is running');
+      await r.framework.quiesce({ timeoutMs: 50, abandon: true });
+      assert.ok(await pollUntil(() => stream.isCancelled), 'the abandon cancelled it');
+      assert.ok(await pollUntil(() => tornDown(r.framework)), 'its teardown ran');
+      const logs = r.framework.queryInferenceLogs({ agentName: 'resident' }).entries.map((e) => e.entry);
+      assert.deepEqual(logs.map((entry) => entry.error), ['Stream aborted: quiesce_abandoned'], "one entry, the abandon's own");
+      assert.equal(logs[0].tokenUsage, undefined, 'it carries no usage');
+      assert.equal(r.traces.filter((e) => e.type === 'usage:updated').length, 0, 'nothing counted');
+      assert.equal(r.framework.getSessionUsage().inferenceCount, 0);
+    } finally {
+      await r.framework.stop();
+      rmSync(r.dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('a stream that ends without writing its own entry is logged once, in finally', () => {
   it('a failure after a completion is logged without carrying the usage again', async () => {
     const r = await resident([() => new MockYieldingStream([finalResponse('Done.', totalUsage)])]);
     // Something after the completion's entry throws: the stream's catch
@@ -896,29 +968,8 @@ describe('a stream that ends without writing its own entry is logged once, in fi
     }
   });
 
-  it('a turn abandoned by an operator quiesce before its first round returns has nothing to carry, and writes no entry', async () => {
-    const stream = new FirstRoundHeld();
-    const r = await residentWith(stream, new TurnTools());
-    const internal = r.framework as unknown as { activeTurnTokens: Map<string, unknown>; activeStreams: Map<string, unknown> };
-    try {
-      assert.ok(await pollUntil(() => stream.started), 'the stream is running');
-      await r.framework.quiesce({ timeoutMs: 50, abandon: true });
-      assert.ok(await pollUntil(() => stream.isCancelled), 'the abandon cancelled it');
-      // The stream and its turn are released at the end of finally, after its accounting.
-      assert.ok(await pollUntil(() => !internal.activeTurnTokens.has('resident') && !internal.activeStreams.has('resident')),
-        'its teardown ran');
-      assert.equal(r.framework.queryInferenceLogs({ agentName: 'resident' }).total, 0, 'no entry');
-      assert.equal(r.traces.filter((e) => e.type === 'usage:updated').length, 0, 'nothing counted');
-      assert.equal(r.framework.getSessionUsage().inferenceCount, 0);
-    } finally {
-      await r.framework.stop();
-      rmSync(r.dir, { recursive: true, force: true });
-    }
-  });
-
   it("a write that fails while finally logs the stream doesn't skip the teardown after it", async () => {
-    const tools = new HeldTools();
-    const r = await residentWith(new RoundThenEnd(firstUsage, unseenCompletion()), tools);
+    const r = await residentWith(new RoundThenEnd(firstUsage, 'close'), new TurnTools());
     const internal = r.framework as unknown as {
       logInference: (entry: { error?: string }) => void;
       activeTurnTokens: Map<string, unknown>;
@@ -926,24 +977,19 @@ describe('a stream that ends without writing its own entry is logged once, in fi
     };
     const write = internal.logInference.bind(r.framework);
     internal.logInference = (entry) => {
-      if (entry.error === 'Turn abandoned by operator quiesce') throw new Error('zz store refused the write');
+      if (entry.error === 'Stream ended without a final response') throw new Error('zz store refused the write');
       write(entry);
     };
     const lines: string[] = [];
     const original = console.error;
     console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
     try {
-      assert.ok(await pollUntil(() => tools.calledWith.length === 1), 'the round finished and its tool is running');
-      await r.framework.quiesce({ timeoutMs: 50, abandon: true });
       assert.ok(await pollUntil(() => lines.some((line) => line.startsWith('[usage] agent=resident could not record'))),
         'the failed write is said');
       assert.ok(await pollUntil(() => !internal.activeTurnTokens.has('resident') && !internal.activeStreams.has('resident')),
         'and the stream and its turn are still released');
     } finally {
       console.error = original;
-      tools.release();
-      await pollUntil(() => r.traces.some((e) =>
-        (e.type === 'tool:completed' || e.type === 'tool:failed') && (e as { callId?: string }).callId === 'echo-1'));
       await r.framework.stop();
       rmSync(r.dir, { recursive: true, force: true });
     }

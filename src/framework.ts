@@ -4423,13 +4423,15 @@ export class AgentFramework {
     agent: Agent;
     myStreamId: number;
     startTime: number;
-    requestId: string;
     compiledRequest: NormalizedRequest | undefined;
     reason: string;
     /** The settling stream's logical turn, as settleAgent takes it. */
     closes: TurnRouting | undefined;
+    /** The stream's own log writer (driveStream's logStream), so the
+     *  terminal's entry carries the rounds the stream finished, once. */
+    log: (entry: Omit<InferenceLogEntry, 'timestamp' | 'agentName' | 'requestId'>) => void;
   }): void {
-    const { agent, myStreamId, startTime, requestId, compiledRequest, reason, closes } = args;
+    const { agent, myStreamId, startTime, compiledRequest, reason, closes, log } = args;
     const durationMs = Date.now() - startTime;
     this.abortAgentScript(agent.name, 'stream cancelled');
     agent.reset();
@@ -4489,10 +4491,7 @@ export class AgentFramework {
     // on live in-memory reducer state. Without this, abort-terminated
     // inferences are invisible to forensic queries (only request-side
     // telemetry via llm-calls.jsonl shows them, and only by absence).
-    this.logInference({
-      timestamp: startTime,
-      agentName: agent.name,
-      requestId,
+    log({
       success: false,
       error: `Stream cancelled (${reason})`,
       request: compiledRequest ?? { note: 'streaming request aborted' },
@@ -4519,13 +4518,15 @@ export class AgentFramework {
     agent: Agent;
     myStreamId: number;
     startTime: number;
-    requestId: string;
     compiledRequest: NormalizedRequest | undefined;
     kind: 'shutdown' | 'quiesce_abandoned';
     /** The settling stream's logical turn, as settleAgent takes it. */
     closes: TurnRouting | undefined;
+    /** The stream's own log writer (driveStream's logStream), so the
+     *  terminal's entry carries the rounds the stream finished, once. */
+    log: (entry: Omit<InferenceLogEntry, 'timestamp' | 'agentName' | 'requestId'>) => void;
   }): void {
-    const { agent, myStreamId, startTime, requestId, compiledRequest, kind, closes } = args;
+    const { agent, myStreamId, startTime, compiledRequest, kind, closes, log } = args;
     const durationMs = Date.now() - startTime;
     if (agent.streamId === myStreamId) {
       this.abortAgentScript(agent.name, kind === 'shutdown' ? 'framework shutting down' : 'turn abandoned by quiesce');
@@ -4554,10 +4555,7 @@ export class AgentFramework {
     }
     // Postmortem 2026-05-28 P2 #7: the abort is a terminal the inference log
     // must be able to attribute later.
-    this.logInference({
-      timestamp: startTime,
-      agentName: agent.name,
-      requestId,
+    log({
       success: false,
       error: `Stream aborted: ${kind}`,
       request: compiledRequest ?? { note: `streaming request aborted by ${kind}` },
@@ -13622,9 +13620,6 @@ export class AgentFramework {
         tokenUsage,
       });
     };
-    // What ended a stream whose end writes no log entry of its own, for the
-    // entry `finally` writes for it.
-    let unloggedEnd: string | undefined;
     // A turn that ended successfully: with its final response (natural
     // completion), or without one, when a tool result with endTurn ended it.
     const completeTurn = (usage: DetailedUsage | undefined, durationMs: number, response?: NormalizedResponse): void => {
@@ -14774,9 +14769,10 @@ export class AgentFramework {
               this.frameworkCancelledStreams.delete(cancelKey);
               lifecyclePhase = 'aborted';
               this.settleFrameworkCancel({
-                agent, myStreamId, startTime, requestId, compiledRequest,
+                agent, myStreamId, startTime, compiledRequest,
                 kind: cancelKind,
                 closes: this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting : undefined,
+                log: logStream,
               });
               break;
             }
@@ -14792,9 +14788,10 @@ export class AgentFramework {
               lifecyclePhase = 'aborted'; // §10.5 — terminal emitted in finally
               if (agent.streamId === myStreamId) {
                 this.settleDeliberateCancel({
-                  agent, myStreamId, startTime, requestId, compiledRequest,
+                  agent, myStreamId, startTime, compiledRequest,
                   reason: callerCancel.reason ?? 'user',
                   closes: this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting : undefined,
+                  log: logStream,
                 });
               }
               break;
@@ -14920,9 +14917,10 @@ export class AgentFramework {
                   // after restart that someone did. inference:aborted and the
                   // inference-log row carry the observability instead.
                   this.settleFrameworkCancel({
-                    agent, myStreamId, startTime, requestId, compiledRequest,
+                    agent, myStreamId, startTime, compiledRequest,
                     kind: cancelKind,
                     closes: streamRouting,
+                    log: logStream,
                   });
                   return;
                 }
@@ -14977,9 +14975,10 @@ export class AgentFramework {
               if (deliberate) {
                 lifecyclePhase = 'aborted'; // §10.5 — terminal emitted in finally
                 this.settleDeliberateCancel({
-                  agent, myStreamId, startTime, requestId, compiledRequest,
+                  agent, myStreamId, startTime, compiledRequest,
                   reason: callerCancel?.reason ?? 'user',
                   closes: streamRouting,
+                  log: logStream,
                 });
               } else {
                 const durationMs = Date.now() - startTime;
@@ -15150,16 +15149,18 @@ export class AgentFramework {
           this.frameworkCancelledStreams.delete(cancelKey);
           lifecyclePhase = 'aborted'; // §10.5 — terminal emitted in finally
           this.settleFrameworkCancel({
-            agent, myStreamId, startTime, requestId, compiledRequest,
+            agent, myStreamId, startTime, compiledRequest,
             kind: cancelKind,
             closes: streamRouting,
+            log: logStream,
           });
         } else if (cancelKind === undefined && callerCancel !== undefined) {
           lifecyclePhase = 'aborted'; // §10.5 — terminal emitted in finally
           this.settleDeliberateCancel({
-            agent, myStreamId, startTime, requestId, compiledRequest,
+            agent, myStreamId, startTime, compiledRequest,
             reason: callerCancel.reason ?? 'user',
             closes: streamRouting,
+            log: logStream,
           });
         }
       }
@@ -15236,21 +15237,21 @@ export class AgentFramework {
         // Every end the cases above didn't count (a stream error or abort, a
         // throw, a superseded generation) still billed the rounds it finished.
         countUsage(latestUsage);
-        // An end that wrote no entry carrying them (a quiesce-abandoned turn,
-        // a stream superseded by a newer one, a disposed agent's stream) writes
-        // one now, as a failure naming what ended it, so the log carries what
-        // the totals count. With no finished round there is nothing to carry,
+        // An end that wrote no entry carrying them (a stream superseded by a
+        // newer one, a disposed agent's stream) writes one now, as a failure
+        // naming what ended it, so the log carries what the totals count. A
+        // stop's terminal writes its own, through logStream. With no finished round there is nothing to carry,
         // and no entry is written, as before.
         if (countedUsage && !usageLogged) {
           const replaced = this.agents.get(agent.name) !== agent;
           const superseded = generationLost || agent.streamId !== myStreamId;
           logStream({
             success: false,
-            error: unloggedEnd ?? (replaced
+            error: replaced
               ? 'Stream abandoned: its agent was disposed or replaced'
               : superseded
                 ? 'Stream superseded: a newer stream of the agent took over'
-                : 'Stream ended without a final response'),
+                : 'Stream ended without a final response',
             request: compiledRequest ?? { note: 'streaming request' },
             durationMs: Date.now() - startTime,
             tokenUsage: tokenUsageOf(countedUsage),
