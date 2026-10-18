@@ -46,12 +46,15 @@ import type {
 } from './types.js';
 import { formatZonedDateTime, resolveTimeZone } from '../../timezone.js';
 import { logValue } from '../../mcpl/log-value.js';
+import { unknownToolMessage } from '../unknown-tool.js';
+import { DiscordRefusal } from './refusal.js';
 
 // Re-export event types for consumers who want to handle them
 export type { DiscordMessageEvent, DiscordEditEvent, DiscordDeleteEvent } from './types.js';
 
 export * from './types.js';
 export { DiscordJsClient, type DiscordJsClientConfig } from './discord-js-client.js';
+export { DiscordRefusal } from './refusal.js';
 
 const DEFAULT_CONFIG: Partial<DiscordModuleConfig> = {
   handleDMs: true,
@@ -107,10 +110,57 @@ const TEXT_FILE_EXTENSIONS = [
 
 const CONVERSATION_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
 
+/** A text attachment this many bytes or larger isn't read into the agent's context. */
+const TEXT_FILE_LIMIT_BYTES = 100_000;
+
+/** activate's and deactivate's answer before the module has started, or once it has stopped. */
+const NOT_RUNNING = "Speech handling wasn't changed: the Discord module hasn't started on this host, or has stopped. Calling it again won't change that until it runs; ask whoever runs this host if you need Discord.";
+
 /** What the agent reads for a text attachment whose contents couldn't be
  *  fetched: by an error, or by an answer that wasn't OK. */
 function attachmentNotFetched(filename: string): { type: 'text'; text: string } {
-  return { type: 'text', text: `[Attachment: ${filename} (failed to fetch)]` };
+  return {
+    type: 'text',
+    text: `[Attachment: ${filename} couldn't be fetched, so its text isn't in your context. If you need it, ask the sender in the channel to paste it.]`,
+  };
+}
+
+/**
+ * What the agent reads when a tool stops on an error that isn't a refusal
+ * (DiscordRefusal), such as a network failure: its outcome is unknown. A send
+ * repeated blindly can post twice, so those say how to check; the other tools
+ * are safe to repeat, since a second call changes nothing more.
+ */
+function unexpectedFailure(call: ToolCall, error: unknown): string {
+  const stopped = `discord--${call.name} stopped on an unexpected error: ${errorText(error)}.`;
+  const channelId = (call.input as { channelId?: unknown } | null | undefined)?.channelId;
+  switch (call.name) {
+    case 'send':
+      return `${stopped} Whether the message was sent is unknown: discord--fetch_history with channelId ${String(channelId)} shows it, so check before you send it again.`;
+    case 'dm':
+      return `${stopped} Whether the message was sent is unknown. If an earlier discord--dm to this user gave you its channelId, discord--fetch_history with it shows whether this one went; without it, sending it again may send it twice.`;
+    case 'edit':
+    case 'react':
+    case 'delete':
+    case 'create_thread':
+      return `${stopped} Whether it took effect is unknown. Calling it again is safe: if it did, the second call changes nothing more.`;
+    case 'list_guilds':
+    case 'list_channels':
+    case 'fetch_history':
+      return `${stopped} It changes nothing on Discord, so you can call it again.`;
+    default:
+      return `${stopped} Calling it again is safe.`;
+  }
+}
+
+/** An error's own words, for a sentence about it. */
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** A count of seconds, for the agent's eyes. */
+function seconds(n: number): string {
+  return `${n} second${n === 1 ? '' : 's'}`;
 }
 
 /** What a stored message reads when it has no text of its own and nothing the
@@ -546,7 +596,7 @@ export class DiscordModule implements Module {
       },
       {
         name: 'list_channels',
-        description: 'List all channels in a Discord server',
+        description: 'List the channels in a Discord server, with their ids. Threads aren\'t listed.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -601,12 +651,14 @@ export class DiscordModule implements Module {
         case 'fetch_history':
           return await this.handleFetchHistory(call.input as FetchHistoryInput);
         default:
-          return { success: false, error: `Unknown tool: ${call.name}`, isError: true };
+          return { success: false, error: unknownToolMessage(this.name, call.name, this.getTools()), isError: true };
       }
     } catch (error) {
+      // A refusal says what was refused and what to do instead; anything else
+      // is unexpected, and its outcome is worded by the tool.
       return {
         success: false,
-        error: error instanceof Error ? error.message : String(error),
+        error: error instanceof DiscordRefusal ? error.message : unexpectedFailure(call, error),
         isError: true,
       };
     }
@@ -773,7 +825,7 @@ export class DiscordModule implements Module {
     }
 
     // Check rate limit
-    if (!this.checkRateLimit(replyCtx.channelId)) {
+    if (this.rateLimitWait(replyCtx.channelId) > 0) {
       console.warn(`Discord: Rate limited for channel ${replyCtx.channelId}`);
       return;
     }
@@ -1148,7 +1200,15 @@ export class DiscordModule implements Module {
 
       // Check for text files - fetch and include content
       const isTextFile = TEXT_FILE_EXTENSIONS.some(ext => filename.endsWith(ext));
-      if (isTextFile && attachment.size && attachment.size < 100_000) { // < 100KB
+      if (isTextFile && attachment.size >= TEXT_FILE_LIMIT_BYTES) {
+        blocks.push({
+          type: 'text',
+          text: `[Attachment: ${attachment.filename} (${attachment.size.toLocaleString('en-US')} bytes): this host reads text files under ${TEXT_FILE_LIMIT_BYTES.toLocaleString('en-US')} bytes into your context, so its text isn't here. If you need it, ask the sender to paste the part that matters.]`,
+        });
+        continue;
+      }
+      // A text file of size 0 gets the note below, as before.
+      if (isTextFile && attachment.size) {
         try {
           const response = await fetch(attachment.url);
           if (response.ok) {
@@ -1173,7 +1233,7 @@ export class DiscordModule implements Module {
       // For unsupported attachments, add a note
       blocks.push({
         type: 'text',
-        text: `[Attachment: ${attachment.filename} (${contentType || 'unknown type'})]`,
+        text: `[Attachment: ${attachment.filename} (${contentType || 'unknown type'}): this host didn't read its contents in, so they aren't in your context. If you need them, ask the sender for them in a form you can read, such as pasted text.]`,
       });
     }
 
@@ -1262,8 +1322,13 @@ export class DiscordModule implements Module {
   }
 
   private async handleSend(input: SendInput, call: ToolCall): Promise<ToolResult> {
-    if (!this.checkRateLimit(input.channelId)) {
-      return { success: false, error: 'Rate limited', isError: true };
+    const wait = this.rateLimitWait(input.channelId);
+    if (wait > 0) {
+      return {
+        success: false,
+        error: `Nothing was sent: channel ${input.channelId} has reached ${this.rateLimitRule()}. Send it again in ${seconds(wait)}; other channels have their own limit.`,
+        isError: true,
+      };
     }
 
     const result = await this.client.sendMessage(input.channelId, input.content, {
@@ -1278,22 +1343,36 @@ export class DiscordModule implements Module {
     if (result.threadFailure !== undefined) {
       return { success: false, error: result.threadFailure, isError: true };
     }
-    return { success: true, data: { messageId: result.messageId } };
+    return { success: true, data: { messageId: result.messageId, ...(result.note !== undefined ? { note: result.note } : {}) } };
   }
 
   private async handleDM(input: SendDMInput): Promise<ToolResult> {
     const result = await this.client.sendDM(input.userId, input.content);
-    return { success: true, data: { messageId: result.messageId } };
+    // The direct message channel's id is what fetch_history reads it by, should a later dm need checking.
+    return { success: true, data: { messageId: result.messageId, ...(result.channelId !== undefined ? { channelId: result.channelId } : {}) } };
   }
 
   private async handleReply(input: ReplyInput, call: ToolCall): Promise<ToolResult> {
     const replyCtx = this.replyContexts.get('default');
     if (!replyCtx) {
-      return { success: false, error: 'No conversation context', isError: true };
+      return {
+        success: false,
+        error: 'Nothing was sent: there\'s no conversation to reply in. Use discord--send with a channelId to post somewhere, or discord--set_reply_context with a channelId to choose where replies go, then reply again.',
+        isError: true,
+      };
     }
 
-    if (!this.checkRateLimit(replyCtx.channelId)) {
-      return { success: false, error: 'Rate limited', isError: true };
+    // The reply goes to the context's thread when it names one, an empty id
+    // as well, as it always has; the words name an empty id as what it is.
+    const thread = replyCtx.threadId;
+    const wait = this.rateLimitWait(replyCtx.channelId);
+    if (wait > 0) {
+      return {
+        success: false,
+        error: `Nothing was sent: this conversation's channel (${replyCtx.channelId}) has reached ${this.rateLimitRule()}`
+          + `${thread ? `, which counts its replies in thread ${thread} too` : ''}. Reply again in ${seconds(wait)}.`,
+        isError: true,
+      };
     }
 
     let content = input.content;
@@ -1301,10 +1380,28 @@ export class DiscordModule implements Module {
       content = `<@${replyCtx.userId}> ${content}`;
     }
 
-    const targetChannel = replyCtx.threadId ?? replyCtx.channelId;
-    const result = await this.client.sendMessage(targetChannel, content, {
-      replyTo: replyCtx.replyToMessageId,
-    });
+    // reply's call names no channel or message: its reply context does, as it
+    // stands now, before the send, which an incoming message can change.
+    const targetChannel = thread ?? replyCtx.channelId;
+    const pointsAt = thread === undefined ? `channel ${targetChannel}` : thread === '' ? 'an empty thread id' : `thread ${targetChannel}`;
+    const check = thread === ''
+      ? `, and its reply context names an empty thread id: discord--set_reply_context with a threadId, or without one to reply in channel ${replyCtx.channelId}, puts that right`
+      : `: discord--fetch_history with channelId ${targetChannel}, its reply context's ${thread !== undefined ? 'thread' : 'channel'}, shows it, so check before you reply again`;
+    const replyTo = replyCtx.replyToMessageId;
+    let result: { messageId: string };
+    try {
+      result = await this.client.sendMessage(targetChannel, content, { replyTo });
+    } catch (error) {
+      if (error instanceof DiscordRefusal) {
+        throw new DiscordRefusal(`${error.message} A reply goes where its reply context points: ${pointsAt}`
+          + `${replyTo ? `, answering message ${replyTo}` : ''}. discord--set_reply_context changes that.`, { cause: error });
+      }
+      return {
+        success: false,
+        error: `discord--reply stopped on an unexpected error: ${errorText(error)}. Whether the reply was sent is unknown${check}.`,
+        isError: true,
+      };
+    }
 
     // Track for thought-editing
     this.notePost(call.callerAgentName, call.callerTurnId, targetChannel, result.messageId);
@@ -1370,7 +1467,7 @@ export class DiscordModule implements Module {
 
   private async handleActivate(input: { additive?: boolean }): Promise<ToolResult> {
     if (!this.ctx) {
-      return { success: false, error: 'Module not started', isError: true };
+      return { success: false, error: NOT_RUNNING, isError: true };
     }
 
     this.ctx.registerSpeechHandler('*', { additive: input.additive });
@@ -1379,7 +1476,7 @@ export class DiscordModule implements Module {
 
   private async handleDeactivate(): Promise<ToolResult> {
     if (!this.ctx) {
-      return { success: false, error: 'Module not started', isError: true };
+      return { success: false, error: NOT_RUNNING, isError: true };
     }
 
     this.ctx.unregisterSpeechHandler();
@@ -1464,8 +1561,25 @@ export class DiscordModule implements Module {
       .join('\n');
   }
 
-  private checkRateLimit(channelId: string): boolean {
-    const limit = this.config.rateLimitPerMinute ?? 30;
+  private rateLimitPerMinute(): number {
+    return this.config.rateLimitPerMinute ?? 30;
+  }
+
+  /** The limit, as the rate-limit refusals word it. */
+  private rateLimitRule(): string {
+    const limit = this.rateLimitPerMinute();
+    return `this host's limit of ${limit} send${limit === 1 ? '' : 's'} a minute from the bot`;
+  }
+
+  /**
+   * Counts a send to `channelId` against its limit and returns 0, or, when
+   * the channel has had its sends for this window, returns the whole seconds
+   * until the window ends, at least 1. A window is the minute from the first
+   * send this lets through, and each send it lets through counts, whether or
+   * not Discord then takes it.
+   */
+  private rateLimitWait(channelId: string): number {
+    const limit = this.rateLimitPerMinute();
     const now = Date.now();
     const windowMs = 60 * 1000;
 
@@ -1477,11 +1591,11 @@ export class DiscordModule implements Module {
     }
 
     if (info.count >= limit) {
-      return false;
+      return Math.max(1, Math.ceil((info.windowStart + windowMs - now) / 1000));
     }
 
     info.count++;
-    return true;
+    return 0;
   }
 
   private cleanupOldConversations(): void {

@@ -412,10 +412,12 @@ export interface DiscordClientInterface {
 
   /**
    * Send a message to a channel, and start the thread `createThread` asks
-   * for when the channel can hold threads; in one that can't, such as a DM,
-   * no thread is started and nothing says so. When this resolves, the
-   * message was sent. `threadFailure`, when there is one, is why the thread
-   * it tried to start wasn't.
+   * for when the channel can hold threads. When this resolves, the message
+   * was sent. `threadFailure`, when there is one, is why the thread it tried
+   * to start wasn't, which the send reports as its error; `note`, when there
+   * is one, is something the agent should know of a send that succeeded,
+   * such as a thread its channel can't hold. DiscordJsClient words both for
+   * the agent.
    */
   sendMessage(
     channelId: string,
@@ -424,10 +426,10 @@ export interface DiscordClientInterface {
       replyTo?: string;
       createThread?: { name: string };
     }
-  ): Promise<{ messageId: string; threadFailure?: string }>;
+  ): Promise<{ messageId: string; threadFailure?: string; note?: string }>;
 
-  /** Send a DM to a user */
-  sendDM(userId: string, content: string): Promise<{ messageId: string }>;
+  /** Send a DM to a user. `channelId`, when the client gives it, is the direct message channel's id, which history reads. */
+  sendDM(userId: string, content: string): Promise<{ messageId: string; channelId?: string }>;
 
   /** Fetch a message's text content */
   fetchMessage(channelId: string, messageId: string): Promise<string>;
