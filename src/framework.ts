@@ -14099,7 +14099,7 @@ export class AgentFramework {
     if (kept > 0) notes.push(`${kept} plain-speech segment(s) kept private (skip_reply or a private think)`);
     if (suppressed > 0) {
       notes.push(agent.proseRouting === 'disabled'
-        ? `${suppressed} plain-speech segment(s) suppressed (proseRouting=disabled — publish only with an explicit send tool)`
+        ? `${suppressed} plain-speech segment(s) kept in the transcript (proseRouting=disabled — post to a channel only with an explicit send tool)`
         : `${suppressed} plain-speech segment(s) suppressed`);
     }
     const suppressedNote = notes.join(' · ');
@@ -14108,10 +14108,17 @@ export class AgentFramework {
     // since the turn held it may have had such an attempt: its state is
     // unknown now.
     const uncertain = unconfirmed.length > 0 || dismissedAtRisk.length > 0 || letGo.length > 0;
+    // In disabled mode, routing posts no plain speech to any channel, and the
+    // words stay in the transcript. The receipt says only that. Who watched
+    // the turn's stream is for the host to know, and an explicit send
+    // reports itself in its tool result. Disabled mode holds no drafts, so
+    // it is never uncertain.
     const text =
       shown.length > 0
         ? `[delivered] plain speech → ${shown.join(' · ')}${suppressedNote ? ` · ${suppressedNote}` : ''}`
-        : `[delivered] nothing${uncertain ? ' confirmed' : ''} — ${suppressedNote}`;
+        : agent.proseRouting === 'disabled'
+          ? `[delivered] plain speech → no channel — ${suppressedNote}`
+          : `[delivered] nothing${uncertain ? ' confirmed' : ''} — ${suppressedNote}`;
     try {
       const mid = agent.getContextManager().addMessage(
         'user',
@@ -17110,9 +17117,9 @@ export class AgentFramework {
             // receipt. Queued deliveries and holds settled before final
             // dispatch, even when the last response is empty, so the receipt
             // and the continuation see the last rounds' deliveries;
-            // trailing/text-only segments were awaited in-loop. Locus and
-            // hybrid modes only; explicit-mode envelopes acknowledge
-            // themselves through the prose gateway.
+            // trailing/text-only segments were awaited in-loop. Every mode
+            // but explicit, whose envelopes acknowledge themselves through
+            // the prose gateway.
             if (!trigger?.suppressProse && turnProseRouting !== 'explicit') {
               this.appendProseDeliveryReceipt(agent, streamRouting);
             }
