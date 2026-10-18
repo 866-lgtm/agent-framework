@@ -677,7 +677,9 @@ describe('stop() with work still in flight', () => {
           framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
           await until(() => internals.activeStreams.has('assistant'), 'the first stream');
           const handle = internals.activeStreams.get('assistant')!;
-          (framework.getAgent('assistant') as unknown as { buildActivationRequest: () => never }).buildActivationRequest = () => {
+          // The stream path compiles through the agent's own assembler
+          // (buildActivationRequest is only its wrapper for previews).
+          (framework.getAgent('assistant') as unknown as { assembleActivationRequest: () => never }).assembleActivationRequest = () => {
             throw new Error('the compile failed');
           };
           release();
