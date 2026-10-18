@@ -427,6 +427,7 @@ describe('notices about an agent\'s own action', () => {
       const traced: string[] = [];
       const off = framework.onTrace((event) => { if (event.type === 'message:added') traced.push(JSON.stringify(event)); });
       state.agents.delete('secondary');
+      let woken = -1;
       try {
         const round = { routing: state.routingOf('secondary'), notice: 'later' };
         // {{unsent}} with nothing held, and no words of its own.
@@ -446,6 +447,8 @@ describe('notices about an agent\'s own action', () => {
         state.bounceProse(agent, 'words whose send threw', 'connection lost', undefined, '>>', round, { outcome: 'unknown' });
         // Prose with no destination: a bounce, whose notice would wake its speaker.
         state.bounceProse(agent, 'words with no destination', 'no destination', undefined, '>>', round);
+        // Counted before the loop runs: running, it takes what is pending.
+        woken = (state.pendingRequests as Array<{ agentName?: string }>).filter((r) => r.agentName === 'secondary').length;
         await framework.runUntilIdle();
       } finally {
         state.agents.set('secondary', agent);
@@ -461,7 +464,7 @@ describe('notices about an agent\'s own action', () => {
       assert.ok(errors.includes('[notice] secondary is no longer registered, so its in-flight-dismiss notice is dropped'));
       assert.ok(errors.includes('[notice] secondary is no longer registered, so its refused-{{unsent}} notice is dropped'));
       assert.ok(errors.includes('[notice] secondary is no longer registered, so its unrecorded-outcome notice is dropped'));
-      assert.ok(!(state.pendingRequests as Array<{ agentName?: string }>).some((r) => r.agentName === 'secondary'), 'no wake is requested for it');
+      assert.equal(woken, 0, 'no wake is requested for it');
       assert.ok(!errors.some((e) => /not a registered agent/.test(e)), 'not dropped by addMessage instead');
     });
 
