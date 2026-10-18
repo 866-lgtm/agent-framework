@@ -17736,7 +17736,8 @@ export class AgentFramework {
     // would start reconnects only for stop() to close them again. Release the
     // barrier instead, as a completed one is released: nothing waits on a
     // rejected barrier, and unless the host is quiesced, what the pause held
-    // back reaches the listeners' stopping refusal.
+    // back reaches the listeners' stopping refusal, except what a connection
+    // closed for good held, which stays held.
     if (this.queue?.isClosed) {
       this.completeMcplDataPlaneGate(barrier);
       return;
@@ -17749,6 +17750,25 @@ export class AgentFramework {
         );
       });
     }));
+  }
+
+  /**
+   * Close a runtime connect's new connection for good, through the registry,
+   * after a step of that connect failed. A close that fails keeps the entry,
+   * so a later disconnect, restart or shutdown can close it again, and is
+   * logged here rather than replacing the failure the connect reports.
+   */
+  private async closeFailedRuntimeConnect(
+    connection: McplServerConnection,
+    failedStep: string,
+  ): Promise<void> {
+    await this.mcplServerRegistry!.closeServer(connection.id, connection).catch((closeError) => {
+      console.error(
+        `[mcpl] could not close MCPL server "${connection.id}" after its ${failedStep} failed; ` +
+          'it stays registered until a disconnect, restart or shutdown closes it:',
+        closeError instanceof Error ? closeError.message : closeError,
+      );
+    });
   }
 
   /**
@@ -17843,13 +17863,27 @@ export class AgentFramework {
       // the runtime connect or restart that asked for it. (A startup connect
       // defers awareness and returns before this gate; a startup that fails
       // ends in create()'s release, which closes its servers.)
+      // That close goes through the registry, which drops the entry itself
+      // rather than waiting for a 'close' event: close() emits none for a
+      // connection that's down between retries, such as a stub waiting for
+      // its next retry, and a stub left registered would refuse a later
+      // connect of its id as already registered.
+      // Then fail the gate, as every other runtime gate does when its
+      // accounting fails. Installing it paused every registered server's
+      // data plane, and left standing it would hold their data until some
+      // other gate completed. While serving, failMcplDataPlaneGate recycles
+      // those servers, so a server without `reconnect: true` stays closed;
+      // while stopping, it releases the gate. It runs after the close, which
+      // has taken this connection out of the registry unless the close
+      // failed, which closeFailedRuntimeConnect logs.
       // Ordering matters: awareness accounting settles BEFORE the §5.3
       // policy round-trip below, so an accounting failure aborts with the
       // grant still empty and every buffered event still behind the gate —
       // a failed connect never reports a released data plane. (The reverse
       // order let a push arrive during the policy await and get flushed by
       // teardown.)
-      await connection.close().catch(() => {});
+      await this.closeFailedRuntimeConnect(connection, 'awareness accounting');
+      await this.failMcplDataPlaneGate(awarenessBarrier, `connect of MCPL server "${config.id}"`, error);
       throw error;
     }
 
@@ -17857,7 +17891,22 @@ export class AgentFramework {
     // completes: the grant is established (or knowingly left empty) before
     // ANY buffered traffic (control or data) flows. complete() then
     // ready()s both planes through the admission gate.
-    await this.registerMcplServerFeatures(config, connection);
+    try {
+      await this.registerMcplServerFeatures(config, connection);
+    } catch (error) {
+      // A policy registration that throws would leave the new connection
+      // live and half registered, and the gate standing over every other
+      // server's data. So close the connection for good through the
+      // registry, as the catch above does, then complete the gate rather
+      // than fail it: accounting succeeded, so nothing calls for a recycle.
+      // A close that fails keeps the connection registered, but a connection
+      // closed for good readies nothing, so this completion, and any later
+      // one, leaves it paused.
+      // Every exit of a runtime connect settles the gate it installed.
+      await this.closeFailedRuntimeConnect(connection, 'policy registration');
+      this.completeMcplDataPlaneGate(awarenessBarrier);
+      throw error;
+    }
     this.completeMcplDataPlaneGate(awarenessBarrier);
 
     this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
@@ -18013,7 +18062,7 @@ export class AgentFramework {
             ...AgentFramework.policyRefusalFields(receipt),
           });
           if (fallback === 'close') {
-            await connection.close();
+            await this.mcplServerRegistry!.closeServer(connection.id, connection);
             return;
           }
           connection.establishGrant(CapabilityGrant.empty());
@@ -18131,7 +18180,7 @@ export class AgentFramework {
           ...AgentFramework.policyRefusalFields(receipt),
         });
         if (fallback === 'close') {
-          await connection.close();
+          await this.mcplServerRegistry!.closeServer(connection.id, connection);
           return;
         }
         // mcp-only (§3.2): grant stays empty, MCPL privileged surface stays
