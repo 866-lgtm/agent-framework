@@ -38,6 +38,11 @@ export interface MountConfig {
    * - Exact name match: ".git", "node_modules"
    * - Directory glob: "node_modules/**" (anything under node_modules)
    * - Extension glob: "*.pyc" (any file ending in .pyc)
+   * A sync without a path and the watcher pass over what the list covers,
+   * and over entries with an editor's swap or backup file name whatever it
+   * says, a directory with what lies beneath it: `.name.swp` and `.name.swx`
+   * (the whole name), and names ending in `~` or in `.subl…tmp`, matched by
+   * `^\..+\.sw[px]$`, `~$` and `\.subl.*\.tmp$`.
    */
   ignore?: string[];
   /** Whether to follow symlinks (default: false) */
