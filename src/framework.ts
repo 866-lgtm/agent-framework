@@ -11750,15 +11750,15 @@ export class AgentFramework {
   private isUnreadPlacement(p: CoalescingPlacement): boolean {
     this.resolvePlacement(p);
     if (p.deferredId) return this.deferredMessages.some((m) => m.id === p.deferredId);
-    return this.isStoredUnreadPlacement(p);
+    if (!p.messageId) return false;
+    const agent = this.agents.get(p.agent);
+    return !!agent && this.isUnreadStoredMessage(agent, p.messageId);
   }
 
   /** Stored, a deferred entry once its flush has stored it, and unread. */
   private isStoredUnreadPlacement(p: CoalescingPlacement): boolean {
     this.resolvePlacement(p);
-    if (p.deferredId || !p.messageId) return false;
-    const agent = this.agents.get(p.agent);
-    return !!agent && this.isUnreadStoredMessage(agent, p.messageId);
+    return !p.deferredId && this.isUnreadPlacement(p);
   }
 
   /**
