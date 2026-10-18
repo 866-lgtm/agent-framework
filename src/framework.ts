@@ -2531,8 +2531,8 @@ export class AgentFramework {
       onTrace: (listener) => this.onTrace(listener),
       // The ONLY entry that confers module origin — a private closure the
       // framework hands to its own module registry. The public
-      // executeToolCall() is shared with model/ephemeral callers and always
-      // stamps agent origin (see there).
+      // executeToolCall(), whose callers act for an agent (the puppet, a
+      // host), always stamps agent origin (see there).
       callTool: (call) => this.executeToolCallFrom(call, { kind: 'module' }),
       notifyOps: (kind, agentName, message, data) => this.notifyOps(kind, agentName, message, data),
     });
@@ -17567,12 +17567,15 @@ export class AgentFramework {
   /**
    * Execute a tool call and return the result.
    * Routes to the appropriate handler (module registry or MCPL).
-   * Used by SubagentModule to dispatch tool calls for ephemeral agents.
+   * Its one caller in the framework is the operator's puppet
+   * (puppetToolCall), which puts the agent's inline cap on the call as
+   * resultMaxChars; a host may call it as well.
    *
-   * This public entry always carries AGENT origin. Ephemeral/promise-based
-   * callers are models, and provenance must identify which internal path a
-   * call entered through — a public method shared with model callers can
-   * never confer module trust, whatever the input claims. Module origin
+   * This public entry always carries AGENT origin. Its callers act for an
+   * agent, the puppet as the agent and a host for the model it runs, and
+   * provenance must identify which internal path a call entered through — a
+   * public method shared with model callers can never confer module trust,
+   * whatever the input claims. Module origin
    * exists only through the private closure handed to ModuleRegistry
    * (ctx.callTool → executeToolCallFrom with {kind:'module'}), which is exempt
    * from agent allowlists. Registered agents' allowedTools is enforced at
