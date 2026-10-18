@@ -754,7 +754,7 @@ describe('Conversation routing', () => {
     try {
       framework.pushEvent(incomingEvent({ channelId: 'slack:D9', text: 'hi', channelType: 'im' }));
       await framework.runUntilIdle();
-      const fork = 'conversation-slack-D9-g1';
+      const fork = forkName('slack:D9', 1);
       const g1 = framework.getAgent(fork);
       assert.ok(g1, 'the fork spawned');
       const disposed: string[] = [];
@@ -795,8 +795,8 @@ describe('Conversation routing', () => {
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'two' }]));
       framework.pushEvent(incomingEvent({ channelId: 'slack:D11', text: 'hi', channelType: 'im' }));
       await framework.runUntilIdle();
-      const failing = 'conversation-slack-D10-g1';
-      const next = 'conversation-slack-D11-g1';
+      const failing = forkName('slack:D10', 1);
+      const next = forkName('slack:D11', 1);
       assert.ok(framework.getAgent(failing) && framework.getAgent(next), 'both forks spawned');
 
       // Both closed, with no closure inference left to run (the case the
