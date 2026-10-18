@@ -1302,6 +1302,56 @@ describe('code_execution per-call time limit (time_limit_ms)', () => {
     }
   });
 
+  const createWith = (storePath: string, codeExecution: Record<string, unknown>) =>
+    AgentFramework.create({
+      storePath,
+      membrane: new MockMembrane().asMembrane(),
+      agents: [],
+      modules: [],
+      syncIntervalMs: 0,
+      codeExecution: codeExecution as never,
+    });
+
+  it('create() refuses a codeExecution.enabled that is not true or false, a quoted "false" included', async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-enabled-');
+    try {
+      // A quoted "false" is truthy, so it turned code execution on, and 0 is
+      // falsy, so it was read as off without a word. The value isn't shown,
+      // since a substituted value can be a credential.
+      for (const [enabled, refused] of [
+        ['false', /^Error: codeExecution\.enabled must be true or false, unquoted, not a string: true gives agents the code_execution tool/],
+        ['sk-secret-token', /^Error: codeExecution\.enabled must be true or false, unquoted, not a string:/],
+        [0, /^Error: codeExecution\.enabled must be true or false, not a number:/],
+        [{ on: true }, /^Error: codeExecution\.enabled must be true or false, not an object:/],
+      ] as const) {
+        await assert.rejects(createWith(storePath, { enabled }), (error: Error) => {
+          assert.match(String(error), refused);
+          assert.doesNotMatch(String(error), /sk-secret-token/);
+          return true;
+        });
+      }
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('a null codeExecution.enabled counts as left out, and a configuration that is off has nothing else checked', async () => {
+    for (const codeExecution of [
+      { enabled: null },
+      // Contradictory limits are refused only once code execution is on.
+      { enabled: false, scriptTimeoutMs: 600_000, maxScriptTimeoutMs: 60_000 },
+    ]) {
+      const { tempDir, storePath } = tempStorePath('pytc-enabled-off-');
+      const framework = await createWith(storePath, codeExecution);
+      try {
+        assert.equal(framework.getAllTools().some((tool) => tool.name === 'code_execution'), false);
+      } finally {
+        await framework.stop();
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+  });
+
   async function withFramework(
     codeExecution: Record<string, unknown>,
     body: (framework: AgentFramework) => Promise<void>,

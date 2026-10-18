@@ -41,7 +41,8 @@ export interface ProcessLoggingConfig {
  * the agent already has broader host access through its tools).
  */
 export interface CodeExecutionConfig {
-  /** Master switch — the tool is only synthesized when true. */
+  /** Master switch — the tool is only synthesized when true. `create()`
+   *  refuses anything but true, false or null, a quoted "false" included. */
   enabled: boolean;
   /** Python interpreter to spawn (default: 'python3' from PATH). */
   pythonPath?: string;
