@@ -7366,7 +7366,16 @@ export class AgentFramework {
       this.disposedEphemeralFrames.add(agent);
       // Cancel before deregistration. Adapters may still yield a queued event;
       // driveStream's Agent-identity check above discards it before dispatch.
-      agent.cancelStream();
+      // A cancel that throws leaves its stream running, and the rest of this
+      // cleanup runs all the same, so the run still leaves and its outcome
+      // still says why it ended. A stop() that found the stream has reported
+      // the failure itself, and a later stop() waits for the stream
+      // (leftRunning).
+      try {
+        agent.cancelStream();
+      } catch (error) {
+        console.error(`[ephemeral] agent=${agent.name} its stream's cancel failed at the run's end; the run leaves all the same:`, error);
+      }
       if (this.ephemeralRuns.get(agent.name) === run) this.ephemeralRuns.delete(agent.name);
       if (this.agents.get(agent.name) === agent) {
         // What is still queued for the run, such as a message held for its

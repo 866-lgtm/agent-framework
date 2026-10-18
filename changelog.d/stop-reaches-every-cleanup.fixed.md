@@ -13,6 +13,12 @@
     out is: `stop()` doesn't wait for it, even with no budget, its agent's
     deferred writes stay queued, and a later `stop()` waits for it before
     it closes the store.
+  - An ephemeral run whose own stream's `cancel()` throws at the run's end
+    now leaves all the same, and settles as it ended, such as with
+    `stop()`'s refusal, rather than with the cancel's error, which is
+    logged. Before, the throw skipped the run's cleanup: the run and its
+    agent stayed registered, and the stream's later text still reached the
+    agent's context.
 - `stop()` now ends Discord awareness delivery. A drain running when
   `stop()` begins sends nothing more, and the marks it hasn't sent stay
   pending in the outbox, unrecorded, for the next start's barrier; a line in

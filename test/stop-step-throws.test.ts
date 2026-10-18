@@ -258,6 +258,60 @@ describe('a step of stop() that throws', () => {
     assert.equal(cancels, 2, 'no cancel once the stream has ended');
     assert.equal(internals(framework).ownedStoreClosed, true, 'once the stream has ended, a stop() closes the store');
   });
+
+  it("an ephemeral run whose own stream's cancel() throws still leaves when stop() ends it, with stop()'s reason, and its stream's late text reaches no context", async (t) => {
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    t.after(() => release());
+    const error = new Error("zz the worker stream's cancel failed");
+    class CancelThrows extends HeldStream {
+      override cancel(): void {
+        throw error;
+      }
+    }
+    const membrane = new MockMembrane();
+    membrane.streamYielding = (request) => {
+      membrane.calls.push(request);
+      return new CancelThrows(released, [createMockResponse([{ type: 'text', text: 'late words' }])]);
+    };
+    const dir = mkdtempSync(join(tmpdir(), 'stop-step-throws-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'), membrane: membrane.asMembrane(), syncIntervalMs: 0, maintenanceIntervalMs: 0,
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'test' }], modules: [],
+    });
+    framework.start();
+    const { agent, contextManager } = await framework.createEphemeralAgent({
+      name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
+    });
+    contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
+    const run = framework.runEphemeralToCompletion(agent, contextManager, { startupTimeoutMs: 30_000 });
+    run.catch(() => {});
+    const activeStreams = internals(framework).activeStreams as Map<string, unknown>;
+    for (let waited = 0; !activeStreams.has('worker'); waited += 10) {
+      assert.ok(waited < 10_000, "the worker's stream is being driven");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const logged: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+    const first = await settlesWithin(framework.stop(), 10_000);
+    assert.ok(failedWith(first, error), `stop() fails with the cancel's error, got ${String(first)}`);
+    // The run's end cancels the stream again, and that cancel throws too.
+    assert.match(String(await settlesWithin(run, 10_000)), /refused: the framework is stopping/, "the run ended, and its outcome says why");
+    assert.ok(logged.some((line) => line.startsWith(
+      "[ephemeral] agent=worker its stream's cancel failed at the run's end; the run leaves all the same:")), logged.join('\n'));
+    assert.equal((internals(framework).ephemeralRuns as Map<string, unknown>).has('worker'), false, 'the run left');
+    assert.equal((internals(framework).agents as Map<string, unknown>).has('worker'), false, 'its agent left');
+    // The stream runs on until released, and stop() left it running.
+    const leftRunning = [...(internals(framework).leftRunning as Map<Promise<unknown>, unknown>).keys()];
+    assert.equal(leftRunning.length, 1, "stop() left the worker's stream running");
+    release();
+    await Promise.allSettled(leftRunning);
+    assert.equal(JSON.stringify(contextManager.getAllMessages()).includes('late words'), false,
+      "the stream's late text reaches no context, the worker's own included");
+    await framework.stop();
+    assert.equal(internals(framework).ownedStoreClosed, true, 'once the stream has ended, a stop() closes the store');
+  });
 });
 
 /** What `settling` came to within `ms`: 'resolved', its rejection, or 'still waiting'. */
