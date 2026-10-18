@@ -41,6 +41,15 @@ const server = createServer((req, res) => {
     // a header type carrying a C1 control (sent as the Latin-1 byte 0x85),
     // over bytes no sniffer recognizes
     res.writeHead(200, { 'content-type': 'text/pl\u0085ain; charset=utf-8' }); res.end(Buffer.from('plain bytes, nothing to sniff'));
+  } else if (url.pathname === '/drip') {
+    // sends ?first bytes at once and ?rest more after ?wait ms, so a fetch
+    // can be stopped partway, with what arrived before it known
+    const first = Number(url.searchParams.get('first') ?? 1000);
+    const rest = Number(url.searchParams.get('rest') ?? 1000);
+    const timer = setTimeout(() => res.end(Buffer.alloc(rest, 9)), Number(url.searchParams.get('wait') ?? 50));
+    res.on('close', () => clearTimeout(timer));
+    res.writeHead(200, { 'content-type': 'application/octet-stream' });
+    res.write(Buffer.alloc(first, 9));
   } else if (url.pathname === '/liar') {
     // claims small in testimony, streams big (vector 10)
     res.writeHead(200, { 'content-type': 'application/octet-stream' });
@@ -370,14 +379,81 @@ for (const expired of [true, false]) {
   });
 }
 
-test('per-server budget exhausts cumulatively', async () => {
+/** A refusal by the budget says it lasts, so a second try is no use (F59's I11). */
+const BUDGET_LASTS = "the budget isn't renewed while this host runs, so calling again won't change that";
+const STOPPED_BY_BUDGET = new RegExp(`^aborted: actual bytes exceeded per-server budget at \\d+; ${BUDGET_LASTS}$`);
+
+test('per-server budget exhausts cumulatively, each fetch counting once', async () => {
   const reg = new ReferenceRegistry();
-  const f = makeFetcher({ srv: { url: ORIGIN, autofetch: { maxTotalBytes: PAYLOAD.length + 10 } } });
+  const f = makeFetcher({ srv: { url: ORIGIN, autofetch: { maxTotalBytes: 2 * PAYLOAD.length } } });
   const a = await f.fetch(makeRecord(reg, `${ORIGIN}/ok?n=1`));
   assert.equal(a.ok, true, a.error);
+  // Exactly what's left: still within the budget.
   const b = await f.fetch(makeRecord(reg, `${ORIGIN}/ok?n=2`));
-  assert.equal(b.ok, false);
-  assert.match(b.error!, /budget/);
+  assert.equal(b.ok, true, b.error);
+  const c = await f.fetch(makeRecord(reg, `${ORIGIN}/ok?n=3`));
+  assert.equal(c.ok, false);
+  assert.equal(c.error, `per-server fetch budget exhausted (${2 * PAYLOAD.length}/${2 * PAYLOAD.length} bytes); ${BUDGET_LASTS}`);
+});
+
+test("a download the budget stops says so, and what arrived counts toward the next fetch's refusal", async () => {
+  const reg = new ReferenceRegistry();
+  const f = makeFetcher({ srv: { url: ORIGIN, autofetch: { maxTotalBytes: 1000 } } });
+  const out = await f.fetch(makeRecord(reg, `${ORIGIN}/liar?budget-abort`));
+  assert.match(out.error!, STOPPED_BY_BUDGET);
+  const next = await f.fetch(makeRecord(reg, `${ORIGIN}/ok?after-budget-abort`));
+  assert.match(next.error!, new RegExp(`^per-server fetch budget exhausted \\(\\d+/1000 bytes\\); ${BUDGET_LASTS}$`));
+});
+
+test('concurrent fetches from one server share its budget, and none takes what another spent', async () => {
+  const reg = new ReferenceRegistry();
+  const budget = 2 * PAYLOAD.length + 100;
+  const f = makeFetcher({ srv: { url: ORIGIN, autofetch: { maxTotalBytes: budget } } });
+  // As the eager path does: several at once, each starting with the whole budget left.
+  const outs = await Promise.all([1, 2, 3, 4].map((n) => f.fetch(makeRecord(reg, `${ORIGIN}/ok?shared-${n}`))));
+  const kept = outs.filter((o) => o.ok);
+  assert.ok(kept.length * PAYLOAD.length <= budget, `${kept.length} kept, ${kept.length * PAYLOAD.length} bytes against ${budget}`);
+  const refused = outs.filter((o) => !o.ok);
+  assert.ok(refused.length > 0, 'four payloads cannot fit a budget of two and a bit');
+  for (const o of refused) assert.match(o.error!, STOPPED_BY_BUDGET);
+  // Every byte that arrived counts, so a fifth is refused before it dials.
+  const fifth = await f.fetch(makeRecord(reg, `${ORIGIN}/ok?shared-5`));
+  assert.match(fifth.error!, /^per-server fetch budget exhausted/);
+});
+
+test("bytes the workspace couldn't store still count against the budget", async () => {
+  const reg = new ReferenceRegistry();
+  const unsaved = new ReferenceFetcher(() => ({ url: ORIGIN, autofetch: { maxTotalBytes: PAYLOAD.length + 100 } }), async () => null);
+  const notStored = await unsaved.fetch(makeRecord(reg, `${ORIGIN}/ok?unsaved-1`));
+  assert.equal(notStored.error, 'no writable workspace mount to store the payload');
+  assert.match((await unsaved.fetch(makeRecord(reg, `${ORIGIN}/ok?unsaved-2`))).error!, STOPPED_BY_BUDGET);
+});
+
+test("bytes that don't match their digest still count against the budget", async () => {
+  const reg = new ReferenceRegistry();
+  const f = makeFetcher({ srv: { url: ORIGIN, autofetch: { maxTotalBytes: PAYLOAD.length + 100 } } });
+  const mismatch = await f.fetch(makeRecord(reg, `${ORIGIN}/ok?mismatch-charged`, { digest: 'sha256:' + 'B'.repeat(43) }));
+  assert.match(mismatch.error!, /^digest mismatch/);
+  assert.match((await f.fetch(makeRecord(reg, `${ORIGIN}/ok?after-mismatch`))).error!, STOPPED_BY_BUDGET);
+});
+
+test('bytes that arrived before a timeout still count against the budget', async () => {
+  const reg = new ReferenceRegistry();
+  const f = makeFetcher({ srv: { url: ORIGIN, autofetch: { maxTotalBytes: PAYLOAD.length + 300 } } });
+  // 1000 bytes arrive at once, and the rest only after the fetch gives up.
+  const slow = await f.fetch(makeRecord(reg, `${ORIGIN}/drip?first=1000&rest=1000&wait=5000`), { timeoutMs: 100 });
+  assert.equal(slow.error, 'fetch timed out or aborted');
+  assert.match((await f.fetch(makeRecord(reg, `${ORIGIN}/ok?after-timeout`))).error!, STOPPED_BY_BUDGET);
+});
+
+test('bytes past the ceiling still count against the budget', async () => {
+  const reg = new ReferenceRegistry();
+  const f = makeFetcher({ srv: { url: ORIGIN, autofetch: { maxTotalBytes: PAYLOAD.length + 500 } } });
+  // 1200 bytes arrive before the pause: past max_bytes, within the budget. A
+  // payload alone fits what's left only if those 1200 bytes went uncounted.
+  const out = await f.fetch(makeRecord(reg, `${ORIGIN}/drip?first=1200&rest=5000&wait=2000`), { maxBytes: 1000 });
+  assert.match(out.error!, /^aborted: actual bytes exceeded ceiling at 1200$/);
+  assert.match((await f.fetch(makeRecord(reg, `${ORIGIN}/ok?after-ceiling`))).error!, STOPPED_BY_BUDGET);
 });
 
 test('eager eligibility: small + sized + connection origin only', () => {
