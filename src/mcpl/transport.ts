@@ -86,9 +86,9 @@ export abstract class McplTransport extends EventEmitter {
   }
 
   /**
-   * Resolves once the server's diagnostic stream has ended, so that
-   * {@link stderrTail} holds all of it, or once `ms` have passed while it
-   * hasn't. At once for a transport that has none.
+   * Resolves once the server's diagnostic stream has ended or closed, so that
+   * {@link stderrTail} holds what arrived on it, or once `ms` have passed while
+   * it hasn't. At once for a transport that has none.
    */
   stderrEnded(_ms: number): Promise<void> {
     return Promise.resolve();
@@ -196,17 +196,16 @@ export function buildChildEnv(
 export const STDERR_TAIL_CHARS = 2_048;
 
 /**
- * How long a failed handshake waits for a stdio child's stderr to end after the
- * child's exit, so that its refusal's `stderrTail` holds what the child wrote.
- * Node can emit a child's `exit` before it has read the last of the child's
- * stderr. When the child held the stream alone, the stream ends with it, so the
- * wait is over at once or within a turn of the loop. The bound binds only when
- * another process still holds the stream, such as one the server started that
- * inherited it. One that ends as the server does closes the stream within a
- * fraction of a second even on a loaded host, and its last words then reach
- * the tail. One that keeps the stream open, such as a process the server
- * started and left running, holds the refusal up by the bound, a fifth of the
- * reconnect's default first interval.
+ * How long a refusal at a stdio child's exit waits for the child's stderr to
+ * end, so that its `stderrTail` holds what the child wrote. Node can emit a
+ * child's `exit` before it has read the last of the child's stderr. When the
+ * child held the stream alone, the stream ends with it, and the wait is short.
+ * The bound binds when another process still holds the stream, such as one the
+ * server started that inherited it, or when the host's loop stalls past it
+ * before reading an end that is waiting. The tail then holds what had arrived.
+ * A process that keeps the stream open, such as one the server started and
+ * left running, holds the refusal up by the bound, a fifth of the reconnect's
+ * default first interval.
  */
 export const STDERR_END_WAIT_MS = 1_000;
 
