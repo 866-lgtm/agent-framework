@@ -40,9 +40,10 @@ const joined = (notes: Array<string | null>): string | undefined => {
  * line's rest starts, since reading on in order starts there: before the next
  * line, or, on the page that ends the file, before the file is read whole. A
  * page whose own fields and least content pass `maxChars` still moves on, and
- * passes it.
+ * passes it. With no `maxChars`, for a call made in process, which takes the
+ * data itself, the page holds to `limit` alone and shows every line whole.
  */
-export function linePage(path: string, file: FileText, offset: number, limit: number, maxChars: number, extraNotes: string[] = []): ToolResult {
+export function linePage(path: string, file: FileText, offset: number, limit: number, maxChars: number | undefined, extraNotes: string[] = []): ToolResult {
   const { lines, starts } = file;
   const total = lines.length;
   const first = offset - 1;
@@ -73,6 +74,10 @@ export function linePage(path: string, file: FileText, offset: number, limit: nu
   const page = (to: number, content: string, note: string | undefined) => ({
     path, totalLines: total, fromLine: first + 1, toLine: to, ...(note !== undefined ? { note } : {}), content,
   });
+  if (maxChars === undefined) {
+    const whole = lines.slice(first, last).map((line, k) => numberedLine(line, first + k + 1, Infinity)).join('\n');
+    return { success: true, data: page(last, whole, joined([last < total ? limitNote(last, null) : null, ...notes])) };
+  }
   // The most anything but the lines can take: the longer note, with the
   // largest numbers this page could show.
   const overhead = Math.max(
@@ -144,9 +149,9 @@ const splitsPair = (text: string, at: number): boolean =>
 /**
  * Raw text from `offsetChars`, at most `limitChars` code units (one more to
  * keep a surrogate pair whole), stopped sooner where its data would pass
- * `maxChars` as JSON.
+ * `maxChars` as JSON, if there is one.
  */
-export function characterPage(path: string, file: FileText, offsetChars: number, limitChars: number, maxChars: number, extraNotes: string[] = []): ToolResult {
+export function characterPage(path: string, file: FileText, offsetChars: number, limitChars: number, maxChars: number | undefined, extraNotes: string[] = []): ToolResult {
   const text = file.raw;
   const start = Math.min(offsetChars, text.length);
   if (splitsPair(text, start)) {
@@ -166,7 +171,7 @@ export function characterPage(path: string, file: FileText, offsetChars: number,
     content: text.slice(start, to),
   });
   const whole = page(end, joined(notes));
-  if (JSON.stringify(whole).length <= maxChars) return { success: true, data: whole };
+  if (maxChars === undefined || JSON.stringify(whole).length <= maxChars) return { success: true, data: whole };
   // As many characters as fit beside the rest of the page, which takes the
   // most with the largest offset it could stop at.
   const overhead = JSON.stringify({ ...page(end, joined([stoppedNote(end), ...notes])), nextOffsetChars: end, content: '' }).length;

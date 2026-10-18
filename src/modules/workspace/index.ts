@@ -1602,8 +1602,9 @@ export class WorkspaceModule implements Module {
       }
       const input = call.input as Record<string, unknown>;
       // The most of this call's result the framework stores before it spills
-      // the rest into a file; a call it didn't dispatch gets the default.
-      const resultMaxChars = call.resultMaxChars ?? DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS;
+      // the rest into a file. A call made in process carries none and takes
+      // the data itself, so its read pages by its line limit alone.
+      const resultMaxChars = call.resultMaxChars;
       const generated = typeof input?.path === 'string' ? this.findGeneratedTextFile(input.path) : undefined;
       if (generated) {
         if (call.name === 'read' && call.callerAgentName === generated.agentName) {
@@ -2674,9 +2675,11 @@ export class WorkspaceModule implements Module {
 
   /**
    * A read's page, held to `maxChars`, the most the framework stores of this
-   * call's result before it spills the rest into a file.
+   * call's result before it spills the rest into a file. A call that carries
+   * none, made in process, takes the data itself: its page holds to its line
+   * limit alone, with every line whole, as it did before pages had a budget.
    */
-  private async handleRead(input: ReadInput, maxChars: number, generatedContent?: string): Promise<ToolResult> {
+  private async handleRead(input: ReadInput, maxChars: number | undefined, generatedContent?: string): Promise<ToolResult> {
     const characterPaging = input.offsetChars !== undefined || input.limitChars !== undefined;
     // Each number is a whole number of at least its schema's minimum by now
     // (inputProblem).
@@ -2723,8 +2726,8 @@ export class WorkspaceModule implements Module {
     }
     // An unlimited read of a large file would inject the whole thing into the
     // turn (a 2MB file ≈ 600k tokens → the request blows past the model
-    // context and 400s), so an omitted limit falls back to a default, and
-    // every page stops at the result limit.
+    // context and 400s), so an omitted limit falls back to a default, and a
+    // page stops at the call's result limit where it has one.
     return characterPaging
       ? characterPage(input.path, file, input.offsetChars ?? 0, input.limitChars ?? 2000, maxChars, notes)
       : linePage(input.path, file, input.offset ?? 1, input.limit ?? DEFAULT_READ_LINE_LIMIT, maxChars, notes);

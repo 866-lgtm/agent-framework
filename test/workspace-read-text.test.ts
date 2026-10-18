@@ -16,7 +16,7 @@ async function setup(t: TestContext, content: string | Buffer) {
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
   assert.equal((await workspace.writeBinary('work/text.txt', Buffer.from(content), 'text/plain')).success, true);
   // A call the framework dispatched carries the most of its result it stores
-  // (resultMaxChars); one without it gets the framework's default, 24,000.
+  // (resultMaxChars); one without it is made in process.
   const read = (input: Record<string, unknown> = {}, resultMaxChars?: number) => workspace.handleToolCall({
     id: 'read', name: 'read', input: { path: 'work/text.txt', ...input }, ...(resultMaxChars !== undefined ? { resultMaxChars } : {}),
   });
@@ -83,7 +83,7 @@ test('a long line is cut at 2000 characters, with the offsetChars that reads the
   // A BOM and a CRLF before the long line, so its offset counts both.
   const long = 'x'.repeat(1999) + '😀' + 'y'.repeat(1000);
   const { read } = await setup(t, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(`short\r\n${long}\r\nlast\r\n`)]));
-  const page = (await read()).data as LinePage;
+  const page = (await read({}, 24_000)).data as LinePage;
   const lines = page.content.split('\n');
   assert.equal(lines.length, 3);
   // The cut doesn't split the emoji's surrogate pair: it falls before it.
@@ -94,7 +94,7 @@ test('a long line is cut at 2000 characters, with the offsetChars that reads the
   assert.equal(more.content, '😀' + 'y'.repeat(1000));
   assert.equal(lines[2], '     3\tlast');
   // Where the cut line ends the page, its note names the offset its marker does.
-  const two = (await read({ limit: 2 })).data as LinePage;
+  const two = (await read({ limit: 2 }, 24_000)).data as LinePage;
   assert.ok(two.note!.startsWith(`Truncated at 2 lines (file has 3). Line 2 is cut: read its rest with offsetChars=${at}. Use offset/limit to read more.`), two.note);
 });
 
@@ -169,7 +169,7 @@ test('a page whose last line is cut names where its rest starts before the next 
   const { read } = await setup(t, `short\n${long}\n${long}\n${long}\n`);
   const at = (line: number) => 'short\n'.length + (line - 2) * (long.length + 1) + 2000;
   // The limit stops the page at the cut line.
-  const byLimit = (await read({ limit: 2 })).data as LinePage;
+  const byLimit = (await read({ limit: 2 }, 24_000)).data as LinePage;
   assert.equal(byLimit.toLine, 2);
   assert.equal(byLimit.note, `Truncated at 2 lines (file has 4). Line 2 is cut: read its rest with offsetChars=${at(2)}. Use offset/limit to read more.`);
   // The result limit stops it there: line 4 would pass 5,000 characters.
@@ -187,13 +187,29 @@ test('a page whose last line is cut names where its rest starts before the next 
   assert.equal(((await readShort({}, 24_000)).data as LinePage).note, undefined);
 });
 
-test('a call that carries no resultMaxChars gets pages held to the framework\'s default, 24,000', async t => {
-  const { read } = await setup(t, Array.from({ length: 3000 }, (_, i) => `line ${i + 1} of a file long enough to pass the default`).join('\n'));
-  const result = await read();
-  assert.ok(stored(result) <= 24_000, `${stored(result)}`);
-  const page = result.data as LinePage;
-  assert.ok(page.toLine! < 2000);
-  assert.match(page.note!, /^Stopped at line \d+ to stay within the 24000-character result limit/);
+test('a call that carries no resultMaxChars pages by its line limit alone, with every line whole', async t => {
+  // Such a call is made in process, and its caller takes the data itself, as
+  // connectome-host's file viewer does with limit 5000 and a cap of its own.
+  const long = 'q'.repeat(3000);
+  const lines = Array.from({ length: 3000 }, (_, i) => (i === 10 ? long : `line ${i + 1} of a file long enough to pass 24,000 characters`));
+  const { read } = await setup(t, lines.join('\r\n'));
+  const page = (await read({ limit: 2500 })).data as LinePage;
+  assert.equal(page.toLine, 2500);
+  assert.equal(page.note, 'Truncated at 2500 lines (file has 3000). Use offset/limit to read more. Line ends are CRLF, shown without the CR. An edit matches text as read shows it, and keeps the CRLF ends.');
+  const shown = page.content.split('\n');
+  assert.equal(shown.length, 2500);
+  assert.equal(shown[10], `    11\t${long}`);
+  assert.ok(JSON.stringify(page).length > 100_000, `${JSON.stringify(page).length}`);
+  // The default is 2000 lines, and the page that ends the file has no note but the text's.
+  assert.equal(((await read()).data as LinePage).toLine, 2000);
+  const end = (await read({ offset: 2001 })).data as LinePage;
+  assert.equal(end.toLine, 3000);
+  assert.equal(end.note, 'Line ends are CRLF, shown without the CR. An edit matches text as read shows it, and keeps the CRLF ends.');
+  // A character page gives its limitChars whole too.
+  const chars = (await read({ offsetChars: 0, limitChars: 100_000 })).data as CharPage;
+  assert.equal(chars.content.length, 100_000);
+  assert.equal(chars.nextOffsetChars, 100_000);
+  assert.equal(chars.note, undefined);
 });
 
 test('a character page stops at the result limit too, with nextOffsetChars', async t => {

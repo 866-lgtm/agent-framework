@@ -253,8 +253,10 @@ export interface ToolCall {
    * it, as the puppet's does; the framework's own read_image tool passes a
    * model's call to the workspace without it; and a utility run through
    * `utils` carries what its `utils` call carried. Without it, a module holds
-   * its answer to a bound of its own, if any: the workspace's is the house
-   * default, 24,000.
+   * its answer to a bound of its own, if any: the workspace's `edit` and
+   * `edit_many` answers hold to the house default, 24,000, and a `read` holds
+   * its page to its line limit alone, with every line whole, since such a
+   * caller takes the data itself.
    */
   resultMaxChars?: number;
 }
