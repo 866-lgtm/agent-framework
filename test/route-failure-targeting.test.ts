@@ -241,9 +241,31 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(primary.mock.callCount(), 1);
       const [, content, metadata] = primary.mock.calls[0]!.arguments;
       assert.match(JSON.stringify(content),
-        /\[discord-send-failed\] A reply by released-conversation \(5 chars\) could not be delivered to missing-channel \(no registered channel[^)]*\)\. released-conversation has ended, and the human did not receive it\./);
+        /\[discord-send-failed\] A reply by released-conversation \(5 chars\) could not be delivered to missing-channel \(no registered channel[^)]*\)\. Nothing was posted\. released-conversation has ended\./);
       assert.equal(metadata?.speaker, 'released-conversation');
       assert.equal(metadata?.textLen, 5);
+      assert.equal(internals(framework).pendingRequests.length, 0, 'context only: the primary is not woken');
+    });
+
+    it('tells the primary, by name, in the speaker\'s notice\'s words when an ended speaker\'s delivery was not confirmed', async (t) => {
+      const primary = t.mock.method(framework.getAgent('primary')!.getContextManager(), 'addMessage');
+      const registry = internals(framework).channelRegistry as unknown as {
+        onRouteFailure(info: { conversationId: string; channelId: string | null; reason: string; textLen: number; outcome?: 'failed' | 'unknown'; detail?: string }): void;
+      };
+
+      registry.onRouteFailure({
+        conversationId: 'released-conversation', channelId: 'missing-channel', reason: 'connection lost', textLen: 5,
+        outcome: 'unknown', detail: 'status 503',
+      });
+
+      assert.equal(primary.mock.callCount(), 1);
+      const [, content, metadata] = primary.mock.calls[0]!.arguments;
+      assert.equal((content as Array<{ text: string }>)[0]!.text,
+        '[discord-send-failed] Delivery of a reply by released-conversation (5 chars) to missing-channel was not confirmed (connection lost). ' +
+        'It may or may not have been posted, so sending it again could post it twice. released-conversation has ended. Connector detail: status 503');
+      assert.equal(metadata?.speaker, 'released-conversation');
+      assert.equal(metadata?.outcome, 'unknown');
+      assert.equal(metadata?.detail, 'status 503');
       assert.equal(internals(framework).pendingRequests.length, 0, 'context only: the primary is not woken');
     });
 
@@ -444,7 +466,7 @@ describe('notices about an agent\'s own action', () => {
       const told = messages.filter((m) => JSON.stringify(m.content).includes(SEND_FAILED));
       assert.equal(told.length, 1);
       assert.match(JSON.stringify(told[0]!.content),
-        new RegExp(`A reply by ${fork.name} \\(${reply.length} chars\\) could not be delivered to missing-channel \\(no registered channel[^)]*\\)\\. ${fork.name} has ended, and the human did not receive it\\.`));
+        new RegExp(`A reply by ${fork.name} \\(${reply.length} chars\\) could not be delivered to missing-channel \\(no registered channel[^)]*\\)\\. Nothing was posted\\. ${fork.name} has ended\\.`));
     });
 
     it('passes on only what a fork never read: a notice its later turn compiled stays its own', async () => {
@@ -597,8 +619,8 @@ describe('notices about an agent\'s own action', () => {
       const { messages } = await framework.getAgent('primary')!.getContextManager().compile();
       const told = messages.filter((m) => JSON.stringify(m.content).includes('has ended')).map((m) => JSON.stringify(m.content));
       assert.equal(told.length, 2);
-      assert.match(told[0]!, /A reply by conversation-gone \(12 chars\) could not be delivered to missing-channel \(no registered channel\)\. conversation-gone has ended/);
-      assert.match(told[1]!, /A reply by conversation-older could not be delivered to missing-channel\. conversation-older has ended/);
+      assert.match(told[0]!, /A reply by conversation-gone \(12 chars\) could not be delivered to missing-channel \(no registered channel\)\. Nothing was posted\. conversation-gone has ended\./);
+      assert.match(told[1]!, /A reply by conversation-older could not be delivered to missing-channel\. Nothing was posted\. conversation-older has ended\./);
       assert.ok(!told.some((t) => t.includes('undefined')));
       assert.equal(count(messages, 'an ordinary write'), 0);
       assert.ok(errors.some((e) => /"conversation-gone" is not a registered agent — message dropped \(participant=user\)/.test(e)));
@@ -702,7 +724,7 @@ describe('notices about an agent\'s own action', () => {
         const told = primary.messages.filter((m) => JSON.stringify(m.content).includes(SEND_FAILED));
         assert.equal(told.length, 1);
         assert.match(JSON.stringify(told[0]!.content),
-          new RegExp(`A reply by ${fork.name} \\(${finalReply.length} chars\\) could not be delivered to #closure test \\(closure-channel\\) \\(.*delivered:false.*\\)\\. ${fork.name} has ended, and the human did not receive it\\.`));
+          new RegExp(`A reply by ${fork.name} \\(${finalReply.length} chars\\) could not be delivered to #closure test \\(closure-channel\\) \\(.*delivered:false.*\\)\\. Nothing was posted\\. ${fork.name} has ended\\.`));
         assert.equal(membrane.calls.length, 2, 'only the initial and closure turns ran');
         assert.equal(state.pendingRequests.length, 0, 'a failed closure reply does not wake another turn');
       });

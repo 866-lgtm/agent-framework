@@ -19334,17 +19334,22 @@ export class AgentFramework {
   }
 
   /**
-   * A fork or an ephemeral run ended before reading that its reply never
-   * reached the human: it was released with the notice unread or still
+   * A fork or an ephemeral run ended before reading that its reply's delivery
+   * to a channel failed: it was released with the notice unread or still
    * queued, its queued notice was restored at boot after it was gone, or its
    * delivery failed after release. Tell the primary instead, naming the
    * speaker, so an agent who can still act learns of it: to resend, or to
-   * tell the human. Only for a delivery to a channel; a reply that had no
+   * tell the human. The words follow the speaker's own notice
+   * (onRouteFailure): a delivery that wasn't confirmed may have been posted,
+   * and neither text says no one saw the reply, since only this channel's
+   * routing failed. Only for a delivery to a channel; a reply that had no
    * channel to go to (no locus) had no human waiting for it. Never throws:
    * it runs inside a release, which must complete whatever this write meets.
    */
   private passFailedReplyToPrimary(speaker: string, metadata: MessageMetadata | undefined): void {
-    const failure = metadata as { kind?: unknown; channelId?: unknown; reason?: unknown; textLen?: unknown } | undefined;
+    const failure = metadata as {
+      kind?: unknown; channelId?: unknown; reason?: unknown; textLen?: unknown; outcome?: unknown; detail?: unknown;
+    } | undefined;
     if (failure?.kind !== 'discord-send-failed') return;
     if (typeof failure.channelId !== 'string' || failure.channelId === '') {
       console.error(`[route-failure] ${speaker} has ended, and its reply had no channel to reach: no one else is told`);
@@ -19356,21 +19361,30 @@ export class AgentFramework {
       console.error(`[route-failure] ${speaker} has ended, and there is no primary to tell that its reply to ${failure.channelId} failed`);
       return;
     }
-    // A notice queued by an earlier build may carry neither; say only what it has.
+    // A notice queued by an earlier build may carry none of these; say only
+    // what it has.
     const textLen = typeof failure.textLen === 'number' ? failure.textLen : undefined;
     const reason = typeof failure.reason === 'string' && failure.reason !== '' ? failure.reason : undefined;
+    const outcome = failure.outcome === 'failed' || failure.outcome === 'unknown' ? failure.outcome : undefined;
+    const detail = typeof failure.detail === 'string' ? failure.detail : undefined;
+    const size = textLen !== undefined ? ` (${textLen} chars)` : '';
+    const why = reason !== undefined ? ` (${reason})` : '';
+    const where = this.channelForNotice(failure.channelId);
+    const text = outcome === 'unknown'
+      ? `[discord-send-failed] Delivery of a reply by ${speaker}${size} to ${where} was not confirmed${why}. ` +
+        `It may or may not have been posted, so sending it again could post it twice. ${speaker} has ended.`
+      : `[discord-send-failed] A reply by ${speaker}${size} could not be delivered to ${where}${why}. ` +
+        `Nothing was posted. ${speaker} has ended.`;
     try {
       this.addMessage(
         'user',
-        [{
-          type: 'text',
-          text: `[discord-send-failed] A reply by ${speaker}${textLen !== undefined ? ` (${textLen} chars)` : ''} could not be delivered to ` +
-            `${this.channelForNotice(failure.channelId)}${reason !== undefined ? ` (${reason})` : ''}. ${speaker} has ended, and the human did not receive it.`,
-        }],
+        [{ type: 'text', text: text + (detail !== undefined ? ` Connector detail: ${detail}` : '') }],
         {
           system: true, kind: 'discord-send-failed', channelId: failure.channelId, speaker,
           ...(reason !== undefined ? { reason } : {}),
           ...(textLen !== undefined ? { textLen } : {}),
+          ...(outcome !== undefined ? { outcome } : {}),
+          ...(detail !== undefined ? { detail } : {}),
         } as MessageMetadata,
       );
     } catch (err) {
