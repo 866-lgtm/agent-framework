@@ -41,7 +41,7 @@ import { constants as fsConstants } from 'node:fs';
 import type { BigIntStats } from 'node:fs';
 import { lstat, mkdir, open, readdir, realpath, stat, statfs } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
-import { dirname, join, posix, sep } from 'node:path';
+import { dirname, isAbsolute, join, posix, sep } from 'node:path';
 import { sameRootIdentity, type Fingerprint, type RootIdentity } from './disk-agreement.js';
 
 export interface MountView {
@@ -224,10 +224,13 @@ async function listedName(dir: string, segment: string, given: BigIntStats | nul
  * and goes back up at `..`, to the directory it came from. At the mount's
  * root a `..` stops it, keeping the rest as given: a path can climb above
  * the root and come back in, as `../proj/x` does for a root named `proj`, and
- * walking that would list the directory above the root.
+ * walking that would list the directory above the root. An absolute path
+ * keeps its spelling too: it names a place from the filesystem's root, not
+ * the mount's, so walking it from the mount's root would respell it against
+ * other directories, and the path returned could lead outside the mount.
  */
 export async function diskSpelling(root: string, relativePath: string): Promise<string> {
-  if (relativePath === '') return relativePath;
+  if (relativePath === '' || isAbsolute(relativePath)) return relativePath;
   const segments = relativePath.split('/');
   // The directories walked into, the mount's root first.
   const dirs = [root];

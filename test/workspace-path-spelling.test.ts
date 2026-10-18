@@ -277,6 +277,19 @@ test('the step reads no further than a symlink or a `..` at the root, goes back 
   assert.equal(await diskSpelling(root, `../${basename(root)}/REAL`), `../${basename(root)}/REAL`, 'a `..` at the root lists nothing above it');
   assert.equal(await diskSpelling(root, 'REAL/./SUB'), 'real/./sub');
   assert.equal(await diskSpelling(root, 'REAL//SUB'), 'real//sub');
+  assert.equal(await diskSpelling(root, '/REAL/SUB'), '/REAL/SUB', 'an absolute path is not walked from the mount\'s root');
+});
+
+test('a path whose part after the mount\'s name is absolute keeps its spelling, so a disk reader reads the file it names', { skip: FOLDING_ONLY }, async (t) => {
+  const { workspace, dir } = await setup(t);
+  // The mount holds a directory spelled as the first segment of its own
+  // absolute path in another case, so walking that path from the mount's
+  // root would respell it and lead to a place outside the mount.
+  const first = dir.split('/')[1]!;
+  mkdirSync(join(dir, first === first.toUpperCase() ? first.toLowerCase() : first.toUpperCase()));
+  const fromDisk = await workspace.readBinaryFromDisk(`work/${join(dir, 'src', 'a.ts')}`);
+  assert.ok('absolutePath' in fromDisk, JSON.stringify(fromDisk));
+  assert.equal(fromDisk.absolutePath, join(dir, 'src', 'a.ts'));
 });
 
 test('on a disk that tells case apart, a directory spelled otherwise than a nested mount\'s is the outer mount\'s own',
