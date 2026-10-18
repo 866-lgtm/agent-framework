@@ -43,9 +43,9 @@
   - **A stop followed by a failure:** when a turn's compile fails after a
     stop reached it, the turn ends at the failure: its `inference:failed`,
     then its `inference:aborted`. It isn't held by a provider hold, and the
-    error policy doesn't retry it. If the agent was replaced or the
-    framework is stopping by then, the turn is dropped as theirs, before it
-    sends anything, as at the checks after the hooks and the compile. A
+    error policy doesn't retry it. If by then the agent was replaced, or the
+    framework is stopping or was stopped and started again, the turn is
+    dropped before it sends anything, as at the check after the compile. A
     failure that would have exhausted the turn emits no
     `inference:exhausted`, the event from which the hard-down alert's
     failure streak, the over-budget drain and the poison-history breaker

@@ -13767,11 +13767,14 @@ export class AgentFramework {
       // catch never holds a compiled request.) As at the checks after the
       // hooks and after the compile, a replaced agent or a stopping framework
       // comes first: the turn is dropped as theirs, and the stop goes with
-      // it. A failed start with no stop goes on below as before.
+      // it, and so does a framework stopped and started again, as after the
+      // compile. A failed start with no stop goes on below as before.
       const stopAtFailure = this.takeStartStop(agent, checkWindow);
       if (stopAtFailure) {
-        if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed) {
-          const why = this.agents.get(agent.name) !== agent ? 'the agent was replaced or removed' : 'the framework was stopping';
+        if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed || lifecycle !== this.lifecycleGeneration) {
+          const why = this.agents.get(agent.name) !== agent ? 'the agent was replaced or removed'
+            : this.providerAdmissionClosed ? 'the framework was stopping'
+              : 'the framework was stopped and started again';
           const reason = `a turn whose request couldn't be built while ${why} is dropped before it sends anything`;
           console.error(`[turn] ${agent.name}: ${reason}`);
           this.endDroppedTurn(agent.name, routing);

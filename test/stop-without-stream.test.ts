@@ -814,7 +814,7 @@ describe('a stop before the turn has a stream', () => {
     }
   });
 
-  for (const how of ['stopping', 'replaced'] as const) it(`a stop during a compile that then fails ${how === 'stopping' ? 'while stop() runs' : 'after its agent was replaced'} drops the turn as ${how === 'stopping' ? "stop()'s" : "the replacement's"}, before it sends anything, with no note`, async () => {
+  for (const how of ['stopping', 'replaced', 'restarted'] as const) it(`a stop during a compile that then fails ${how === 'stopping' ? 'while stop() runs' : how === 'replaced' ? 'after its agent was replaced' : 'after the framework was stopped and started again'} drops the turn as ${how === 'stopping' ? "stop()'s" : how === 'replaced' ? "the replacement's" : "the earlier lifecycle's"}, before it sends anything, with no note`, async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'af-stop-without-stream-'));
     const { membrane, requests } = answeringMembrane();
     const framework = await AgentFramework.create({
@@ -866,14 +866,18 @@ describe('a stop before the turn has a stream', () => {
       if (how === 'stopping') {
         stopping = framework.stop();
         await waitFor('stop() to close provider admission', () => (framework as unknown as { providerAdmissionClosed: boolean }).providerAdmissionClosed);
-      } else {
+      } else if (how === 'replaced') {
         // As a replacement under the agent's name does.
         (framework as unknown as { agents: Map<string, unknown> }).agents.set('prime', Object.create(agent));
+      } else {
+        // As a stop() and a start() do: each advances the lifecycle, and
+        // admission is open again.
+        (framework as unknown as { lifecycleGeneration: number }).lifecycleGeneration += 2;
       }
       compileReleased.resolve();
       await waitFor('the turn to end', () => traces.some((t) => t.type === 'inference:aborted' || t.type === 'inference:exhausted'));
       if (stopping) await within('stop() to finish', stopping);
-      const why = how === 'stopping' ? 'the framework was stopping' : 'the agent was replaced or removed';
+      const why = how === 'stopping' ? 'the framework was stopping' : how === 'replaced' ? 'the agent was replaced or removed' : 'the framework was stopped and started again';
       assert.ok(traces.some((t) => t.type === 'inference:failed'), "the compile's failure was reported");
       assert.equal(compiles, 1, 'no retry compiled');
       assert.equal(requests.length, 0, 'nothing was sent');
