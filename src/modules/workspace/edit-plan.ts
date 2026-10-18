@@ -512,16 +512,36 @@ export function planFile(
   const named = new Set<number>();
   const pairs = new Set<string>();
   const clashes: Array<{ edits: [number, number]; at: number; same: boolean }> = [];
+  // A later replacement whose edit is already named can't name it again, so
+  // the first loop to meet it links past it (nextLater), and the loops after
+  // cross a run of such replacements in one step: many edits matching one
+  // text cost their replacements, not their pairs at every place.
+  const nextLater = slots > 1 ? new Int32Array(total + 1) : undefined;
+  for (let k = 0; nextLater && k <= total; k++) nextLater[k] = k;
+  const laterFrom = (k: number): number => {
+    let found = k;
+    while (nextLater![found] !== found) found = nextLater![found]!;
+    while (nextLater![k] !== found) {
+      const step = nextLater![k]!;
+      nextLater![k] = found;
+      k = step;
+    }
+    return found;
+  };
   for (let i = 0; slots > 1 && i < total; i++) {
     const first = applied[slotOf(i)]!.spec;
     const firstStart = startOf(i);
     const firstEnd = firstStart + first.oldText.length;
-    for (let j = i + 1; j < total && startOf(j) < firstEnd; j++) {
+    for (let j = laterFrom(i + 1); j < total && startOf(j) < firstEnd; j = laterFrom(j + 1)) {
       const later = applied[slotOf(j)]!.spec;
+      if (named.has(later.index)) {
+        nextLater![j] = j + 1;
+        continue;
+      }
       const laterStart = startOf(j);
       const a = Math.min(first.index, later.index);
       const b = Math.max(first.index, later.index);
-      if (a === b || named.has(later.index) || pairs.has(`${a} ${b}`)) continue;
+      if (a === b || pairs.has(`${a} ${b}`)) continue;
       named.add(later.index);
       pairs.add(`${a} ${b}`);
       clashes.push({ edits: [a, b], at: laterStart, same: laterStart === firstStart && laterStart + later.oldText.length === firstEnd });

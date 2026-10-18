@@ -154,6 +154,24 @@ test('a thousand edits of one stretch are named as at most a thousand clashes', 
   assert.equal(problems('shared\n', specs).length, 999);
 });
 
+test('many edits matching one text cost their replacements, not their pairs at every place', () => {
+  // Every pair of these 2,000 edits overlaps at each of 500 places. Walking
+  // the pairs at every place, the planner took 34 s on this case, on Linux
+  // with Node 24.22.0; linking past each named edit's replacements takes
+  // 0.3 s. The child is stopped at 5 s.
+  const moduleUrl = new URL('../src/modules/workspace/edit-plan.js', import.meta.url).href;
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+    const { decodeForEdit, planFile } = await import(${JSON.stringify(moduleUrl)});
+    const bytes = Buffer.from('x '.repeat(500));
+    const specs = Array.from({ length: 2000 }, (_, index) => ({ index, oldText: 'x', newText: 'y', expected: 'all' }));
+    const planned = planFile(decodeForEdit(bytes), bytes, specs);
+    console.log(JSON.stringify(planned.problems.map((problem) => [problem.kind, problem.edits, problem.same])));
+  `], { encoding: 'utf8', timeout: 5_000, maxBuffer: 16 * 1024 * 1024 });
+  assert.equal(child.status, 0, child.stderr || `stopped by ${child.signal}`);
+  // Each edit after the first is named once, with the first, as the same text.
+  assert.deepEqual(JSON.parse(child.stdout), Array.from({ length: 1999 }, (_, k) => ['clash', [0, k + 1], true]));
+});
+
 test('each clash names its own line', () => {
   const text = 'one two\nthree four\nfive six\n';
   const clashes = problems(text, [spec(0, 'three four', 'X'), spec(1, 'four', 'Y'), spec(2, 'one two', 'Z'), spec(3, 'two', 'W')]);
