@@ -199,12 +199,13 @@ def _check_own_fds():
 
 def _diag(text):
     # A note of the runtime's own for the host's log, through fd 2's copy, or
-    # fd 2 itself if a script closed the copy.
+    # fd 2 itself if a script closed the copy. It waits for room on a pipe a
+    # command left non-blocking, as the marks do (_write_some).
     data = ("[pytc-runtime] " + text + "\n").encode("utf-8", "backslashreplace")
     for fd in (_STD_ERR, 2):
         try:
             if fd is not None:
-                os.write(fd, data)
+                _write_all(fd, data)
                 return
         except OSError:
             pass
