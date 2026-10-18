@@ -1,9 +1,9 @@
 /**
  * The queue of context writes deferred while quiesced, when its record can't
  * be written or the queue is over the cap: quiesce() writes the queue before
- * it changes the host's mode, and rejects when the write fails or, without
- * abandon, when the queue is over the cap; elsewhere a write that fails or
- * meets the cap keeps the queue in memory with one ops alert a run.
+ * it changes the host's mode and, without abandon, refuses when the write
+ * fails or the queue is over the cap; elsewhere a write that fails or meets
+ * the cap keeps the queue in memory with one ops alert a run.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -146,22 +146,22 @@ for (const where of ['recovery file', 'store only'] as const) {
       await h.liveTurn();
       h.add('held for the turn');
       const quiesce = () => h.framework.quiesce({ reason: 'surgery', timeoutMs: 1_000 });
-      const waysOut = (record: string): string => `. A restart would restore only what it last held, not the queue's 1 ` +
-        `deferred context write(s). Make ${record} writable and quiesce again, or quiesce with abandon: true to go on ` +
-        'with the queue in memory, and resume before any restart.';
+      const waysOut = ". So the record doesn't hold the queue's 1 deferred context write(s). Once it can be written, " +
+        'quiesce again, or quiesce with abandon: true, which cancels the turns still streaming, to go on with the ' +
+        'queue in memory, and resume before any restart.';
       if (where === 'recovery file') {
         mkdirSync(h.queuePath, { recursive: true });
         const refusal = await quiesce().then(() => undefined, (error: unknown) => error as Error & { cause?: NodeJS.ErrnoException });
         assert.equal(refusal?.name, 'QuiesceBlockedError');
         assert.equal(refusal?.cause?.code, 'EISDIR', 'the failed write is its cause');
         assert.ok(refusal?.message.startsWith(`quiesce refused: writing ${h.queuePath} failed: ${h.queuePath} was left as it was: `), refusal?.message);
-        assert.ok(refusal?.message.endsWith(waysOut(h.queuePath)), refusal?.message);
+        assert.ok(refusal?.message.endsWith(waysOut), refusal?.message);
         rmSync(h.queuePath, { recursive: true });
       } else {
         await withFailingSlotSync(() => assert.rejects(quiesce(), {
           name: 'QuiesceBlockedError',
           message: "quiesce refused: writing the store's framework/deferred-writes slot failed: injected EIO syncing the store" +
-            waysOut("the store's framework/deferred-writes slot"),
+            waysOut,
         }));
       }
       const status = h.framework.getHostModeStatus();
@@ -211,6 +211,15 @@ test("a quiesce() whose record write fails after the queue's leaves the host ser
     assert.deepEqual(h.queued(), ['held for the turn'], 'the queue was written first');
     h.add('also held');
     assert.deepEqual(h.queued(), ['held for the turn', 'also held'], 'and stays mirrored: the next change rewrites it');
+
+    // A failed write on the serving host raises the alert with no advice to resume.
+    rmSync(h.queuePath);
+    mkdirSync(h.queuePath);
+    h.add('third');
+    assert.equal(h.alerts.length, 1);
+    assert.ok(h.alerts[0]!.message.endsWith("the queue's 3 deferred context write(s)"), h.alerts[0]!.message);
+    rmSync(h.queuePath, { recursive: true });
+
     await h.framework.quiesce({ reason: 'surgery', timeoutMs: 1_000 });
     assert.equal(h.framework.getHostModeStatus().quiesced, true);
   });
@@ -256,6 +265,8 @@ test('a first quiesce({ abandon: true }) whose write fails goes on with the queu
     assert.equal(h.alerts.length, 1);
     assert.equal(h.alerts[0]!.data?.code, 'EISDIR');
     assert.ok(h.alerts[0]!.message.endsWith('. Resume before any restart'), h.alerts[0]!.message);
+    assert.ok(h.errors.some((l) => l.startsWith('[host-mode] failed to persist deferred context writes; quiesce goes on ' +
+      'with them in memory, so resume before any restart:')), h.errors.join('\n'));
 
     rmSync(h.queuePath, { recursive: true });
     await h.framework.resume();
@@ -414,8 +425,8 @@ test('a deferral whose write fails while quiesced keeps the write in memory, rai
     assert.equal(alert!.agentName, 'framework');
     assert.match(alert!.message, new RegExp(
       `^writing ${h.queuePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} failed: .*EISDIR.*\\. The queue's next change writes ` +
-      `it again, and a restart before a write of it succeeds restores what it last held, not the queue's 1 deferred ` +
-      `context write\\(s\\)\\. Resume before any restart$`,
+      `it again, and until a write of it succeeds, the record doesn't hold the queue's 1 deferred context ` +
+      `write\\(s\\)\\. Resume before any restart$`,
     ));
     assert.deepEqual(alert!.data, { record: h.queuePath, queued: 1, code: 'EISDIR' });
 
@@ -524,8 +535,8 @@ test('store only, a deferral while quiesced syncs the store after the slot\'s wr
     assert.equal(h.alerts.length, 1);
     assert.equal(h.alerts[0]!.message,
       "writing the store's framework/deferred-writes slot failed: injected EIO syncing the store. The queue's next " +
-      "change writes it again, and a restart before a write of it succeeds restores what it last held, not the queue's " +
-      '2 deferred context write(s). Resume before any restart');
+      "change writes it again, and until a write of it succeeds, the record doesn't hold the queue's 2 deferred " +
+      'context write(s). Resume before any restart');
     assert.deepEqual(h.alerts[0]!.data, { record: "the store's framework/deferred-writes slot", queued: 2 });
   });
 });
