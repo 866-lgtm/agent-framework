@@ -2123,8 +2123,9 @@ export class WorkspaceModule implements Module {
         return new WorkspaceImageReadError('parent_symlink', err.message);
       case 'other_mount':
         // The core reader's own words for a link on its way into a nested
-        // mount's directory: that mount and the path to use there. (#460's own
-        // other_mount, a path in that directory, is refused at parse.)
+        // mount's directory: that mount and the path to use there in place of
+        // the link. (#460's own other_mount, a path in that directory, is
+        // refused at parse.)
         return new WorkspaceImageReadError('other_mount', err.message);
       case 'escape':
         // The core reader's own words: "Symlink escape detected: <path>" for a

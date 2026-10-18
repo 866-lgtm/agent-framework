@@ -374,7 +374,7 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
     m.initStore(env.store);
     await m.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
     t.after(() => m.stop().catch(() => {}));
-    const reason = '"work/l" is a symlink to "work/nested/sub", which this mount does not follow; it lies in mount "inner", nested in mount "work": use "inner/sub"';
+    const reason = '"work/l" is a symlink to "work/nested/sub", which this mount does not follow; it lies in mount "inner", nested in mount "work": use "inner/sub" in place of "work/l"';
     await assert.rejects(m.readFileFromDisk('work/l/x.txt'), (err: unknown) => {
       assert.ok(err instanceof WorkspaceReadError, String(err));
       // The code a path in the nested mount's directory gets (#460), so a host

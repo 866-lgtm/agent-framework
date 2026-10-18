@@ -264,10 +264,10 @@ export function nestedHolder(target: string, nested: readonly { dir: string; nam
  * path beneath it exist); for one leading outside the mount, that it does;
  * for one that can't be resolved, nothing more. A target in a nested mount's
  * directory (`nested`) is that mount's: the refusal names the mount and the
- * path to use there, and offers no setting, since following the link would
- * only reach into another mount's directory. For a directory the walk
- * couldn't ask, which one, and the answer it got. Paths are spelled as the
- * tools take them, from the mount's name.
+ * path to use there in place of the link, and offers no setting, since
+ * following the link would only reach into another mount's directory. For a
+ * directory the walk couldn't ask, which one, and the answer it got. Paths
+ * are spelled as the tools take them, from the mount's name.
  */
 export function linkWords(name: string, found: LinkFound, leads: LinkLeads | null, nested: readonly { dir: string; name: string }[] = []): string {
   const spell = (rel: string) => `"${rel === '' ? name : `${name}/${rel}`}"`;
@@ -279,7 +279,7 @@ export function linkWords(name: string, found: LinkFound, leads: LinkLeads | nul
   if (holder) {
     const rest = leads.target.slice(holder.dir.length + 1);
     return `${link} to ${spell(leads.target)}, which this mount does not follow; it lies in mount "${holder.name}", ` +
-      `nested in mount "${name}": use "${rest ? `${holder.name}/${rest}` : holder.name}"`;
+      `nested in mount "${name}": use "${rest ? `${holder.name}/${rest}` : holder.name}" in place of ${spell(found.link)}`;
   }
   const setting = leads.directory ? "; the mount's host can set followSymlinks: true" : '';
   return `${link} to ${spell(leads.target)}, which this mount does not follow${setting}`;
