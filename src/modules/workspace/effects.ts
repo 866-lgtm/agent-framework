@@ -371,10 +371,11 @@ export async function writeContained(
  * Before an effect on an opened file: a regular file, and — unless forced —
  * still holding what was decided on. The hash reads the whole file, so it
  * comes first, and the checks of where the file is follow it: canonically
- * inside the mount, the one this path names (and not a symlink, where the
- * mount follows none and the open couldn't refuse one), with no other names,
- * in the directory still at its path beneath the root still at its own; and
- * nothing wrote it while those ran.
+ * inside the mount and in no nested mount's directory (nestedAtReal), the
+ * one this path names (and not a symlink, where the mount follows none and
+ * the open couldn't refuse one), with no other names, in the directory still
+ * at its path beneath the root still at its own; and nothing wrote it while
+ * those ran.
  */
 async function checkOpened(
   view: MountView,

@@ -76,6 +76,13 @@ function leadsInto(path: string, outer: string, inner: string, use: string): str
   return `"${path}" leads into mount "${inner}", nested in mount "${outer}", which neither reads nor writes it: use "${use}".`;
 }
 
+/** Read `path`, the path a refusal named, and check it holds `text`: the named path reaches the file. */
+async function readsBack(m: WorkspaceModule, path: string, text: string): Promise<void> {
+  const read = await call(m, 'read', { path });
+  assert.equal(read.success, true, `${path}: ${read.error}`);
+  assert.match(read.data.content, new RegExp(text), path);
+}
+
 /** The skipped reason for a path in a materialize's or a sync's result. */
 function skippedReason(data: any, path: string): string {
   const entry = ((data.skipped ?? []) as Array<{ path?: string; reason: string }>)
@@ -110,6 +117,31 @@ describe('a mount root configured through a symlink', () => {
     const read = await call(m, 'read', { path: 'outer/a/b/x.txt' });
     assert.equal(read.success, false);
     assert.equal(read.error, '"outer/a/b/x.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/x.txt".');
+    await readsBack(m, 'inner/x.txt', "the inner mount's");
+  });
+
+  test('an inner root configured as a link to a directory not made yet inside the outer mount is nested where the link leads', async (t) => {
+    const env = new Env(t);
+    env.write('outer/top.txt', "the outer mount's\n");
+    symlinkSync(env.at('outer/c/inner-dir'), env.at('via'));
+    const m = await env.open(t, [mount('outer', env.at('outer')), mount('inner', env.at('via'))]);
+    // The inner mount's directory is made after the module is constructed.
+    env.write('outer/c/inner-dir/x.txt', "the inner mount's\n");
+    assert.equal((await call(m, 'sync', {})).success, true);
+    assert.deepEqual(env.tree('outer'), ['top.txt'], "the outer mount took none of the inner mount's files in");
+    const read = await call(m, 'read', { path: 'outer/c/inner-dir/x.txt' });
+    assert.equal(read.error, '"outer/c/inner-dir/x.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/x.txt".');
+    await readsBack(m, 'inner/x.txt', "the inner mount's");
+  });
+
+  test('a mount configured as a link to the outer mount\'s own root isn\'t nested in it, and claims none of its paths', async (t) => {
+    const env = new Env(t);
+    env.write('outer/x.txt', "the outer mount's\n");
+    symlinkSync(env.at('outer'), env.at('outer/self'));
+    const m = await env.open(t, [mount('outer', env.at('outer')), mount('self', env.at('outer/self'))]);
+    await readsBack(m, 'outer/x.txt', "the outer mount's");
+    const write = await call(m, 'write', { path: 'outer/y.txt', content: 'outer wrote\n' });
+    assert.equal(write.success, true, write.error);
   });
 
   test('an inner mount configured through a link inside the outer mount is passed over at both of its directories', async (t) => {
@@ -165,6 +197,7 @@ describe('a link into a nested mount\'s directory, on a mount that follows symli
     const read = await call(m, 'read', { path: 'work/l/x.txt' });
     assert.equal(read.success, false);
     assert.equal(read.error, leadsInto('work/l/x.txt', 'work', 'inner', 'inner/sub/x.txt'));
+    await readsBack(m, 'inner/sub/x.txt', 'inner file');
     const write = await call(m, 'write', { path: 'work/l/new.txt', content: 'via work\n' });
     assert.equal(write.success, false);
     assert.equal(write.error, leadsInto('work/l/new.txt', 'work', 'inner', 'inner/sub/new.txt'));
@@ -201,6 +234,7 @@ describe('a link into a nested mount\'s directory, on a mount that follows symli
     ]);
     const read = await call(m, 'read', { path: 'work/l/b/x.txt' });
     assert.equal(read.error, leadsInto('work/l/b/x.txt', 'work', 'inner', 'inner/x.txt'));
+    await readsBack(m, 'inner/x.txt', 'inner file');
     const top = await call(m, 'read', { path: 'work/l/top.txt' });
     assert.equal(top.success, true, top.error);
     assert.match(top.data.content, /outer file under a/);
@@ -210,6 +244,39 @@ describe('a link into a nested mount\'s directory, on a mount that follows symli
     }
     assert.equal(existsSync(env.at('work/a/b/new.txt')), false);
     assert.equal(existsSync(env.at('work/a/b/deep')), false);
+  });
+
+  test('a link to a place not made yet in it leads there: a write through it is refused before anything is stored', async (t) => {
+    const env = new Env(t);
+    env.write('work/nested/keep.txt', 'inner\n');
+    symlinkSync('nested/new.txt', env.at('work/flink.txt'));
+    symlinkSync('nested/sub', env.at('work/l'));
+    const m = await env.open(t, [
+      mount('work', env.at('work'), { followSymlinks: true, autoMaterialize: true }),
+      mount('inner', env.at('work/nested'), { autoMaterialize: true }),
+    ]);
+    for (const [path, use] of [['work/flink.txt', 'inner/new.txt'], ['work/l/x.txt', 'inner/sub/x.txt']] as const) {
+      const write = await call(m, 'write', { path, content: 'via work\n' });
+      assert.equal(write.error, leadsInto(path, 'work', 'inner', use));
+    }
+    assert.deepEqual(env.tree('work'), [], 'nothing was stored');
+    assert.equal(existsSync(env.at('work/nested/new.txt')), false);
+    assert.equal(existsSync(env.at('work/nested/sub')), false);
+  });
+
+  test('read_image refuses a path that now leads into it, rather than give the copy held from before', async (t) => {
+    const env = new Env(t);
+    mkdirSync(env.at('work/l'), { recursive: true });
+    env.write('work/nested/sub/keep.txt', 'inner\n');
+    const m = await env.open(t, [mount('work', env.at('work'), { followSymlinks: true }), mount('inner', env.at('work/nested'))]);
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4////fwAJ+wP9KobjigAAAABJRU5ErkJggg==', 'base64');
+    const saved = await m.writeBinary('work/l/img.png', png, 'image/png');
+    assert.equal(saved.success, true, saved.error);
+    rmSync(env.at('work/l'), { recursive: true, force: true });
+    symlinkSync('nested/sub', env.at('work/l'));
+    const image = await call(m, 'read_image', { path: 'work/l/img.png' });
+    assert.equal(image.success, false);
+    assert.equal(image.error, leadsInto('work/l/img.png', 'work', 'inner', 'inner/sub/img.png'));
   });
 
   test('a file link into it is taken in by no sync, and a copy held from before is neither read nor pushed through it', async (t) => {
@@ -274,6 +341,7 @@ describe('a link into a nested mount\'s directory, on a mount that follows symli
     assert.equal(materialize.data.count, 0);
     assert.equal(skippedReason(materialize.data, 'alias/x.txt'), 'alias/x.txt: not written: "outer/alias" leads into mount "inner", nested in mount "outer": use "inner" in its place');
     assert.equal(readFileSync(env.at('outer/a/b/x.txt'), 'utf8'), 'inner v2\n');
+    await readsBack(m, 'inner/x.txt', 'inner v2');
     for (const [name, input] of [
       ['edit', { path: 'outer/alias/x.txt', oldString: 'old', newString: 'outer-edited' }],
       ['write', { path: 'outer/alias/y.txt', content: 'outer wrote y\n' }],

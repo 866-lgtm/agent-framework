@@ -6,9 +6,9 @@
  */
 
 import { isUtf8 } from 'node:buffer';
-import { constants as fsConstants, realpathSync } from 'node:fs';
+import { constants as fsConstants, readlinkSync, realpathSync } from 'node:fs';
 import type { Stats } from 'node:fs';
-import { open, readdir, stat, lstat, realpath } from 'node:fs/promises';
+import { open, readdir, readlink, stat, lstat, realpath } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve, relative, sep } from 'node:path';
 import type { JsStore } from '@animalabs/chronicle';
 import type { Module, ModuleContext, ProcessState, EventResponse } from '../../types/module.js';
@@ -305,34 +305,47 @@ function nestedDir(from: string, to: string): string | undefined {
   return rel.split(sep).join('/');
 }
 
+/** How many links realRoot and realBeneath follow to a place not made yet before they stop, as the kernel's limit does. */
+const LINKS_FOLLOWED = 40;
+
 /**
  * A mount root as realpath resolves it, with the links on its way and in it
- * taken out: for a root not made yet, its nearest existing directory's real
- * path with the rest as configured. Where a directory can't be resolved for
+ * taken out. Where nothing is there yet, a link leads where its target would
+ * be, and anything else lies beneath its nearest existing directory's real
+ * path, with the rest as configured. Where a directory can't be resolved for
  * any other reason, such as a loop or a lack of permission, the path as
  * resolved lexically from there.
  */
-function realRoot(path: string): string {
+function realRoot(path: string, links = 0): string {
   const absolute = resolve(path);
   try {
     return realpathSync.native(absolute);
   } catch (err) {
     const code = errnoOf(err);
+    if ((code !== 'ENOENT' && code !== 'ENOTDIR') || links >= LINKS_FOLLOWED) return absolute;
+    let target: string | null = null;
+    try {
+      target = readlinkSync(absolute);
+    } catch {
+      // Not a link: what's missing is it or a directory above it.
+    }
+    if (target !== null) return realRoot(resolve(dirname(absolute), target), links + 1);
     const parent = dirname(absolute);
-    if ((code !== 'ENOENT' && code !== 'ENOTDIR') || parent === absolute) return absolute;
-    return join(realRoot(parent), basename(absolute));
+    return parent === absolute ? absolute : join(realRoot(parent, links), basename(absolute));
   }
 }
 
 /** realRoot for any absolute path, read without holding the process. */
-async function realBeneath(absolute: string): Promise<string> {
+async function realBeneath(absolute: string, links = 0): Promise<string> {
   try {
     return await realpath(absolute);
   } catch (err) {
     const code = errnoOf(err);
+    if ((code !== 'ENOENT' && code !== 'ENOTDIR') || links >= LINKS_FOLLOWED) return absolute;
+    const target = await readlink(absolute).catch(() => null);
+    if (target !== null) return realBeneath(resolve(dirname(absolute), target), links + 1);
     const parent = dirname(absolute);
-    if ((code !== 'ENOENT' && code !== 'ENOTDIR') || parent === absolute) return absolute;
-    return join(await realBeneath(parent), basename(absolute));
+    return parent === absolute ? absolute : join(await realBeneath(parent, links), basename(absolute));
   }
 }
 
@@ -831,6 +844,10 @@ export class WorkspaceModule implements Module {
         if (outer === inner) continue;
         const outerPath = resolve(outer.path);
         const real = reals.get(inner.name)!;
+        // A mount whose real root is this one's, or holds it, isn't nested in
+        // it, however its configured path reads: it would claim this mount's
+        // every path.
+        if (isContainedPath(real, reals.get(outer.name)!)) continue;
         const fromRoots: Array<{ dir: string; root: string }> = [];
         for (const dir of [nestedDir(outerPath, resolve(inner.path)), nestedDir(reals.get(outer.name)!, real)]) {
           if (dir !== undefined && !fromRoots.some((s) => s.dir === dir)) fromRoots.push({ dir, root: join(outerPath, ...dir.split('/')) });

@@ -64,9 +64,10 @@ export class MountWatcher {
   private readonly debounceMs: number;
   private readonly config: MountConfig;
   /**
-   * The root as watched and as each event's path is read against: resolved,
-   * since chokidar hands back the paths it reports normalized, and those of
-   * a root configured as `./m` matched none of them.
+   * The root as the watcher makes, watches and checks it, and as each
+   * event's path is read against: the configured path resolved (a link in it
+   * kept), since chokidar hands back the paths it reports normalized, and
+   * those of a root configured as `./m` matched none of them.
    */
   private readonly root: string;
   private readonly onChangeCallback: (changes: FsChange[]) => void;
@@ -107,7 +108,7 @@ export class MountWatcher {
     // directories a user asked us only to read would be surprising.
     if (this.config.mode === 'read-write') {
       try {
-        mkdirSync(this.config.path, { recursive: true });
+        mkdirSync(this.root, { recursive: true });
       } catch (err) {
         this.lifecycle.onError?.(err instanceof Error ? err : new Error(String(err)));
       }
@@ -176,7 +177,7 @@ export class MountWatcher {
       if (event !== 'rename') return;
       // A rename on the watched root's path/basename is the one signal that
       // survives inode reuse on Linux, where unlinkDir/error never fire.
-      if (this.isRootPath(rawPath) || basename(rawPath) === basename(this.config.path)) {
+      if (this.isRootPath(rawPath) || basename(rawPath) === basename(this.root)) {
         void this.checkRootLiveness({ force: true });
       }
     });
@@ -373,7 +374,7 @@ export class MountWatcher {
   }
 
   private readRootIdentity(): RootIdentity {
-    const stat = statSync(this.config.path);
+    const stat = statSync(this.root);
     return { dev: stat.dev, ino: stat.ino, birthtimeMs: stat.birthtimeMs };
   }
 
