@@ -306,7 +306,9 @@ class SequentialStreamMembrane extends MockMembrane {
 }
 
 /** A stream that finishes one tool round with `usage`, then ends as `ending`
- *  says: with that event, by throwing it, or, for 'close', by just closing. */
+ *  says: with that event, by throwing it, or, for 'close', by just closing.
+ *  A cancel ends it as `cancelledAs` says: with an `aborted` event, as
+ *  membrane reports one, with an `error` event, or by just closing. */
 class RoundThenEnd implements YieldingStream {
   isWaitingForTools = false;
   pendingToolCallIds: string[] = [];
@@ -314,7 +316,11 @@ class RoundThenEnd implements YieldingStream {
   isCancelled = false;
   private resumed = false;
   private resume: (() => void) | null = null;
-  constructor(private readonly usage: DetailedUsage, private readonly ending: StreamEvent | Error | 'close') {}
+  constructor(
+    private readonly usage: DetailedUsage,
+    private readonly ending: StreamEvent | Error | 'close',
+    private readonly cancelledAs: 'aborted' | 'error' | 'close' = 'aborted',
+  ) {}
   provideToolResults(): void {
     this.isWaitingForTools = false;
     this.resumed = true;
@@ -337,7 +343,8 @@ class RoundThenEnd implements YieldingStream {
     } as StreamEvent;
     if (!this.resumed) await new Promise<void>((r) => { this.resume = r; });
     if (this.isCancelled) {
-      yield { type: 'aborted', reason: 'user' } as StreamEvent;
+      if (this.cancelledAs === 'aborted') yield { type: 'aborted', reason: 'user' } as StreamEvent;
+      if (this.cancelledAs === 'error') yield { type: 'error', error: new Error('stream cancelled') } as StreamEvent;
       return;
     }
     if (this.ending === 'close') return;
@@ -782,10 +789,11 @@ class HeldTools implements Module {
 
 type WrittenEntry = { agentName?: string; success?: boolean; error?: string; tokenUsage?: unknown };
 
-/** A resident whose first stream is `stream`, with `tools`, started on one
- *  message. `written` holds every inference-log entry as it's written, which
- *  outlasts stop() closing the store the log query reads. */
-async function residentWith(stream: YieldingStream, tools: Module) {
+/** A resident whose first stream is `stream`, with `tools` and any `limits`
+ *  of its own, started on one message. `written` holds every inference-log
+ *  entry as it's written, which outlasts stop() closing the store the log
+ *  query reads. */
+async function residentWith(stream: YieldingStream, tools: Module, limits: { maxStreamTokens?: number } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'af-end-turn-usage-'));
   const membrane = new MockMembrane();
   let made = false;
@@ -797,7 +805,7 @@ async function residentWith(stream: YieldingStream, tools: Module) {
   };
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
-    agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system', allowedTools: 'all' }],
+    agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system', allowedTools: 'all', ...limits }],
     modules: [new InputModule(), tools], syncIntervalMs: 0, maintenanceIntervalMs: 0,
   });
   const traces: TraceEvent[] = [];
@@ -900,6 +908,118 @@ describe("a stop's own entry carries the rounds its stream finished, once", () =
       rmSync(r.dir, { recursive: true, force: true });
     }
   });
+
+  // The stop terminals are reached from the `aborted` case, the `error` case
+  // and the block after the stream loop, each with the stream's logStream.
+  const stops = [
+    { stop: "a caller's stop", error: 'Stream cancelled (user)' },
+    { stop: 'a shutdown', error: 'Stream aborted: shutdown' },
+    { stop: 'an operator quiesce', error: 'Stream aborted: quiesce_abandoned' },
+  ] as const;
+  for (const cancelledAs of ['error', 'close'] as const) {
+    for (const { stop, error } of stops) {
+      it(`${stop} after a finished round, its stream reporting the cancel ${cancelledAs === 'error' ? 'as an error' : 'by just closing'}`, async () => {
+        const tools = new HeldTools();
+        const r = await residentWith(new RoundThenEnd(firstUsage, unseenCompletion(), cancelledAs), tools);
+        try {
+          assert.ok(await pollUntil(() => tools.calledWith.length === 1), 'the round finished and its tool is running');
+          if (stop === 'a shutdown') {
+            const stopping = r.framework.stop();
+            tools.release();
+            await stopping;
+          } else {
+            if (stop === "a caller's stop") assert.ok(r.framework.abortInference('resident'), 'the stream was cancelled');
+            else await r.framework.quiesce({ timeoutMs: 50, abandon: true });
+            assert.ok(await pollUntil(() => tornDown(r.framework)), 'its teardown ran');
+          }
+          const entries = r.written.filter((entry) => entry.agentName === 'resident');
+          assert.deepEqual(entries.map((entry) => entry.error), [error], "one entry, the stop's own");
+          assert.deepEqual(entries[0].tokenUsage, expectedTokens(firstUsage), 'it carries the round the stream finished');
+          assert.equal(r.traces.filter((e) => e.type === 'usage:updated').length, 1, 'counted once');
+          assert.equal(r.traces.filter((e) => e.type === 'inference:exhausted').length, 0, 'and not as a failure');
+        } finally {
+          tools.release();
+          if (stop !== 'a shutdown') {
+            await pollUntil(() => r.traces.some((e) =>
+              (e.type === 'tool:completed' || e.type === 'tool:failed') && (e as { callId?: string }).callId === 'echo-1'));
+            await r.framework.stop();
+          }
+          rmSync(r.dir, { recursive: true, force: true });
+        }
+      });
+    }
+  }
+
+  // settleDeliberateCancel() writes after its trace, settleFrameworkCancel()
+  // before it.
+  for (const { stop, error } of stops) {
+    it(`${stop} after a finished round whose own entry's write throws stays a stop, and says so`, async () => {
+      const tools = new HeldTools();
+      const r = await residentWith(new RoundThenEnd(firstUsage, unseenCompletion()), tools);
+      const internal = r.framework as unknown as { logInference: (entry: WrittenEntry) => void };
+      const write = internal.logInference;
+      internal.logInference = (entry) => {
+        if (entry.error === error) throw new Error('zz store refused the write');
+        write(entry);
+      };
+      const lines: string[] = [];
+      const original = console.error;
+      console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+      try {
+        assert.ok(await pollUntil(() => tools.calledWith.length === 1), 'the round finished and its tool is running');
+        if (stop === 'a shutdown') {
+          const stopping = r.framework.stop();
+          tools.release();
+          await stopping;
+        } else {
+          if (stop === "a caller's stop") assert.ok(r.framework.abortInference('resident'), 'the stream was cancelled');
+          else await r.framework.quiesce({ timeoutMs: 50, abandon: true });
+          assert.ok(await pollUntil(() => tornDown(r.framework)), 'its teardown ran');
+        }
+        assert.equal(r.traces.filter((e) => e.type === 'inference:aborted').length, 1, 'one aborted trace');
+        assert.deepEqual(r.traces.filter((e) => e.type === 'inference:failed' || e.type === 'inference:exhausted').map((e) => e.type), [],
+          'and no failure');
+        assert.equal(lines.filter((line) =>
+          line.startsWith("[usage] agent=resident could not record a stopped stream's inference-log entry: ")).length, 1,
+          'the failed write is said, once');
+        assert.equal(r.traces.filter((e) => e.type === 'usage:updated').length, 1, 'the round is counted');
+        assert.deepEqual(r.written.filter((entry) => entry.agentName === 'resident').map((entry) => entry.error), [],
+          'and no other entry carries it');
+      } finally {
+        console.error = original;
+        tools.release();
+        if (stop !== 'a shutdown') {
+          await pollUntil(() => r.traces.some((e) =>
+            (e.type === 'tool:completed' || e.type === 'tool:failed') && (e as { callId?: string }).callId === 'echo-1'));
+          await r.framework.stop();
+        }
+        rmSync(r.dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+describe("a budget restart's own cancel isn't a caller's stop, however its stream reports it", () => {
+  // The restart marks its stream and then calls cancelStream() at the tool
+  // boundary, which leaves a reasonless caller record there too. The record
+  // decides only when the framework marked nothing.
+  for (const cancelledAs of ['error', 'close'] as const) {
+    it(`its stream reporting the cancel ${cancelledAs === 'error' ? 'as an error' : 'by just closing'}`, async () => {
+      const r = await residentWith(new RoundThenEnd(firstUsage, unseenCompletion(), cancelledAs), new TurnTools(), { maxStreamTokens: 50 });
+      try {
+        assert.ok(await pollUntil(() => r.traces.some((e) => e.type === 'inference:stream_restarted')), 'the boundary restarted the turn');
+        assert.ok(await pollUntil(() => r.membrane.calls.length >= 2), 'the restart opened its next stream');
+        assert.ok(await pollUntil(() => tornDown(r.framework)), 'and the turn ended');
+        assert.deepEqual(r.traces.filter((e) => e.type === 'inference:aborted'), [], 'no stop was traced');
+        const texts = r.framework.getAgent('resident')!.getContextManager().queryMessages({}).messages
+          .flatMap((m) => m.content.filter((b): b is { type: 'text'; text: string } => b.type === 'text').map((b) => b.text));
+        assert.ok(!texts.some((text) => text.startsWith('[turn-interrupted]')), 'and no stop marker was written');
+      } finally {
+        await r.framework.stop();
+        rmSync(r.dir, { recursive: true, force: true });
+      }
+    });
+  }
 });
 
 describe('a stream that ends without writing its own entry is logged once, in finally', () => {

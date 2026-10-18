@@ -250,8 +250,9 @@ describe("the stream's own word decides before a caller's record", () => {
     const { framework, agent, traces, teardown } = await boot('cancel-aborted-error-', () => new AbortedWithErrorOnCancelStream());
     try {
       agent.cancelStream('operator');
-      await waitFor(() => types(traces, 'inference:aborted', 'inference:failed', 'inference:exhausted').length > 0);
-      await new Promise((r) => setTimeout(r, 100));
+      // The turn's terminal trace: inference:exhausted on the failure path,
+      // inference:aborted had it been taken as a stop.
+      await waitFor(() => types(traces, 'inference:aborted', 'inference:exhausted').length > 0);
       assert.ok(!types(traces, 'inference:aborted').length, `not a deliberate stop: ${JSON.stringify(types(traces, 'inference:aborted', 'inference:failed', 'inference:exhausted'))}`);
       assert.ok(types(traces, 'inference:exhausted').length > 0, 'the failure pipeline ends it');
       assert.ok(!contextTexts(framework).some((t) => t.startsWith('[turn-interrupted]')), 'no deliberate-stop marker');

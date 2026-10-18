@@ -4387,14 +4387,15 @@ export class AgentFramework {
     if (!agent) {
       return false;
     }
-    const hadStream = agent.state.status === 'streaming' ||
-      (agent.state.status === 'waiting_for_tools' && !!agent.state.stream);
+    // The same test Agent.abortInference() cancels by: any state that holds
+    // a stream, a tool boundary's `ready` included.
+    const hadStream = 'stream' in agent.state && !!agent.state.stream;
     const result = agent.abortInference(reason);
-    // A streaming abort is reported by driveStream when the stream's own
-    // `aborted` event lands — once, carrying this reason (Agent hands it
-    // over via takeCancel). Emitting here as well produced two
-    // inference:aborted traces per abort. Only the non-streaming inference
-    // path has no stream driver to report for it.
+    // A stream's abort is reported by driveStream when the stream's own
+    // terminal lands — once, carrying this reason (Agent hands it over via
+    // takeCancel). Emitting here as well produced two inference:aborted
+    // traces per abort. Only the non-streaming inference path has no stream
+    // driver to report for it.
     if (result && !hadStream) {
       this.emitTrace({ type: 'inference:aborted', agentName, reason, durationMs: result.durationMs });
     }
@@ -4491,12 +4492,20 @@ export class AgentFramework {
     // on live in-memory reducer state. Without this, abort-terminated
     // inferences are invisible to forensic queries (only request-side
     // telemetry via llm-calls.jsonl shows them, and only by absence).
-    log({
-      success: false,
-      error: `Stream cancelled (${reason})`,
-      request: compiledRequest ?? { note: 'streaming request aborted' },
-      durationMs,
-    });
+    // A failed write is said, as the writes at a boundary end and in finally
+    // are, and doesn't reach driveStream's failure path, so the stop stays a
+    // stop. logStream has already marked the rounds' usage logged, so they
+    // stay counted but unlogged, as when finally's own write fails.
+    try {
+      log({
+        success: false,
+        error: `Stream cancelled (${reason})`,
+        request: compiledRequest ?? { note: 'streaming request aborted' },
+        durationMs,
+      });
+    } catch (error) {
+      console.error(`[usage] agent=${agent.name} could not record a stopped stream's inference-log entry: ${describeFailureWithFrames(error)}`);
+    }
     if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
   }
 
@@ -4555,12 +4564,18 @@ export class AgentFramework {
     }
     // Postmortem 2026-05-28 P2 #7: the abort is a terminal the inference log
     // must be able to attribute later.
-    log({
-      success: false,
-      error: `Stream aborted: ${kind}`,
-      request: compiledRequest ?? { note: `streaming request aborted by ${kind}` },
-      durationMs,
-    });
+    // As in settleDeliberateCancel(): a failed write is said, and the trace
+    // and the gate release below still run.
+    try {
+      log({
+        success: false,
+        error: `Stream aborted: ${kind}`,
+        request: compiledRequest ?? { note: `streaming request aborted by ${kind}` },
+        durationMs,
+      });
+    } catch (error) {
+      console.error(`[usage] agent=${agent.name} could not record a stopped stream's inference-log entry: ${describeFailureWithFrames(error)}`);
+    }
     this.emitTrace({
       type: 'inference:aborted',
       agentName: agent.name,
@@ -14777,7 +14792,7 @@ export class AgentFramework {
               break;
             }
 
-            if (callerCancel !== undefined) {
+            if (cancelKind === undefined && callerCancel !== undefined) {
               // The caller-cancel twin: Agent.cancelStream(reason) /
               // framework.abortInference(reason) on a stream that reports
               // cancel() as `error`. Same terminal as `aborted` with wire
@@ -14785,6 +14800,10 @@ export class AgentFramework {
               // twins end. Without this the Stop fell through to errorPolicy
               // and relaunched the inference it had just stopped
               // (inference:started → failed → started; Sol, 2026-09-23).
+              // As after the loop, the caller record decides only when the
+              // framework marked nothing: a budget restart's own
+              // cancelStream() at a tool boundary also leaves one, and
+              // that restart isn't a caller's stop.
               lifecyclePhase = 'aborted'; // §10.5 — terminal emitted in finally
               if (agent.streamId === myStreamId) {
                 this.settleDeliberateCancel({
@@ -15129,7 +15148,7 @@ export class AgentFramework {
       // be emitted, and an in-flight runEphemeralToCompletion would ride out
       // its watchdog. If THIS side cancelled the stream, that cancel is the
       // terminal: the same end as the `aborted` and `error` twins. As there,
-      // the framework's own record is read first: stop() records 'shutdown'
+      // the framework's own record decides first: stop() records 'shutdown'
       // and then calls cancelStream(), which also leaves a reasonless caller
       // record, so the caller record alone would end a shutdown as a user's
       // stop, marker and all. The caller record decides only when the
@@ -15240,8 +15259,9 @@ export class AgentFramework {
         // An end that wrote no entry carrying them (a stream superseded by a
         // newer one, a disposed agent's stream) writes one now, as a failure
         // naming what ended it, so the log carries what the totals count. A
-        // stop's terminal writes its own, through logStream. With no finished round there is nothing to carry,
-        // and no entry is written, as before.
+        // stop that reaches its terminal writes its own, through logStream.
+        // With no finished round there is nothing to carry, and no entry is
+        // written, as before.
         if (countedUsage && !usageLogged) {
           const replaced = this.agents.get(agent.name) !== agent;
           const superseded = generationLost || agent.streamId !== myStreamId;

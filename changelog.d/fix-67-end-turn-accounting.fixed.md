@@ -16,8 +16,9 @@
   or one that ended with no final response and no other end, which wrote no entry before, now
   writes a failure entry naming what ended it and carrying its rounds, and `inferenceCount`
   counts it, when it had finished a round; one that hadn't has nothing to carry and writes none,
-  as before. A stop writes its own entry, which carries them. If the store fails while a stream's end is
-  recorded, the error is reported on stderr and what comes after it still runs: the rest of a
+  as before. A stop of any other stream writes its own entry, which carries them. If the store
+  fails while a stream's end is recorded, the error is reported on stderr and what comes after it
+  still runs: the rest of a
   tool-ended turn's end, a restart's next stream, and the stream's teardown. Exactly one
   entry of each stream carries its usage, so totals summed from the inference log count each
   stream once, as the session's do. A health snapshot's token totals read the log's newest 1,000
