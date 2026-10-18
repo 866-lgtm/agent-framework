@@ -1010,7 +1010,7 @@ test('an assembly for an agent outside the audience of a batch another assembly 
 // another agent's queue (a turn with nothing to read never reaches the model)
 // ---------------------------------------------------------------------------
 
-type Wake = { agentName: string; reason?: string; source?: string; timestamp?: number; coalescingSubject?: string; coalescingBatch?: boolean };
+type Wake = { agentName: string; reason?: string; source?: string; timestamp?: number; coalescingSubject?: string; coalescingBatch?: boolean; coalescingBatchSubjects?: string[] };
 
 type TurnInternals = {
   startAgentStream: (...a: unknown[]) => Promise<unknown>;
@@ -1409,8 +1409,10 @@ test("a batch-only turn whose call a provider's capacity limit held is retried w
   // The first call meets an organization acceleration 429, which holds the
   // turn's trigger for one fresh compile once the cooldown ends.
   let calls = 0;
+  const shown: Array<Wake | undefined> = [];
   (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: unknown) => {
     f.membrane.calls.push(request as never);
+    shown.push(f.framework.getActiveTurnTrigger('agent') as Wake | undefined);
     if (++calls > 1) return new MockYieldingStream([ok()]);
     return new FailingStream(new MembraneError({
       type: 'rate_limit', retryable: true, httpStatus: 429,
@@ -1424,6 +1426,8 @@ test("a batch-only turn whose call a provider's capacity limit held is retried w
   assert.equal(f.membrane.calls.length, 1);
   const hold = internals.providerAccelerationCooldowns.get('agent');
   assert.equal(hold?.heldRequests.length, 1, "the turn's trigger is held");
+  const marks = (w: Wake | undefined) => [w?.coalescingSubject, w?.coalescingBatch, w?.coalescingBatchSubjects];
+  assert.deepEqual(marks(hold!.heldRequests[0]), [undefined, undefined, undefined], 'as an ordinary wake, without the batch wake\'s marks');
   // The cooldown's time is up, and its timer's work runs now (a release
   // before its time only sets the timer again).
   hold!.until = Date.now();
@@ -1432,6 +1436,8 @@ test("a batch-only turn whose call a provider's capacity limit held is retried w
   assert.equal(f.membrane.calls.length, 2, 'the held turn was retried');
   assert(f.lastRequest().includes('document_diff'), 'and the retry read the render');
   assert.deepEqual(withdrawn, []);
+  assert.equal(shown[0]?.coalescingBatch, true, "getActiveTurnTrigger shows the first attempt's batch wake as it came");
+  assert.deepEqual(marks(shown[1]), [undefined, undefined, undefined], "and the retry's trigger without the batch wake's marks");
 });
 
 test("a turn a provider hold kept is retried though another resident's request consumed a newer batch of its subject meanwhile", async (t) => {
@@ -1458,6 +1464,10 @@ test("a turn a provider hold kept is retried though another resident's request c
   await settles(internals.processInferenceRequests(), 'the pass whose primary call meets the limit');
   const hold = internals.providerAccelerationCooldowns.get('agent');
   assert.equal(hold?.heldRequests.length, 1, "the primary's trigger is held");
+  // The hold de-duplicates by timestamp, among other fields: the held wake
+  // dates from before the newer batch's, as it would in a running host, where
+  // a render and a call lie between them, not a shared millisecond.
+  hold!.heldRequests[0].timestamp = Date.now() - 1000;
   // During the hold, 'other' already has a wake queued (a heartbeat), so its
   // turn comes first in the next pass. A newer batch of the subject arrives;
   // 'other''s assembly consumes it, and its freeze withdraws the subject's
@@ -1477,6 +1487,53 @@ test("a turn a provider hold kept is retried though another resident's request c
   assert.equal(f.membrane.calls.length, callsBefore + 1, "the primary's held turn was retried");
   assert(f.lastRequest().includes('document_diff'), 'and the retry read the first render');
   assert(!withdrawn.includes('agent'), "the primary's retry wasn't withdrawn");
+});
+
+/** One pass merges the agent's queued wakes into one trigger; the wrapped
+ *  `startAgentStream` sends it back to the queue before its gate, as the
+ *  auxiliary park's requeue does when another turn has taken the agent. */
+async function mergeAndRequeue(f: Awaited<ReturnType<typeof fixture>>): Promise<Wake> {
+  const internals = f.framework as unknown as TurnInternals;
+  const start = internals.startAgentStream.bind(internals);
+  let merged: Wake | undefined;
+  internals.startAgentStream = async (_agent: unknown, trigger: unknown) => {
+    internals.startAgentStream = start;
+    merged = trigger as Wake;
+    internals.pendingRequests.push(merged);
+  };
+  await settles(internals.processInferenceRequests(), 'the pass that merges the wakes');
+  assert(merged, 'the pass merged the wakes into one trigger');
+  return merged!;
+}
+
+test("a wake merged from a batch wake and another wake keeps the other cause when the batch's subject is withdrawn before its gate", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  f.alwaysRespond();
+  await f.send('push/event', f.params('1', 'merged_fallback', { deferred: true, initial: true }));
+  const internals = f.framework as unknown as TurnInternals;
+  // A heartbeat for the same agent, queued behind the batch's wake: the merge
+  // is spread from the batch's wake.
+  internals.pendingRequests.push({ agentName: 'agent', reason: 'heartbeat', source: 'framework', timestamp: Date.now() });
+  const merged = await mergeAndRequeue(f);
+  // A retraction withdraws the wakes whose sole cause is the subject (§4.2).
+  const r = await f.send('push/event', f.params('2', '', { retract: true }));
+  assert.equal(r.result.coalesce.outcome, 'retracted');
+  assert(internals.pendingRequests.includes(merged), "the merged wake, which the heartbeat shares, isn't withdrawn with the batch's subject");
+  await settles(f.framework.runUntilIdle(), 'the merged turn');
+  assert.equal(f.membrane.calls.length, 1, "the heartbeat's turn ran");
+});
+
+test("a batch wake requeued before its gate is still withdrawn with its subject", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  f.alwaysRespond();
+  await f.send('push/event', f.params('1', 'stale_fallback', { deferred: true, initial: true }));
+  const internals = f.framework as unknown as TurnInternals;
+  const merged = await mergeAndRequeue(f);
+  const r = await f.send('push/event', f.params('2', '', { retract: true }));
+  assert.equal(r.result.coalesce.outcome, 'retracted');
+  assert(!internals.pendingRequests.includes(merged), 'the wake, whose sole cause was the batch, is withdrawn with its subject');
+  await settles(f.framework.runUntilIdle(), 'the drain');
+  assert.equal(f.membrane.calls.length, 0);
 });
 
 test('R14: two consecutive crash windows with an acceptance in between keep both recovered batches', async (t) => {

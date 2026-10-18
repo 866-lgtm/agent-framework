@@ -135,13 +135,14 @@ export interface AssemblyResult {
   settled: Set<string>;
   /** Of those, the subjects whose render or fallback this assembly delivered
    *  where its compile reads it, as content the turn reads as its own. A
-   *  settled subject that is not here gave the turn nothing to read: empty or
-   *  blank render (§5.2), cancelled, revoked before the render or at its
-   *  response, a render-start that could not be made durable (the batch then
-   *  waits for its recovery wake), a batch whose audience doesn't include the
-   *  agent, a render placed in another agent's deferred queue, a render
-   *  another assembly froze, or a cause whose batch was withdrawn, displaced
-   *  or consumed by another request. */
+   *  settled subject that is not here gave the turn nothing new of its own to
+   *  read: empty or blank render (§5.2), cancelled, revoked before the render
+   *  or at its response, a render-start that could not be made durable (the
+   *  batch then waits for its recovery wake), a batch whose audience doesn't
+   *  include the agent, a render placed in another agent's deferred queue, a
+   *  render another assembly froze (its compile may show it, as that
+   *  request's), or a cause whose batch was withdrawn, displaced or consumed
+   *  by another request. */
   materialized: Set<string>;
 }
 

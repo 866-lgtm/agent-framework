@@ -12688,6 +12688,13 @@ export class AgentFramework {
         coalescingBatchSubjects: batchOnly
           ? [...new Set(requests.flatMap((r) => r.coalescingBatchSubjects ?? [r.coalescingSubject!]))]
           : undefined,
+        // A withdrawal of a subject's wakes takes a wake whose sole cause is
+        // that subject (§4.2), so the merged trigger carries a subject only
+        // when it is every merged request's: withdrawing it then never takes
+        // the merge's other causes, such as an ordinary wake, another
+        // subject's batch, or a retry past its gate.
+        coalescingSubject: requests.every((r) => r.coalescingSubject === trigger?.coalescingSubject)
+          ? trigger?.coalescingSubject : undefined,
         suppressProse: silentOnly ? trigger?.suppressProse : undefined,
         ephemeralSystemPrompt: silentOnly ? trigger?.ephemeralSystemPrompt : undefined,
         silentHeartbeat: silentOnly ? trigger?.silentHeartbeat : undefined,
@@ -14800,13 +14807,14 @@ export class AgentFramework {
       }
       return false;
     }
-    // The turn has what its batches gave it, so from here it goes on with a
-    // copy of its trigger without a batch wake's marks. A retry of it then
-    // comes back as an ordinary wake by whatever door it takes (a provider
-    // hold's release, the auxiliary park's requeue, the tool-result guard's
+    // The turn has passed its gate, so from here it goes on with a copy of
+    // its trigger without a batch wake's marks. A retry of it then comes back
+    // as an ordinary wake by whatever door it takes (a provider hold's
+    // release, the auxiliary park's requeue, the tool-result guard's
     // restart): this gate doesn't withdraw it for finding its batches
     // consumed, and no withdrawal of the subject's wakes reaches it (§4.2
-    // withdraws a wake whose sole cause is the subject). This frame's
+    // withdraws a wake whose sole cause is the subject, and a merge carries
+    // a subject only when it is every merged request's). This frame's
     // activeTurnTriggers entry keeps the trigger as it came; a retry's frame
     // records the copy it carries.
     if (trigger?.coalescingSubject !== undefined || trigger?.coalescingBatch) {
