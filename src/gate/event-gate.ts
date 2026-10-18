@@ -14,6 +14,7 @@
 import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
+import { safeSlice } from '../safe-slice.js';
 
 import type { ToolDefinition } from '../types/events.js';
 import type {
@@ -1484,7 +1485,7 @@ export class EventGate {
     const event: PendingEvent = {
       policyName: policy.name,
       content: info.content.length > MAX_CONTENT_SNIPPET
-        ? info.content.slice(0, MAX_CONTENT_SNIPPET) + '...'
+        ? safeSlice(info.content, 0, MAX_CONTENT_SNIPPET) + '...'
         : info.content,
       eventType: info.eventType,
       timestamp: Date.now(),
@@ -1573,8 +1574,10 @@ export class EventGate {
       }
       for (const [channelId, { count, oldest, label }] of byChannel) {
         // Prefer the human-readable name; keep the id parenthesized so the
-        // agent can still address tools that want the composite id.
-        const channel = label ? `#${label} (${channelId})` : channelId;
+        // agent can still address tools that want the composite id. A name
+        // may carry its own `#`, so one is added only where the name lacks
+        // it, as at the other places that add a `#`.
+        const channel = label ? `${label.startsWith('#') ? label : `#${label}`} (${channelId})` : channelId;
         const age = Math.round((Date.now() - oldest) / 1000);
         lines.push(
           `- ${count} message${count > 1 ? 's' : ''} in ${channel} ` +
