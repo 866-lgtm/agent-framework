@@ -351,18 +351,23 @@ def _open_streams():
 
 
 def _note(stream, text):
-    # The runtime's own line in a script's stream, which may have broken under it.
+    # The runtime's own line in a script's stream, which may have broken under
+    # it, or whose write the script may have replaced with its own, which may
+    # raise anything, SystemExit included: the line is then lost, and the
+    # exec's end goes on.
     try:
         stream.write(text)
-    except Exception:
+    except BaseException:
         pass
 
 
 def _flush_writers():
     # Send what the script left in its writers, the ones it kept from earlier
-    # execs too. A script can put its own code in one, as by replacing its
-    # flush, which may raise anything, SystemExit included: it's said, and the
-    # exec's end goes on, as for a script's own object (_flush_script_streams).
+    # execs too, at the exec's end and before a fork. A script can put its own
+    # code in one, as by replacing its flush, which may raise anything,
+    # SystemExit included: what it raises is said, but for the ValueError
+    # _flush takes as a closed writer, and the exec's end or the fork goes on,
+    # as for a script's own object (_flush_script_streams).
     for writer in list(_script_writers):
         try:
             _flush(writer)
@@ -412,7 +417,8 @@ def _flush(writer):
         # goes through it. A script that closed or detached the writer itself
         # flushed it then, and saw any failure of that flush; one that closed
         # the stream under it dropped what the writer held, which can't be told
-        # from nothing here.
+        # from nothing here. A ValueError from a flush the script put in its
+        # place is taken the same way.
         return
     except Exception as exc:
         # Its fd closed or broke under it, so that much can't be sent. Dropped,

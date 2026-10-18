@@ -1899,7 +1899,7 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
     }
   });
 
-  it("a script whose own object in sys.stdout raises anything from its flush, SystemExit included, still settles with the runtime's note, and keeps its interpreter", async () => {
+  it("a script whose own object in sys.stdout raises an error or SystemExit from its flush still settles with the runtime's note, and keeps its interpreter", async () => {
     const runner = new PyRunner({ onToolCall: async () => '' });
     try {
       const cases: [string, string, string][] = [
@@ -1936,7 +1936,7 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
     }
   });
 
-  it("a script that replaces its writer's flush with one that raises anything, SystemExit included, still settles with the runtime's note, and keeps its interpreter", async () => {
+  it("a script that replaces its writers' flush with one that raises an error or SystemExit still settles with a note for each writer, and keeps its interpreter", async () => {
     const runner = new PyRunner({ onToolCall: async () => '' });
     try {
       const cases: [string, string, string][] = [
@@ -1944,12 +1944,35 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
         ['SystemExit', 'def flush():\n    raise SystemExit(3)', '3'],
       ];
       for (const [what, defines, said] of cases) {
-        const result = await within(runner.exec(`import sys\n${defines}\nsys.stdout.flush = flush\nkept = "${what}"`, []), what);
+        // Both writers, so each is flushed and said whatever the other raised.
+        const result = await within(runner.exec(`import sys\n${defines}\nsys.stdout.flush = flush\nsys.stderr.flush = flush\nkept = "${what}"`, []), what);
+        const note = `[pytc-runtime] some of what the script wrote couldn't be sent (${said})\n`;
         assert.deepStrictEqual(
           { stdout: result.stdout, stderr: result.stderr, returnCode: result.returnCode },
-          { stdout: '', stderr: `[pytc-runtime] some of what the script wrote couldn't be sent (${said})\n`, returnCode: 0 },
+          { stdout: '', stderr: note + note, returnCode: 0 },
           what,
         );
+        assert.strictEqual((await within(runner.exec('print(kept)', []), `the next script (${what})`)).stdout, `${what}\n`, what);
+      }
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it("a script that replaces its stderr writer's write with one that raises anything, SystemExit included, still settles when it fails, and keeps its interpreter", async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      const cases: [string, string][] = [
+        ['CancelledError', 'import asyncio\ndef write(s):\n    raise asyncio.CancelledError()'],
+        ['SystemExit', 'def write(s):\n    raise SystemExit(4)'],
+      ];
+      for (const [what, defines] of cases) {
+        // The runtime's note of the script's error goes through that write, and is lost.
+        const result = await within(
+          runner.exec(`import sys\n${defines}\nsys.stderr.write = write\nkept = "${what}"\nraise RuntimeError("the script's own")`, []),
+          what,
+        );
+        assert.strictEqual(result.returnCode, 1, what);
         assert.strictEqual((await within(runner.exec('print(kept)', []), `the next script (${what})`)).stdout, `${what}\n`, what);
       }
     } finally {
