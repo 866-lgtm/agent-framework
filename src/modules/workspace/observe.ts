@@ -19,7 +19,7 @@
  * identity, and what they showed — a listing, an absence — is accepted only
  * if each is still the directory its logical path names afterwards. A walk records which
  * directories it listed completely, and only those prove a file absent: an
- * unreadable directory, an ignored subtree, the file cap, a symlink the walk
+ * unreadable directory, an ignored subtree, the walk cap, a symlink the walk
  * doesn't descend, or a directory that changed while it was listed leave
  * everything beneath them unproven. Outside a walk, absence is proven the
  * same way: by a directory inside the mount, still at its path, that lacks
@@ -41,7 +41,7 @@ import { constants as fsConstants } from 'node:fs';
 import type { BigIntStats } from 'node:fs';
 import { lstat, mkdir, open, readdir, realpath, stat, statfs } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
-import { dirname, join, sep } from 'node:path';
+import { dirname, join, posix, sep } from 'node:path';
 import { sameRootIdentity, type Fingerprint, type RootIdentity } from './disk-agreement.js';
 
 export interface MountView {
@@ -56,6 +56,11 @@ export interface MountView {
   /** Text above this size is not ingested. */
   maxFileSize: number;
   ignore: string[];
+  /**
+   * Other mounts' directories nested inside this one, mount-relative. Every
+   * pass passes over them, named or not, as another mount's directory.
+   */
+  others: readonly string[];
 }
 
 export type StatFingerprint = Omit<Fingerprint, 'hashedAt'>;
@@ -571,9 +576,41 @@ async function openContained(
 }
 
 /**
+ * Read an open file from its start, at most `limit` bytes, and whether it
+ * goes on past them. Where the file ends is what the reads find: `sizeHint`,
+ * the size its fstat gave, only sizes the first buffer. Once a buffer is
+ * full, one byte read past it tells whether the file goes on. At the limit,
+ * that byte says it does, and isn't kept. Short of it, the file has grown
+ * since its fstat: the byte is kept, and the read goes on in a larger buffer,
+ * up to the limit. A file that has shrunk ends where the reads find its end.
+ * A fractional `limit` allows the whole bytes in it.
+ */
+export async function readPrefix(handle: FileHandle, limit: number, sizeHint: number): Promise<{ bytes: Buffer; more: boolean }> {
+  const cap = Math.floor(limit);
+  const next = Buffer.alloc(1);
+  let bytes = Buffer.alloc(Math.min(cap, sizeHint));
+  let length = 0;
+  for (;;) {
+    while (length < bytes.length) {
+      const { bytesRead } = await handle.read(bytes, length, bytes.length - length, length);
+      if (bytesRead === 0) return { bytes: bytes.subarray(0, length), more: false };
+      length += bytesRead;
+    }
+    if ((await handle.read(next, 0, 1, length)).bytesRead === 0) return { bytes, more: false };
+    if (length === cap) return { bytes, more: true };
+    // Longer than its fstat said: read on, up to the limit.
+    const grown = Buffer.alloc(Math.min(cap, Math.max(2 * length, length + 64 * 1024)));
+    bytes.copy(grown, 0, 0, length);
+    grown[length++] = next[0];
+    bytes = grown;
+  }
+}
+
+/**
  * Read and hash a mount-relative file through one located descriptor. The
- * whole file is returned when it is at most `limit` bytes; larger files are
- * hashed in chunks and only their head is kept.
+ * whole file is returned when it is at most `limit` bytes, both at its fstat
+ * and as read; any other file, including one that grew past `limit` since its
+ * fstat, is hashed in chunks and only its head is kept.
  */
 export async function readPath(
   view: MountView,
@@ -588,8 +625,13 @@ export async function readPath(
     const hashedAt = Date.now();
     const size = Number(info.size);
     const fp: Fingerprint = { ...statFingerprint(info), hashedAt };
-    if (size <= limit) {
-      const bytes = await handle.readFile();
+    // A file within the limit at its fstat is read no further than the limit,
+    // so one that has grown past it since is hashed below, from its start,
+    // never loaded whole. One over the limit at its fstat is hashed below
+    // without that read.
+    const within = size <= limit ? await readPrefix(handle, limit, size) : null;
+    if (within && !within.more) {
+      const { bytes } = within;
       return {
         kind: 'read',
         size: bytes.byteLength,
@@ -672,24 +714,98 @@ export function sniffImageMime(head: Buffer): string | undefined {
 // ===========================================================================
 
 export interface Walk {
-  /** Regular files seen. */
+  /** Regular files the walk took: the pass observes each one. */
   files: Set<string>;
+  /**
+   * Regular files a listing showed that the walk didn't take, past its cap
+   * or outside the stretch a resumed walk covered: present, and not
+   * observed by this pass.
+   */
+  seen: Set<string>;
+  /**
+   * The names in `others` that it doesn't pass over by design and that the walk took, as it
+   * takes files, against its cap: the pass observes these by path. The rest
+   * are present, and not observed by this pass.
+   */
+  othersTaken: Set<string>;
   /** Directories seen. */
   dirs: Set<string>;
-  /** Names seen that are neither (symlinks, sockets…), or ignored: present, unproven. */
+  /**
+   * Names seen that are neither (symlinks, sockets…), or that the walk passes
+   * over by design (another mount's directory, the ignore list, an editor's
+   * file name): present, unproven.
+   */
   others: Map<string, string>;
-  /** Directories listed completely. */
+  /**
+   * Directories whose listing the walk read whole, and that were still the
+   * directory at their path once it had: every name in one is in `files`,
+   * `seen`, `dirs` or `others`, so a name in none of them is absent.
+   */
   complete: Set<string>;
   /** Directories that don't exist (everything beneath them is absent). */
   missing: Set<string>;
   /**
    * Where the walk didn't reach, and why. `error` and `cap` regions may hide
    * files the listing would show. An `ignored` region is passed over by
-   * design: one that hides a tracked entry is reported as incomplete, and
-   * one that hides nothing is counted as passed over. A `symlink` region is
-   * never walked; the pass reports the link itself by path.
+   * design: one that hides a tracked entry, or is the pass's whole scope, is
+   * reported as incomplete, and any other is counted as passed over. A
+   * `symlink` region is never walked; the pass reports the link itself by
+   * path.
    */
   incomplete: Array<{ path: string; reason: string; kind: 'error' | 'cap' | 'ignored' | 'symlink' }>;
+  /**
+   * When the walk cap stopped the walk, the last entry it took. A walk that
+   * resumes after it takes the entries after it first, in the walk's order
+   * (`compareInWalk`), then wraps to the start of its scope.
+   */
+  stoppedAfter?: string;
+}
+
+/** Names compare by UTF-16 code unit, the same on every platform and filesystem. */
+function compareNames(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/**
+ * Where file `a` falls against file `b` in the walk's order: in each
+ * directory, its files by name, then its subdirectories by name, each with
+ * everything beneath it. A resumed walk relies on visiting files in the
+ * order it compares positions by, so the walk sorts each listing itself
+ * rather than take `readdir`'s order, which is the platform's (Node returns
+ * UTF-8 byte order on Linux, which differs from this one for some names).
+ */
+function compareInWalk(a: string, b: string): number {
+  const x = a.split('/');
+  const y = b.split('/');
+  for (let i = 0; ; i++) {
+    const lastX = i === x.length - 1;
+    const lastY = i === y.length - 1;
+    if (x[i] !== y[i]) {
+      if (lastX && lastY) return compareNames(x[i]!, y[i]!);
+      if (lastX) return -1; // a directory's files come before its subdirectories
+      if (lastY) return 1;
+      return compareNames(x[i]!, y[i]!);
+    }
+    if (lastX && lastY) return 0;
+    if (lastX) return -1;
+    if (lastY) return 1;
+  }
+}
+
+/**
+ * Where the subtree of directory `dir` falls against file `at` in the walk's
+ * order: wholly before it, holding it (an ancestor of it), or wholly after it.
+ */
+function subtreeAgainst(dir: string, at: string): 'before' | 'holds' | 'after' {
+  if (dir === '') return 'holds';
+  const d = dir.split('/');
+  const p = at.split('/');
+  for (let i = 0; i < d.length; i++) {
+    // `at` is a file in the directory above d[i], whose files come first.
+    if (i === p.length - 1) return 'after';
+    if (d[i] !== p[i]) return compareNames(d[i]!, p[i]!) < 0 ? 'before' : 'after';
+  }
+  return 'holds';
 }
 
 /**
@@ -703,6 +819,101 @@ export function coveredByIgnore(relativePath: string, patterns: string[]): boole
     if (isIgnored(segments.slice(0, i + 1).join('/'), segments[i]!, patterns)) return true;
   }
   return false;
+}
+
+/**
+ * The ignore patterns a walk that names `scope` reads beneath it: a pattern
+ * covering the scope itself, or a directory above it, doesn't apply beneath
+ * it (#276); one covering only something inside it does.
+ */
+export function ignoreBeneath(scope: string, patterns: string[]): string[] {
+  return patterns.filter((pattern) => !coveredByIgnore(scope, [pattern]));
+}
+
+/**
+ * Names editors give the files they keep beside the one being edited: vim's
+ * swap files (`.name.swp`, and `.name.swx` while it checks it can make one),
+ * backups ending in `~`, and Sublime Text's save-in-progress files, ending
+ * in `.subl…tmp`. A walk passes over an entry with such a name as it passes
+ * over what the ignore list covers, a directory with what lies beneath it,
+ * and the watcher ignores it; a sync that names one takes it in. They are
+ * the families chokidar's `atomic` option hid from the watcher, but that
+ * tested them against the whole path, unanchored, so it also hid
+ * `report.v2.swp`, and under a directory with a dot in its name, a plain
+ * `notes.swp`. Here each is matched against an entry's name, to its end,
+ * and vim's from its start.
+ */
+const EDITOR_FILE = /^\..+\.sw[px]$|~$|\.subl.*\.tmp$/;
+
+/** The walk's reason for an entry the mount's ignore list covers. */
+export const IGNORED = 'ignored by the mount';
+/** The walk's reason for an entry `EDITOR_FILE` names. */
+const EDITOR_FILE_REASON = "an editor's swap or backup file";
+
+/** Whether a reason the walk gave an entry is one it passes over by design. */
+export function passedOverByDesign(why: string | undefined): boolean {
+  return why === IGNORED || why === EDITOR_FILE_REASON || why === OTHER_MOUNT;
+}
+
+/** Why a pass passes over a directory that another mount nested in this one holds, and what lies beneath it. */
+export const OTHER_MOUNT = "another mount's directory";
+
+/**
+ * Whether a mount-relative path is another mount's directory, or lies
+ * beneath one, read as a join reads it: `.` and `..` segments within the
+ * path and repeated or trailing separators resolved, links not followed. A
+ * stored key such as `a//b/x`, which chronicle accepts, is read as `a/b/x`.
+ * A leading `..` that climbs above the mount's root is left as written.
+ * Every nested-mount check (a pass's, a walk's, a push's, grep's) asks this.
+ */
+export function inOtherMount(relativePath: string, others: readonly string[]): boolean {
+  const lexical = posix.normalize(relativePath).replace(/\/+$/, '');
+  return others.some((dir) => lexical === dir || lexical.startsWith(dir + '/'));
+}
+
+/**
+ * Why a walk passes over an entry by design, by its mount-relative path and
+ * its name: another mount's directory, the ignore list, or an editor's file
+ * name. Undefined when none covers it.
+ */
+function passedOverBecause(relativePath: string, name: string, patterns: string[], others: readonly string[]): string | undefined {
+  if (inOtherMount(relativePath, others)) return OTHER_MOUNT;
+  if (isIgnored(relativePath, name, patterns)) return IGNORED;
+  if (EDITOR_FILE.test(name)) return EDITOR_FILE_REASON;
+  return undefined;
+}
+
+/**
+ * Why a sync without a path, and the watcher, pass over a mount-relative
+ * path: the path itself or a directory above it is passed over by design, as
+ * the walk reads each entry by its path and name. A path in another mount's
+ * directory is that mount's, whatever else covers a directory above it.
+ * Undefined when nothing covers it.
+ */
+export function passedOverAt(relativePath: string, patterns: string[], others: readonly string[]): string | undefined {
+  if (inOtherMount(relativePath, others)) return OTHER_MOUNT;
+  const segments = relativePath.split('/').filter(Boolean);
+  for (let i = 0; i < segments.length; i++) {
+    const why = passedOverBecause(segments.slice(0, i + 1).join('/'), segments[i]!, patterns, others);
+    if (why !== undefined) return why;
+  }
+  return undefined;
+}
+
+/**
+ * Why a walk of `scope` passes over a directory between it and a path beneath
+ * it: the first directory strictly beneath the scope and above the path that
+ * the mount passes over by design, by its path and name, with the patterns
+ * the walk reads there. Undefined when none is.
+ */
+export function passedOverBetween(scope: string, relativePath: string, patterns: string[], others: readonly string[]): string | undefined {
+  const segments = relativePath.split('/').filter(Boolean);
+  const from = scope === '' ? 0 : scope.split('/').filter(Boolean).length;
+  for (let i = from; i < segments.length - 1; i++) {
+    const why = passedOverBecause(segments.slice(0, i + 1).join('/'), segments[i]!, patterns, others);
+    if (why !== undefined) return why;
+  }
+  return undefined;
 }
 
 /** Simple ignore patterns, as the watcher and the old walk read them. */
@@ -740,17 +951,55 @@ async function checkChild(view: MountView, rootReal: string, parent: CheckedDir,
 
 /**
  * List a directory scope ('' for the mount root), descending when recursive,
- * up to `cap` files in total. A scope that resolves outside the mount is not
- * listed at all; beneath it, the walk only descends real directories, never
- * symlinks. Each directory's listing counts only if, once listed, it is still
- * the directory at its path: a directory moved or replaced meanwhile is an
- * incomplete region, contributing no names and proving nothing absent.
+ * taking up to `cap` entries in the walk's order (`compareInWalk`): files,
+ * and links or other entries that aren't directories. A scope
+ * that resolves outside the mount is not listed at all; beneath it, the walk
+ * only descends real directories, never symlinks. Each directory's listing
+ * counts only if, once listed, it is still the directory at its path: a
+ * directory moved or replaced meanwhile is an incomplete region, contributing
+ * no names and proving nothing absent.
+ *
+ * Each listing is read whole and every name in it recorded, so the files the
+ * cap leaves are known present (`seen`) and a name the listing lacks is
+ * proven absent, whichever files were taken. Once the cap is reached, no
+ * further directory is listed.
+ *
+ * With `resumeAfter` (an entry in the scope, from an earlier walk's
+ * `stoppedAfter`), a recursive walk takes the entries after it first, then
+ * wraps to the start of the scope, so repeated walks cover a scope larger
+ * than the cap.
  */
 export async function walkScope(
   view: MountView, rootReal: string, scope: string, recursive: boolean, cap: number,
-  opts: { named?: boolean } = {},
+  opts: { named?: boolean; resumeAfter?: string } = {},
 ): Promise<Walk> {
-  const walk: Walk = { files: new Set(), dirs: new Set(), others: new Map(), complete: new Set(), missing: new Set(), incomplete: [] };
+  const walk: Walk = {
+    files: new Set(), seen: new Set(), othersTaken: new Set(), dirs: new Set(), others: new Map(), complete: new Set(), missing: new Set(),
+    incomplete: [],
+  };
+  // A walk that isn't named passes over a scope the mount passes over by
+  // design, at it or a directory above it, as its parent's listing would pass
+  // over its entry: a name rule (a bare-name ignore entry, an editor's name)
+  // doesn't match what lies beneath, as a path rule (`cache/**`) does. So a
+  // listing, glob or grep there never starts tracking what the mount leaves
+  // out, and a stored copy beneath it is unobserved, as beneath any region
+  // passed over by design. Its region says how to take what's there in: a
+  // sync that names it, whose scope is walked (#276), below.
+  // Another mount's directory is passed over by every walk, named or not,
+  // and no sync of this mount takes it in, so its region gives no advice.
+  if (scope !== '' && inOtherMount(scope, view.others)) {
+    walk.others.set(scope, OTHER_MOUNT);
+    walk.incomplete.push({ path: scope, reason: OTHER_MOUNT, kind: 'ignored' });
+    return walk;
+  }
+  if (!opts.named && scope !== '') {
+    const why = passedOverAt(scope, view.ignore, view.others);
+    if (why !== undefined) {
+      walk.others.set(scope, why);
+      walk.incomplete.push({ path: scope, reason: `${why}: a sync that names this path takes in what's there, editors' files aside`, kind: 'ignored' });
+      return walk;
+    }
+  }
   const top = await checkDir(view, rootReal, scope);
   if (top.kind === 'absent') {
     walk.missing.add(scope);
@@ -760,20 +1009,87 @@ export async function walkScope(
     walk.incomplete.push({ path: scope, reason: top.outside ? 'the directory resolves outside the mount' : top.reason, kind: 'error' });
     return walk;
   }
-  let capped = false;
   // A scope a path sync names is walked even where the ignore list covers
   // it: a pattern covering the scope itself, or a directory above it, doesn't
   // apply beneath it. So a named directory's contents are synced, as a named
-  // file is (agent-framework #276). A listing keeps the ignore: its pass
-  // would otherwise start tracking what it lists.
-  const ignore = opts.named ? view.ignore.filter((pattern) => !coveredByIgnore(scope, [pattern])) : view.ignore;
+  // file is (agent-framework #276), apart from what a pattern covering only
+  // something inside it covers, and editors' files, which are passed over
+  // there as anywhere. A listing keeps the ignore: its pass would otherwise
+  // start tracking what it lists.
+  const ignore = opts.named ? ignoreBeneath(scope, view.ignore) : view.ignore;
+  // A position outside the scope, or for a walk that doesn't descend, is no
+  // position in this walk's order.
+  const after = recursive && opts.resumeAfter !== undefined && (scope === '' || opts.resumeAfter.startsWith(scope + '/'))
+    ? opts.resumeAfter
+    : undefined;
 
-  const visit = async (dir: CheckedDir): Promise<void> => {
-    const rel = dir.rel;
-    if (capped) {
-      walk.incomplete.push({ path: rel, reason: `not visited: the file cap (${cap}) was reached`, kind: 'cap' });
-      return;
+  /** A listing's entries that aren't directories or ignored, in the walk's order, each a regular file or not. */
+  type Listing = { leaves: Array<[string, boolean]>; subdirs: string[]; dev: string; ino: string };
+  /**
+   * Each directory is listed once: a resumed walk visits the ones holding its
+   * position on both sides of it, and the second visit reuses the listing
+   * while the directory at its path is still the one it was read from.
+   */
+  const listings = new Map<string, Listing | null>();
+  const visited = new Set<string>();
+  /** Paths already reported as errors, so a second visit doesn't report them again. */
+  const failed = new Set<string>();
+  const fail = (path: string, reason: string): void => {
+    if (failed.has(path)) return;
+    failed.add(path);
+    walk.incomplete.push({ path, reason, kind: 'error' });
+  };
+  let left = cap;
+  let lastTaken: string | undefined;
+
+  /**
+   * Take back what the walk read at or beneath `rel`, a directory replaced
+   * or gone since it was listed: it describes the directory that was there,
+   * so no listing there proves anything absent, the entries and
+   * subdirectories they left untaken aren't the cap's to report, and a
+   * subdirectory proven missing there proves nothing about what's there
+   * now. What was taken stays taken: the pass observes it by path.
+   */
+  const dropBeneath = (rel: string): void => {
+    const beneath = (path: string): boolean => rel === '' || path.startsWith(rel + '/');
+    for (const [path, listing] of listings) {
+      if (path !== rel && !beneath(path)) continue;
+      if (listing) {
+        for (const [leaf, isFile] of listing.leaves) if (isFile) walk.seen.delete(leaf);
+        for (const sub of listing.subdirs) walk.dirs.delete(sub);
+      }
+      walk.complete.delete(path);
+      listings.set(path, null);
     }
+    // The links, ignored names and other entries those listings showed, and
+    // the regions they gave rise to, described the directory that was there.
+    for (const [path] of walk.others) if (beneath(path) && !walk.othersTaken.has(path)) walk.others.delete(path);
+    for (let i = walk.incomplete.length - 1; i >= 0; i--) {
+      const region = walk.incomplete[i]!;
+      if ((region.kind === 'symlink' || region.kind === 'ignored') && beneath(region.path)) walk.incomplete.splice(i, 1);
+    }
+    for (const path of walk.missing) if (beneath(path)) walk.missing.delete(path);
+  };
+
+  const list = async (dir: CheckedDir): Promise<Listing | null> => {
+    const rel = dir.rel;
+    const known = listings.get(rel);
+    if (known === null) return null;
+    if (known !== undefined) {
+      // The scope's own directory comes back as the same CheckedDir, so its
+      // identity is checked against the path again, as a subdirectory's is
+      // by the fresh check that brought it here.
+      const now = dir.identity();
+      if (known.dev === now.dev && known.ino === now.ino && await dir.stillHere()) return known;
+      dropBeneath(rel);
+      fail(rel, CHANGED_WALK);
+      return null;
+    }
+    listings.set(rel, null);
+    // Reading a directory is a check of it too, and replaces an earlier proof
+    // that it was missing: the scope's own directory, read afresh on the
+    // wrap, has no check of its own.
+    walk.missing.delete(rel);
     let entries;
     try {
       entries = await readdir(dir.real, { withFileTypes: true });
@@ -782,37 +1098,38 @@ export async function walkScope(
       if (code === 'ENOENT' || code === 'ENOTDIR') {
         // Gone since it was checked: absent beneath only if that can be shown.
         const proof = rel === '' ? ROOT_UNAVAILABLE : await confirmAbsent(view, rootReal, rel, 'beneath');
-        if (typeof proof === 'string') walk.incomplete.push({ path: rel, reason: proof, kind: 'error' });
-        else walk.missing.add(rel);
-        return;
+        if (typeof proof === 'string') fail(rel, proof);
+        else {
+          walk.missing.add(rel);
+          // Nothing was listed, so a later check that finds it again, on the
+          // wrap, lists it afresh.
+          listings.delete(rel);
+        }
+        return null;
       }
-      walk.incomplete.push({ path: rel, reason: `cannot list (${code ?? String(err)})`, kind: 'error' });
-      return;
+      fail(rel, `cannot list (${code ?? String(err)})`);
+      return null;
     }
-    const files: string[] = [];
+    entries.sort((a, b) => compareNames(a.name, b.name));
+    const leaves: Array<[string, boolean]> = [];
     const subdirs: string[] = [];
     const others: Array<[string, string]> = [];
     const regions: Walk['incomplete'] = [];
-    let reachedCap = false;
     for (const entry of entries) {
       const childRel = rel ? `${rel}/${entry.name}` : entry.name;
-      if (isIgnored(childRel, entry.name, ignore)) {
-        others.push([childRel, 'ignored by the mount']);
-        regions.push({ path: childRel, reason: 'ignored by the mount', kind: 'ignored' });
+      const passedOver = passedOverBecause(childRel, entry.name, ignore, view.others);
+      if (passedOver !== undefined) {
+        others.push([childRel, passedOver]);
+        regions.push({ path: childRel, reason: passedOver, kind: 'ignored' });
         continue;
       }
       if (entry.isDirectory()) {
         subdirs.push(childRel);
       } else if (entry.isFile()) {
-        if (walk.files.size + files.length >= cap) {
-          capped = true;
-          reachedCap = true;
-          regions.push({ path: rel, reason: `the file cap (${cap}) was reached`, kind: 'cap' });
-          break;
-        }
-        files.push(childRel);
+        leaves.push([childRel, true]);
       } else {
         const symlink = entry.isSymbolicLink();
+        leaves.push([childRel, false]);
         others.push([childRel, symlink ? 'a symlink' : 'not a regular file']);
         if (symlink) regions.push({ path: childRel, reason: 'a symlink, not walked', kind: 'symlink' });
       }
@@ -820,25 +1137,103 @@ export async function walkScope(
     // A listing of a directory that was moved or replaced meanwhile says
     // nothing about this path: neither its names nor its absences count.
     if (!(await dir.stillHere())) {
-      walk.incomplete.push({ path: rel, reason: CHANGED_WALK, kind: 'error' });
-      return;
+      fail(rel, CHANGED_WALK);
+      return null;
     }
-    for (const f of files) walk.files.add(f);
+    for (const [p, isFile] of leaves) if (isFile) walk.seen.add(p);
     for (const d of subdirs) walk.dirs.add(d);
     for (const [p, why] of others) walk.others.set(p, why);
     walk.incomplete.push(...regions);
-    if (reachedCap) return;
     walk.complete.add(rel);
+    const listing = { leaves, subdirs, ...dir.identity() };
+    listings.set(rel, listing);
+    return listing;
+  };
+
+  type Stretch = 'all' | 'after' | 'upto';
+  const fileIn = (stretch: Stretch, file: string): boolean =>
+    stretch === 'all' || (compareInWalk(file, after!) > 0) === (stretch === 'after');
+  const dirIn = (stretch: Stretch, dir: string): boolean => {
+    if (stretch === 'all') return true;
+    const at = subtreeAgainst(dir, after!);
+    return at === 'holds' || at === (stretch === 'after' ? 'after' : 'before');
+  };
+
+  const visit = async (dir: CheckedDir, stretch: Stretch): Promise<void> => {
+    visited.add(dir.rel);
+    const listing = await list(dir);
+    if (!listing) return;
+    // A link or other entry that isn't a directory is taken as a file is,
+    // against the cap: the pass observes each one it takes, and following a
+    // link can read as much as a file.
+    for (const [leaf, isFile] of listing.leaves) {
+      if (left === 0) break;
+      if (!fileIn(stretch, leaf)) continue;
+      left--;
+      if (isFile) {
+        walk.seen.delete(leaf);
+        walk.files.add(leaf);
+      } else {
+        walk.othersTaken.add(leaf);
+      }
+      lastTaken = leaf;
+    }
     if (!recursive) return;
-    for (const sub of subdirs) {
+    for (const sub of listing.subdirs) {
+      // Once the cap is reached, no further directory is listed.
+      if (left === 0) break;
+      if (!dirIn(stretch, sub)) continue;
       const child = await checkChild(view, rootReal, dir, sub);
-      if (child.kind === 'checked') await visit(child.dir);
-      else if (child.kind === 'absent') walk.missing.add(sub);
-      else walk.incomplete.push({ path: sub, reason: child.reason, kind: 'error' });
+      // This check replaces what an earlier one proved of `sub` itself, such
+      // as missing on the after stretch and found again on the wrap. What was
+      // proven beneath a directory that is still the same one stands, and
+      // list() drops it from one that isn't.
+      walk.missing.delete(sub);
+      if (child.kind === 'checked') {
+        await visit(child.dir, stretch);
+        continue;
+      }
+      // On the wrap, a directory listed on the first stretch that isn't the
+      // directory there now: what the walk read of it describes another.
+      dropBeneath(sub);
+      if (child.kind === 'absent') walk.missing.add(sub);
+      else fail(sub, child.reason);
     }
   };
 
-  await visit(top.dir);
+  if (after === undefined) {
+    await visit(top.dir, 'all');
+  } else {
+    await visit(top.dir, 'after');
+    if (left > 0) await visit(top.dir, 'upto');
+  }
+
+  // What the cap left: directories holding entries not taken, and
+  // directories a listing showed that weren't listed. A walk that doesn't
+  // descend leaves its subdirectories by design.
+  const capped = `the walk cap (${cap}) was reached`;
+  const holdingUntaken = new Set<string>();
+  for (const f of walk.seen) holdingUntaken.add(parentOf(f));
+  for (const [p, why] of walk.others) if (!passedOverByDesign(why) && !walk.othersTaken.has(p)) holdingUntaken.add(parentOf(p));
+  for (const d of holdingUntaken) {
+    walk.incomplete.push({ path: d, reason: `${capped} before everything here was taken`, kind: 'cap' });
+  }
+  let unlisted = 0;
+  if (recursive) {
+    for (const d of walk.dirs) {
+      if (visited.has(d) || walk.missing.has(d) || failed.has(d)) continue;
+      unlisted++;
+      walk.incomplete.push({ path: d, reason: `not visited: ${capped}`, kind: 'cap' });
+    }
+  }
+  // The cap stopped the walk only if it left something: a walk whose last
+  // file used up the cap covered its scope. A directory the walk didn't list
+  // counts as left, even one that holds nothing it would take (empty, or
+  // only names it passes over by design): telling them apart would take
+  // another read. Such a
+  // walk keeps its place and reports the directory as not visited, and the
+  // next one lists it on its way to the wrap.
+  if (left === 0 && lastTaken !== undefined && (holdingUntaken.size > 0 || unlisted > 0)) walk.stoppedAfter = lastTaken;
   return walk;
 }
 
@@ -855,7 +1250,7 @@ export function provenAbsent(walk: Walk, path: string): boolean {
     if (walk.missing.has(dir)) return true;
     const child = dir ? `${dir}/${parts[i]}` : parts[i]!;
     if (walk.complete.has(dir)) {
-      if (walk.others.has(child)) return false; // present, but unproven
+      if (walk.others.has(child) || walk.seen.has(child)) return false; // present, but unproven
       if (i === parts.length - 1) return !walk.files.has(child) && !walk.dirs.has(child);
       if (!walk.dirs.has(child)) return true; // no directory there: nothing beneath can exist
     }
