@@ -15,6 +15,8 @@ import type { TraceEventListener } from './trace.js';
 export interface MessageQuery {
   /** Filter by external source (e.g., 'discord') */
   source?: string;
+  /** Filter by external IDs: messages whose metadata.external.id is one of these. An empty list filters nothing. */
+  externalIds?: string[];
   /** Filter by participant name */
   participant?: string;
   /** Filter by metadata fields (shallow match) */

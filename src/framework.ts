@@ -1,6 +1,6 @@
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { dirname, join } from 'node:path';
-import { INLINE_WITHHELD_TEXT, REFERENCE_LIMITS, classifyBlock, isInlineContradiction, isReferenceExpired, referenceRegistry, referenceStubOrNull, referenceTypeLabel, sanitizeLabel, unfetchableReason } from './mcpl/references.js';
+import { INLINE_WITHHELD_TEXT, REFERENCE_LIMITS, classifyBlock, isInlineContradiction, isReferenceExpired, referenceRegistry, referenceStubOrNull, sanitizeLabel, unfetchableReason } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
 import {
   appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync,
@@ -77,7 +77,7 @@ import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE
 import { Agent } from './agent.js';
 import { ModuleRegistry, checkedToolResult, ensureStateRegistered, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
-import { logValue } from './mcpl/log-value.js';
+import { logDetail, logValue } from './mcpl/log-value.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './mcpl/capability-grant.js';
 import { maskNegotiatedCapabilities } from './mcpl/capability-mask.js';
@@ -92,7 +92,7 @@ import {
   coalescingSubjectKey, type AssemblyResult, type CoalescedOccurrence, type CoalescingPlacement, type CoalescingSnapshot,
   type CoalescingReceiptRecord,
 } from './mcpl/push-coalescer.js';
-import type { ChannelIncomingMessage, ChannelIncomingMessageResult, McplContentBlock, PushEventResult } from './mcpl/types.js';
+import type { ChannelIncomingMessage, ChannelIncomingMessageResult, McplContentBlock, McpToolResultContent, PushEventResult } from './mcpl/types.js';
 import { isSilentHeartbeatMarker, isVisiblyEmptyContent, NON_STRING_TEXT_PLACEHOLDER } from './mcpl/visible-content.js';
 import { parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
 import { ProseStreamRouter } from './mcpl/prose-stream-router.js';
@@ -110,15 +110,19 @@ import {
   toolResultDataToHistoryString,
   truncateForHistory,
   DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
+  type HistoryBlockSpan,
 } from './tool-result-history.js';
 import {
   TOOL_IMAGE_REF_RE,
   ToolImageLedger,
-  formatPreservedImageSlots,
+  cutStoredToolResult,
+  formatKeptImageSlots,
   parseImagePlaceholders,
   sha256Hex,
-  splitPreservingImageSlots,
+  storedImageSlots,
+  toolResultCutAt,
   type ParsedImagePlaceholder,
+  type ShownRanges,
 } from './tool-image-ledger.js';
 import { randomUUID, createHash } from 'node:crypto';
 import { PyRunner, buildInjectedTools, formatLimit } from './code-execution/py-runner.js';
@@ -292,6 +296,32 @@ function extractChannelIdFromToolResult(
 }
 
 /**
+ * The text of an MCPL tools/call result: its text blocks' text, joined by
+ * line breaks, with empty ones left out. A text block whose text isn't a
+ * string, which only a nonconformant server sends, shows as the converters'
+ * placeholder, and content that isn't a list, which only such a server sends
+ * too, has no text.
+ */
+function mcplResultText(content: McpToolResultContent[] | undefined): string {
+  return (Array.isArray(content) ? content : [])
+    .filter((c) => c.type === 'text')
+    .map((c) => (typeof c.text === 'string' ? c.text : NON_STRING_TEXT_PLACEHOLDER))
+    .filter((text) => text !== '')
+    .join('\n');
+}
+
+/**
+ * An MCPL tools/call result the server marked `isError`, as a failure: its
+ * text is the error, or `Tool call failed` when it has none, and its other
+ * blocks aren't kept. The model's dispatch and an in-process caller
+ * (`executeToolCall`, `ModuleContext.callTool`) both take a server's error
+ * from here, so it reads the same on each path.
+ */
+function mcplToolFailure(content: McpToolResultContent[] | undefined): ToolResult {
+  return { success: false, error: mcplResultText(content) || 'Tool call failed', isError: true };
+}
+
+/**
  * True when an incoming channel message explicitly addressed the agent.
  * Primary signal is the MCPL RFC-001 `chat:addressed` tag (mention / reply /
  * DM, as classified by the server); the metadata booleans are the fallback
@@ -423,6 +453,7 @@ import { EventGate, formatShadowWarning } from './gate/event-gate.js';
 import { UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import { stderrTailOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
+import { boundedForLog, describeCause } from './mcpl/errors.js';
 import { assertServerConfigBooleans, isWebSocketTransport } from './mcpl/transport.js';
 import type {
   McplServerConfig,
@@ -516,6 +547,13 @@ interface DeferredWrite {
   forAgent?: string;
 }
 const bySeq = (a: { seq: number }, b: { seq: number }): number => a.seq - b.seq;
+
+/** The reply helpers an MCPL connection hands an inbound request's handler. */
+type InboundResponder = {
+  id: string | number;
+  respond: (result: unknown) => void;
+  respondError: (code: number, message: string, data?: unknown) => void;
+};
 
 /** A drained entry as writeDrainedInOrder wrote it: the id its store gave it
  *  (empty when addMessage deferred it again; a sharded body's first shard)
@@ -1719,66 +1757,6 @@ function jsonKind(value: unknown): string {
         : `a ${typeof value}`;
 }
 
-/**
- * A failed handler's reason, never throwing: an Error's message, else "the
- * handler failed" and what it threw (nothing, for `undefined`). Telling an
- * Error apart is itself guarded, since instanceof throws on a revoked Proxy.
- */
-function handlerFailureText(error: unknown): string {
-  let isError = false;
-  try {
-    isError = error instanceof Error;
-  } catch {
-    // Not an Error that can be read; thrownText says so.
-  }
-  if (isError) return thrownText(error);
-  return error === undefined ? 'the handler failed' : `the handler failed: ${thrownText(error)}`;
-}
-
-/** A server's responder, and whether the request it belongs to has been answered yet. */
-type AnswerOnce = {
-  responder: { respond?: (result: unknown) => void; respondError?: (code: number, message: string, data?: unknown) => void } | undefined;
-  answered: () => boolean;
-};
-
-/**
- * Wrap a server request's responder so the request is answered at most once,
- * and a later failure can tell whether the handler already answered.
- * - An answer counts once the responder returns. One that throws, such as a
- *   result the transport can't serialize, leaves the request unanswered, so
- *   the listener's failure answer still goes out. This assumes a responder
- *   that throws has sent nothing, which holds for the connection's own: they
- *   serialize before they write, and their transports' writes don't throw
- *   after writing.
- * - A second answer is refused and logged: a handler that answered and then
- *   threw isn't answered again, and a handler that answers after the
- *   listener answered its failure doesn't send a second response.
- * - Only the methods the responder has are wrapped, so a handler that checks
- *   for `respondError` still finds a responder without one.
- */
-function answerOnce<R extends { respond?: (result: unknown) => void; respondError?: (code: number, message: string, data?: unknown) => void }>(
-  responder: R | undefined,
-  method: string,
-  serverId: string,
-): AnswerOnce & { responder: R | undefined } {
-  if (!responder) return { responder: undefined, answered: () => false };
-  let done = false;
-  const once = <A extends unknown[]>(kind: string, send: (...args: A) => void) => (...args: A): void => {
-    if (done) {
-      console.error(`[mcpl] ${method} from ${serverId}: a second answer (${kind}) was refused; the request was already answered`);
-      return;
-    }
-    send(...args);
-    done = true;
-  };
-  const wrapped: { respond?: (result: unknown) => void; respondError?: (code: number, message: string, data?: unknown) => void } = { ...responder };
-  if (responder.respond) wrapped.respond = once('respond', (result: unknown) => responder.respond!(result));
-  if (responder.respondError) {
-    wrapped.respondError = once('respondError', (code: number, message: string, data?: unknown) => responder.respondError!(code, message, data));
-  }
-  return { responder: wrapped as R, answered: () => done };
-}
-
 export class AgentFramework {
   private toolPresentations = new Map<string, ToolPresentation>();
   private presentationPreviews = new WeakMap<object, PresentationSnapshot>();
@@ -2362,7 +2340,7 @@ export class AgentFramework {
    */
   static async create(config: FrameworkConfig): Promise<AgentFramework> {
     // Before anything opens or starts: a refused config must leave nothing behind.
-    if (config.codeExecution?.enabled) validateCodeExecutionConfig(config.codeExecution);
+    if (config.codeExecution != null) validateCodeExecutionConfig(config.codeExecution);
 
     // Create or use existing store
     let store: JsStore;
@@ -2458,6 +2436,26 @@ export class AgentFramework {
     // The legacy single-map checkpoint state (TURN_CHECKPOINTS_ID) is no longer
     // registered for new stores — it's read-only fallback data in old ones.
     ensureStateRegistered(store, { id: TURN_CHECKPOINTS_TREE_ID, strategy: 'tree' });
+
+    // The conversation router's generation counters (see the routing setup
+    // below) are read now, before anything starts, so a read that fails
+    // leaves nothing running: create() fails with the read error, and its
+    // release closes a store it opened. No persisted state yet reads as null.
+    // A read that fails is not that: taken as no counters, it would do what
+    // the routing setup's comment warns of.
+    let routerGenerations: Record<string, number> | undefined;
+    if (config.conversations) {
+      ensureStateRegistered(store, { id: CONVERSATION_ROUTER_STATE_ID, strategy: 'snapshot' });
+      try {
+        routerGenerations = (store.getStateJson(CONVERSATION_ROUTER_STATE_ID) as
+          { generations?: Record<string, number> } | null)?.generations;
+      } catch (error) {
+        throw new Error(
+          `the conversation router's generation counters (${CONVERSATION_ROUTER_STATE_ID}) could not be read: ${thrownText(error)}`,
+          { cause: error },
+        );
+      }
+    }
 
     // Process logging config (default: disabled)
     const processLoggingPersist = config.processLogging?.persist ?? false;
@@ -2582,16 +2580,10 @@ export class AgentFramework {
 
       // Generation counters persist across restarts — reusing generation 1's
       // agent name after a restart would reopen (and re-seed) the previous
-      // engagement's Chronicle namespace.
-      ensureStateRegistered(store, { id: CONVERSATION_ROUTER_STATE_ID, strategy: 'snapshot' });
-      try {
-        const data = store.getStateJson(CONVERSATION_ROUTER_STATE_ID) as
-          { generations?: Record<string, number> } | null;
-        if (data?.generations) {
-          framework.conversationRouter.hydrateGenerations(data.generations);
-        }
-      } catch {
-        // No persisted state yet
+      // engagement's Chronicle namespace. They were read before anything
+      // started (above).
+      if (routerGenerations) {
+        framework.conversationRouter.hydrateGenerations(routerGenerations);
       }
     }
 
@@ -2669,7 +2661,7 @@ export class AgentFramework {
 
     // Client-side programmatic tool calling (code_execution). Config is only
     // retained when enabled — everything downstream gates on the field.
-    framework.codeExecutionConfig = config.codeExecution?.enabled ? config.codeExecution : null;
+    framework.codeExecutionConfig = config.codeExecution?.enabled === true ? config.codeExecution : null;
 
     framework.toolClassOverrides = normalizeClassTable(config.toolClassOverrides, 'toolClassOverrides');
     framework.hostToolClasses = [
@@ -4190,47 +4182,21 @@ export class AgentFramework {
   }
 
   /**
-   * A server's request or notification the host couldn't handle, answered
-   * with a JSON-RPC error when it is a request (a notification has no one to
-   * answer, and is logged), rather than thrown out of the connection's
-   * listener, where it was an unhandled rejection and the server's request
-   * waited for its timeout.
-   * - `refused`: the listener turned it away before its handler ran; the
-   *   host is stopping, and none of it was taken. Answered -32000, "the host
-   *   is stopping", the code the push coalescer already gives a stopping
-   *   host: the server can send it again to the host's next run.
-   * - `failed`: the handler threw, whatever it threw, `undefined` included.
-   *   While the host stops (its queue closed), that's answered -32000 too,
-   *   with the handler's own message after the stop wording; on a live host
-   *   it's a fault, answered -32603 with the handler's message. The handler
-   *   may have admitted part of the request first (an earlier message of a
-   *   batch), so nothing here claims that none of it was taken.
-   * A request the handler already answered before it threw isn't answered
-   * again: the failure is logged.
+   * A server's request turned away before its handler ran, because the host
+   * is stopping and none of it was taken: answered -32000, "the host is
+   * stopping", the code the push coalescer already gives a stopping host, so
+   * the server can send it again to the host's next run, and logged. A
+   * handler's own failure is answered by containedInboundHandler, with
+   * -32000 and the stop wording alone once the host is stopping.
    */
   private refuseServerItem(
     method: string,
     serverId: string,
-    answer: AnswerOnce,
-    outcome: { kind: 'refused' } | { kind: 'failed'; error: unknown },
+    responder: { respondError?: (code: number, message: string, data?: unknown) => void } | undefined,
   ): void {
-    // Optional chaining: prototype-built harnesses leave the queue unset.
-    const stopping = outcome.kind === 'refused' || !!this.queue?.isClosed;
-    const what = outcome.kind === 'refused' ? '' : handlerFailureText(outcome.error);
-    const reason = outcome.kind === 'refused'
-      ? 'the host is stopping'
-      : stopping
-        ? `the host stopped while handling this request (${what})`
-        : what;
-    if (outcome.kind === 'failed' && answer.answered()) {
-      console.error(`[mcpl] ${method} from ${serverId} failed after it was answered: ${reason}`);
-      return;
-    }
-    console.error(outcome.kind === 'refused'
-      ? `[mcpl] ${method} from ${serverId} refused: ${reason}`
-      : `[mcpl] ${method} from ${serverId} failed: ${reason} (part of it may already have been admitted)`);
+    console.error(`[mcpl] ${method} from ${serverId} refused: the host is stopping`);
     try {
-      answer.responder?.respondError?.(stopping ? -32000 : -32603, reason);
+      responder?.respondError?.(-32000, 'the host is stopping');
     } catch {
       // The connection is going too; there is no one left to tell.
     }
@@ -10827,33 +10793,71 @@ export class AgentFramework {
   }
 
   /**
-   * Create the fork a spawn decision names, bind its channel to it and
-   * persist the counters, registered in conversationSpawns under the channel
-   * until it settles. routeConversation registers a spawn only when none is
+   * Store the router's counters with the spawn's generation, create the fork
+   * the decision names and bind its channel to it, registered in
+   * conversationSpawns under the channel until it settles. The store runs
+   * inside the spawn's promise, still in routeConversation's synchronous
+   * step, so a store that throws rejects the spawn, which each caller reports
+   * as a failed spawn, rather than throwing out of routeConversation before
+   * the caller's try. routeConversation registers a spawn only when none is
    * in flight for the channel, and only this spawn's settlement removes it,
    * so the entry it removes is its own. It's removed before anyone waiting
    * on it resumes, so a waiter that decides again doesn't find it.
    */
   private spawnConversationAgent(channelId: string, decision: { agentName: string; generation: number }): Promise<Agent> {
-    const spawn = this.createConversationAgent(decision.agentName, channelId).then((agent) => {
+    const spawn = (async () => {
+      this.storeConversationGeneration(channelId, decision.generation);
+      const agent = await this.createConversationAgent(decision.agentName, channelId);
       this.conversationRouter!.bind(channelId, decision.agentName, decision.generation);
-      this.persistConversationRouterState();
       return agent;
-    });
+    })();
     const done = (): void => { this.conversationSpawns.delete(channelId); };
     this.conversationSpawns.set(channelId, spawn.then(done, done));
     return spawn;
   }
 
-  /** Persist the router's generation counters (see hydration in create()). */
-  private persistConversationRouterState(): void {
+  /**
+   * Store the router's generation counters with a spawn's generation, before
+   * the spawn it names (see hydration in create()). A fork whose counter isn't
+   * stored would have its name reused at the next restart, reopening its
+   * namespace, so a failed read or write throws and the caller refuses the
+   * spawn. The stored counters, the router's own and this spawn's are
+   * merged, each at its highest, in one synchronous step: another channel's
+   * spawn still in flight has stored its counter but not bound it yet, so
+   * the router's map alone would write that counter back down, and the
+   * router's own counters keep the stored ones from going back down when
+   * they read lower, as on a branch with older counters. The merge is a Map,
+   * so a channel id such as "constructor" is a key like any other. The
+   * callers name the channel; the errors name the state and what failed.
+   */
+  private storeConversationGeneration(channelId: string, generation: number): void {
     if (!this.conversationRouter) return;
+    let stored: unknown;
     try {
-      this.store.setStateJson(CONVERSATION_ROUTER_STATE_ID, {
-        generations: this.conversationRouter.exportGenerations(),
-      });
+      stored = (this.store.getStateJson(CONVERSATION_ROUTER_STATE_ID) as { generations?: unknown } | null)?.generations;
     } catch (error) {
-      console.error('Failed to persist conversation router state:', error);
+      throw new Error(
+        `the conversation router's generation counters (${CONVERSATION_ROUTER_STATE_ID}) could not be read: ${thrownText(error)}`,
+        { cause: error },
+      );
+    }
+    const generations = new Map<string, number>();
+    for (const source of [
+      stored && typeof stored === 'object' ? Object.entries(stored) : [],
+      Object.entries(this.conversationRouter.exportGenerations()),
+      [[channelId, generation]] as Array<[string, unknown]>,
+    ]) {
+      for (const [id, n] of source) {
+        if (typeof n === 'number' && n > (generations.get(id) ?? 0)) generations.set(id, n);
+      }
+    }
+    try {
+      this.store.setStateJson(CONVERSATION_ROUTER_STATE_ID, { generations: Object.fromEntries(generations) });
+    } catch (error) {
+      throw new Error(
+        `the conversation router's generation counters (${CONVERSATION_ROUTER_STATE_ID}) could not be stored: ${thrownText(error)}`,
+        { cause: error },
+      );
     }
   }
 
@@ -13006,19 +13010,21 @@ export class AgentFramework {
       }
     }
 
-    // A turn whose only causes were deferred batches, all of which rendered
-    // nothing (empty or blank render, §5.2; cancelled; revoked), has nothing
-    // new to show: running it would wake the model to `[Continue]` or an
-    // older message, an uncaused wake. Stop before the checkpoint, locus,
-    // typing and compile. Any batch this assembly materialized keeps the
-    // turn, including one that was not among its causes (a batch whose wake
-    // the freeze withdrew, or one that never qualified for a wake). A cause
-    // this assembly did not settle (rendered elsewhere, not yet frozen) keeps
-    // the turn, as before.
+    // A turn whose only causes were deferred batches, none of which gave it
+    // anything to read (an empty or blank render, §5.2; cancelled; revoked; a
+    // render-start that could not be made durable, whose batch then waits for
+    // its recovery wake; a batch whose audience doesn't include the agent),
+    // has nothing new to show: running it would wake the model to
+    // `[Continue]` or an older message, an uncaused wake. Stop before the
+    // checkpoint, locus, typing and compile. Any batch this assembly
+    // materialized keeps the turn, including one that was not among its
+    // causes (a batch whose wake the freeze withdrew, or one that never
+    // qualified for a wake). A cause this assembly did not settle (rendered
+    // elsewhere, not yet frozen) keeps the turn, as before.
     const batchSubjects = trigger?.coalescingBatchSubjects;
     if (assembly && batchSubjects?.length && assembly.materialized.size === 0
       && batchSubjects.every((s) => assembly.settled.has(s))) {
-      console.error(`[coalescing] ${agent.name}: deferred render produced nothing; turn not started (no wake cause left)`);
+      console.error(`[coalescing] ${agent.name}: its deferred batches gave this turn nothing to read; turn not started (no wake cause left)`);
       this.emitTrace({ type: 'mcpl:coalescing', kind: 'turn-withdrawn', agentName: agent.name, subjects: batchSubjects });
       // Release the turn and land anything deferred while assembly awaited
       // the render, as a torn-down turn would.
@@ -15435,6 +15441,10 @@ export class AgentFramework {
     }
     try {
       const result = await server.sendToolsCall(toolName, call.input as Record<string, unknown>);
+      // A server's error is a failure here too, as the model's dispatch
+      // reads it. A success is the server's own blocks, for the caller to
+      // use in process.
+      if (result.isError) return mcplToolFailure(result.content);
       return {
         success: true,
         data: result.content,
@@ -15926,23 +15936,9 @@ export class AgentFramework {
   }> {
     const spilled = new Map<string, { text: string; filePath: string | null }>();
     const dateLabel = new Date().toISOString().slice(0, 10);
-    const ledger = this.toolImageLedgerFor(agentName);
     for (const tc of toolResults) {
-      // Retain every image the result carries BEFORE the placeholder is
-      // written (issue #104): the placeholder embeds the ref, so the image
-      // stays reachable by provenance after the bytes leave the wire.
-      const raw = tc.result.isError
-        ? tc.result.error ?? 'Unknown error'
-        : nonErrorResultText(tc.result, undefined, {
-          imageRef: (blockIndex, image) => ledger.retain({
-            toolCallId: tc.id,
-            toolName: tc.name,
-            blockIndex,
-            data: image.data,
-            mediaType: image.mimeType,
-          }).ref,
-        });
-      spilled.set(tc.id, await this.spillOrTruncate(raw, maxChars, `${dateLabel}-${tc.id}`));
+      const { text, shown } = this.storedToolResultText(agentName, tc, maxChars);
+      spilled.set(tc.id, await this.spillOrTruncate(text, maxChars, `${dateLabel}-${tc.id}`, shown));
     }
     const blocks: ContentBlock[] = toolResults.map(tc => ({
       type: 'tool_result' as const,
@@ -15954,6 +15950,47 @@ export class AgentFramework {
       isError: tc.result.isError,
     }));
     return { blocks, spilled };
+  }
+
+  /**
+   * A tool result's text as its stored copy is written before any cut, and
+   * what its live copy showed beside that text (see cutStoredToolResult). An
+   * error result is its error text. Any other is serialized by
+   * nonErrorResultText, which retains each inline image BEFORE its
+   * placeholder is written (issue #104): the placeholder embeds the ref, so
+   * the image stays reachable by provenance after the bytes leave the wire.
+   *
+   * The live copy is the stored text itself unless the result is a content
+   * array carrying an inline image, which tryNativeToolResultContent sends
+   * as native blocks. It takes the same arrays the serializer takes block by
+   * block, and shows each image and each reference block's stub whole and
+   * each text block up to where it cuts that block at the cap (`maxChars`,
+   * toolResultCutAt), so those are the ranges of the text it showed.
+   */
+  private storedToolResultText(
+    agentName: string,
+    tc: CompletedToolCall,
+    maxChars: number | undefined,
+  ): { text: string; shown: ShownRanges | null } {
+    if (tc.result.isError) return { text: tc.result.error ?? 'Unknown error', shown: null };
+    const ledger = this.toolImageLedgerFor(agentName);
+    let blocks = null as HistoryBlockSpan[] | null;
+    const text = nonErrorResultText(tc.result, undefined, {
+      imageRef: (blockIndex, image) => ledger.retain({
+        toolCallId: tc.id,
+        toolName: tc.name,
+        blockIndex,
+        data: image.data,
+        mediaType: image.mimeType,
+      }).ref,
+      onBlocks: (spans) => { blocks = spans; },
+    });
+    if (!blocks?.some((block) => block.kind === 'image')) return { text, shown: null };
+    return {
+      text,
+      shown: blocks.map(({ kind, start, end }): [number, number] =>
+        [start, kind === 'text' && maxChars ? start + toolResultCutAt(text.slice(start, end), maxChars) : end]),
+    };
   }
 
   /** Where a tool result labelled `label` is written: `<first writable
@@ -16087,15 +16124,21 @@ export class AgentFramework {
     content: string,
     cap: number | undefined,
     label: string,
+    /** What the live copy showed beside this text (storedToolResultText);
+     *  null when the live copy was this text. */
+    shown: ShownRanges | null = null,
   ): Promise<{ text: string; filePath: string | null }> {
     if (!cap || content.length <= cap) return { text: content, filePath: null };
     // The stored text is the only place save_recent_image discovers tool
-    // images, and the live wire delivers every image regardless of text
-    // length — so an image slot dropped by the cut is an image the resident
-    // saw that the index would silently slide past (issue #104). Keep the
-    // slots at or past the cut, re-appended after the notice.
-    const { head, tail } = splitPreservingImageSlots(content, cap);
-    const kept = formatPreservedImageSlots(tail);
+    // images. When the live wire delivered them beside the text, whatever
+    // its length, an image slot dropped by the cut is an image the resident
+    // saw that the index would silently slide past (issue #104), so the
+    // newest slots past the cut that the live copy showed are re-appended
+    // after the notice. Otherwise the live copy is this text, and nothing
+    // past the cut is kept (#403).
+    const cut = cutStoredToolResult(content, cap, shown);
+    const { head } = cut;
+    const kept = formatKeptImageSlots(cut);
 
     const written = await this.writeToolResultFile(label, content);
     if (written && written.error === undefined) {
@@ -16194,8 +16237,13 @@ export class AgentFramework {
     if (result.data === undefined || result.data === null) return nonErrorResultText(result, 5_000_000);
     // RFC-005 "eagerly lazy": a script receiving a result is the strongest
     // available signal that the bytes are wanted (scripts process, they do
-    // not browse) — materialize every referenced payload now, so the stub
-    // the script receives carries a workspace path it can open directly.
+    // not browse) — materialize the references of a content array now, so
+    // the stub the script receives carries a workspace path it can open
+    // directly. Only a reference registered against its server can be
+    // fetched: an MCPL server's result content is, on arrival. An in-process
+    // module's reference has no server, so its fetch is refused (and logged
+    // here) and the script gets its stub, as it does for a reference nested
+    // in other data, which isn't fetched.
     if (Array.isArray(result.data)) {
       const fetcher = this.getReferenceFetcher();
       for (const block of result.data) {
@@ -16208,8 +16256,10 @@ export class AgentFramework {
       }
     }
     // Scripts get (nearly) full data — the script environment IS the spill:
-    // filtering big results in code is the whole point. 5MB protocol safety
-    // cap only; no context-cap truncation, no file spill.
+    // filtering big results in code is the whole point. As in history, a
+    // reference is its stub at any depth and inline data claiming a uri or a
+    // disposition is withheld (RFC-005). 5MB protocol safety cap only; no
+    // context-cap truncation, no file spill.
     return toolResultDataToHistoryString(result.data, 5_000_000);
   }
 
@@ -16309,8 +16359,8 @@ export class AgentFramework {
     }
     // MCPL tool results arrive as `data: McpToolResultContent[]` — preserve image
     // blocks natively rather than JSON-stringifying them away. Anything else
-    // (objects, scalars) falls through to JSON. The error path was handled
-    // above, so isError is always false on these return paths.
+    // goes as text. The error path was handled above, so isError is always
+    // false on these return paths.
     const blocks = this.tryNativeToolResultContent(afResult.data, maxChars, precomputed?.filePath ?? null);
     if (blocks) {
       return { toolUseId: callId, content: blocks, isError: false };
@@ -16318,15 +16368,11 @@ export class AgentFramework {
     if (precomputed !== undefined) {
       return { toolUseId: callId, content: precomputed.text, isError: false };
     }
-    // JSON.stringify returns the VALUE undefined (not a string) for undefined
-    // input — a module tool returning `{ success: true }` with no data would
-    // otherwise make `content.length` below throw a TypeError mid-turn.
-    let content = JSON.stringify(afResult.data) ?? '';
-    if (maxChars && content.length > maxChars) {
-      content = safeSlice(content, 0, maxChars)
-        + '\n\n[truncated — original was ' + content.length + ' chars]';
-    }
-    return { toolUseId: callId, content, isError: false };
+    // Without the history path's copy, the text is made as that copy is
+    // (nonErrorResultText), so a reference's uri stays out of it at any depth
+    // (RFC-005), a result with no data reads its error text, or no text, and
+    // never the value undefined.
+    return { toolUseId: callId, content: nonErrorResultText(afResult, maxChars), isError: false };
   }
 
   /**
@@ -16334,7 +16380,9 @@ export class AgentFramework {
    * convert to Membrane's native ToolResultContentBlock[]. Returns null when
    * the array is text-only (let JSON path handle it; saves a code path).
    * `maxChars`, when provided, caps each accompanying text block so an image
-   * inlined alongside an enormous text payload can't blow the context.
+   * inlined alongside an enormous text payload can't blow the context. A
+   * block is cut as the stored copy is (toolResultCutAt), never inside a
+   * slot, so the stored copy can keep exactly the slots this showed (#403).
    */
   private tryNativeToolResultContent(
     data: unknown,
@@ -16359,7 +16407,7 @@ export class AgentFramework {
         // rather than sending the whole array to the JSON fallback.
         let text = typeof b.text === 'string' ? b.text : NON_STRING_TEXT_PLACEHOLDER;
         if (maxChars && text.length > maxChars) {
-          text = safeSlice(text, 0, maxChars)
+          text = text.slice(0, toolResultCutAt(text, maxChars))
             + '\n\n[truncated — original was ' + text.length + ' chars'
             + (spillPath ? `; full serialized result: workspace file ${spillPath}` : '')
             + ']';
@@ -16379,7 +16427,7 @@ export class AgentFramework {
         if (stub === null) return null;
         blocks.push({ type: 'text', text: stub });
       } else {
-        return null; // unknown shape — bail to JSON path
+        return null; // unknown shape: the stored copy's text, which shows any reference in it as its stub
       }
     }
     return hasImage ? blocks : null;
@@ -17347,7 +17395,17 @@ export class AgentFramework {
       try {
         listener(traceEvent);
       } catch (error) {
-        console.error('Trace listener error:', error);
+        // console.error inspects the value, and inspecting can throw (a
+        // throwing util.inspect.custom, say). That throw would leave this
+        // loop, so the listeners after this one would miss the event and the
+        // code that emitted it would get the throw. describeCause never
+        // throws, a template string isn't inspected, and log-value prints
+        // the text as one escaped, bounded line.
+        try {
+          console.error('Trace listener error:', error);
+        } catch {
+          console.error(`Trace listener error: ${logDetail(describeCause(error))}`);
+        }
       }
     }
   }
@@ -18721,7 +18779,7 @@ export class AgentFramework {
           const cur = this.manifestRefreshState.get(connection.id);
           if (cur?.queued && !cur.inFlight) {
             cur.queued = false;
-            void this.handleManifestChanged(connection, announce).catch(() => {});
+            this.rerunManifestRefresh(connection, announce);
           }
         }, AgentFramework.MANIFEST_FETCH_FLOOR_MS - sinceLast).unref?.();
       }
@@ -18866,10 +18924,23 @@ export class AgentFramework {
       st.lastCompletedAt = Date.now();
       if (st.queued) {
         st.queued = false;
-        setTimeout(() => { void this.handleManifestChanged(connection, announce).catch(() => {}); },
+        setTimeout(() => { this.rerunManifestRefresh(connection, announce); },
           AgentFramework.MANIFEST_FETCH_FLOOR_MS).unref?.();
       }
     }
+  }
+
+  /** A refresh handleManifestChanged schedules for itself, after the fetch
+   *  floor or behind a fetch in flight. It's contained as the announcement's
+   *  own run is. Its fetch's own failure is logged by the fetch's catch, as
+   *  in 0.22.x; any other failure emits mcpl:request-handler-error and a
+   *  stderr line through the containment. */
+  private rerunManifestRefresh(
+    connection: McplServerConnection,
+    announce: unknown,
+  ): void {
+    this.containedInboundHandler(connection.id, 'manifest-changed',
+      (params: unknown) => this.handleManifestChanged(connection, params))(announce);
   }
 
   /**
@@ -19302,10 +19373,191 @@ export class AgentFramework {
   }
 
   /**
+   * An inbound MCPL handler, contained: EventEmitter doesn't consume the
+   * promise a listener returns, so this keeps each handler's throw or
+   * rejection at this boundary, including failures after channels/register or
+   * channels/changed has acknowledged the request. It's invoked at once, so
+   * control-plane replies keep their acknowledge-before-reconcile order.
+   */
+  private containedInboundHandler<T>(
+    serverId: string,
+    event: string,
+    handler: (params: T, responder?: InboundResponder) => void | Promise<void>,
+  ): (params: T, responder?: InboundResponder) => void {
+    return (params: T, responder?: InboundResponder) => {
+      // Whether the handler wrote a reply. A reply counts once its write
+      // returns: a write that throws has sent nothing, since the connection
+      // encodes a reply before it writes it, and neither transport's write
+      // throws after writing (a stream write reports a failure
+      // asynchronously, and a WebSocket is written only while it's open). A
+      // transport whose write could throw after sending bytes would break
+      // this: the internal-error reply would follow part of a reply.
+      let responseAttempted = false;
+      // The first reply write that threw, if any, which a handler may have
+      // swallowed.
+      let writeFailure: unknown;
+      let writeFailed = false;
+      // A write the handler tried after a reply was written. It's refused
+      // without throwing, so a handler that answers again in its own catch
+      // and then rethrows reports its own error; what it tried to send is
+      // kept for the report.
+      let refused: { kind: 'result' } | { kind: 'error'; code: number; message: string } | undefined;
+      // Once a failure is reported, no report follows, so a later answer is
+      // logged as it's refused.
+      let reported = false;
+      const writeResponse = (
+        write: () => void,
+        refusedAs: { kind: 'result' } | { kind: 'error'; code: number; message: string },
+      ): void => {
+        if (responseAttempted) {
+          refused ??= refusedAs;
+          if (reported) {
+            console.error(`[mcpl] ${serverId} ${event}: a second answer was refused; the request was already answered`);
+          }
+          return;
+        }
+        try {
+          write();
+        } catch (error) {
+          if (!writeFailed) {
+            writeFailed = true;
+            writeFailure = error;
+          }
+          throw error;
+        }
+        responseAttempted = true;
+      };
+      // Only the methods the responder has are wrapped, so a handler that
+      // checks for respondError still finds a responder without one, such
+      // as a caller's own that has none.
+      const respondError = responder?.respondError as InboundResponder['respondError'] | undefined;
+      const tracked = (responder && {
+        ...responder,
+        respond: (result: unknown) => writeResponse(() => responder.respond(result), { kind: 'result' }),
+        ...(respondError ? {
+          respondError: (code: number, message: string, data?: unknown) =>
+            writeResponse(() => respondError(code, message, data), {
+              kind: 'error', code, message: typeof message === 'string' ? message : describeCause(message),
+            }),
+        } : {}),
+      }) as InboundResponder | undefined;
+      // Report a failure: the handler's own error when it threw or
+      // rejected, else the reply write it swallowed, else the reply it
+      // tried to send twice. Nothing in here may throw: on the async path
+      // it runs as a rejection handler, where an exception would leave the
+      // report unfinished for the backstop below to log. So every value it
+      // puts in text, the code of an answer the handler tried again
+      // included, is converted with describeCause, the internal-error
+      // reply's send is caught, and emitTrace's own catch can't throw.
+      const report = (handlerError: { error: unknown } | undefined): void => {
+        const primary = handlerError
+          ? handlerError.error
+          : writeFailed ? writeFailure : new Error('the handler tried to answer a second time after its reply');
+        reported = true;
+        const message = describeCause(primary);
+        // What the handler's own writes did, before any internal-error
+        // reply sent here.
+        const handlerResponseAttempted = responseAttempted;
+        // A reply write the handler's own attempt failed, read before the
+        // internal-error reply below, whose own failure is responseError.
+        const responseFailure = writeFailed && handlerError && handlerError.error !== writeFailure
+          ? describeCause(writeFailure) : undefined;
+        let responseError: string | undefined;
+        if (tracked && !responseAttempted) {
+          // The server gets the standard message, not the handler's own
+          // text, which may name internal paths or errors; the trace and
+          // stderr carry the detail. Once the host is stopping (its queue
+          // closed), it gets -32000 with the stop wording alone, the code a
+          // request turned away at stop gets, so it can send it again to
+          // the host's next run. Optional chaining: prototype-built
+          // harnesses leave the queue unset.
+          const stopping = !!this.queue?.isClosed;
+          try {
+            tracked.respondError?.(
+              stopping ? -32000 : -32603,
+              stopping ? 'the host stopped while handling this request' : 'Internal error',
+            );
+          } catch (sendError) {
+            responseError = describeCause(sendError);
+          }
+        }
+        this.emitTrace({
+          type: 'mcpl:request-handler-error',
+          serverId,
+          event,
+          // The trace's type is string | number. Only those are kept, as
+          // the connection's own reports keep them, and a string is
+          // bounded like the texts beside it.
+          requestId: typeof responder?.id === 'number' ? responder.id
+            : typeof responder?.id === 'string' ? boundedForLog(responder.id, 500) : undefined,
+          responseAttempted: handlerResponseAttempted,
+          // The trace's copies are bounded, as data; the log line below
+          // prints each text raw through log-value, which escapes it.
+          error: boundedForLog(message, 500),
+          ...(responseFailure === undefined ? {} : { responseFailure: boundedForLog(responseFailure, 500) }),
+          ...(refused === undefined ? {} : {
+            refusedResponse: refused.kind === 'error' ? { ...refused, message: boundedForLog(refused.message, 500) } : refused,
+          }),
+          ...(responseError === undefined ? {} : { responseError: boundedForLog(responseError, 500) }),
+        });
+        // Keep headless hosts diagnosable even without a trace subscriber.
+        // The handler's text and the server's go through log-value, so a
+        // line stays one line of bounded, escaped text.
+        const tried = refused === undefined ? undefined
+          : refused.kind === 'result' ? 'a result' : `error ${describeCause(refused.code)}: ${refused.message}`;
+        console.error(
+          `[mcpl] ${serverId} ${event} handler failed: ${logDetail(message)}` +
+            (responseFailure === undefined ? '' : ` | its reply write had failed: ${logDetail(responseFailure)}`) +
+            (tried === undefined ? '' : ` | it then tried to answer again with ${logDetail(tried)}`) +
+            (responseError === undefined ? '' : ` | the internal-error reply failed too: ${logDetail(responseError)}`),
+        );
+      };
+      const failed = (error: unknown): void => report({ error });
+      // A handler may swallow a write failure, or answer twice, and still
+      // resolve.
+      const succeeded = (): void => {
+        if (writeFailed || refused) report(undefined);
+      };
+      try {
+        // Invoke immediately: control-plane responses must retain their
+        // ACK-before-reconcile ordering and data-plane barrier semantics.
+        const result = handler(params, tracked);
+        if (result) {
+          // On this path the report runs as a rejection handler, where a
+          // throw would be an unhandled rejection, which ends the host. The
+          // report converts and catches what it knows can throw; this
+          // backstop catches anything else, a defect in the report itself,
+          // and logs it on a line of its own, printed through log-value as
+          // the report's line is. Nothing catches the backstop, so a failure
+          // of its own log is swallowed.
+          void Promise.resolve(result).then(succeeded, failed).catch((reportFailure: unknown) => {
+            try {
+              console.error(`[mcpl] ${serverId} ${event}: the handler failure's report threw: ${logDetail(describeCause(reportFailure))}`);
+            } catch { /* nothing is left to log it to */ }
+          });
+        } else succeeded();
+      } catch (error) {
+        failed(error);
+      }
+    };
+  }
+
+  /**
    * Wire event listeners on an MCPL server connection.
    * Push events and inference requests are deferred to Steps 6/7.
    */
   private wireMcplEvents(connection: McplServerConnection): void {
+    type Responder = InboundResponder;
+
+    // Every inbound handler, request or notification, is contained
+    // (containedInboundHandler).
+    const onRequest = <T>(
+      event: string,
+      handler: (params: T, responder?: Responder) => void | Promise<void>,
+    ): void => {
+      connection.on(event, this.containedInboundHandler(connection.id, event, handler));
+    };
+
     // Forward subprocess stderr lines as trace events so consumers (conhost,
     // log sinks, TUI badges) can persist and surface them.
     connection.on('stderr', (params: { line: string }) => {
@@ -19323,30 +19575,25 @@ export class AgentFramework {
     // framework; the ScopeManager and config `scopes` wiring went with it.
 
     // Handle push events (Step 6)
-    connection.on('push-event', async (
+    onRequest('push-event', async (
       params: PushEventParams,
       responder?: { respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
-      const answer = answerOnce(responder, 'push/event', connection.id);
-      try {
-        // Only when a generation is current: with none, the event is handled in
-        // the turn it arrives, as it always was (the push coalescer's ordering of
-        // a push against its retraction depends on that).
-        if (this.discordAwarenessBarrier) await this.awaitDiscordAwarenessBarriers();
-        // Checked here, after the barrier and before anything records the
-        // push as accepted: a stopped host refuses it.
-        if (this.queue?.isClosed) {
-          this.refuseServerItem('push/event', connection.id, answer, { kind: 'refused' });
-          return;
-        }
-        await this.pushHandler?.handlePushEvent(connection.id, params, answer.responder as never);
-      } catch (error) {
-        this.refuseServerItem('push/event', connection.id, answer, { kind: 'failed', error });
+      // Only when a generation is current: with none, the event is handled in
+      // the turn it arrives, as it always was (the push coalescer's ordering of
+      // a push against its retraction depends on that).
+      if (this.discordAwarenessBarrier) await this.awaitDiscordAwarenessBarriers();
+      // Checked here, after the barrier and before anything records the
+      // push as accepted: a stopped host refuses it.
+      if (this.queue?.isClosed) {
+        this.refuseServerItem('push/event', connection.id, responder);
+        return;
       }
+      await this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
     });
 
     // Handle server-initiated inference requests (Step 6)
-    connection.on('inference-request', async (
+    onRequest('inference-request', async (
       params: McplInferenceRequestParams,
       responder?: { id: string | number; respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
@@ -19360,61 +19607,46 @@ export class AgentFramework {
         return;
       }
       if (this.inferenceRouter && responder) {
-        const answer = answerOnce(responder, 'inference/request', connection.id);
-        try {
-          if (this.discordAwarenessBarrier) await this.awaitDiscordAwarenessBarriers();
-          // A stopping host starts no inference for a server: refused, like a
-          // push, before the router runs.
-          if (this.queue?.isClosed) {
-            this.refuseServerItem('inference/request', connection.id, answer, { kind: 'refused' });
-            return;
-          }
-          await this.inferenceRouter.handleInferenceRequest(connection.id, params, {
-            respond: answer.responder!.respond,
-            respondError: answer.responder!.respondError,
-            requestId: responder.id,
-          });
-        } catch (error) {
-          this.refuseServerItem('inference/request', connection.id, answer, { kind: 'failed', error });
+        if (this.discordAwarenessBarrier) await this.awaitDiscordAwarenessBarriers();
+        // A stopping host starts no inference for a server: refused, like a
+        // push, before the router runs.
+        if (this.queue?.isClosed) {
+          this.refuseServerItem('inference/request', connection.id, responder);
+          return;
         }
+        await this.inferenceRouter.handleInferenceRequest(connection.id, params, {
+          respond: responder.respond,
+          respondError: responder.respondError,
+          requestId: responder.id,
+        });
       }
     });
 
     // Handle channel registration (Step 7)
-    connection.on('channels-register', async (
+    onRequest('channels-register', async (
       params: ChannelsRegisterParams,
       responder?: { respond: (result: unknown) => void; respondError?: (code: number, message: string) => void },
     ) => {
-      const answer = answerOnce(responder, 'channels/register', connection.id);
-      try {
-        if (this.queue?.isClosed) {
-          this.refuseServerItem('channels/register', connection.id, answer, { kind: 'refused' });
-          return;
-        }
-        await this.channelRegistry?.handleRegister(connection.id, params, answer.responder as never);
-      } catch (error) {
-        this.refuseServerItem('channels/register', connection.id, answer, { kind: 'failed', error });
+      if (this.queue?.isClosed) {
+        this.refuseServerItem('channels/register', connection.id, responder);
+        return;
       }
+      await this.channelRegistry?.handleRegister(connection.id, params, responder as never);
     });
 
     // Handle channel changes (Step 7) — §14.5 dual-mode: the responder is
     // present for the Request form and carries itemized added-descriptor
     // results; absent for Notifications, where rejection is itemwise
     // filtering plus a diagnostic trace.
-    connection.on('channels-changed', async (
+    onRequest('channels-changed', async (
       params: ChannelsChangedParams,
       responder?: { respond: (result: unknown) => void; respondError?: (code: number, message: string) => void },
     ) => {
-      const answer = answerOnce(responder, 'channels/changed', connection.id);
-      try {
-        if (this.queue?.isClosed) {
-          this.refuseServerItem('channels/changed', connection.id, answer, { kind: 'refused' });
-          return;
-        }
-        await this.channelRegistry?.handleChanged(connection.id, params, answer.responder as never);
-      } catch (error) {
-        this.refuseServerItem('channels/changed', connection.id, answer, { kind: 'failed', error });
+      if (this.queue?.isClosed) {
+        this.refuseServerItem('channels/changed', connection.id, responder);
+        return;
       }
+      await this.channelRegistry?.handleChanged(connection.id, params, responder as never);
     });
 
     // §6.6/§12: requests that previously had no handler and hung forever
@@ -19422,13 +19654,15 @@ export class AgentFramework {
     // §17.3: a manifest-change announcement. Rate-limited re-fetch → diff
     // → §6.7 consequences → one receipt. The announcement itself carries no
     // payload and no authority; everything below acts on FETCHED content.
-    connection.on('manifest-changed', (params: unknown) => {
-      void this.handleManifestChanged(connection, params).catch((err) => {
-        console.error(`[mcpl] ${connection.id} manifest refresh failed:`, err instanceof Error ? err.message : err);
-      });
-    });
+    // A notification, contained like every inbound handler. A manifest fetch
+    // that fails is caught and logged inside handleManifestChanged, and the
+    // previous manifest stands (§17.5); anything else it throws or rejects
+    // with emits mcpl:request-handler-error, in this run or in a re-run it
+    // schedules (rerunManifestRefresh).
+    onRequest('manifest-changed', (params: unknown) =>
+      this.handleManifestChanged(connection, params));
 
-    connection.on('channels-list', (
+    onRequest('channels-list', (
       _params: unknown,
       responder?: { respond: (result: unknown) => void },
     ) => {
@@ -19440,7 +19674,7 @@ export class AgentFramework {
     // RFC-007 §6: the server's filter over tools/lifecycle. Admission already
     // required toolLifecycle.observe (-32002 otherwise). Validation failures
     // leave the previous filter in force (§6.6).
-    connection.on('tools-observe', (
+    onRequest('tools-observe', (
       params: unknown,
       responder?: { respond: (result: unknown) => void; respondError?: (code: number, message: string, data?: unknown) => void },
     ) => {
@@ -19454,7 +19688,7 @@ export class AgentFramework {
       responder?.respond({});
     });
 
-    connection.on('model-info', (
+    onRequest('model-info', (
       _params: unknown,
       responder?: { respond: (result: unknown) => void; respondError?: (code: number, message: string, data?: unknown) => void },
     ) => {
@@ -19471,60 +19705,60 @@ export class AgentFramework {
     });
 
     // Handle incoming channel messages (Step 7)
-    connection.on('channels-incoming', async (
+    onRequest('channels-incoming', async (
       params: ChannelsIncomingParams,
       responder?: { respond: (result: unknown) => void; respondError?: (code: number, message: string) => void },
     ) => {
-      const answer = answerOnce(responder, 'channels/incoming', connection.id);
-      try {
-        if (this.discordAwarenessBarrier) await this.awaitDiscordAwarenessBarriers();
-        if (this.queue?.isClosed) {
-          this.refuseServerItem('channels/incoming', connection.id, answer, { kind: 'refused' });
-          return;
-        }
-        await this.channelRegistry?.handleIncoming(connection.id, params, answer.responder as never);
-      } catch (error) {
-        this.refuseServerItem('channels/incoming', connection.id, answer, { kind: 'failed', error });
+      if (this.discordAwarenessBarrier) await this.awaitDiscordAwarenessBarriers();
+      if (this.queue?.isClosed) {
+        this.refuseServerItem('channels/incoming', connection.id, responder);
+        return;
       }
+      await this.channelRegistry?.handleIncoming(connection.id, params, responder as never);
     });
 
     // Handle host-level admin commands from a surface (e.g. Discord /undo)
-    connection.on('host-command', async (
+    onRequest('host-command', async (
       params: HostCommandParams,
       responder?: { respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
       if (!responder) return;
-      const answer = answerOnce(responder, 'host/command', connection.id);
-      try {
-        if (this.discordAwarenessBarrier) await this.awaitDiscordAwarenessBarriers();
-        // A stopping host runs no host command: refused like the requests
-        // above, before its handler runs, from the moment stop() has begun.
-        if (this.stopHasBegun()) {
-          this.refuseServerItem('host/command', connection.id, answer, { kind: 'refused' });
-          return;
-        }
-        const result = await this.handleHostCommand(connection.id, params ?? {});
-        answer.responder!.respond(result);
-      } catch (error) {
-        this.refuseServerItem('host/command', connection.id, answer, { kind: 'failed', error });
+      if (this.discordAwarenessBarrier) await this.awaitDiscordAwarenessBarriers();
+      // A stopping host runs no host command: refused like the requests
+      // above, before its handler runs, from the moment stop() has begun.
+      if (this.stopHasBegun()) {
+        this.refuseServerItem('host/command', connection.id, responder);
+        return;
       }
+      const result = await this.handleHostCommand(connection.id, params ?? {});
+      responder.respond(result);
     });
 
-    // Handle dynamic tool list changes (notifications/tools/list_changed)
-    connection.on('tools-list-changed', () => {
+    // Handle dynamic tool list changes (notifications/tools/list_changed).
+    // Contained like every inbound handler: a synchronous failure here emits
+    // mcpl:request-handler-error. A failure of the awareness accounting its
+    // barrier waits on is global, and failMcplDataPlaneGate reports it for
+    // every connection (mcpl:server-error) as it recycles them.
+    onRequest('tools-list-changed', () => {
       // Pause before starting any async refresh. This listener runs
       // synchronously in the transport line callback, so a following inbound
       // data event cannot pass before the new barrier exists.
       const awarenessBarrier = this.installMcplDataPlaneGate();
       this.releaseMcplDataPlaneGate(awarenessBarrier);
-      this.handleToolsListChanged(connection.id);
-      void awarenessBarrier.promise.then(() => {
-        this.completeMcplDataPlaneGate(awarenessBarrier);
-      }).catch((error) => this.failMcplDataPlaneGate(
-        awarenessBarrier,
-        'tools-list reconciliation',
-        error,
-      ));
+      try {
+        this.handleToolsListChanged(connection.id);
+      } finally {
+        // A throw from the refresh is contained like the handler's; the gate
+        // is still completed when its barrier settles, or failed with it, as
+        // on the way through.
+        void awarenessBarrier.promise.then(() => {
+          this.completeMcplDataPlaneGate(awarenessBarrier);
+        }).catch((error) => this.failMcplDataPlaneGate(
+          awarenessBarrier,
+          'tools-list reconciliation',
+          error,
+        ));
+      }
     });
 
     // Re-establish full server registration on reconnect. The 'close' handler
@@ -19988,7 +20222,28 @@ export class AgentFramework {
       })
       .then((result) => {
         const durationMs = Date.now() - startTime;
-        this.emitTrace({ type: 'tool:completed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, durationMs });
+        // Convert MCP tool result to framework ToolResult. A server's error
+        // is a failure (mcplToolFailure, which an in-process caller's error
+        // takes too). When a success contains non-text blocks (e.g. images
+        // from an MCP tool like zulip-mcp's fetch_attachment), pass the full
+        // content array through so toMembraneToolResult can preserve image
+        // blocks natively. Text-only results still collapse to a joined
+        // string for backward compatibility with callers that expect data to
+        // be string-ish.
+        const converted: ToolResult = result.isError
+          ? mcplToolFailure(result.content)
+          : {
+              success: true,
+              data: result.content?.some((c) => c.type !== 'text')
+                ? result.content
+                : (mcplResultText(result.content) || undefined),
+              isError: false,
+            };
+        this.emitTrace({
+          type: converted.isError ? 'tool:failed' : 'tool:completed',
+          module: `mcpl:${serverId}`, tool: toolName, callId: call.id, durationMs,
+          ...(converted.isError ? { error: converted.error } : {}),
+        });
 
         // Record checkpoint from stateful tool response (Step 8).
         // Explicit response attribution is authoritative. Otherwise use the
@@ -20051,39 +20306,13 @@ export class AgentFramework {
           }
         }
 
-        // Convert MCP tool result to framework ToolResult.
-        // When the result contains non-text blocks (e.g. images from an MCP
-        // tool like zulip-mcp's fetch_attachment), pass the full content array
-        // through so toMembraneToolResult can preserve image blocks natively.
-        // Text-only results still collapse to a joined string for backward
-        // compatibility with callers that expect data to be string-ish.
-        // A text block whose text isn't a string, which only a nonconformant
-        // server sends, shows as the converter's placeholder, where it used to
-        // vanish (null, 0, false) or read as String(text), "[object Object]".
-        const textContent = result.content
-          ?.filter((c) => c.type === 'text')
-          .map((c) => (typeof c.text === 'string' ? c.text : NON_STRING_TEXT_PLACEHOLDER))
-          .filter((text) => text !== '')
-          .join('\n');
-        const hasNonText = result.content?.some((c) => c.type !== 'text');
-        const data = result.isError
-          ? undefined
-          : hasNonText
-            ? result.content
-            : (textContent || undefined);
-
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
           toolName: call.name,
           agentName,
           moduleName: `mcpl:${serverId}`,
-          result: {
-            success: !result.isError,
-            data,
-            error: result.isError ? (textContent || 'Tool call failed') : undefined,
-            isError: result.isError ?? false,
-          },
+          result: converted,
         });
       })
       .catch((error) => {
@@ -20165,7 +20394,11 @@ export class AgentFramework {
     this.channelRegistry!.handleChannelToolCall(call.name, call.input, { kind: 'agent', agentName })
       .then((result) => {
         const durationMs = Date.now() - startTime;
-        this.emitTrace({ type: 'tool:completed', module: 'channels', tool: call.name, callId: call.id, durationMs });
+        this.emitTrace({
+          type: result.isError ? 'tool:failed' : 'tool:completed',
+          module: 'channels', tool: call.name, callId: call.id, durationMs,
+          ...(result.isError ? { error: result.error } : {}),
+        });
         // A successful channel_open plants the agent's feet in the opened
         // channel. The agent's own deliberate open is the strongest "my next
         // words go here" signal in the system — stronger than any injection —
@@ -20894,36 +21127,28 @@ export class AgentFramework {
               consider({ kind: 'tool', ref: ph.ref, toolCallId, toolName, mediaType: ph.mediaType, messagesBack });
               continue;
             }
-            // Reference stub: the registry's claimed type (when this process
-            // still has the record), else the first image/ token in the
-            // stub's text, which can come from its name, says whether it was
-            // an image. Either is read as the stub shows a type, sanitized
-            // and bounded. Non-image references are not slots.
-            const claimed = referenceRegistry.get(ph.refId)?.testimony.mimeType ?? ph.mediaType ?? undefined;
-            const mediaType = referenceTypeLabel(claimed).toLowerCase();
-            if (!mediaType.startsWith('image/')) continue;
-            consider({ kind: 'reference', refId: ph.refId, mediaType, toolCallId, toolName, messagesBack });
+            // A reference stub whose text shows an image type: a slot that
+            // never saves (parseImagePlaceholders returns no other stub).
+            consider({ kind: 'reference', refId: ph.refId, mediaType: ph.mediaType, toolCallId, toolName, messagesBack });
           }
         };
 
         // Same-batch results (e.g. a snapshot dispatched alongside the save)
-        // are not in the store yet but ARE the newest images. Classify them
-        // with the very serializer the commit path will run — contradiction
-        // blocks withheld, uri-form blocks as reference stubs, unknown shapes
-        // as no slot at all — so the inventory means the same thing before
-        // and after commit. Retention is idempotent per block, so the
-        // placeholder written at commit time carries the same ref.
+        // are not in the store yet but ARE the newest images. Count them as
+        // their stored copies will count: the very text the commit path will
+        // serialize (contradiction blocks withheld, uri-form blocks as
+        // reference stubs, unknown shapes as no slot at all), cut at this
+        // agent's inline cap as spillOrTruncate will cut it, so the inventory
+        // means the same thing before and after commit. Retention is
+        // idempotent per block, so the placeholder written at commit time
+        // carries the same ref.
         const state = agent.state;
         if (state.status === 'waiting_for_tools') {
+          const cap = this.resolveToolResultInlineCap(agent).cap;
           for (let i = state.completed.length - 1; i >= 0 && collecting(); i--) {
             const tc = state.completed[i]!;
-            if (tc.result.isError) continue;
-            const text = toolResultDataToHistoryString(tc.result.data, undefined, {
-              imageRef: (blockIndex, image) => ledger.retain({
-                toolCallId: tc.id, toolName: tc.name, blockIndex, data: image.data, mediaType: image.mimeType,
-              }).ref,
-            });
-            considerToolResultImages(tc.id, tc.name, parseImagePlaceholders(text), 0);
+            const { text, shown } = this.storedToolResultText(agentName, tc, cap);
+            considerToolResultImages(tc.id, tc.name, storedImageSlots(text, cap, shown), 0);
           }
         }
 

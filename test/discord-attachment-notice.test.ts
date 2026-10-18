@@ -15,7 +15,8 @@ interface ConversionHarness {
   convertMessageToContent(message: DiscordMessageData): Promise<ContentBlock[]>;
 }
 
-/** A message whose only content is one small text attachment. */
+/** A message whose only content is one small text attachment, so its own
+ *  text, stored first, is ''. */
 function messageWithTextFile(filename: string): DiscordMessageData {
   return {
     id: 'm1', channelId: 'c1', guildId: 'g1', authorId: 'u1', authorName: 'User', isBot: false,
@@ -41,7 +42,7 @@ test('a text attachment whose fetch is answered with a status that isn\'t OK rea
   const warn = t.mock.method(console, 'warn', () => {});
   let response: Response | undefined;
   const blocks = await convert(t, async () => (response = new Response('gone', { status: 404 })));
-  assert.deepEqual(blocks, [{ type: 'text', text: '[Attachment: notes.txt (failed to fetch)]' }]);
+  assert.deepEqual(blocks, [{ type: 'text', text: '' }, { type: 'text', text: '[Attachment: notes.txt (failed to fetch)]' }]);
   // The operator's line names the file, the message and the status, and the
   // unread answer is cancelled, so its connection is released.
   assert.deepEqual(warn.mock.calls.map((c) => c.arguments.join(' ')), ['Discord: Attachment notes.txt in message m1 wasn\'t fetched: HTTP 404']);
@@ -58,7 +59,7 @@ test('a filename that could break a log line is printed quoted, as one field', a
 test('a text attachment whose fetch throws reads the same', async (t) => {
   const warn = t.mock.method(console, 'warn', () => {});
   const blocks = await convert(t, async () => { throw new TypeError('fetch failed'); });
-  assert.deepEqual(blocks, [{ type: 'text', text: '[Attachment: notes.txt (failed to fetch)]' }]);
+  assert.deepEqual(blocks, [{ type: 'text', text: '' }, { type: 'text', text: '[Attachment: notes.txt (failed to fetch)]' }]);
   assert.equal(warn.mock.calls.length, 1);
   assert.match(String(warn.mock.calls[0].arguments[0]), /^Discord: Attachment notes\.txt in message m1 wasn't fetched:$/);
   assert.equal((warn.mock.calls[0].arguments[1] as Error).message, 'fetch failed');
@@ -66,5 +67,5 @@ test('a text attachment whose fetch throws reads the same', async (t) => {
 
 test('a text attachment that is fetched is read whole', async (t) => {
   const blocks = await convert(t, async () => new Response('line one', { status: 200 }));
-  assert.deepEqual(blocks, [{ type: 'text', text: '\n--- File: notes.txt ---\nline one\n--- End of notes.txt ---\n' }]);
+  assert.deepEqual(blocks, [{ type: 'text', text: '' }, { type: 'text', text: '\n--- File: notes.txt ---\nline one\n--- End of notes.txt ---\n' }]);
 });
