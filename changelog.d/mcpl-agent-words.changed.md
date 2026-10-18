@@ -4,7 +4,7 @@
     - The other texts change the same way: a close by this host, a request on a closed connection, a server's error answer (in the server's own words, or, with none, saying the outcome is unknown) and a timeout.
     - The log gains a line for a close with requests pending, with the close's code, signal and reason, whether this host closed it, and the requests left unanswered; one for a server's error answer, with its method, id and code; and one for a timeout, with its method and id.
   - **The framework's MCPL tool calls:**
-    - A call to a server missing from the registry, or to a tool its policy denies, says it didn't run and whether anything can change that, in the same words for the model's call and a script's.
+    - A call to a server missing from the registry, or to a tool its policy denies, says it didn't run and whether anything can change that, in the same words for the model's call and a script's. One made while this host is connecting to the server, as in a restart, says so and to try again in a moment.
     - An error result with no text, or only whitespace, reads as one whose effect is unknown, where it read `Tool call failed`, or the blank text.
     - A conversation's `channel_open` is told where to reply.
   - **Blocks the host can't show** read as what they were and why: `[Image not shown: …]`, `[Audio not shown: …]`, `[Reference not shown: …]`, `[Content not shown: …]`, and the text marker `[Text not shown: a text part arrived without readable text.]`. They had read `[Image: no data]`, `[unrecognized content block: …]`, `[inline content withheld: …]` and `[Text not shown: the server's text block had no string text.]`. An image or audio block with an empty link and no data reads as the no-data marker on the tool-result lane too.

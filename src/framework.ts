@@ -137,12 +137,22 @@ import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 
 /** An MCPL tool call refused because its server isn't in the registry: one
- *  closed for good, one removed, or one never connected, which this host
+ *  closed for good, one removed, or one whose connect failed, which this host
  *  doesn't bring back on its own. A server that's reconnecting stays
- *  registered, and its closed connection answers the call instead. */
+ *  registered, and its closed connection answers the call instead. One this
+ *  host is connecting to isn't registered yet, and mcplServerConnectingText
+ *  answers for it. */
 function mcplServerGoneText(serverId: string, toolName: string): string {
   return `The "${serverId}" server that provides ${toolName} isn't connected, and this host won't reconnect to it on its own, ` +
     "so the call didn't run. If you need it, ask whoever runs this host.";
+}
+
+/** An MCPL tool call refused while this host connects to its server, as a
+ *  runtime connect or a restart does: the server's prefix routes calls to it
+ *  before the registry holds it, which it does once the handshake is done. */
+function mcplServerConnectingText(serverId: string, toolName: string): string {
+  return `This host is connecting to the "${serverId}" server that provides ${toolName}, so the call didn't run. ` +
+    'Try again in a moment.';
 }
 
 /** An MCPL tool call its server's tool policy denies. The policy hides the
@@ -2238,6 +2248,10 @@ export class AgentFramework {
   private toolPatternKnownPrefixes: Map<string, string> = new Map();
   /** Maps serverId → McplServerConfig for prefix lookup. */
   private mcplServerConfigs: Map<string, import('./mcpl/types.js').McplServerConfig> = new Map();
+  /** Servers whose connect is in flight (connectMcplServerInternal), from the
+   *  registry's handshake until it settles: a call their prefix routes then
+   *  finds no server registered, and is told this host is connecting to it. */
+  private mcplConnecting: Set<string> = new Set();
   /** Host capabilities advertised during the MCP handshake — stored so servers
    *  can be connected at runtime (connectMcplServer) after initialization. */
   private mcplHostCapabilities: McplHostCapabilities | null = null;
@@ -15739,7 +15753,7 @@ export class AgentFramework {
     }
     const server = this.mcplServerRegistry.getServer(serverId);
     if (!server) {
-      return { success: false, error: mcplServerGoneText(serverId, call.name), isError: true };
+      return { success: false, error: this.mcplServerAbsentText(serverId, call.name), isError: true };
     }
     const toolName = call.name.slice(prefix.length + 2); // Strip prefix + '--'
     if (!isToolAllowed(toolName, this.mcplServerConfigs.get(serverId))) {
@@ -18942,7 +18956,17 @@ export class AgentFramework {
         }),
       });
     }
-    const connection = await this.mcplServerRegistry.addServer(connectionConfig, this.mcplHostCapabilities);
+    // The prefix above routes this server's tool calls already, and addServer
+    // registers the server only once its handshake is done, so until it
+    // settles a call is told this host is connecting to it. A connect that
+    // fails leaves it unregistered, and a call is told it's gone.
+    this.mcplConnecting.add(config.id);
+    let connection: McplServerConnection;
+    try {
+      connection = await this.mcplServerRegistry.addServer(connectionConfig, this.mcplHostCapabilities);
+    } finally {
+      this.mcplConnecting.delete(config.id);
+    }
 
     // Wire listeners before either startup staging or the runtime global gate
     // releases control traffic needed for registration and marker service.
@@ -20414,6 +20438,14 @@ export class AgentFramework {
     }
   }
 
+  /** The refusal of an MCPL tool call whose server isn't in the registry, for
+   *  the model's call and a script's alike. */
+  private mcplServerAbsentText(serverId: string, toolName: string): string {
+    return this.mcplConnecting.has(serverId)
+      ? mcplServerConnectingText(serverId, toolName)
+      : mcplServerGoneText(serverId, toolName);
+  }
+
   /**
    * Dispatch a tool call to an MCPL server.
    * Strips the configured toolPrefix and routes to the server.
@@ -20431,7 +20463,7 @@ export class AgentFramework {
         toolName: call.name,
         agentName,
         moduleName: `mcpl:${serverId}`,
-        result: { success: false, error: mcplServerGoneText(serverId, call.name), isError: true },
+        result: { success: false, error: this.mcplServerAbsentText(serverId, call.name), isError: true },
       });
       return;
     }

@@ -236,6 +236,7 @@ function frameworkWith(server: unknown, config: Record<string, unknown> = {}) {
   };
   framework.mcplServerRegistry = { getServer: () => server };
   framework.mcplServerConfigs = new Map([['words', { id: 'words', ...config }]]);
+  framework.mcplConnecting = new Set();
   framework.emitTrace = () => {};
   framework.pushEvent = (event: ToolResultEvent) => { events.push(event); if (event.type === 'tool-result') resolve(); };
   return { framework, events, delivered };
@@ -256,6 +257,63 @@ test("an MCPL tool call refused before it runs says it didn't run, and whether a
     "and calling it again won't change that. If you need it, ask whoever runs this host.";
   assert.equal(denied.events[0]?.result?.error, deniedText);
   assert.equal((await denied.framework.executeMcplToolCall({ id: 'c4', name: 'words--lookup', input: {} }, 'words', 'words')).error, deniedText);
+});
+
+test("a call while this host connects to the tool's server says so, and after a connect that failed, that the server's gone", async () => {
+  // A runtime connect or a restart's maps the server's prefix, so its tool
+  // calls route to it, then awaits addServer, which registers the server once
+  // the handshake is done. Each handshake here waits for the test.
+  const servers = new Map<string, unknown>();
+  const handshakes: Array<(ok: boolean) => void> = [];
+  const { framework, events } = frameworkWith(null);
+  Object.assign(framework, {
+    mcplServerRegistry: {
+      getServer: (id: string) => servers.get(id) ?? null,
+      addServer: (cfg: { id: string }) => new Promise((resolve, reject) => {
+        handshakes.push((ok) => {
+          if (!ok) return reject(new Error('handshake refused'));
+          const connection = { on: () => {} };
+          servers.set(cfg.id, connection);
+          resolve(connection);
+        });
+      }),
+    },
+    mcplHostCapabilities: {},
+    mcplPrefixMap: new Map(),
+    mcplServerConfigs: new Map(),
+    channelRegistry: null,
+    discordAwarenessOutbox: null,
+    discordAwarenessEmoji: '🔕',
+    wireMcplEvents: () => {},
+    registerMcplServerFeatures: async () => {},
+  });
+  const connect = (framework as unknown as {
+    connectMcplServerInternal(config: McplServerConfig, deferAwareness?: boolean): Promise<void>;
+  }).connectMcplServerInternal.bind(framework);
+  const call = (id: string) => ({ id, name: 'words--lookup', input: {} });
+  const settle = () => new Promise<void>((r) => setImmediate(r));
+
+  const connecting = connect({ id: 'words', url: 'ws://127.0.0.1:9', toolPrefix: 'words' }, true);
+  await settle();
+  assert.equal(handshakes.length, 1, 'the handshake has begun');
+  framework.dispatchMcplToolCall('agent', call('c1'), 'words', 'words');
+  const connectingText = 'This host is connecting to the "words" server that provides words--lookup, so the call didn\'t run. Try again in a moment.';
+  assert.equal(events[0]?.result?.error, connectingText);
+  assert.equal((await framework.executeMcplToolCall(call('c2'), 'words', 'words')).error, connectingText, "a script's call reads the same");
+  handshakes[0]!(true);
+  await connecting;
+
+  // A connect that fails leaves the server unregistered, which nothing brings back.
+  servers.clear();
+  const failing = connect({ id: 'words', url: 'ws://127.0.0.1:9', toolPrefix: 'words' }, true);
+  await settle();
+  handshakes[1]!(false);
+  await assert.rejects(failing, /handshake refused/);
+  const goneText = 'The "words" server that provides words--lookup isn\'t connected, ' +
+    "and this host won't reconnect to it on its own, so the call didn't run. If you need it, ask whoever runs this host.";
+  framework.dispatchMcplToolCall('agent', call('c3'), 'words', 'words');
+  assert.equal(events[1]?.result?.error, goneText);
+  assert.equal((await framework.executeMcplToolCall(call('c4'), 'words', 'words')).error, goneText, "a script's call reads the same");
 });
 
 test("an MCPL tool's error result with no words says so, and that its effect is unknown", async () => {
