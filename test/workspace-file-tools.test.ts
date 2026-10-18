@@ -445,18 +445,20 @@ test('an edit that fails after its change is stored, having taken disk\'s change
   assert.equal(await stored('e.txt'), 'v2 LINE from another writer\n');
 });
 
-test('a deletion whose disk copy is not a regular file names the materialize that unlinks it', { skip: process.platform === 'win32' ? 'no FIFOs' : false }, async (t) => {
+test('a deletion whose disk copy is not a regular file says no push unlinks it, forced or not', { skip: process.platform === 'win32' ? 'no FIFOs' : false }, async (t) => {
   const { dir, call } = setup(t, { autoMaterialize: true });
   writeFileSync(join(dir, 'q.txt'), 'v1\n');
   assert.equal((await call('read', { path: 'work/q.txt' })).success, true);
   rmSync(join(dir, 'q.txt'));
   assert.equal(spawnSync('mkfifo', [join(dir, 'q.txt')]).status, 0, 'mkfifo');
+  const noPush = 'disk has a pipe, socket or device at this path, or a symlink to one, and no push unlinks it, forced or not — '
+    + 'ask whoever runs this host if it should go';
   assert.equal(errorOf(await call('delete', { path: 'work/q.txt' })), 'The deletion of "work/q.txt" is stored in the workspace, so don\'t send it again. '
-    + "Its push to disk didn't complete: cannot verify disk copy (not a regular file) — "
-    + 'fix it and materialize again with applyDeletions, or materialize it with force and applyDeletions to delete it.');
+    + `Its push to disk didn't complete: ${noPush}.`);
   const forced = await call('materialize', { path: 'work/q.txt', force: true, applyDeletions: true });
   assert.equal(forced.success, true, forced.error);
-  assert.equal(existsSync(join(dir, 'q.txt')), false, 'the forced materialize unlinked it');
+  assert.deepEqual((forced.data as { skipped?: unknown }).skipped, [{ mount: 'work', reason: `q.txt: not unlinked: ${noPush}` }]);
+  assert.equal(statSync(join(dir, 'q.txt')).isFIFO(), true, 'the FIFO stays');
 });
 
 // ---------------------------------------------------------------------------

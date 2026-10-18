@@ -212,8 +212,9 @@ export interface FrameworkConfig {
 
   /**
    * Client-side programmatic tool calling (`code_execution` tool). Omitted or
-   * `enabled: false` → tool absent, no python is ever spawned. A value that
-   * isn't an object is refused at `create()`.
+   * `enabled: false` → tool absent, no python is ever spawned. At runtime,
+   * untyped configs may also use `null` or `false` to omit this setting.
+   * Other values that aren't objects are refused at `create()`.
    */
   codeExecution?: CodeExecutionConfig;
 
