@@ -11712,6 +11712,7 @@ export class AgentFramework {
       remove: (p) => this.removePlacement(p),
       deliver: (occ, materialized, assemblingFor) => this.deliverCoalesced(occ, materialized, assemblingFor),
       wakeForBatch: (occ) => this.wakeForCoalescedBatch(occ),
+      wakeToRead: (occ, agentName) => this.queueCoalescedWakes({ ...occ, deliverTo: agentName }),
       cancelWake: (subject) => this.cancelCoalescedWakes(subject),
       authorized: (occ) => this.coalescedAuthorized(occ),
       audience: (occ) => this.coalescedAudience(occ),
@@ -12099,8 +12100,13 @@ export class AgentFramework {
   }
 
   private async wakeForCoalescedBatch(occ: CoalescedOccurrence<CoalescedDelivery>): Promise<void> {
+    this.cancelCoalescedWakes(coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key));
+    await this.queueCoalescedWakes(occ);
+  }
+
+  /** Queue a wake for each agent of the batch's audience, when its latest occurrence triggers inference. */
+  private async queueCoalescedWakes(occ: CoalescedOccurrence<CoalescedDelivery>): Promise<void> {
     const subject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
-    this.cancelCoalescedWakes(subject);
     if (occ.event.lane !== 'push' || !occ.event.event.triggerInference) return;
     const origin = occ.event.event.origin;
     // The wake carries the batch's channel so the turn freezes its reply
@@ -14756,7 +14762,8 @@ export class AgentFramework {
     // Not on a context-budget restart: that continues the same logical turn.
     // A turn whose only causes are deferred batches assembles even when no
     // batch is pending: its batch may have been withdrawn after its wake was
-    // dispatched, or be rendering for another agent's assembly, and only the
+    // dispatched or be rendering for another agent's assembly, or the turn may
+    // be the one woken to read a render queued for this agent, and only the
     // assembly can say whether the turn has anything to read.
     const batchSubjects = trigger?.coalescingBatchSubjects;
     let assembly: AssemblyResult | undefined;
@@ -14773,16 +14780,16 @@ export class AgentFramework {
     // anything to read (an empty or blank render, §5.2; cancelled; revoked; a
     // render-start that could not be made durable, whose batch then waits for
     // its recovery wake; a batch whose audience doesn't include the agent; a
-    // render placed in another agent's deferred queue; a batch withdrawn,
-    // displaced or consumed by another request before this assembly), has
-    // nothing new to show: running it would wake the model to `[Continue]` or
-    // an older message, an uncaused wake. Stop before the checkpoint, locus,
-    // typing and compile. Any batch this assembly materialized keeps the
-    // turn, including one that was not among its causes (a batch whose wake
-    // the freeze withdrew, or one that never qualified for a wake), and so
-    // does a cause whose delivery is stored and still unread. A cause this
-    // assembly did not settle (the host stopping, or its subject moving on
-    // during the audience lookup) keeps the turn, as before.
+    // render placed in another agent's deferred queue; a batch another
+    // assembly froze, or one withdrawn, displaced or consumed by another
+    // request before this assembly), has nothing new to show: running it would
+    // wake the model to `[Continue]` or an older message, an uncaused wake.
+    // Stop before the checkpoint, locus, typing and compile. Any batch this
+    // assembly materialized keeps the turn, including one that was not among
+    // its causes (a batch whose wake the freeze withdrew, or one that never
+    // qualified for a wake), and so does a render queued for this agent that
+    // the flush has stored and nothing has read. A cause this assembly did not
+    // settle (the host stopping) keeps the turn, as before.
     if (assembly && batchSubjects?.length && assembly.materialized.size === 0
       && batchSubjects.every((s) => assembly.settled.has(s))) {
       console.error(`[coalescing] ${agent.name}: its deferred batches gave this turn nothing to read; turn not started (no wake cause left)`);
