@@ -584,12 +584,17 @@ test('the step takes an entry\'s name where disk has nothing, keeps an entry\'s 
   assert.equal(lookups, 2, 'one lookup each, of the path itself');
   // Whether a directory folds case: the root's as read at start, and beneath
   // it, as the directory holding it did when the walk looked its name up
-  // flipped, or for a name with no letter to flip, as the nearest above.
+  // flipped, or for a name with no letter to flip, as the nearest above:
+  // 2024 has no other spelling at all, and \u304c has another normalization
+  // form but no case.
   mkdirSync(join(root, '2024'));
+  mkdirSync(join(root, '\u304c'));
   assert.equal(await diskSpelling(root, 'src/NEW.txt', entriesOf(['src/New.txt'], false)), 'src/New.txt', 'src was found as SRC');
   assert.equal(await diskSpelling(root, 'DOCS/b.txt', entriesOf(['Docs/a.txt'], false)), 'DOCS/b.txt', 'the root, read at start as telling case apart');
   assert.equal(await diskSpelling(root, '2024/NEW.txt', entriesOf(['2024/New.txt'])), '2024/New.txt', 'as the root');
   assert.equal(await diskSpelling(root, '2024/NEW.txt', entriesOf(['2024/New.txt'], false)), '2024/NEW.txt', 'as the root');
+  assert.equal(await diskSpelling(root, '\u304c/NEW.txt', entriesOf(['\u304c/New.txt'])), '\u304c/New.txt', 'as the root');
+  assert.equal(await diskSpelling(root, '\u304c/NEW.txt', entriesOf(['\u304c/New.txt'], false)), '\u304c/NEW.txt', 'as the root');
 });
 
 test('a directory folds case if a name it lists does, flipped, or where none tells, if its own name does, or the directory holding it', { skip: FOLDING_ONLY }, async (t) => {
