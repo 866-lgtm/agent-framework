@@ -361,6 +361,41 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(internals(framework).deferredMessages.length, 0);
     });
 
+    it('drops, logged once, a draft notice for an agent no longer registered: its drafts are held, with no write or trace', async (t) => {
+      const state = internals(framework) as unknown as ReturnType<typeof internals> & {
+        agents: Map<string, unknown>;
+        routingOf(name: string): unknown;
+        holdProseDrafts(agent: unknown, texts: Array<{ text: string }>, reason: string, options: unknown): Array<{ id: string }>;
+        bounceProse(agent: unknown, text: string, reason: string, candidates: undefined, prefix: '>>', round: unknown, after?: { outcome?: 'unknown' }): void;
+      };
+      const agent = framework.getAgent('secondary')!;
+      const writes = [
+        t.mock.method(framework.getAgent('primary')!.getContextManager(), 'addMessage'),
+        t.mock.method(agent.getContextManager(), 'addMessage'),
+      ];
+      const errors: string[] = [];
+      t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+      const traced: string[] = [];
+      const off = framework.onTrace((event) => { if (event.type === 'message:added') traced.push(JSON.stringify(event)); });
+      state.agents.delete('secondary');
+      try {
+        const round = { routing: state.routingOf('secondary'), notice: 'later' };
+        const held = state.holdProseDrafts(agent, [{ text: 'words held at once' }], 'bounced', { routing: state.routingOf('secondary'), notice: 'now' });
+        assert.equal(held.length, 1, 'the draft is held as before');
+        state.bounceProse(agent, 'words whose send threw', 'connection lost', undefined, '>>', round, { outcome: 'unknown' });
+        await framework.runUntilIdle();
+      } finally {
+        state.agents.set('secondary', agent);
+        off();
+      }
+      assert.equal(writes.reduce((n, w) => n + w.mock.callCount(), 0), 0, 'nothing is written to any window');
+      assert.equal(state.deferredMessages.length, 0);
+      assert.deepEqual(traced, [], 'nothing is traced as added');
+      assert.ok(errors.includes('[notice] secondary is no longer registered, so its held-draft notice is dropped'));
+      assert.ok(errors.includes('[notice] secondary is no longer registered, so its unknown-send notice is dropped'));
+      assert.ok(!errors.some((e) => /not a registered agent/.test(e)), 'not dropped by addMessage instead');
+    });
+
     it('drops, logged once, a background-script wake for an agent no longer registered: no write, trace or wake', async (t) => {
       const primary = t.mock.method(framework.getAgent('primary')!.getContextManager(), 'addMessage');
       const errors: string[] = [];

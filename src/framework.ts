@@ -12843,12 +12843,13 @@ export class AgentFramework {
       textLen: held.reduce((n, d) => n + d.text.length, 0),
     });
     if (opts.notice === 'now') {
+      const target = this.noticeTargetFor(agent.name, 'held-draft');
       try {
-        this.addMessage(
+        if (target) this.addMessage(
           'user',
           [{ type: 'text', text: this.draftsHeldNotice(agent.name, held, reason) }],
           { system: true, kind: 'prose-drafts', draftOwner: agent.name, draftIds: held.map((d) => d.id) } as MessageMetadata,
-          { forAgent: agent.name },
+          target,
         );
       } catch (err) {
         console.error('[drafts] held-draft notice failed:', err);
@@ -13898,12 +13899,13 @@ export class AgentFramework {
       if (own) {
         this.bounceProse(agent, own, reason, undefined, prefix, round);
       } else {
+        const target = this.noticeTargetFor(agent.name, 'empty-{{unsent}}');
         try {
-          this.addMessage(
+          if (target) this.addMessage(
             'user',
             [{ type: 'text', text: `[prose-routing] ${reason}, so nothing was sent. drafts(action: "list") shows your open drafts.` }],
             { system: true, kind: 'prose-bounce' },
-            { forAgent: agent.name },
+            target,
           );
         } catch (err) {
           console.error('[drafts] empty-unsent notice failed:', err);
@@ -13948,13 +13950,14 @@ export class AgentFramework {
         : ' Your message could not be held as a draft; its words remain in your history.';
     const text = `[prose-routing] {{unsent}} is draft ${draft.id}, ${why.startsWith('which') ? why : `and ${why}`}. ` +
       `Nothing was sent; ${next}.${kept}`;
+    const target = this.noticeTargetFor(agent.name, 'refused-{{unsent}}');
     try {
-      this.addMessage(
+      if (target) this.addMessage(
         'user',
         [{ type: 'text', text }],
         // It names the refused draft as well as any copy it held.
         { system: true, kind: 'prose-bounce', draftOwner: agent.name, draftIds: held ? [draft.id, held.id] : [draft.id] } as MessageMetadata,
-        { forAgent: agent.name },
+        target,
       );
     } catch (err) {
       console.error('[drafts] refused-unsent notice failed:', err);
@@ -14012,12 +14015,13 @@ export class AgentFramework {
         const text =
           `[prose-routing] {{unsent}} was draft ${unsent.id}; its send came back ${outcome.status}, but recording that ` +
           `failed, so the draft reads as ${this.draftStateNow(agent.name, unsent.id)} now. drafts(action: "read") shows it.`;
+        const target = this.noticeTargetFor(agent.name, 'unrecorded-outcome');
         try {
-          this.addMessage(
+          if (target) this.addMessage(
             'user',
             [{ type: 'text', text }],
             { system: true, kind: 'prose-bounce', draftOwner: agent.name, draftIds: [unsent.id] } as MessageMetadata,
-            { forAgent: agent.name },
+            target,
           );
         } catch (noticeErr) {
           console.error('[drafts] unrecorded-outcome notice failed:', noticeErr);
@@ -14155,8 +14159,10 @@ export class AgentFramework {
     const draft = this.proseDrafts.latestBounce(agent.name);
     if (!draft) return;
     const tell = (text: string, what: string): void => {
+      const target = this.noticeTargetFor(agent.name, what);
+      if (!target) return;
       try {
-        this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'prose-bounce' }, { forAgent: agent.name });
+        this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'prose-bounce' }, target);
       } catch (err) {
         console.error(`[drafts] ${what} notice failed:`, err);
       }
@@ -14358,9 +14364,12 @@ export class AgentFramework {
       const notice =
         `[prose-routing] Your text (${text.length} chars) may not have been delivered — ${reason}. ` +
         "It isn't held as a draft, since a resend could post it twice; the words remain in your history.";
+      const target = this.noticeTargetFor(name, 'unknown-send');
       try {
-        const id = this.addMessage('user', [{ type: 'text', text: notice }], { system: true, kind: 'prose-bounce' } as MessageMetadata, { forAgent: name });
-        this.emitTrace({ type: 'message:added', messageId: id ?? 'deferred', source: 'prose-bounce' });
+        if (target) {
+          const id = this.addMessage('user', [{ type: 'text', text: notice }], { system: true, kind: 'prose-bounce' } as MessageMetadata, target);
+          this.emitTrace({ type: 'message:added', messageId: id ?? 'deferred', source: 'prose-bounce' });
+        }
       } catch (err) {
         console.error('bounceProse: failed to record the unknown-send notice:', err);
       }
