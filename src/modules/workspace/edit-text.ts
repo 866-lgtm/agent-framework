@@ -11,7 +11,7 @@
  */
 
 import { type Change, type FilePlan, type MatchProblem, SHOWN_MATCHES } from './edit-plan.js';
-import { jsonLength, numbered, safeCut } from './text.js';
+import { MAX_LINE_CHARS, jsonLength, numberedLine, safeCut } from './text.js';
 
 /** The tool a call came through, which words its refusals and receipt. */
 export type EditTool = 'edit' | 'edit_many';
@@ -60,16 +60,20 @@ export function editList(edits: number[]): string {
 }
 
 /**
- * "line 5", "lines 5 and 9", or "lines 5, 9 and 12": each line once, the
- * first SHOWN_MATCHES of them, and how many more.
+ * "line 5", "lines 5 and 9", "lines 5, 9 and 12", or "lines 5, 9 and 3
+ * more": the lines shown, each once, of `total` lines in all.
  */
-function onLines(lines: number[]): string {
-  const distinct = [...new Set(lines)];
-  const shown = distinct.slice(0, SHOWN_MATCHES);
-  const more = distinct.length - shown.length;
+function lineList(shown: number[], total: number): string {
+  const more = total - shown.length;
   const list = more > 0 ? `${shown.join(', ')} and ${more} more`
     : shown.length < 2 ? `${shown[0] ?? ''}` : `${shown.slice(0, -1).join(', ')} and ${shown.at(-1)}`;
-  return `${plural(distinct.length, 'line')} ${list}`;
+  return `${plural(total, 'line')} ${list}`;
+}
+
+/** Each line once, the first SHOWN_MATCHES of them, and how many more, as lineList words them. */
+function onLines(lines: number[]): string {
+  const distinct = [...new Set(lines)];
+  return lineList(distinct.slice(0, SHOWN_MATCHES), distinct.length);
 }
 
 /**
@@ -267,16 +271,32 @@ function regionOf(updated: string, change: Change): Region {
   return { from, to, start, end };
 }
 
+/** How much of a long line an excerpt shows before the change it's for. */
+const CHANGE_LEAD = 80;
+
+/**
+ * A line too long to show whole, numbered, from shortly before the change
+ * at `column` for as much as read shows of a line, marked where it's cut on
+ * either side.
+ */
+function excerptLine(line: string, n: number, column: number): string {
+  // safeCut takes a cut at or before 0 as 0.
+  const from = safeCut(line, column - CHANGE_LEAD);
+  if (from === 0) return numberedLine(line, n);
+  const to = safeCut(line, from + MAX_LINE_CHARS);
+  const after = line.length - to;
+  return `${String(n).padStart(6)}\t[… ${from} chars before] ${line.slice(from, to)}${after > 0 ? ` [… ${after} more chars]` : ''}`;
+}
+
 /**
  * Each edit's first change in a file, as numbered regions merged where they
  * meet, while the budget lasts, counted as the answer's JSON holds them; past
  * it, the regions are named by their lines.
  */
 export function shownRegions(plan: FilePlan, budget: { left: number }, maxChars: number): string[] {
-  const firsts = new Map<number, Change>();
-  for (const change of plan.changes) if (!firsts.has(change.edit)) firsts.set(change.edit, change);
+  const firsts = plan.edits.map((edit) => edit.first).sort((a, b) => a.at - b.at);
   const regions: Region[] = [];
-  for (const change of [...firsts.values()].sort((a, b) => a.at - b.at)) {
+  for (const change of firsts) {
     const region = regionOf(plan.updated, change);
     if (region.to < region.from) continue;
     const last = regions.at(-1);
@@ -291,7 +311,16 @@ export function shownRegions(plan: FilePlan, budget: { left: number }, maxChars:
     const slice = plan.updated.slice(region.start, region.end);
     const lines = slice.split('\n');
     if (slice.endsWith('\n')) lines.pop();
-    const shown = numbered(lines, region.from);
+    // A line too long to show whole shows its start, or, where a change
+    // starts on it, the stretch from shortly before the change.
+    let lineStart = region.start;
+    const shown = lines.map((text, k) => {
+      const n = region.from + k;
+      const change = text.length > MAX_LINE_CHARS ? firsts.find((first) => first.line === n) : undefined;
+      const numberedText = change ? excerptLine(text, n, change.at - lineStart) : numberedLine(text, n);
+      lineStart += text.length + 1;
+      return numberedText;
+    }).join('\n');
     // The line before it ("…" between regions, or the line end) counts too.
     const cost = jsonLength(shown) + (out.length ? jsonLength('\n…\n') : jsonLength('\n'));
     if (!omitted.length && cost <= budget.left) {
@@ -324,17 +353,15 @@ export function lineEndNote(plan: FilePlan): string | null {
  */
 export function otherReplacements(plan: FilePlan, labelled: boolean): string[] {
   const notes: string[] = [];
-  const edits = [...new Set(plan.changes.map((change) => change.edit))].sort((a, b) => a - b);
   let more = 0;
-  for (const edit of edits) {
-    const rest = plan.changes.filter((change) => change.edit === edit).slice(1);
-    if (!rest.length) continue;
+  for (const edit of [...plan.edits].sort((a, b) => a.first.edit - b.first.edit)) {
+    if (edit.count < 2) continue;
     if (notes.length === SHOWN_MATCHES) {
       more++;
       continue;
     }
-    const lines = onLines(rest.map((change) => change.line));
-    notes.push(labelled ? `Edit ${edit + 1}'s other replacements are on ${lines}.` : `The other replacements are on ${lines}.`);
+    const lines = lineList(edit.otherLines, edit.otherLineCount);
+    notes.push(labelled ? `Edit ${edit.first.edit + 1}'s other replacements are on ${lines}.` : `The other replacements are on ${lines}.`);
   }
   if (more) notes.push(`${more} more ${plural(more, 'edit')} made other replacements too.`);
   return notes;
@@ -372,6 +399,10 @@ export function editReceipt(tool: EditTool, files: StoredFile[], editCount: numb
       ...(plan.quoteNormalized.length
         ? [`${tool === 'edit' ? 'The text' : capitalized(editList(plan.quoteNormalized))} matched with straight and curly quotes treated as equal.`]
         : []),
+      ...(plan.readForm.length
+        ? [`${tool === 'edit' ? 'The text' : capitalized(editList(plan.readForm))} matched without the BOM or the line end's CR `
+          + `${tool === 'edit' ? 'it' : plan.readForm.length === 1 ? 'its old text' : 'their old text'} carried, which the file keeps.`]
+        : []),
       ...(lineEnds !== null ? [lineEnds] : []),
       ...otherReplacements(plan, tool === 'edit_many'),
     ];
@@ -382,7 +413,7 @@ export function editReceipt(tool: EditTool, files: StoredFile[], editCount: numb
     const data: Record<string, unknown> = {
       path: file.path,
       size: file.plan.bytes.length,
-      replacements: file.plan.changes.length,
+      replacements: file.plan.replacements,
       ...(notes.length ? { note: notes.join(' ') } : {}),
       changed: '',
     };
@@ -393,7 +424,7 @@ export function editReceipt(tool: EditTool, files: StoredFile[], editCount: numb
   const listed: Array<Record<string, unknown>> = [];
   const data: Record<string, unknown> = {
     edits: editCount,
-    replacements: files.reduce((sum, file) => sum + file.plan.changes.length, 0),
+    replacements: files.reduce((sum, file) => sum + file.plan.replacements, 0),
     files: listed,
     changed: '',
   };
@@ -407,8 +438,8 @@ export function editReceipt(tool: EditTool, files: StoredFile[], editCount: numb
   let editsLeftOut = 0;
   for (const [i, file] of files.entries()) {
     const notes = notesOf(file);
-    const bare = { path: file.path, size: file.plan.bytes.length, replacements: file.plan.changes.length };
-    const edits = [...new Set(file.plan.changes.map((change) => change.edit + 1))].sort((a, b) => a - b);
+    const bare = { path: file.path, size: file.plan.bytes.length, replacements: file.plan.replacements };
+    const edits = file.plan.edits.map((edit) => edit.first.edit + 1).sort((a, b) => a - b);
     // The fullest entry that fits: with its notes, then without them, then
     // without its edits' numbers too, so a file is named before it's counted.
     const entry = [

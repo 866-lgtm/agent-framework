@@ -1161,9 +1161,12 @@ export class WorkspaceModule implements Module {
         description: 'Edit a file by replacing exact text. oldString must occur exactly once, or with replaceAll at least once, '
           + "and every occurrence is replaced; occurrences that overlap count, but can't each be replaced. "
           + 'A miss shows the closest region it finds, numbered, and a count that differs shows the lines that matched. '
-          + 'CRLF line ends are matched with LF text and kept, as is a BOM, and straight and curly quotes match as a second chance. '
+          + 'CRLF line ends are matched with LF text and kept, as is a BOM. As second chances, straight and curly quotes match as equal, '
+          + "and an oldString carrying the file's BOM at its start or a line's CR at its end, as a character page shows them, matches without them, "
+          + 'its newString read the same way. '
           + "Only the replaced text changes, and the new text's line ends take those of the text it replaces. "
-          + "A change disk made to the file is taken in first, and the answer says so. The answer shows the changed region, numbered, as its length allows. "
+          + 'A change disk made to the file is taken in first, and the answer says so. '
+          + 'The answer shows the changed region, numbered, a long line from shortly before the change, as its length allows. '
           + 'For several edits at once, in one file or across files, applied all or none, use edit_many.',
         inputSchema: {
           type: 'object' as const,
@@ -1186,7 +1189,7 @@ export class WorkspaceModule implements Module {
           + "A refusal names every problem, each by its edit's number in the list (from 1). "
           + 'All or none holds in the workspace: on a mount that writes to disk, disk can still refuse a file, '
           + "and the answer then says every edit is stored and names each file disk refused, with its push's reason. "
-          + "The answer shows each edit's first changed region, numbered, as its length allows.",
+          + "The answer shows each edit's first changed region, numbered, a long line from shortly before the change, as its length allows.",
         inputSchema: {
           type: 'object' as const,
           properties: {

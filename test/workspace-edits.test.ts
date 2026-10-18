@@ -119,6 +119,34 @@ test('straight and curly quotes match as a second chance, and the receipt says s
   assert.equal(await stored('q.txt'), 'plain\n');
 });
 
+test("an oldString carrying the file's BOM or a line's CR, as a character page shows them, matches without them, and the receipt says so", async (t) => {
+  const { call, disk, file } = setup(t, { autoMaterialize: true });
+  await file('cr.txt', 'alpha\r\nbeta\r\n');
+  const receipt = dataOf(await call('edit', { path: 'work/cr.txt', oldString: 'alpha\r', newString: 'gamma\r' }));
+  assert.equal(receipt.note, "The text matched without the BOM or the line end's CR it carried, which the file keeps. The file's CRLF line ends are kept.");
+  assert.deepEqual(disk('cr.txt'), Buffer.from('gamma\r\nbeta\r\n'));
+  const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+  await file('bom.txt', Buffer.concat([bom, Buffer.from('alpha\nbeta\n')]));
+  const many = dataOf(await call('edit_many', {
+    edits: [
+      { path: 'work/bom.txt', oldString: '\uFEFFalpha', newString: '\uFEFFgamma' },
+      { path: 'work/bom.txt', oldString: 'beta', newString: 'delta' },
+    ],
+  }));
+  assert.equal((many.files as Array<{ note?: string }>)[0]!.note, "Edit 1 matched without the BOM or the line end's CR its old text carried, which the file keeps.");
+  assert.deepEqual(disk('bom.txt'), Buffer.concat([bom, Buffer.from('gamma\ndelta\n')]));
+});
+
+test('a receipt shows a long line from shortly before the change on it, and its start where the change is there', async (t) => {
+  const { call, file } = setup(t);
+  await file('long.txt', `${'a'.repeat(2500)}target${'z'.repeat(10)}\nnext\n`);
+  const late = dataOf(await call('edit', { path: 'work/long.txt', oldString: 'target', newString: 'DONE' }));
+  assert.equal(late.changed, `     1\t[… 2420 chars before] ${'a'.repeat(80)}DONE${'z'.repeat(10)}\n     2\tnext`);
+  await file('early.txt', `ab${'c'.repeat(2500)}\n`);
+  const early = dataOf(await call('edit', { path: 'work/early.txt', oldString: 'ab', newString: 'AB' }));
+  assert.equal(early.changed, `     1\tAB${'c'.repeat(1998)} [… 502 more chars]`);
+});
+
 test('identical strings are refused before the path is touched, as an empty oldString is', async (t) => {
   const { call } = setup(t);
   assert.equal(errorOf(await call('edit', { path: 'nowhere/x.txt', oldString: 'same', newString: 'same' })),

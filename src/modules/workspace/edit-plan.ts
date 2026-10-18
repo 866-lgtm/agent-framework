@@ -85,6 +85,32 @@ function normalizeQuotes(value: string): string {
   return value.replace(/[‘’‚‛]/g, "'").replace(/[“”„‟]/g, '"');
 }
 
+/**
+ * An edit as matching reads it when its old text carries what matching leaves
+ * out of a file's text: the BOM, which decodeForEdit takes off before the
+ * first line, at its start, or a line's CR, which matching reads as part of
+ * the line end, at its end. A character page shows both. The edit without
+ * them, its new text read the same way, so a replacement keeps the file's one
+ * BOM and its CRLF line end; and where it may match: at the text's start, and
+ * before a CRLF line end. Null when the old text carries neither where the
+ * file has them, or is nothing without them.
+ */
+function readForm(spec: EditSpec, file: FileText, crAt: (lf: number) => boolean): { spec: EditSpec; accept: (at: number) => boolean } | null {
+  const leading = file.bom && spec.oldText.startsWith('\uFEFF');
+  const trailing = file.crs.length > 0 && spec.oldText.endsWith('\r');
+  if (!leading && !trailing) return null;
+  const oldText = spec.oldText.slice(leading ? 1 : 0, trailing ? -1 : undefined);
+  if (!oldText) return null;
+  let newText = spec.newText;
+  if (leading && newText.startsWith('\uFEFF')) newText = newText.slice(1);
+  if (trailing && newText.endsWith('\r')) newText = newText.slice(0, -1);
+  return {
+    spec: { ...spec, oldText, newText },
+    // crs holds only LFs that followed a CR, so one there is a CRLF line end.
+    accept: (at) => (!leading || at === 0) && (!trailing || crAt(at + oldText.length)),
+  };
+}
+
 /** Where an old text occurs in a file: what scan finds. */
 interface Found {
   /** The first `keep` positions it starts at. */
@@ -105,8 +131,9 @@ interface Found {
  * at is more than those shown. Otherwise a needle that overlaps itself,
  * such as a run of spaces, would be compared in full at every position of a
  * long run of the same, at a cost of the run's length times the needle's.
+ * With `accept`, only the positions it accepts are occurrences.
  */
-function scan(haystack: string, needle: string, keep: number): Found {
+function scan(haystack: string, needle: string, keep: number, accept?: (at: number) => boolean): Found {
   const starts: number[] = [];
   let count = 0;
   let overlapping = false;
@@ -115,6 +142,7 @@ function scan(haystack: string, needle: string, keep: number): Found {
   if (!needle) return { starts, count, overlapping, atLeast: false };
   let previous = -Infinity;
   for (let at = haystack.indexOf(needle); at !== -1; at = haystack.indexOf(needle, at + 1)) {
+    if (accept && !accept(at)) continue;
     if (at < previous + needle.length) overlapping = true;
     if (count < keep) starts.push(at);
     count++;
@@ -298,19 +326,70 @@ export interface Change {
   lines: number;
 }
 
+/**
+ * What one edit replaced in a file: its first replacement, which a receipt
+ * shows, and where the rest fell, as far as a receipt names them. One edit
+ * can make millions of replacements, so the rest are counted, not kept.
+ */
+export interface EditChanges {
+  /** Its first replacement in the file. */
+  first: Change;
+  /** How many replacements it made. */
+  count: number;
+  /** The lines of its replacements after the first, each line once: the first SHOWN_MATCHES of them. */
+  otherLines: number[];
+  /** How many lines those replacements fall on in all, each line once. */
+  otherLineCount: number;
+}
+
 /** A file's edits, applied together. */
 export interface FilePlan {
   /** The file's new bytes, BOM and every line end it keeps included. */
   bytes: Buffer;
   /** Its new text with line ends as LF, for the receipt. */
   updated: string;
-  /** Every replacement, in the order they sit in the file. */
-  changes: Change[];
+  /** Each edit's replacements, in the order of its first replacement in the file. */
+  edits: EditChanges[];
+  /** How many replacements the edits made in all. */
+  replacements: number;
   /** The edits matched with straight and curly quotes treated as equal. */
   quoteNormalized: number[];
+  /** The edits matched without the BOM or the line end's CR their old text carried (readForm). */
+  readForm: number[];
   crlf: boolean;
   mixed: boolean;
   bom: boolean;
+}
+
+/**
+ * Text built from many pieces, joined a batch at a time, so the pieces of a
+ * replaceAll with millions of occurrences aren't all held at once.
+ */
+function textBuilder(): { add: (piece: string) => void; text: () => string } {
+  const chunks: string[] = [];
+  let pieces: string[] = [];
+  const flush = () => {
+    chunks.push(pieces.join(''));
+    pieces = [];
+  };
+  return {
+    add: (piece) => {
+      if (!piece) return;
+      pieces.push(piece);
+      if (pieces.length >= 4096) flush();
+    },
+    text: () => {
+      flush();
+      return chunks.join('');
+    },
+  };
+}
+
+/** How many line feeds a string holds. */
+function lineFeeds(value: string): number {
+  let count = 0;
+  for (let at = value.indexOf('\n'); at !== -1; at = value.indexOf('\n', at + 1)) count++;
+  return count;
 }
 
 /**
@@ -319,9 +398,14 @@ export interface FilePlan {
  * number of times it asks for, counting overlapping occurrences (so "aa"
  * occurs twice in "aaa"), and occurrences that overlap one another can't each
  * be replaced. When old text is absent, it is matched again with straight and
- * curly quotes treated as equal. Two edits' matches may touch but not overlap.
- * Only the replaced text changes: every other byte stays as it was, and each
- * new text's line ends take, by position, those of the text it replaces.
+ * curly quotes treated as equal, and then, if it carries the file's BOM at its
+ * start or a line's CR at its end, without them (readForm). Two edits'
+ * matches may touch but not overlap. Only the replaced text changes: every
+ * other byte stays as it was, and each new text's line ends take, by
+ * position, those of the text it replaces. What it holds grows with the
+ * file and the edits, not with the occurrences an edit replaces: positions as
+ * numbers, the new text built a batch of pieces at a time, and of each edit's
+ * replacements only what a receipt names.
  */
 export function planFile(
   file: FileText,
@@ -332,18 +416,36 @@ export function planFile(
   const { raw, value, crs, lfs } = file;
   const crlf = crs.length > 0;
   const mixed = crlf && crs.length < lfs;
+  const crAt = (lf: number) => {
+    const i = countBelow(crs, lf);
+    return i < crs.length && crs[i] === lf;
+  };
   const problems: MatchProblem[] = [];
-  const spans: { spec: EditSpec; start: number; end: number }[] = [];
+  // Each edit that matches, with where: the edit as matched (readForm's for an
+  // old text read without its BOM or CR) and its starts, ascending.
+  const applied: Array<{ spec: EditSpec; starts: number[] }> = [];
   const quoteNormalized: number[] = [];
+  const readForms: number[] = [];
   let quoted: string | undefined;
   for (const spec of specs) {
     // Every occurrence when every one is replaced; otherwise enough to replace or to show.
     const keep = spec.expected === 'all' ? Infinity : Math.max(spec.expected, SHOWN_MATCHES);
+    let matched = spec;
     let { starts, count, overlapping, atLeast } = scan(value, spec.oldText, keep);
     let normalized = false;
     if (count === 0) {
       ({ starts, count, overlapping, atLeast } = scan((quoted ??= normalizeQuotes(value)), normalizeQuotes(spec.oldText), keep));
       normalized = count > 0;
+    }
+    if (count === 0) {
+      const read = readForm(spec, file, crAt);
+      if (read) {
+        ({ starts, count, overlapping, atLeast } = scan(value, read.spec.oldText, keep, read.accept));
+        if (count > 0) {
+          matched = read.spec;
+          readForms.push(spec.index);
+        }
+      }
     }
     if (count === 0) {
       problems.push({ kind: 'miss', edit: spec.index, hint: closestRegion(value, spec.oldText, hints), crlf });
@@ -366,37 +468,55 @@ export function planFile(
       continue;
     }
     if (normalized) quoteNormalized.push(spec.index);
-    for (const start of starts) spans.push({ spec, start, end: start + spec.oldText.length });
+    applied.push({ spec: matched, starts });
   }
+  // Every replacement in file order. One edit's starts are that already; for
+  // several, each replacement is a number, its start times the edits plus
+  // the edit's slot, so sorting them sorts by start, then by the edit's place
+  // in the call's list.
+  applied.sort((a, b) => a.spec.index - b.spec.index);
+  const slots = applied.length;
+  const total = applied.reduce((sum, { starts }) => sum + starts.length, 0);
+  let order: Float64Array | undefined;
+  if (slots > 1) {
+    order = new Float64Array(total);
+    let k = 0;
+    applied.forEach(({ starts }, slot) => {
+      for (const start of starts) order![k++] = start * slots + slot;
+    });
+    order.sort();
+  }
+  const slotOf = (k: number) => (order ? order[k]! % slots : 0);
+  const startOf = (k: number) => (order ? (order[k]! - (order[k]! % slots)) / slots : applied[0]!.starts[k]!);
   // Overlapping matches are named at their first overlap, whatever order the
   // list gave them in, and each edit at most once as the later of a pair, so
   // the problems grow with the edits rather than their pairs: a thousand edits
-  // of one stretch are a thousand problems at most, not half a million.
-  spans.sort((a, b) => a.start - b.start || a.spec.index - b.spec.index);
+  // of one stretch are a thousand problems at most, not half a million. One
+  // edit's own occurrences don't overlap (scan), so only several can clash.
   const named = new Set<number>();
   const pairs = new Set<string>();
   const clashes: Array<{ edits: [number, number]; at: number; same: boolean }> = [];
-  spans.forEach((first, i) => {
-    for (let j = i + 1; j < spans.length && spans[j]!.start < first.end; j++) {
-      const later = spans[j]!;
-      const a = Math.min(first.spec.index, later.spec.index);
-      const b = Math.max(first.spec.index, later.spec.index);
-      if (a === b || named.has(later.spec.index) || pairs.has(`${a} ${b}`)) continue;
-      named.add(later.spec.index);
+  for (let i = 0; slots > 1 && i < total; i++) {
+    const first = applied[slotOf(i)]!.spec;
+    const firstStart = startOf(i);
+    const firstEnd = firstStart + first.oldText.length;
+    for (let j = i + 1; j < total && startOf(j) < firstEnd; j++) {
+      const later = applied[slotOf(j)]!.spec;
+      const laterStart = startOf(j);
+      const a = Math.min(first.index, later.index);
+      const b = Math.max(first.index, later.index);
+      if (a === b || named.has(later.index) || pairs.has(`${a} ${b}`)) continue;
+      named.add(later.index);
       pairs.add(`${a} ${b}`);
-      clashes.push({ edits: [a, b], at: later.start, same: later.start === first.start && later.end === first.end });
+      clashes.push({ edits: [a, b], at: laterStart, same: laterStart === firstStart && laterStart + later.oldText.length === firstEnd });
     }
-  });
+  }
   // Every clash's line in one pass over the text, rather than a pass each.
   const clashAts = [...new Set(clashes.map((clash) => clash.at))].sort((x, y) => x - y);
   const lineAt = new Map(lineNumbersAt(value, clashAts).map((line, k) => [clashAts[k]!, line]));
   for (const clash of clashes) problems.push({ kind: 'clash', edits: clash.edits, line: lineAt.get(clash.at)!, same: clash.same });
   if (problems.length) return { problems };
 
-  const crAt = (lf: number) => {
-    const i = countBelow(crs, lf);
-    return i < crs.length && crs[i] === lf;
-  };
   const endingAt = (lf: number) => (crAt(lf) ? '\r\n' : '\n');
   // The line end after a replaced text that holds none: its line's own, found
   // once per line as the matches ascend, or for an unterminated last line the
@@ -430,37 +550,81 @@ export function planFile(
     for (let k = 1; k < newPieces.length; k++) joined += replaced[Math.min(k - 1, replaced.length - 1)]! + newPieces[k]!;
     return joined;
   };
-  const rawIndex = (i: number) => i + countBelow(crs, i);
-  const out: string[] = [];
-  const updated: string[] = [];
-  const ats: number[] = [];
+  // The CRs below an index of the text, counted as the replacements ascend:
+  // each index asked is at or past the one before.
+  let crsBelow = 0;
+  const rawIndex = (i: number) => {
+    while (crsBelow < crs.length && crs[crsBelow]! < i) crsBelow++;
+    return i + crsBelow;
+  };
+  // What each edit's new text adds: its line feeds, and the lines a receipt
+  // shows it on.
+  const added = applied.map(({ spec }) => {
+    const feeds = lineFeeds(spec.newText);
+    return { feeds, lines: feeds + 1 - (spec.newText.endsWith('\n') ? 1 : 0) };
+  });
+  const out = textBuilder();
+  const updated = textBuilder();
+  const kept: Array<EditChanges | undefined> = applied.map(() => undefined);
+  // The line of each edit's last replacement after its first; lines start at 1.
+  const lastOther = applied.map(() => 0);
   let rawFrom = 0;
   let from = 0;
   let length = 0;
-  for (const { spec, start, end } of spans) {
-    out.push(raw.slice(rawFrom, rawIndex(start)), withEndings(spec, start));
-    rawFrom = rawIndex(end);
-    updated.push(value.slice(from, start), spec.newText);
+  // The updated text's line at `from`: the line feeds of the text kept before
+  // it, and of each new text put in, counted as the replacements ascend. The
+  // text's next line feed is kept as it's found, so text with none left is
+  // read to its end once, not once per replacement.
+  let line = 1;
+  let nextFeed = value.indexOf('\n');
+  const feedsBefore = (to: number) => {
+    let feeds = 0;
+    while (nextFeed !== -1 && nextFeed < to) {
+      feeds++;
+      nextFeed = value.indexOf('\n', nextFeed + 1);
+    }
+    return feeds;
+  };
+  for (let k = 0; k < total; k++) {
+    const slot = slotOf(k);
+    const { spec } = applied[slot]!;
+    const start = startOf(k);
+    out.add(raw.slice(rawFrom, rawIndex(start)));
+    out.add(withEndings(spec, start));
+    rawFrom = rawIndex(start + spec.oldText.length);
+    updated.add(value.slice(from, start));
+    updated.add(spec.newText);
+    line += feedsBefore(start);
     length += start - from;
-    ats.push(length);
+    const edit = kept[slot];
+    if (!edit) {
+      kept[slot] = { first: { edit: spec.index, at: length, line, lines: added[slot]!.lines }, count: 1, otherLines: [], otherLineCount: 0 };
+    } else {
+      edit.count++;
+      // An edit's replacements ascend, so their lines never fall: a line
+      // already counted is the last one.
+      if (lastOther[slot] !== line) {
+        lastOther[slot] = line;
+        edit.otherLineCount++;
+        if (edit.otherLines.length < SHOWN_MATCHES) edit.otherLines.push(line);
+      }
+    }
     length += spec.newText.length;
-    from = end;
+    line += added[slot]!.feeds;
+    from = start + spec.oldText.length;
+    // The old text's line feeds are replaced, not kept.
+    feedsBefore(from);
   }
-  out.push(raw.slice(rawFrom));
-  updated.push(value.slice(from));
-  const text = updated.join('');
-  const lines = lineNumbersAt(text, ats);
+  out.add(raw.slice(rawFrom));
+  updated.add(value.slice(from));
   return {
     plan: {
-      bytes: Buffer.concat([file.bom ? bytes.subarray(0, 3) : Buffer.alloc(0), Buffer.from(out.join(''), 'utf8')]),
-      updated: text,
-      changes: spans.map(({ spec }, k) => ({
-        edit: spec.index,
-        at: ats[k]!,
-        line: lines[k]!,
-        lines: spec.newText.split('\n').length - (spec.newText.endsWith('\n') ? 1 : 0),
-      })),
+      bytes: Buffer.concat([file.bom ? bytes.subarray(0, 3) : Buffer.alloc(0), Buffer.from(out.text(), 'utf8')]),
+      updated: updated.text(),
+      edits: kept.filter((edit): edit is EditChanges => edit !== undefined).sort((a, b) => a.first.at - b.first.at),
+      replacements: total,
       quoteNormalized,
+      readForm: readForms,
       crlf,
       mixed,
       bom: file.bom,

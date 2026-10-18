@@ -3,6 +3,7 @@
 // applies, with every byte the edits don't name kept as it was.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import {
   type EditSpec,
   type FilePlan,
@@ -39,10 +40,47 @@ test('every edit is matched in the text as read, in any order, never in another 
   const backward = plan(text, [spec(1, 'gamma\n', 'delta\n'), spec(0, 'alpha', 'gamma gamma')]);
   assert.equal(forward.bytes.toString(), 'gamma gamma beta\ndelta\n');
   assert.deepEqual(backward.bytes, forward.bytes);
-  assert.deepEqual(forward.changes.map(({ edit, line, lines }) => ({ edit, line, lines })), [
+  assert.deepEqual(forward.edits.map(({ first: { edit, line, lines } }) => ({ edit, line, lines })), [
     { edit: 0, line: 1, lines: 1 },
     { edit: 1, line: 2, lines: 1 },
   ]);
+});
+
+test("each edit's replacements are counted, and only its first and the lines of the rest a receipt names are kept", () => {
+  // Edit 0 replaces on lines 1, 1, 2, 4 and 5 of the file; edit 1 on line 3, once; edit 2 on
+  // 25 lines; edit 3 three times on one line; edit 4 twice, each time two lines it joins.
+  const text = `a a\na\nb\na\na\n${'c\n'.repeat(25)}d d d\np\nq\np\nq\n`;
+  const planned = plan(text, [spec(0, 'a', 'x\ny', 'all'), spec(1, 'b', 'z'), spec(2, 'c', 'w', 'all'), spec(3, 'd', 'e', 'all'), spec(4, 'p\nq', 'r', 'all')]);
+  assert.equal(planned.replacements, 36);
+  assert.deepEqual(planned.edits.map(({ first, count, otherLines, otherLineCount }) => [first.edit, first.line, count, otherLines, otherLineCount]), [
+    // Each replacement of edit 0 adds a line, so its later ones fall on later lines of the new text.
+    [0, 1, 5, [2, 4, 7, 9], 4],
+    [1, 6, 1, [], 0],
+    [2, 11, 25, Array.from({ length: 20 }, (_, i) => 12 + i), 24],
+    // A line counted once, however many replacements fall on it.
+    [3, 36, 3, [36], 1],
+    // The line ends an old text replaces aren't counted.
+    [4, 37, 2, [38], 1],
+  ]);
+  assert.equal(planned.updated, `x\ny x\ny\nx\ny\nz\nx\ny\nx\ny\n${'w\n'.repeat(25)}e e e\nr\nr\n`);
+});
+
+test('a replaceAll of millions of occurrences fits a small heap', () => {
+  // While the planner held an object per occurrence, an edit replacing
+  // 5,000,000 needed a heap of more than 512 MiB and about 1.4 GiB of memory.
+  // Joining the new text's pieces only at the end, it needs a heap of more
+  // than 96 MiB for these 3,000,000, on Node 20 and 24 alike, and as it is,
+  // one of about 50 MiB. A heap of 80 MiB stops the child if either comes back.
+  const moduleUrl = new URL('../src/modules/workspace/edit-plan.js', import.meta.url).href;
+  const child = spawnSync(process.execPath, ['--max-old-space-size=80', '--input-type=module', '-e', `
+    const { decodeForEdit, planFile } = await import(${JSON.stringify(moduleUrl)});
+    const bytes = Buffer.from('a'.repeat(3_000_000) + '\\n');
+    const planned = planFile(decodeForEdit(bytes), bytes, [{ index: 0, oldText: 'a', newText: 'b', expected: 'all' }]);
+    const { replacements, bytes: out, edits } = planned.plan;
+    console.log(JSON.stringify({ replacements, size: out.length, last: out.subarray(-2).toString(), others: edits[0].otherLines.length }));
+  `], { encoding: 'utf8', timeout: 120_000 });
+  assert.equal(child.status, 0, child.stderr);
+  assert.deepEqual(JSON.parse(child.stdout), { replacements: 3_000_000, size: 3_000_001, last: 'b\n', others: 1 });
 });
 
 test('an occurrence is a position: overlapping occurrences count, and they can\'t each be replaced', () => {
@@ -107,6 +145,8 @@ test("two edits' matches may touch but not overlap, and the same text twice is n
   assert.deepEqual(overlap, { kind: 'clash', edits: [0, 1], line: 1, same: false });
   const [same] = problems('abcd\n', [spec(1, 'bc', 'Y'), spec(0, 'bc', 'X')]);
   assert.deepEqual(same, { kind: 'clash', edits: [0, 1], line: 1, same: true });
+  // Matches at one start are taken in the edits' order, whatever order the list gave them in.
+  assert.deepEqual(problems('abc\n', [spec(2, 'ab', 'X'), spec(1, 'ab', 'Y'), spec(0, 'abc', 'Z')]).map((clash) => clash.kind === 'clash' && clash.edits), [[0, 1], [0, 2]]);
 });
 
 test('a thousand edits of one stretch are named as at most a thousand clashes', () => {
@@ -171,6 +211,35 @@ test("a match at a CRLF's line end takes its CR along, and an unterminated last 
   assert.equal(plan(Buffer.from('a\r\nb\r\n'), [spec(0, 'a\n', 'x\n')]).bytes.toString(), 'x\r\nb\r\n');
   assert.equal(plan(Buffer.from('a\r\nb'), [spec(0, 'b', 'b\nc')]).bytes.toString(), 'a\r\nb\r\nc');
   assert.equal(plan(Buffer.from('b'), [spec(0, 'b', 'b\nc')]).bytes.toString(), 'b\nc', 'a file with no CRLF takes the new text as given');
+});
+
+test("an old text carrying a line's CR at its end matches before a CRLF line end, and its new text's CR is read the same way", () => {
+  const crlf = Buffer.from('alpha\r\nbeta\r\nalphabet\r\n');
+  for (const newText of ['gamma\r', 'gamma']) {
+    const planned = plan(crlf, [spec(0, 'alpha\r', newText)]);
+    assert.equal(planned.bytes.toString(), 'gamma\r\nbeta\r\nalphabet\r\n', JSON.stringify(newText));
+    assert.deepEqual(planned.readForm, [0]);
+  }
+  // Only before a CRLF line end: not inside a line, not before a bare LF.
+  assert.equal(problems('alphabet\r\n', [spec(0, 'alpha\r', 'x')])[0]!.kind, 'miss');
+  assert.equal(plan(Buffer.from('alpha\nalpha\r\n'), [spec(0, 'alpha\r', 'x')]).bytes.toString(), 'alpha\nx\r\n');
+  assert.equal(problems('alpha\n', [spec(0, 'alpha\r', 'x')])[0]!.kind, 'miss', 'a file with no CRLF line end');
+  // A lone CR the file holds is matched as given, first.
+  const lone = plan(Buffer.from('alpha\rbeta\r\n'), [spec(0, 'alpha\r', 'x')]);
+  assert.deepEqual([lone.bytes.toString(), lone.readForm], ['xbeta\r\n', []]);
+});
+
+test("an old text carrying the file's BOM at its start matches at the text's start, keeping one BOM", () => {
+  const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+  const bytes = Buffer.concat([bom, Buffer.from('alpha\nbeta\n')]);
+  for (const newText of ['\uFEFFgamma', 'gamma']) {
+    const planned = plan(bytes, [spec(0, '\uFEFFalpha', newText)]);
+    assert.deepEqual(planned.bytes, Buffer.concat([bom, Buffer.from('gamma\nbeta\n')]), JSON.stringify(newText));
+    assert.deepEqual(planned.readForm, [0]);
+  }
+  // Only at the start, and only where the file has a BOM ('\uFEFF' encodes as one).
+  assert.equal(problems('\uFEFFalpha\nbeta\n', [spec(0, '\uFEFFbeta', 'x')])[0]!.kind, 'miss', 'not at the start');
+  assert.equal(problems('alpha\n', [spec(0, '\uFEFFalpha', 'x')])[0]!.kind, 'miss', 'a file with no BOM');
 });
 
 test("only the replaced text changes: a lone CR, and bytes the edits don't name, stay as they were", () => {
