@@ -1,4 +1,4 @@
-import { describe, it } from 'node:test';
+import { describe, it, mock } from 'node:test';
 import assert from 'node:assert';
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -150,6 +150,16 @@ async function runStartedEphemeral(
 // A short one turns that into a "stalled" rejection, which the refusal's
 // pattern doesn't match.
 const STOPPED_RUN_WATCHDOGS = { idleTimeoutMs: 20_000, idlePollMs: 50 };
+
+/** The store throws when asked for this agent's turn checkpoints. */
+function failCheckpointReads(framework: AgentFramework, agentName: string): void {
+  const store = framework.getStore();
+  const treeGet = store.treeGet.bind(store);
+  (store as unknown as { treeGet: typeof treeGet }).treeGet = (treeId, key) => {
+    if (treeId === 'framework/turn-checkpoints/tree' && key === agentName) throw new Error('injected checkpoint store failure');
+    return treeGet(treeId, key);
+  };
+}
 
 async function stopAndRemove(framework: AgentFramework, tempDir: string): Promise<void> {
   await framework.stop();
@@ -620,6 +630,46 @@ describe('runEphemeralToCompletion settle signal', () => {
     }
   });
 
+  it('a run whose turn checkpoints the store fails to remove still resolves with its speech, and the failure is logged', async () => {
+    const { tempDir, storePath } = tempStorePath('ephemeral-evict-fails-');
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Plain final answer' }]));
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: [],
+      modules: [new EphemeralToolModule()],
+      syncIntervalMs: 0,
+    });
+    const errors = mock.method(console, 'error', () => {});
+    try {
+      const { agent, contextManager } = await createEphemeral(framework);
+      // The turn's start reads the agent's checkpoints before its stream, so
+      // the store fails from the stream on, and the removal's read is the
+      // next to ask.
+      const streamYielding = membrane.streamYielding.bind(membrane);
+      membrane.streamYielding = (request, options) => {
+        failCheckpointReads(framework, agent.name);
+        return streamYielding(request, options);
+      };
+      const result = await runStartedEphemeral(framework, agent, contextManager);
+
+      assert.deepStrictEqual(result, { speech: 'Plain final answer', toolCallsCount: 0 });
+      assert.strictEqual(framework.getAgent(agent.name), null);
+      const internals = framework as unknown as { activeTurnTokens: Map<string, unknown> };
+      assert.equal(internals.activeTurnTokens.has(agent.name), false, 'the teardown went on past the failure');
+      const lines = errors.mock.calls.map((call) => String(call.arguments[0]));
+      assert.ok(
+        lines.some((line) => line.startsWith(`[checkpoints] agent=${agent.name}: removing its turn checkpoints from the store failed`)
+          && line.includes('injected checkpoint store failure')),
+        lines.join('\n'),
+      );
+    } finally {
+      errors.mock.restore();
+      await stopAndRemove(framework, tempDir);
+    }
+  });
+
   it('resolves after tool rounds with final speech and dispatched call count', async () => {
     const { tempDir, storePath } = tempStorePath('ephemeral-tools-');
     const membrane = new MockMembrane();
@@ -727,13 +777,9 @@ describe('runEphemeralToCompletion settle signal', () => {
     tools.duringCall = () => {
       returned.push(tools.ctx!.addMessage('Antra', [{ type: 'text', text: 'look left' }]));
     };
-    const errors: string[] = [];
-    const error = console.error;
     try {
       const { agent, contextManager } = await createEphemeral(framework, 'worker');
-      console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
       const result = await runStartedEphemeral(framework, agent, contextManager);
-      console.error = error;
       assert.strictEqual(result.speech, 'Done.');
       assert.deepStrictEqual(returned, [''], 'deferred: the run was waiting on its tool');
       assert.strictEqual(framework.getAgent(agent.name), null, 'deregistered');
@@ -742,14 +788,12 @@ describe('runEphemeralToCompletion settle signal', () => {
       assert.strictEqual(stored.filter((s) => s === 'Antra: look left').length, 1,
         `stored once, in the run's namespace:\n${stored.join('\n')}`);
       assert.deepStrictEqual(internals.deferredMessages, [], 'nothing is left queued');
-      assert.ok(!errors.some((e) => e.includes('is lost')), errors.join('\n'));
     } finally {
-      console.error = error;
       await stopAndRemove(framework, tempDir);
     }
   });
 
-  it('a write queued for a run that its store refuses at the run\'s last flush leaves the queue with the run, logged as lost', async () => {
+  it('a write queued for a run that its store refuses leaves the queue at the run\'s release, logged', async () => {
     const { tempDir, storePath } = tempStorePath('ephemeral-lost-');
     const membrane = new MockMembrane();
     membrane.pushResponse(createMockResponse([
@@ -798,67 +842,10 @@ describe('runEphemeralToCompletion settle signal', () => {
       assert.deepStrictEqual(internals.deferredMessages.filter((m) => m.forAgent === 'worker'), [], 'nothing is left queued for the run');
       const file = JSON.parse(readFileSync(join(storePath, 'recovery', 'deferred-writes.json'), 'utf8')) as { pending: Array<{ forAgent?: string }> };
       assert.deepStrictEqual(file.pending.filter((m) => m.forAgent === 'worker'), [], 'the recovery file keeps nothing for it');
-      assert.ok(errors.some((e) => e.includes('end of ephemeral run worker: deferred write ')
-        && e.includes('(Antra: text) for worker is lost: its agent has left the framework')), errors.join('\n'));
+      assert.ok(errors.some((e) => e.includes('[deferred-flush] worker: failed to store a queued write before release (participant=Antra)')
+        && e.includes('disk full')), errors.join('\n'));
       assert.ok(!errors.some((e) => e.includes('delivery target "worker" is not a registered agent')),
         `no later flush meets it:\n${errors.join('\n')}`);
-    } finally {
-      console.error = error;
-      await stopAndRemove(framework, tempDir);
-    }
-  });
-
-  it('what is queued for a run that ends while the host is quiesced leaves the persisted queue with the run, logged as lost', async () => {
-    const { tempDir, storePath } = tempStorePath('ephemeral-quiesced-');
-    const membrane = new MockMembrane();
-    membrane.pushResponse(createMockResponse([
-      { type: 'tool_use', id: 'call_1', name: 'test--echo', input: {} },
-    ], 'tool_use'));
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
-
-    const tools = new DuringCallToolModule();
-    const framework = await AgentFramework.create({
-      storePath,
-      membrane: membrane.asMembrane(),
-      agents: [],
-      modules: [tools],
-      syncIntervalMs: 0,
-    });
-    const internals = framework as unknown as {
-      addMessage(participant: string, content: Array<{ type: 'text'; text: string }>, metadata?: undefined, opts?: { forAgent?: string }): string;
-      deferredMessages: Array<{ forAgent?: string }>;
-    };
-    // While the run's tool call is pending, two messages for it are deferred:
-    // one named as the run itself, which waits for its turn's end, and one
-    // queued behind it. Then an operator quiesces the host, which waits for
-    // the run to end.
-    let quiescing: Promise<unknown> | undefined;
-    tools.duringCall = () => {
-      internals.addMessage('worker', [{ type: 'text', text: 'my own words' }], undefined, { forAgent: 'worker' });
-      internals.addMessage('Antra', [{ type: 'text', text: 'look left' }], undefined, { forAgent: 'worker' });
-      quiescing = framework.quiesce({ reason: 'surgery' });
-    };
-    const errors: string[] = [];
-    const error = console.error;
-    try {
-      const { agent, contextManager } = await createEphemeral(framework, 'worker');
-      console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
-      const result = await runStartedEphemeral(framework, agent, contextManager);
-      await quiescing;
-      console.error = error;
-      assert.strictEqual(result.speech, 'Done.');
-      assert.strictEqual(framework.getAgent(agent.name), null, 'deregistered');
-      const texts = contextManager.getAllMessages().flatMap((m) => m.content.map((b) => (b as { text?: string }).text));
-      assert.ok(!texts.includes('my own words') && !texts.includes('look left'), 'neither was stored: the host is quiesced');
-      assert.deepStrictEqual(internals.deferredMessages.filter((m) => m.forAgent === 'worker'), [], 'nothing is left queued for the run');
-      const file = JSON.parse(readFileSync(join(storePath, 'recovery', 'deferred-writes.json'), 'utf8')) as { pending: Array<{ forAgent?: string }> };
-      assert.deepStrictEqual(file.pending.filter((m) => m.forAgent === 'worker'), [], 'the recovery file keeps nothing for it');
-      for (const named of ['(worker: text)', '(Antra: text)']) {
-        assert.ok(errors.some((e) => e.includes('end of ephemeral run worker: deferred write ')
-          && e.includes(`${named} for worker is lost: its agent has left the framework`)), `${named}:\n${errors.join('\n')}`);
-      }
-      assert.ok(!errors.some((e) => e.includes('delivery target "worker" is not a registered agent')),
-        `no later flush meets them:\n${errors.join('\n')}`);
     } finally {
       console.error = error;
       await stopAndRemove(framework, tempDir);

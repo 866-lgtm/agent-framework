@@ -7,7 +7,9 @@
  * non-streaming path has always sent (-32603, the cause in its message). A
  * streamed request's result is built from membrane's response as a
  * non-streamed one's is, after chunks of the text membrane marks visible
- * (§11.4).
+ * (§11.4). A result names the model that served it, which §11.3 defines as
+ * the actual model used, and the completion trace names it beside the routed
+ * one.
  *
  * The router runs on a real Membrane here, with a scripted provider adapter,
  * so each case meets membrane's own streams: its `error` and `aborted`
@@ -34,7 +36,7 @@ import type {
 import { InferenceRouter } from '../src/mcpl/inference-router.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 import type { HookOrchestrator } from '../src/mcpl/hook-orchestrator.js';
-import type { InferenceChunkParams, McplInferenceRequestResult } from '../src/mcpl/types.js';
+import type { InferenceChunkParams, InferenceRoutingPolicy, McplInferenceRequestResult } from '../src/mcpl/types.js';
 
 /** What the scripted provider streams, and how its call ends. */
 type Script =
@@ -46,6 +48,8 @@ type Script =
     providerStopReason?: string;
     /** A native tool_use block after the text. */
     toolUse?: string;
+    /** The model the provider says served the call: `scripted-model` unless given. */
+    servedModel?: string;
   }
   | { chunks: string[]; fails: Error };
 
@@ -86,7 +90,7 @@ class ScriptedAdapter implements ProviderAdapter {
       ...(script.stopSequence ? { stopSequence: script.stopSequence } : {}),
       ...(script.providerStopReason ? { providerStopReason: script.providerStopReason } : {}),
       usage: { ...USAGE },
-      model: 'scripted-model',
+      model: script.servedModel ?? 'scripted-model',
       rawRequest: null,
       raw: null,
     };
@@ -109,7 +113,10 @@ interface Answer {
 }
 
 /** Ask the router for one inference, played by `script` on a real Membrane. */
-async function ask(script: Script, opts: { stream: boolean; mode: Mode }): Promise<Answer> {
+async function ask(
+  script: Script,
+  opts: { stream: boolean; mode: Mode; policy?: InferenceRoutingPolicy },
+): Promise<Answer> {
   const membrane = new Membrane(new ScriptedAdapter(script), {
     formatter: opts.mode === 'xml' ? new AnthropicXmlFormatter({ toolMode: 'xml' }) : new NativeFormatter(),
   });
@@ -119,16 +126,21 @@ async function ask(script: Script, opts: { stream: boolean; mode: Mode }): Promi
     answer.stream = streamYielding(request);
     return answer.stream;
   };
-  return askWith(membrane, opts.stream, answer);
+  return askWith(membrane, opts.stream, answer, opts.policy);
 }
 
-/** Ask a router built on `membrane` for one inference. */
-async function askWith(membrane: Membrane, stream: boolean, answer: Answer = { chunks: [], sent: [], traces: [] }): Promise<Answer> {
+/** Ask a router built on `membrane`, routing by `policy` (none: `default`), for one inference. */
+async function askWith(
+  membrane: Membrane,
+  stream: boolean,
+  answer: Answer = { chunks: [], sent: [], traces: [] },
+  policy?: InferenceRoutingPolicy,
+): Promise<Answer> {
   const router = new InferenceRouter(
     membrane,
     { isInHook: false } as unknown as HookOrchestrator,
     { validateInbound: () => {} } as unknown as FeatureSetManager,
-    null,
+    policy ?? null,
     (event) => { answer.traces.push(event); },
     (_serverId, params) => {
       answer.chunks.push(params);
@@ -181,9 +193,12 @@ const PROVIDER_ERROR = "The provider ended the inference with an error (finish_r
  */
 const PROVIDER_FAILED_PARTWAY: Script = { chunks: ['A summ'], stopReason: 'error', providerStopReason: 'error' };
 
-/** The success trace for a completion played with USAGE. */
+/**
+ * The success trace for a completion played with USAGE: the routed model,
+ * `default` with no routing policy, and the one the provider served.
+ */
 const completeTrace = (streamed: boolean) => ({
-  type: 'mcpl:inference_complete', serverId: 'scripted-server', model: 'default', ...USAGE, streamed,
+  type: 'mcpl:inference_complete', serverId: 'scripted-server', model: 'default', actualModel: 'scripted-model', ...USAGE, streamed,
 });
 
 /** A tool call as a model writes it in XML mode, which stops at the closing tag. */
@@ -243,6 +258,13 @@ for (const mode of ['native', 'xml'] as const) {
       assert.deepStrictEqual(answer.traces.at(-1), completeTrace(true));
     });
 
+    it('answers with the model that served the inference, not the routed one', async () => {
+      const answer = await ask({ chunks: ['Hello world'], stopReason: 'end_turn' }, { stream: true, mode });
+
+      assert.strictEqual(answer.result?.model, 'scripted-model');
+      assert.strictEqual(answer.traces[0]?.model, 'default');
+    });
+
     it('answers a stop at a stop sequence with stop_sequence', async () => {
       const answer = await ask(
         { chunks: ['They met twice.'], stopReason: 'stop_sequence', stopSequence: '\nuser:' },
@@ -294,16 +316,30 @@ for (const mode of ['native', 'xml'] as const) {
   });
 
   describe(`MCPL inference router, ${mode} mode: a request answered whole`, () => {
-    it('answers a completion with its text, finish reason and usage (control)', async () => {
+    it('answers a completion with its text, the model that served it, its finish reason and usage', async () => {
       const answer = await ask({ chunks: ['Hello world'], stopReason: 'end_turn' }, { stream: false, mode });
 
       assert.deepStrictEqual(answer.result, {
         content: 'Hello world',
-        model: 'default',
+        model: 'scripted-model',
         finishReason: 'end_turn',
         usage: USAGE,
       });
       assert.deepStrictEqual(answer.chunks, []);
+    });
+
+    it('answers with the routed model when membrane names none, and traces no actualModel (control)', async () => {
+      // A policy, so the routed model is one the policy chose rather than
+      // the `default` a router without one sends.
+      const answer = await ask(
+        { chunks: ['Hello world'], stopReason: 'end_turn', servedModel: '' },
+        { stream: false, mode, policy: { default: 'house-summarizer' } },
+      );
+
+      assert.strictEqual(answer.result?.model, 'house-summarizer');
+      assert.deepStrictEqual(answer.traces.at(-1), {
+        type: 'mcpl:inference_complete', serverId: 'scripted-server', model: 'house-summarizer', ...USAGE, streamed: false,
+      });
     });
 
     it('traces a completion as not streamed', async () => {
@@ -436,7 +472,10 @@ describe('MCPL inference router: a stop reason FinishReason has no value for', (
           toolCalls: [],
           stopReason,
           usage: { ...USAGE },
-          details: { stop: { reason: stopReason, wasTruncated: false } },
+          details: {
+            stop: { reason: stopReason, wasTruncated: false },
+            model: { requested: 'default', actual: 'scripted-model', provider: 'scripted' },
+          },
         }) as unknown as NormalizedResponse,
       } as unknown as Membrane;
 

@@ -15,6 +15,8 @@ import type { TraceEventListener } from './trace.js';
 export interface MessageQuery {
   /** Filter by external source (e.g., 'discord') */
   source?: string;
+  /** Filter by external IDs: messages whose metadata.external.id is one of these. An empty list filters nothing. */
+  externalIds?: string[];
   /** Filter by participant name */
   participant?: string;
   /** Filter by metadata fields (shallow match) */
@@ -189,8 +191,11 @@ export interface ModuleContext {
    * `modules/<module>/<name>`. Idempotent — safe to call on every start().
    * Items are appended with `appendToLog` (one O(item) record per append) and
    * point-edited with `editLogItem`; Chronicle's append_log snapshot cadence
-   * handles consolidation. `name` must not be 'state' (reserved for the main
-   * snapshot state) and must not contain '/'.
+   * handles consolidation. The cadence applies when the state is first
+   * registered: a store that already holds the state keeps the cadence it was
+   * registered with. `name` must not be 'state' (reserved for the main
+   * snapshot state) and must not contain '/'. A registration that fails
+   * throws, naming the state, and leaves the name unregistered.
    */
   registerLogState(
     name: string,
@@ -518,6 +523,15 @@ export interface SpeechContext {
    * Empty when no tool calls were made.
    */
   thoughts?: ContentBlock[];
+
+  /**
+   * The turn this speech ends: the same id as `ToolCall.callerTurnId` on the
+   * calls made in it (its model's calls and its foreground scripts' inner
+   * calls), kept across the turn's streams (a context-budget restart or a
+   * retry), and larger for the agent's next turn. Unique only within one run
+   * of the process.
+   */
+  turnId?: number;
 }
 
 /**
