@@ -520,7 +520,7 @@ export function assertServerConfigBooleans(config: McplServerConfig): void {
 
 /** The kind of a value that isn't undefined, null or a boolean, as a refusal
  *  names it in place of the value. */
-function kindOf(value: unknown): string {
+export function kindOf(value: unknown): string {
   if (Array.isArray(value)) return 'an array';
   if (typeof value !== 'object') return `a ${typeof value}`;
   const prototype = Object.getPrototypeOf(value) as { constructor?: { name?: string } } | null;

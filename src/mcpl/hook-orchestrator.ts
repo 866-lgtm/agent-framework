@@ -90,6 +90,8 @@ export class HookOrchestrator {
   private _isInHook = false;
   /** Servers already told that an injection's namespace wasn't a string. */
   private readonly namespaceWarned = new Set<string>();
+  /** Server and namespace pairs already told that a system injection held a block that isn't text. */
+  private readonly notShownWarned = new Set<string>();
 
   constructor(registry: McplServerRegistry, featureSetManager: FeatureSetManager) {
     this.registry = registry;
@@ -223,7 +225,9 @@ export class HookOrchestrator {
             continue;
           }
           if (typeof mcplInj.namespace !== 'string') this.readNamespace(server.id, mcplInj.namespace);
-          injections.push(convertMcplInjection(mcplInj));
+          const injection = convertMcplInjection(mcplInj);
+          if (injection.position === 'system') this.noteBlocksNotShown(server.id, mcplInj.namespace, injection.content);
+          injections.push(injection);
         } catch (error) {
           // Such as a null block, content that isn't an array, a null
           // injection, or a namespace that can't be read as text.
@@ -261,6 +265,26 @@ export class HookOrchestrator {
       `[mcpl] ${serverId}: a beforeInference injection's namespace isn't a string, which §10.4 requires, so it keeps the ` +
         `injection to no channel and every agent gets it; where it names a participant, it's read as its text, ${logValue(text)}; ` +
         'this line prints once per server while the host runs',
+    );
+  }
+
+  /**
+   * The system prompt is text, so an agent given a `system` injection reads
+   * a line in place of each of its blocks that isn't text (the agent's
+   * buildSystemPrompt). The server meant those blocks for the model, so its
+   * operator is told, once per server and namespace, as the server's
+   * injections are gathered, whichever agents are given them. The namespace
+   * is read as its text, which readNamespace has checked it has.
+   */
+  private noteBlocksNotShown(serverId: string, namespace: unknown, content: ContentBlock[]): void {
+    if (!content.some((block) => block.type !== 'text')) return;
+    const key = `${serverId}\u0000${String(namespace)}`;
+    if (this.notShownWarned.has(key)) return;
+    this.notShownWarned.add(key);
+    console.error(
+      `[mcpl] ${serverId}: a system injection in namespace ${logValue(namespace)} holds a block that isn't text, ` +
+        "which the system prompt can't carry, so an agent given the injection reads a line in place of each such block; " +
+        'this line prints once per server and namespace while the host runs',
     );
   }
 
