@@ -156,6 +156,27 @@ test("a server's error answer that echoes a credential reaches the caller as sen
   assert.ok(!lines.some((line) => line.includes(token)), 'no log line has the token');
 });
 
+test("an error answer settles its call when its log line can't be redacted, and that line prints none of the server's text", async (t) => {
+  const errors = t.mock.method(console, 'error', () => {});
+  // A stdio server's env, as the framework gives it, is a getter, which
+  // throws once the reaction baseline's ledger can't be read.
+  let unreadable = false;
+  const withGetter = config();
+  Object.defineProperty(withGetter, 'env', {
+    enumerable: true,
+    get: () => { if (unreadable) throw new Error('reaction-baseline ledger unreadable'); return {}; },
+  });
+  const connection = await McplServerConnection.connect(withGetter, HOST_CAPS);
+  t.after(() => { unreadable = false; return connection.close(); });
+  connection.ready();
+  unreadable = true;
+  await within(assert.rejects(connection.sendToolsCall('refuse', {}),
+    { message: 'The "words" server answered with an error: Missing Access' }), 'settled call');
+  const lines = errors.mock.calls.map((call) => String(call.arguments[0]));
+  assert.ok(!lines.some((line) => line.includes('Missing')), lines.join('\n'));
+  assert.ok(lines.some((line) => /inbound dispatch failed .*reaction-baseline ledger unreadable/.test(line)), lines.join('\n'));
+});
+
 test("a server that drops with a call pending says the outcome is unknown, and whether it's coming back", async (t) => {
   const errors = t.mock.method(console, 'error', () => {});
   const once = await McplServerConnection.connect(config(), HOST_CAPS);

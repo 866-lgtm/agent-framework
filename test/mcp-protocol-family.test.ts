@@ -22,6 +22,7 @@ import {
   mcplPolicyGrants,
   MAX_TIMER_MS,
 } from '../src/mcpl/protocol-family.js';
+import { logValueRedacted } from '../src/mcpl/log-value.js';
 import { getEventListeners } from 'node:events';
 import { DEFAULT_EAGER_FETCH_MAX_BYTES, DEFAULT_MAX_TOTAL_BYTES } from '../src/mcpl/reference-fetcher.js';
 import { DEFAULT_MAX_INPUT_BYTES } from '../src/mcpl/tool-lifecycle.js';
@@ -552,6 +553,28 @@ test('recorded server text: a credential as JSON.stringify writes it, its quotes
       assert.equal(redactServerText(`config {"secret":"${form}"} refused`, config), 'config {"secret":"redacted"} refused', form);
     }
   }
+});
+
+test("recorded server text: a url's credentials, pairs and userinfo as JSON.stringify writes them, as a token's are", () => {
+  // Decoded, each holds a quote and a backslash, or a slash: a path segment,
+  // a credential-named query value, a pair whose value is too short to go on
+  // its own, a ws:// password, and a userinfo unit too short to go on its own.
+  const config = cfg({ url: 'wss://bot:pa%22ss%5Cw0rd@h/mcpl/s3cr%22et%5C0123456789?password=sec%2Fret%22key123&region=e%22u' });
+  for (const decoded of ['s3cr"et\\0123456789', 'sec/ret"key123', 'pa"ss\\w0rd']) {
+    const json = JSON.stringify(decoded).slice(1, -1);
+    for (const form of [decoded, json, json.replace(/\//g, '\\/')]) {
+      assert.equal(redactServerText(`config {"secret":"${form}"} refused`, config), 'config {"secret":"redacted"} refused', form);
+    }
+  }
+  assert.equal(redactServerText('config {"q":"region=e\\"u"} refused', config), 'config {"q":"redacted"} refused');
+  const short = cfg({ url: 'wss://b%22t:p%22w@h/mcp' });
+  assert.equal(redactServerText('dial {"url":"wss://b\\"t:p\\"w@h/mcp"} failed', short), 'dial {"url":"wss://redacted@h/mcp"} failed');
+});
+
+test("a JSON value logged through logValueRedacted keeps no url credential, though its JSON text escapes the credential's quote", () => {
+  const config = cfg({ url: 'wss://h/mcpl?password=secret%22key123' });
+  const line = logValueRedacted({ said: 'secret"key123' }, (text) => redactServerText(text, config));
+  assert.equal(line, '"{\\"said\\":\\"redacted\\"}"');
 });
 
 test("one redactor over several configurations' strings takes the longest secret among them all", () => {
