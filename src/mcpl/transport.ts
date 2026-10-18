@@ -23,6 +23,7 @@ import { StringDecoder } from 'node:string_decoder';
 import WebSocket from 'ws';
 
 import type { McplServerConfig } from './types.js';
+import { logDetail } from './log-value.js';
 
 /** Why/how a transport closed. `code`/`signal` are populated for stdio child
  *  exits; `reason` carries a WebSocket close reason or an error message. */
@@ -55,7 +56,10 @@ export abstract class McplTransport extends EventEmitter {
   private lineBuffer: string[] = [];
   private stderrBuffer: string[] = [];
 
-  protected constructor() {
+  /** The server's id from its config, so a line the transport logs names it.
+   *  The stdio and WebSocket transports always give it; a test's stand-in
+   *  transport may leave it out. */
+  protected constructor(protected readonly serverId?: string) {
     super();
     // Flush buffered inbound lines the moment a consumer subscribes.
     this.on('newListener', (event) => {
@@ -104,6 +108,23 @@ export abstract class McplTransport extends EventEmitter {
   protected pushStderr(line: string): void {
     if (this.listenerCount('stderr') > 0) this.emit('stderr', line);
     else this.stderrBuffer.push(line);
+  }
+
+  /**
+   * Report a transport error: to the 'error' listeners if there are any, else
+   * as a log line. EventEmitter throws an 'error' that nothing listens for,
+   * and a transport reports its errors from I/O callbacks, where nothing
+   * catches that throw, so it would end the process. A transport has no
+   * listener from its creation until the handshake attaches one, and a
+   * WebSocket server that sends a malformed frame with its upgrade response
+   * makes ws raise an 'error' in that window.
+   */
+  protected reportError(err: Error): void {
+    if (this.listenerCount('error') > 0) this.emit('error', err);
+    else {
+      const server = this.serverId === undefined ? '' : `${this.serverId}: `;
+      console.error(`[mcpl] ${server}a ${this.kind} transport error, with nothing listening for it: ${logDetail(err.message)}`);
+    }
   }
 
   /** Emit 'close' exactly once. */
@@ -244,8 +265,9 @@ export class StdioTransport extends McplTransport {
   private constructor(
     private readonly child: ChildProcess,
     private readonly rl: ReadlineInterface,
+    serverId: string,
   ) {
-    super();
+    super(serverId);
 
     this.rl.on('line', (line: string) => this.pushLine(line));
 
@@ -275,7 +297,7 @@ export class StdioTransport extends McplTransport {
     // A stream destroyed by an error closes without ending: nothing more comes.
     this.child.stderr?.on('close', () => { this.stderrDone = true; });
 
-    this.child.on('error', (err) => this.emit('error', err));
+    this.child.on('error', (err) => this.reportError(err));
     // The child's stdin and stdout carry the protocol, so after an error on
     // either, a write's EPIPE or a read error, this transport can't reach the
     // child even if it's still running. The handler sends a running child
@@ -296,13 +318,11 @@ export class StdioTransport extends McplTransport {
     // listener absorbs that copy.
     this.child.stdout?.on('error', endOnPipeError);
     this.rl.on('error', () => { /* readline's copy of a stdout error, handled above */ });
-    // stderr carries diagnostics only: a read error on it is reported if
-    // anyone listens and never thrown. It ends nothing once the connection
-    // is wired; during a handshake the listener is the handshake's, which
-    // fails it.
-    this.child.stderr?.on('error', (err) => {
-      if (this.listenerCount('error') > 0) this.emit('error', err);
-    });
+    // stderr carries diagnostics only: a read error on it is reported, to the
+    // listeners or else in the log, and never thrown. It ends nothing once
+    // the connection is wired; during a handshake the listener is the
+    // handshake's, which fails it.
+    this.child.stderr?.on('error', (err) => this.reportError(err));
     this.child.on('exit', (code, signal) => this.markClosed({
       code,
       signal,
@@ -342,7 +362,7 @@ export class StdioTransport extends McplTransport {
       });
     });
     const rl = createInterface({ input: child.stdout! });
-    return new StdioTransport(child, rl);
+    return new StdioTransport(child, rl, config.id);
   }
 
   writeLine(json: string): void {
@@ -381,8 +401,8 @@ const WS_OPEN_TIMEOUT_MS = 15_000;
 export class WebSocketTransport extends McplTransport {
   readonly kind = 'websocket' as const;
 
-  private constructor(private readonly ws: WebSocket) {
-    super();
+  private constructor(private readonly ws: WebSocket, serverId: string) {
+    super(serverId);
 
     this.ws.on('message', (data: WebSocket.RawData, isBinary: boolean) => {
       // MCPL frames are UTF-8 JSON text. A frame MAY contain multiple
@@ -394,7 +414,7 @@ export class WebSocketTransport extends McplTransport {
       }
     });
 
-    this.ws.on('error', (err: Error) => this.emit('error', err));
+    this.ws.on('error', (err: Error) => this.reportError(err));
     this.ws.on('close', (code: number, reason: Buffer) => {
       const text = reason?.toString('utf8');
       this.markClosed(text ? { code, reason: text, reasonFromPeer: true } : { code, reason: 'websocket closed' });
@@ -453,7 +473,7 @@ export class WebSocketTransport extends McplTransport {
         settled = true;
         clearTimeout(timer);
         ws.removeAllListeners('error'); // the instance re-attaches its own handlers
-        resolve(new WebSocketTransport(ws));
+        resolve(new WebSocketTransport(ws, config.id));
       });
 
       ws.once('error', (err: Error) => {
