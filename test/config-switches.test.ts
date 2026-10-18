@@ -84,7 +84,7 @@ const TOOL_RESULT_GUARD = 'true turns on tool-output admission, with one guarded
 const TOOL_WRAPPER_PROSE_GUARD = 'true keeps a response whose whole prose is a tool-call-shaped wrapper from running or entering the agent\'s history, ' + doesnt;
 
 describe('config switches', () => {
-  it('create() refuses a framework switch that is not true or false, and a settings object that is not an object, null or false', async () => {
+  it('create() refuses a framework switch that is not true or false, and a settings object other than an object, null or false', async () => {
     await assertRefused([
       [{ subconscious: { enabled: 'false', systemPrompt: 'x' } }, `subconscious.enabled must be true or false, unquoted, not a string: ${SUBCONSCIOUS_ENABLED}`],
       [{ subconscious: { enabled: true, systemPrompt: 'x', allowChannelSpeech: 'false' } }, `subconscious.allowChannelSpeech must be true or false, unquoted, not a string: ${ALLOW_CHANNEL_SPEECH}`],
@@ -96,7 +96,7 @@ describe('config switches', () => {
     ]);
   });
 
-  it('create() refuses an agent switch that is not true or false, and a settings object that is not an object, null or false', async () => {
+  it('create() refuses an agent switch that is not true or false, and a settings object other than an object, null or false', async () => {
     const refused = (settings: Record<string, unknown>, message: string) =>
       [{ agents: [agentWith(settings)] }, `Agent "agent" ${message}`] as const;
     await assertRefused([
@@ -139,7 +139,7 @@ describe('config switches', () => {
     });
   });
 
-  it('promptCaching false leaves the prompt-caching markers off', async () => {
+  it('promptCaching false is sent in the request as false, the flag membrane reads for its caching markers', async () => {
     const request = await newAgent({ promptCaching: false }).buildActivationRequest([]);
     assert.equal(request.promptCaching, false);
   });
@@ -198,5 +198,18 @@ describe('config switches', () => {
       }
     }
     assert.deepEqual(watchdog(), [], 'the watchdog never armed');
+  });
+
+  it('a watchdog that is on prints that it armed, the line the tests above look for', async (t) => {
+    const watchdog = watchdogLines(t);
+    const { tempDir, storePath } = tempStorePath('config-switches-watchdog-');
+    let framework: AgentFramework | undefined;
+    try {
+      framework = await createWith(storePath, { watchdog: { enabled: true, thresholdMs: 600_000, action: 'exit' } });
+      assert.ok(watchdog().some((line) => line.startsWith('[liveness-watchdog] armed')), `watchdog lines: ${JSON.stringify(watchdog())}`);
+    } finally {
+      await framework?.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 });

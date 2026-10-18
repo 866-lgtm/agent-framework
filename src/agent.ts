@@ -77,14 +77,15 @@ const DEFAULT_TRANSITION_PACE_TOKENS = 16_000;
 const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
 
 /**
- * Refuse an agent config whose `thinking` or `refusalHandling` is anything but
- * an object, null or false (holdsSettings), or whose switch holds anything but
- * true or false (assertBooleanSetting). The constructor runs it first, so the
- * rule holds wherever an Agent is built. `create()` also runs it for each of
- * its agents before anything opens, and `createEphemeralAgent` before it
- * reserves the name, so a refusal there leaves nothing behind. Membrane reads
- * `thinking.enabled`, and the refusal is here because the setting is
- * AgentConfig's.
+ * Refuse an agent config whose `promptCaching`, `toolResultGuard`,
+ * `toolWrapperProseGuard`, `thinking.enabled` or `refusalHandling.autoRewind`
+ * holds anything but true or false (assertBooleanSetting), or whose `thinking`
+ * or `refusalHandling` is anything but an object, null or false
+ * (holdsSettings). The constructor runs it first, so the rule holds wherever
+ * an Agent is built. `create()` also runs it for each of its agents before
+ * anything opens, and `createEphemeralAgent` before it reserves the name, so a
+ * refusal there leaves nothing behind. Membrane reads `thinking.enabled`, and
+ * the refusal is here because the setting is AgentConfig's.
  */
 export function assertAgentSwitches(config: AgentConfig): void {
   const agent = `Agent "${config.name}"`;

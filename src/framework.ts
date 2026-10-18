@@ -6929,7 +6929,8 @@ export class AgentFramework {
     cleanup: () => void;
   }> {
     // Checked before anything happens: the constructor checks too, but only
-    // after the name is reserved and the agent's states are registered.
+    // after the name is reserved and ContextManager.open has registered the
+    // agent's message and context states in the store.
     assertAgentSwitches(config);
     // Names are Chronicle namespaces and generation identities. Reserve before
     // opening the namespace so a second creation cannot append to an earlier

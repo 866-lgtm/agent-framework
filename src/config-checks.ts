@@ -34,10 +34,10 @@ export function assertBooleanSetting(setting: string, value: unknown, whatItDoes
 
 /**
  * Whether a settings object holds settings to check: false when it's null,
- * false or left out, which count as not set, since every setting in it reads
- * as left out and those say as much. Anything else that isn't an object,
- * `true` and an array included, is refused, since every setting in it would
- * read as left out whatever it says.
+ * false or left out, which count as not set. Each of those has every setting
+ * in it read as left out, which is what null and false ask for. Anything else
+ * that isn't an object, `true` and an array included, is refused, since every
+ * setting in it would read as left out too, whatever it says.
  */
 export function holdsSettings<T>(setting: string, value: T, example: string): value is NonNullable<T> {
   if (value === undefined || value === null || value === false) return false;
