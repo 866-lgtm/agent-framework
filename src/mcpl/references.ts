@@ -446,3 +446,48 @@ export function referenceStubOrNull(block: unknown, provenance?: string, serverI
     case 'invalid': return c.shown;
   }
 }
+
+/**
+ * RFC-005 treatment for one MCPL wire block, for a script's structured
+ * result, which carries blocks rather than text. It makes the decision
+ * referenceStubOrNull makes for the model's lanes, since what a script prints
+ * comes back to the model. A reference becomes the stub's facts as data,
+ * without its URI: the host's reference id, what the server said about it in
+ * this block (its labels stripped and bounded as in the stub), and `savedTo`,
+ * the workspace path its payload was fetched to, or null when it wasn't
+ * (`fetch_reference` takes the id as `ref_id`). An unsaved reference that
+ * counts as expired also carries `expired`, the reason the stub gives in
+ * place of advising fetch_reference. The reference is registered bound to
+ * `serverId`, the server whose tool returned it, as the model's lanes bind
+ * a tool result's references, so the fetch its id offers can be made. A
+ * block the classifier
+ * rejects becomes the notice the model's lanes show, and inline data that
+ * also claims a bulk disposition the withheld notice, each as a text block.
+ * A text block, or inline data that claims nothing, is returned as sent.
+ */
+export function referenceBlockForScript(block: unknown, serverId: string): unknown {
+  const c = classifyBlock(block);
+  switch (c.kind) {
+    case 'text': return block;
+    case 'inline':
+      return c.contradiction ? { type: 'text', text: INLINE_WITHHELD_TEXT } : block;
+    case 'invalid': return { type: 'text', text: c.shown };
+    case 'reference': {
+      const t = c.testimony;
+      const record = referenceRegistry.register(t, serverId);
+      // As the stub judges it: a saved copy is still served.
+      const expiry = record.fetchedPath ? null : referenceExpiry(record.testimony);
+      return {
+        type: (block as { type: string }).type,
+        refId: record.refId,
+        ...(t.name !== undefined ? { name: sanitizeLabel(t.name, STUB_FIELD_CHARS) } : {}),
+        ...(t.mimeType !== undefined ? { mimeType: sanitizeLabel(t.mimeType, STUB_FIELD_CHARS) } : {}),
+        ...(t.sizeBytes !== undefined ? { sizeBytes: t.sizeBytes } : {}),
+        ...(t.digest !== undefined ? { digest: t.digest } : {}),
+        ...(t.expiresAt !== undefined ? { expiresAt: sanitizeLabel(t.expiresAt, STUB_FIELD_CHARS) } : {}),
+        savedTo: record.fetchedPath ?? null,
+        ...(expiry ? { expired: EXPIRY_REASON[expiry] } : {}),
+      };
+    }
+  }
+}
