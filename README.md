@@ -527,7 +527,8 @@ work, with how many adds and removals, on stderr wherever it runs, and in a
 `discord-awareness-import-unsent` ops alert at the host's start that
 imported it. A batch 0.22.x never activated placed no marks; a retract of a
 batch takes off the mark of its emoji from each of its messages, whichever
-batch placed it.
+batch placed it. A version 1 ledger, which only an unreleased commit wrote,
+is refused until it is moved away, and its error says what that gives up.
 
 ## Observability
 

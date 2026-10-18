@@ -48,7 +48,8 @@
   `discord-awareness-import-unsent` ops alert at the host's start that
   imports it, each before the import is recorded. A batch 0.22.x never activated placed no marks; a retract of
   a batch takes off the mark of its emoji from each of its messages, whichever
-  batch placed it.
+  batch placed it. A version 1 ledger, which only an unreleased commit wrote,
+  is refused until it is moved away, and its error says what that gives up.
   A release before this one doesn't read the
   journal, so a host downgraded after the import starts without it, and
   marks queued since aren't delivered.

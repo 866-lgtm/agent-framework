@@ -95,7 +95,7 @@ export class DiscordAwarenessRefusal extends Error {
   }
 }
 
-/** The pre-journal (version 1 and 2) ledger file name, imported once. */
+/** The pre-journal ledger's file name, imported once. */
 const LEGACY_LEDGER_NAME = 'discord-awareness-outbox.json';
 
 /**
@@ -1760,10 +1760,10 @@ function authorizationOf(state: JournalState, cause: DiscordAwarenessOpCause): n
 }
 
 interface LegacyEntry extends DiscordAwarenessRef {
-  desired?: boolean;
-  markerPresent?: boolean;
-  deliveryStatus?: 'pending' | 'applied' | 'permanent-failure';
-  attempts?: number;
+  desired: boolean;
+  markerPresent: boolean;
+  deliveryStatus: 'pending' | 'applied' | 'permanent-failure';
+  attempts: number;
   lastAction?: DiscordAwarenessAction;
   lastAttemptAt?: number;
   lastError?: string;
@@ -1771,7 +1771,7 @@ interface LegacyEntry extends DiscordAwarenessRef {
 
 interface LegacyBatch {
   id: string;
-  status: 'prepared' | 'active' | 'pending';
+  status: 'prepared' | 'active';
   agentName: string;
   sourceBranch: string;
   targetBranch: string;
@@ -1783,45 +1783,36 @@ interface LegacyBatch {
 }
 
 /**
- * Whether a parsed pre-journal ledger is one the released readers accepted
- * (every release with the outbox, 0.6.7 to 0.22.2, checked these fields
- * alike): version 1, whose batches are `prepared` or `pending` with plain
- * refs, or version 2, whose batches are `prepared` or `active`, with an
- * activation policy and suppression intervals of the shapes they wrote, and
- * refs that are full entries.
+ * Whether a parsed pre-journal ledger is a version 2 ledger the released
+ * readers accepted (every release with the outbox, 0.6.7 to 0.22.2, checked
+ * these fields alike): batches `prepared` or `active`, with an activation
+ * policy and suppression intervals of the shapes they wrote, and refs that
+ * are full entries.
  */
 function isLegacyLedger(value: unknown): boolean {
   if (!value || typeof value !== 'object') return false;
   const document = value as { version?: unknown; batches?: unknown };
-  if ((document.version !== 1 && document.version !== 2) || !Array.isArray(document.batches)) return false;
-  const v1 = document.version === 1;
+  if (document.version !== 2 || !Array.isArray(document.batches)) return false;
   return document.batches.every((batch) => {
     if (!batch || typeof batch !== 'object') return false;
     const candidate = batch as Record<string, unknown>;
     return typeof candidate.id === 'string'
-      && (v1
-        ? candidate.status === 'prepared' || candidate.status === 'pending'
-        : candidate.status === 'prepared' || candidate.status === 'active')
+      && (candidate.status === 'prepared' || candidate.status === 'active')
       && typeof candidate.agentName === 'string'
       && typeof candidate.sourceBranch === 'string'
       && typeof candidate.targetBranch === 'string'
       && typeof candidate.emoji === 'string'
       && typeof candidate.createdAt === 'number'
       && Array.isArray(candidate.refs)
-      && (v1
-        ? candidate.refs.every((ref: unknown) => !!ref && typeof ref === 'object'
-          && typeof (ref as Record<string, unknown>).serverId === 'string'
-          && typeof (ref as Record<string, unknown>).channelId === 'string'
-          && typeof (ref as Record<string, unknown>).messageId === 'string')
-        : (candidate.activationPolicy === undefined
-          || candidate.activationPolicy === 'target-branch'
-          || candidate.activationPolicy === 'explicit')
-          && (candidate.suppressionIntervals === undefined
-            || (Array.isArray(candidate.suppressionIntervals)
-              && candidate.suppressionIntervals.every((interval: unknown) => !!interval && typeof interval === 'object'
-                && typeof (interval as Record<string, unknown>).fromId === 'string'
-                && typeof (interval as Record<string, unknown>).toId === 'string')))
-          && candidate.refs.every(isLegacyEntry));
+      && (candidate.activationPolicy === undefined
+        || candidate.activationPolicy === 'target-branch'
+        || candidate.activationPolicy === 'explicit')
+      && (candidate.suppressionIntervals === undefined
+        || (Array.isArray(candidate.suppressionIntervals)
+          && candidate.suppressionIntervals.every((interval: unknown) => !!interval && typeof interval === 'object'
+            && typeof (interval as Record<string, unknown>).fromId === 'string'
+            && typeof (interval as Record<string, unknown>).toId === 'string')))
+      && candidate.refs.every(isLegacyEntry);
   });
 }
 
@@ -1842,10 +1833,11 @@ function isLegacyEntry(value: unknown): boolean {
 }
 
 /**
- * Translate a version 1 or 2 ledger into journal records. Batches keep their ids.
- * Of what the old ledger recorded about each ref's attempts, each batch
- * keeps how many refs its last attempt saw added (`legacyAdded`): never
- * synthesized attempts, and never a judgment about what is on Discord. The work it had
+ * Translate a version 2 ledger into journal records (a version 1 ledger is
+ * refused, and its error says why). Batches keep their ids. Of what the old
+ * ledger recorded about each ref's attempts, each batch keeps how many refs
+ * its last attempt saw added (`legacyAdded`): never synthesized attempts,
+ * and never a judgment about what is on Discord. The work it had
  * still to do (its pending adds and removals, and every mark of a batch it
  * never activated) is retired, none of it sent, and returned in `unsent`:
  * it was queued before marks were an explicit choice, so nobody chose it.
@@ -1865,12 +1857,22 @@ function importLegacy(
   path: string,
   journalBatches: ReadonlyMap<string, unknown>,
 ): { records: JournalRecord[]; unsent: DiscordAwarenessImportedUnsent[] } {
+  if (!!parsed && typeof parsed === 'object' && (parsed as { version?: unknown }).version === 1) {
+    throw new Error(
+      `Discord awareness ledger ${path} is version 1, which only agent-framework commit b16731b2 wrote ` +
+        '(2026-07-15, before any release). Every release rewrites it as version 2 at its next write, and this ' +
+        'build reads only version 2. Nothing in the journal is read until the file is moved away. Moving it gives up ' +
+        'only work it still had to send, which this build would retire unsent anyway, since that commit took each ' +
+        'mark out of the file once Discord confirmed it. A mark added just before that process ended, before its ' +
+        'confirmation was written, stays on Discord, and retract can\'t find it',
+    );
+  }
   // A ledger the released readers would have refused is refused here too,
   // never read for a meaning: a malformed field (`activationPolicy:
   // 'explicit '`) would otherwise retire a suppression whose removals a
   // start on its branch still owes.
   if (!isLegacyLedger(parsed)) throw new Error(`Invalid Discord awareness ledger ${path}`);
-  const document = parsed as { version: 1 | 2; batches: unknown[] };
+  const document = parsed as { version: 2; batches: unknown[] };
   const at = Date.now();
   const records: JournalRecord[] = [];
   const unsent: DiscordAwarenessImportedUnsent[] = [];
@@ -1878,7 +1880,7 @@ function importLegacy(
   for (const raw of document.batches as LegacyBatch[]) {
     if (journalBatches.has(raw.id) || imported.has(raw.id)) continue;
     imported.add(raw.id);
-    const legacyActive = raw.status === 'active' || raw.status === 'pending';
+    const legacyActive = raw.status === 'active';
     const refs = raw.refs.map((entry) => ({
       serverId: entry.serverId,
       channelId: entry.channelId,
@@ -1915,14 +1917,9 @@ function importLegacy(
     let adds = 0;
     let removals = 0;
     for (const entry of raw.refs) {
-      // v1 entries carry no delivery state. A v1 batch is `prepared` or
-      // `pending`, and `pending` was the active one, every mark still to
-      // deliver: its entries are pending, a prepared one's are not.
-      const status = entry.deliveryStatus ?? (raw.status === 'pending' ? 'pending' : 'applied');
-      const desired = entry.desired ?? raw.status === 'pending';
       // What 0.22.x had still to do for this ref, retired here.
-      if ((!legacyActive || status === 'pending') && (!legacyActive || desired || entry.markerPresent)) {
-        if (desired || !legacyActive) adds++;
+      if ((!legacyActive || entry.deliveryStatus === 'pending') && (!legacyActive || entry.desired || entry.markerPresent)) {
+        if (entry.desired || !legacyActive) adds++;
         else removals++;
       }
     }

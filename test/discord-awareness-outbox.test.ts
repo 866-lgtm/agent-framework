@@ -2570,17 +2570,25 @@ test('an operator\'s request the journal won\'t carry out is a refusal; a journa
   assert.throws(() => outbox.cancel(batch.id), (error) => !(error instanceof DiscordAwarenessRefusal) && /injected sync failure/.test((error as Error).message));
 }));
 
-test('a version 1 ledger\'s pending batch, the active one, is imported active with nothing due', withJournal((_outbox, h) => {
+test('a version 1 ledger is refused, naming its file, the one commit that wrote it, and what moving it away gives up', withJournal((_outbox, h) => {
   mkdirSync(join(h.dir, 'recovery'), { recursive: true });
   writeFileSync(h.legacyPath, JSON.stringify({
     version: 1,
     batches: [{ id: 'v1-batch', status: 'pending', agentName: 'resident', sourceBranch: 'main', targetBranch: 'rollback/resident/1', emoji: '💤', createdAt: 1, refs: [ref('a1')] }],
   }));
-  // v1's `pending` was its active status: the batch stays active, and the
-  // add it had still to send is dropped, never sent.
   const outbox = h.reopen();
-  assert.deepEqual(outbox.batches().map((batch) => [batch.id, batch.status]), [['v1-batch', 'active']]);
-  assert.equal(outbox.pendingDispatches('discord').length, 0);
+  const words = `Discord awareness ledger ${h.legacyPath} is version 1, which only agent-framework commit b16731b2 wrote `
+    + '(2026-07-15, before any release). Every release rewrites it as version 2 at its next write, and this build reads '
+    + 'only version 2. Nothing in the journal is read until the file is moved away. Moving it gives up only work it still '
+    + 'had to send, which this build would retire unsent anyway, since that commit took each mark out of the file once '
+    + 'Discord confirmed it. A mark added just before that process ended, before its confirmation was written, stays on '
+    + 'Discord, and retract can\'t find it';
+  assert.throws(() => outbox.batches(), (error: Error) => error.message === words);
+  assert.throws(() => outbox.batches(), (error: Error) => error.message === words, 'a later read refuses it again');
+  assert.equal(existsSync(h.legacyPath), true, 'the file stays where it was');
+  // Moved away, the journal reads, with nothing of the file in it.
+  rmSync(h.legacyPath);
+  assert.deepEqual(h.reopen().batches(), []);
 }));
 
 test('a sync for one server drains only that server', async () => {
@@ -2618,12 +2626,11 @@ test("a legacy ledger whose batches the released readers would have refused can'
     id: 'legacy-sup', status: 'prepared', agentName: 'cairn', sourceBranch: 'main', targetBranch: 'partial', emoji: '💤', createdAt: 1,
     activationPolicy: 'explicit', suppressionIntervals: [{ fromId: 'i1', toId: 'i2' }], refs: [entry],
   };
-  const v1 = { id: 'legacy-v1', status: 'prepared', agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/1', emoji: '💤', createdAt: 1, refs: [ref('m1')] };
   const without = <T extends object>(value: T, key: string) => Object.fromEntries(Object.entries(value).filter(([k]) => k !== key));
-  // Every field the released readers (0.6.7 to 0.22.2) checked, each made
-  // wrong in turn: the document's, a batch's, an interval's, an entry's, and
-  // a version 1 batch's and ref's. Imported as written, the first would
-  // retire a suppression whose removals a start on its branch still owes.
+  // Every field the released readers (0.6.7 to 0.22.2) checked in a version
+  // 2 ledger, each made wrong in turn: the document's, a batch's, an
+  // interval's and an entry's. Imported as written, the first would retire
+  // a suppression whose removals a start on its branch still owes.
   const refused: Array<[string, unknown]> = [
     ['version', { version: 3, batches: [v2] }],
     ['batches', { version: 2, batches: v2 }],
@@ -2642,13 +2649,6 @@ test("a legacy ledger whose batches the released readers would have refused can'
     ['an entry\'s lastAction', { version: 2, batches: [{ ...v2, refs: [{ ...entry, lastAction: 'react' }] }] }],
     ['an entry\'s lastAttemptAt', { version: 2, batches: [{ ...v2, refs: [{ ...entry, lastAttemptAt: '1' }] }] }],
     ['an entry\'s lastError', { version: 2, batches: [{ ...v2, refs: [{ ...entry, lastError: 7 }] }] }],
-    ['a v1 status', { version: 1, batches: [{ ...v1, status: 'active' }] }],
-    ...['id', 'agentName', 'sourceBranch', 'targetBranch', 'emoji'].map((key): [string, unknown] =>
-      [`a v1 ${key}`, { version: 1, batches: [{ ...v1, [key]: 7 }] }]),
-    ['a v1 createdAt', { version: 1, batches: [{ ...v1, createdAt: '1' }] }],
-    ['a v1 refs', { version: 1, batches: [{ ...v1, refs: ref('m1') }] }],
-    ...['serverId', 'channelId', 'messageId'].map((key): [string, unknown] =>
-      [`a v1 ref's ${key}`, { version: 1, batches: [{ ...v1, refs: [without(ref('m1'), key)] }] }]),
   ];
   for (const [field, ledger] of refused) {
     writeFileSync(h.legacyPath, JSON.stringify(ledger));
@@ -2656,9 +2656,7 @@ test("a legacy ledger whose batches the released readers would have refused can'
     assert.throws(() => outbox.batches(), /Invalid Discord awareness ledger/, field);
     assert.equal(existsSync(h.legacyPath), true, `the ledger stays where it was (${field})`);
   }
-  // As those releases wrote them, both import, and the suppression's body stays owed.
-  writeFileSync(h.legacyPath, JSON.stringify({ version: 1, batches: [v1] }));
-  assert.deepEqual(h.reopen().batches().map((b) => b.id), ['legacy-v1']);
+  // As those releases wrote it, it imports, and the suppression's body stays owed.
   writeFileSync(h.legacyPath, JSON.stringify({ version: 2, batches: [v2] }));
   const outbox = h.reopen();
   assert.deepEqual(outbox.pendingSuppressionsFor('partial').map((b) => b.id), ['legacy-sup']);
