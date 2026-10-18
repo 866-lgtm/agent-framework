@@ -41,13 +41,17 @@
  * into both streams once the script has returned; each stream is first in,
  * first out, so what the script and the commands it waited for wrote is ahead
  * of it. Nothing a script or a command does with fds 0, 1 or 2 reaches the
- * protocol, short of pointing them at the runtime's own fds, and the runtime
- * puts them back as the host set them, blocking, at each exec's start. Its own
- * fds (3 and 4, and its copies of 0, 1 and 2) it checks at each exec's start
- * and end, and fd 4 before each message: one a script closed or replaced ends
- * the interpreter, saying which (_check_own_fds). So does a message or an end
- * mark that can't be written, as after a script shuts down the socket under
- * fd 4 or an output pipe, which leaves the fd as it was (send, _write_marks).
+ * protocol, short of pointing them at the runtime's channel, fds 3 and 4,
+ * which can garble its messages while the script runs and, through a command
+ * started holding the channel, for as long as that command runs. The runtime
+ * puts them back as the host set them, blocking, at each exec's start, and puts
+ * back fd 1 or 2 pointed at the channel at the script's end too, before
+ * anything is flushed (_off_channel). Its own fds (3 and 4, and its copies of 0, 1 and 2) it
+ * checks at each exec's start and end, and fd 4 before each message: one a
+ * script closed or replaced ends the interpreter, saying which
+ * (_check_own_fds). So does a message or an end mark that can't be written, as
+ * after a script shuts down the socket under fd 4 or an output pipe, which
+ * leaves the fd as it was (send, _write_marks).
  *
  * Embedded as a TS string because tsc does not copy non-TS assets to dist/;
  * PyRunner materializes it to a temp file at spawn.
@@ -352,15 +356,37 @@ def _open_streams():
     return _script_writer(1), _script_writer(2)
 
 
+def _off_channel():
+    # A script can point its fd 1 or 2 at the runtime's own channel, as with
+    # os.dup2(4, 1). What its writers still hold would then go into the channel
+    # ahead of the script's result, which the host couldn't read, and the exec
+    # would wait out its time limit. So at the script's end, before anything is
+    # flushed, one that is fd 3 or fd 4 goes back to its pipe, as each exec's
+    # start puts it (_open_streams). What a script or its commands write onto
+    # the channel, or read from it, can still garble the runtime's messages: the
+    # script's own while it runs, and, from a command it started holding the
+    # channel, a later script's for as long as that command runs, each script
+    # bounded by its time limit. Only a channel per script would end that.
+    # A copy a script closed or replaced is left alone, so nothing goes into
+    # a file of the script's: the check at the exec's end ends the runtime.
+    channel = [_OWN_FDS[fd][2] for fd in (3, 4) if fd in _OWN_FDS]
+    for fd, pipe in ((1, _STD_OUT), (2, _STD_OUT if BACKGROUND else _STD_ERR)):
+        try:
+            if _identity(fd) in channel and _identity(pipe) == _OWN_FDS[pipe][2]:
+                os.dup2(pipe, fd)
+        except OSError:
+            pass
+
+
 def _note(stream, text):
     # The runtime's own line in a script's stream, which may have broken under
     # it, or whose write the script may have replaced with its own, which may
-    # raise anything, SystemExit included: the line is then lost, and the
-    # exec's end goes on.
+    # raise anything, SystemExit included: the line then goes through the
+    # runtime's own note (_diag), and the exec's end goes on.
     try:
         stream.write(text)
     except BaseException:
-        pass
+        _diag(text.strip("\n"))
 
 
 def _flush_writers():
@@ -403,12 +429,13 @@ def _said(exc):
     # of the script's code runs past the try: the text is taken as an exact str,
     # since a str subclass's own methods run on truth and concatenation, and the
     # name comes through type's own descriptor, as _brief's does, so a
-    # metaclass's doesn't run.
+    # metaclass's doesn't run, and as an exact str too, since a script can set
+    # a class's __name__ to a str subclass.
     try:
         text = str.__str__(str(exc))
     except BaseException:
         text = ""
-    return text or type.__dict__["__name__"].__get__(type(exc))
+    return text or str.__str__(type.__dict__["__name__"].__get__(type(exc)))
 
 
 def _flush(writer):
@@ -422,8 +449,9 @@ def _flush(writer):
         # from nothing here. A ValueError from a flush the script put in its
         # place is taken the same way.
         return
-    except Exception as exc:
-        # Its fd closed or broke under it, so that much can't be sent. Dropped,
+    except BaseException as exc:
+        # Its fd closed or broke under it, or the script's own flush in its place
+        # raised, so that much can't be sent. Dropped,
         # it can't go out later, once the fd is back, in another exec's output,
         # where a writer the script kept would flush it: a writer over the
         # runtime's raw writer is (_drop_held), and what a file of the script's
@@ -443,9 +471,11 @@ def _drop_held(writer):
     raw = getattr(getattr(writer, "buffer", None), "raw", None)
     if not isinstance(raw, _FdWriter):
         return
+    # Through the type's own flush, since a script may have put a flush of
+    # its own on the writer, which is what failed.
     raw.dropping = True
     try:
-        writer.flush()
+        type(writer).flush(writer)
     finally:
         raw.dropping = False
 
@@ -471,8 +501,11 @@ def _write_marks(mark):
     # after a script shut down the socket under fd 1 or 2, ends the
     # interpreter, which settles the exec rather than leave it waiting out
     # its time limit for the mark.
+    # The stream the runtime's notes go to gets its mark last, so the line
+    # _fatal writes when the other's can't be written is still in this exec's
+    # share: stderr's, or a background script's journal, stdout's (_diag).
     data = mark.encode("utf-8")
-    for fd in (_STD_OUT, _STD_ERR):
+    for fd in ((_STD_ERR, _STD_OUT) if BACKGROUND else (_STD_OUT, _STD_ERR)):
         try:
             _write_all(fd, data)
         except OSError as exc:
@@ -813,6 +846,7 @@ async def _run_script(exec_id, code, mark, st):
                 await result
         finally:
             st.running = False
+            _off_channel()
     except asyncio.CancelledError:
         _note(err, "\nKeyboardInterrupt: script cancelled by host\n")
         return_code = 1
@@ -932,8 +966,8 @@ async def main():
         # script runs, it's the script's doing, or the host process's own exit,
         # which leaves nobody to read the line: PyRunner closes fd 3 only as it
         # kills the runtime, and its SIGKILL lands before the end can, and a
-        # host that stops the runtime without killing it sends exit first, as
-        # the protocol notes ask. An end while no script runs, or after exit,
+        # host that runs the runtime itself and stops it without killing it
+        # sends exit first, as the protocol notes ask. An end while no script runs, or after exit,
         # is a clean exit, the host's own way out.
         task = _current_exec_task
         if not exiting and task is not None and not task.done():

@@ -14,7 +14,7 @@ import { ChildProcess, execFileSync } from 'node:child_process';
 import { chmodSync, closeSync, existsSync, mkdtempSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { Writable } from 'node:stream';
+import { PassThrough, type Writable } from 'node:stream';
 import type {
   EventResponse,
   Module,
@@ -27,6 +27,7 @@ import type {
   ToolResult,
 } from '../src/index.js';
 import { AgentFramework, PYTHON_RUNTIME_SOURCE, PyRunner, buildInjectedTools } from '../src/index.js';
+import { OutputStream } from '../src/code-execution/py-runner.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
 import { PYTC_STOP_ROWS_DRIVER } from './helpers/pytc-stop-rows.js';
 
@@ -70,6 +71,19 @@ const exitedUnder = (how: string, background = false): string =>
   + 'so check them before you run it again in a new interpreter. If it stops the same way, check whether the script itself '
   + `ends the process, for example ${how.startsWith('was ended by') ? 'by using too much memory' : 'with os._exit()'}; if not, ask whoever runs this host.`;
 
+/**
+ * What a script's result says when its interpreter exits after the script's own
+ * result came, before all of its output arrived (py-runner's interpreterExit,
+ * ended), with the advice for a runtime that ended itself over `taken`, if given.
+ */
+const exitedAfterEnd = (how: string, taken?: string, background = false): string =>
+  `script ended, but the Python interpreter ${how} before all of its output reached the host, so some of it may be missing`
+  + `${background ? '' : ', and variables from earlier scripts are gone'}. If it happens again, `
+  + (taken
+    ? `check whether the script closes, shuts down or replaces ${taken}, as the runtime's line above says`
+    : `check whether the script itself ends the process, for example ${how.startsWith('was ended by') ? 'by using too much memory' : 'with os._exit()'}`)
+  + '; if not, ask whoever runs this host.';
+
 /** The result's text after the runtime ended itself because a script took one of its file descriptors. */
 const runtimeLost = (taken: string): string =>
   "script stopped: the Python interpreter exited with code 70 while it ran, so the rest of the script didn't run, and variables "
@@ -112,6 +126,72 @@ describe('buildInjectedTools', () => {
     assert.deepStrictEqual(injected, [{ pyName: 'a__b', toolName: 'a--b' }]);
     assert.strictEqual(logs.length, 1);
     assert.match(logs[0], /collides/);
+  });
+});
+
+describe("OutputStream: what a pipe brings while no script of its interpreter runs", () => {
+  const head = 'stdout while its interpreter runs no script: ';
+  const dropped = `${head}past 65536 characters of the log, so the host drops what follows while its interpreter runs no script`;
+  const open = () => {
+    const pipe = new PassThrough();
+    const logged: string[] = [];
+    const stream = new OutputStream('stdout', pipe, (line) => logged.push(line), () => {});
+    return { pipe, logged, stream };
+  };
+  /** Each piece as a chunk of its own, read before the next is written. */
+  const feed = async (pipe: PassThrough, pieces: string[]) => {
+    for (const piece of pieces) {
+      pipe.write(piece);
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  };
+  const logChars = (logged: string[]) => logged.filter((l) => l !== dropped).reduce((sum, l) => sum + l.length, 0);
+
+  it('logs pieces cut at 2,000 characters, from its start, in lines of 65,536 characters in all, the last cut to fit, then one line dropping the rest', async () => {
+    const { pipe, logged } = open();
+    await feed(pipe, Array.from({ length: 40 }, (_, i) => `${i} `.padEnd(3000, 'y')));
+    assert.strictEqual(logged[0], `${head}0 ${'y'.repeat(1998)} [… 1000 more characters]`);
+    assert.strictEqual(logged.filter((l) => l === dropped).length, 1);
+    assert.strictEqual(logged.at(-1), dropped);
+    assert.strictEqual(logChars(logged), 65_536);
+  });
+
+  it("charges each line its whole length, so many small writes take no more of the log", async () => {
+    const { pipe, logged } = open();
+    await feed(pipe, Array.from({ length: 3000 }, () => 'x'));
+    assert.strictEqual(logged.at(-1), dropped);
+    assert.ok(logChars(logged) <= 65_536, `${logChars(logged)}`);
+  });
+
+  it('renews the share as an exec begins, and keeps the exec its own output', async () => {
+    const { pipe, logged, stream } = open();
+    await feed(pipe, Array.from({ length: 40 }, () => 'y'.repeat(3000)));
+    assert.strictEqual(logged.at(-1), dropped);
+    const mark = Buffer.from('\x1emark\x1e');
+    stream.begin(mark, null);
+    await feed(pipe, ["the exec's own", mark.toString()]);
+    assert.strictEqual(stream.take(), "the exec's own");
+    await feed(pipe, ['after it\n']);
+    assert.strictEqual(logged.at(-1), `${head}after it`);
+  });
+
+  it('cuts no surrogate pair in half', async () => {
+    const { pipe, logged } = open();
+    await feed(pipe, [`${'a'.repeat(1999)}\u{1F600}${'b'.repeat(10)}`]);
+    assert.strictEqual(logged[0], `${head}${'a'.repeat(1999)} [… 12 more characters]`);
+  });
+
+  it("reads a live interpreter's pipe at full speed, and a torn-down one's at about 1 MiB a second, pausing after each chunk, whitespace too", async () => {
+    const live = open();
+    await feed(live.pipe, ['\n'.repeat(65_536)]);
+    assert.strictEqual(live.pipe.isPaused(), false);
+    const retired = open();
+    retired.stream.retire();
+    await feed(retired.pipe, ['\n'.repeat(65_536)]);
+    assert.strictEqual(retired.pipe.isPaused(), true);
+    // 65,536 bytes at 1 MiB a second: 62.5 ms.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.strictEqual(retired.pipe.isPaused(), false);
   });
 });
 
@@ -1050,7 +1130,8 @@ describe('PyRunner: an abort or dispose while the interpreter starts (real pytho
       const result = await within(runner.exec('print(1)', []), 'the exit to settle');
       assert.strictEqual(result.returnCode, 5);
       assert.strictEqual(result.aborted, true);
-      assert.strictEqual(result.stderr, exitedUnder('exited with code 3'));
+      // Its result says the script ended.
+      assert.strictEqual(result.stderr, exitedAfterEnd('exited with code 3'));
     } finally {
       runner.dispose();
       late.done();
@@ -1471,6 +1552,177 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
     });
   });
 
+  it("a command left running past its interpreter's reclaim is read at about 1 MiB a second, while it goes on writing, neither ended nor held", async () => {
+    await logging(async (logged) => {
+      const dir = mkdtempSync(join(tmpdir(), 'pytc-flood-'));
+      const progress = join(dir, 'progress');
+      const runner = new PyRunner({ onToolCall: async () => '', idleReclaimMs: 500 });
+      let pid = 0;
+      try {
+        // Once its interpreter has been reclaimed, the command writes without
+        // end, saying how much it has written after each write. It gives up
+        // waiting after 20 s.
+        const command = [
+          'import os, sys, time',
+          'for _ in range(400):',
+          '    if os.path.exists(os.path.join(sys.argv[1], "reclaimed")): break',
+          '    time.sleep(0.05)',
+          'else:',
+          '    sys.exit(1)',
+          'chunk = b"y\\n" * 32768',
+          'n = 0',
+          'while True:',
+          '    os.write(1, chunk)',
+          '    n += len(chunk)',
+          '    with open(os.path.join(sys.argv[1], "progress.new"), "w") as f: f.write(str(n))',
+          '    os.replace(os.path.join(sys.argv[1], "progress.new"), os.path.join(sys.argv[1], "progress"))',
+        ].join('\n');
+        const first = await runner.exec(
+          `import subprocess, sys\nprint(subprocess.Popen([sys.executable, "-c", ${JSON.stringify(command)}, ${JSON.stringify(dir)}]).pid)`,
+          [],
+        );
+        pid = Number(first.stdout.trim());
+        assert.ok(pid > 0, first.stdout);
+        await until(() => logged.some((l) => l.endsWith('reclaiming python interpreter (idle)')), 'the idle reclaim');
+        writeFileSync(join(dir, 'reclaimed'), '');
+        await until(() => existsSync(progress), 'the command to write');
+        const written = () => Number(readFileSync(progress, 'utf8'));
+        const start = written();
+        await until(() => written() > start, 'the command to go on writing');
+        const before = written();
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        const after = written();
+        assert.ok(alive(pid), 'the command ended');
+        // 2 MiB at 1 MiB a second, with what the pipe holds; read at full speed, gigabytes.
+        assert.ok(after - before < 4 * 1_048_576, `read at ${after - before} bytes in 2 s`);
+      } finally {
+        if (pid && alive(pid)) process.kill(pid, 'SIGKILL');
+        runner.dispose();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it("a script that points fd 1 or fd 2 at the runtime's channel and leaves a partial line still ends, with the line in its result, and keeps its interpreter", async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      await runner.exec('kept = "kept"', []);
+      for (const [fd, to] of [[1, 4], [2, 4], [1, 3]] as const) {
+        const what = `fd ${fd} to fd ${to}`;
+        const result = await within(
+          runner.exec(`import os, sys\nos.dup2(${to}, ${fd})\nprint("x", end="", file=${fd === 1 ? 'sys.stdout' : 'sys.stderr'})`, []),
+          what,
+        );
+        assert.deepStrictEqual(
+          { stdout: result.stdout, stderr: result.stderr, returnCode: result.returnCode, aborted: result.aborted === true },
+          { stdout: fd === 1 ? 'x' : '', stderr: fd === 2 ? 'x' : '', returnCode: 0, aborted: false },
+          what,
+        );
+        assert.strictEqual((await within(runner.exec('print(kept)', []), `the next script (${what})`)).stdout, 'kept\n', what);
+      }
+      // One that fails: its traceback is put back on stderr's pipe before the
+      // runtime writes it.
+      const failed = await within(runner.exec('import os\nos.dup2(4, 2)\nraise RuntimeError("boom")', []), 'the failing script');
+      assert.strictEqual(failed.returnCode, 1);
+      assert.match(failed.stderr, /^Traceback \(most recent call last\):\n[\s\S]*\nRuntimeError: boom\n$/);
+      assert.strictEqual((await within(runner.exec('print(kept)', []), 'the next script (the failing one)')).stdout, 'kept\n');
+      // One that also replaced the runtime's copy of fd 1 with a file of its
+      // own: nothing goes into the file, and the check ends the runtime.
+      const dir = mkdtempSync(join(tmpdir(), 'pytc-copy-'));
+      try {
+        const file = join(dir, 'own');
+        const replaced = await within(
+          runner.exec(
+            `import os, __main__\nown = os.open(${JSON.stringify(file)}, os.O_WRONLY | os.O_CREAT)\nos.dup2(own, __main__._STD_OUT)\nos.dup2(4, 1)\nprint("x", end="")`,
+            [],
+          ),
+          'the script that replaced the copy too',
+        );
+        assert.strictEqual(readFileSync(file, 'utf8'), '');
+        assert.ok(replaced.stderr.endsWith(runtimeLost("the runtime's copy of fd 1")), replaced.stderr);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it("an interpreter that exits as its script ends, seen before the script's end mark is read, says so in the host's log, even once the next script has replaced it", async () => {
+    await logging(async (logged) => {
+      const dir = mkdtempSync(join(tmpdir(), 'pytc-ended-'));
+      const runner = new PyRunner({ onToolCall: async () => '' });
+      const internals = runner as unknown as { child: ChildProcess | null };
+      try {
+        await runner.exec('pass', []);
+        const child = internals.child!;
+        // Its stdout is held back until the host has seen the exit, so the
+        // mark there arrives while the host waits for the last of its output,
+        // and a command holding the pipes keeps it waiting past the settle.
+        child.stdout!.pause();
+        const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
+        const running = runner.exec(
+          [
+            'import __main__, os, subprocess',
+            `open(${JSON.stringify(join(dir, 'pid'))}, "w").write(str(subprocess.Popen(["sleep", "30"]).pid))`,
+            'write_marks = __main__._write_marks',
+            'def then_exit(mark):',
+            '    write_marks(mark)',
+            '    os._exit(0)',
+            '__main__._write_marks = then_exit',
+            'print("done")',
+          ].join('\n'),
+          [],
+        );
+        await within(exited, 'the exit');
+        child.stdout!.resume();
+        const result = await within(running, 'the script');
+        assert.deepStrictEqual({ stdout: result.stdout, returnCode: result.returnCode, aborted: result.aborted === true }, { stdout: 'done\n', returnCode: 0, aborted: false });
+        // The next script replaces the dead interpreter before the host has done waiting.
+        assert.strictEqual((await within(runner.exec('print("next")', []), 'the next script')).stdout, 'next\n');
+        await until(
+          () => logged.some((l) => l.endsWith('python runtime exited as its script ended (code=0, signal=none); the next script starts a new one')),
+          'the exit in the log',
+        );
+      } finally {
+        const pid = Number(readFileSync(join(dir, 'pid'), 'utf8'));
+        if (pid && alive(pid)) process.kill(pid, 'SIGKILL');
+        runner.dispose();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it("an interpreter whose script the host stops while it waits for the last of its output isn't logged as having exited as its script ended", async () => {
+    await logging(async (logged) => {
+      const dir = mkdtempSync(join(tmpdir(), 'pytc-stopped-'));
+      const runner = new PyRunner({ onToolCall: async () => '' });
+      const internals = runner as unknown as { child: ChildProcess | null };
+      try {
+        await runner.exec('pass', []);
+        const child = internals.child!;
+        const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
+        // A command holding the pipes keeps the host waiting after the exit.
+        const running = runner.exec(
+          `import os, subprocess\nopen(${JSON.stringify(join(dir, 'pid'))}, "w").write(str(subprocess.Popen(["sleep", "30"]).pid))\nos._exit(0)`,
+          [],
+        );
+        await within(exited, 'the exit');
+        runner.abort('the test stops it');
+        const result = await within(running, 'the abort');
+        assert.strictEqual(result.aborted, true);
+        // Past the host's 200 ms wait for the pipes.
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        assert.ok(!logged.some((l) => l.includes('exited as its script ended')), logged.join('\n'));
+      } finally {
+        const pid = Number(readFileSync(join(dir, 'pid'), 'utf8'));
+        if (pid && alive(pid)) process.kill(pid, 'SIGKILL');
+        runner.dispose();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
   it('a writer a script kept from an earlier exec sends its partial line in the exec that wrote it', async () => {
     const runner = new PyRunner({ onToolCall: async () => '' });
     try {
@@ -1516,13 +1768,17 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
     }
   });
 
-  it("a script whose stderr is gone still reports, and the next one's traceback arrives", async () => {
+  it("a script whose stderr is gone still reports, its traceback through the runtime's own line, and the next one's traceback arrives", async () => {
     const runner = new PyRunner({ onToolCall: async () => '' });
     try {
       const gone = await within(runner.exec('import os\nos.close(2)\nraise ValueError("unheard")', []), 'the script to report');
       assert.strictEqual(gone.returnCode, 1);
-      // Its traceback can't reach the host, and the runtime says so.
-      assert.strictEqual(gone.stderr, "[pytc-runtime] some of what the script wrote couldn't be sent ([Errno 9] Bad file descriptor)\n");
+      // Its traceback can't go through fd 2, so the runtime's own line carries
+      // it, and says what its writer still held couldn't be sent.
+      assert.match(
+        gone.stderr,
+        /^\[pytc-runtime\] Traceback \(most recent call last\):\n[\s\S]*\nValueError: unheard\n\[pytc-runtime\] some of what the script wrote couldn't be sent \(\[Errno 9\] Bad file descriptor\)\n$/,
+      );
       const next = await runner.exec('raise ValueError("heard")', []);
       assert.match(next.stderr, /ValueError: heard/);
     } finally {
@@ -1599,30 +1855,32 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
     // A shutdown leaves the fd as it was, so only the write that fails shows it:
     // the end mark's on fd 1's copy, the exec_result's or the tool call's on fd 4.
     const shut = (fd: number) => `socket.socket(fileno=os.dup(${fd})).shutdown(socket.SHUT_WR)`;
+    // The end mark's failure comes after the script's result has gone, so that
+    // result says the script ended; the others come before it.
     const rows: [string, string, string, RegExp, string][] = [
       [
         'fd 1',
         `import os, socket\nprint("shutting")\n${shut(1)}`,
         'shutting\n',
         /cannot reach the output pipes any more: a script closed, shut down or replaced the runtime's copy of fd 1 \(\[Errno \d+\] [^)\n]+\); exiting/,
-        "the runtime's copy of fd 1",
+        exitedAfterEnd('exited with code 70', "the runtime's copy of fd 1"),
       ],
       [
         'fd 4',
         `import os, socket\n${shut(4)}\nprint("shut")`,
         'shut\n',
         /cannot send the host a message any more: a script closed, shut down or replaced fd 4, where they go \(\[Errno \d+\] [^)\n]+\); exiting/,
-        'fd 4',
+        runtimeLost('fd 4'),
       ],
       [
         'fd 4, before a tool call',
         `import os, socket\n${shut(4)}\nprint("shut")\nawait test__echo({})\nprint("called")`,
         'shut\n',
         /cannot send the host a message any more: a script closed, shut down or replaced fd 4, where they go \(\[Errno \d+\] [^)\n]+\); exiting/,
-        'fd 4',
+        runtimeLost('fd 4'),
       ],
     ];
-    for (const [what, code, stdout, says, taken] of rows) {
+    for (const [what, code, stdout, says, ending] of rows) {
       const runner = new PyRunner({ onToolCall: async () => 'echoed' });
       try {
         // Waiting for a mark or a result that can't come would take the 10-minute limit, past within's 10 s.
@@ -1630,7 +1888,7 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
         assert.strictEqual(result.aborted, true, what);
         assert.strictEqual(result.stdout, stdout, what);
         assert.match(result.stderr, says, what);
-        assert.ok(result.stderr.endsWith(`; exiting\n${runtimeLost(taken)}`), `${what}: ${result.stderr.slice(-500)}`);
+        assert.ok(result.stderr.endsWith(`; exiting\n${ending}`), `${what}: ${result.stderr.slice(-500)}`);
         const next = await within(runner.exec('print("fresh")', []), `the next script (${what})`);
         assert.strictEqual(next.stdout, 'fresh\n', what);
       } finally {
@@ -1645,7 +1903,8 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
       const result = await within(runner.exec('import os, socket\nsocket.socket(fileno=os.dup(2)).shutdown(socket.SHUT_WR)\nprint("shut")', []), 'the exit');
       assert.strictEqual(result.aborted, true);
       assert.strictEqual(result.stdout, 'shut\n');
-      assert.strictEqual(result.stderr, exitedUnder('exited with code 70'));
+      // The end mark's failure comes after the script's result has gone.
+      assert.strictEqual(result.stderr, exitedAfterEnd('exited with code 70'));
       assert.strictEqual((await within(runner.exec('print("fresh")', []), 'the next script')).stdout, 'fresh\n');
     } finally {
       runner.dispose();
@@ -1993,6 +2252,18 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
             + 'class Out:\n    def write(self, s): return len(s)\n    def flush(self): raise Odd()',
           'odd text',
         ],
+        [
+          'an error whose text raises SystemExit',
+          'class Exiting(Exception):\n    def __str__(self): raise SystemExit(5)\nclass Out:\n    def write(self, s): return len(s)\n    def flush(self): raise Exiting()',
+          'Exiting',
+        ],
+        [
+          "an error with no text whose type's name is a str of its own that refuses joining",
+          'class Hostile(str):\n    def __radd__(self, other): raise RuntimeError("no joining")\n'
+            + 'class Renamed(Exception):\n    pass\nRenamed.__name__ = Hostile("Renamed")\n'
+            + 'class Out:\n    def write(self, s): return len(s)\n    def flush(self): raise Renamed()',
+          'Renamed',
+        ],
       ];
       for (const [what, defines, said] of cases) {
         const result = await within(runner.exec(`import sys\n${defines}\nsys.stdout = Out()\nkept = "${what}"`, []), what);
@@ -2026,6 +2297,15 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
         );
         assert.strictEqual((await within(runner.exec('print(kept)', []), `the next script (${what})`)).stdout, `${what}\n`, what);
       }
+      // What a writer held when its replaced flush raised is dropped, not sent
+      // in a later exec once the script takes its flush back.
+      const held = await within(
+        runner.exec('import sys\nwriter = sys.stdout\nwriter.write("held")\ndef flush():\n    raise SystemExit("no flush")\nwriter.flush = flush', []),
+        'the held line',
+      );
+      assert.strictEqual(held.stderr, "[pytc-runtime] some of what the script wrote couldn't be sent (no flush)\n");
+      const later = await within(runner.exec('del writer.flush\nprint("later")', []), 'the later script');
+      assert.deepStrictEqual({ stdout: later.stdout, stderr: later.stderr }, { stdout: 'later\n', stderr: '' });
     } finally {
       runner.dispose();
     }
@@ -2039,12 +2319,14 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
         ['SystemExit', 'def write(s):\n    raise SystemExit(4)'],
       ];
       for (const [what, defines] of cases) {
-        // The runtime's note of the script's error goes through that write, and is lost.
+        // The runtime's note of the script's error goes through that write,
+        // and when it refuses, through the runtime's own line instead.
         const result = await within(
           runner.exec(`import sys\n${defines}\nsys.stderr.write = write\nkept = "${what}"\nraise RuntimeError("the script's own")`, []),
           what,
         );
         assert.strictEqual(result.returnCode, 1, what);
+        assert.match(result.stderr, /^\[pytc-runtime\] Traceback \(most recent call last\):\n[\s\S]*\nRuntimeError: the script's own\n$/, what);
         assert.strictEqual((await within(runner.exec('print(kept)', []), `the next script (${what})`)).stdout, `${what}\n`, what);
       }
     } finally {
@@ -2893,6 +3175,27 @@ describe('PyRunner background mode (real python3)', () => {
     } finally {
       runner.dispose();
       rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("a background script whose stderr mark can't be written, after its result, has the runtime's line in its journal and is told it ended, with no word of earlier scripts' variables", async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      // A shutdown leaves the fd as it was, so only the mark's write fails:
+      // stderr's goes first, so the runtime's line still reaches stdout's, the journal's.
+      const result = await within(
+        runner.exec(
+          'import os, socket, __main__\nsocket.socket(fileno=os.dup(__main__._STD_ERR)).shutdown(socket.SHUT_WR)\nprint("shut")',
+          [],
+          { logPath: null, lifetimeMs: 30_000, onWake: async () => null },
+        ),
+        'the exit to settle',
+      );
+      assert.strictEqual(result.aborted, true);
+      assert.match(result.tail ?? '', /^shut\n\[pytc-runtime\] cannot reach the output pipes any more: a script closed, shut down or replaced the runtime's copy of fd 2 \(\[Errno \d+\] [^)\n]+\); exiting\n/);
+      assert.strictEqual(result.stderr, exitedAfterEnd('exited with code 70', "the runtime's copy of fd 2", true));
+    } finally {
+      runner.dispose();
     }
   });
 
@@ -3982,15 +4285,20 @@ describe('code_execution time limit vs blocking code (real python3)', { skip: pr
     const runner = new PyRunner({ onToolCall: async () => '', cancelGraceMs: 3000 });
     try {
       assert.strictEqual((await runner.exec('kept = 41', [])).returnCode, 0);
-      // The script's own sys.stdout flushes slowly as the script forks, through the limit's first signals.
+      // The script's own sys.stdout holds the flush before the fork until the
+      // limit's first signal has landed in it, and says how the runtime took it.
       const code = [
-        'import os, sys, time, warnings',
+        'import os, sys, time, warnings, __main__',
         'warnings.simplefilter("ignore", DeprecationWarning)',
         'class Out:',
         '    slow = False',
         '    def write(self, s): return len(s)',
         '    def flush(self):',
-        '        if Out.slow: time.sleep(1.5)',
+        '        if Out.slow:',
+        '            for _ in range(1000):',
+        '                if __main__._stop.state != __main__._PENDING: break',
+        '                time.sleep(0.01)',
+        '            os.write(1, ("in the flush, the stop was " + __main__._stop.state + "\\n").encode())',
         'sys.stdout = Out()',
         'Out.slow = True',
         'pid = os.fork()',
@@ -4001,6 +4309,7 @@ describe('code_execution time limit vs blocking code (real python3)', { skip: pr
         'time.sleep(30)',
       ].join('\n');
       const result = await within(runner.exec(code, [], undefined, { deadlineMs: 1000 }), 'the script to stop');
+      assert.strictEqual(result.stdout, 'in the flush, the stop was requested\n');
       assert.strictEqual(result.returnCode, 1, result.stderr);
       assert.match(result.stderr, /KeyboardInterrupt: script interrupted by host/);
       assert.doesNotMatch(result.stderr, /couldn't be sent|killed/);

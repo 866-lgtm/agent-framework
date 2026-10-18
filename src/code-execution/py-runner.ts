@@ -140,6 +140,25 @@ const EXIT_OUTPUT_GRACE_MS = 200;
 const UNREACHABLE_GRACE_MS = 200;
 /** How much of what an interpreter wrote before it failed to start, or crashed, goes into the message and the host's log, and how much of each piece of output with no script running goes into the log. */
 const LAST_WORDS_CHARS = 2000;
+/**
+ * How much of the host's log a pipe's output takes while no script of its
+ * interpreter runs, from the start of its last exec, or its own start: lines
+ * of up to 65,536 characters in all, each piece cut at LAST_WORDS_CHARS,
+ * enough to see what a command a script left running is doing. The rest is
+ * dropped.
+ */
+const IDLE_LOG_CHARS = 65_536;
+/**
+ * How fast the host reads the pipes of an interpreter it has torn down, which
+ * a command a script left running may still hold. It goes on reading, so such
+ * a command isn't ended by a broken pipe, and one writing far under this, as a
+ * dev server's log does, never waits; one that writes without end slows to
+ * this, rather than costing the host a core for as long as it runs. A live
+ * interpreter's pipes are read at full speed, so what such a command writes
+ * between scripts is read as it's written, and the idle reclaim bounds how
+ * long that lasts, unless a host turns the reclaim off.
+ */
+const IDLE_READ_BYTES_PER_SECOND = 1_048_576;
 /** The runtime's exit when the host's channel, fds 3 and 4, didn't reach it: the host's configuration, which calling again doesn't change. 78 is sysexits' EX_CONFIG, which Python itself never exits with. */
 const HOST_CHANNEL_MISSING_EXIT = 78;
 /**
@@ -247,6 +266,13 @@ class Journal {
 
 const NOTHING = Buffer.alloc(0);
 
+/** The first n UTF-16 code units of s, short of a surrogate pair the cut would split. */
+function cutWhole(s: string, n: number): string {
+  if (s.length <= n) return s;
+  const cut = s.slice(0, n);
+  return /[\uD800-\uDBFF]$/.test(cut) ? cut.slice(0, -1) : cut;
+}
+
 /**
  * One of the interpreter's output pipes, its fd 1 or fd 2, as the host reads it.
  * While an exec runs, what arrives before that exec's end mark is the exec's:
@@ -254,9 +280,11 @@ const NOTHING = Buffer.alloc(0);
  * script's journal. The mark itself is cut out. What arrives while no exec of
  * its interpreter runs, such as what a command a script left running writes,
  * goes to the host's log as it arrives, both while the interpreter lives and
- * after it has ended.
+ * after it has ended, up to IDLE_LOG_CHARS between scripts; once the runner
+ * has torn the interpreter down, it's read at IDLE_READ_BYTES_PER_SECOND at
+ * most (retire).
  */
-class OutputStream {
+export class OutputStream {
   /** Every process holding the pipe has closed it, so nothing more will come. */
   ended = false;
   /** The running exec's mark has arrived, so all of its output on this pipe has. */
@@ -273,10 +301,16 @@ class OutputStream {
   private truncated = false;
   private journal: Journal | null = null;
   private onEnd: (() => void)[] = [];
+  /** How many characters of log lines output with no script running has taken since this pipe's last exec began: IDLE_LOG_CHARS at most. */
+  private idleLogged = 0;
+  /** Set once the runner has torn its interpreter down: nothing reads this pipe for an exec again. */
+  private retired = false;
+  /** The wait that holds a retired pipe back (slow). */
+  private resumer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     private readonly name: 'stdout' | 'stderr',
-    pipe: Readable,
+    private readonly pipe: Readable,
     private readonly log: (text: string) => void,
     private readonly onMarked: () => void,
   ) {
@@ -298,8 +332,10 @@ class OutputStream {
   begin(mark: Buffer, journal: Journal | null): void {
     // A character that output with no script running left half-written is
     // that output's, not this exec's.
-    const left = this.decoder.end();
-    if (left.trim() !== '') this.logIdle(left);
+    this.logIdle(this.decoder.end());
+    // The stretch with no script running that follows this exec logs a share
+    // of its own.
+    this.idleLogged = 0;
     this.mark = mark;
     this.marked = false;
     this.journal = journal;
@@ -360,15 +396,50 @@ class OutputStream {
       } else {
         this.lastIdle = idle;
       }
-      if (text.trim() !== '') this.logIdle(text);
+      this.logIdle(text);
+      if (this.retired) this.slow(bytes.length);
     }
   }
 
-  /** Log output that arrived while no exec of this pipe's interpreter ran, each piece up to LAST_WORDS_CHARS. */
+  /** The runner has torn its interpreter down: read what still comes at IDLE_READ_BYTES_PER_SECOND at most. */
+  retire(): void {
+    this.retired = true;
+  }
+
+  /**
+   * Log output that arrived while no exec of this pipe's interpreter ran, each
+   * piece up to LAST_WORDS_CHARS, in lines of IDLE_LOG_CHARS in all since the
+   * pipe's last exec began, the last cut to fit. Each line is charged its
+   * whole length, so many small writes can't take more of the log.
+   */
   private logIdle(text: string): void {
     const shown = text.trimEnd();
-    const more = shown.length - LAST_WORDS_CHARS;
-    this.log(`${this.name} while its interpreter runs no script: ${more > 0 ? `${shown.slice(0, LAST_WORDS_CHARS)} [… ${more} more characters]` : shown}`);
+    if (this.idleLogged >= IDLE_LOG_CHARS || shown.trim() === '') return;
+    const head = `${this.name} while its interpreter runs no script: `;
+    const kept = cutWhole(shown, LAST_WORDS_CHARS);
+    const piece = kept.length < shown.length ? `${kept} [… ${shown.length - kept.length} more characters]` : shown;
+    const fits = IDLE_LOG_CHARS - this.idleLogged - head.length;
+    if (fits > 0) {
+      const line = head + cutWhole(piece, fits);
+      this.idleLogged += line.length;
+      this.log(line);
+    }
+    if (fits <= piece.length) {
+      this.idleLogged = IDLE_LOG_CHARS;
+      this.log(`${head}past ${IDLE_LOG_CHARS} characters of the log, so the host drops what follows while its interpreter runs no script`);
+    }
+  }
+
+  /** Hold the pipe back for as long as these bytes take at IDLE_READ_BYTES_PER_SECOND, then read on. */
+  private slow(bytes: number): void {
+    if (this.resumer !== null) return;
+    this.pipe.pause();
+    this.resumer = setTimeout(() => {
+      this.resumer = null;
+      this.pipe.resume();
+    }, Math.ceil((bytes * 1000) / IDLE_READ_BYTES_PER_SECOND));
+    // A command left running doesn't keep the host's process alive.
+    this.resumer.unref();
   }
 
   /** Keep what arrived for the running exec. */
@@ -495,8 +566,12 @@ function stoppedReading(background: boolean): string {
     + "shuts down or replaces file descriptor 3, where the host's messages arrive; if not, ask whoever runs this host.";
 }
 
-/** Why a script stopped when its interpreter exited under it, and what running it again does. */
-function interpreterExit(exitCode: number | null, signal: NodeJS.Signals | null, background: boolean, said = ''): string {
+/**
+ * Why a script stopped when its interpreter exited under it, and what running it
+ * again does; or, when the script's result came before the exit (ended), that
+ * the script ran to its end and what of its output the exit may have cost.
+ */
+function interpreterExit(exitCode: number | null, signal: NodeJS.Signals | null, background: boolean, said = '', ended = false): string {
   const how = signal ? `was ended by ${signal}` : `exited with code ${exitCode}`;
   // The runtime ends itself (_fatal) with code 70 after a line saying which of its fds a script took,
   // or shut down the socket under. The line reaches the host unless the script took both the runtime's
@@ -506,9 +581,14 @@ function interpreterExit(exitCode: number | null, signal: NodeJS.Signals | null,
   const check = taken
     ? `check whether the script closes, shuts down or replaces ${taken}, as the runtime's line above says`
     : `check whether the script itself ends the process, for example ${signal ? 'by using too much memory' : 'with os._exit()'}`;
-  return `script stopped: the Python interpreter ${how} while it ran, so the rest of the script didn't run`
-    + `${background ? '' : ', and variables from earlier scripts are gone'}. Tool calls it had already made keep their effects, `
-    + `so check them before you run it again in a new interpreter. If it stops the same way, ${check}; if not, ask whoever runs this host.`;
+  const gone = background ? '' : ', and variables from earlier scripts are gone';
+  if (ended) {
+    return `script ended, but the Python interpreter ${how} before all of its output reached the host, so some of it may be missing${gone}. `
+      + `If it happens again, ${check}; if not, ask whoever runs this host.`;
+  }
+  return `script stopped: the Python interpreter ${how} while it ran, so the rest of the script didn't run${gone}. `
+    + 'Tool calls it had already made keep their effects, so check them before you run it again in a new interpreter. '
+    + `If it stops the same way, ${check}; if not, ask whoever runs this host.`;
 }
 
 /** The file descriptor the runtime's last line of its own says a script took from it (runtime-py.ts _lost), if it says so. */
@@ -545,6 +625,8 @@ interface PendingExec {
   /** The script's return code, once the interpreter has reported it; the exec
    *  settles when its output's end marks have arrived too. */
   returnCode: number | null;
+  /** Set when the host settled the exec itself (stopPending), rather than its result and marks. */
+  stopped?: true;
 }
 
 /**
@@ -854,7 +936,9 @@ export class PyRunner {
       const killedDeaf = inputFailed && signal === 'SIGKILL';
       // Why, from what arrived: the runtime's own exit names the fd it lost in its last line.
       const why = (said: string) =>
-        killedDeaf ? stoppedReading(pending.background) : interpreterExit(exitCode, signal, pending.background, said);
+        killedDeaf
+          ? stoppedReading(pending.background)
+          : interpreterExit(exitCode, signal, pending.background, said, pending.returnCode !== null);
       // The host's log keeps the short form, with the exit's own code and signal.
       const logged = killedDeaf
         ? "python runtime stopped reading the host's messages, so it was killed"
@@ -869,6 +953,11 @@ export class PyRunner {
           // A background script's last output is its journal's, both streams.
           const what = pending.journal ? 'the last it wrote' : 'the last it wrote to stderr';
           this.log(last ? `${logged}; ${what}: ${last.slice(-LAST_WORDS_CHARS)}` : logged);
+        } else if (!pending.stopped) {
+          // Its script's result and marks, already on their way, settled the
+          // exec while the host waited: it exited as its script ended, whether
+          // or not a next exec has replaced it since.
+          this.log(`python runtime exited as its script ended (code=${exitCode}, signal=${signal ?? 'none'}); the next script starts a new one`);
         }
         if (this.child === child) this.teardownChild();
       });
@@ -1029,6 +1118,7 @@ export class PyRunner {
   private stopPending(reason: string | ((said: string) => string)): string {
     const pending = this.pending;
     if (!pending || pending.settled) return '';
+    pending.stopped = true;
     const stdout = this.out?.take() ?? '';
     const stderr = this.err?.take() ?? '';
     const returnCode = pending.returnCode ?? 1;
@@ -1158,7 +1248,10 @@ export class PyRunner {
       this.unreachable = null;
       // Its output pipes stay read, into the host's log, until whatever still
       // holds them, such as a command its script left running, closes them:
-      // breaking them under such a command could end it.
+      // breaking them under such a command could end it. They're read slower
+      // from now on, since nothing reads them for an exec again.
+      this.out?.retire();
+      this.err?.retire();
       this.out = null;
       this.err = null;
       child.removeAllListeners('exit');
