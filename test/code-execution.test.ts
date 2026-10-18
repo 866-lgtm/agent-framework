@@ -66,16 +66,19 @@ const alive = (pid: number): boolean => {
 };
 
 /** What a script's result says when its interpreter exits under it (py-runner's
- *  interpreterExit), for `how` such as "exited with code 3" or "was ended by SIGKILL";
- *  after any other signal, `check` gives the advice's first step. */
+ *  interpreterExit), for `how` such as "exited with code 3" or "was ended by SIGKILL",
+ *  with `check` for the advice's first step after a crash's signal. */
 const exitedUnder = (how: string, background = false, check?: string): string =>
   `script stopped: the Python interpreter ${how} while it ran, so the rest of the script didn't run`
   + `${background ? '' : ', and variables from earlier scripts are gone'}. Tool calls it had already made keep their effects, `
   + `so check them before you run it again in a new interpreter. If it stops the same way, ${check ?? 'check whether the script itself '
-  + `ends the process, for example ${how === 'was ended by SIGKILL' ? 'by using too much memory' : 'with os._exit()'}`}; if not, ask whoever runs this host.`;
+  + `ends the process, for example ${
+    how === 'was ended by SIGKILL' ? 'by using too much memory' : how.startsWith('was ended by') ? 'with os.kill()' : 'with os._exit()'}`
+  }; if not, ask whoever runs this host.`;
 
-/** The advice's first step after a crash's signal, where faulthandler's traceback is above it. */
-const NATIVE_CRASH = 'check the traceback above for native code that crashed, such as an extension module the script uses';
+/** The advice's first step after a crash's signal, with faulthandler's traceback above it, and without. */
+const NATIVE_CRASH = 'check the traceback above for the call that crashed in native code, such as an extension module the script uses';
+const NATIVE_CRASH_UNSEEN = 'check whether native code the script calls crashes, such as an extension module it uses';
 
 /**
  * What a script's result says when its interpreter exits after the script's own
@@ -1462,21 +1465,28 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
     }
   });
 
-  it("a signal's advice fits it: native code after a crash's signal, the script's own os.kill() after another", async () => {
-    const cases: [string, string, string][] = [
-      ['a segfault', 'import ctypes\nctypes.string_at(0)', exitedUnder('was ended by SIGSEGV', false, NATIVE_CRASH)],
-      ['a fatal error', 'import ctypes\nctypes.pythonapi.Py_FatalError(b"probe reason")', exitedUnder('was ended by SIGABRT', false, NATIVE_CRASH)],
-      ...['SIGBUS', 'SIGFPE', 'SIGILL'].map((sig): [string, string, string] =>
-        [sig, `import os, signal\nos.kill(os.getpid(), signal.${sig})`, exitedUnder(`was ended by ${sig}`, false, NATIVE_CRASH)]),
-      ['SIGTERM', 'import os, signal\nos.kill(os.getpid(), signal.SIGTERM)', exitedUnder('was ended by SIGTERM', false,
-        'check whether the script itself ends the process, for example with os.kill()')],
+  it("a signal's advice fits it: the traceback's call after a crash's signal, native code when no traceback came, the script's own os.kill() after another", async () => {
+    // Each with whether faulthandler's traceback is in the result, above the advice.
+    const cases: [string, string, boolean, string][] = [
+      ['a segfault', 'import ctypes\nctypes.string_at(0)', true, exitedUnder('was ended by SIGSEGV', false, NATIVE_CRASH)],
+      ['a fatal error', 'import ctypes\nctypes.pythonapi.Py_FatalError(b"probe reason")', true, exitedUnder('was ended by SIGABRT', false, NATIVE_CRASH)],
+      ...['SIGBUS', 'SIGFPE', 'SIGILL'].map((sig): [string, string, boolean, string] =>
+        [sig, `import os, signal\nos.kill(os.getpid(), signal.${sig})`, true, exitedUnder(`was ended by ${sig}`, false, NATIVE_CRASH)]),
+      ['a segfault with faulthandler disabled', 'import ctypes, faulthandler\nfaulthandler.disable()\nctypes.string_at(0)', false,
+        exitedUnder('was ended by SIGSEGV', false, NATIVE_CRASH_UNSEEN)],
+      ['SIGTERM', 'import os, signal\nos.kill(os.getpid(), signal.SIGTERM)', false, exitedUnder('was ended by SIGTERM')],
     ];
-    for (const [what, code, says] of cases) {
+    for (const [what, code, traced, says] of cases) {
       const runner = new PyRunner({ onToolCall: async () => '' });
       try {
         const result = await within(runner.exec(code, []), what);
         assert.strictEqual(result.aborted, true, what);
-        assert.ok(result.stderr.endsWith(`\n${says}`) || result.stderr === says, `${what}: ${JSON.stringify(result.stderr.slice(-600))}`);
+        if (traced) {
+          assert.match(result.stderr, /^Fatal Python error: /m, what);
+          assert.ok(result.stderr.endsWith(`\n${says}`), `${what}: ${JSON.stringify(result.stderr.slice(-600))}`);
+        } else {
+          assert.strictEqual(result.stderr, says, what);
+        }
       } finally {
         runner.dispose();
       }
