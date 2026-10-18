@@ -3,8 +3,8 @@
   that agent in its queue entry, so it is that agent's as a targeted write is:
   the agent's own flushes store it, and so does its window's release when it
   leaves. Before, the entry named no agent, so neither the run's flushes nor
-  its release took it: after the run it was still queued, unstored, and in the
-  recovery file when the queue was persisted.
+  the run's end took it: after the run it was still queued, unstored, and in
+  the recovery file when the queue was persisted.
 - Boot recovery numbers the restored deferred-write queue 1, 2, 3, … in the
   order it restores it, and later deferrals are numbered on from there.
   Before, it kept each entry's `seq` and numbered only the entries without a
