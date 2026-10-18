@@ -50,6 +50,7 @@ test("a reference block that can't be read says which part is missing, and what 
   assert.equal(referenceStubOrNull(424242), "[Content not shown: a part arrived in a form this host can't read.]");
   assert.equal(referenceStubOrNull({ type: 'hologram\u0007' }), `[Content not shown: this host can't display "hologram" content.]`);
   assert.equal(referenceStubOrNull({ type: '\u0007' }), '[Content not shown: a part arrived with no type.]');
+  assert.equal(referenceStubOrNull({ type: 42 }), '[Content not shown: a part arrived with no type.]');
   // An empty link is no link: the tool-result lane says what the push lane's
   // converter says for the same block.
   for (const [block, text] of [[{ type: 'image', uri: '' }, IMAGE_NO_DATA_TEXT], [{ type: 'audio', uri: '' }, AUDIO_NO_DATA_TEXT]] as const) {
@@ -63,8 +64,9 @@ test("a reference block that can't be read says which part is missing, and what 
 // ---------------------------------------------------------------------------
 
 // Stdio server: answers initialize and tools/list; tools/call "refuse" gets a
-// JSON-RPC error, "mute" one with an empty message, "exit" ends the process
-// with the call pending, and "hang" is never answered.
+// JSON-RPC error, "mute" one with an empty message, "odd" one whose message
+// isn't a string, "exit" ends the process with the call pending,
+// "answer-then-exit" answers and then ends it, and "hang" is never answered.
 const SERVER = `
 let buf = '';
 process.stdin.on('data', (c) => {
@@ -79,6 +81,8 @@ process.stdin.on('data', (c) => {
     else if (m.method === 'tools/list') send({ result: { tools: [] } });
     else if (m.method === 'tools/call' && m.params.name === 'refuse') send({ error: { code: -32000, message: 'Missing Access' } });
     else if (m.method === 'tools/call' && m.params.name === 'mute') send({ error: { code: -32000, message: '  ' } });
+    else if (m.method === 'tools/call' && m.params.name === 'odd') send({ error: { code: -32000, message: 42 } });
+    else if (m.method === 'tools/call' && m.params.name === 'answer-then-exit') { send({ result: { content: [] } }); setTimeout(() => process.exit(0), 50); }
     else if (m.method === 'tools/call' && m.params.name === 'exit') process.exit(3);
   }
 });
@@ -88,6 +92,13 @@ setInterval(() => {}, 1 << 30);
 const HOST_CAPS: McplHostCapabilities = { version: '0.4', pushEvents: true, contextHooks: { beforeInference: true }, featureSets: true };
 const config = (overrides: Partial<McplServerConfig> = {}): McplServerConfig =>
   ({ id: 'words', command: process.execPath, args: ['-e', SERVER], ...overrides });
+
+/** `promise`, or a failure naming `what` after five seconds, so a regression fails rather than hangs. */
+async function within<T>(promise: Promise<T>, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`no ${what} within 5 s`)), 5000); });
+  try { return await Promise.race([promise, late]); } finally { clearTimeout(timer); }
+}
 
 /** Whether some console.error line matches. */
 const logged = (calls: ReadonlyArray<{ arguments: unknown[] }>, line: RegExp): boolean =>
@@ -104,6 +115,10 @@ test("a server's error answer is shown as the server's, and its method, id and c
   // An answer with no words says so, rather than ending on a colon.
   await assert.rejects(connection.sendToolsCall('mute', {}),
     { message: 'The "words" server answered with an error without saying what went wrong.' });
+  // A message that isn't a string reads the same, and the log keeps what was sent.
+  await assert.rejects(connection.sendToolsCall('odd', {}),
+    { message: 'The "words" server answered with an error without saying what went wrong.' });
+  assert.ok(logged(errors.mock.calls, /^MCPL server "words" answered tools\/call \(id=\d+\) with error -32000: 42$/), 'the log has the number');
 });
 
 test("a server that drops with a call pending says the outcome is unknown, and whether it's coming back", async (t) => {
@@ -113,13 +128,13 @@ test("a server that drops with a call pending says the outcome is unknown, and w
   once.ready();
   await assert.rejects(once.sendToolsCall('exit', {}), {
     message: 'The connection to the "words" server closed before it answered, so whether the request took effect is unknown. ' +
-      "Check its effect before trying again; this host won't reconnect to it on its own.",
+      "This host won't reconnect to it on its own. If you need it, ask whoever runs this host.",
   });
   // The close's details are the operator's: they go to the log.
   assert.ok(logged(errors.mock.calls, /^MCPL server "words" disconnected \(code=.*\) with 1 request\(s\) unanswered: tools\/call \(id=\d+\)$/),
     'the operator log has the close');
   await assert.rejects(once.sendToolsCall('refuse', {}), {
-    message: `The request wasn't sent: the connection to the "words" server is closed, so nothing ran. This host won't reconnect to it on its own.`,
+    message: `The request wasn't sent: the connection to the "words" server is closed, so nothing ran. This host won't reconnect to it on its own. If you need it, ask whoever runs this host.`,
   });
 
   const again = await McplServerConnection.connectWithReconnect(config({ reconnect: true, reconnectIntervalMs: 600_000 }), HOST_CAPS);
@@ -130,7 +145,7 @@ test("a server that drops with a call pending says the outcome is unknown, and w
       'Check its effect before trying again; this host is reconnecting to it.',
   });
   await assert.rejects(again.sendToolsCall('refuse', {}), {
-    message: `The request wasn't sent: the connection to the "words" server is closed, so nothing ran. This host is reconnecting to it; try again once it's back.`,
+    message: `The request wasn't sent: the connection to the "words" server is closed, so nothing ran. This host is reconnecting to it; try again later.`,
   });
 });
 
@@ -145,8 +160,33 @@ test('a call pending when this host recycles the connection reads as a closed co
   });
   await connection.reconnectAfterFailure();
   await pending;
-  assert.ok(logged(errors.mock.calls, /^MCPL server "words" disconnected \(closed by this host\) with 1 request\(s\) unanswered: tools\/call \(id=\d+\)$/),
-    'the operator log says the host closed it');
+  assert.ok(logged(errors.mock.calls, /^MCPL server "words" disconnected \(closed by this host, code=.*, signal=.*, reason=.*\) with 1 request\(s\) unanswered: tools\/call \(id=\d+\)$/),
+    'the operator log says the host closed it, and keeps the close\'s details');
+});
+
+test('a timeout of one second says so in the singular', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const connection = await McplServerConnection.connect(config({ requestTimeoutMs: 1000 }), HOST_CAPS);
+  t.after(() => connection.close());
+  connection.ready();
+  await assert.rejects(connection.sendToolsCall('hang', {}), (error: Error) => {
+    assert.match(error.message, /^The "words" server didn't answer within 1 second, so whether the request took effect is unknown: /);
+    return true;
+  });
+});
+
+test('a connection that closes with nothing pending logs nothing new, by this host or by the server', async (t) => {
+  const errors = t.mock.method(console, 'error', () => {});
+  const byHost = await McplServerConnection.connect(config(), HOST_CAPS);
+  byHost.ready();
+  await byHost.close();
+  const dropped = await McplServerConnection.connect(config(), HOST_CAPS);
+  t.after(() => dropped.close());
+  dropped.ready();
+  const closed = new Promise<void>((resolve) => { dropped.once('close', () => resolve()); });
+  await dropped.sendToolsCall('answer-then-exit', {});
+  await within(closed, 'the server to exit');
+  assert.ok(!logged(errors.mock.calls, /unanswered/), errors.mock.calls.map((call) => String(call.arguments[0])).join('\n'));
 });
 
 test('a call pending when this host closes the connection says the outcome is unknown, and the log names it', async (t) => {
@@ -207,7 +247,7 @@ test("an MCPL tool call refused before it runs says it didn't run, and whether a
 test("an MCPL tool's error result with no words says so, and that its effect is unknown", async () => {
   const silent = frameworkWith({ sendToolsCall: async () => ({ isError: true, content: [] }) });
   silent.framework.dispatchMcplToolCall('agent', { id: 'c1', name: 'words--lookup', input: {} }, 'words', 'words');
-  await silent.delivered;
+  await within(silent.delivered, 'the tool result');
   const result = silent.events.find((event) => event.type === 'tool-result')!.result!;
   assert.equal(result.isError, true);
   assert.equal(result.error, `The "words" server reported an error for words--lookup without saying what went wrong. ` +

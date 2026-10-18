@@ -136,9 +136,6 @@ import { splitProseSegments, withoutRoundsProse } from './prose-segments.js';
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 
-/** Detect a supported image media type from magic bytes (the model API
- *  rejects mislabeled media types, so trust bytes over extensions).
- *  Returns undefined for non-image content. */
 /** An MCPL tool call refused because its server isn't in the registry: one
  *  closed for good, one removed, or one never connected, which this host
  *  doesn't bring back on its own. A server that's reconnecting stays
@@ -156,6 +153,9 @@ function mcplToolDeniedText(serverId: string, toolName: string): string {
     "and calling it again won't change that. If you need it, ask whoever runs this host.";
 }
 
+/** Detect a supported image media type from magic bytes (the model API
+ *  rejects mislabeled media types, so trust bytes over extensions).
+ *  Returns undefined for non-image content. */
 function sniffImageMediaType(data: Buffer): string | undefined {
   if (data.length >= 4 && data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4e && data[3] === 0x47) {
     return 'image/png';

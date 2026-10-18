@@ -95,15 +95,16 @@ export function withStderr(error: unknown): string {
   return '. The last of its stderr:' + tail.split('\n').map((line) => `\n  stderr: ${logDetail(line)}`).join('');
 }
 
-/** A transport close's reason, as an error message gives it: the transport's
- *  own words. A WebSocket peer's close reason is the server's text
- *  (`reasonFromPeer`), so an error gives the words the transport uses for a
- *  close without one, as `mcpl:server-closed` leaves that text out. A
+/** A transport close's reason, as the host's log and the handshake's error
+ *  give it: the transport's own words. A WebSocket peer's close reason is the
+ *  server's text (`reasonFromPeer`), so they give the words the transport uses
+ *  for a close without one, as `mcpl:server-closed` leaves that text out. A
  *  WebSocket close's code, a number, says what the server meant (4001: a
- *  refused credential), with or without a reason, so each error gives it too:
- *  a pending request's error has `code=`, and the handshake's adds it for any
- *  WebSocket close, since a close before the handshake completes reaches no
- *  'close' event. A stdio child's exit reads as before. */
+ *  refused credential), with or without a reason, so each gives it too: the
+ *  log line for a close with requests pending has `code=`, and the
+ *  handshake's error adds it for any WebSocket close, since a close before the
+ *  handshake completes reaches no 'close' event. A stdio child's exit reads
+ *  as before. */
 function closeReasonText(info: TransportCloseInfo): string {
   if (info.reasonFromPeer) return 'websocket closed';
   return info.reason ?? 'unknown';
@@ -1196,8 +1197,8 @@ export class McplServerConnection extends EventEmitter {
       return Promise.reject(new Error(
         `The request wasn't sent: the connection to the "${this.id}" server is closed, so nothing ran. ` +
         (this.willReconnect
-          ? "This host is reconnecting to it; try again once it's back."
-          : "This host won't reconnect to it on its own."),
+          ? 'This host is reconnecting to it; try again later.'
+          : "This host won't reconnect to it on its own. If you need it, ask whoever runs this host."),
       ));
     }
 
@@ -1572,9 +1573,10 @@ export class McplServerConnection extends EventEmitter {
         // dropped or this host closed the transport to recover; how it closed
         // is the operator's, so it goes to the log, not into the messages.
         if (this.pendingRequests.size > 0) {
-          const how = byHost
-            ? 'closed by this host'
-            : `code=${info.code ?? 'n/a'}, signal=${info.signal ?? 'n/a'}, reason=${closeReasonText(info)}`;
+          // Whatever the host asked for, the close's own details are kept, so
+          // a drop that races a recycle loses nothing.
+          const how = `${byHost ? 'closed by this host, ' : ''}` +
+            `code=${info.code ?? 'n/a'}, signal=${info.signal ?? 'n/a'}, reason=${closeReasonText(info)}`;
           console.error(`MCPL server "${this.id}" disconnected (${how}) with ${this.unansweredRequests()}`);
         }
         for (const pending of this.pendingRequests.values()) {
@@ -1582,8 +1584,9 @@ export class McplServerConnection extends EventEmitter {
           pending.reject(
             new Error(
               `The connection to the "${this.id}" server closed before it answered, so whether the request took effect is unknown. ` +
-              'Check its effect before trying again; ' +
-              (this.reconnectEnabled ? 'this host is reconnecting to it.' : "this host won't reconnect to it on its own."),
+              (this.reconnectEnabled
+                ? 'Check its effect before trying again; this host is reconnecting to it.'
+                : "This host won't reconnect to it on its own. If you need it, ask whoever runs this host."),
             ),
           );
         }

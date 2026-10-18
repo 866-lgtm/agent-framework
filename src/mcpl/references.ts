@@ -161,7 +161,9 @@ export const INLINE_WITHHELD_TEXT =
 export const IMAGE_NO_MEDIA_TYPE_TEXT = '[Image not shown: its data arrived without a media type.]';
 export const IMAGE_NO_DATA_TEXT = '[Image not shown: it arrived with no usable data or link.]';
 export const AUDIO_NO_MEDIA_TYPE_TEXT = '[Audio not shown: its data arrived without a media type.]';
-/** Audio shows only as inline data, so a link alone isn't enough either. */
+/** On the push, channel and context-injection lanes, audio shows only as
+ *  inline data, so a plain link isn't enough either. (A tool result's audio
+ *  with a link is a reference, as any block with one is there.) */
 export const AUDIO_NO_DATA_TEXT = '[Audio not shown: it arrived with no usable inline data.]';
 export const REFERENCE_NO_LINK_TEXT = '[Reference not shown: it arrived without a link.]';
 export const REFERENCE_LINK_TOO_LONG_TEXT = '[Reference not shown: its link is longer than this host accepts.]';

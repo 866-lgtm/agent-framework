@@ -363,7 +363,8 @@ test('a server that closes during the handshake with a code and no reason gets t
   }
 });
 
-test("a server's close reason stays out of the error a pending request is rejected with", async () => {
+test("a server's close reason stays out of the error a pending request is rejected with, and out of the log", async (t) => {
+  const errors = t.mock.method(console, 'error', () => {});
   const wss = startClosingWsServer('tools/call', 4001, PEER_REASON);
   await waitListening(wss);
   let conn: McplServerConnection | undefined;
@@ -374,10 +375,14 @@ test("a server's close reason stays out of the error a pending request is reject
       withDeadline(conn.sendToolsCall('echo', { text: 'hello' }), 10_000, 'the call to be rejected'),
       (error: Error) => {
         assert.equal(error.message, 'The connection to the "editor" server closed before it answered, so whether the request took effect is unknown. ' +
-          "Check its effect before trying again; this host won't reconnect to it on its own.");
+          "This host won't reconnect to it on its own. If you need it, ask whoever runs this host.");
         return true;
       },
     );
+    // The log has the close's code and the transport's words, never the peer's.
+    const lines = errors.mock.calls.map((call) => String(call.arguments[0]));
+    assert.ok(lines.some((line) => /^MCPL server "editor" disconnected \(code=4001, signal=n\/a, reason=websocket closed\) with 1 request\(s\) unanswered: tools\/call \(id=\d+\)$/.test(line)), lines.join('\n'));
+    assert.ok(!lines.some((line) => line.includes(PEER_REASON)), 'no log line carries the peer\'s close text');
   } finally {
     await conn?.close();
     wss.close();
