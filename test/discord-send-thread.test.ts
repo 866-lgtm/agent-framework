@@ -1,7 +1,7 @@
 /**
  * A send whose message went out but whose thread wasn't started: the result
- * stays the error it was, and the message counts as the one the bot last
- * sent, so the agent's thoughts are edited into it.
+ * stays the error it was, and the message counts as the agent's post in its
+ * turn, so that turn's thoughts are edited into it.
  *
  * Run: node --import tsx --test test/discord-send-thread.test.ts
  */
@@ -43,13 +43,14 @@ test('a send whose thread wasn\'t started stays an error, and the agent\'s thoug
     fetchMessage: async () => 'hello',
     editMessage: async (channelId: string, messageId: string, content: string) => { edited.push([channelId, messageId, content]); },
   } as unknown as DiscordClientInterface, { token: 'test-token' });
-  const send = (input: Record<string, unknown>): Promise<ToolResult> => m.handleToolCall({ id: 'call-1', name: 'send', input });
+  const send = (input: Record<string, unknown>): Promise<ToolResult> =>
+    m.handleToolCall({ id: 'call-1', name: 'send', input, callerAgentName: 'agent', callerTurnId: 1 });
 
   assert.equal((await send({ channelId: 'C1', content: 'first' })).success, true);
   sent = { messageId: 'M3', threadFailure: 'Missing Permissions' };
   assert.deepEqual(await send({ channelId: 'C1', content: 'hello', createThread: { name: 'topic' } }),
     { success: false, error: 'Missing Permissions', isError: true });
-  await m.onAgentSpeech('agent', [], { thoughts: [{ type: 'text', text: 'why' }] } as never);
+  await m.onAgentSpeech('agent', [], { thoughts: [{ type: 'text', text: 'why' }], turnId: 1 } as never);
   assert.deepEqual(edited, [['C1', 'M3', '||why||\nhello']]);
 });
 
@@ -60,8 +61,8 @@ test('a send whose client throws is the send\'s error, and records no message fo
     fetchMessage: async () => 'hello',
     editMessage: async (...args: unknown[]) => { edited.push(args); },
   } as unknown as DiscordClientInterface, { token: 'test-token' });
-  assert.deepEqual(await m.handleToolCall({ id: 'call-1', name: 'send', input: { channelId: 'C1', content: 'hi' } }),
+  assert.deepEqual(await m.handleToolCall({ id: 'call-1', name: 'send', input: { channelId: 'C1', content: 'hi' }, callerAgentName: 'agent', callerTurnId: 1 }),
     { success: false, error: 'Missing Permissions', isError: true });
-  await m.onAgentSpeech('agent', [], { thoughts: [{ type: 'text', text: 'why' }] } as never);
+  await m.onAgentSpeech('agent', [], { thoughts: [{ type: 'text', text: 'why' }], turnId: 1 } as never);
   assert.deepEqual(edited, []);
 });

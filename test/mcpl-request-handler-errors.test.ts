@@ -913,20 +913,20 @@ test('a request form held at the buffer cap is kept, and answered when its plane
   const errors = t.mock.method(console, 'error', () => {});
   const { connection, transport, refreshed } = stagedHarness();
   transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 5, method: 'mcpl/manifestChanged', params: { revision: 'held' } }));
-  // 1,100 notifications pass the cap of 1,000 held events by 101.
+  // 1,100 notifications pass the cap of 1,000 held notifications by 100. The
+  // request form is counted apart, against the budget for held requests.
   for (let i = 0; i < 1_100; i++) {
     transport.emit('line', JSON.stringify({ jsonrpc: '2.0', method: 'mcpl/manifestChanged', params: { revision: `n${i}` } }));
   }
   connection.ready();
   await settle();
   assert.deepEqual(transport.lines.map((line) => JSON.parse(line)), [{ jsonrpc: '2.0', id: 5, result: {} }]);
-  assert.equal(refreshed.length, 1_000);
-  assert.deepEqual(refreshed.slice(0, 2), [{ revision: 'held' }, { revision: 'n101' }]);
+  assert.equal(refreshed.length, 1_001);
+  assert.deepEqual(refreshed.slice(0, 2), [{ revision: 'held' }, { revision: 'n100' }]);
   assert.deepEqual(refreshed.at(-1), { revision: 'n1099' });
   assert.deepEqual(errors.mock.calls.map((call) => String(call.arguments[0])), [
     '[mcpl] srv: buffered-event cap (1000) — dropped 1 responder-less event(s) while the plane is paused',
-    '[mcpl] srv: buffered-event cap (1000) — dropped 101 responder-less event(s) while the plane is paused',
-    '[mcpl] srv: flushing 1000 buffered event(s) synchronously (long pause backlog; 101 dropped at cap)',
+    '[mcpl] srv: flushing 1001 buffered event(s) synchronously (long pause backlog; 100 dropped at cap)',
   ]);
 });
 
