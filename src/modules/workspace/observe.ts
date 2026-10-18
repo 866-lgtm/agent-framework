@@ -147,23 +147,34 @@ function lexicalOf(view: MountView, rel: string): string {
 
 const sameFile = (a: BigIntStats, b: BigIntStats): boolean => a.dev === b.dev && a.ino === b.ino;
 
-/** The name with each letter's case flipped. */
+/**
+ * The name with each letter's case flipped, where its other case is one
+ * letter: `ß`, whose upper case is `SS`, stays `ß`, so the name still reaches
+ * the same file on a disk whose folding is simple, letter for letter.
+ */
 const flippedCase = (name: string): string =>
-  [...name].map((c) => (c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase())).join('');
+  [...name].map((c) => {
+    const other = c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase();
+    return [...other].length === 1 ? other : c;
+  }).join('');
 
 /** What a disk that folds names compares: NFC, in lower case. */
 const folded = (name: string): string => name.normalize('NFC').toLowerCase();
 
 /**
  * The name `dir` lists for `segment`: `segment` itself, unless disk folds it
- * there and lists it otherwise. Disk folds it there when its case flipped, or
- * its other Unicode normalization form, finds the same file (device and
- * inode) as `given`, the segment's own entry, or, for the last segment, which
- * isn't looked up as given unless it must be, finds anything. Only then is
- * `dir` listed, so a disk that tells the spellings apart is never listed.
- * The name as given wins if it's listed; otherwise the segment takes the
- * listed name that folds to it and is the same file, so the name returned
- * reaches the file the segment does, or is the segment as given.
+ * there and lists it otherwise. `dir` is listed only where a variant of
+ * `segment`, its case flipped or its other Unicode normalization form, finds
+ * the same file (device and inode) as `given`, the segment's own entry, as on
+ * a disk that folds names. The last segment isn't looked up as given unless
+ * the listing must settle it, so for it any variant found leads to the
+ * listing: on a disk that tells spellings apart, that's only where `dir`
+ * holds a variant as a name of its own. The name as given wins if it's
+ * listed; otherwise the segment takes the listed name that folds to it and is
+ * the same file, so the name returned reaches the file the segment does, or
+ * is the segment as given. A directory that can't be listed, or a name that
+ * can't be looked up, leaves the segment as given, as it was before this
+ * step.
  */
 async function listedName(dir: string, segment: string, given: BigIntStats | null): Promise<string> {
   const variants = new Set([flippedCase(segment), segment.normalize('NFC'), segment.normalize('NFD')]);
@@ -193,9 +204,11 @@ async function listedName(dir: string, segment: string, given: BigIntStats | nul
  * given takes the file in a second time, under a name disk doesn't list. So
  * each segment, from the mount's root down, takes the name its directory
  * lists for it (listedName). The walk goes on beneath a segment only if it's
- * a directory, a symlink not included, so nothing past a link is read and
- * nothing outside the mount, and it stops at an empty, `.` or `..` segment,
- * keeping the rest as given.
+ * a directory, a symlink not included, so nothing past a link is read. It
+ * passes over an empty or `.` segment, which names the directory reached,
+ * and stops at `..`, keeping the rest as given: a path can climb above the
+ * mount's root and come back in, as `../proj/x` does for a root named
+ * `proj`, and walking it would list the directory above the root.
  */
 export async function diskSpelling(root: string, relativePath: string): Promise<string> {
   if (relativePath === '') return relativePath;
@@ -203,7 +216,8 @@ export async function diskSpelling(root: string, relativePath: string): Promise<
   let dir = root;
   for (let i = 0; i < segments.length; i++) {
     const segment = segments[i]!;
-    if (segment === '' || segment === '.' || segment === '..') break;
+    if (segment === '' || segment === '.') continue;
+    if (segment === '..') break;
     const last = i === segments.length - 1;
     const given = last ? null : await lstat(join(dir, segment), { bigint: true }).catch(() => null);
     if (!last && given === null) break;

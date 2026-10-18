@@ -1,9 +1,11 @@
 // On a disk that folds names (macOS's default folds case, and Unicode
 // normalization), a path spelled otherwise than disk spells it reaches disk's
 // file. The workspace's tools take such a path as disk spells it, so they
-// name each file by one name and take nothing in twice. The tests of that run
-// where the temp directory folds names, and skip, saying why, where it
-// doesn't; the step's own rules are tested on any disk.
+// name each file by one name and take nothing in twice. These tests need a
+// temp directory that folds case (one needs it to fold normalization), and
+// skip, saying why, where it doesn't: a disk that tells spellings apart has
+// nothing to respell. The last runs only there instead: two hard links whose
+// names differ in case each keep their own name.
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -116,7 +118,7 @@ test('beneath a directory disk has, a name disk doesn\'t have keeps the spelling
     assert.equal(readFileSync(join(dir, 'src', 'New', 'x.ts'), 'utf8'), 'x\n');
   });
 
-test('a path into a nested mount\'s directory, spelled in another case, is refused as that mount\'s',
+test('a nested mount whose directory is configured as disk spells it is that mount\'s in another spelling too',
   { skip: FOLDING_ONLY }, async (t) => {
     const { workspace, dir } = await setup(t, (d) => [
       { name: 'outer', path: d, mode: 'read-write', watch: 'never' },
@@ -132,8 +134,70 @@ test('a path into a nested mount\'s directory, spelled in another case, is refus
     assert.deepEqual(await workspace.readBinary('outer/INNER/x.txt'), { error: read.error });
   });
 
+test('a nested mount whose directory is configured in another spelling than disk\'s is that mount\'s in either',
+  { skip: FOLDING_ONLY }, async (t) => {
+    const { workspace, dir, call, pushed } = await setup(t, (d) => {
+      mkdirSync(join(d, 'inner'), { recursive: true });
+      writeFileSync(join(d, 'inner', 'x.txt'), 'inner\n');
+      return [
+        { name: 'outer', path: d, mode: 'read-write', watch: 'never' },
+        { name: 'inner', path: join(d, 'Inner'), mode: 'read-write', watch: 'never' },
+      ];
+    });
+    const refusal = '"outer/inner/x.txt" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/x.txt".';
+    for (const path of ['outer/Inner/x.txt', 'outer/inner/x.txt']) {
+      const read = await workspace.handleToolCall({ id: 'r', name: 'read', input: { path } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+      assert.equal(read.error, refusal, path);
+      assert.equal(workspace.resolveAbsolutePath(path), null, path);
+    }
+    const write = await workspace.handleToolCall({ id: 'w', name: 'write', input: { path: 'outer/Inner/y.txt', content: 'y\n' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+    assert.equal(write.success, false);
+    assert.equal(existsSync(join(dir, 'inner', 'y.txt')), false);
+    const synced = await call('sync', { path: 'outer/Inner' });
+    assert.equal((synced.data as { totalSynced: number }).totalSynced, 0);
+    const listed = await call('ls', { path: 'outer', recursive: true });
+    assert.deepEqual((listed.data as { entries: Array<{ path: string }> }).entries.map((e) => e.path), ['src/a.ts']);
+    assert.deepEqual(pushed(), ['created outer/src/a.ts'], 'the outer mount takes nothing of the inner one\'s in');
+  });
+
+test('a sync and a materialize of a path spelled in another case act on disk\'s file, under its own name',
+  { skip: FOLDING_ONLY }, async (t) => {
+    const { dir, call, pushed } = await setup(t, (d) => [{ name: 'work', path: d, mode: 'read-write', watch: 'never' }]);
+    await call('ls', { path: 'work', recursive: true });
+    pushed();
+    writeFileSync(join(dir, 'src', 'b.ts'), 'b\n');
+    await call('sync', { path: 'work/SRC/B.TS' });
+    assert.deepEqual(pushed(), ['created work/src/b.ts']);
+    await call('write', { path: 'work/src/a.ts', content: 'export const a = 2;\n' });
+    assert.equal(readFileSync(join(dir, 'src', 'a.ts'), 'utf8'), 'export const a = 1;\n', 'not on disk until materialized');
+    await call('materialize', { path: 'work/SRC/A.TS' });
+    assert.equal(readFileSync(join(dir, 'src', 'a.ts'), 'utf8'), 'export const a = 2;\n');
+    const listed = await call('ls', { path: 'work', recursive: true });
+    assert.deepEqual((listed.data as { entries: Array<{ path: string }> }).entries.map((e) => e.path), ['src/a.ts', 'src/b.ts']);
+    assert.deepEqual(pushed().filter((e) => !e.startsWith('modified work/src/a.ts')), []);
+  });
+
+test('read_image of a path spelled in another case names the file as disk does', { skip: FOLDING_ONLY }, async (t) => {
+  const { dir, call } = await setup(t);
+  // A 1x1 PNG.
+  writeFileSync(join(dir, 'src', 'dot.png'), Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64'));
+  const image = await call('read_image', { path: 'work/SRC/DOT.PNG' });
+  const text = (image.data as Array<{ type: string; text?: string }>).find((b) => b.type === 'text')?.text ?? '';
+  assert.match(text, /^Path: work\/src\/dot\.png\n/);
+});
+
+test('a name with ß, spelled in another case, takes disk\'s spelling', { skip: FOLDING_ONLY }, async (t) => {
+  const { dir, call } = await setup(t);
+  // ß's upper case is two letters, SS, which a disk whose folding is simple doesn't fold to ß.
+  writeFileSync(join(dir, 'src', 'stra\u00dfe.txt'), 'sharp s\n');
+  const read = await call('read', { path: 'work/src/Stra\u00dfe.txt', offsetChars: 0, limitChars: 100 });
+  assert.equal((read.data as { path: string }).path, 'work/src/stra\u00dfe.txt');
+});
+
 test('the public readers and writer take a path as disk spells it too', { skip: FOLDING_ONLY }, async (t) => {
-  const { workspace, dir } = await setup(t);
+  const { workspace, dir, call } = await setup(t);
+  await call('ls', { path: 'work', recursive: true });
+  assert.deepEqual(await workspace.readBinary('work/SRC/A.TS'), { data: Buffer.from('export const a = 1;\n') });
   const fromDisk = await workspace.readBinaryFromDisk('work/SRC/a.ts');
   assert.ok('absolutePath' in fromDisk, JSON.stringify(fromDisk));
   assert.equal(fromDisk.absolutePath, join(dir, 'src', 'a.ts'));
@@ -155,7 +219,7 @@ test('a name in the other Unicode normalization form takes the form disk lists',
   assert.deepEqual(pushed(), []);
 });
 
-test('the step reads no further than a symlink or a `..`, and keeps the rest as spelled', { skip: FOLDING_ONLY }, async (t) => {
+test('the step reads no further than a symlink or a `..`, keeping the rest as spelled, and passes over `.` and empty segments', { skip: FOLDING_ONLY }, async (t) => {
   const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-link-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   mkdirSync(join(root, 'real', 'sub'), { recursive: true });
@@ -163,6 +227,8 @@ test('the step reads no further than a symlink or a `..`, and keeps the rest as 
   assert.equal(await diskSpelling(root, 'REAL/SUB'), 'real/sub');
   assert.equal(await diskSpelling(root, 'LNK/SUB'), 'lnk/SUB');
   assert.equal(await diskSpelling(root, 'REAL/../REAL'), 'real/../REAL');
+  assert.equal(await diskSpelling(root, 'REAL/./SUB'), 'real/./sub');
+  assert.equal(await diskSpelling(root, 'REAL//SUB'), 'real//sub');
 });
 
 test('on a disk that tells case apart, two hard links that differ only in case keep their own names',

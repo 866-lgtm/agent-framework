@@ -691,10 +691,12 @@ export class WorkspaceModule implements Module {
   /** Per canonical root: the device of its filesystem when that maintains ctime, else null. */
   private ctimeTrust = new Map<string, string | null>();
   /**
-   * Each mount's directories that are other mounts nested inside it:
-   * mount-relative, `/`-separated, with each mount's name and resolved root.
+   * Each mount's directories that are other mounts nested inside it, with
+   * each mount's name, in each spelling that names the directory: as
+   * configured, and as disk spells it where that differs (spellNestedDirs).
+   * Each spelling is mount-relative and `/`-separated, with its resolved root.
    */
-  private otherMounts = new Map<string, Array<{ dir: string; name: string; root: string }>>();
+  private otherMounts = new Map<string, Array<{ name: string; spellings: Array<{ dir: string; root: string }> }>>();
   /**
    * Whether a file's mode is observed, taken in and applied (MountRuntime's
    * `modesObserved`): not on Windows, which reports no POSIX modes. A test
@@ -738,7 +740,7 @@ export class WorkspaceModule implements Module {
           // directory, read against `/`-separated paths, whatever the
           // platform's.
           const relPath = rel.split(sep).join('/');
-          this.otherMounts.set(outer.name, [...(this.otherMounts.get(outer.name) ?? []), { dir: relPath, name: inner.name, root: innerPath }]);
+          this.otherMounts.set(outer.name, [...(this.otherMounts.get(outer.name) ?? []), { name: inner.name, spellings: [{ dir: relPath, root: innerPath }] }]);
           console.warn(
             `[workspace] Mount "${outer.name}" contains mount "${inner.name}" ` +
             `at ${relPath}/ — passing over it as another mount's directory`,
@@ -862,7 +864,7 @@ export class WorkspaceModule implements Module {
   }
 
   /**
-   * Where a search's walk starts: `base`, its path as given, then each
+   * Where a search's walk starts: `base`, its path as disk spells it, then each
    * segment of `beneath` while disk lists it, in the directory reached so
    * far, as a directory with exactly that spelling. The walk names what it
    * finds from its start's spelling, and a case-insensitive disk would let
@@ -917,6 +919,8 @@ export class WorkspaceModule implements Module {
   }
 
   async start(ctx: ModuleContext): Promise<void> {
+    // Before anything walks or watches a mount with another nested in it.
+    await this.spellNestedDirs();
     this.ctx = ctx;
     this.stopped = false;
 
@@ -1583,7 +1587,9 @@ export class WorkspaceModule implements Module {
    */
   resolveAbsolutePath(mountPrefixedPath: string): string | null {
     try {
-      // Synchronous, so the path as given: it reaches the same file.
+      // Synchronous, so the path as given: it reaches the same file, and
+      // the nested-mount check matches it as configured or as disk spells
+      // the nested mount's directory (spellNestedDirs).
       const { mount, relativePath } = this.refuseNested({ ...this.parsePathAsGiven(mountPrefixedPath), path: mountPrefixedPath });
       return resolve(mount.config.path, relativePath);
     } catch {
@@ -1742,9 +1748,30 @@ export class WorkspaceModule implements Module {
     }
   }
 
-  /** The directories of the mounts nested inside a mount, mount-relative. */
+  /** The directories of the mounts nested inside a mount, mount-relative, in each spelling. */
   private othersOf(mountName: string): string[] {
-    return (this.otherMounts.get(mountName) ?? []).map((o) => o.dir);
+    return (this.otherMounts.get(mountName) ?? []).flatMap((o) => o.spellings.map((s) => s.dir));
+  }
+
+  /**
+   * Adds to each nested mount's directory the spelling disk lists it by,
+   * where that differs from the configuration's. On a disk that folds names,
+   * the outer mount's walks and watcher name the directory as disk does, and
+   * so does a path parsePath has respelled, while a path given as configured
+   * still names it as configured (resolveAbsolutePath). A directory not on
+   * disk keeps its configured spelling alone. Run at each start.
+   */
+  private async spellNestedDirs(): Promise<void> {
+    for (const [outerName, nested] of this.otherMounts) {
+      const outer = this.config.mounts.find((m) => m.name === outerName);
+      if (!outer) continue;
+      const outerRoot = resolve(outer.path);
+      for (const entry of nested) {
+        const configured = entry.spellings[0]!;
+        const dir = await diskSpelling(outerRoot, configured.dir);
+        entry.spellings = dir === configured.dir ? [configured] : [configured, { dir, root: join(outerRoot, ...dir.split('/')) }];
+      }
+    }
   }
 
   /**
@@ -1759,7 +1786,7 @@ export class WorkspaceModule implements Module {
     if (!mount) return undefined;
     const resolved = resolve(mount.config.path, relativePath);
     const holder = (this.otherMounts.get(mountName) ?? [])
-      .filter((o) => isContainedPath(o.root, resolved))
+      .flatMap((o) => o.spellings.filter((s) => isContainedPath(s.root, resolved)).map((s) => ({ name: o.name, root: s.root })))
       .sort((a, b) => b.root.length - a.root.length)[0];
     if (!holder) return undefined;
     const rest = relative(holder.root, resolved).split(sep).join('/');
@@ -3093,11 +3120,7 @@ export class WorkspaceModule implements Module {
     const modesKept: Array<{ mount: string; path: string; reason: string }> = [];
 
     let explicit: { mount: MountState; relativePath: string } | null = null;
-    if (input.path) {
-      const parsed = await this.parsePath(input.path);
-      explicit = parsed;
-      input = { ...input, path: parsed.path };
-    }
+    if (input.path) explicit = await this.parsePath(input.path);
 
     let mountsToMaterialize: Array<{ name: string; mount: MountState }>;
     if (explicit) {
@@ -3283,8 +3306,7 @@ export class WorkspaceModule implements Module {
     // A path names its own mount; otherwise the given mount, or every mount.
     let targets: Array<{ name: string; mount: MountState; relativePath: string }>;
     if (input.path) {
-      const { mount, relativePath, path } = await this.parsePath(input.path);
-      input = { ...input, path };
+      const { mount, relativePath } = await this.parsePath(input.path);
       targets = [{ name: mount.config.name, mount, relativePath }];
     } else if (input.mount) {
       const m = this.mounts.get(input.mount);
