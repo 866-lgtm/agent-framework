@@ -1444,7 +1444,9 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
   it("a script that closes fd 3 while it still waits on the host ends the interpreter when the runtime's reader fails, or reads a file that took the number to its end", async () => {
     const dir = mkdtempSync(join(tmpdir(), 'pytc-fd3-'));
     const file = join(dir, 'readable');
-    writeFileSync(file, 'not a message from the host\n');
+    // Empty, so the reader meets its end at once and queues no line of the
+    // file's for the runtime's loop, which would log it as a bad line.
+    writeFileSync(file, '');
     const runner = new PyRunner({ onToolCall: async () => 'echoed' });
     try {
       // The tool's result can still reach a read already waiting on fd 3; the
@@ -1472,11 +1474,15 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
     }
   });
 
-  it("a script's own exit with the runtime's code, 70, keeps the general advice", async () => {
+  it("a script's own exit keeps the general advice, with the runtime's code or after a line like the runtime's", async () => {
     const runner = new PyRunner({ onToolCall: async () => '' });
     try {
-      const result = await within(runner.exec('import os\nos._exit(70)', []), 'the exit');
-      assert.strictEqual(result.stderr, exitedUnder('exited with code 70'));
+      const own = await within(runner.exec('import os\nos._exit(70)', []), 'the exit with 70');
+      assert.strictEqual(own.stderr, exitedUnder('exited with code 70'));
+      // A script that shows such a line, as one reading an old log might, then ends some other way.
+      const line = "[pytc-runtime] cannot read the host's messages any more: a script closed or replaced fd 3, where they arrive; exiting";
+      const shown = await within(runner.exec(`import os, sys\nsys.stderr.write(${JSON.stringify(line + '\n')})\nsys.stderr.flush()\nos._exit(3)`, []), 'the exit with 3');
+      assert.strictEqual(shown.stderr, `${line}\n${exitedUnder('exited with code 3')}`);
     } finally {
       runner.dispose();
     }
@@ -1560,6 +1566,64 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
       // too big for os._exit; a code that isn't a number is written, then 1.
       assert.deepStrictEqual(exits, { stdout: 'parent saw [3, 0, 3, 0, 1, 1]\n', stderr: 'boom\n', returnCode: 0 });
       assert.strictEqual((await runner.exec('print("next")', [])).stdout, 'next\n');
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it("a script that detaches its stdout's buffer, keeping the old writer, still settles, and so do forks after it", async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      const result = await within(
+        runner.exec(
+          [
+            'import io, os, sys, warnings',
+            'warnings.simplefilter("ignore", DeprecationWarning)',
+            'old = sys.stdout',
+            'sys.stdout = io.TextIOWrapper(old.detach(), encoding="utf-8", line_buffering=True)',
+            'print("after the detach")',
+            'pid = os.fork()',
+            'if pid == 0:',
+            '    os._exit(0)',
+            'os.waitpid(pid, 0)',
+            'print("after the fork")',
+          ].join('\n'),
+          [],
+        ),
+        'the detaching script',
+      );
+      assert.deepStrictEqual(
+        { stdout: result.stdout, stderr: result.stderr, returnCode: result.returnCode },
+        { stdout: 'after the detach\nafter the fork\n', stderr: '', returnCode: 0 },
+      );
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it("a multiprocessing child doesn't send the parent's partial line again", async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      // The child leaves through multiprocessing's own exit, which flushes sys.stdout.
+      const result = await within(
+        runner.exec(
+          [
+            'import multiprocessing, warnings',
+            'warnings.simplefilter("ignore", DeprecationWarning)',
+            'print("partial", end="")',
+            'child = multiprocessing.get_context("fork").Process(target=lambda: print("|child", end=""))',
+            'child.start()',
+            'child.join()',
+            'print("|parent", child.exitcode)',
+          ].join('\n'),
+          [],
+        ),
+        'the multiprocessing script',
+      );
+      assert.deepStrictEqual(
+        { stdout: result.stdout, stderr: result.stderr, returnCode: result.returnCode },
+        { stdout: 'partial|child|parent 0\n', stderr: '', returnCode: 0 },
+      );
     } finally {
       runner.dispose();
     }

@@ -285,10 +285,12 @@ def _flush_writers():
     # Send what the script left in its writers, the ones it kept from earlier
     # execs too.
     for writer in list(_script_writers):
-        if writer.closed:
-            continue  # a script closed it, which sent what it held
         try:
+            if writer.closed:
+                continue  # a script closed it, which sent what it held
             writer.flush()
+        except ValueError:
+            continue  # a script detached its buffer, which took what it held
         except Exception as exc:
             # Its fd closed or broke under it, so that much can't be sent.
             _diag("some of what the script wrote couldn't be sent (" + str(exc) + ")")
@@ -642,10 +644,10 @@ async def _run_script(exec_id, code, mark, st):
 
     if os.getpid() != _RUNTIME_PID:
         # A process the script forked ran off the script's end: the exec, its
-        # result and its marks are the runtime's, so it leaves, sending none,
-        # with the status Python gives a script that ended so. Its writers
-        # hold only what it wrote (_flush_writers ran before the fork), so it
-        # sends that.
+        # result and its marks are the runtime's, so it leaves without sending
+        # them, with the status Python gives a script that ended so. Its
+        # writers hold only what it wrote (_flush_writers ran before the
+        # fork), and it sends that first.
         _flush_writers()
         os._exit(return_code)
     # What the script left in its writers, then the runtime's own fds, then

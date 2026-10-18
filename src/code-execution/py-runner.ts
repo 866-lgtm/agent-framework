@@ -109,6 +109,12 @@ const UNREACHABLE_GRACE_MS = 200;
 const LAST_WORDS_CHARS = 2000;
 /** The runtime's exit when the host's channel, fds 3 and 4, didn't reach it: the host's configuration, which calling again doesn't change. 78 is sysexits' EX_CONFIG, which Python itself never exits with. */
 const HOST_CHANNEL_MISSING_EXIT = 78;
+/**
+ * The runtime's exit when it ends itself (runtime-py.ts _fatal), after a line
+ * that, when a script took one of its fds, says which. Read with that line, so
+ * a script that prints such a line and ends any other way isn't taken for it.
+ */
+const RUNTIME_FATAL_EXIT = 70;
 
 /** The longest delay Node's timers honour (~24.8 days); a longer one fires after ~1 ms. */
 export const MAX_TIMER_MS = 2_147_483_647;
@@ -435,8 +441,9 @@ function stoppedReading(background: boolean): string {
 /** Why a script stopped when its interpreter exited under it, and what running it again does. */
 function interpreterExit(exitCode: number | null, signal: NodeJS.Signals | null, background: boolean, said = ''): string {
   const how = signal ? `was ended by ${signal}` : `exited with code ${exitCode}`;
-  // The runtime ends itself (runtime-py.ts _fatal) with a line saying which of its fds a script took.
-  const taken = fdTakenFromRuntime(said);
+  // The runtime ends itself (_fatal) after a line saying which of its fds a script took, which reaches
+  // the host unless the script took its copy of fd 2 as well, and what the result keeps holds it.
+  const taken = exitCode === RUNTIME_FATAL_EXIT ? fdTakenFromRuntime(said) : null;
   const check = taken
     ? `check whether the script closes or replaces ${taken}, as the runtime's line above says`
     : `check whether the script itself ends the process, for example ${signal ? 'by using too much memory' : 'with os._exit()'}`;
