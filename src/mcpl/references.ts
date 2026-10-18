@@ -189,6 +189,15 @@ export const EXPIRY_REASON = {
  *  server that delivered the reference. */
 export const UNBOUND_REASON = 'unbound: no server is recorded to fetch it from';
 
+/** The fetcher's refusal for a server it has no address to dial, one the
+ *  host doesn't connect to over a network, such as a stdio server; the
+ *  fetcher dials only through a server's address. save_recent_image gives it
+ *  too. A stub can't know it, since only the framework holds its servers'
+ *  configs. */
+export function noAddressReason(serverId: string): string {
+  return `no address: this host doesn't connect to server ${serverId} over a network, so there's nowhere to fetch it from`;
+}
+
 /** Strip control characters (C0, DEL, C1) and every bidi control (marks,
  *  embeddings, overrides, isolates, and the Arabic letter mark), trim the
  *  whitespace (a BOM included) left at either end, and bound the length.
@@ -371,13 +380,15 @@ export function buildReferenceStub(t: ReferenceTestimony, provenance?: string, s
 }
 
 /**
- * Why the fetcher would refuse a reference, as far as its record shows: no
- * server registered for it, which the fetcher checks first, or its expiry.
- * Null for a saved copy, which the fetcher serves before any check, and when
- * the record shows neither. The fetcher's other refusals rest on what a record
- * doesn't hold: whether any of its servers is still known to the host and on
- * the uri's origin, a claimed size over the ceiling a fetch is given, or the
- * dialed server's fetch budget spent, and it gives those in its own words.
+ * Why the fetcher would refuse a reference, as far as its record alone shows,
+ * for its stub: no server registered for it, which the fetcher checks first,
+ * or its expiry. Null for a saved copy, which the fetcher serves before any
+ * check, and when the record shows neither. The fetcher's other refusals rest
+ * on what a record doesn't hold: whether any of its servers is known to the
+ * host, has an address and is on the uri's origin, the dialed server's fetch
+ * budget spent, or a claimed size over the ceiling a fetch is given. The
+ * fetcher gives those in its own words, and save_recent_image, in the
+ * framework where it can ask the fetcher, says them too.
  */
 export function unfetchableReason(record: ReferenceRecord, nowMs = Date.now()): string | null {
   if (record.fetchedPath) return null;

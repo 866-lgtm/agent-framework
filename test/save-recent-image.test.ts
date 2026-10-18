@@ -62,10 +62,19 @@ import {
   UNBOUND_REASON,
   buildReferenceStub,
   classifyBlock,
+  noAddressReason,
   referenceRegistry,
   type ReferenceTestimony,
 } from '../src/mcpl/references.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
+
+/** Give the framework MCPL server configs for its fetcher to resolve, without
+ *  connecting to them: a ws:// or wss:// url for one the host connects to over
+ *  a network, a command alone for a stdio server. */
+function configureServers(framework: AgentFramework, configs: Array<{ id: string; url?: string; command?: string; autofetch?: { maxTotalBytes?: number } }>): void {
+  const known = (framework as unknown as { mcplServerConfigs: Map<string, unknown> }).mcplServerConfigs;
+  for (const config of configs) known.set(config.id, config);
+}
 
 const PNG = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4////fwAJ+wP9KobjigAAAABJRU5ErkJggg==',
@@ -558,6 +567,7 @@ describe('save_recent_image provenance (issue #104)', () => {
         done,
       ],
       seedHistory: (framework) => {
+        configureServers(framework, [{ id: 'vst', url: 'wss://example.invalid' }]);
         framework.getAgent('prime')!.getContextManager().addMessage('user', [{
           type: 'tool_result',
           toolUseId: 'call_cam',
@@ -602,6 +612,7 @@ describe('save_recent_image provenance (issue #104)', () => {
         done,
       ],
       seedHistory: (framework) => {
+        configureServers(framework, [{ id: 'vst', url: 'wss://example.invalid' }]);
         framework.getAgent('prime')!.getContextManager().addMessage('user', [{
           type: 'tool_result',
           toolUseId: 'call_render',
@@ -624,6 +635,68 @@ describe('save_recent_image provenance (issue #104)', () => {
       assert.match(boundRefusal.content, new RegExp(`index 1 is a reference \\(${bound.refId}, image/png, from`));
       assert.match(boundRefusal.content, /Fetch it with fetch_reference and save the materialized file instead\./);
       assert.strictEqual(await fileBytes(h, 'files/unbound.png'), null);
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("a bound reference the fetcher would refuse before dialing refuses with the fetcher's own reason", async () => {
+    // Each bound to a server: one with no address (a stdio server), one whose
+    // address is on another origin, one the host doesn't know, one claimed
+    // over a fetch's ceiling, and one from a server whose budget is spent.
+    const register = (uri: string, serverId: string, sizeBytes?: number) => {
+      const c = classifyBlock({ type: 'image', uri, mimeType: 'image/png', ...(sizeBytes === undefined ? {} : { sizeBytes }) });
+      assert.strictEqual(c.kind, 'reference');
+      return referenceRegistry.register((c as { testimony: ReferenceTestimony }).testimony, serverId);
+    };
+    const spent = register('https://example.invalid/sri-spent.png', 'spent');
+    const big = register('https://example.invalid/sri-big.png', 'vst', 512 * 1024 * 1024);
+    const gone = register('https://example.invalid/sri-gone.png', 'gone');
+    const offOrigin = register('https://cdn.example.invalid/sri-off-origin.png', 'vst');
+    const noAddress = register('https://example.invalid/sri-no-address.png', 'stdio');
+    const h = await startTurn({
+      prefix: 'sri-reference-refused-',
+      responses: [
+        [saveCall('call_save0', { path: 'files/no-address.png', index: 0 })],
+        [saveCall('call_save1', { path: 'files/off-origin.png', index: 1 })],
+        [saveCall('call_save2', { path: 'files/gone.png', index: 2 })],
+        [saveCall('call_save3', { path: 'files/big.png', index: 3 })],
+        [saveCall('call_save4', { path: 'files/spent.png', index: 4 })],
+        done,
+      ],
+      seedHistory: (framework) => {
+        configureServers(framework, [
+          { id: 'vst', url: 'wss://example.invalid' },
+          { id: 'stdio', command: 'stdio-server' },
+          { id: 'spent', url: 'wss://example.invalid', autofetch: { maxTotalBytes: 0 } },
+        ]);
+        framework.getAgent('prime')!.getContextManager().addMessage('user', [{
+          type: 'tool_result',
+          toolUseId: 'call_refs',
+          toolName: 'mcpl--vst--render',
+          // Index 0 is the newest slot, the last line.
+          content: [spent, big, gone, offOrigin, noAddress].map((r) => `[${r.refId}] image/png — from tool result — fetch with fetch_reference`).join('\n'),
+          isError: false,
+        }] as ContentBlock[]);
+      },
+    });
+    try {
+      const budgetLasts = "the budget doesn't renew on its own, so calling again won't change that unless whoever runs this host raises or renews it";
+      const expected = [
+        ['call_save0', noAddress.refId, `It can't be fetched either — ${noAddressReason('stdio')}.`],
+        ['call_save1', offOrigin.refId, "It can't be fetched either — third-party origin (https://cdn.example.invalid != dialed https://example.invalid); not fetched by this host."],
+        ['call_save2', gone.refId, "It can't be fetched either — unknown server: gone."],
+        ['call_save3', big.refId, "It can't be fetched either — claimed 536870912 bytes exceeds fetch ceiling 268435456."],
+        ['call_save4', spent.refId, `It can't be fetched either — per-server fetch budget exhausted (0/0 bytes); ${budgetLasts}.`],
+      ] as const;
+      for (const [call, refId, reason] of expected) {
+        const refused = await waitForToolResult(h.framework, call);
+        assert.strictEqual(refused.isError, true);
+        assert.ok(refused.content.includes(`a reference (${refId}, image/png, from`), refused.content);
+        assert.ok(refused.content.includes(reason), refused.content);
+        assert.ok(!refused.content.includes('fetch_reference'), refused.content);
+      }
     } finally {
       await h.framework.stop();
       rmSync(h.tempDir, { recursive: true, force: true });
