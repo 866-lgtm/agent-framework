@@ -14,6 +14,7 @@
 import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
+import { safeSlice } from '../safe-slice.js';
 
 import type { ToolDefinition } from '../types/events.js';
 import type {
@@ -88,6 +89,11 @@ interface PendingEvent {
    *  newer ambient chatter when a batched wake picks its provenance — the same
    *  rule the framework applies to the turn's speech locus. */
   addressed: boolean;
+  /** The REGISTERED (composite) channel id the event arrived on, resolved by
+   *  the host at enqueue time. Differs from `channelId` for push events,
+   *  whose `channelId` is the adapter's raw id (a bare Discord snowflake for a
+   *  DM) — unroutable. Absent when the host could not resolve one. */
+  routeChannelId?: string;
 }
 
 /**
@@ -106,6 +112,15 @@ export interface WakeProvenance {
   counterparty?: string;
   /** True when the chosen event was `chat:addressed`. */
   addressed?: boolean;
+  /** Speech locus for the wake: the routable channel of the chosen event,
+   *  set ONLY when that event addressed the agent (mention / reply / DM) and
+   *  the host resolved its registered channel. A batched wake used to carry
+   *  no locus at all, so its reply fell back to the process-global
+   *  most-recent-inbound channel — which any ambient message elsewhere,
+   *  arriving a second after the DM that caused the wake, could retarget
+   *  (2026-09-30: a DM reply published into a guild channel). Ambient-only
+   *  batches still set nothing and keep the legacy fallback. */
+  routeChannelId?: string;
   /** Timestamp (ms) of the chosen event, so a consumer coalescing several
    *  requests can order by event recency, not by flush order. */
   at?: number;
@@ -190,7 +205,14 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
   let newest: PendingEvent | undefined;
   let newestAddressed: PendingEvent | undefined;
   for (const e of events) {
-    if (!e.channelId && !e.authorId) continue;
+    // A resolved route counts as naming a channel only for an ADDRESSED
+    // event: a push whose origin declares only `mcplChannelId` (no raw
+    // channel id, no author) is still a routable addressed message, and
+    // skipping it would leave its wake on the most-recent-inbound fallback.
+    // An ambient one stays out: the route is never reported for it, so as
+    // the pick it would carry no telemetry at all and hide an earlier event
+    // that names its channel and author.
+    if (!e.channelId && !e.authorId && !(e.addressed && e.routeChannelId)) continue;
     if (!newest || e.timestamp >= newest.timestamp) newest = e;
     if (e.addressed && (!newestAddressed || e.timestamp >= newestAddressed.timestamp)) newestAddressed = e;
   }
@@ -204,8 +226,18 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
     ...(channelId ? { channelId } : {}),
     ...(pick.authorId ? { counterparty: `${ns}:user:${pick.authorId}` } : {}),
     ...(pick.addressed ? { addressed: true } : {}),
+    ...(pick.addressed && pick.routeChannelId ? { routeChannelId: pick.routeChannelId } : {}),
     at: pick.timestamp,
   };
+}
+
+/**
+ * Default route-channel resolution when the host supplies none: a
+ * channel-incoming event's channel id is already the registered composite id;
+ * a push event's is the adapter's raw id, which only the host can map.
+ */
+function defaultRouteChannel(info: GateEventInfo): string | undefined {
+  return info.eventType === 'mcpl:channel-incoming' && info.channelId ? info.channelId : undefined;
 }
 
 /** Compact, log-friendly serialization of a GateBehavior. */
@@ -587,6 +619,7 @@ export class EventGate {
   ) => unknown;
   private requestInferenceFn: (agentName: string, reason: string, source: string, provenance?: WakeProvenance) => void;
   private getAgentNamesFn: () => string[];
+  private resolveRouteChannelFn: (info: GateEventInfo) => string | undefined;
   /** Clock injection — keeps the new rate_limit / passive_sample paths
    *  testable without monkey-patching Date.now globally. */
   private now: () => number;
@@ -608,6 +641,10 @@ export class EventGate {
     now?: () => number;
     /** Per-event timeout (ms) for the optional gate.js script. Default 50. */
     scriptTimeoutMs?: number;
+    /** Map an event to the registered channel it arrived on (the host knows
+     *  how push-event origins compose into channel ids). Default: a
+     *  channel-incoming event's own channel id; nothing for push events. */
+    resolveRouteChannel?: (info: GateEventInfo) => string | undefined;
   }) {
     this.configPath = opts.configPath;
     this.privilegedUsersPath = opts.privilegedUsersPath;
@@ -615,6 +652,7 @@ export class EventGate {
     this.addMessageFn = opts.addMessage;
     this.requestInferenceFn = opts.requestInference;
     this.getAgentNamesFn = opts.getAgentNames;
+    this.resolveRouteChannelFn = opts.resolveRouteChannel ?? defaultRouteChannel;
     this.now = opts.now ?? (() => Date.now());
     this.loadPrivileged();
 
@@ -1432,13 +1470,22 @@ export class EventGate {
   // Debounce
   // =========================================================================
 
+  /** Registered channel for an event; a resolver fault never breaks gating. */
+  private routeChannelFor(info: GateEventInfo): string | undefined {
+    try {
+      return this.resolveRouteChannelFn(info) || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   private handleDebounce(policy: GatePolicy, info: GateEventInfo): void {
     const debounceMs = (policy.behavior as { debounce: number }).debounce;
 
     const event: PendingEvent = {
       policyName: policy.name,
       content: info.content.length > MAX_CONTENT_SNIPPET
-        ? info.content.slice(0, MAX_CONTENT_SNIPPET) + '...'
+        ? safeSlice(info.content, 0, MAX_CONTENT_SNIPPET) + '...'
         : info.content,
       eventType: info.eventType,
       timestamp: Date.now(),
@@ -1451,6 +1498,7 @@ export class EventGate {
       authorId: this.extractAuthorId(info.metadata) ?? undefined,
       serverId: info.serverId || undefined,
       addressed: Array.isArray(info.tags) && info.tags.includes('chat:addressed'),
+      routeChannelId: this.routeChannelFor(info),
     };
 
     const existing = this.debounceTimers.get(policy.name);
@@ -1514,7 +1562,10 @@ export class EventGate {
     if (referenced.length > 0) {
       const byChannel = new Map<string, { count: number; oldest: number; label?: string }>();
       for (const e of referenced) {
-        const key = e.channelId ?? '(unknown channel)';
+        // The registered id when known, so this line names the channel the
+        // same way routing notices and send tools do (a push event's own
+        // channelId is the adapter's raw id).
+        const key = e.routeChannelId ?? e.channelId ?? '(unknown channel)';
         const entry = byChannel.get(key) ?? { count: 0, oldest: e.timestamp, label: e.channelLabel };
         entry.count += 1;
         entry.oldest = Math.min(entry.oldest, e.timestamp);
@@ -1523,8 +1574,10 @@ export class EventGate {
       }
       for (const [channelId, { count, oldest, label }] of byChannel) {
         // Prefer the human-readable name; keep the id parenthesized so the
-        // agent can still address tools that want the composite id.
-        const channel = label ? `#${label} (${channelId})` : channelId;
+        // agent can still address tools that want the composite id. A name
+        // may carry its own `#`, so one is added only where the name lacks
+        // it, as at the other places that add a `#`.
+        const channel = label ? `${label.startsWith('#') ? label : `#${label}`} (${channelId})` : channelId;
         const age = Math.round((Date.now() - oldest) / 1000);
         lines.push(
           `- ${count} message${count > 1 ? 's' : ''} in ${channel} ` +
@@ -1541,11 +1594,13 @@ export class EventGate {
       policies: policyNames,
     });
 
-    // Provenance of the batched wake (telemetry: who/where woke the agent):
-    // the newest ADDRESSED event first, else the newest event naming a
-    // channel or an author; channel + author + addressed from that ONE
-    // event. It does not set the turn's speech locus — the framework keeps
-    // its own routing rule for that.
+    // Provenance of the batched wake (who/where woke the agent): the newest
+    // ADDRESSED event first, else the newest event naming a channel or an
+    // author; channel + author + addressed from that ONE event. When that
+    // event addressed the agent and its registered channel is known,
+    // `routeChannelId` names the turn's speech locus too — the reply goes
+    // back to whoever addressed the agent, not to whichever channel last saw
+    // any traffic. Ambient-only batches carry telemetry only.
     const provenance = wakeProvenance(events);
     for (const agentName of this.getAgentNamesFn()) {
       this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);
@@ -1566,6 +1621,17 @@ export class EventGate {
       clearTimeout(selfWake);
       this.selfWakeTimers.delete(agentName);
     }
+  }
+
+  /** A turn that continues another (a budget restart, a tool-result-guard
+   *  retry) holds the entry its predecessor kept for it, and takes it again
+   *  where that entry ended in between: at a stop(), whose dispose() clears
+   *  every entry, or at a provider hold that kept the turn from starting,
+   *  whose end queues it again. Unlike onInferenceStarted it leaves a
+   *  pending self-wake alone: the logical turn that armed it is the one
+   *  still running. */
+  onInferenceResumed(agentName: string): void {
+    this.inferring.add(agentName);
   }
 
   onInferenceEnded(agentName: string): void {
@@ -1931,5 +1997,16 @@ export class EventGate {
     this.rateLimitDenied.clear();
     this.passiveSampleFires.clear();
     this.inferenceBuffer = [];
+    // stop() disposes the gate once its streams and event loop have ended (a
+    // turn still compiling then is dropped at its next check, before it sends
+    // anything), and a start() goes on with this gate. An agent left here by
+    // a turn whose exit didn't end it (a retry stop() cancelled, a successor
+    // stop() refused) would make every debounced batch buffer until that
+    // agent's next turn ended. A turn that continues after the start() takes
+    // its entry again (onInferenceResumed). A turn that a start() during the
+    // stop() began before this ran loses its entry too, and runs on without
+    // it, so debounced batches are delivered while it runs: nothing refuses
+    // a start() during a stop() yet.
+    this.inferring.clear();
   }
 }

@@ -92,6 +92,10 @@ export interface ToolResultEvent {
   agentName: string;
   /** Module that handled the call */
   moduleName: string;
+  /** The tool's name, as its call named it. The framework's own
+   *  producers set it, so a result nothing can take any more (one arriving
+   *  after stop()) is still logged by tool. */
+  toolName?: string;
   /** Result of the tool call */
   result: ToolResult;
 }
@@ -195,6 +199,18 @@ export interface ToolResult {
    * Adapted from Anarchid/agent-framework@mcpl-module-proto.
    */
   endTurn?: boolean;
+  /**
+   * Fields of `data` that say what the tool acted on, such as the paths a
+   * write wrote, removed or took from disk, the path it deleted, or a mount
+   * whose root it accepted, in the order they should be kept. When the
+   * tool-result guard withholds this result, these fields stay in its stub,
+   * so the agent still sees what the tool did; the result as stored goes
+   * where every withheld original goes (agent-framework #277). Past the
+   * inline cap they're cut, in this order, so a later field can be cut away
+   * entirely; put the short, telling ones first. Only data's own fields can
+   * be kept, and a failed result (success false) keeps nothing.
+   */
+  keepWhenWithheld?: string[];
 }
 
 /**
@@ -209,6 +225,19 @@ export interface ToolCall {
   input: unknown;
   /** The agent that made this tool call. Set by the framework dispatch layer. */
   callerAgentName?: string;
+  /**
+   * The turn the call was made in, the same id as that turn's
+   * `SpeechContext.turnId`. Set by the framework dispatch layer, beside
+   * `callerAgentName`: a model's call carries the turn whose stream made it, a
+   * foreground script's inner call the turn of the code_execution call whose
+   * script is running when the call arrives, and a utility run its `utils`
+   * call's. A background script runs apart from any turn, so its calls carry
+   * none. Ids increase, so a later turn's is larger, and they're unique only
+   * within one run of the process. A call made with `executeToolCall` or a
+   * module's `callTool` skips that layer and carries whatever turn its caller
+   * put on the call, usually none.
+   */
+  callerTurnId?: number;
 }
 
 // ============================================================================
@@ -231,6 +260,8 @@ export interface McplPushEvent {
   inferenceId: string;
   triggerInference?: boolean;
   targetAgents?: string[];
+  /** Host acceptance time (epoch ms), stamped where the push is admitted. */
+  acceptedAt?: number;
 }
 
 /**
@@ -249,4 +280,6 @@ export interface McplChannelIncomingEvent {
   metadata?: Record<string, unknown>;
   triggerInference?: boolean;
   targetAgents?: string[];
+  /** Host acceptance time (epoch ms), stamped where the message is admitted. */
+  acceptedAt?: number;
 }

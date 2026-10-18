@@ -15,6 +15,8 @@ import type { TraceEventListener } from './trace.js';
 export interface MessageQuery {
   /** Filter by external source (e.g., 'discord') */
   source?: string;
+  /** Filter by external IDs: messages whose metadata.external.id is one of these. An empty list filters nothing. */
+  externalIds?: string[];
   /** Filter by participant name */
   participant?: string;
   /** Filter by metadata fields (shallow match) */
@@ -53,7 +55,12 @@ export interface Module {
 
   /**
    * Stop the module.
-   * Called when the framework stops or when the module is removed.
+   * Called when the framework stops or when the module is removed. Also called
+   * when a create() that started the module fails (#389): create() stops the
+   * framework before it rejects, so before the host has it and before anything
+   * a host wires up after create() returns, such as a WorkspaceModule's
+   * initStore(). A stop() that saves state can therefore run before that
+   * wiring, and shouldn't then save over state it was handed and hasn't used.
    */
   stop(): Promise<void>;
 
@@ -108,6 +115,21 @@ export interface Module {
    * Adapted from Anarchid/agent-framework@mcpl-module-proto.
    */
   gatherContext?(agentName: string): Promise<ContextInjection[]>;
+
+  /**
+   * Called once an agent's tool batch has completed — when the round's last
+   * pending result arrives, before it is provided to the agent and before
+   * anything that continues the turn (re-inference, stream resume). The
+   * framework awaits it, bounded at 30 s and fail-open, so a module can
+   * bring its state up to date with what the batch's tools did (the
+   * workspace's `watch: 'on-agent-action'` mounts scan disk here) before the
+   * agent's next inference. It's awaited in the framework's event loop, so
+   * a slow hook holds every agent's event processing, not only this one's.
+   * A hook still running from an earlier batch is skipped, not called again.
+   * Not called for script-inner tool calls, nor when the framework fills in
+   * error results for a batch whose stream ended before its tools answered.
+   */
+  onToolBatchComplete?(agentName: string): Promise<void>;
 
   /**
    * Declare extra settings for the synthesized `agent_settings` tool.
@@ -169,8 +191,11 @@ export interface ModuleContext {
    * `modules/<module>/<name>`. Idempotent — safe to call on every start().
    * Items are appended with `appendToLog` (one O(item) record per append) and
    * point-edited with `editLogItem`; Chronicle's append_log snapshot cadence
-   * handles consolidation. `name` must not be 'state' (reserved for the main
-   * snapshot state) and must not contain '/'.
+   * handles consolidation. The cadence applies when the state is first
+   * registered: a store that already holds the state keeps the cadence it was
+   * registered with. `name` must not be 'state' (reserved for the main
+   * snapshot state) and must not contain '/'. A registration that fails
+   * throws, naming the state, and leaves the name unregistered.
    */
   registerLogState(
     name: string,
@@ -202,14 +227,19 @@ export interface ModuleContext {
   getLogLength(name: string): number;
 
   /**
-   * Process queue for pushing events from external listeners.
+   * Process queue for pushing events from external listeners. Once stop()
+   * has begun, a push is dropped with a log line naming this module, as
+   * pushEvent()'s is.
    * @deprecated Use pushEvent() instead — it also emits process:received traces.
    */
   readonly queue: ProcessQueue;
 
   /**
    * Push a process event to the queue and emit a process:received trace.
-   * Preferred over direct queue.push() for proper observability.
+   * Preferred over direct queue.push() for proper observability. Once stop()
+   * has begun, nothing will process the event: it's dropped with a log line
+   * naming this module, untraced, rather than thrown into the listener or
+   * stop() that pushed it.
    */
   pushEvent(event: ProcessEvent): void;
 
@@ -301,10 +331,15 @@ export interface ModuleContext {
    *
    * Modules use this to react to agent lifecycle without polling — e.g. an
    * adapter that wants to show a "typing" indicator can bracket it between
-   * `inference:started` and the terminal events (`inference:turn_ended`,
-   * `inference:aborted`, `inference:failed`, `inference:exhausted`), all of
-   * which carry `agentName`. The terminal events fire once per turn, after any
-   * tool-call cycles, so a single start/stop bracket spans the whole turn.
+   * `inference:started` and the terminal events: `inference:completed` (the
+   * model answered and the turn ended, with a final response or with a tool
+   * result that ended it, which `inference:turn_ended` then follows),
+   * `inference:aborted`, `inference:failed` and `inference:exhausted`, all of
+   * which carry `agentName`. A turn's tool-call cycles stay inside its
+   * stream, so one bracket spans them. A context-budget restart emits
+   * `inference:started` again with no terminal event for the stream it
+   * replaced, and a failing turn can emit `inference:failed` and then
+   * `inference:exhausted`, so a bracket should allow a repeated start or end.
    *
    * Returns an unsubscribe function. Call it in the module's `stop()` to avoid
    * leaking listeners across teardown/recreate (e.g. session switch).
@@ -355,14 +390,17 @@ export interface ProcessState {
   getActiveTools(): ToolDefinition[];
 
   /**
-   * Queue for emitting follow-up events.
+   * Queue for emitting follow-up events. Once stop() has begun, a push is
+   * dropped with a log line naming the module, as pushEvent()'s is.
    * @deprecated Use pushEvent() instead — it also emits process:received traces.
    */
   readonly queue: ProcessQueue;
 
   /**
    * Push a process event to the queue and emit a process:received trace.
-   * Preferred over direct queue.push() for proper observability.
+   * Preferred over direct queue.push() for proper observability. Once stop()
+   * has begun, the event is dropped with a log line naming the module,
+   * untraced.
    */
   pushEvent(event: ProcessEvent): void;
 }
@@ -485,6 +523,15 @@ export interface SpeechContext {
    * Empty when no tool calls were made.
    */
   thoughts?: ContentBlock[];
+
+  /**
+   * The turn this speech ends: the same id as `ToolCall.callerTurnId` on the
+   * calls made in it (its model's calls and its foreground scripts' inner
+   * calls), kept across the turn's streams (a context-budget restart or a
+   * retry), and larger for the agent's next turn. Unique only within one run
+   * of the process.
+   */
+  turnId?: number;
 }
 
 /**

@@ -9,10 +9,12 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
+import { EventEmitter } from 'node:events';
 
 import { AgentFramework } from '../src/framework.js';
 import { McplServerConnection } from '../src/mcpl/server-connection.js';
 import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
+import { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
 import { DiscordAwarenessOutbox } from '../src/recovery/discord-awareness-outbox.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
@@ -533,6 +535,86 @@ test('reconnect pauses fresh inbound data but permits registration and awareness
   }
 });
 
+test('a reconnect gate opens only after re-registration, even when the awareness drain settles first', async () => {
+  // The gate is global: marks pending for one server keep every data plane
+  // paused. Here the reconnecting server's re-registration (its §5.3 policy
+  // reply) is held while another server's drain finishes. The reconnecting
+  // server's data must wait for its grant, not only for the drain.
+  mkdirSync(TEST_ROOT, { recursive: true });
+  const dir = mkdtempSync(join(TEST_ROOT, 'awareness-reconnect-grant-'));
+  const outboxPath = join(dir, 'awareness.json');
+  const statusPath = join(dir, 'status.jsonl');
+  const crashPath = join(dir, 'crash');
+  const policyHoldPath = join(dir, 'release-policy');
+  const server = (id: 'discord' | 'heartbeat', env: Record<string, string>, reconnect = false): McplServerConfig => ({
+    id,
+    command: process.execPath,
+    args: [FIXTURE],
+    requestTimeoutMs: 0,
+    env: { STATUS_PATH: statusPath, LEDGER_PATH: outboxPath, SERVER_ID: id, ...env },
+    enabledFeatureSets: ['chat'],
+    ...(reconnect ? { reconnect: true, reconnectIntervalMs: 20, reconnectMaxIntervalMs: 20 } : {}),
+  });
+  const outbox = new DiscordAwarenessOutbox(outboxPath);
+  let framework: AgentFramework | undefined;
+  try {
+    framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      discordAwarenessOutboxPath: outboxPath,
+      discordAwarenessDeadlineMs: 1_000,
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'assistant', model: 'test', systemPrompt: 'test' }],
+      modules: [],
+      mcplServers: [
+        server('discord', {}),
+        server('heartbeat', {
+          CRASH_PATH: crashPath,
+          GENERATION_PATH: join(dir, 'heartbeat-generation'),
+          POLICY_HOLD_PATH: policyHoldPath,
+        }, true),
+      ],
+    });
+    await waitFor('both servers\' startup data answered', () => ['discord', 'heartbeat'].every((id) =>
+      records(statusPath).some((r) => r.serverId === id && r.generation === 1 && r.event === 'push-response')));
+
+    // A mark pending for discord, then the heartbeat server drops and comes back.
+    const batch = outbox.prepare({
+      agentName: 'assistant',
+      sourceBranch: 'source',
+      targetBranch: 'main',
+      activationPolicy: 'explicit',
+      refs: [{ serverId: 'discord', channelId: 'discord:guild:startup', messageId: 'message-3' }],
+    });
+    assert.ok(batch);
+    outbox.activate(batch.id);
+    writeFileSync(crashPath, 'crash');
+
+    await waitFor('the reconnect generation\'s policy held', () =>
+      records(statusPath).some((r) => r.serverId === 'heartbeat' && r.generation === 2 && r.event === 'policy-held'));
+    assert.ok(
+      records(statusPath).some((r) => r.serverId === 'heartbeat' && r.generation === 2 && r.event === 'data-request-sent'),
+      'the reconnected server has already sent the data its grant must hold',
+    );
+    await waitFor('discord\'s mark delivered while re-registration is held', () =>
+      outbox.batches()[0]?.refs[0]?.deliveryStatus === 'applied');
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(
+      records(statusPath).some((r) => r.serverId === 'heartbeat' && r.generation === 2 && r.event === 'push-response'),
+      false,
+      'the reconnected server\'s data waits for its grant, though the drain has settled',
+    );
+
+    writeFileSync(policyHoldPath, 'release');
+    await waitFor('the reconnected server\'s data after its grant', () =>
+      records(statusPath).some((r) => r.serverId === 'heartbeat' && r.generation === 2 && r.event === 'push-response'));
+    const push = records(statusPath).find((r) => r.serverId === 'heartbeat' && r.generation === 2 && r.event === 'push-response');
+    assert.equal(push?.accepted, true, 'delivered under the re-established grant, not rejected fail-closed');
+  } finally {
+    await framework?.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('startup fails explicitly when awareness reconciliation throws', async () => {
   mkdirSync(TEST_ROOT, { recursive: true });
   const dir = mkdtempSync(join(TEST_ROOT, 'awareness-reconcile-failure-'));
@@ -618,6 +700,261 @@ for (const writeMethod of ['recordSuccess', 'recordFailure'] as const) test(
     }
   },
 );
+
+/** A second fixture server, `heartbeat`, for a framework to serve from create(). */
+function heartbeatConfig(dir: string, overrides: Partial<McplServerConfig> = {}): McplServerConfig {
+  return {
+    id: 'heartbeat',
+    command: process.execPath,
+    args: [FIXTURE],
+    requestTimeoutMs: 1_000,
+    env: {
+      SERVER_ID: 'heartbeat',
+      STATUS_PATH: join(dir, 'heartbeat-status.jsonl'),
+      GENERATION_PATH: join(dir, 'heartbeat-generation'),
+    },
+    enabledFeatureSets: ['chat'],
+    ...overrides,
+  };
+}
+
+/**
+ * A framework serving `heartbeat`, then a runtime connect of `discord` whose
+ * first connect fails, so the registry holds a reconnect stub, and whose
+ * awareness accounting then fails (recordFailure throws). Serving another
+ * server brings MCPL up at create(), so the runtime connect is the one that
+ * accounts for the pending work: brought up lazily by that connect, MCPL
+ * would account for it in its own startup barrier first. A failure after
+ * create() stops the framework, so no child outlives the test.
+ */
+async function failRuntimeConnectWhileServing(dir: string, heartbeatOverrides: Partial<McplServerConfig> = {}) {
+  const statusPath = join(dir, 'status.jsonl');
+  const heartbeatStatusPath = join(dir, 'heartbeat-status.jsonl');
+  const { outboxPath, config } = frameworkConfig(dir, {
+    STATUS_PATH: statusPath,
+    LEDGER_PATH: join(dir, 'awareness.json'),
+    GENERATION_PATH: join(dir, 'generation'),
+    FAIL_INITIAL_GENERATION: '1',
+  }, 1_000, {
+    reconnect: true,
+    // A stub waiting a minute for its retry is down between retries when the
+    // accounting failure closes it: the close that emits no 'close'.
+    reconnectIntervalMs: 60_000,
+    reconnectMaxIntervalMs: 60_000,
+  });
+  const discord = config.mcplServers[0]!;
+  const heartbeat = heartbeatConfig(dir, heartbeatOverrides);
+  const framework = await AgentFramework.create({ ...config, mcplServers: [heartbeat] });
+  try {
+    const traces: Array<{ type: string; serverId?: string; error?: string }> = [];
+    framework.onTrace((event) => traces.push(event as never));
+    preparePending(outboxPath);
+    const prototype = DiscordAwarenessOutbox.prototype as any;
+    const original = prototype.recordFailure;
+    prototype.recordFailure = () => { throw new Error('injected recordFailure write failure'); };
+    try {
+      await assert.rejects(
+        framework.connectMcplServer(discord),
+        /awareness accounting failed.*injected recordFailure write failure/i,
+      );
+    } finally {
+      prototype.recordFailure = original;
+    }
+    assert.equal(
+      records(statusPath).filter((record) => record.event === 'initial-connect-failure').length,
+      1,
+      'the first connect failed, so the registry held a reconnect stub',
+    );
+    // The catch closes the refused connection before it fails the gate, so
+    // the gate's failure finds it gone from the registry and doesn't trace or
+    // recycle it.
+    assert.equal(
+      traces.some((trace) => trace.type === 'mcpl:server-error'
+        && trace.serverId === discord.id
+        && /accounting unhealthy/.test(trace.error ?? '')),
+      false,
+      'the refused connection was out of the registry when the gate failed',
+    );
+    return { framework, discord, heartbeatStatusPath, traces };
+  } catch (error) {
+    await framework.stop();
+    throw error;
+  }
+}
+
+test('a runtime connect whose awareness accounting fails frees the id of the reconnect stub it closed, and closes a running server without reconnect: true for good', async () => {
+  mkdirSync(TEST_ROOT, { recursive: true });
+  const dir = mkdtempSync(join(TEST_ROOT, 'awareness-runtime-stub-'));
+  let framework: AgentFramework | undefined;
+
+  try {
+    const failed = await failRuntimeConnectWhileServing(dir);
+    framework = failed.framework;
+
+    // The running server has no reconnect: true, so the failed gate's
+    // recycle closed it for good: neither connected and held, nor retrying.
+    await waitFor('the running server closed for good', () => {
+      const heartbeat = failed.framework.listMcplServers().find((server) => server.id === 'heartbeat');
+      return heartbeat !== undefined && !heartbeat.connected && !heartbeat.retrying;
+    }, 10_000);
+
+    // Connecting the id again reaches the server: a stub left registered
+    // would fail this connect as already registered.
+    await framework.connectMcplServer(failed.discord);
+    assert.equal(framework.listMcplServers().find((server) => server.id === 'discord')?.connected, true);
+  } finally {
+    await framework?.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a runtime connect whose awareness accounting fails fails its gate, so a running server is recycled rather than held', async () => {
+  mkdirSync(TEST_ROOT, { recursive: true });
+  const dir = mkdtempSync(join(TEST_ROOT, 'awareness-runtime-gate-'));
+  let framework: AgentFramework | undefined;
+
+  try {
+    const failed = await failRuntimeConnectWhileServing(dir, {
+      reconnect: true,
+      reconnectIntervalMs: 20,
+      reconnectMaxIntervalMs: 20,
+    });
+    framework = failed.framework;
+    assert.ok(
+      failed.traces.some((trace) => trace.type === 'mcpl:server-error'
+        && trace.serverId === 'heartbeat'
+        && /accounting unhealthy/.test(trace.error ?? '')),
+      'the gate failed for the running server, as a failed gate on the other runtime paths does',
+    );
+
+    // Recycled, the server reconnects, and its data flows once its
+    // reconnect's accounting succeeds: the new process's startup push is
+    // answered.
+    await waitFor('the recycled server\'s startup push answered', () =>
+      records(failed.heartbeatStatusPath).some((record) =>
+        record.generation === 2 && record.event === 'push-response'), 10_000);
+  } finally {
+    await framework?.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * A framework serving `heartbeat`, then a runtime connect of `discord` whose
+ * awareness accounting succeeds and whose §5.3 policy registration throws
+ * (initializeServer made to throw for it). With `closeFails`, the close that
+ * follows fails once in its transport close, after close() has marked the
+ * connection closed for good, as a real one fails. Returns the framework with
+ * every patch undone; a failure before then stops it.
+ */
+async function failPolicyRegistrationWhileServing(dir: string, closeFails: boolean) {
+  const { config } = frameworkConfig(dir, {
+    STATUS_PATH: join(dir, 'status.jsonl'),
+    LEDGER_PATH: join(dir, 'awareness.json'),
+    GENERATION_PATH: join(dir, 'generation'),
+  });
+  const discord = config.mcplServers[0]!;
+  const framework = await AgentFramework.create({ ...config, mcplServers: [heartbeatConfig(dir)] });
+  try {
+    const traces: Array<{ type: string; serverId?: string; error?: string }> = [];
+    framework.onTrace((event) => traces.push(event as never));
+    const features = FeatureSetManager.prototype as any;
+    const initializeServer = features.initializeServer;
+    features.initializeServer = function (this: unknown, serverId: string, ...rest: unknown[]) {
+      if (serverId === discord.id) throw new Error('injected policy registration failure');
+      return initializeServer.call(this, serverId, ...rest);
+    };
+    const connections = McplServerConnection.prototype as any;
+    const close = connections.close;
+    let closeFailed = false;
+    connections.close = function (this: any) {
+      if (closeFails && this.id === discord.id && !closeFailed && this.transport) {
+        closeFailed = true;
+        const transport = this.transport;
+        const transportClose = transport.close;
+        transport.close = () => {
+          transport.close = transportClose;
+          return Promise.reject(new Error('injected close failure'));
+        };
+      }
+      return close.call(this);
+    };
+    try {
+      // The connect reports its own failure, not the close's.
+      await assert.rejects(framework.connectMcplServer(discord), /injected policy registration failure/);
+    } finally {
+      features.initializeServer = initializeServer;
+      connections.close = close;
+    }
+    assert.equal(closeFailed, closeFails, 'the close failed only when asked to');
+    const internals = framework as unknown as {
+      discordAwarenessBarrier: unknown;
+      mcplServerRegistry: { getServer(id: string): unknown };
+    };
+    assert.equal(internals.discordAwarenessBarrier, null, 'the failed connect completed the gate it installed');
+    const running = internals.mcplServerRegistry.getServer('heartbeat') as { isConnected: boolean; dataPlaneReady: boolean };
+    assert.equal(running.isConnected, true, 'accounting succeeded, so the running server was not recycled');
+    assert.equal(running.dataPlaneReady, true, 'the running server\'s data flows');
+    assert.equal(
+      traces.some((trace) => trace.type === 'mcpl:server-error' && /accounting unhealthy/.test(trace.error ?? '')),
+      false,
+      'no gate failed',
+    );
+    return { framework, discord, registry: internals.mcplServerRegistry };
+  } catch (error) {
+    await framework.stop();
+    throw error;
+  }
+}
+
+test('a runtime connect whose policy registration throws closes its connection for good and completes its gate, so a running server keeps its data', async () => {
+  mkdirSync(TEST_ROOT, { recursive: true });
+  const dir = mkdtempSync(join(TEST_ROOT, 'awareness-runtime-policy-'));
+  let framework: AgentFramework | undefined;
+
+  try {
+    const failed = await failPolicyRegistrationWhileServing(dir, false);
+    framework = failed.framework;
+    assert.equal(failed.registry.getServer(failed.discord.id), null, 'the half-registered connection was closed for good');
+
+    // Connecting the id again reaches the server.
+    await framework.connectMcplServer(failed.discord);
+    assert.equal(framework.listMcplServers().find((server) => server.id === failed.discord.id)?.connected, true);
+  } finally {
+    await framework?.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a runtime connect whose policy registration throws and whose close then fails keeps that connection registered and paused through later gates, and logs the close', async (t) => {
+  mkdirSync(TEST_ROOT, { recursive: true });
+  const dir = mkdtempSync(join(TEST_ROOT, 'awareness-runtime-policy-close-'));
+  const logged: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+  let framework: AgentFramework | undefined;
+
+  try {
+    const failed = await failPolicyRegistrationWhileServing(dir, true);
+    framework = failed.framework;
+    // A close that fails keeps the entry, so a later disconnect, restart or
+    // shutdown can close it again. Closed for good, it readies nothing: not
+    // at this connect's completion, and not at a later gate's.
+    const refused = failed.registry.getServer(failed.discord.id) as { dataPlaneReady: boolean; willReconnect: boolean } | null;
+    assert.ok(refused, 'the connection whose close failed is still registered');
+    assert.equal(refused.willReconnect, false, 'its close had disarmed it before the transport close failed');
+    assert.equal(refused.dataPlaneReady, false, 'the gate\'s completion left the refused connection paused');
+    await failed.framework.syncDiscordAwarenessMarkers();
+    assert.equal(refused.dataPlaneReady, false, 'a later gate\'s completion leaves it paused too');
+    assert.ok(
+      logged.some((line) => line.includes(`could not close MCPL server "${failed.discord.id}" after its policy registration failed`)
+        && line.includes('injected close failure')),
+      'the failed close was logged',
+    );
+  } finally {
+    await framework?.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test('runtime reconciliation failure recycles the connection and keeps fresh data gated', async () => {
   mkdirSync(TEST_ROOT, { recursive: true });
@@ -736,6 +1073,43 @@ test('a control flush that installs a newer generation cannot be released by the
   assert.equal(readyCalls, 1);
 });
 
+test('while the host stops, a failed gate lets out what a running connection held, and nothing of one closed for good', async () => {
+  const framework = Object.create(AgentFramework.prototype) as any;
+  framework.discordAwarenessBarrier = null;
+  framework.discordAwarenessBarrierGeneration = 0;
+  framework.beginDiscordAwarenessBarrier = () => ({ requiresBarrier: true, promise: new Promise(() => {}) });
+  framework.queue = { isClosed: true }; // stop() has closed the queue
+  framework.emitTrace = () => {};
+  const running = Reflect.construct(McplServerConnection, ['running', null, null]) as McplServerConnection;
+  const closing = Reflect.construct(McplServerConnection, ['closing', null, null]) as McplServerConnection;
+  framework.mcplServerRegistry = { getAllServers: () => [running, closing] };
+  const delivered: string[] = [];
+  for (const connection of [running, closing]) {
+    connection.on('stderr', () => delivered.push(`${connection.id} control`));
+    connection.on('held-data', () => delivered.push(`${connection.id} data`));
+  }
+
+  // Each connection holds a control event and a data event behind the gate.
+  const barrier = framework.installMcplDataPlaneGate();
+  for (const connection of [running, closing]) {
+    connection.emit('stderr', 'a line');
+    connection.emit('held-data', {});
+  }
+  assert.deepEqual(delivered, []);
+
+  // closeAll has begun closing one of them, and that close is still under
+  // way while the gate is released and then failed: close() closes the
+  // connection for good as it starts.
+  const closed = closing.close();
+  framework.releaseMcplDataPlaneGate(barrier);
+  assert.deepEqual(delivered, ['running control'], 'only the running connection lets out its control traffic');
+  await framework.failMcplDataPlaneGate(barrier, 'test sync', new Error('accounting failed'));
+  assert.equal(framework.discordAwarenessBarrier, null, 'the stopping host released the failed gate');
+  assert.deepEqual(delivered, ['running control', 'running data'],
+    'the running connection\'s held data reaches its listeners, and the closing one lets out nothing');
+  await closed;
+});
+
 test('overlapping reconnect/list-change generations release only the newest barrier', async () => {
   const reconnectDrain = deferred<any>();
   const listChangeDrain = deferred<any>();
@@ -770,6 +1144,94 @@ test('overlapping reconnect/list-change generations release only the newest barr
   await listChangeBarrier.promise;
   framework.completeMcplDataPlaneGate(listChangeBarrier);
   assert.equal(readyCalls, 1);
+});
+
+test('inbound handlers wait out a generation installed while they wait', async () => {
+  const framework = Object.create(AgentFramework.prototype) as any;
+  const first = deferred<any>();
+  const second = deferred<any>();
+  framework.discordAwarenessBarrier = { generation: 1, requiresBarrier: true, promise: first.promise };
+  const handled: string[] = [];
+  framework.pushHandler = { handlePushEvent: async () => { handled.push('push-event'); } };
+  framework.inferenceRouter = { handleInferenceRequest: async () => { handled.push('inference-request'); } };
+  framework.channelRegistry = { handleIncoming: async () => { handled.push('channels-incoming'); } };
+  framework.handleHostCommand = async () => { handled.push('host-command'); return { ok: true }; };
+  const connection = new EventEmitter() as any;
+  connection.id = 'discord';
+  framework.wireMcplEvents(connection);
+  const responder = { id: 1, respond: () => {}, respondError: () => {} };
+  for (const event of ['push-event', 'inference-request', 'channels-incoming', 'host-command']) {
+    connection.emit(event, {}, responder);
+  }
+
+  // A newer generation is armed while the handlers wait on the first.
+  framework.discordAwarenessBarrier = { generation: 2, requiresBarrier: true, promise: second.promise };
+  first.resolve({ status: 'delivered', delivered: 0, failed: 0 });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(handled, [], 'no handler runs behind the newer generation');
+
+  framework.discordAwarenessBarrier = null;
+  second.resolve({ status: 'delivered', delivered: 0, failed: 0 });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(handled.sort(), ['channels-incoming', 'host-command', 'inference-request', 'push-event']);
+});
+
+test('an inbound handler waiting on a generation that fails refuses its request and never runs it', async () => {
+  // A generation fails when the awareness ledger can't be read or written, so
+  // its marks were not all attempted: nothing that waited behind it may run,
+  // and each request is answered with the failure rather than left waiting.
+  const framework = Object.create(AgentFramework.prototype) as any;
+  // Each refused request is reported as a handler failure, through
+  // emitTrace, which iterates the trace listeners a constructed framework
+  // always has (#318's registrations, which onTrace makes).
+  framework.traceListeners = [];
+  const failing = deferred<any>();
+  framework.discordAwarenessBarrier = { generation: 1, requiresBarrier: true, promise: failing.promise };
+  const handled: string[] = [];
+  framework.pushHandler = { handlePushEvent: async () => { handled.push('push-event'); } };
+  framework.inferenceRouter = { handleInferenceRequest: async () => { handled.push('inference-request'); } };
+  framework.channelRegistry = { handleIncoming: async () => { handled.push('channels-incoming'); } };
+  framework.handleHostCommand = async () => { handled.push('host-command'); return { ok: true }; };
+  const connection = new EventEmitter() as any;
+  connection.id = 'discord';
+  framework.wireMcplEvents(connection);
+  const answers: Array<{ event: string; code?: number; result?: unknown }> = [];
+  for (const event of ['push-event', 'inference-request', 'channels-incoming', 'host-command']) {
+    connection.emit(event, {}, {
+      id: 1,
+      respond: (result: unknown) => { answers.push({ event, result }); },
+      respondError: (code: number) => { answers.push({ event, code }); },
+    });
+  }
+
+  failing.reject(new Error('injected accounting failure'));
+  await waitFor('every request to be answered', () => answers.length === 4);
+  assert.deepEqual(handled, [], 'nothing runs behind a failed generation');
+  assert.deepEqual(
+    answers.sort((a, b) => a.event.localeCompare(b.event)),
+    ['channels-incoming', 'host-command', 'inference-request', 'push-event'].map((event) => ({ event, code: -32603 })),
+    'each request is refused with the failure',
+  );
+});
+
+test('with no generation current, an inbound event is handled in the turn it arrives', () => {
+  // The push coalescer orders a push against its retraction by arrival, so a
+  // handler with no gate to wait out must not yield first.
+  const framework = Object.create(AgentFramework.prototype) as any;
+  framework.discordAwarenessBarrier = null;
+  const handled: string[] = [];
+  framework.pushHandler = { handlePushEvent: async () => { handled.push('push-event'); } };
+  framework.inferenceRouter = { handleInferenceRequest: async () => { handled.push('inference-request'); } };
+  framework.channelRegistry = { handleIncoming: async () => { handled.push('channels-incoming'); } };
+  framework.handleHostCommand = async () => { handled.push('host-command'); return { ok: true }; };
+  const connection = new EventEmitter() as any;
+  connection.id = 'discord';
+  framework.wireMcplEvents(connection);
+  const responder = { id: 1, respond: () => {}, respondError: () => {} };
+  for (const event of ['push-event', 'inference-request', 'channels-incoming', 'host-command']) {
+    connection.emit(event, {}, responder);
+  }
+  assert.deepEqual(handled.sort(), ['channels-incoming', 'host-command', 'inference-request', 'push-event']);
 });
 
 test('synchronous zero-pending flush rechecks the gate after a nested list change', () => {

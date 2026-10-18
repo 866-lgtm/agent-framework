@@ -2,12 +2,13 @@
 export * from './types/index.js';
 
 // Core classes
-export { AgentFramework, BudgetPreflightError, ResumeBlockedError } from './framework.js';
+export { AgentFramework, BudgetPreflightError, ProviderWaitNotSleptError, QuiesceBlockedError, ResumeBlockedError } from './framework.js';
 export type { RuntimeSettingsPreview, HostModeStatus } from './framework.js';
 export { Agent } from './agent.js';
 export type { StartStreamResult } from './agent.js';
 export { ProcessQueueImpl } from './queue.js';
 export { ModuleRegistry } from './module-registry.js';
+export { ShutdownTimeoutError, DEFAULT_SHUTDOWN_TIMEOUT_MS } from './shutdown.js';
 export { formatZonedDateTime, formatZonedTime, isValidTimeZone, resolveTimeZone } from './timezone.js';
 export { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
 
@@ -16,7 +17,7 @@ export * from './modules/index.js';
 
 // API
 export { ApiServer } from './api/server.js';
-export { McpServer } from './api/mcp-server.js';
+export { McpServer } from './api/mcp-server-core.js';
 export type {
   ApiServerConfig,
   ApiMessage,
@@ -83,6 +84,15 @@ export type { GateConfig, GateOptions, GatePolicy, GatePolicyMatch, GateBehavior
 // MCPL channel registry (exposed for modules that need channel-level operations)
 export { ChannelRegistry } from './mcpl/index.js';
 
+// Where each accepted inbound item came from (`metadata.inboundSource`)
+export { INBOUND_SOURCE_KEY, readInboundSource, conversationKey } from './mcpl/index.js';
+export type {
+  InboundSource,
+  InboundChannelSource,
+  InboundUnscopedSource,
+  InboundSurfaceSource,
+} from './mcpl/index.js';
+
 // MCPL server config (exposed for hosts that manage servers at runtime via
 // connectMcplServer / disconnectMcplServer / restartMcplServer)
 export type { McplServerConfig } from './mcpl/index.js';
@@ -90,8 +100,8 @@ export type { McplServerConfig } from './mcpl/index.js';
 // MCPL client connection (exposed so external tooling — server playtests,
 // health probes, protocol harnesses — can dial an MCPL server exactly the
 // way the framework host does, over stdio or WebSocket)
-export { McplServerConnection } from './mcpl/index.js';
-export type { McplHostCapabilities } from './mcpl/index.js';
+export { McplServerConnection, McplRequestError } from './mcpl/index.js';
+export type { McplHostCapabilities, McplConnectionCloseInfo } from './mcpl/index.js';
 
 // MCPL tool lifecycle (RFC-007) and tool classes (RFC-008): the types a host
 // needs to write McplServerConfig.toolLifecycle policy and class tables, and
@@ -99,6 +109,7 @@ export type { McplHostCapabilities } from './mcpl/index.js';
 export { TOOL_CLASSES, DEFAULT_INPUT_CLASSES, globMatch } from './mcpl/index.js';
 export type {
   ToolClass,
+  ToolClassSource,
   ToolLifecycleConfig,
   ToolLifecycleNarrowing,
   ToolLifecycleParams,
@@ -106,7 +117,9 @@ export type {
 } from './mcpl/index.js';
 
 // Per-channel conversation routing
+/** @deprecated Per-channel conversation routing is deprecated and will be removed (anima-research/agent-framework#235). */
 export { ConversationRouter, DEFAULT_CLOSURE_PROMPT } from './mcpl/index.js';
+/** @deprecated Per-channel conversation routing is deprecated and will be removed (anima-research/agent-framework#235). */
 export type {
   ConversationRouterConfig,
   ConversationBinding,
@@ -139,9 +152,22 @@ export type {
 } from './recovery/discord-awareness-outbox.js';
 // Live operator surgery (rollback / suppress) and its durable action log
 export { OperatorLog, OperatorActionError, defaultOperatorLogPath } from './operator-log.js';
-export type { OperatorLogEntry, OperatorLogInput, OperatorRequester } from './operator-log.js';
+export type {
+  OperatorLogEntry,
+  OperatorLogInput,
+  OperatorRequester,
+  SurgeryMarkerReceipt,
+} from './operator-log.js';
 export { createOfflineRecoveryBranch } from './recovery/offline-branch.js';
 export type {
   OfflineRecoveryBranchOptions,
   OfflineRecoveryBranchResult,
 } from './recovery/offline-branch.js';
+
+export * from "./tool-presentation.js";
+export {
+  SILENT_HEARTBEAT_SEPARATOR,
+  silentHeartbeatOf,
+  type SilentHeartbeatStamp,
+  type SilentHeartbeatTick,
+} from './silent-heartbeat.js';

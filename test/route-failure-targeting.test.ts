@@ -166,7 +166,7 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(primary.mock.callCount(), 1);
       assert.equal(secondary.mock.callCount(), 0);
       assert.equal(primary.mock.calls[0]!.arguments[2]?.kind, 'discord-send-failed');
-      assert.match(JSON.stringify(primary.mock.calls[0]!.arguments[1]), /Your previous reply \(5 chars\) could not be delivered to the channel/);
+      assert.match(JSON.stringify(primary.mock.calls[0]!.arguments[1]), /\[send-undeliverable\] Your previous reply \(5 chars\) had no channel to go to/);
       assert.equal(internals(framework).pendingRequests.length, 0);
     });
 
@@ -259,20 +259,21 @@ describe('notices about an agent\'s own action', () => {
       assert.ok(errors.some((e) => e.includes('[route-failure] released-conversation has ended, and its reply had no channel to reach')));
     });
 
-    it('lands an ephemeral run\'s last failure notice in its own window before releasing it', async (t) => {
+    it('tells no one, logged, when an ephemeral run\'s final reply had no channel to reach, before or after its release', async (t) => {
       const errors: string[] = [];
       t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
       const speech = 'Worker speech with no channel to go to.';
 
       const archived = await runEphemeral('locus', speech);
 
-      const replyIndex = archived.findIndex((m) => m.participant === 'worker' && JSON.stringify(m.content).includes(speech));
-      const noticeIndex = archived.findIndex((m) => JSON.stringify(m.content).includes(SEND_FAILED));
-      assert.ok(replyIndex >= 0, 'the run\'s reply is archived');
-      assert.ok(noticeIndex > replyIndex, 'its failure notice follows the reply in its own window');
-      assert.equal(count(archived, SEND_FAILED), 1);
+      // The run settles before its final reply is routed, so its release and
+      // the reply's failure can come in either order: the notice lands in its
+      // window and is read at its release, or the failure finds it gone. Either
+      // way, a reply that had no channel to reach is passed on to no one.
+      assert.ok(archived.some((m) => m.participant === 'worker' && JSON.stringify(m.content).includes(speech)), 'the run\'s reply is archived');
       const { messages } = await framework.getAgent('primary')!.getContextManager().compile();
-      assert.equal(count(messages, SEND_FAILED), 0, 'the primary did not write that reply');
+      assert.equal(count(messages, 'Your previous reply'), 0, 'the primary did not write that reply');
+      assert.equal(count(messages, 'A reply by worker'), 0);
       assert.ok(!errors.some((e) => /not a registered agent/.test(e)));
       assert.ok(errors.some((e) => e.includes('[route-failure] worker has ended, and its reply had no channel to reach')));
       assert.equal(internals(framework).deferredMessages.length, 0);
@@ -282,9 +283,11 @@ describe('notices about an agent\'s own action', () => {
       (internals(framework).channelRegistry as unknown as { defaultPublishChannel: string | null }).defaultPublishChannel = 'missing-channel';
       const speech = 'Worker speech for a channel that is not registered.';
 
-      const archived = await runEphemeral('locus', speech);
+      await runEphemeral('locus', speech);
 
-      assert.equal(count(archived, '[discord-send-failed] Your previous reply'), 1, 'the run keeps its own record');
+      // Whether the delivery fails before the run's release (its window's
+      // notice is passed on at release) or after it (the failure finds it
+      // gone), the primary is told once, by name.
       const { messages } = await framework.getAgent('primary')!.getContextManager().compile();
       const named = messages.filter((m) => JSON.stringify(m.content).includes(SEND_FAILED));
       assert.equal(named.length, 1);
@@ -303,10 +306,9 @@ describe('notices about an agent\'s own action', () => {
       const errors: string[] = [];
       t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
 
-      const archived = await runEphemeral('locus', 'Worker speech for a channel that is not registered.');
+      await runEphemeral('locus', 'Worker speech for a channel that is not registered.');
 
       assert.equal(framework.getAgent('worker'), null, 'the run is released');
-      assert.equal(count(archived, '[discord-send-failed] Your previous reply'), 1);
       assert.ok(errors.some((e) => e.includes('[route-failure] failed to tell the primary that worker\'s reply to missing-channel failed')));
     });
 
@@ -335,7 +337,6 @@ describe('notices about an agent\'s own action', () => {
         });
         const { messages } = await archive.compile();
         assert.equal(count(messages, 'A reply by worker'), 0, 'the run is not told about itself');
-        assert.equal(count(messages, '[discord-send-failed] Your previous reply'), 1);
         assert.ok(errors.some((e) => e.includes('[route-failure] worker has ended, and there is no primary to tell that its reply to missing-channel failed')));
       } finally {
         await bare.stop();
@@ -343,13 +344,17 @@ describe('notices about an agent\'s own action', () => {
       }
     });
 
-    it('sends an ephemeral run\'s bounced prose notice to its own window, beside its clipboard', async (t) => {
+    it('keeps an ephemeral run\'s bounced prose notice to its own window, or drops it, logged, once the run is released', async (t) => {
       const errors: string[] = [];
       t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
 
       const archived = await runEphemeral('explicit', 'Worker prose with no destination.');
 
-      assert.equal(count(archived, BOUNCED), 1, 'the speaker reads why its text did not go out');
+      // The run settles before its final prose is routed, so the bounce can
+      // come before or after its release: its notice lands in its own window,
+      // or, once it's gone, is dropped, logged, and passed to no one.
+      const dropped = errors.some((e) => e.includes('[notice] worker is no longer registered, so its prose-bounce notice is dropped'));
+      assert.equal(count(archived, BOUNCED) + (dropped ? 1 : 0), 1, 'the notice lands in its own window or is dropped, once');
       const { messages } = await framework.getAgent('primary')!.getContextManager().compile();
       assert.equal(count(messages, BOUNCED), 0, 'the primary wrote no such text, and is not told of it');
       assert.ok(!errors.some((e) => e.includes('[route-failure]')), 'a bounce is not a failed reply');
@@ -630,11 +635,9 @@ describe('notices about an agent\'s own action', () => {
           await framework.resume({ force: true });
         }
         assert.equal(framework.getAgent(fork.name), null, 'the fork is disposed when its closure turn ends');
-        if (condition === 'other-tool-cycle') {
-          // The primary's notice waits for the shared slot's tool cycle.
-          assert.equal(state.deferredMessages.length, 1);
-          await state.flushDeferredWrites('the primary\'s next boundary');
-        }
+        // other-tool-cycle: a write waits only for its own target's tool
+        // cycle, so neither the fork's notice nor the primary's waits for the
+        // secondary's.
         assert.equal(state.deferredMessages.length, 0, 'nothing is left queued');
         assert.equal(state.unackedDeferredWrites.length, 0, 'nor waiting in the recovery queue');
         // Open a fresh manager over the retained fork namespace, rather than

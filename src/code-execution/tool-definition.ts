@@ -9,15 +9,21 @@
  */
 
 import type { ToolDefinition } from '../types/index.js';
+import { kindOf } from '../mcpl/transport.js';
+import { formatLimit, MAX_TIMER_MS } from './py-runner.js';
 
 export const CODE_EXECUTION_TOOL_NAME = 'code_execution';
 
 export function buildCodeExecutionToolDefinition(opts?: {
   idleReclaimMs?: number;
   toolCallTimeoutMs?: number;
+  scriptTimeoutMs?: number;
+  maxScriptTimeoutMs?: number;
+  backgroundMaxLifetimeMs?: number;
 }): ToolDefinition {
   const idleMinutes = Math.max(1, Math.round((opts?.idleReclaimMs ?? 300_000) / 60_000));
   const callTimeoutSeconds = Math.round((opts?.toolCallTimeoutMs ?? 270_000) / 1000);
+  const limits = scriptTimeLimits(opts);
   return {
     name: CODE_EXECUTION_TOOL_NAME,
     description:
@@ -36,6 +42,9 @@ export function buildCodeExecutionToolDefinition(opts?: {
       'what you need. Interpreter state (variables, imports) persists across code_execution ' +
       `calls but is reclaimed after ~${idleMinutes} minutes idle. A tool call that receives no ` +
       `response within ~${callTimeoutSeconds}s raises TimeoutError inside the script. ` +
+      `A foreground script is stopped after ${formatLimit(limits.defaultMs)}; pass time_limit_ms to set this call's limit ` +
+      `(at most ${formatLimit(limits.maxMs)}; a background script runs up to ${formatLimit(limits.backgroundMaxMs)}). ` +
+      'Stopping a script does not stop tools it already called. ' +
       'Use this when fanning out across many items, looping over tool calls, or when tool ' +
       'results are large and you only need a slice or summary. Call tools directly (not via ' +
       'code) when a single call answers the question or when you need to reason about each ' +
@@ -72,8 +81,72 @@ export function buildCodeExecutionToolDefinition(opts?: {
           type: 'string',
           description: 'Background script id (for action: cancel).',
         },
+        time_limit_ms: {
+          type: 'integer',
+          description:
+            `Time limit for this script in milliseconds; it is stopped when the limit is reached. ` +
+            `Default ${limits.defaultMs}, at most ${limits.maxMs}; a background script defaults to and is capped at ` +
+            `its ${formatLimit(limits.backgroundMaxMs)} lifetime.`,
+        },
       },
       required: [],
     },
   };
+}
+
+/**
+ * A script's time limits: the default, the most an agent may ask for with
+ * `time_limit_ms`, and the background lifetime (default and ceiling at once).
+ */
+export function scriptTimeLimits(opts?: {
+  scriptTimeoutMs?: number;
+  maxScriptTimeoutMs?: number;
+  backgroundMaxLifetimeMs?: number;
+}): { defaultMs: number; maxMs: number; backgroundMaxMs: number } {
+  // Every limit fits Node's timer range (MAX_TIMER_MS, ~24.8 days).
+  const defaultMs = Math.min(MAX_TIMER_MS, opts?.scriptTimeoutMs ?? 600_000);
+  return {
+    defaultMs,
+    // A ceiling below the default is refused when a framework with code
+    // execution on is created (validateCodeExecutionConfig); never below the
+    // default here either.
+    maxMs: Math.min(MAX_TIMER_MS, Math.max(defaultMs, opts?.maxScriptTimeoutMs ?? defaultMs)),
+    backgroundMaxMs: Math.min(MAX_TIMER_MS, opts?.backgroundMaxLifetimeMs ?? 86_400_000),
+  };
+}
+
+/**
+ * Refuse a codeExecution that isn't an object, or whose switch is set to
+ * anything but true or false, and, once it's on, one whose time limits
+ * contradict each other. A JSON config, or a `${VAR}` substituted as a string,
+ * can carry a quoted "false" where the type says boolean, and only `true` turns
+ * code execution on, so the quotes would hide what the value does; a bare
+ * `codeExecution: true` would be read as off. A null switch counts as not set,
+ * as a left-out one does. The refusal names the value's kind, not the value.
+ * A configuration that isn't on has nothing else read.
+ */
+export function validateCodeExecutionConfig(cfg: {
+  enabled?: unknown;
+  scriptTimeoutMs?: number;
+  maxScriptTimeoutMs?: number;
+}): void {
+  if (cfg === null || typeof cfg !== 'object' || Array.isArray(cfg)) {
+    throw new Error(`codeExecution must be an object, such as { enabled: true }, not ${cfg === null ? 'null' : kindOf(cfg)}`);
+  }
+  if (cfg.enabled !== undefined && cfg.enabled !== null && typeof cfg.enabled !== 'boolean') {
+    const wanted = typeof cfg.enabled === 'string' ? 'true or false, unquoted,' : 'true or false,';
+    throw new Error(
+      `codeExecution.enabled must be ${wanted} not ${kindOf(cfg.enabled)}: ` +
+        'true gives agents the code_execution tool, which runs their scripts in a python interpreter on the host, ' +
+        'and false or leaving it out doesn\'t',
+    );
+  }
+  if (cfg.enabled !== true) return;
+  const defaultMs = cfg.scriptTimeoutMs ?? 600_000;
+  if (cfg.maxScriptTimeoutMs !== undefined && !(cfg.maxScriptTimeoutMs >= defaultMs)) {
+    throw new Error(
+      `codeExecution.maxScriptTimeoutMs (${cfg.maxScriptTimeoutMs}) must be at least scriptTimeoutMs (${defaultMs}): ` +
+        'it is the most an agent may ask for, and the default is always allowed',
+    );
+  }
 }
