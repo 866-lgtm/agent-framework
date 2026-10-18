@@ -177,7 +177,16 @@ export class McplServerRegistry {
     })), timeoutMs);
   }
 
-  private closeServer(id: string, connection: McplServerConnection): Promise<void> {
+  /**
+   * Close a server for good and drop its entry, if this connection is still
+   * the one registered under `id`. The entry goes when close() resolves,
+   * whatever the connection reports: close() emits no 'close' for a
+   * connection that's down between retries, such as a reconnect stub waiting
+   * for its next retry, so the 'close' listener alone would leave it
+   * registered. A close that fails keeps the entry and rejects; a close
+   * already under way is shared.
+   */
+  closeServer(id: string, connection: McplServerConnection): Promise<void> {
     const existing = this.closing.get(connection);
     if (existing) return existing;
     const attempt = Promise.resolve().then(() => connection.close()).then(() => {

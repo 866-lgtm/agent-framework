@@ -207,7 +207,7 @@ test("a tool call's failure, from either engine, reaches its caller and its trac
   const server = { id: config.id, sendToolsCall: async () => { throw new Error(`socket closed: 1008 /api/mcp/s/${secret}/mcp`); } };
   framework.mcplServerRegistry = { getServer: (id: string) => (id === config.id ? server : null) };
   framework.modernServers = () => new Map();
-  const result = await framework.executeMcplToolCall({ id: 'c1', name: 'mcpl--remote--echo', input: {} }, config);
+  const result = await framework.executeMcplToolCall({ id: 'c1', name: 'mcpl--remote--echo', input: {} }, config.id, 'mcpl--remote');
   assert.equal(result.success, false);
   assert.match(String(result.error), /socket closed: 1008 \/api\/mcp\/s\/redacted\/mcp/);
   // A redactor for any server's text is made before an operation waits, so

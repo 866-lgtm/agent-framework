@@ -18,6 +18,7 @@ import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
 import type { EventResponse, Module, ModuleContext, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
 import { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
+import { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import { CapabilityGrant, computeGrant, expandAdvertisementShorthand } from '../src/mcpl/capability-grant.js';
 import { checkToolPattern } from '../src/mcpl/tool-pattern-check.js';
 import type { McplCapabilities, McplServerConfig } from '../src/mcpl/types.js';
@@ -405,7 +406,7 @@ test("the initial policy's other records keep the credentials out too", async ()
   await run(async () => ({ accepted: false, fallback: 'mcp-only', reason: `bad ${secret}` }));
 });
 
-test('registerMcplServerFeatures: a refused initial policy is traced, and fallback close closes', async () => {
+test('registerMcplServerFeatures: a refused initial policy is traced, and fallback close closes the server and unregisters it', async () => {
   for (const fallback of ['close', 'mcp-only'] as const) {
     const fw = Object.create(AgentFramework.prototype) as any;
     fw.traceListeners = [];
@@ -415,6 +416,8 @@ test('registerMcplServerFeatures: a refused initial policy is traced, and fallba
     fw.onTrace((e: Traced) => traces.push(e));
     let closed = 0;
     let established = 0;
+    // Its close() emits no 'close', as a server's doesn't once it's down
+    // between retries, so only a close through the registry unregisters it.
     const connection = {
       id: 'srv',
       capabilities: { version: '0.5', pushEvents: true } as unknown as McplCapabilities,
@@ -423,6 +426,9 @@ test('registerMcplServerFeatures: a refused initial policy is traced, and fallba
       sendFeatureSetsUpdateRequest: async () => ({ accepted: false, fallback, reason: 'policy too narrow' }),
       close: async () => { closed++; },
     };
+    const registry = new McplServerRegistry();
+    (registry as any).servers.set('srv', connection);
+    fw.mcplServerRegistry = registry;
     const capture = captureConsoleError();
     try {
       await fw.registerMcplServerFeatures({ id: 'srv', command: 'unused' } as McplServerConfig, connection);
@@ -430,6 +436,7 @@ test('registerMcplServerFeatures: a refused initial policy is traced, and fallba
       capture.stop();
     }
     assert.equal(closed, fallback === 'close' ? 1 : 0, fallback);
+    assert.equal(registry.getServer('srv'), fallback === 'close' ? null : connection, `${fallback}: registered afterwards`);
     assert.equal(established, 0, 'a refusal never establishes the grant');
     assert.deepEqual(
       traces.filter((t) => t.type === 'mcpl:policy-refused').map(withoutTimestamp),
@@ -486,7 +493,9 @@ function manifestHarness(receipt: Record<string, unknown>) {
   const config: McplServerConfig = { id: 'srv', command: 'unused', enabledFeatureSets: ['chat', 'bare'] };
   fw.mcplServerConfigs = new Map([[config.id, config]]);
   const connection = new ManifestFake(receipt);
-  fw.mcplServerRegistry = { getAllServers: () => [connection], getServer: (id: string) => (id === 'srv' ? connection : null) };
+  const registry = new McplServerRegistry();
+  (registry as any).servers.set('srv', connection);
+  fw.mcplServerRegistry = registry;
   // Post-§5.3 state: initial policy done, full grant active.
   const grant = computeGrant(connection.capabilities!, config, { mcpToolsAdvertised: false });
   const quiet = captureConsoleError();

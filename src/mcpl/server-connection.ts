@@ -476,6 +476,13 @@ export class McplServerConnection extends EventEmitter {
     return this.unreaped.length > 0;
   }
 
+  /** Closed with no reconnect to come: after close(), whether or not its
+   *  transport close succeeded, or a drop with reconnect off. A connection
+   *  between retries keeps reconnectEnabled, so it isn't closed for good. */
+  private get closedForGood(): boolean {
+    return this.closed && !this.reconnectEnabled;
+  }
+
   /**
    * Private constructor. Use `McplServerConnection.connect()` instead.
    */
@@ -503,8 +510,17 @@ export class McplServerConnection extends EventEmitter {
    * Mark the connection as ready — flushes any events that arrived between
    * construction (when setupMessageRouting starts emitting) and now (when
    * the caller has attached listeners via wireMcplEvents).
+   *
+   * Does nothing once the connection is closed for good. Its policy was reset
+   * when it closed, so what it held that needs a grant would be refused, and a
+   * closed connection sends no response, so nothing it held could be answered.
+   * Only what needs no grant would pass, to listeners of a server that won't
+   * be served again. A connection between retries isn't closed for good: what
+   * it held, such as a reconnect stub's connect-failed, still reaches its
+   * listeners.
    */
   ready(): void {
+    if (this.closedForGood) return;
     this.controlPlaneReady = true;
     this.dataPlaneReady = true;
     const pending = this.bufferedEvents;
@@ -536,9 +552,11 @@ export class McplServerConnection extends EventEmitter {
    * Release only server-establishment and lifecycle/control traffic. Responses
    * to host requests are never event-buffered, so tools/list and tools/call
    * responses remain live as well. Inference-bearing requests stay queued in
-   * their original relative order until {@link ready} is called.
+   * their original relative order until {@link ready} is called. Like
+   * {@link ready}, it does nothing once the connection is closed for good.
    */
   readyControlPlane(): void {
+    if (this.closedForGood) return;
     this.controlPlaneReady = true;
     const pending = this.bufferedEvents;
     this.bufferedEvents = [];
