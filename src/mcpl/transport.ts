@@ -23,6 +23,7 @@ import { StringDecoder } from 'node:string_decoder';
 import WebSocket from 'ws';
 
 import type { McplServerConfig } from './types.js';
+import { assertBooleanSetting } from '../config-checks.js';
 import { logDetail } from './log-value.js';
 
 /** Why/how a transport closed. `code`/`signal` are populated for stdio child
@@ -166,7 +167,8 @@ export const CHILD_ENV_ALLOWLIST = [
   'http_proxy', 'https_proxy', 'no_proxy',
   '__CF_USER_TEXT_ENCODING',
   // Windows equivalents, harmless elsewhere.
-  'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT', 'APPDATA', 'LOCALAPPDATA', 'USERPROFILE',
+  // USERNAME is Windows' USER, which Python's getpass.getuser() reads there.
+  'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT', 'APPDATA', 'LOCALAPPDATA', 'USERPROFILE', 'USERNAME',
 ];
 
 /** Environment for a stdio child: allowlisted host vars (+ LC_*), then the
@@ -513,8 +515,9 @@ export class WebSocketTransport extends McplTransport {
 }
 
 /**
- * Build the dial URL: validate it's a ws(s):// URL and append the auth token as
- * a `token` query param when provided (preserving any existing query).
+ * Build the dial URL: validate it's a ws(s):// URL the ws library will dial,
+ * which refuses one with a fragment, and append the auth token as a `token`
+ * query param when provided (preserving any existing query).
  */
 export function buildWebSocketUrl(config: McplServerConfig, tokenOverride?: string | null): string {
   if (!config.url) {
@@ -530,6 +533,9 @@ export function buildWebSocketUrl(config: McplServerConfig, tokenOverride?: stri
     throw new Error(
       `MCPL server "${config.id}": websocket url must be ws:// or wss://, got "${parsed.protocol}"`,
     );
+  }
+  if (parsed.hash) {
+    throw new Error(`MCPL server "${config.id}": websocket url must not have a fragment, got "${parsed.hash}"`);
   }
   const token = tokenOverride !== undefined ? tokenOverride : config.token;
   if (token) {
@@ -578,23 +584,8 @@ const SERVER_CONFIG_BOOLEANS: Record<BooleanSetting, string> = {
 export function assertServerConfigBooleans(config: McplServerConfig): void {
   for (const [setting, whatTrueDoes] of Object.entries(SERVER_CONFIG_BOOLEANS) as Array<[BooleanSetting, string]>) {
     if (setting === 'inheritEnv' && isWebSocketTransport(config)) continue;
-    const value: unknown = config[setting];
-    if (value === undefined || value === null || typeof value === 'boolean') continue;
-    const wanted = typeof value === 'string' ? 'true or false, unquoted,' : 'true or false,';
-    throw new Error(`MCPL server "${config.id}" ${setting} must be ${wanted} not ${kindOf(value)}: ${whatTrueDoes}`);
+    assertBooleanSetting(`MCPL server "${config.id}" ${setting}`, config[setting], whatTrueDoes);
   }
-}
-
-/** The kind of a value that isn't undefined, null or a boolean, as a refusal
- *  names it in place of the value. */
-export function kindOf(value: unknown): string {
-  if (Array.isArray(value)) return 'an array';
-  if (typeof value !== 'object') return `a ${typeof value}`;
-  const prototype = Object.getPrototypeOf(value) as { constructor?: { name?: string } } | null;
-  if (prototype === null || prototype === Object.prototype) return 'an object';
-  const name = prototype.constructor?.name;
-  if (!name) return 'an object that isn\'t plain';
-  return `${/^[aeiou]/i.test(name) ? 'an' : 'a'} ${name}`;
 }
 
 /**

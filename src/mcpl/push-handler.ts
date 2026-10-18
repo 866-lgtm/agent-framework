@@ -199,7 +199,7 @@ export class PushHandler {
 
     // 2. Convert content blocks, and refuse content with nothing visible in
     // it — before dedup, so a refused eventId is not burned for a retry.
-    const content: ContentBlock[] = params.payload.content.map((block) => convertBlock(block, 'attachment on push event'));
+    const content: ContentBlock[] = params.payload.content.map((block) => convertBlock(block, 'attachment on push event', serverId));
     if (!emptyAllowed && isVisiblyEmptyConversion(params.payload.content, content)) {
       const err = new EmptyContentError();
       this.traceEmptyRejection(serverId, params);

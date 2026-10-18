@@ -33,14 +33,16 @@
   inner silencing send, a `drafts` resend among them, holds it and the
   turn's later prose as drafts, as a direct one does. An inner
   `think` under the private same-round policy holds the round back in
-  every mode. An inner `skip_reply` refused for its `wake_in_seconds`, on
-  a host without an EventGate, counts as a refused direct one: it keeps
-  only its own round private, and the turn goes on. On the fallback
-  without `roundContent`, as in XML tool mode, an inner call counts only
-  as a direct one does there. Nothing is routed until the turn ends, so a
-  silencing send holds the whole turn's prose as drafts, the rounds before
-  it included. The private `think` hold and an explicit round's
-  `skip_reply` don't apply there (#307).
+  every mode. An inner `skip_reply` that's refused, because the agent's
+  allowedTools doesn't name it or because this host can't set the
+  `wake_in_seconds` it asks for, counts as a refused direct one: it keeps
+  only its own round private, and the turn goes on. An inner send the
+  allowedTools refuses silences nothing, as a refused direct one doesn't.
+  On the fallback without `roundContent`, as in XML tool mode, an inner
+  call counts only as a direct one does there. Nothing is routed until the
+  turn ends, so a silencing send holds the whole turn's prose as drafts,
+  the rounds before it included. The private `think` hold and an explicit
+  round's `skip_reply` don't apply there (#307).
 - A round whose script can change its routing waits for the script, and its
   prose goes out when the script finishes. A script can change it when its
   code names a tool whose call changes the round's routing in the turn's

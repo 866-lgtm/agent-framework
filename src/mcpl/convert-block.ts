@@ -15,9 +15,12 @@ import type { McplContentBlock } from './types.js';
  * for the caller to refuse or leave out): a type, data, mimeType or uri that
  * isn't a string counts as absent, and a text block whose text isn't a string
  * shows as NON_STRING_TEXT_PLACEHOLDER. `provenance` is what a reference stub
- * says the reference came on, such as 'attachment on push event'.
+ * says the reference came on, such as 'attachment on push event'. `serverId`
+ * is the server that sent the content: a reference is registered with it, as
+ * a tool result's references are, so fetch_reference can fetch it through that
+ * server's address, where it has one.
  */
-export function convertBlock(block: McplContentBlock, provenance: string): ContentBlock {
+export function convertBlock(block: McplContentBlock, provenance: string, serverId: string): ContentBlock {
   switch (block.type) {
     case 'text':
       // Text that isn't a string can't be shown, so the agent reads that a
@@ -34,7 +37,7 @@ export function convertBlock(block: McplContentBlock, provenance: string): Conte
       if (isFilledString(block.uri) && block.disposition) {
         // RFC-005 uri-form media with a disposition claim: stub, do not
         // hand the URI to the provider or inline it.
-        return { type: 'text', text: referenceStubOrNull(block, provenance) ?? '[reference]' };
+        return { type: 'text', text: referenceStubOrNull(block, provenance, serverId) ?? '[reference]' };
       }
       if (isFilledString(block.data) && isFilledString(block.mimeType)) {
         return {
@@ -59,7 +62,7 @@ export function convertBlock(block: McplContentBlock, provenance: string): Conte
       if (isFilledString(block.uri) && block.disposition) {
         // RFC-005 uri-form media with a disposition claim: stub, do not
         // hand the URI to the provider or inline it.
-        return { type: 'text', text: referenceStubOrNull(block, provenance) ?? '[reference]' };
+        return { type: 'text', text: referenceStubOrNull(block, provenance, serverId) ?? '[reference]' };
       }
       if (isFilledString(block.data) && isFilledString(block.mimeType)) {
         return {
@@ -72,7 +75,7 @@ export function convertBlock(block: McplContentBlock, provenance: string): Conte
     case 'resource':
       // RFC-005: reference blocks become bounded stubs — never raw URIs
       // (a signed URL is a bearer credential that looks like a location).
-      return { type: 'text', text: referenceStubOrNull(block, provenance) ?? '[reference]' };
+      return { type: 'text', text: referenceStubOrNull(block, provenance, serverId) ?? '[reference]' };
 
     default: {
       // Unknown wire block types previously fell off the exhaustive switch

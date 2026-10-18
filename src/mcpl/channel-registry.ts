@@ -44,6 +44,7 @@ import { RefusalLines } from './refusal-lines.js';
 import { CapabilityGrant } from './capability-grant.js';
 import type { InboundSource } from './inbound-source.js';
 import { McplRequestError } from './server-connection.js';
+import { readSkipReplyWake } from './skip-reply-wake.js';
 
 // ============================================================================
 // Typing indicator interval (Discord typing lasts ~10s, so 7s keeps it alive)
@@ -251,6 +252,20 @@ interface McplChannelIncomingEvent {
 // Channel Tool Definitions
 // ============================================================================
 
+/**
+ * `journal`'s description. It tells the model to call `skip_reply` to end the
+ * turn only where the agent may call it: the framework builds each agent's
+ * surface with that agent's permission, and a refused `skip_reply` leaves the
+ * turn going on.
+ */
+export function journalToolDescription(canSkipReply: boolean): string {
+  return 'Write an entry in your private journal. The entry stays in your own context and ' +
+    'memory and is NOT sent to any channel, surface or person. Use it for anything longer ' +
+    'than a line that you want to keep for yourself — reflections, what you decided and ' +
+    'why, notes for later. It does not end your turn and does not affect where ordinary ' +
+    'text is routed' + (canSkipReply ? '; to end the turn without replying, call skip_reply afterwards.' : '.');
+}
+
 const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'channel_list',
@@ -328,6 +343,9 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'think',
+    // No agent's surface shows this description: getToolsForAgent gives every
+    // agent its own think (buildThinkTool), which names skip_reply only where
+    // that agent may call it.
     description:
       'Reason privately. The content stays in your own context and is NOT sent to any ' +
       'channel or surface. Same-round routing of ordinary text beside think() depends on ' +
@@ -347,12 +365,7 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'journal',
-    description:
-      'Write an entry in your private journal. The entry stays in your own context and ' +
-      'memory and is NOT sent to any channel, surface or person. Use it for anything longer ' +
-      'than a line that you want to keep for yourself — reflections, what you decided and ' +
-      'why, notes for later. It does not end your turn and does not affect where ordinary ' +
-      'text is routed; to end the turn without replying, call skip_reply afterwards.',
+    description: journalToolDescription(true),
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -382,8 +395,9 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
           type: 'number',
           description:
             'Optional self-wake: if nothing else wakes you first, you wake again after this ' +
-            'many seconds (1 = go again almost immediately; clamped to 1–3600). Any other ' +
-            'wake before then cancels it. Omit to stay idle until the next external wake.',
+            'many seconds, from 1 to 3600; a larger number waits 3600 (1 = go again almost ' +
+            'immediately). Any other wake before then cancels it. Omit to stay idle until the ' +
+            'next external wake.',
         },
       },
       required: [],
@@ -1097,7 +1111,7 @@ export class ChannelRegistry {
         }
       }
       if (message.tags) message.tags = expandCoreTags(message.tags);
-      const convertedContent: ContentBlock[] = message.content.map((block) => convertBlock(block, 'attachment on channel message'));
+      const convertedContent: ContentBlock[] = message.content.map((block) => convertBlock(block, 'attachment on channel message', serverId));
       if (!emptyAllowed && isVisiblyEmptyConversion(message.content, convertedContent)) {
         rejectEmpty();
         continue;
@@ -1515,7 +1529,7 @@ export class ChannelRegistry {
         return this.handleToolJournal(input as { content?: string });
 
       case 'skip_reply':
-        return this.handleToolSkipReply(input as { reason?: string; wake_in_seconds?: number });
+        return this.handleToolSkipReply(input as { reason?: string; wake_in_seconds?: unknown });
 
       default:
         return { success: false, error: `Unknown channel tool: ${toolName}`, isError: true };
@@ -2986,7 +3000,8 @@ export class ChannelRegistry {
    * Handle the synthesized `think` tool — a private reasoning scratchpad. It
    * sends nothing, and (unlike before) does NOT silence the turn: trailing
    * plain text is still routed as the reply. The thought stays in the agent's
-   * own context/chronicle. To deliberately not reply, the agent uses skip_reply.
+   * own context/chronicle. To deliberately not reply, an agent that may call
+   * skip_reply uses it.
    */
   private handleToolThink(input: { content?: string }): ToolResult {
     return {
@@ -2995,10 +3010,12 @@ export class ChannelRegistry {
       // tool_use block; don't duplicate it in the result.
       data: {
         noted: true,
+        // No tool to end the turn with: this handler can't see whether the
+        // caller may call skip_reply, and think's own description says so
+        // where it may.
         note:
           'Thought recorded (private — not sent anywhere). Same-round text routing depends on ' +
-          'your current same_round_think_text_policy; use agent_settings get to inspect it, or ' +
-          'call skip_reply to end the turn without replying.',
+          'your current same_round_think_text_policy; use agent_settings get to inspect it.',
       },
     };
   }
@@ -3032,14 +3049,15 @@ export class ChannelRegistry {
    * tool, so any trailing prose this turn is NOT posted. Replaces the old
    * overloaded use of `think` for staying silent.
    */
-  private handleToolSkipReply(input: { reason?: string; wake_in_seconds?: number }): ToolResult {
+  private handleToolSkipReply(input: { reason?: string; wake_in_seconds?: unknown }): ToolResult {
     // The self-wake itself is armed by the framework (which owns the
-    // EventGate) BEFORE this dispatch. Without a gate, a positive timer request
-    // is refused before this successful end-turn handler is reached.
-    const wakeSecs = Number(input.wake_in_seconds);
-    const selfWake = Number.isFinite(wakeSecs) && wakeSecs > 0
-      ? Math.max(1, Math.min(3600, Math.floor(wakeSecs)))
-      : undefined;
+    // EventGate) BEFORE its dispatch reaches this handler, from the same
+    // reading, and the framework refuses a wake the host can't set before
+    // dispatching. A caller of this registry's handleChannelToolCall
+    // (AgentFramework.channels) goes past both, so its note names a wake
+    // nothing armed.
+    const wake = readSkipReplyWake(input);
+    const selfWake = wake.kind === 'wake' ? wake.seconds : undefined;
     return {
       success: true,
       // The note says "ended the turn" — make it TRUE. Without endTurn the

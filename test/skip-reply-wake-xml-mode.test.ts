@@ -42,7 +42,7 @@ const echo = (id: string, text: string, ...more: string[]): Round => ({
   calls: [id, ...more].map((callId) => ({ id: callId, name: 'test--echo', input: { message: 'x' } })),
   results: `<function_results>${[id, ...more].map(() => '<result><stdout>{"echoed":"x"}</stdout></result>').join('')}</function_results>`,
 });
-const refusedWake = (id: string, text: string): Round => ({ text, calls: [{ id, name: 'skip_reply', input: { reason: 'later', wake_in_seconds: 60 } }], results: '<function_results><error>refused</error></function_results>' });
+const refusedWake = (id: string, text: string, wake: unknown = 60): Round => ({ text, calls: [{ id, name: 'skip_reply', input: { reason: 'later', wake_in_seconds: wake } }], results: '<function_results><error>refused</error></function_results>' });
 /** A round whose one call is a foreground code_execution script. */
 const script = (id: string, text: string, code: string): Round => ({ text, calls: [{ id, name: 'code_execution', input: { code } }], results: '<function_results><result><stdout></stdout></result></function_results>' });
 const REFUSED_IN_SCRIPT = 'await skip_reply({"wake_in_seconds": 60})';
@@ -124,12 +124,12 @@ class EchoModule implements Module {
 }
 
 /**
- * One XML-mode turn with no EventGate: what reached the channel, whether each
- * round's result was an error, and which channel tools the registry handled.
- * With scripts, code execution is on and skip_reply is a channel tool a script
- * can call.
+ * One XML-mode turn, with no EventGate unless asked: what reached the channel,
+ * whether each round's result was an error, and which channel tools the
+ * registry handled. With scripts, code execution is on and skip_reply is a
+ * channel tool a script can call.
  */
-async function xmlTurn(rounds: Round[], finalText: string, thinking = false, opts: { scripts?: boolean } = {}) {
+async function xmlTurn(rounds: Round[], finalText: string, thinking = false, opts: { scripts?: boolean; gate?: boolean } = {}) {
   let stream: XmlStream | undefined;
   const membrane = {
     async complete(_r: NormalizedRequest): Promise<NormalizedResponse> { throw new Error('not used'); },
@@ -143,6 +143,7 @@ async function xmlTurn(rounds: Round[], finalText: string, thinking = false, opt
     storePath: join(dir, 'store'), membrane: membrane as unknown as import('@animalabs/membrane').Membrane,
     agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }], modules: [new EchoModule()],
     ...(opts.scripts ? { codeExecution: { enabled: true } } : {}),
+    ...(opts.gate ? { gate: { configPath: join(dir, 'gate.json') } } : {}),
   });
   const routed: string[] = [];
   const registrySaw: string[] = [];
@@ -223,6 +224,12 @@ describe('skip_reply refused in XML tool mode: its round stays private, and the 
   it('a round of two calls counts once, so the refused round after it is the one kept private', async () => {
     const r = await xmlTurn([echo('e1', 'ONE', 'e2'), refusedWake('w1', 'REFUSED_PRIVATE')], '\nFINAL_REPLY');
     assert.deepEqual(r.errors, [false, true]);
+    assert.deepEqual(r.routed, ['ONE', 'FINAL_REPLY']);
+  });
+
+  it('with a gate, a wake_in_seconds that isn\'t a number of seconds is refused the same way', async () => {
+    const r = await xmlTurn([echo('e1', 'ONE'), refusedWake('w1', 'REFUSED_PRIVATE', 'soon')], '\nFINAL_REPLY', false, { gate: true });
+    assert.deepEqual(r.errors, [false, true], 'the wake was refused and the turn went on');
     assert.deepEqual(r.routed, ['ONE', 'FINAL_REPLY']);
   });
 
