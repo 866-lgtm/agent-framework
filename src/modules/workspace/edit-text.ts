@@ -132,6 +132,8 @@ function problemText(problem: EditProblem, tool: EditTool): string {
         ? `edits ${a + 1} and ${b + 1} replace the same text in ${problem.path} (line ${problem.line}); give each its own stretch of text.`
         : `edits ${a + 1} and ${b + 1} overlap in ${problem.path} (from line ${problem.line}); give each its own stretch of text, or make them one edit.`;
     }
+    case 'same':
+      return `oldString and newString are the same once the BOM or the line end's CR that oldString carries is read as ${problem.path}'s own, which the file keeps, so there's nothing to change.`;
   }
 }
 
@@ -158,9 +160,11 @@ export function cutLine(line: string): string {
 /**
  * The answer's last line: what it left out, and what to do. `cut` parts left
  * out their details; `problems` and `notes` weren't shown at all. A refusal
- * that shows a problem says to answer it and send the call again. For edits
- * stored, the problems are the files disk refused, and a last line that
- * leaves some out points to ls.
+ * that leaves out problems, and shows at least one, says to answer those
+ * shown and send the call again to see the rest; sending it again shows no
+ * more of a problem whose details alone were left out. For edits stored, the
+ * problems are the files disk refused, and a last line that leaves some out
+ * points to ls.
  */
 function tailText(kind: AnswerKind, maxChars: number, cut: number, problems: number, notes: number, anyShown: boolean): string {
   const items = [
@@ -275,17 +279,31 @@ function regionOf(updated: string, change: Change): Region {
 const CHANGE_LEAD = 80;
 
 /**
- * A line too long to show whole, numbered, from shortly before the change
- * at `column` for as much as read shows of a line, marked where it's cut on
- * either side.
+ * A line too long to show whole, numbered, as a stretch for each change that
+ * starts on it, at the ascending `columns`: from at most CHANGE_LEAD
+ * characters before the change, for as much as read shows of a line.
+ * Stretches that meet run together, and each stretch of the line left out is
+ * marked with how many characters it holds.
  */
-function excerptLine(line: string, n: number, column: number): string {
-  // safeCut takes a cut at or before 0 as 0.
-  const from = safeCut(line, column - CHANGE_LEAD);
-  if (from === 0) return numberedLine(line, n);
-  const to = safeCut(line, from + MAX_LINE_CHARS);
-  const after = line.length - to;
-  return `${String(n).padStart(6)}\t[… ${from} chars before] ${line.slice(from, to)}${after > 0 ? ` [… ${after} more chars]` : ''}`;
+function excerptLine(line: string, n: number, columns: number[]): string {
+  const stretches: Array<{ from: number; to: number }> = [];
+  for (const column of columns) {
+    // safeCut takes a cut at or before 0 as 0.
+    const from = safeCut(line, column - CHANGE_LEAD);
+    const to = safeCut(line, from + MAX_LINE_CHARS);
+    const last = stretches.at(-1);
+    if (last && from <= last.to) last.to = Math.max(last.to, to);
+    else stretches.push({ from, to });
+  }
+  let text = '';
+  let shownTo = 0;
+  for (const { from, to } of stretches) {
+    if (from > shownTo) text += shownTo === 0 ? `[… ${from} chars before] ` : ` [… ${from - shownTo} chars] `;
+    text += line.slice(from, to);
+    shownTo = to;
+  }
+  if (shownTo < line.length) text += ` [… ${line.length - shownTo} more chars]`;
+  return `${String(n).padStart(6)}\t${text}`;
 }
 
 /**
@@ -311,13 +329,13 @@ export function shownRegions(plan: FilePlan, budget: { left: number }, maxChars:
     const slice = plan.updated.slice(region.start, region.end);
     const lines = slice.split('\n');
     if (slice.endsWith('\n')) lines.pop();
-    // A line too long to show whole shows its start, or, where a change
-    // starts on it, the stretch from shortly before the change.
+    // A line too long to show whole shows its start, or, where changes
+    // start on it, a stretch from shortly before each.
     let lineStart = region.start;
     const shown = lines.map((text, k) => {
       const n = region.from + k;
-      const change = text.length > MAX_LINE_CHARS ? firsts.find((first) => first.line === n) : undefined;
-      const numberedText = change ? excerptLine(text, n, change.at - lineStart) : numberedLine(text, n);
+      const columns = text.length > MAX_LINE_CHARS ? firsts.filter((first) => first.line === n).map((first) => first.at - lineStart) : [];
+      const numberedText = columns.length ? excerptLine(text, n, columns) : numberedLine(text, n);
       lineStart += text.length + 1;
       return numberedText;
     }).join('\n');

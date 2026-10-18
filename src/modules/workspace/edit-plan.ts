@@ -311,7 +311,12 @@ export type MatchProblem =
     overlapping: boolean;
   }
   /** Two edits' matches overlap, or are the same text. */
-  | { kind: 'clash'; edits: [number, number]; line: number; same: boolean };
+  | { kind: 'clash'; edits: [number, number]; line: number; same: boolean }
+  /**
+   * It matches only without the BOM or the line end's CR its old text
+   * carries (readForm), and without them it is the same as its new text.
+   */
+  | { kind: 'same'; edit: number };
 
 /** One replacement made, in the updated text. */
 export interface Change {
@@ -348,7 +353,11 @@ export interface FilePlan {
   bytes: Buffer;
   /** Its new text with line ends as LF, for the receipt. */
   updated: string;
-  /** Each edit's replacements, in the order of its first replacement in the file. */
+  /**
+   * What each edit replaced, in the order of its first replacement in the
+   * file: its first replacement, how many it made, and the lines of the rest
+   * a receipt names, not the replacements themselves.
+   */
   edits: EditChanges[];
   /** How many replacements the edits made in all. */
   replacements: number;
@@ -399,13 +408,15 @@ function lineFeeds(value: string): number {
  * occurs twice in "aaa"), and occurrences that overlap one another can't each
  * be replaced. When old text is absent, it is matched again with straight and
  * curly quotes treated as equal, and then, if it carries the file's BOM at its
- * start or a line's CR at its end, without them (readForm). Two edits'
- * matches may touch but not overlap. Only the replaced text changes: every
- * other byte stays as it was, and each new text's line ends take, by
- * position, those of the text it replaces. What it holds grows with the
- * file and the edits, not with the occurrences an edit replaces: positions as
- * numbers, the new text built a batch of pieces at a time, and of each edit's
- * replacements only what a receipt names.
+ * start or a line's CR at its end, without them (readForm); an edit that
+ * matches only without them, and without them is the same as its new text,
+ * has nothing to change. Two edits' matches may touch but not overlap. Only
+ * the replaced text changes: every other byte stays as it was, and each new
+ * text's line ends take, by position, those of the text it replaces. For
+ * each occurrence an edit replaces it holds numbers, not objects: the
+ * occurrence's start, and with several edits a key in one Float64Array. The
+ * new text is built a batch of pieces at a time, and of each edit's
+ * replacements it keeps only what a receipt names.
  */
 export function planFile(
   file: FileText,
@@ -441,6 +452,11 @@ export function planFile(
       const read = readForm(spec, file, crAt);
       if (read) {
         ({ starts, count, overlapping, atLeast } = scan(value, read.spec.oldText, keep, read.accept));
+        // Read as the file's own, the BOM or CR was all the edit changed.
+        if (count > 0 && read.spec.oldText === read.spec.newText) {
+          problems.push({ kind: 'same', edit: spec.index });
+          continue;
+        }
         if (count > 0) {
           matched = read.spec;
           readForms.push(spec.index);

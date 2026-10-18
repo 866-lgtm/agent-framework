@@ -227,6 +227,9 @@ test("an old text carrying a line's CR at its end matches before a CRLF line end
   // A lone CR the file holds is matched as given, first.
   const lone = plan(Buffer.from('alpha\rbeta\r\n'), [spec(0, 'alpha\r', 'x')]);
   assert.deepEqual([lone.bytes.toString(), lone.readForm], ['xbeta\r\n', []]);
+  // The CR was all it changed, so there's nothing to change; one that doesn't match is a miss.
+  assert.deepEqual(problems('alpha\r\nbeta\r\n', [spec(0, 'alpha\r', 'alpha')]), [{ kind: 'same', edit: 0 }]);
+  assert.equal(problems('beta\r\n', [spec(0, 'alpha\r', 'alpha')])[0]!.kind, 'miss');
 });
 
 test("an old text carrying the file's BOM at its start matches at the text's start, keeping one BOM", () => {
@@ -240,6 +243,8 @@ test("an old text carrying the file's BOM at its start matches at the text's sta
   // Only at the start, and only where the file has a BOM ('\uFEFF' encodes as one).
   assert.equal(problems('\uFEFFalpha\nbeta\n', [spec(0, '\uFEFFbeta', 'x')])[0]!.kind, 'miss', 'not at the start');
   assert.equal(problems('alpha\n', [spec(0, '\uFEFFalpha', 'x')])[0]!.kind, 'miss', 'a file with no BOM');
+  // The BOM was all it changed, so there's nothing to change.
+  assert.deepEqual(problems('\uFEFFalpha\n', [spec(0, '\uFEFFalpha', 'alpha')]), [{ kind: 'same', edit: 0 }]);
 });
 
 test("only the replaced text changes: a lone CR, and bytes the edits don't name, stay as they were", () => {

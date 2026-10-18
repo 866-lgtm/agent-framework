@@ -1166,7 +1166,7 @@ export class WorkspaceModule implements Module {
           + 'its newString read the same way. '
           + "Only the replaced text changes, and the new text's line ends take those of the text it replaces. "
           + 'A change disk made to the file is taken in first, and the answer says so. '
-          + 'The answer shows the changed region, numbered, a long line from shortly before the change, as its length allows. '
+          + 'The answer shows the changed region, numbered, a long line from shortly before the change on it, as its length allows. '
           + 'For several edits at once, in one file or across files, applied all or none, use edit_many.',
         inputSchema: {
           type: 'object' as const,
@@ -1189,7 +1189,7 @@ export class WorkspaceModule implements Module {
           + "A refusal names every problem, each by its edit's number in the list (from 1). "
           + 'All or none holds in the workspace: on a mount that writes to disk, disk can still refuse a file, '
           + "and the answer then says every edit is stored and names each file disk refused, with its push's reason. "
-          + "The answer shows each edit's first changed region, numbered, a long line from shortly before the change, as its length allows.",
+          + "The answer shows each edit's first changed region, numbered, a long line from shortly before each change on it, as its length allows.",
         inputSchema: {
           type: 'object' as const,
           properties: {

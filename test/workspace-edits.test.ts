@@ -135,6 +135,10 @@ test("an oldString carrying the file's BOM or a line's CR, as a character page s
   }));
   assert.equal((many.files as Array<{ note?: string }>)[0]!.note, "Edit 1 matched without the BOM or the line end's CR its old text carried, which the file keeps.");
   assert.deepEqual(disk('bom.txt'), Buffer.concat([bom, Buffer.from('gamma\ndelta\n')]));
+  // An edit whose only change is the CR the file keeps has nothing to change.
+  assert.equal(errorOf(await call('edit', { path: 'work/cr.txt', oldString: 'gamma\r', newString: 'gamma' })),
+    "The edit did nothing: oldString and newString are the same once the BOM or the line end's CR that oldString carries is read as work/cr.txt's own, which the file keeps, so there's nothing to change.");
+  assert.deepEqual(disk('cr.txt'), Buffer.from('gamma\r\nbeta\r\n'));
 });
 
 test('a receipt shows a long line from shortly before the change on it, and its start where the change is there', async (t) => {
@@ -145,6 +149,28 @@ test('a receipt shows a long line from shortly before the change on it, and its 
   await file('early.txt', `ab${'c'.repeat(2500)}\n`);
   const early = dataOf(await call('edit', { path: 'work/early.txt', oldString: 'ab', newString: 'AB' }));
   assert.equal(early.changed, `     1\tAB${'c'.repeat(1998)} [… 502 more chars]`);
+  // Several edits' first changes on one long line: a stretch from shortly
+  // before each, run together where they meet.
+  await file('many.txt', `${'a'.repeat(3000)}one${'b'.repeat(100)}two${'c'.repeat(3000)}three${'d'.repeat(500)}\n`);
+  const many = dataOf(await call('edit_many', {
+    edits: [
+      { path: 'work/many.txt', oldString: 'three', newString: '3' },
+      { path: 'work/many.txt', oldString: 'one', newString: '1' },
+      { path: 'work/many.txt', oldString: 'two', newString: '2' },
+    ],
+  }));
+  // Each stretch runs from 80 characters before its change for 2,000: the
+  // first two meet and run together, and the third is apart.
+  assert.equal(many.changed, `work/many.txt\n     1\t[… 2920 chars before] ${'a'.repeat(80)}1${'b'.repeat(100)}2${'c'.repeat(1919)}`
+    + ` [… 1001 chars] ${'c'.repeat(80)}3${'d'.repeat(500)}`);
+});
+
+test("a receipt names the lines of an edit's other replacements, the first 20 and how many more", async (t) => {
+  const { call, file } = setup(t);
+  await file('lines.txt', 'x\n'.repeat(25));
+  const all = dataOf(await call('edit', { path: 'work/lines.txt', oldString: 'x', newString: 'y', replaceAll: true }));
+  assert.equal(all.replacements, 25);
+  assert.equal(all.note, `The other replacements are on lines ${Array.from({ length: 20 }, (_, i) => i + 2).join(', ')} and 4 more.`);
 });
 
 test('identical strings are refused before the path is touched, as an empty oldString is', async (t) => {
