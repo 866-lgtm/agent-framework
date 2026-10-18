@@ -40,7 +40,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
-import { IGNORED, NONBLOCK, OTHER_MOUNT, checkDir, diskSpelling, filesystemTrustsCtime, inOtherMount, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, nestedHolder, passedOverAt, readPrefix, foldsCase, lowered, type LinkFound, type WorkspaceEntries } from './observe.js';
+import { IGNORED, NONBLOCK, OTHER_MOUNT, checkDir, diskSpelling, filesystemTrustsCtime, inOtherMount, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, nestedHolder, passedOverAt, readPrefix, foldsCase, foldedLoosely, type LinkFound, type WorkspaceEntries } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
 import {
   type MountRuntime,
@@ -1963,21 +1963,24 @@ export class WorkspaceModule implements Module {
   /**
    * A mount's entries on the current branch, as diskSpelling reads them when
    * it does, and whether its root folds case as the last start read it
-   * (false before the first). An entry in a nested mount's directory, in any
-   * spelling that names it in lower case (lowered), isn't the mount's to
-   * spell by: a path there takes disk's spelling, which the nested-mount
-   * checks know.
+   * (false before the first). An entry's spelling may stand for a path
+   * (`usable`) unless it lies in a nested mount's directory, compared as
+   * loosely as the walk respells a name (foldedLoosely), in a spelling other
+   * than the configured one or disk's: the nested-mount checks compare
+   * spellings as they are, and know only those two (spellNestedDirs).
    */
   private entriesOf(mount: MountState): WorkspaceEntries {
     const store = this.getStore();
-    const nested = this.othersOf(mount.config.name).map(lowered);
-    const outside = (path: string): boolean => {
-      const name = lowered(path);
-      return !nested.some((dir) => name === dir || name.startsWith(`${dir}/`));
-    };
+    const known = this.othersOf(mount.config.name);
+    const loose = known.map(foldedLoosely);
+    const within = (path: string, dir: string): boolean => path === dir || path.startsWith(`${dir}/`);
     return {
-      has: (path) => outside(path) && store.treeGet(mount.treeStateId, path) !== null,
-      under: (prefix) => store.treeList(mount.treeStateId, prefix).map((entry) => entry.path).filter(outside),
+      has: (path) => store.treeGet(mount.treeStateId, path) !== null,
+      under: (prefix) => store.treeList(mount.treeStateId, prefix).map((entry) => entry.path),
+      usable: (path) => {
+        const name = foldedLoosely(path);
+        return !loose.some((dir) => within(name, dir)) || known.some((dir) => within(path, dir));
+      },
       rootFoldsCase: this.rootFoldsCase.get(mount.config.name) ?? false,
     };
   }

@@ -320,7 +320,7 @@ const folded = (name: string): string => name.normalize('NFC').toLowerCase();
  * does. It also folds dotless `ı` with `i`, which a disk may keep apart;
  * the same-file check keeps that from naming another file.
  */
-const foldedLoosely = (name: string): string => name.normalize('NFC').toLowerCase().toUpperCase().toLowerCase();
+export const foldedLoosely = (name: string): string => name.normalize('NFC').toLowerCase().toUpperCase().toLowerCase();
 
 /** What the workspace holds of a mount, as the spelling step reads it (diskSpelling). */
 export interface WorkspaceEntries {
@@ -328,6 +328,12 @@ export interface WorkspaceEntries {
   has(path: string): boolean;
   /** The paths of the entries under `prefix`, a directory's path and `/`, or `''` for every entry. */
   under(prefix: string): string[];
+  /**
+   * Whether an entry's spelling of this path, the whole of it or its first
+   * segments, may stand for a path: false where it lies in a nested mount's
+   * directory in a spelling the nested-mount checks don't know.
+   */
+  usable(path: string): boolean;
   /** Whether the mount's root folds case (foldsCase). */
   rootFoldsCase: boolean;
 }
@@ -336,11 +342,13 @@ export interface WorkspaceEntries {
  * Whether `dir` folds case, told without writing: by looking up flipped a
  * name it lists whose flipped spelling it doesn't list too (a name with no
  * letter to flip is its own flipped spelling, and two hard links that differ
- * only in case are one file on any disk). Where it lists none, or can't be
- * listed, its own name is looked up flipped in the directory holding it,
- * which is taken to fold as `dir` does where both are on one device. A
- * directory not there yet folds as the one it would be made in. Where
- * nothing tells, it's taken to tell case apart.
+ * only in case are one file on any disk). Where no name it lists tells, or
+ * it can't be listed, its own name is looked up flipped in the directory
+ * holding it, which is taken to fold as `dir` does where both are on one
+ * device, each as a link to it leads; a name with no letter to flip takes
+ * that directory's folding instead. A directory not there yet folds as the
+ * one it would be made in. Where nothing tells, it's taken to tell case
+ * apart.
  */
 export async function foldsCase(dir: string): Promise<boolean> {
   const holder = dirname(dir);
@@ -357,42 +365,55 @@ export async function foldsCase(dir: string): Promise<boolean> {
     const [named, flipped] = await Promise.all([look(join(dir, name)), look(join(dir, flippedCase(name)))]);
     return named != null && flipped != null && sameFile(named, flipped);
   }
+  if (holder === dir) return false;
+  // Looked up through links, so a root that is one, or is reached through
+  // one, is compared by the device it lies on.
+  const see = (path: string) => stat(path, { bigint: true }).catch(() => null);
   const own = basename(dir);
-  if (flippedCase(own) === own) return false;
-  const [self, held, flipped] = await Promise.all([look(dir), look(holder), look(join(holder, flippedCase(own)))]);
-  return self != null && held != null && flipped != null && self.dev === held.dev && sameFile(self, flipped);
+  const [self, held, flipped] = await Promise.all([see(dir), see(holder), see(join(holder, flippedCase(own)))]);
+  if (self == null || held == null || self.dev !== held.dev) return false;
+  if (flippedCase(own) === own) return foldsCase(holder);
+  return flipped != null && sameFile(self, flipped);
 }
 
 /**
- * A name in lower case letter by letter, each letter on its own, so a word's
- * last `Σ` is `σ` as anywhere else, and `ς` is taken as `σ`. A letter whose
- * lower case is more than one letter, as `İ`'s is, stays as it is. Unicode
+ * A name in simple case folding, letter by letter: each letter as the lower
+ * case of its upper case, so `Σ` and a word's last `ς` are both `σ`, `ſ` is
+ * `s` and `µ` is `μ`. A letter that comes back as more than one, as `ß` and
+ * `İ` do, stays as it is, and so does dotless `ı`, whose upper case `I`
+ * lowers to `i`, which case folding keeps apart from it. Unicode
  * normalization is left alone, and so are letters only a fuller folding
- * joins, such as `ß` with `ss`: no disk listing shows two such names to be
- * one file, and disks that fold case differ on them.
+ * joins, such as `ß` with `ss`: no listing shows two such names to be one
+ * file, and a disk that folds case needn't join them.
  */
 export const lowered = (name: string): string =>
   [...name].map((c) => {
-    const lower = c.toLowerCase();
-    return lower === '\u03c2' ? '\u03c3' : [...lower].length === 1 ? lower : c;
+    if (c === '\u0131') return c;
+    const lower = c.toUpperCase().toLowerCase();
+    return [...lower].length === 1 ? lower : c;
   }).join('');
 
 /**
  * The name `segment` takes among the workspace's entries directly under the
  * directory `prefix` (its path and `/`, or `''` for the mount's root): the
  * segment itself where an entry is there under it, else the first name, in
- * the order given, equal to it in lower case (lowered), else null.
+ * the order given, equal to it in simple case folding (lowered) that may
+ * stand for a path there (`usable`), else null. Entries under one name come
+ * together in path order, so each name is compared once.
  */
-function entryName(paths: readonly string[], prefix: string, segment: string): string | null {
+function entryName(paths: readonly string[], prefix: string, segment: string, usable: (path: string) => boolean): string | null {
   const want = lowered(segment);
   let found: string | null = null;
+  let previous: string | null = null;
   for (const path of paths) {
     if (!path.startsWith(prefix)) continue;
     const rest = path.slice(prefix.length);
     const slash = rest.indexOf('/');
     const name = slash === -1 ? rest : rest.slice(0, slash);
+    if (name === previous) continue;
+    previous = name;
     if (name === segment) return segment;
-    if (found === null && lowered(name) === want) found = name;
+    if (found === null && lowered(name) === want && usable(`${prefix}${name}`)) found = name;
   }
   return found;
 }
@@ -473,16 +494,19 @@ async function listedName(dir: string, segment: string, given: BigIntStats | nul
  * spelling, so an entry that disk lists in another spelling, or in a
  * directory disk lists in another, stays reachable by its own path. And
  * where the directory reached folds case, each segment disk has nothing for
- * takes the name of an entry it equals in lower case (entryName), as the
- * disk will once that entry is written: a second draft spelled in another
- * case is the first one. The root's folding is read at start
- * (`rootFoldsCase`), and a directory beneath it is taken to fold as the
- * directory holding it did when its name was looked up with its case
- * flipped, or, for a name with no letter to flip, as the nearest directory
- * above that told, so the step reads nothing more of disk for this.
+ * takes the name of an entry it equals in simple case folding (entryName),
+ * as the disk will once that entry is written: a second draft spelled in
+ * another case is the first one. An entry's spelling stands for a path only
+ * where the entries allow it (`usable`), which they don't for one in a
+ * nested mount's directory that the nested-mount checks wouldn't know. The
+ * root's folding is read at start (`rootFoldsCase`), and a directory beneath
+ * it is taken to fold as the directory holding it did when its name was
+ * looked up with its case flipped, or, for a name with no letter to flip, as
+ * the nearest directory above that told, so the step reads nothing more of
+ * disk for this.
  */
 export async function diskSpelling(root: string, relativePath: string, entries?: WorkspaceEntries): Promise<string> {
-  if (relativePath === '' || isAbsolute(relativePath) || entries?.has(relativePath)) return relativePath;
+  if (relativePath === '' || isAbsolute(relativePath) || (entries?.has(relativePath) && entries.usable(relativePath))) return relativePath;
   const segments = relativePath.split('/');
   // The directories walked into, the mount's root first; their names below
   // the root, as returned; and whether each folds case: the root's as read at
@@ -506,7 +530,7 @@ export async function diskSpelling(root: string, relativePath: string, entries?:
     for (let j = from; j < segments.length; j++) {
       const segment = segments[j]!;
       if (segment === '' || segment === '.') continue;
-      const name = entryName(paths, prefix, segment);
+      const name = entryName(paths, prefix, segment, entries.usable);
       if (name === null) return;
       segments[j] = name;
       prefix = `${prefix}${name}/`;
@@ -524,7 +548,8 @@ export async function diskSpelling(root: string, relativePath: string, entries?:
     }
     const dir = dirs[dirs.length - 1]!;
     if (i === segments.length - 1) {
-      if (entries?.has([...names, segment].join('/'))) break;
+      const exact = [...names, segment].join('/');
+      if (entries?.has(exact) && entries.usable(exact)) break;
       const { name, found } = await listedName(dir, segment, null);
       segments[i] = name;
       if (!found) fromEntries(i);
