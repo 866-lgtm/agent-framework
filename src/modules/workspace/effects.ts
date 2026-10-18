@@ -188,21 +188,24 @@ async function hashAt(target: string, id: { dev: bigint; ino: bigint }, flags: n
  * directories, and make the file durable (its directories are synced by the
  * caller, after all of a push's effects: syncDirectories). With `mode`, the
  * file takes those permission bits; without it, a file written in place
- * keeps its own and a new one is created 0o644 under the umask. A new file
- * is created at its mode and given it exactly before its bytes; a file
- * written in place loses the bits `mode` removes before its bytes and gains
- * the ones it adds after them, so no bytes ever sit at a mode wider than
- * both their old and new ones. With `from`, the mode is given only to a file
- * in place that still has the permission bits `from`: one whose permission
- * bits changed since it was checked keeps them, as a changed byte would be
- * kept, and the widening after the bytes is made only over the mode the
- * write left them at, so a mode set while they went in is kept too, up to
- * the check just before that chmod. Without it, as a forced push writes,
- * the mode is given whatever the file has. Setuid and setgid are another
- * matter, whatever `from` says: a file that has either when the write
- * checks it loses both before the bytes, and keeps its permission bits and
- * its sticky bit; the chmod after the bytes keeps the special bits the file
- * has then (withSpecialBits).
+ * keeps its own, and one the write creates takes `createMode`, the store's,
+ * or 0o644 under the umask without one. A new file is created at that mode
+ * and given it exactly before its bytes, whether or not a chmod was owed
+ * when the write was planned; a file written in place loses the bits
+ * `mode` removes before its bytes and gains the ones it adds after them, so
+ * no bytes ever sit at a mode wider than both their old and new ones. With
+ * `from`, the mode is given only to a file in place that still has the
+ * permission bits `from`: one whose permission bits changed since it was
+ * checked keeps them, as a changed byte would be kept, and the widening
+ * after the bytes is made only over the mode the write left them at, so a
+ * mode set while they went in is kept too, up to the check just before that
+ * chmod. Without it, as a forced push writes, the mode is given whatever the
+ * file has, before the bytes and again after them where a mode set while
+ * they went in differs. Setuid and setgid are another matter, whatever
+ * `from` says: a file that has either when the write checks it loses both
+ * before the bytes, and keeps its permission bits and its sticky bit; the
+ * chmod after the bytes keeps the special bits the file has then
+ * (withSpecialBits).
  *
  * Where the kernel refuses a chmod (EPERM or EACCES: another user's file,
  * an ACL), the write acts on the refusal. A refused drop of setuid and
@@ -219,6 +222,7 @@ async function hashAt(target: string, id: { dev: bigint; ino: bigint }, flags: n
  */
 export async function writeContained(
   view: MountView, rootReal: string, rel: string, bytes: Buffer, expect: Expect, mode?: number, from?: number, overDisk?: boolean,
+  createMode?: number,
 ): Promise<{ perm: number; widenRefused: boolean; modeKept: boolean }> {
   const checked = await parentFor(view, rootReal, rel, true);
   if (checked.kind !== 'checked') throw new EffectFailed('a parent path is not a directory', false);
@@ -238,7 +242,7 @@ export async function writeContained(
       // appeared since planning saw none. At the mode it's given, which the
       // umask can only narrow, so the file is never wider than that mode,
       // even stopped before the chmod that makes the mode exact.
-      const handle = await open(target, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, mode ?? 0o644);
+      const handle = await open(target, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, mode ?? createMode ?? 0o644);
       touched = true;
       return handle;
     } catch (err) {
@@ -276,15 +280,21 @@ export async function writeContained(
     let left: number | undefined;
     const seen = (await handle.stat({ bigint: true })).mode;
     const current = Number(seen & 0o777n);
-    if (mode !== undefined) {
-      if (created) before = mode;
+    // A file the write creates gets the store's mode exactly, whether or not
+    // a chmod was owed when the write was planned: a forced write can find
+    // the file removed since.
+    const exact = mode ?? (created ? createMode : undefined);
+    if (exact !== undefined) {
+      if (created) before = exact;
       else if (from === undefined || current === from) {
-        before = current & mode;
-        after = mode;
+        before = current & exact;
+        after = exact;
       }
       if (before === current) before = undefined;
       left = before ?? current;
-      if (after === left) after = undefined;
+      // A forced write gives its mode after the bytes too, wherever the file's
+      // differs then (below); an unforced one owes nothing more here.
+      if (after === left && from !== undefined) after = undefined;
     }
     // A file that has setuid or setgid when the write checks it loses both
     // before the bytes, whether or not the write narrows the mode, and keeps
@@ -323,13 +333,18 @@ export async function writeContained(
     // A mode set while the bytes went in is kept, unless the write is forced:
     // one set in the instant between this check and the chmod isn't, since
     // there's no compare-and-chmod to make the two one step.
-    if (after !== undefined && (from === undefined || Number((await handle.stat({ bigint: true })).mode & 0o777n) === left)) {
-      stage = 'set the file\'s mode';
-      try {
-        await handle.chmod(await withSpecialBits(handle, after));
-      } catch (err) {
-        if (!chmodRefused(err)) throw err;
-        widenRefused = true;
+    if (after !== undefined) {
+      const now = Number((await handle.stat({ bigint: true })).mode & 0o777n);
+      // Forced, wherever the file's mode isn't the one it gives; unforced,
+      // only over the mode the write left the bytes at.
+      if (from === undefined ? now !== after : now === left) {
+        stage = 'set the file\'s mode';
+        try {
+          await handle.chmod(await withSpecialBits(handle, after));
+        } catch (err) {
+          if (!chmodRefused(err)) throw err;
+          widenRefused = true;
+        }
       }
     }
     stage = 'make the write durable (file fsync)';

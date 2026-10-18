@@ -395,6 +395,9 @@ interface Verdict {
    * The last confirmed evidence decide resolved for the path, which an
    * adoption's intent carries as its prior: a settled same-branch adoption's
    * outcome, where the recorded P is still that adoption's pending record.
+   * Or the evidence a push's narrowing left when it stopped before its
+   * bytes, which decide uses without recording it, so the intent stays: a
+   * push plans from it, and its new intent carries it as its prior.
    */
   prior?: Agreed;
 }
@@ -507,12 +510,13 @@ function resolvePending(
     }
     if (priorCandidate && sameCandidate(dc, priorCandidate)) {
       // The push narrowed the mode and stopped before its bytes: disk's mode
-      // is the push's, and the evidence records it, so the next push writes
+      // is the push's, so the rule decides from it, and the next push writes
       // the bytes at it and then widens to the store's. The old bytes are
-      // never given the store's mode.
+      // never given the store's mode. Nothing is recorded: the intent, with
+      // the modes that map disk's narrowed one back to the old bytes' own,
+      // stays until a push completes it or a sync adopts disk's copy.
       if (prior!.kind === 'content' && d.kind === 'file' && pushedMode(p, dc, d) !== undefined) {
-        const narrowed: Agreed = { ...prior!, mode: d.mode };
-        return { p: narrowed, record: narrowed };
+        return { p: { ...prior!, mode: d.mode } };
       }
       return { p: prior!, record: prior! };
     }
@@ -618,6 +622,9 @@ function decide(
   // verdict below records newer evidence.
   let p = pIn;
   let resolution: Agreed | Interrupted | 'forget' | undefined;
+  // Evidence a resolution decides from without recording it: a stopped
+  // push's narrowing, whose intent stays (resolvePending).
+  let unrecorded: Agreed | undefined;
   let uncaptured = false;
   if (p?.kind === 'pending') {
     const resolved = resolvePending(p, dc, s, d, branchId);
@@ -633,9 +640,11 @@ function decide(
     }
     p = resolved.p;
     resolution = resolved.record;
+    if (resolution === undefined && p !== undefined && (p.kind === 'content' || p.kind === 'absent')) unrecorded = p;
     uncaptured = resolved.uncaptured === true;
   }
-  const verdict = (v: Verdict): Verdict => (resolution && v.p === undefined ? { ...v, p: resolution } : v);
+  const verdict = (v: Verdict): Verdict => (resolution && v.p === undefined ? { ...v, p: resolution }
+    : unrecorded && v.p === undefined && v.prior === undefined ? { ...v, prior: unrecorded } : v);
 
   // Agreement settles everything, a recorded conflict included.
   if (sameCandidate(dc, sc)) {
@@ -1274,7 +1283,7 @@ export async function pushPaths(
     // The prior a new intent carries is the last confirmed evidence: for a
     // path whose earlier push is unconfirmed, that push's own prior, never
     // the bytes it wrote.
-    const known = v.unconfirmed ? (p as Pending).prior ?? undefined : v.p === 'forget' ? undefined : v.p !== undefined ? v.p : p;
+    const known = v.unconfirmed ? (p as Pending).prior ?? undefined : v.p === 'forget' ? undefined : v.p !== undefined ? v.p : v.prior ?? p;
     const prior = known && (known.kind === 'absent' || known.kind === 'content') ? known : null;
     if (v.mode === 'push' && s && d.kind === 'file') {
       // Forced, disk takes the store's mode whatever it holds now, as it takes its bytes.
@@ -1415,7 +1424,7 @@ export async function pushPaths(
     try {
       if (step.kind === 'write') {
         const { perm, widenRefused, modeKept } = await writeContained(
-          mount.view, mount.rootReal, step.path, step.blob, step.expect, step.apply, step.from, step.overDisk === true,
+          mount.view, mount.rootReal, step.path, step.blob, step.expect, step.apply, step.from, step.overDisk === true, step.storeMode,
         );
         effected.push({ step, dirs: chainOf(step.path), mode: perm, widenRefused, modeKept });
       } else if (step.kind === 'chmod') {
