@@ -19272,8 +19272,10 @@ export class AgentFramework {
 
   /**
    * The failed-reply notices stored in `agent`'s window that it never read:
-   * above its consumed watermark (or any, when it never compiled on this
-   * branch). The watermark moves at a compile, and at a tool boundary whose
+   * those above the lower of its consumed watermark and the point where the
+   * watermark's branch and the current one part (branchesPartAt), or every
+   * one, when it never compiled. The watermark moves at a compile, and at a
+   * tool boundary whose
    * stream declares it carries the messages injected there
    * (markContextConsumed), so a notice the live stream heard is under it, and
    * one a boundary stored without sending (a turn a tool ended, a budget
@@ -19283,8 +19285,8 @@ export class AgentFramework {
     try {
       const cm = agent.getContextManager();
       const watermark = agent.getConsumedWatermark();
-      const floor = watermark && watermark.branch === cm.currentBranch().name
-        ? watermark.sequence
+      const floor = watermark
+        ? Math.min(watermark.sequence, this.branchesPartAt(watermark.branch, cm.currentBranch().name))
         : Number.NEGATIVE_INFINITY;
       return cm.getAllMessages()
         .filter((m) => {
@@ -19297,6 +19299,37 @@ export class AgentFramework {
       console.error(`[route-failure] ${agent.name}: could not read its window for unread failed replies:`, err);
       return [];
     }
+  }
+
+  /**
+   * The last sequence two branches' histories share: Infinity for one branch,
+   * and for two, the point where they part. A branch's records are numbered
+   * on from its branch point (Chronicle gives each record its branch's head
+   * plus one), so up to that point both hold the same records under the same
+   * numbers, and past it each branch's numbers are its own. -Infinity when
+   * the store knows no shared history for them, as for an empty branch.
+   */
+  private branchesPartAt(a: string, b: string): number {
+    if (a === b) return Number.POSITIVE_INFINITY;
+    const branches = this.store.listBranches();
+    const byName = new Map(branches.map((branch) => [branch.name, branch]));
+    const byId = new Map(branches.map((branch) => [branch.id, branch]));
+    // Each branch `a` descends from, with the last sequence `a` shares with it.
+    const sharedWithA = new Map<string, number>();
+    let through = Number.POSITIVE_INFINITY;
+    for (let x = byName.get(a); x; x = x.parentId != null ? byId.get(x.parentId) : undefined) {
+      sharedWithA.set(x.id, through);
+      if (x.branchPoint == null) break;
+      through = Math.min(through, x.branchPoint);
+    }
+    through = Number.POSITIVE_INFINITY;
+    for (let y = byName.get(b); y; y = y.parentId != null ? byId.get(y.parentId) : undefined) {
+      const shared = sharedWithA.get(y.id);
+      if (shared !== undefined) return Math.min(shared, through);
+      if (y.branchPoint == null) break;
+      through = Math.min(through, y.branchPoint);
+    }
+    return Number.NEGATIVE_INFINITY;
   }
 
   /**

@@ -656,6 +656,32 @@ describe('notices about an agent\'s own action', () => {
       assert.match(JSON.stringify(entry.content), /A reply by conversation-gone \(12 chars\) could not be delivered/);
     });
 
+    it('counts as read, across branches, only what an agent\'s window shares with the branch it read up to the point they part', async () => {
+      const state = internals(framework) as unknown as { unreadFailedReplies(agent: unknown): Array<{ tag?: unknown }> };
+      const agent = framework.getAgent('secondary')!;
+      const cm = agent.getContextManager();
+      const store = framework.getStore();
+      const notice = (tag: string) => cm.getMessage(cm.addMessage('user', [{ type: 'text', text: `[discord-send-failed] ${tag}` }],
+        { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', tag } as never))!;
+      const tags = () => state.unreadFailedReplies(agent).map((m) => m.tag);
+
+      const read = notice('read');
+      agent.markContextConsumed();
+      // A branch made at the head shares everything the agent read.
+      store.createBranch('maintained', store.currentBranch().name);
+      await framework.switchBranch('maintained');
+      notice('after the switch');
+      assert.deepEqual(tags(), ['after the switch'], 'what it read stays read; what came after is unread');
+
+      // A branch made before what it read: past that point, nothing on it was
+      // read, though its numbers repeat the ones the agent read up to.
+      store.createBranchAt('rewound', 'maintained', read.sequence - 1);
+      await framework.switchBranch('rewound');
+      const again = notice('on the rewound branch');
+      assert.ok(again.sequence <= agent.getConsumedWatermark()!.sequence, 'numbered within what the watermark covers on its own branch');
+      assert.deepEqual(tags(), ['on the rewound branch']);
+    });
+
     for (const condition of ['ordinary', 'other-tool-cycle', 'quiesced', 'write-fails'] as const) {
       it('handles a failed TTL-closure reply notice at disposal: ' + condition, async (t) => {
         const state = internals(framework);
