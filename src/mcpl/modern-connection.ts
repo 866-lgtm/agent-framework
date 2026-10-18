@@ -312,8 +312,8 @@ class SpawnerStdioTransport implements Transport {
 
   async send(message: JSONRPCMessage): Promise<void> {
     if (!this.line || this.line.closed) throw new NotWrittenError(`MCP server "${this.config.id}" stdio transport is closed`);
-    // The child can't read what's written once its stdin or stdout has
-    // failed, while the line waits for it to exit.
+    // Once the child's stdin or stdout has failed, the line is ending it and
+    // writes nothing more to it, so a message is refused here as not sent.
     const failed = this.line.pipeFailure;
     if (failed) throw new NotWrittenError(`MCP server "${this.config.id}" stdio pipe failed with ${failed.message}`);
     this.line.writeLine(JSON.stringify(message));
@@ -578,8 +578,10 @@ export class ModernMcpConnection extends EventEmitter {
       ? new SpawnerStdioTransport(
         this.config,
         (line) => { if (this.isCurrent(generation)) this.deliverStderr(line); },
-        // A loss whose reap fails: handleLost's reap finds the child still
-        // running and holds the launch, as for any launch it can't reap.
+        // A child whose pipe failed and that outlived SIGKILL: a loss, whose
+        // reap finds the child still running and holds the launch, as for any
+        // launch it can't reap. During a connect there is no session to lose
+        // yet: the connect's own cleanup holds it, once the connect fails.
         (reason) => { if (this.isCurrent(generation)) this.handleLost(generation, reason); },
       )
       : new StreamableHTTPClientTransport(new URL(this.config.url!), { authProvider: bearerAuth(this.config) });

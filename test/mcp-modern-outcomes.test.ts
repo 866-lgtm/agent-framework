@@ -779,7 +779,7 @@ test('close() during a connect waits for that connect\'s own cleanup, and report
   await connection.close();
 });
 
-test('a server that closes its stdin and ignores SIGTERM is killed 2 s later and reconnected, and a call made after the failure is refused as not sent', { timeout: 40_000 }, async () => {
+test('a server that closes its stdin and ignores SIGTERM is killed and reconnected, and a call made after the failure is refused as not sent', { timeout: 40_000 }, async () => {
   const log = scratchLog();
   const connection = await connect('ignore-sigterm', log, { reconnect: true, reconnectIntervalMs: 30, reconnectMaxIntervalMs: 60, requestTimeoutMs: 30_000 });
   connection.on('error', () => { /* out-of-band SDK errors */ });

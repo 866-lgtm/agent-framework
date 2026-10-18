@@ -6,11 +6,13 @@
   as its `close()` does, in the one attempt `close()` shares, so the
   connection closes and reconnects as after any exit, its close still naming
   the pipe's error.
-  - A request made after the failure is refused as not sent (`not-sent`),
-    where it was written to the failed pipe and reported at its deadline as
-    possibly executed. One written before the failure is still reported as
-    possibly executed.
+  - Nothing more is written to the child after the failure. A request made
+    then is refused as not sent (`not-sent`), where it was written to the
+    failed pipe and reported at its deadline as possibly executed. One
+    written before the failure is still reported as possibly executed.
   - A child that outlives SIGKILL too is held as a launch that couldn't be
     reaped, as a reconnect holds one: reconnecting halts, the `mcpl-down`
     alert is raised, its tools leave the agents' list, and its id stays held
     until a disconnect or `stop()` retries the reap and confirms the exit.
+    During a connect, that happens when the connect times out, and the
+    connect fails with it.

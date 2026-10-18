@@ -440,6 +440,69 @@ test("legacy, without reconnect: a recycle whose child can't be reaped keeps the
   });
 });
 
+test("legacy, with reconnect: a recycle whose close can't reap leaves the server's tools listed for its reconnect loop to settle", async () => {
+  await withFramework(async ({ framework, dir }) => {
+    const log = join(dir, 'legacy.log');
+    // Its reconnect is a minute away, so what the recycle itself did is seen
+    // before the reconnect loop settles anything.
+    const config = { ...legacy('l', 'ok', log), reconnect: true, reconnectIntervalMs: 60_000, reconnectMaxIntervalMs: 60_000 };
+    const reaping = unreapable();
+    await framework.connectMcplServer(config);
+    assert.ok(toolsOf(framework, 'l').length > 0);
+    const internals = framework as unknown as { handleToolsListChanged(id: string): void };
+    const refresh = internals.handleToolsListChanged.bind(framework);
+    const refreshes: string[] = [];
+    internals.handleToolsListChanged = (id: string) => { refreshes.push(id); refresh(id); };
+    // The awareness accounting fails, and the gate recycles every server.
+    const gate = framework as unknown as {
+      installMcplDataPlaneGate(): unknown;
+      failMcplDataPlaneGate(barrier: unknown, context: string, error: unknown): Promise<void>;
+    };
+    await gate.failMcplDataPlaneGate(gate.installMcplDataPlaneGate(), 'a test', new Error('accounting failed on purpose'));
+    assert.equal(legacyServer(framework, 'l').willReconnect, true, 'its reconnect is still to come');
+    assert.deepEqual(refreshes, [], 'the failed recycle refreshed nothing');
+    assert.ok(toolsOf(framework, 'l').length > 0, 'its tools are still listed');
+
+    await killAndWait(reaping.stuck[0]!);
+    reaping.active = false;
+    await framework.disconnectMcplServer('l');
+    assert.equal(status(framework, 'l'), undefined, 'the disconnect completed');
+  });
+});
+
+for (const engine of ['legacy', 'modern'] as const) {
+  test(`${engine}: a connect that stop() ends, whose cleanup can't reap its child, says the framework stopped and offers no disconnect`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mcp-ownership-'));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
+      modules: [],
+    });
+    const reaping = unreapable();
+    const log = join(dir, engine === 'legacy' ? 'legacy.log' : 'raw.jsonl');
+    // Neither connect finishes on its own: the legacy handshake waits an
+    // hour, and the modern server never answers discover.
+    const pending = framework.connectMcplServer(engine === 'legacy'
+      ? legacy('s', 'slow', log, { SLOW_INIT_MS: '3600000' })
+      : modern('s', 'hang-discover', log)).then(() => null, (error: unknown) => error as Error);
+    await until(
+      () => (engine === 'legacy' ? launches(log).length === 1 : lines(log).some((l) => l.includes('server/discover'))),
+      'the connect in flight',
+    );
+    await assert.rejects(framework.stop(), /could not be reaped/);
+    const refused = await pending;
+    assert.match(
+      refused?.message ?? 'connected',
+      /^MCP server "s" was not connected: the framework stopped while it was connecting; its cleanup also failed: .*could not be reaped\. MCP server "s" stays registered, closed, until its exit is confirmed$/,
+    );
+    for (const stuck of reaping.stuck) await killAndWait(stuck);
+    reaping.active = false;
+    await framework.stop();
+  });
+}
+
 test("modern: ModernMcpConnection.connect hands back the connection that owns a launch its cleanup couldn't reap", async () => {
   const dir = mkdtempSync(join(tmpdir(), 'mcp-ownership-'));
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));

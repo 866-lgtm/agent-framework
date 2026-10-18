@@ -858,6 +858,11 @@ async function failPolicyRegistrationWhileServing(dir: string, closeFails: boole
   try {
     const traces: Array<{ type: string; serverId?: string; error?: string }> = [];
     framework.onTrace((event) => traces.push(event as never));
+    // Which servers' tools the framework asks to relist.
+    const lists = framework as unknown as { handleToolsListChanged(id: string): void };
+    const relist = lists.handleToolsListChanged.bind(framework);
+    const refreshed: string[] = [];
+    lists.handleToolsListChanged = (id: string) => { refreshed.push(id); relist(id); };
     const features = FeatureSetManager.prototype as any;
     const initializeServer = features.initializeServer;
     features.initializeServer = function (this: unknown, serverId: string, ...rest: unknown[]) {
@@ -900,7 +905,7 @@ async function failPolicyRegistrationWhileServing(dir: string, closeFails: boole
       false,
       'no gate failed',
     );
-    return { framework, discord, registry: internals.mcplServerRegistry };
+    return { framework, discord, registry: internals.mcplServerRegistry, refreshed };
   } catch (error) {
     await framework.stop();
     throw error;
@@ -943,6 +948,7 @@ test('a runtime connect whose policy registration throws and whose close then fa
     assert.ok(refused, 'the connection whose close failed is still registered');
     assert.equal(refused.willReconnect, false, 'its close had disarmed it before the transport close failed');
     assert.equal(refused.dataPlaneReady, false, 'the gate\'s completion left the refused connection paused');
+    assert.ok(failed.refreshed.includes(failed.discord.id), 'its tools leave the list though its close failed');
     await failed.framework.syncDiscordAwarenessMarkers();
     assert.equal(refused.dataPlaneReady, false, 'a later gate\'s completion leaves it paused too');
     assert.ok(

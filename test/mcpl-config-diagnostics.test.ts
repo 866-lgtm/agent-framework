@@ -536,6 +536,51 @@ test('manifest change: a refused policy is traced with phase manifest-change, fo
   ]);
 });
 
+test("a policy refusal's 'close' fallback whose close fails reports that failure, not an unanswered policy, and the server's tools leave the list", async () => {
+  const unreaped = () => new Error('stdio child 7 of MCP server "srv" did not exit within 2000ms of SIGKILL; it could not be reaped');
+  // At the initial policy.
+  const fw = Object.create(AgentFramework.prototype) as any;
+  fw.traceListeners = [];
+  fw.featureSetManager = new FeatureSetManager();
+  fw.checkpointManager = null;
+  const refreshed: string[] = [];
+  fw.handleToolsListChanged = (id: string) => { refreshed.push(id); };
+  const connection = {
+    id: 'srv',
+    capabilities: { version: '0.5', pushEvents: true } as unknown as McplCapabilities,
+    mcpToolsAdvertised: false,
+    establishGrant: () => {},
+    sendFeatureSetsUpdateRequest: async () => ({ accepted: false, fallback: 'close', reason: 'policy too narrow' }),
+    close: async () => { throw unreaped(); },
+  };
+  const registry = new McplServerRegistry();
+  (registry as any).servers.set('srv', connection);
+  fw.mcplServerRegistry = registry;
+  const initial = captureConsoleError();
+  try {
+    await assert.rejects(fw.registerMcplServerFeatures({ id: 'srv', command: 'unused' } as McplServerConfig, connection), /it could not be reaped$/);
+  } finally {
+    initial.stop();
+  }
+  assert.deepEqual(refreshed, ['srv'], 'its tools leave the list');
+  assert.equal(registry.getServer('srv'), connection, 'it stays registered, holding its id');
+  assert.ok(!initial.lines.some((l) => l.includes('did not answer')), initial.lines.join('\n'));
+
+  // At a manifest change.
+  const h = manifestHarness({ accepted: false, fallback: 'close', reason: 'too narrow' });
+  h.connection.close = () => Promise.reject(unreaped());
+  const changed: string[] = [];
+  h.fw.handleToolsListChanged = (id: string) => { changed.push(id); };
+  const later = captureConsoleError();
+  try {
+    await assert.rejects(h.fw.handleManifestChanged(h.connection, { revision: 'r2', domains: ['capabilities'] }), /it could not be reaped$/);
+  } finally {
+    later.stop();
+  }
+  assert.deepEqual(changed, ['srv'], 'its tools leave the list');
+  assert.ok(!later.lines.some((l) => l.includes('did not answer')), later.lines.join('\n'));
+});
+
 test('policy-refused traces report the branch the host took, not raw receipt fields', async () => {
   // Anything but `close` takes the mcp-only branch; a non-string reason is dropped.
   const odd = await runManifestChange({ accepted: false, fallback: 'other', reason: 42 });

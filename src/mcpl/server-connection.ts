@@ -249,7 +249,8 @@ export class McplUnreapedLaunchError<Connection extends { close(): Promise<void>
   constructor(
     readonly connection: Connection,
     failure: Error,
-    cleanup: Error,
+    /** The cleanup's own failure: the child it couldn't confirm exited. */
+    readonly cleanup: Error,
   ) {
     super(`${failure.message}; its cleanup also failed: ${cleanup.message}`, { cause: failure });
     this.name = 'McplUnreapedLaunchError';
@@ -511,16 +512,19 @@ export class McplServerConnection extends EventEmitter {
    * construction (when setupMessageRouting starts emitting) and now (when
    * the caller has attached listeners via wireMcplEvents).
    *
-   * Does nothing once the connection is closed for good. Its policy was reset
-   * when it closed, so what it held that needs a grant would be refused, and a
-   * closed connection sends no response, so nothing it held could be answered.
-   * Only what needs no grant would pass, to listeners of a server that won't
-   * be served again. A connection between retries isn't closed for good: what
-   * it held, such as a reconnect stub's connect-failed, still reaches its
-   * listeners.
+   * Once the connection is closed for good it readies nothing. Its policy was
+   * reset when it closed, so what the server sent that needs a grant would be
+   * refused, and a closed connection sends no response, so nothing it held
+   * could be answered. It delivers only its own reports of how it ended (see
+   * {@link deliverOwnReports}). A connection between retries isn't closed for
+   * good: what it held, such as a reconnect stub's connect-failed, reaches
+   * its listeners as it does any connection's.
    */
   ready(): void {
-    if (this.closedForGood) return;
+    if (this.closedForGood) {
+      this.deliverOwnReports();
+      return;
+    }
     this.controlPlaneReady = true;
     this.dataPlaneReady = true;
     const pending = this.bufferedEvents;
@@ -553,10 +557,14 @@ export class McplServerConnection extends EventEmitter {
    * to host requests are never event-buffered, so tools/list and tools/call
    * responses remain live as well. Inference-bearing requests stay queued in
    * their original relative order until {@link ready} is called. Like
-   * {@link ready}, it does nothing once the connection is closed for good.
+   * {@link ready}, once the connection is closed for good it delivers only
+   * its own reports of how it ended.
    */
   readyControlPlane(): void {
-    if (this.closedForGood) return;
+    if (this.closedForGood) {
+      this.deliverOwnReports();
+      return;
+    }
     this.controlPlaneReady = true;
     const pending = this.bufferedEvents;
     this.bufferedEvents = [];
@@ -573,6 +581,21 @@ export class McplServerConnection extends EventEmitter {
     } finally {
       this.flushDepth--;
     }
+  }
+
+  /**
+   * A connection closed for good still says how it ended. Its own buffered
+   * connect-failed and reconnect-failed, such as a launch held as unreaped
+   * before the first gate released it, are the framework's records of it:
+   * they need no grant, and its listeners act on them (an alert, and its
+   * tools leaving the list). What the server sent stays held.
+   */
+  private deliverOwnReports(): void {
+    const own = (item: { event: string }) => item.event === 'connect-failed' || item.event === 'reconnect-failed';
+    const reports = this.bufferedEvents.filter(own);
+    if (reports.length === 0) return;
+    this.bufferedEvents = this.bufferedEvents.filter((item) => !own(item));
+    for (const { event, args } of reports) super.emit(event, ...args);
   }
 
   /**
@@ -1545,8 +1568,9 @@ export class McplServerConnection extends EventEmitter {
     if (this.closed) {
       return Promise.reject(new McplRequestError(`Cannot send request: connection to "${this.id}" is closed`, 'not-sent'));
     }
-    // The child can't read what's written once its stdin or stdout has
-    // failed, while the transport waits for it to exit.
+    // Once the child's stdin or stdout has failed, the transport is ending
+    // it and writes nothing more to it, so a request is refused here as not
+    // sent rather than left to wait out its timeout.
     const pipeFailure = this.transport?.pipeFailure;
     if (pipeFailure) {
       return Promise.reject(new McplRequestError(`Cannot send request: the stdio pipe of "${this.id}" failed with ${pipeFailure.message}`, 'not-sent'));
@@ -1888,7 +1912,8 @@ export class McplServerConnection extends EventEmitter {
     // reconnecting, and is lost as on a close, with the permanent failure
     // that raises the alert and takes its tools off the list. Its id stays
     // held until close() confirms the exit. A close the host has begun
-    // reports the failure itself.
+    // reports the failure itself. During a handshake nothing listens yet:
+    // the handshake's own cleanup holds the launch, once the handshake fails.
     transport.on('unreaped', (failure: Error) => {
       if (this.closed || this.transport !== transport) return;
       this.holdUnreaped(transport, failure);

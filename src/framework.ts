@@ -17977,11 +17977,14 @@ export class AgentFramework {
    * A connect whose failed launch couldn't be confirmed exited. Its
    * connection stays registered, closed, and holds the id, so nothing
    * launches beside a child that may still be running; a disconnect retries
-   * the reap, and completes once the exit is confirmed.
+   * the reap, and completes once the exit is confirmed. Once stop() has
+   * begun it refuses a disconnect, and retries the reap itself, so no
+   * disconnect is offered then.
    */
-  private static unreapedConnectFailure(id: string, failure: Error): Error {
+  private unreapedConnectFailure(id: string, failure: Error): Error {
     return new Error(
-      `${failure.message}. MCP server "${id}" stays registered, closed, until its exit is confirmed: disconnect it to retry the reap`,
+      `${failure.message}. MCP server "${id}" stays registered, closed, until its exit is confirmed` +
+        (this.stopHasBegun() ? '' : ': disconnect it to retry the reap'),
       { cause: failure },
     );
   }
@@ -18397,6 +18400,22 @@ export class AgentFramework {
   }
 
   /**
+   * Close a legacy connection for good through the registry. A close that
+   * can't confirm its child exited keeps the connection registered, holding
+   * its id, and emits no 'close', so no close listener takes its tools off
+   * the agents' list: this does, then rethrows the failure for the caller to
+   * report. A server the host has given up on leaves the list either way.
+   */
+  private async closeMcplServerForGood(connection: McplServerConnection): Promise<void> {
+    try {
+      await this.mcplServerRegistry!.closeServer(connection.id, connection);
+    } catch (error) {
+      this.handleToolsListChanged(connection.id);
+      throw error;
+    }
+  }
+
+  /**
    * Close a runtime connect's new connection for good, through the registry,
    * after a step of that connect failed. A close that fails keeps the entry,
    * so a later disconnect, restart or shutdown can close it again, and is
@@ -18406,7 +18425,7 @@ export class AgentFramework {
     connection: McplServerConnection,
     failedStep: string,
   ): Promise<void> {
-    await this.mcplServerRegistry!.closeServer(connection.id, connection).catch((closeError) => {
+    await this.closeMcplServerForGood(connection).catch((closeError) => {
       console.error(
         `[mcpl] could not close MCPL server "${connection.id}" after its ${failedStep} failed; ` +
           'it stays registered until a disconnect, restart or shutdown closes it:',
@@ -18512,7 +18531,7 @@ export class AgentFramework {
         const message = cleanup instanceof Error ? cleanup.message : String(cleanup);
         this.emitTrace({ type: 'mcpl:server-error', serverId: config.id, error: redactServerText(message, config) });
         if (this.modernServers().get(config.id) === modern) {
-          throw AgentFramework.unreapedConnectFailure(config.id, new Error(`${reason.message}; its cleanup also failed: ${message}`, { cause: reason }));
+          throw this.unreapedConnectFailure(config.id, new Error(`${reason.message}; its cleanup also failed: ${message}`, { cause: reason }));
         }
         throw reason;
       }
@@ -18565,19 +18584,21 @@ export class AgentFramework {
     try {
       connection = await this.mcplServerRegistry.addServer(connectionConfig, this.mcplHostCapabilities, abort.signal);
     } catch (error) {
-      // The registry keeps a failed launch that may still be running, as the
-      // closed connection that owns it.
-      if (error instanceof McplUnreapedLaunchError) throw AgentFramework.unreapedConnectFailure(config.id, error);
       // Ended by stop() or by a disconnect of its id (its abort): said as a
       // modern connect ended that way says it, with the handshake's own
       // error as the cause.
-      if (abort.signal.aborted) {
-        throw new Error(
-          `MCP server "${config.id}" was not connected: ` +
-            (this.stopHasBegun() ? 'the framework stopped while it was connecting' : 'it was disconnected while connecting'),
-          { cause: error },
-        );
+      const ended = abort.signal.aborted
+        ? `MCP server "${config.id}" was not connected: ` +
+          (this.stopHasBegun() ? 'the framework stopped while it was connecting' : 'it was disconnected while connecting')
+        : null;
+      // The registry keeps a failed launch that may still be running, as the
+      // closed connection that owns it.
+      if (error instanceof McplUnreapedLaunchError) {
+        throw this.unreapedConnectFailure(config.id, ended === null
+          ? error
+          : new Error(`${ended}; its cleanup also failed: ${error.cleanup.message}`, { cause: error }));
       }
+      if (ended !== null) throw new Error(ended, { cause: error });
       throw error;
     } finally {
       if (this.legacyConnectAborts().get(config.id) === abort) this.legacyConnectAborts().delete(config.id);
@@ -18823,6 +18844,9 @@ export class AgentFramework {
       //              feature state, mirroring the §5.3 initial path;
       //  unanswered → interim grant and interim-derived state stand.
       let negotiated = false;
+      // A 'close' fallback closes after this try, so a close that fails is
+      // reported as itself, not as an unanswered policy.
+      let closeForGood = false;
       try {
         const receipt = await connection.sendFeatureSetsUpdateRequest(updateParams);
         if (receipt && receipt.accepted === false) {
@@ -18836,11 +18860,11 @@ export class AgentFramework {
             ...refusal,
           });
           if (fallback === 'close') {
-            await this.mcplServerRegistry!.closeServer(connection.id, connection);
-            return;
+            closeForGood = true;
+          } else {
+            connection.establishGrant(CapabilityGrant.empty());
+            this.featureSetManager!.initializeServer(connection.id, maskedOrEmpty, cfg, CapabilityGrant.empty());
           }
-          connection.establishGrant(CapabilityGrant.empty());
-          this.featureSetManager!.initializeServer(connection.id, maskedOrEmpty, cfg, CapabilityGrant.empty());
         } else {
           connection.establishGrant(newGrant);
           this.featureSetManager!.initializeServer(connection.id, maskedOrEmpty, cfg, newGrant);
@@ -18849,6 +18873,10 @@ export class AgentFramework {
         }
       } catch {
         console.error(`[mcpl] ${connection.id} did not answer post-manifest policy — expansion does not activate (§6.7); interim state stands`);
+      }
+      if (closeForGood) {
+        await this.closeMcplServerForGood(connection);
+        return;
       }
 
       // Adopt the validated manifest + tracking. droppedCapabilities is
@@ -18944,6 +18972,9 @@ export class AgentFramework {
       updateParams.deniedCapabilities = [...grant.deniedPaths];
     }
 
+    // A 'close' fallback closes after this try, so a close that fails is
+    // reported as itself, not as an unanswered policy.
+    let closeForGood = false;
     try {
       const receipt = await connection.sendFeatureSetsUpdateRequest(updateParams);
       if (receipt && receipt.accepted === false) {
@@ -18960,22 +18991,20 @@ export class AgentFramework {
           phase: 'initial',
           ...refusal,
         });
-        if (fallback === 'close') {
-          await this.mcplServerRegistry!.closeServer(connection.id, connection);
-          return;
-        }
         // mcp-only (§3.2): grant stays empty, MCPL privileged surface stays
         // dark, plain MCP tools keep working. MUST NOT widen in response to
         // the refusal — a human can change config; the policy engine cannot.
-        return;
-      }
-      // Expansion activates on receipt (§6.7).
-      connection.establishGrant(grant);
-      if (receipt?.accepted === true && receipt.mode === 'degraded') {
-        for (const uf of receipt.unavailableFeatures ?? []) {
-          console.error(recorded(
-            `[mcpl] ${config.id} degraded: ${uf.featureSet} (${uf.effect}; missing ${Array.isArray(uf.missingCapabilities) ? uf.missingCapabilities.join(', ') : 'unknown'})`,
-          ));
+        if (fallback !== 'close') return;
+        closeForGood = true;
+      } else {
+        // Expansion activates on receipt (§6.7).
+        connection.establishGrant(grant);
+        if (receipt?.accepted === true && receipt.mode === 'degraded') {
+          for (const uf of receipt.unavailableFeatures ?? []) {
+            console.error(recorded(
+              `[mcpl] ${config.id} degraded: ${uf.featureSet} (${uf.effect}; missing ${Array.isArray(uf.missingCapabilities) ? uf.missingCapabilities.join(', ') : 'unknown'})`,
+            ));
+          }
         }
       }
     } catch (err) {
@@ -18989,6 +19018,10 @@ export class AgentFramework {
           `MCPL privileged surface stays disabled (§6.7 unanswered expansion): ` +
           recorded(err instanceof Error ? err.message : err),
       );
+      return;
+    }
+    if (closeForGood) {
+      await this.closeMcplServerForGood(connection);
       return;
     }
 

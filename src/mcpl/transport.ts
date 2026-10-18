@@ -90,10 +90,11 @@ export abstract class McplTransport extends EventEmitter {
   }
 
   /**
-   * The error a stdio child's stdin or stdout failed with, once one has: no
-   * write reaches the child after it, though the transport stays open until
-   * the child exits. Undefined while writes can go out, and always for a
-   * transport that has no pipes.
+   * The error a stdio child's stdin or stdout failed with, once one has. The
+   * transport is ending the child then, and stays open until it exits, but
+   * writes nothing more to it: writeLine drops each line, and both engines
+   * refuse a request as not sent. Undefined while writes go out, and always
+   * for a transport that has no pipes.
    */
   get pipeFailure(): Error | undefined {
     return undefined;
@@ -255,14 +256,16 @@ export class StdioTransport extends McplTransport {
     // does, SIGTERM and then SIGKILL, in the one attempt close() shares, and
     // the exit's close names the error, so the connection handles it as any
     // other exit. The close is the report: no 'error' is emitted, nothing is
-    // thrown, and pipeFailure refuses writes meanwhile. A child that outlives
-    // SIGKILL too stays this transport's: 'unreaped' says so, unless the host
-    // is closing it, whose close() reports the failure itself. A child that
-    // stops reading without closing its stdin raises no error: the writes are
-    // buffered, and only request timeouts bound it
-    // (McplServerConfig.requestTimeoutMs).
+    // thrown, and nothing more is written meanwhile (pipeFailure). The first
+    // error starts that one attempt, and a later one, from either pipe, adds
+    // nothing to it. A child that outlives SIGKILL too stays this
+    // transport's: 'unreaped' says so, unless the host is closing it, whose
+    // close() reports the failure itself. A child that stops reading without
+    // closing its stdin raises no error: the writes are buffered, and only
+    // request timeouts bound it (McplServerConfig.requestTimeoutMs).
     const endOnPipeError = (err: Error) => {
-      this.pipeError ??= err;
+      if (this.pipeError) return;
+      this.pipeError = err;
       void this.terminate().catch((failure: unknown) => {
         if (!this.closed) this.emit('unreaped', failure instanceof Error ? failure : new Error(String(failure)));
       });
@@ -324,6 +327,9 @@ export class StdioTransport extends McplTransport {
   }
 
   writeLine(json: string): void {
+    // Nothing more goes to a child whose stdin or stdout has failed: this
+    // transport is ending it.
+    if (this.pipeError) return;
     // stdin may be gone if the child died between the closed-check and here.
     this.child.stdin?.write(json + '\n');
   }
