@@ -41,6 +41,17 @@ function injected(id: string): RegExp {
   return new RegExp(`^Error: Registering state '${escaped}' failed: injected EIO registering ${escaped}$`);
 }
 
+/** loadHostState's refusal for a feature set's host state at registration:
+ *  it says what the failure stops, and its cause is the helper's error. */
+function hostStateRefused(error: unknown): boolean {
+  assert.match(
+    String(error),
+    /^Error: the host-managed state of feature set "fs" on MCPL server "srv" \(mcpl\/state\/srv\/fs\) could not be registered or read: Registering state 'mcpl\/state\/srv\/fs' failed: injected EIO registering mcpl\/state\/srv\/fs\. The feature set isn't registered without it, /,
+  );
+  assert.match(String((error as Error).cause), injected('mcpl/state/srv/fs'));
+  return true;
+}
+
 type FailingStore = JsStore & { readonly registrations: string[] };
 
 /** A real store whose registerState fails for one id, as an I/O error would:
@@ -179,7 +190,7 @@ describe('MCPL state lets a failed registration through', () => {
     const manager = new CheckpointManager(failingOn(store, 'mcpl/state/srv/fs'), () => {});
     assert.throws(
       () => manager.registerFeatureSet('srv', 'fs', { hostState: true, rollback: false }),
-      injected('mcpl/state/srv/fs'),
+      hostStateRefused,
     );
   }));
 
@@ -191,7 +202,7 @@ describe('MCPL state lets a failed registration through', () => {
     const manager = new CheckpointManager(flaky, () => {});
     assert.throws(
       () => manager.registerFeatureSet('srv', 'fs', { hostState: true, rollback: false }),
-      injected('mcpl/state/srv/fs'),
+      hostStateRefused,
     );
     assert.equal(manager.isHostManaged('srv', 'fs'), false, 'a failed call records nothing');
     manager.registerFeatureSet('srv', 'fs', { hostState: true, rollback: false });
