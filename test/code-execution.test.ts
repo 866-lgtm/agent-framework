@@ -1321,6 +1321,8 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
     await logging(async (logged) => {
       const dir = mkdtempSync(join(tmpdir(), 'pytc-reclaimed-'));
       const runner = new PyRunner({ onToolCall: async () => '', idleReclaimMs: 50 });
+      const flag = (name: string) => writeFileSync(join(dir, name), '');
+      let pid = 0;
       try {
         // The command writes when each file appears, once its interpreter has
         // been reclaimed, and makes a file of its own after each write, which
@@ -1340,29 +1342,32 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
           'open(os.path.join(sys.argv[1], "wrote again"), "w").close()',
         ].join('\n');
         const first = await runner.exec(
-          `import subprocess, sys\nsubprocess.Popen([sys.executable, "-c", ${JSON.stringify(command)}, ${JSON.stringify(dir)}])\nprint("started")`,
+          `import subprocess, sys\nprint(subprocess.Popen([sys.executable, "-c", ${JSON.stringify(command)}, ${JSON.stringify(dir)}]).pid)`,
           [],
         );
-        assert.strictEqual(first.stdout, 'started\n');
+        pid = Number(first.stdout.trim());
+        assert.ok(pid > 0, first.stdout);
         await until(() => logged.some((l) => l.endsWith('reclaiming python interpreter (idle)')), 'the idle reclaim');
-        writeFileSync(join(dir, 'reclaimed'), '');
+        flag('reclaimed');
         await until(() => existsSync(join(dir, 'wrote')), 'the command to write after the reclaim and go on');
         await until(() => logged.some((l) => l.endsWith('stdout while its interpreter runs no script: after the reclaim')), 'its line in the log');
-        // A new interpreter's script runs while the command writes again.
-        const next = await runner.exec(
+        // A new interpreter's script runs while the command writes again, and
+        // returns only once the host has read and logged that line.
+        const next = runner.exec(
           [
             'import os, time',
             `open(os.path.join(${JSON.stringify(dir)}, "replaced"), "w").close()`,
-            'for _ in range(200):',
-            `    if os.path.exists(os.path.join(${JSON.stringify(dir)}, "wrote again")): break`,
-            '    time.sleep(0.05)',
+            `while not os.path.exists(os.path.join(${JSON.stringify(dir)}, "logged")): time.sleep(0.05)`,
             'print("new")',
           ].join('\n'),
           [],
         );
-        assert.strictEqual(next.stdout, 'new\n');
         await until(() => logged.some((l) => l.endsWith('stdout while its interpreter runs no script: while a new interpreter runs a script')), 'its second line in the log');
+        flag('logged');
+        assert.strictEqual((await within(next, 'the new script')).stdout, 'new\n');
+        await until(() => existsSync(join(dir, 'wrote again')), 'the command to go on after its second write');
       } finally {
+        if (pid && alive(pid)) process.kill(pid, 'SIGKILL');
         runner.dispose();
         rmSync(dir, { recursive: true, force: true });
       }
@@ -1490,6 +1495,27 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
       } finally {
         runner.dispose();
       }
+    }
+  });
+
+  it("a script that replaces the runtime's copy of fd 2 with a file is told so through fd 2, and the file gets nothing of the runtime's", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pytc-copy2-'));
+    const file = join(dir, 'taken');
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      const result = await within(
+        runner.exec(`import __main__, os\nos.dup2(os.open(${JSON.stringify(file)}, os.O_WRONLY | os.O_CREAT), __main__._STD_ERR)\nprint("replaced")`, []),
+        'the replacing script',
+      );
+      assert.strictEqual(result.aborted, true);
+      assert.strictEqual(result.stdout, 'replaced\n');
+      assert.match(result.stderr, /cannot reach the output pipes any more: a script closed or replaced the runtime's copy of fd 2/);
+      assert.ok(result.stderr.endsWith(`; exiting\n${runtimeLost("the runtime's copy of fd 2")}`), result.stderr.slice(-500));
+      assert.strictEqual(readFileSync(file, 'utf8'), '');
+      assert.strictEqual((await within(runner.exec('print("fresh")', []), 'the next script')).stdout, 'fresh\n');
+    } finally {
+      runner.dispose();
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 
@@ -1648,6 +1674,23 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
         { stdout: result.stdout, stderr: result.stderr, returnCode: result.returnCode },
         { stdout: 'after the detach\nafter the fork\n', stderr: '', returnCode: 0 },
       );
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it("a script that closes its stdout's writer settles with what it wrote, with no note, and the next script prints", async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      const result = await within(
+        runner.exec('import sys\nprint("before the close")\nsys.stdout.write("partial")\nsys.stdout.close()', []),
+        'the closing script',
+      );
+      assert.deepStrictEqual(
+        { stdout: result.stdout, stderr: result.stderr, returnCode: result.returnCode },
+        { stdout: 'before the close\npartial', stderr: '', returnCode: 0 },
+      );
+      assert.strictEqual((await within(runner.exec('print("next")', []), 'the next script')).stdout, 'next\n');
     } finally {
       runner.dispose();
     }

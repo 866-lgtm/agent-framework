@@ -198,7 +198,8 @@ const NOTHING = Buffer.alloc(0);
  * kept for its result, up to OUTPUT_CAP_CHARS, or written to a background
  * script's journal. The mark itself is cut out. What arrives while no exec of
  * its interpreter runs, such as what a command a script left running writes,
- * goes to the host's log, once the interpreter has ended too.
+ * goes to the host's log as it arrives, both while the interpreter lives and
+ * after it has ended.
  */
 class OutputStream {
   /** Every process holding the pipe has closed it, so nothing more will come. */
@@ -308,7 +309,7 @@ class OutputStream {
     }
   }
 
-  /** Log output that arrived while no script ran, each piece up to LAST_WORDS_CHARS. */
+  /** Log output that arrived while no exec of this pipe's interpreter ran, each piece up to LAST_WORDS_CHARS. */
   private logIdle(text: string): void {
     const shown = text.trimEnd();
     const more = shown.length - LAST_WORDS_CHARS;
@@ -442,8 +443,9 @@ function stoppedReading(background: boolean): string {
 /** Why a script stopped when its interpreter exited under it, and what running it again does. */
 function interpreterExit(exitCode: number | null, signal: NodeJS.Signals | null, background: boolean, said = ''): string {
   const how = signal ? `was ended by ${signal}` : `exited with code ${exitCode}`;
-  // The runtime ends itself (_fatal) after a line saying which of its fds a script took, which reaches
-  // the host unless the script took its copy of fd 2 as well, and what the result keeps holds it.
+  // The runtime ends itself (_fatal) with code 70 after a line saying which of its fds a script took.
+  // The line reaches the host unless the script took both the runtime's copy of fd 2 and fd 2 itself,
+  // and it's read from what the result keeps, which past the stderr cap or a journal's tail lacks it.
   const taken = exitCode === RUNTIME_FATAL_EXIT ? fdTakenFromRuntime(said) : null;
   const check = taken
     ? `check whether the script closes or replaces ${taken}, as the runtime's line above says`

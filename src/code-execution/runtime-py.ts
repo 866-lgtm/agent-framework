@@ -205,13 +205,16 @@ def _check_own_fds():
 
 
 def _diag(text):
-    # A note of the runtime's own for the host's log, through fd 2's copy, or
-    # fd 2 itself if a script closed the copy. It waits for room on a pipe a
-    # command left non-blocking, as the marks do (_write_some).
+    # A note of the runtime's own for the host's log, through fd 2's copy or,
+    # if a script closed or replaced that, fd 2 itself, and only while it's
+    # one of the host's output pipes: a note never goes into a file a script
+    # put in its place. It waits for room on a pipe a command left
+    # non-blocking, as the marks do (_write_some).
     data = ("[pytc-runtime] " + text + "\n").encode("utf-8", "backslashreplace")
+    pipes = [_OWN_FDS[fd][2] for fd in (_STD_OUT, _STD_ERR) if fd in _OWN_FDS]
     for fd in (_STD_ERR, 2):
         try:
-            if fd is not None:
+            if fd is not None and (not pipes or _identity(fd) in pipes):
                 _write_all(fd, data)
                 return
         except OSError:
@@ -286,11 +289,12 @@ def _flush_writers():
     # execs too.
     for writer in list(_script_writers):
         try:
-            if writer.closed:
-                continue  # a script closed it, which sent what it held
             writer.flush()
         except ValueError:
-            continue  # a script detached its buffer, which took what it held
+            # A script closed or detached it, or the stream under it: nothing
+            # more goes through it. Closing or detaching the writer itself
+            # sent what it held first.
+            continue
         except Exception as exc:
             # Its fd closed or broke under it, so that much can't be sent.
             _diag("some of what the script wrote couldn't be sent (" + str(exc) + ")")
