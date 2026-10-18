@@ -1921,7 +1921,6 @@ export class AgentFramework {
   /** Per-agent last inference activity (epoch ms), for /healthz + doctor tooling. */
   private lastInferenceAt = new Map<string, { startedAt?: number; endedAt?: number; failedAt?: number; lastError?: string }>();
   private processLoggingPersist: boolean;
-  private processLoggingBroadcast: boolean;
   private activeStreams: Map<string, Promise<void>> = new Map();
   /** Told once per inbound acceptance (mcpl/inbound-source.ts). An internal
    *  seam, unset here: the receipt work (shelf-354) assigns it inside the
@@ -2352,7 +2351,6 @@ export class AgentFramework {
     syncIntervalMs: number,
     maintenanceIntervalMs: number,
     processLoggingPersist: boolean,
-    processLoggingBroadcast: boolean,
     timeZone: string,
     discordAwarenessOutbox: DiscordAwarenessOutbox | null,
     discordAwarenessEmoji: string,
@@ -2380,7 +2378,6 @@ export class AgentFramework {
     this.syncIntervalMs = syncIntervalMs;
     this.maintenanceIntervalMs = maintenanceIntervalMs;
     this.processLoggingPersist = processLoggingPersist;
-    this.processLoggingBroadcast = processLoggingBroadcast;
     this.timeZone = timeZone;
     this.discordAwarenessOutbox = discordAwarenessOutbox;
     this.discordAwarenessEmoji = discordAwarenessEmoji;
@@ -2543,7 +2540,6 @@ export class AgentFramework {
 
     // Process logging config (default: disabled)
     const processLoggingPersist = config.processLogging?.persist === true;
-    const processLoggingBroadcast = config.processLogging?.broadcast ?? false;
 
     // Register process log state only if persistence is enabled
     if (processLoggingPersist) {
@@ -2582,7 +2578,6 @@ export class AgentFramework {
       config.syncIntervalMs ?? DEFAULT_SYNC_INTERVAL_MS,
       config.maintenanceIntervalMs ?? DEFAULT_MAINTENANCE_INTERVAL_MS,
       processLoggingPersist,
-      processLoggingBroadcast,
       resolveTimeZone(config.timeZone),
       discordAwarenessOutbox,
       config.discordAwarenessEmoji ?? DEFAULT_DISCORD_AWARENESS_EMOJI,
@@ -6636,11 +6631,8 @@ export class AgentFramework {
   /**
    * Check if process logging is enabled.
    */
-  isProcessLoggingEnabled(): { persist: boolean; broadcast: boolean } {
-    return {
-      persist: this.processLoggingPersist,
-      broadcast: this.processLoggingBroadcast,
-    };
+  isProcessLoggingEnabled(): { persist: boolean } {
+    return { persist: this.processLoggingPersist };
   }
 
   /**
@@ -8092,40 +8084,6 @@ export class AgentFramework {
       this.rewindEpisode.set(agent.name, { markerId: id, count, category });
     }
     return count;
-  }
-
-  /**
-   * Announce a refusal-rewind on the conversational surface (Discord), used
-   * when the withheld turn was a *human* message so it isn't dropped silently.
-   * Best-effort; mirrors reactToRefusal's locus resolution.
-   */
-  private async announceRewind(
-    agentName: string,
-    rec: RewindRecord,
-    category: string,
-  ): Promise<void> {
-    try {
-      const incoming = this.channelRegistry?.buildChannelContext()?.incoming;
-      if (!incoming) return;
-      const parts = incoming.channelId.split(':');
-      if (parts[0] !== 'discord') return;
-      const channelId = parts[parts.length - 1];
-      const serverId = this.channelRegistry?.getChannelServerId(incoming.channelId);
-      const server = serverId ? this.mcplServerRegistry?.getServer(serverId) : null;
-      if (!server) return;
-      await server.sendToolsCall('send_message', {
-        channelId,
-        content:
-          `⚠️ I had to set aside ${rec.descriptor} — it tripped a content ` +
-          `filter (${category}), so it's withheld from my context and I'm ` +
-          `continuing without it. If it was important, please rephrase or re-send.`,
-      });
-    } catch (err) {
-      console.error(
-        '[refusal-rewind] announce failed:',
-        err instanceof Error ? err.message : err,
-      );
-    }
   }
 
   /**

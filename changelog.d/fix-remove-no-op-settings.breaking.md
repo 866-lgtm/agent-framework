@@ -1,0 +1,3 @@
+- **Hosts that set `processLogging.broadcast` or an agent's `refusalHandling.announceHumanTurns`, or read `isProcessLoggingEnabled().broadcast`:** both settings are removed. Neither has changed what the framework does in any release: `process:completed` trace events are emitted whatever `broadcast` says, and `announceHumanTurns` lost its one reader before 0.6.2, the first release that had it. `isProcessLoggingEnabled()` now returns `{ persist }`.
+  - **Migration:** delete either setting from your config. A TypeScript config that writes one in an object literal no longer compiles until you do.
+  - **Unchanged:** a config that still sets either starts as before, with the setting ignored.
