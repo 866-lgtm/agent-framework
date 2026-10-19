@@ -80,13 +80,13 @@ export function safeCut(value: string, at: number): number {
 /**
  * One line numbered the way `cat -n` numbers it: a six-wide number, a tab and
  * the line. A line longer than `maxChars` is cut, saying how many characters
- * it holds past the cut, and `readOn` adds how to read them.
+ * it holds past the cut, or, where `readOn` is given, how to read them.
  */
 export function numberedLine(line: string, n: number, maxChars = MAX_LINE_CHARS, readOn?: (cut: number) => string): string {
   const number = String(n).padStart(6);
   if (line.length <= maxChars) return `${number}\t${line}`;
   const cut = safeCut(line, maxChars);
-  return `${number}\t${line.slice(0, cut)} [… ${line.length - cut} more chars${readOn ? `; ${readOn(cut)}` : ''}]`;
+  return `${number}\t${line.slice(0, cut)} [… ${readOn ? readOn(cut) : `${line.length - cut} more chars`}]`;
 }
 
 /** Lines numbered from `start`, each as numberedLine shows it. */

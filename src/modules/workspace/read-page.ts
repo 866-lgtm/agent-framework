@@ -65,7 +65,8 @@ export function linePage(path: string, file: FileText, offset: number, limit: nu
   }
   const last = Math.min(first + limit, total);
   const shown = (i: number, maxLineChars = MAX_LINE_CHARS) =>
-    numberedLine(lines[i], i + 1, maxLineChars, (cut) => `read them with offsetChars=${starts[i] + cut}`);
+    numberedLine(lines[i], i + 1, maxLineChars,
+      (cut) => `read the rest with offsetChars=${starts[i] + cut} and limitChars=${lines[i].length - cut}`);
   // Where the rest of line i starts in the stored text, shown at most
   // maxLineChars long, as its marker says; null for a line shown whole.
   const restOf = (i: number, maxLineChars: number): number | null =>
@@ -169,7 +170,7 @@ export function characterPage(path: string, file: FileText, offsetChars: number,
   // that as limitChars, so a reader that follows its notes ends where it
   // asked to: at a cut line's end, for the rest a line page's note names.
   const stoppedNote = (to: number, left: number) =>
-    `Stopped at character ${to} to stay within the ${maxChars}-character result limit; continue with offsetChars=${to} and limitChars=${left}.`;
+    `Stopped at character ${to} to stay within the ${maxChars}-character result limit; read the rest of what you asked for with offsetChars=${to} and limitChars=${left}.`;
   const page = (to: number, note: string | undefined) => ({
     path,
     totalChars: text.length,

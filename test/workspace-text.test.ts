@@ -53,7 +53,7 @@ test('numberedLine numbers a line as cat -n does, and cuts a long one without sp
   assert.equal(numberedLine('x'.repeat(2001), 1), `     1\t${'x'.repeat(2000)} [… 1 more chars]`);
   const emoji = 'x'.repeat(4) + '😀' + 'y';
   assert.equal(safeCut(emoji, 5), 4);
-  assert.equal(numberedLine(emoji, 2, 5, (cut) => `from ${cut}`), `     2\txxxx [… 3 more chars; from 4]`);
+  assert.equal(numberedLine(emoji, 2, 5, (cut) => `from ${cut}`), `     2\txxxx [… from 4]`);
   assert.equal(numberedLine('abc', 3, 0), '     3\t [… 3 more chars]');
 });
 
