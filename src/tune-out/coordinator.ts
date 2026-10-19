@@ -374,30 +374,37 @@ export class TuneOutCoordinator {
     // The subconscious gets one cancel turn of its own: the issue's cancel
     // shape is dump + a report from the subconscious, and when the cap
     // truncated the raw dump, its summary is what covers the tail. The held
-    // messages the dump can't give the resident whole come with the notice,
-    // each with its own content, as its view can't have them until they're
-    // stored. A cancel the subconscious makes itself gets the notice and the
-    // turn when some do, since it wrote its note before it could see them,
-    // and when it wrote no note and the cap cut anything, since nothing else
-    // then covers what the dump leaves out. Otherwise its note speaks for
-    // what it saw.
+    // messages the dump can't give the resident whole follow the notice,
+    // each a row of its own with its own content, as its view can't have
+    // them until they're stored. A cancel the subconscious makes itself gets
+    // the notice and the turn when some do, since it wrote its note before
+    // it could see them, and when it wrote no note and the cap cut anything,
+    // since nothing else then covers what the dump leaves out. Otherwise its
+    // note speaks for what it saw.
     const selfCancel = source === 'subconscious';
     if (subName && (!selfCancel || heldForReport.length > 0 || (!subconsciousNote && truncated > 0))) {
       const truncNote = truncated > 0
         ? ` ${truncated} of ${backlog.length} diverted messages were above the cap and not delivered raw to the resident.`
         : '';
-      const heldBlocks: ContentBlock[] = heldForReport.length > 0
-        ? [
-            { type: 'text', text: 'Still held at the cancel, so your view may not have them yet:' },
-            ...heldForReport.flatMap((m): ContentBlock[] => [{ type: 'text', text: `${authorOf(m)}:` }, ...m.content]),
-          ]
-        : [];
+      const heldNote = heldForReport.length > 0
+        ? ` Still held at the cancel, so your view may not have them yet: the ${heldForReport.length} message${heldForReport.length === 1 ? '' : 's'} after this one.`
+        : '';
       this.hooks.addMessage(
         'user',
-        [{ type: 'text', text: `[Tune-out cancelled: ${channelId} — ${reason}.${truncNote}]` }, ...heldBlocks],
+        [{ type: 'text', text: `[Tune-out cancelled: ${channelId} — ${reason}.${truncNote}${heldNote}]` }],
         { system: true, kind: 'tune-out-cancel-report', channelId },
         subName,
       );
+      // Each held message is a row of its own, so a per-message cap cuts each
+      // one on its own, its author's label included, not the batch's newest.
+      for (const m of heldForReport) {
+        this.hooks.addMessage(
+          'user',
+          [{ type: 'text', text: `${authorOf(m)}:` }, ...m.content],
+          { system: true, kind: 'tune-out-cancel-held', channelId },
+          subName,
+        );
+      }
       this.hooks.requestInference(subName, `tune-out cancelled: ${channelId}`, 'tune-out');
     }
     this.hooks.emitTrace({ type: 'tune-out:cancelled', serverId, channelId, epochId, reason, wakeCount: ended.wakeCount });

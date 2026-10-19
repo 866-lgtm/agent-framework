@@ -16,7 +16,7 @@ import { join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { MessageQuery } from '@animalabs/context-manager';
 import type { EventResponse, Module, ModuleContext, ModuleMessage, ToolDefinition, ToolResult } from '../src/index.js';
-import { AgentFramework } from '../src/index.js';
+import { AgentFramework, PassthroughStrategy } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import type { TuneOutCoordinator } from '../src/tune-out/coordinator.js';
 
@@ -53,7 +53,10 @@ class ProbeModule implements Module {
 
 interface Internals {
   tuneOutCoordinator: TuneOutCoordinator | null;
-  agents: Map<string, { getContextManager(): { getAllMessages(): Array<{ content: ContentBlock[] }> } }>;
+  agents: Map<string, { getContextManager(): {
+    getAllMessages(): Array<{ content: ContentBlock[]; metadata?: Record<string, unknown> }>;
+    compile(): Promise<{ messages: Array<{ content: ContentBlock[] }> }>;
+  } }>;
   deferredMessages: Array<{ seq: number; content: ContentBlock[] }>;
   channelRegistry: {
     listChannelsRaw(): unknown[];
@@ -99,7 +102,7 @@ interface Rig {
  *  given backlogCap, and a module whose context the test reads through. Each
  *  test opens its own, so no reply one test queues on the mock reaches
  *  another's turn. */
-async function open(backlogCap = 10): Promise<Rig> {
+async function open(backlogCap = 10, strategy?: PassthroughStrategy): Promise<Rig> {
   const tempDir = mkdtempSync(join(tmpdir(), 'module-rows-held-'));
   const commandPath = join(tempDir, 'commands.txt');
   writeFileSync(commandPath, '');
@@ -108,7 +111,7 @@ async function open(backlogCap = 10): Promise<Rig> {
   const framework = await AgentFramework.create({
     storePath: join(tempDir, 'test.chronicle'),
     membrane: membrane.asMembrane(),
-    agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+    agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', ...(strategy ? { strategy: strategy as never } : {}) }],
     subconscious: { enabled: true, systemPrompt: 'You are the Subconscious.' },
     mcplServers: [{
       id: 'disc',
@@ -145,6 +148,20 @@ async function open(backlogCap = 10): Promise<Rig> {
 
 const rowWith = (rows: ModuleMessage[], text: string): ModuleMessage | undefined =>
   rows.find((m) => textOf(m).includes(text));
+
+/** The subconscious's cancel report notice, and the held rows after it. */
+function reportOf(internals: Internals): { notice: string; held: string[] } | undefined {
+  const all = internals.agents.get('Subconscious')!.getContextManager().getAllMessages();
+  const at = all.findIndex((m) => textOf(m).includes('[Tune-out cancelled:'));
+  if (at === -1) return undefined;
+  const held = all.slice(at + 1).filter((m) => m.metadata?.kind === 'tune-out-cancel-held').map(textOf);
+  return { notice: textOf(all[at]!), held };
+}
+
+/** A strategy whose per-message cap the subconscious mirrors. */
+class CappedPassthroughStrategy extends PassthroughStrategy {
+  readonly maxMessageTokens = 80;
+}
 
 describe("a message a tune-out holds stays out of what the residents are shown, and a module reads it as heldFromResidents", () => {
   it('marks a stored held message in queryMessages and getMessage, during the tune-out and after the cancel, and leaves an ordinary row unmarked', async () => {
@@ -316,6 +333,7 @@ describe("a message a tune-out holds stays out of what the residents are shown, 
         sub.getAllMessages().map(textOf).find((t) => t.includes('[Tune-out cancelled:'));
       await waitFor("the subconscious's report notice", () => noticeOf() !== undefined);
       assert.ok(!noticeOf()!.includes('Still held'), 'the notice carries no held message, as the dump shows them all');
+      assert.deepEqual(reportOf(internals)!.held, [], 'and no held row follows it');
       assert.ok(noticeOf()!.includes('1 of 4 diverted messages were above the cap and not delivered raw to the resident'), 'it gives the count above the cap');
 
       // The boundary then stores the held messages without injecting them, so
@@ -346,7 +364,7 @@ describe("a message a tune-out holds stays out of what the residents are shown, 
     }
   });
 
-  it("hands the subconscious's cancel report the held messages the cap leaves out of the dump, oldest first", async () => {
+  it("hands the subconscious's cancel report the older held message, which the cap leaves out of the dump, after the queue was put out of seq order", async () => {
     const { framework, ctx, module, membrane, internals, emit, close } = await open(1);
     let release: () => void = () => {};
     try {
@@ -386,9 +404,12 @@ describe("a message a tune-out holds stays out of what the residents are shown, 
       const noticeOf = (): string | undefined =>
         sub.getAllMessages().map(textOf).find((t) => t.includes('[Tune-out cancelled:'));
       await waitFor("the subconscious's report notice", () => noticeOf() !== undefined);
-      const notice = noticeOf()!;
-      assert.ok(notice.includes('T4-HELD-1'), 'the notice carries the held message the dump leaves out');
-      assert.ok(!notice.includes('T4-HELD-2'), 'and not the one the dump shows');
+      await waitFor('the held row after it', () => (reportOf(internals)?.held.length ?? 0) > 0);
+      const report = reportOf(internals)!;
+      assert.ok(report.notice.includes('the 1 message after this one'), 'the notice counts the held row that follows it');
+      assert.equal(report.held.length, 1);
+      assert.ok(report.held[0]!.includes('T4-HELD-1'), 'the notice carries the held message the dump leaves out, as a row of its own');
+      assert.ok(!report.held[0]!.includes('T4-HELD-2'), 'and not the one the dump shows');
     } finally {
       release();
       await close();
@@ -428,11 +449,48 @@ describe("a message a tune-out holds stays out of what the residents are shown, 
       const noticeOf = (): string | undefined =>
         sub.getAllMessages().map(textOf).find((t) => t.includes('[Tune-out cancelled:'));
       await waitFor("the subconscious's report notice", () => noticeOf() !== undefined);
-      const notice = noticeOf()!;
-      const first = notice.indexOf('T5-HELD-1');
-      const second = notice.indexOf('T5-HELD-2');
-      assert.ok(first !== -1 && second !== -1, 'the notice carries both held messages');
-      assert.ok(first < second, 'oldest first');
+      await waitFor('the held rows after it', () => (reportOf(internals)?.held.length ?? 0) === 2);
+      const { held } = reportOf(internals)!;
+      assert.ok(held[0]!.includes('T5-HELD-1') && held[1]!.includes('T5-HELD-2'), 'the notice carries both held messages, oldest first, a row each');
+    } finally {
+      release();
+      await close();
+    }
+  });
+
+  it("with a per-message cap that the held messages pass together but not one by one, hands each of them to the subconscious whole", async () => {
+    // The subconscious mirrors the primary's maxMessageTokens (80 here), and
+    // cuts one message's text past it. Each held message is about 55 tokens,
+    // four of them well past 80 together.
+    const { framework, ctx, module, membrane, internals, emit, close } = await open(0, new CappedPassthroughStrategy());
+    let release: () => void = () => {};
+    try {
+      let waiting!: () => void;
+      const inTool = new Promise<void>((resolve) => { waiting = resolve; });
+      module.hold = new Promise<void>((resolve) => { release = resolve; });
+      module.onWait = waiting;
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'Waiting.' },
+        { type: 'tool_use', id: 'w1', name: 'probe--wait', input: {} },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+      framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as never);
+      await within("the resident's tool", inTool);
+      const filler = 'chatter while the turn is alive, '.repeat(6).trim();
+      for (const n of [1, 2, 3, 4]) {
+        emit(`t6${n}`, `T6-HELD-${n} ${filler}`);
+        await waitFor(`held write ${n}`, () => rowWith(ctx.queryMessages({}).messages, `T6-HELD-${n}`)?.held === true);
+      }
+
+      assert.ok(internals.tuneOutCoordinator!.cancel('disc', CHANNEL, 'agent-tool', 'test').ok);
+      // The notice and whatever follows it are added in the one cancel call.
+      await waitFor("the subconscious's report notice", () => reportOf(internals) !== undefined);
+      // The originals are still held, so the report is the only place the
+      // subconscious's view has their text.
+      const view = (await internals.agents.get('Subconscious')!.getContextManager().compile()).messages.map(textOf).join('\n');
+      for (const n of [1, 2, 3, 4]) {
+        assert.ok(view.includes(`T6-HELD-${n} ${filler}`), `the subconscious's view holds held message ${n} whole`);
+      }
     } finally {
       release();
       await close();
