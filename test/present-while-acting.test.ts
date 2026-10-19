@@ -1520,7 +1520,9 @@ describe('present while acting', () => {
         name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
       });
       contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
-      const run = framework.runEphemeralToCompletion(agent, contextManager, { startupTimeoutMs: 3_000 });
+      // The default startup limit, 30 s, so only a host stalled that long
+      // ends the run before its start's error does.
+      const run = framework.runEphemeralToCompletion(agent, contextManager);
       framework.start();
       await assert.rejects(run, /checkpoint store unavailable/, "the run fails with its start's error");
     } finally {
