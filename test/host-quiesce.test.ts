@@ -767,7 +767,7 @@ process.stdin.on('data', (c) => {
     if (!line.trim()) continue;
     let m; try { m = JSON.parse(line); } catch { continue; }
     const reply = (result) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result }) + '\\n');
-    if (m.method === 'initialize') reply({ capabilities: { experimental: { mcpl: { version: '0.4', pushEvents: true } } } });
+    if (m.method === 'initialize') reply({ protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.4', pushEvents: true } } } });
     else if (m.method === 'tools/list') reply({ tools: [] });
     else if (m.id === 900) log('push-response', { error: m.error ?? null });
     else if (m.id === 901) log('resume-response', { result: m.result ?? null, error: m.error ?? null });
@@ -982,10 +982,93 @@ test('a cancel that surfaces as a stream ERROR still settles as an operator abor
     assert.ok(traces.some((t) => t.type === 'inference:aborted'
       && (t as { reason?: string }).reason === 'quiesce_abandoned'));
     assert.ok(!traces.some((t) => t.type === 'inference:exhausted'));
+    // The cancel provenance is read BEFORE the failure accounting: the same
+    // stream must not be reported failed and then aborted.
+    assert.ok(!traces.some((t) => t.type === 'inference:failed'),
+      'an abandoned turn is not first recorded as a provider failure');
     const lifecycle = traces
       .filter((t) => String(t.type).includes('lifecycle'))
       .map((t) => (t as { phase?: string }).phase);
     if (lifecycle.length > 0) assert.ok(!lifecycle.includes('completed'), 'an abandoned turn is not "completed"');
+  });
+});
+
+/** The `error` of each inference-log row the framework writes, in order. */
+function watchInferenceLog(framework: AgentFramework): string[] {
+  const logged: string[] = [];
+  const logs = framework as unknown as { logInference(entry: { error?: string }): void };
+  const logInference = logs.logInference.bind(framework);
+  logs.logInference = (entry) => { logged.push(entry.error ?? '(no error)'); logInference(entry); };
+  return logged;
+}
+
+test('an abandoned turn writes one inference-log row, attributed to the abandon', async () => {
+  // Every other terminal of a stream writes an inference-log row, the
+  // abandon's `error` twin included, so the log can attribute it later.
+  const membrane = new HangingMembrane();
+  await withFramework(membrane, async (framework) => {
+    const logged = watchInferenceLog(framework);
+    framework.start();
+    framework.nudgeAgent('agent', 'operator');
+    await waitFor('turn to start', () => membrane.calls.length === 1);
+    const status = await framework.quiesce({ timeoutMs: 1_000, abandon: true });
+    assert.equal(status.drained, true);
+    await waitFor('agent back to idle', () => framework.getAgent('agent')!.state.status === 'idle');
+    assert.deepEqual(logged, ['Stream aborted: quiesce_abandoned']);
+  });
+});
+
+test("an abandon stops the agent's running code_execution script with the turn", async () => {
+  const membrane = new HangingMembrane();
+  await withFramework(membrane, async (framework) => {
+    framework.start();
+    framework.nudgeAgent('agent', 'operator');
+    await waitFor('turn to start', () => membrane.calls.length === 1);
+    const scriptAborts: string[] = [];
+    (framework as unknown as { codeExecutionRunners: Map<string, unknown> }).codeExecutionRunners.set('agent', {
+      busy: true,
+      abort: (reason: string) => { scriptAborts.push(reason); },
+      dispose: () => {},
+    });
+    const status = await framework.quiesce({ timeoutMs: 1_000, abandon: true });
+    assert.equal(status.drained, true);
+    await waitFor('agent back to idle', () => framework.getAgent('agent')!.state.status === 'idle');
+    assert.deepEqual(scriptAborts, ['turn abandoned by quiesce']);
+  });
+});
+
+test('an abandon whose stream just closes still settles the turn as an operator abort', async () => {
+  // A stream implementation may answer cancel() by just closing its
+  // iterator, with no `aborted` or `error` event. The abandon still ends the
+  // turn as its twins do: the agent back to idle, one inference:aborted with
+  // the abandon's reason, one log row, and no failure accounting.
+  class ClosingHangStream extends HangingStream {
+    override async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+      await this.waitForCancel();
+    }
+  }
+  class ClosingMembrane extends MockMembrane {
+    override streamYielding(request: NormalizedRequest): YieldingStream {
+      this.calls.push(request);
+      return new ClosingHangStream();
+    }
+  }
+  const membrane = new ClosingMembrane();
+  await withFramework(membrane, async (framework) => {
+    const traces: TraceEvent[] = [];
+    framework.onTrace((event) => traces.push(event));
+    const logged = watchInferenceLog(framework);
+    framework.start();
+    framework.nudgeAgent('agent', 'operator');
+    await waitFor('turn to start', () => membrane.calls.length === 1);
+    const status = await framework.quiesce({ timeoutMs: 1_000, abandon: true });
+    assert.equal(status.drained, true);
+    await waitFor('agent back to idle', () => framework.getAgent('agent')!.state.status === 'idle');
+    const aborted = traces.filter((t) => t.type === 'inference:aborted').map((t) => (t as { reason?: string }).reason);
+    assert.deepEqual(aborted, ['quiesce_abandoned']);
+    assert.ok(!traces.some((t) => t.type === 'inference:exhausted' || t.type === 'inference:failed'),
+      'an operator cancel must not feed the failure accounting');
+    assert.deepEqual(logged, ['Stream aborted: quiesce_abandoned']);
   });
 });
 
@@ -1416,6 +1499,59 @@ test('boot recovery restores a recovery file that predates seq in file order, an
     const texts = framework.getAgent('agent')!.getContextManager().getAllMessages().slice(before)
       .map((m) => (m.content[0] as { text: string }).text);
     assert.deepEqual(texts, ['third', 'first', 'second']);
+  } finally {
+    console.error = error;
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('boot recovery numbers the restored queue 1..N, so after a seq at Number.MAX_SAFE_INTEGER each deferral still gets a seq of its own', { timeout: 60_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-seq-limit-'));
+  const storePath = join(dir, 'store');
+  const config = () => ({
+    storePath,
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
+    modules: [],
+  });
+  const add = (fw: AgentFramework, text: string) =>
+    (fw as unknown as { addMessage(p: string, c: unknown[]): unknown }).addMessage('user', [{ type: 'text', text }]);
+  let framework = await AgentFramework.create(config());
+  const lines: string[] = [];
+  const error = console.error;
+  try {
+    await framework.quiesce({ reason: 'surgery' });
+    const before = framework.getAgent('agent')!.getContextManager().getAllMessages().length;
+    add(framework, 'first');
+    await framework.stop();
+
+    // A seq at the limit, as damage or a hand edit could leave it. It is a
+    // valid seq, so boot names nothing and has no reason to rewrite the file.
+    const file = join(storePath, 'recovery', 'deferred-writes.json');
+    const doc = JSON.parse(readFileSync(file, 'utf8')) as { pending: Array<Record<string, unknown>> };
+    assert.equal(doc.pending.length, 1);
+    doc.pending[0]!.seq = Number.MAX_SAFE_INTEGER;
+    const edited = JSON.stringify(doc);
+    writeFileSync(file, edited);
+
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    framework = await AgentFramework.create(config());
+    assert.equal(readFileSync(file, 'utf8'), edited, "boot doesn't rewrite a file whose seqs are all valid");
+    add(framework, 'second');
+    add(framework, 'third');
+    const persisted = JSON.parse(readFileSync(file, 'utf8')) as { pending: Array<{ seq: unknown; content: Array<{ text: string }> }> };
+    assert.deepEqual(persisted.pending.map((m) => [m.content[0]!.text, m.seq]), [['first', 1], ['second', 2], ['third', 3]],
+      'numbered 1..N at boot, and the deferrals after it go on from N');
+    await framework.stop();
+
+    framework = await AgentFramework.create(config());
+    console.error = error;
+    assert.ok(!lines.some((line) => line.includes('has seq')), `every seq the next boot reads is valid:\n${lines.join('\n')}`);
+    await framework.resume();
+    const texts = framework.getAgent('agent')!.getContextManager().getAllMessages().slice(before)
+      .map((m) => (m.content[0] as { text: string }).text);
+    assert.deepEqual(texts, ['first', 'second', 'third']);
   } finally {
     console.error = error;
     await framework.stop();
