@@ -13,6 +13,8 @@ class FakeService {
   upserts: Item[][] = [];
   searches: Record<string, unknown>[] = [];
   failNext = 0;
+  /** Answer hits without text, as a service that keeps only vectors and ids does. */
+  omitText = false;
   server!: Server; url = '';
   async start(): Promise<void> {
     this.server = createServer((req, res) => {
@@ -43,7 +45,7 @@ class FakeService {
         const q = JSON.parse(body) as Record<string, unknown>; this.searches.push(q);
         const hits = [...this.items.values()].filter((it) => !q.kinds || (q.kinds as string[]).includes(it.kind))
           .filter((it) => !q.channel || it.channel === q.channel)
-          .map((it) => ({ id: it.id, score: it.text.includes(q.query as string) ? 0.9 : 0.1, ts: it.ts ?? null, channel: it.channel ?? null, kind: it.kind, level: it.level ?? null, meta: it.meta ?? {}, text: it.text.slice(0, 40), chars: it.text.length }))
+          .map((it) => ({ id: it.id, score: it.text.includes(q.query as string) ? 0.9 : 0.1, ts: it.ts ?? null, channel: it.channel ?? null, kind: it.kind, level: it.level ?? null, meta: it.meta ?? {}, ...(this.omitText ? {} : { text: it.text.slice(0, 40), chars: it.text.length }) }))
           .sort((a, b) => b.score - a.score).slice(0, (q.k as number) ?? 10);
         return json(200, { namespace: 'test/ns', hits, count_indexed: this.items.size, timing_ms: { embed: 1, search: 1 } });
       });
@@ -158,6 +160,23 @@ describe('HistoryModule semantic_search', () => {
       const sdata = sum.data as { hits: Array<{ id: string }>; index: { droppedOffBranch: number } };
       assert.ok(!sdata.hits.some((h) => h.id === 'sum:s1'), JSON.stringify(sdata.hits));
       assert.equal(sdata.index.droppedOffBranch, 1);
+      await mod.stop();
+    } finally { await svc2.stop(); }
+  });
+
+  it('rebuilds a summary hit\'s snippet from the local summary when the service returns no text', async () => {
+    const svc2 = new FakeService(); await svc2.start();
+    try {
+      const mod = new HistoryModule({ semantic: { url: svc2.url, token: 'tok', namespace: 'test/ns', syncIntervalMs: 0 } });
+      mod.bind(stubCm(messages, summaries));
+      await mod.syncSemanticIndex()!;
+      svc2.omitText = true;
+      const res = await mod.handleToolCall({ id: 'n', name: 'semantic_search', input: { query: 'evening', level: 1 } });
+      assert.equal(res.success, true, JSON.stringify(res));
+      const hit = (res.data as { hits: Array<{ id: string; snippet: string; chars: number }> }).hits.find((h) => h.id === 'sum:s1');
+      assert.ok(hit, JSON.stringify(res.data));
+      assert.equal(hit.snippet, 'Summary of the evening');
+      assert.equal(hit.chars, 'Summary of the evening'.length);
       await mod.stop();
     } finally { await svc2.stop(); }
   });

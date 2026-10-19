@@ -1679,6 +1679,8 @@ export class HistoryModule implements Module {
     // A message hit's snippet is rebuilt from the CURRENT local text, never
     // the remote copy: an edit not yet synced (or one the index never got)
     // must not leak a passage the edit removed. Only the ranking can be stale.
+    // A summary hit's snippet is rebuilt from the local summary too, so a
+    // service that keeps only vectors and ids (no text) still yields one.
     const currentText = new Map<string, string>();
     const keep = (h: { id: string }): 'ok' | 'offBranch' | 'stale' => {
       const msgId = /^msg:(.+)$/.exec(h.id)?.[1];
@@ -1691,7 +1693,14 @@ export class HistoryModule implements Module {
         currentText.set(h.id, text);
         return 'ok';
       }
-      if (sumId !== undefined) return cm.getSummary(sumId) !== null ? 'ok' : 'offBranch';
+      if (sumId !== undefined) {
+        const s = cm.getSummary(sumId);
+        if (!s) return 'offBranch';
+        // Cut as summaryToItem cuts the text it indexes.
+        const text = safeSlice(s.content.trim(), 0, this.semanticCfg!.maxChars ?? 32_000);
+        if (text) currentText.set(h.id, text);
+        return 'ok';
+      }
       return 'ok';
     };
     let k = limit;
