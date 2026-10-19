@@ -40,7 +40,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
-import { IGNORED, NONBLOCK, OTHER_MOUNT, OUTSIDE_INCLUDE, ROOT_REPLACED, ROOT_UNAVAILABLE, beginsWithDir, type LevelFolds, checkDir, checkRoot, diskSpelling, filesystemTrustsCtime, foldsAtEach, includePatternReadable, inOtherMount, insideMount, leadsInto, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, landing, namesHolder, namesNestedPlace, nestedAtReal, nestedHolder, type CheckedDir, type MountView, type NestedMount, parsedSpelling, passedOverAt, pathSegments, readPrefix, type LinkFound } from './observe.js';
+import { IGNORED, NONBLOCK, OTHER_MOUNT, OUTSIDE_INCLUDE, ROOT_REPLACED, ROOT_UNAVAILABLE, beginsWithDir, type LevelFolds, checkDir, checkRoot, diskSpelling, filesystemTrustsCtime, foldsAtEach, includePatternReadable, inOtherMount, insideMount, leadsInto, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, landedFor, namesHolder, namesNestedPlace, nestedAtReal, nestedHolder, type CheckedDir, type MountView, type NestedMount, parsedSpelling, passedOverAt, pathSegments, readPrefix, type LinkFound } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
 import {
   type MountRuntime,
@@ -380,13 +380,16 @@ const LINKS_FOLLOWED = 40;
  * it, with the links on its way and in it taken out, read without holding
  * the process. Where nothing is there yet, a link leads where its target
  * would be, and anything else lies beneath its nearest existing directory's
- * real path, with the rest as given. A link's target is read from the
- * link's directory as it is on disk, and nothing is resolved lexically on
- * the way, so a `..` is taken from where the links before it lead, as the
+ * real path, with the rest as given, a `..` after a name that isn't there
+ * taken lexically. A link's target is read from the link's directory as it
+ * is on disk, so a `..` is taken from where the links before it lead, as the
  * kernel takes it. Where realpath fails for any other reason, such as a
  * loop or a lack of permission, the whole path as path.resolve reads it.
+ * `unresolved`, where given, says where the kernel didn't resolve the place
+ * whole: there, and where a link read here leads to a place not made yet,
+ * whose spelling can come out as a path's own though a link was followed.
  */
-async function realBeneath(given: string, links = 0): Promise<string> {
+async function realBeneath(given: string, links = 0, unresolved?: { found: boolean }): Promise<string> {
   // A trailing separator, as a link to a directory is often written, names
   // the same place, but readlink would then follow the link it names.
   const { root } = parse(given);
@@ -397,10 +400,14 @@ async function realBeneath(given: string, links = 0): Promise<string> {
   } catch (err) {
     const code = errnoOf(err);
     const parent = dirname(absolute);
-    if ((code !== 'ENOENT' && code !== 'ENOTDIR') || links >= LINKS_FOLLOWED || parent === absolute) return resolve(absolute);
-    const place = await realBeneath(parent, links);
+    if ((code !== 'ENOENT' && code !== 'ENOTDIR') || links >= LINKS_FOLLOWED || parent === absolute) {
+      if (unresolved) unresolved.found = true;
+      return resolve(absolute);
+    }
+    const place = await realBeneath(parent, links, unresolved);
     const target = await readlink(absolute).catch(() => null);
-    if (target !== null) return realBeneath(isAbsolute(target) ? target : `${place}${sep}${target}`, links + 1);
+    if (target !== null && unresolved) unresolved.found = true;
+    if (target !== null) return realBeneath(isAbsolute(target) ? target : `${place}${sep}${target}`, links + 1, unresolved);
     return join(place, basename(absolute));
   }
 }
@@ -863,6 +870,12 @@ export class WorkspaceModule implements Module {
    */
   private otherMounts = new Map<string, NestedMountEntry[]>();
   /**
+   * Each mount's root where disk has it, read at each start with the nesting
+   * (readNesting), so the file tools can tell a path that follows a link from
+   * one whose root is configured through a link, as one under macOS's /var is.
+   */
+  private realRoots = new Map<string, string>();
+  /**
    * Whether a file's mode is observed, taken in and applied (MountRuntime's
    * `modesObserved`): not on Windows, which reports no POSIX modes. A test
    * sets it false to run that case anywhere.
@@ -1134,9 +1147,10 @@ export class WorkspaceModule implements Module {
     // watches nothing before they're known. A stop begun meanwhile stands,
     // and this start then sets nothing.
     const stops = this.stopsBegun;
-    const nesting = await this.readNesting();
+    const { nesting, roots } = await this.readNesting();
     if (this.stopsBegun !== stops) return;
     this.otherMounts = nesting;
+    this.realRoots = roots;
 
     this.ctx = ctx;
     this.stopped = false;
@@ -2078,7 +2092,7 @@ export class WorkspaceModule implements Module {
    * levels from the first segment not on disk are taken to fold until a
    * start finds them.
    */
-  private async readNesting(): Promise<Map<string, NestedMountEntry[]>> {
+  private async readNesting(): Promise<{ nesting: Map<string, NestedMountEntry[]>; roots: Map<string, string> }> {
     const reals = new Map<string, string>();
     // Each directory above a mount's configured path, with where it lies on
     // disk, so a path that reaches another mount's root through a link, as
@@ -2136,7 +2150,7 @@ export class WorkspaceModule implements Module {
         }
       }
     }
-    return nesting;
+    return { nesting, roots: reals };
   }
 
   /**
@@ -2225,17 +2239,21 @@ export class WorkspaceModule implements Module {
     const nested = this.nestedOf(mount.config.name);
     if (nested.length === 0) return null;
     const lexical = resolve(mount.config.path, relativePath);
-    const real = await realBeneath(lexical);
+    const unresolved = { found: false };
+    const real = await realBeneath(lexical, 0, unresolved);
     // A place no mount shows leaves this one, in the disk readers' words: the
     // file tools refuse it here, before anything is stored or served there,
     // with the words openContainedFile gives the same place.
-    const escape = new WorkspaceReadError('escape', `Symlink escape detected: ${path}`, 'realpath');
-    if (mount.config.followSymlinks === true && real !== lexical) {
-      // Through a link into a nested mount's directory with an include, that
-      // mount's view decides (landing).
-      const landed = await landing(mount.config.path, relativePath, nested);
-      if (landed) return landed.shown ? new NestedMountError(path, mount.config.name, landed.name, landed.use, 'leads into') : escape;
-    }
+    const escape = (): Error => new WorkspaceReadError('escape', `Symlink escape detected: ${path}`, 'realpath');
+    // Through a link into a nested mount's directory with an include, that
+    // mount's view decides (landedFor), and where the kernel couldn't resolve
+    // the path, as for a loop, the walk tells where it went. A path is
+    // compared as spelled beneath the root where disk has it (realRoots), so
+    // a root configured through a link doesn't make every path walk.
+    const realRoot = this.realRoots.get(mount.config.name) ?? resolve(mount.config.path);
+    const view = { root: mount.config.path, followSymlinks: mount.config.followSymlinks === true, nested };
+    const landed = await landedFor(view, realRoot, relativePath, unresolved.found ? null : real);
+    if (landed) return landed.shown ? new NestedMountError(path, mount.config.name, landed.name, landed.use, 'leads into') : escape();
     const holder = nestedAtReal(real, nested);
     if (!holder) return null;
     if (mount.config.followSymlinks !== true) {
@@ -2244,7 +2262,7 @@ export class WorkspaceModule implements Module {
     }
     // Where the walk reached no place of a nested mount with an include, such
     // as past a name the kernel can't enter, nothing there is shown.
-    if (holder.include !== undefined) return escape;
+    if (holder.include !== undefined) return escape();
     return new NestedMountError(path, mount.config.name, holder.name, holder.use, 'leads into');
   }
 
@@ -2610,24 +2628,38 @@ export class WorkspaceModule implements Module {
     const linkView = { root: mount.config.path, followSymlinks: follow };
     const onTheWay = await linkOnTheWay(linkView, relativePath, 'parents');
     if (onTheWay !== null) throw await linkReadError(mount, onTheWay, mountPrefixedPath, this.nestedOf(mount.config.name));
+    const escape = (): WorkspaceReadError => new WorkspaceReadError('escape', `Symlink escape detected: ${mountPrefixedPath}`, 'realpath');
+    // Through a link the mount follows into a nested mount's directory with
+    // an include, that mount's view decides (landedFor), as the parse did,
+    // before anything the kernel answered is told: an errno, what the file
+    // is, or where it ended. `real` is the path's real place where known.
+    const landedRefusal = async (real: string | null, stage: 'lstat' | 'open' | 'fstat' | 'realpath'): Promise<WorkspaceReadError | undefined> => {
+      const landed = await landedFor({ ...linkView, nested: this.nestedOf(mount.config.name) }, realMountRoot, relativePath, real);
+      if (landed === undefined) return undefined;
+      return landed.shown ? new WorkspaceReadError('other_mount', leadsInto(mount.config.name, relativePath, landed), stage) : escape();
+    };
 
     let fileInfo: Awaited<ReturnType<typeof lstat>>;
     try {
       fileInfo = await lstat(lexicalPath);
     } catch (err) {
       const code = errnoOf(err);
+      const refusal = await landedRefusal(null, 'lstat');
+      if (refusal) throw refusal;
       if (code === 'ENOENT' || code === 'ENOTDIR') {
         throw new WorkspaceReadError('not_found', `File not found: ${mountPrefixedPath}`, 'lstat', code);
       }
       throw new WorkspaceReadError('not_found', `Unable to read file: ${mountPrefixedPath}`, 'lstat', code);
     }
-    if (fileInfo.isDirectory()) {
-      throw new WorkspaceReadError('directory', `Path is a directory: ${mountPrefixedPath}`, 'lstat');
-    }
     if (fileInfo.isSymbolicLink() && !follow) {
       throw new WorkspaceReadError('symlink', `Symlinks are not allowed: ${mountPrefixedPath}`, 'lstat');
     }
     if (!fileInfo.isFile() && !fileInfo.isSymbolicLink()) {
+      const refusal = await landedRefusal(null, 'lstat');
+      if (refusal) throw refusal;
+      if (fileInfo.isDirectory()) {
+        throw new WorkspaceReadError('directory', `Path is a directory: ${mountPrefixedPath}`, 'lstat');
+      }
       // A FIFO, socket or device is never opened.
       throw new WorkspaceReadError('not_found', `Not a regular file: ${mountPrefixedPath}`, 'lstat');
     }
@@ -2639,6 +2671,8 @@ export class WorkspaceModule implements Module {
       handle = await open(lexicalPath, fsConstants.O_RDONLY | NONBLOCK | (useNoFollow ? fsConstants.O_NOFOLLOW : 0));
     } catch (err) {
       const code = errnoOf(err);
+      const refusal = await landedRefusal(null, 'open');
+      if (refusal) throw refusal;
       if (code === 'ENOENT' || code === 'ENOTDIR') {
         throw new WorkspaceReadError('not_found', `File not found: ${mountPrefixedPath}`, 'open', code);
       }
@@ -2661,10 +2695,12 @@ export class WorkspaceModule implements Module {
           code,
         );
       }
-      if (fileStat.isDirectory()) {
-        throw new WorkspaceReadError('directory', `Path is a directory: ${mountPrefixedPath}`, 'fstat');
-      }
       if (!fileStat.isFile()) {
+        const refusal = await landedRefusal(null, 'fstat');
+        if (refusal) throw refusal;
+        if (fileStat.isDirectory()) {
+          throw new WorkspaceReadError('directory', `Path is a directory: ${mountPrefixedPath}`, 'fstat');
+        }
         throw new WorkspaceReadError('not_found', `Not a regular file: ${mountPrefixedPath}`, 'fstat');
       }
 
@@ -2689,6 +2725,8 @@ export class WorkspaceModule implements Module {
         realFilePath = await realpath(lexicalPath);
       } catch (err) {
         const code = errnoOf(err);
+        const refusal = await landedRefusal(null, 'realpath');
+        if (refusal) throw refusal;
         if (code === 'ENOENT') {
           throw new WorkspaceReadError('changed', `File changed during read: ${mountPrefixedPath}`, 'realpath', code);
         }
@@ -2700,19 +2738,13 @@ export class WorkspaceModule implements Module {
       const resolvedThrough = await linkRefusal(linkView, realMountRoot, relativePath, realFilePath);
       if (resolvedThrough !== null) throw await linkReadError(mount, resolvedThrough, mountPrefixedPath, this.nestedOf(mount.config.name));
 
-      const inside = isContainedPath(realMountRoot, realFilePath);
-      const escape = new WorkspaceReadError('escape', `Symlink escape detected: ${mountPrefixedPath}`, 'realpath');
-      if (!inside) throw escape;
-      // Through a link the mount follows, a nested mount with an include
-      // judges the place by its view (landing), as the parse did.
-      if (follow && realFilePath !== join(realMountRoot, relativePath)) {
-        const landed = await landing(mount.config.path, relativePath, this.nestedOf(mount.config.name));
-        if (landed) throw landed.shown ? new WorkspaceReadError('other_mount', leadsInto(mount.config.name, relativePath, landed), 'realpath') : escape;
-      }
+      const refusal = await landedRefusal(realFilePath, 'realpath');
+      if (refusal) throw refusal;
+      if (!isContainedPath(realMountRoot, realFilePath)) throw escape();
       const holder = nestedAtReal(realFilePath, this.nestedOf(mount.config.name));
       // A place in a nested mount's directory that its include leaves out is
       // no mount's, so the path leaves this one (namesNestedPlace).
-      if (holder !== undefined && !namesNestedPlace(holder.rest, holder.include, false)) throw escape;
+      if (holder !== undefined && !namesNestedPlace(holder.rest, holder.include, false)) throw escape();
       if (holder) throw new WorkspaceReadError('other_mount', leadsInto(mount.config.name, relativePath, holder), 'realpath');
 
       let pathStat: Stats;
@@ -3663,6 +3695,17 @@ export class WorkspaceModule implements Module {
       if (this.holderOf(mount.config.name, relativePath)) {
         incomplete.push({ path: `${mount.config.name}/${relativePath}`, reason: this.otherMountNote(mount.config.name, relativePath, 'list') });
         continue;
+      }
+      // A path that follows a link into a nested mount's directory, to a
+      // place its include leaves out, is refused here as read refuses it
+      // (leadsIntoNested), before grep asks disk whether it names a file, so
+      // the answer is the same whether anything is there.
+      if (relativePath !== '' && mount.config.followSymlinks === true && this.nestedOf(mount.config.name).some((n) => n.include !== undefined)) {
+        const refusal = await this.leadsIntoNested(mount, relativePath, `${mount.config.name}/${relativePath}`);
+        if (refusal instanceof WorkspaceReadError && refusal.code === 'escape') {
+          skipped.push({ file: `${mount.config.name}/${relativePath}`, reason: refusal.message });
+          continue;
+        }
       }
       // A `path` and a filter whose directories don't overlap leave no file
       // the filter can let through, so nothing is searched.

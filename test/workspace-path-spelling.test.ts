@@ -664,3 +664,37 @@ test('on a disk that tells case apart, two hard links that differ only in case k
     assert.equal(await diskSpelling(root, 'a.txt'), 'a.txt');
     assert.equal(await diskSpelling(root, 'SRC/a.ts'), 'SRC/a.ts', 'a name disk lacks keeps its spelling');
   });
+
+test("a walk through a link that spells a directory above a nested mount's otherwise than disk does passes over that mount's directory", { skip: FOLDING_ONLY }, async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-walk-alias-'));
+  const dir = join(root, 'mount');
+  mkdirSync(join(dir, 'a', 'sub', 'in'), { recursive: true });
+  writeFileSync(join(dir, 'a', 'sub', 'in', 'secret.txt'), 'not the nested mount\'s\n');
+  writeFileSync(join(dir, 'a', 'sub', 'in', 'kept.json'), '{}\n');
+  writeFileSync(join(dir, 'a', 'sub', 'own.txt'), 'the outer mount\'s\n');
+  // The link spells the directory above the nested one in another case than disk does.
+  symlinkSync('A', join(dir, 'x'));
+  const store = JsStore.openOrCreate({ path: join(root, 'store') });
+  const workspace = new WorkspaceModule({ mounts: [
+    { name: 'outer', path: dir, mode: 'read-write', watch: 'never', followSymlinks: true },
+    { name: 'nested', path: join(dir, 'a', 'sub', 'in'), mode: 'read-write', watch: 'never', include: ['*.json'] },
+  ] });
+  workspace.initStore(store);
+  await workspace.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
+  t.after(async () => { await workspace.stop(); store.close(); rmSync(root, { recursive: true, force: true }); });
+  const tool = async (name: string, input: Record<string, unknown>): Promise<Record<string, unknown>> => {
+    const res = await workspace.handleToolCall({ id: name, name, input } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+    assert.equal(res.success, true, `${name}: ${String(res.error)}`);
+    return res.data as Record<string, unknown>;
+  };
+  const listing = await tool('ls', { path: 'outer/x/sub', recursive: true });
+  assert.deepEqual((listing.entries as Array<{ path: string }>).map((e) => e.path), ['x/sub/own.txt']);
+  const synced = await tool('sync', { path: 'outer/x/sub' });
+  // The nested root was passed over as another mount's directory, not left as one the walk didn't reach.
+  assert.ok(JSON.stringify(synced.passedOver ?? []).includes("another mount's directory"), JSON.stringify(synced));
+  assert.ok(!JSON.stringify([listing, synced]).includes('not visited'), JSON.stringify([listing, synced]));
+  const grepped = await tool('grep', { path: 'outer/x/sub', pattern: 'mount' });
+  assert.deepEqual((grepped.results as Array<{ file: string }>).map((r) => r.file), ['outer/x/sub/own.txt']);
+  const answers = JSON.stringify([listing, synced, grepped]);
+  assert.ok(!answers.includes('secret') && !answers.includes('kept.json'), answers);
+});

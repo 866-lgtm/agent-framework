@@ -93,9 +93,12 @@ export interface MountConfig {
    * folds names, a path is judged as disk spells it, as the walk judges what it
    * lists, so a covered name whose file disk spells otherwise is outside the
    * mount, and a refusal shows the path as given. `resolveAbsolutePath`, which
-   * is synchronous, judges the include on the path as given: on such a disk it
-   * returns the path to a covered name's file that disk spells otherwise, and
-   * null for a covered file named in another case. It takes a nested mount's
+   * is synchronous, judges the include on the path as given and follows no
+   * link: on such a disk it returns the path to a covered name's file that
+   * disk spells otherwise, and null for a covered file named in another case.
+   * Through a link a mount follows, a nested mount's include judges the names
+   * in its directory as the path and its links spell them, the same way. It
+   * takes a nested mount's
    * directory as that mount's in any spelling disk folds to it, compared level
    * by level as each directory on the way compares names. It errs toward the
    * nested mount where it can't tell. A level is taken to fold until a start
@@ -113,7 +116,12 @@ export interface MountConfig {
    * mount's directory is that mount's, whatever this include covers: every tool
    * gives the answer that names the mount holding it, with the rest of the path
    * past that mount's directory as given. A path with a `..` segment is refused
-   * before that, as above. Text the host registers for a path
+   * before that, as above. A nested mount's root is placed where disk has it
+   * at each start, so two cases fall outside this, as for any nested mount: on
+   * a disk that folds names, a mount configured through a link that spells a
+   * directory otherwise than disk does isn't found nested, and its files read
+   * as this mount's; and a nested mount whose root moves while running, as
+   * `acceptRoot` takes, stays placed where it was until the next start. Text the host registers for a path
    * (`registerGeneratedTextFile`) is served there whatever the include says,
    * since it isn't one of the mount's files: it's matched by the path a
    * spelling resolves to, before anything else checks the path, so every
