@@ -3485,7 +3485,7 @@ export class ChannelRegistry {
           // The caller reports both: the channel isn't open, but it stays
           // selected for opening, so reconciliation may open it later.
           throw new ChannelLifecycleError(
-            afterClause(lifecycleClause(err), 'the channel stays selected for opening, as this host couldn\'t record ' +
+            afterClause(lifecycleClause(err), 'the channel stays selected for opening, because this host couldn\'t record ' +
               `undoing that: ${requestErrorText(putBackErr)}`),
             'put-back-unrecorded',
             undefined,
@@ -3532,8 +3532,8 @@ export class ChannelRegistry {
         }
         if (selectedAgain) {
           throw new ChannelLifecycleError(
-            afterClause(lifecycleClause(err), 'the channel is selected for opening again, as ' +
-              (selectedAgain === 'server-bootstrap' ? 'its server announces it open' : 'the subscription policy admits it')),
+            afterClause(lifecycleClause(err), 'the channel is selected for opening again, because ' +
+              (selectedAgain === 'server-bootstrap' ? 'its server lists it as open by default' : 'the subscription policy admits it')),
             'selected-again',
             undefined,
             { by: selectedAgain, cause: err },

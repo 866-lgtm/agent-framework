@@ -660,11 +660,11 @@ describe('notices about an agent\'s own action', () => {
 
       assert.equal(forkCm.mock.callCount(), 1);
       assert.equal(JSON.stringify(forkCm.mock.calls[0]!.arguments[1]), JSON.stringify([{ type: 'text', text:
-        '[channels] Now open: #one (c-1): your own message into the closed channel opened it. What an open channel delivers to you depends on its server.' }]));
+        '[channels] Now open: #one (c-1): your own message into the closed channel opened it. Your primary has been told and can close it.' }]));
       assert.equal(primary.mock.callCount(), 1, 'the primary is told too');
       assert.equal(JSON.stringify(primary.mock.calls[0]!.arguments[1]), JSON.stringify([{ type: 'text', text:
-        `[channels] Now open: #one (c-1): ${fork.name}'s own message into the closed channel opened it, and ${fork.name} can't close it. ` +
-        "What an open channel delivers to you depends on its server. If you don't want it, use channel_close; your choice outranks policy." }]));
+        `[channels] Now open: #one (c-1): a message from your fork bound to missing-channel (${fork.name}) into the closed channel opened it, and that fork can't close it. ` +
+        "If you don't want it, use channel_close; your choice outranks policy." }]));
       assert.equal((primary.mock.calls[0]!.arguments[2] as { speaker?: unknown } | undefined)?.speaker, fork.name);
 
       // The advice left out is advice the fork can't take: its channel_close
@@ -697,8 +697,8 @@ describe('notices about an agent\'s own action', () => {
         .filter((m) => JSON.stringify(m.content).includes('#home'));
       assert.equal(told.length, 1, 'the primary is told once');
       assert.equal((told[0]!.content[0] as { text: string }).text,
-        `[channels] Now open: #home (missing-channel): ${fork.name}'s own message into the closed channel opened it; ${fork.name} has ended. ` +
-        "What an open channel delivers to you depends on its server. If you don't want it, use channel_close; your choice outranks policy.");
+        `[channels] Now open: #home (missing-channel): a message from your fork bound to missing-channel (${fork.name}) into the closed channel opened it; that fork has ended. ` +
+        "If you don't want it, use channel_close; your choice outranks policy.");
       assert.equal((told[0]!.metadata as { speaker?: unknown } | undefined)?.speaker, fork.name);
     });
 
@@ -713,7 +713,7 @@ describe('notices about an agent\'s own action', () => {
       const told = framework.getAgent('primary')!.getContextManager().getAllMessages()
         .filter((m) => JSON.stringify(m.content).includes('#one'));
       assert.equal(told.length, 1, 'only the notice of the time');
-      assert.match(JSON.stringify(told[0]!.content), new RegExp(`${fork.name} can't close it`));
+      assert.match(JSON.stringify(told[0]!.content), new RegExp(`your fork bound to missing-channel \\(${fork.name}\\) into the closed channel opened it, and that fork can't close it`));
     });
 
     it('tells the primary, by name, of a channel an ended agent\'s send opened, and the primary\'s channel_close closes it', async (t) => {
@@ -734,7 +734,7 @@ describe('notices about an agent\'s own action', () => {
       const told = framework.getAgent('primary')!.getContextManager().getAllMessages()
         .filter((m) => JSON.stringify(m.content).includes('Now open: #opened (opened-1)'));
       assert.equal(told.length, 1, 'the primary is told once');
-      assert.match(JSON.stringify(told[0]!.content), /released-run's own message into the closed channel opened it; released-run has ended\. .*use channel_close/);
+      assert.match(JSON.stringify(told[0]!.content), /a message from released-run into the closed channel opened it; released-run has ended\. .*use channel_close/);
       assert.equal((told[0]!.metadata as { speaker?: unknown } | undefined)?.speaker, 'released-run');
       assert.equal(state.deferredMessages.length, 0);
 
@@ -833,10 +833,10 @@ describe('notices about an agent\'s own action', () => {
       const told = framework.getAgent('primary')!.getContextManager().getAllMessages()
         .filter((m) => JSON.stringify(m.content).includes('conversation-gone'));
       assert.deepEqual(told.map((m) => (m.content[0] as { text: string }).text), [
-        "[channels] Now open: #four (c-4): conversation-gone's own message into the closed channel opened it; conversation-gone has ended. " +
-          "What an open channel delivers to you depends on its server. If you don't want it, use channel_close; your choice outranks policy.",
-        "[channels] Not open: #five (c-5). conversation-gone's reply there went out, but opening the channel failed; conversation-gone has ended. " +
-          "It's selected for opening again, as its server announces it open: the host tries again, and channel_close withdraws that.",
+        "[channels] Now open: #four (c-4): a message from conversation-gone into the closed channel opened it; conversation-gone has ended. " +
+          "If you don't want it, use channel_close; your choice outranks policy.",
+        "[channels] Not open: #five (c-5). A reply from conversation-gone went out there, but opening the channel failed; conversation-gone has ended. " +
+          "It's selected for opening again, because its server lists it as open by default: the host tries again, and channel_close withdraws that.",
       ]);
       assert.deepEqual(told.map((m) => (m.metadata as { deferredWriteId?: unknown; speaker?: unknown }).deferredWriteId), ['w-4', 'w-5']);
       assert.deepEqual(told.map((m) => (m.metadata as { speaker?: unknown }).speaker), ['conversation-gone', 'conversation-gone']);
@@ -1251,7 +1251,7 @@ describe('notices about an agent\'s own action', () => {
         content: [{ type: 'text', text: '[channels] Now open: #seven (c-7): your own message into the closed channel opened it.' }],
         metadata: { system: true, kind: 'channel-notice', passOn: { notice: 'channel-opened', cause: 'opened-by-delivery', channels: [{ channelId: 'c-7', label: '#seven' }] } },
         inRun: 'Now open: #seven',
-        toPrimary: "worker's own message into the closed channel opened it; worker has ended",
+        toPrimary: "a message from worker into the closed channel opened it; worker has ended",
       },
     ];
     for (const queued of queuedForTheRun) it(`passes ${queued.what} still queued when a run ends unquiesced on to the primary as the same queue entry`, async () => {
@@ -1333,7 +1333,7 @@ describe('notices about an agent\'s own action', () => {
         what: 'a channel notice the run could act on',
         content: [{ type: 'text' as const, text: '[channels] Now open: #eight (c-8): your own message into the closed channel opened it.' }],
         metadata: { system: true, kind: 'channel-notice', passOn: { notice: 'channel-opened', cause: 'opened-by-reply', channels: [{ channelId: 'c-8', label: '#eight' }] } },
-        toPrimary: "worker's own message into the closed channel opened it; worker has ended",
+        toPrimary: "a message from worker into the closed channel opened it; worker has ended",
       },
     ];
     for (const unread of storedUnread) it(`passes ${unread.what} a run stored unread on to the primary\'s queue when the host stops before the release it waited for`, async () => {

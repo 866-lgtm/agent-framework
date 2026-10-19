@@ -15123,7 +15123,11 @@ export class AgentFramework {
       .join(', ');
     const ids = channels.map((c) => c.channelId);
     const plural = channels.length > 1;
-    const optOut = (canClose: boolean) => ' What an open channel delivers to you depends on its server.' +
+    // What the channels deliver is said only to an agent that holds their
+    // traffic (holdsChannelTraffic), and channel_close is named only to one
+    // that can call it for every one of them.
+    const optOut = (holds: boolean, canClose: boolean) =>
+      (holds ? ' What an open channel delivers to you depends on its server.' : '') +
       (canClose ? ` If you don't want ${plural ? 'one of them' : 'it'}, use channel_close; your choice outranks policy.` : '');
     // An open caused by an agent's own send is that agent's to hear about, in
     // the window it reads; a policy admission with no agent behind it goes to
@@ -15139,9 +15143,10 @@ export class AgentFramework {
         console.error(`[channel] ${agentName} has ended, and there is no primary to tell that ${shown} opened`);
         return [];
       }
+      const sender = this.agentForPrimary(agentName);
       return [{
-        text: `[channels] Now open: ${shown}: ${agentName}'s own message into the closed channel opened it; ${agentName} has ended.` +
-          optOut(this.canCloseChannels(primary, ids)),
+        text: `[channels] Now open: ${shown}: a message from ${sender.first} into the closed channel opened it; ${sender.again} has ended.` +
+          optOut(this.holdsChannelTraffic(primary, ids), this.canCloseChannels(primary, ids)),
         metadata: { system: true, kind: 'channel-notice', speaker: agentName } as MessageMetadata,
         told: `the primary, by name (${agentName} has ended)`,
         shown,
@@ -15151,11 +15156,21 @@ export class AgentFramework {
     // admission, the agent addMessage delivers to (deliveryAgent).
     const who = agentName || this.deliveryAgent()?.name;
     const canClose = this.canCloseChannels(who, ids);
+    // Where the agent whose send opened them can't close them, as a fork away
+    // from its home can't, or an agent whose allowedTools leave channel_close
+    // out, the primary is told by name too, where it's registered and can
+    // close them, so an agent that can close the channels hears they opened,
+    // and the agent hears who was told. (The primary can't be that agent: it
+    // can close them, and that agent can't.)
+    const tellPrimary = !!agentName && !canClose && primary !== undefined && this.agents.has(primary) &&
+      this.canCloseChannels(primary, ids);
     const notices: ChannelNotice[] = [{
       text: (cause === 'subscription-policy'
         ? `[channels] Selected for opening by subscription policy: ${shown}. ` +
           'This records the admission decision; channel_list shows current transport state.'
-        : `[channels] Now open: ${shown}: your own message into the closed channel opened it.`) + optOut(canClose),
+        : `[channels] Now open: ${shown}: your own message into the closed channel opened it.`) +
+        optOut(this.holdsChannelTraffic(who, ids), canClose) +
+        (tellPrimary ? ` ${this.primaryForReader(agentName, primary)} has been told and can close ${plural ? 'them' : 'it'}.` : ''),
       metadata: {
         system: true, kind: 'channel-notice',
         ...(agentName && canClose ? { passOn: { notice: 'channel-opened', cause, channels } satisfies ChannelNoticePassOn } : {}),
@@ -15164,17 +15179,11 @@ export class AgentFramework {
       told: agentName ?? 'primary',
       shown,
     }];
-    // Where the agent whose send opened them can't close them, as a fork away
-    // from its home can't, or an agent whose allowedTools leave channel_close
-    // out, the primary is told by name too, where it's registered and can
-    // close them, so an agent that can close the channels hears they opened.
-    // (The primary can't be that agent: it can close them, and that agent
-    // can't.)
-    if (agentName && !canClose && primary !== undefined && this.agents.has(primary) &&
-        this.canCloseChannels(primary, ids)) {
+    if (tellPrimary) {
+      const sender = this.agentForPrimary(agentName);
       notices.push({
-        text: `[channels] Now open: ${shown}: ${agentName}'s own message into the closed channel opened it, and ${agentName} can't close ${plural ? 'them' : 'it'}.` +
-          optOut(true),
+        text: `[channels] Now open: ${shown}: a message from ${sender.first} into the closed channel opened it, and ${sender.again} can't close ${plural ? 'them' : 'it'}.` +
+          optOut(this.holdsChannelTraffic(primary, ids), true),
         metadata: { system: true, kind: 'channel-notice', speaker: agentName } as MessageMetadata,
         told: `the primary, by name (${agentName} can't close ${plural ? 'them' : 'it'})`,
         shown,
@@ -15193,6 +15202,50 @@ export class AgentFramework {
     if (who === undefined) return false;
     const home = this.conversationAgentHomes.get(who);
     return channelIds.every((id) => !home || home === id) && this.canAgentUseTool(who, 'channel_close');
+  }
+
+  /**
+   * Whether `who` holds the traffic of every one of `channelIds`, so that
+   * what an open channel delivers is stored in its window. A conversation
+   * fork holds only its home's: where conversations are routed, an incoming
+   * message goes to the fork bound to its channel or nowhere, and never to
+   * the primary (handleMcplChannelIncoming). Elsewhere an incoming message is
+   * stored with no forAgent, in deliveryAgent()'s window. (A push names its
+   * channel and lands in the primary's window either way, but it comes
+   * whether or not the channel is open, so it isn't what opening one
+   * delivers.)
+   */
+  private holdsChannelTraffic(who: string | undefined, channelIds: readonly string[]): boolean {
+    if (who === undefined) return false;
+    const home = this.conversationAgentHomes.get(who);
+    if (home !== undefined) return channelIds.every((id) => id === home);
+    if (this.conversationRouter) return false;
+    return who === this.deliveryAgent()?.name;
+  }
+
+  /**
+   * How a notice to the primary names `agentName`: a conversation fork by the
+   * channel it's bound to, as notices name channels, with its own name once
+   * in parentheses, and as "that fork" after; any other agent by its name.
+   * A fork's home is known while it's registered and through its release; a
+   * notice passed on later, at resume or at boot, names it by its name.
+   */
+  private agentForPrimary(agentName: string): { first: string; again: string } {
+    const home = this.conversationAgentHomes.get(agentName);
+    if (home === undefined) return { first: agentName, again: agentName };
+    const label = this.channelRegistry?.getDescriptor(home)?.label;
+    const bound = label && label !== home ? `${label} (${home})` : home;
+    return { first: `your fork bound to ${bound} (${agentName})`, again: 'that fork' };
+  }
+
+  /**
+   * How a notice to `reader` names the primary it says was told: "Your
+   * primary" to a conversation fork, whose configuration is the template's,
+   * the primary's, with only its name changed, so its prompt may give the
+   * primary's name as its own; the primary's name to any other agent.
+   */
+  private primaryForReader(reader: string | undefined, primary: string | undefined): string {
+    return reader !== undefined && this.conversationAgentHomes.has(reader) ? 'Your primary' : primary ?? 'The primary';
   }
 
   /**
@@ -15269,17 +15322,28 @@ export class AgentFramework {
     const canOpen = who !== undefined && !this.conversationAgentHomes.has(who) && this.canAgentUseTool(who, 'channel_open');
     const canClose = this.canCloseChannels(who, [channel.channelId]);
     const selected = selectedForOpening === 'unrecorded'
-      ? " It stays selected for opening, as the host couldn't record undoing that: a later delivery or reconnect tries again"
+      ? " It stays selected for opening, because the host couldn't record undoing that: a later delivery or reconnect tries again"
       : selectedForOpening !== undefined
-        ? ` It's selected for opening again, as ${selectedForOpening === 'server-bootstrap' ? 'its server announces it open' : 'the subscription policy admits it'}: the host tries again`
+        ? ` It's selected for opening again, because ${selectedForOpening === 'server-bootstrap' ? 'its server lists it as open by default' : 'the subscription policy admits it'}: the host tries again`
         : '';
     const hostRetries = selectedForOpening === 'server-bootstrap' || selectedForOpening === 'subscription-policy';
+    // Where the reader can't close a channel selected for opening, as a fork
+    // away from its home can't, or an agent whose allowedTools leave
+    // channel_close out, the primary is told by name too, where it's
+    // registered and can close it, so an agent that could close the channel
+    // hears it may open, and the reader hears who was told. (The primary
+    // can't be the reader: it can close it, and the reader can't.)
+    const tellPrimary = !ended && selectedForOpening !== undefined && who !== undefined && !canClose &&
+      primary !== undefined && this.agents.has(primary) &&
+      this.canCloseChannels(primary, [channel.channelId]);
+    const sender = ended ? this.agentForPrimary(agentName!) : undefined;
     const notices: ChannelNotice[] = [{
       text: `[channels] Not open: ${shown}. ` +
         (ended
-          ? `${agentName}'s reply there went out, but opening the channel failed; ${agentName} has ended.`
+          ? `A reply from ${sender!.first} went out there, but opening the channel failed; ${sender!.again} has ended.`
           : 'Your reply there went out, but opening the channel failed.') +
         (selected ? selected + (canClose ? ', and channel_close withdraws that.' : '.') : '') +
+        (tellPrimary ? ` ${this.primaryForReader(who, primary)} has been told, and can withdraw that.` : '') +
         (canOpen && !hostRetries ? ' channel_open tries again.' : ''),
       metadata: (ended
         ? { system: true, kind: 'channel-notice', speaker: agentName }
@@ -15293,20 +15357,11 @@ export class AgentFramework {
       told: ended ? `the primary, by name (${agentName} has ended)` : who ?? 'no agent',
       shown,
     }];
-    // Where the reader can't close a channel selected for opening, as a fork
-    // away from its home can't, or an agent whose allowedTools leave
-    // channel_close out, the primary is told by name too, where it's
-    // registered and can close it, so an agent that could close the channel
-    // hears it may open. (The primary can't be the reader: it can close it,
-    // and the reader can't.)
-    if (
-      !ended && selectedForOpening !== undefined && who !== undefined && !canClose &&
-      primary !== undefined && this.agents.has(primary) &&
-      this.canCloseChannels(primary, [channel.channelId])
-    ) {
-      const primaryCanOpen = !this.conversationAgentHomes.has(primary) && this.canAgentUseTool(primary, 'channel_open');
+    if (tellPrimary) {
+      const primaryCanOpen = !this.conversationAgentHomes.has(primary!) && this.canAgentUseTool(primary!, 'channel_open');
+      const reader = this.agentForPrimary(who!);
       notices.push({
-        text: `[channels] Not open: ${shown}. ${who}'s reply there went out, but opening the channel failed, and ${who} can't close it.` +
+        text: `[channels] Not open: ${shown}. A reply from ${reader.first} went out there, but opening the channel failed, and ${reader.again} can't close it.` +
           selected + ', and channel_close withdraws that.' +
           (primaryCanOpen && !hostRetries ? ' channel_open tries again.' : ''),
         metadata: { system: true, kind: 'channel-notice', speaker: who } as MessageMetadata,
