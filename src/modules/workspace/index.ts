@@ -4772,7 +4772,7 @@ function inputProblem(
 const CRLF_CR_NOTE = 'The pattern names a CR, and a file searched has CRLF line ends. Lines are matched as read shows them, '
   + 'which leaves out a CRLF end\'s CR unless the line\'s own text ends in a CR. read with offsetChars shows every CR in the workspace\'s copy.';
 const BOM_NOTE = 'The pattern names U+FEFF, and a file searched starts with a BOM. Lines are matched as read shows them, '
-  + 'and a BOM isn\'t part of the first line. read with offsetChars shows it in the workspace\'s copy.';
+  + 'and a BOM isn\'t part of the first line. read with offsetChars shows any BOM the workspace\'s copy has.';
 
 /** grep's note for a pattern that names a character its lines leave out, where a file it searched has one. */
 function leftOutNote(pattern: string, searchedCrlf: boolean, searchedBom: boolean): { note?: string } {

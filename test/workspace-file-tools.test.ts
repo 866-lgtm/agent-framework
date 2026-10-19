@@ -423,7 +423,8 @@ test('grep matches and shows a CRLF file\'s lines without the CR, as read shows 
   }
   // A pattern that names no CR, and a CR pattern over files without a CRLF
   // end, get no note.
-  for (const [pattern, path] of [['foo', 'work/crlf.txt'], ['\\\\r', 'work/crlf.txt'], ['\\\\x0d', 'work/crlf.txt'], ['\\R', 'work/crlf.txt'], ['\\r', 'work/lf.txt']]) {
+  for (const [pattern, path] of [['foo', 'work/crlf.txt'], ['\\\\r', 'work/crlf.txt'], ['\\\\x0d', 'work/crlf.txt'], ['\\\\cM', 'work/crlf.txt'],
+    ['\\\\u000d', 'work/crlf.txt'], ['\\R', 'work/crlf.txt'], ['\\X0D', 'work/crlf.txt'], ['\\U000D', 'work/crlf.txt'], ['\\CM', 'work/crlf.txt'], ['\\r', 'work/lf.txt']]) {
     const data = (await call('grep', { pattern, path })).data as object;
     assert.equal('note' in data, false, JSON.stringify([pattern, path]));
   }
@@ -433,13 +434,16 @@ test('grep matches and shows a CRLF file\'s lines without the CR, as read shows 
   assert.deepEqual(lone.results[0].matches, [{ line: 1, text: 'a\rb' }]);
   // Any CRLF file searched gives the note, whatever comes after it: here an LF
   // file is searched on either side of the CRLF one, whichever order the walk
-  // takes. A file the glob passes over isn't searched, so it gives none.
+  // takes. A file the glob passes over isn't searched, so it gives none: here
+  // the glob takes a.txt alone, which the search finds.
   mkdirSync(join(dir, 'many'));
   writeFileSync(join(dir, 'many', 'a.txt'), 'x\n');
   writeFileSync(join(dir, 'many', 'b.txt'), 'x\r\n');
   writeFileSync(join(dir, 'many', 'c.txt'), 'x\n');
   assert.equal(((await call('grep', { pattern: '\\r', path: 'work/many' })).data as { note?: string }).note, note);
-  assert.equal('note' in ((await call('grep', { pattern: '\\r', path: 'work/many', glob: 'many/a.txt' })).data as object), false);
+  const globbed = (await call('grep', { pattern: 'x|\\r', path: 'work/many', glob: 'many/a.txt' })).data as { results: Array<{ file: string }> };
+  assert.deepEqual(globbed.results.map((r) => r.file), ['work/many/a.txt']);
+  assert.equal('note' in globbed, false);
 });
 
 test("grep says a BOM isn't part of the first line when a pattern for U+FEFF searched a file that starts with one", async (t) => {
@@ -447,15 +451,17 @@ test("grep says a BOM isn't part of the first line when a pattern for U+FEFF sea
   writeFileSync(join(dir, 'bom.txt'), Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('foo\n')]));
   writeFileSync(join(dir, 'inner.txt'), 'a\uFEFFb\n');
   const note = "The pattern names U+FEFF, and a file searched starts with a BOM. Lines are matched as read shows them, "
-    + "and a BOM isn't part of the first line. read with offsetChars shows it in the workspace's copy.";
+    + "and a BOM isn't part of the first line. read with offsetChars shows any BOM the workspace's copy has.";
   for (const pattern of ['\\uFEFF', '^\\ufeff', '\uFEFF', '\\\uFEFF']) {
     const data = (await call('grep', { pattern, path: 'work/bom.txt' })).data as { results: unknown[]; note?: string };
     assert.equal(data.note, note, JSON.stringify(pattern));
     assert.deepEqual(data.results, [], JSON.stringify(pattern));
   }
-  // An escaped backslash names no U+FEFF, and a U+FEFF inside a line, in a
-  // file with no BOM, is found with no note.
-  assert.equal('note' in ((await call('grep', { pattern: '\\\\uFEFF', path: 'work/bom.txt' })).data as object), false);
+  // An escaped backslash names no U+FEFF, nor does \U, an identity escape,
+  // and a U+FEFF inside a line, in a file with no BOM, is found with no note.
+  for (const pattern of ['\\\\uFEFF', '\\UFEFF']) {
+    assert.equal('note' in ((await call('grep', { pattern, path: 'work/bom.txt' })).data as object), false, JSON.stringify(pattern));
+  }
   const inner = (await call('grep', { pattern: '\\uFEFF', path: 'work/inner.txt' })).data as { results: Array<{ matches: unknown[] }> };
   assert.equal('note' in inner, false);
   assert.deepEqual(inner.results[0].matches, [{ line: 1, text: 'a\uFEFFb' }]);
@@ -464,6 +470,21 @@ test("grep says a BOM isn't part of the first line when a pattern for U+FEFF sea
   writeFileSync(join(dir, 'crlf.txt'), 'x\r\n');
   assert.equal('note' in ((await call('grep', { pattern: '\\r', path: 'work/bom.txt' })).data as object), false);
   assert.equal('note' in ((await call('grep', { pattern: '\\uFEFF', path: 'work/crlf.txt' })).data as object), false);
+  // Any BOM file searched gives the note, whatever comes after it: a file
+  // without one is searched on either side of the BOM file.
+  mkdirSync(join(dir, 'boms'));
+  writeFileSync(join(dir, 'boms', 'a.txt'), 'x\n');
+  writeFileSync(join(dir, 'boms', 'b.txt'), Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('x\n')]));
+  writeFileSync(join(dir, 'boms', 'c.txt'), 'x\n');
+  assert.equal(((await call('grep', { pattern: '\\uFEFF', path: 'work/boms' })).data as { note?: string }).note, note);
+  // A pattern that names both, over a file with a BOM and CRLF ends, gets both
+  // notes, the CR's first.
+  writeFileSync(join(dir, 'both.txt'), Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('x\r\n')]));
+  const crNote = "The pattern names a CR, and a file searched has CRLF line ends. Lines are matched as read shows them, "
+    + "which leaves out a CRLF end's CR unless the line's own text ends in a CR. read with offsetChars shows every CR in the workspace's copy.";
+  const both = (await call('grep', { pattern: '^\\uFEFF|\\r$', path: 'work/both.txt' })).data as { results: unknown[]; note?: string };
+  assert.equal(both.note, `${crNote} ${note}`);
+  assert.deepEqual(both.results, []);
 });
 
 test('text copied from a read or a grep of a CRLF file matches in an edit, and the file keeps its line ends and BOM', async (t) => {
