@@ -21550,17 +21550,16 @@ export class AgentFramework {
    * The agent never reads its window again, so every failed-reply notice it
    * never read, and every channel notice it could act on and never read, is
    * passed to the primary, by name, once (passesToPrimary): each one stored
-   * in its window above its consumed watermark (unreadNoticesForPrimary), and
-   * each one still queued for it. Writes still
-   * queued would wait for a boundary it never reaches, and the flush that
-   * finds it gone would drop them, so they land in its own window now, which
-   * Chronicle keeps for investigation. Its stream is over or cancelled, so it
-   * compiles nothing more. One path still stores after these writes: a
-   * `complete` that arrived while the agent still waited for tools awaits
-   * the spill of its last tool results, and stores them once that resolves,
-   * even if a watchdog has ended the run meanwhile. A tool boundary stores
-   * nothing for a round whose turn was stopped while its results were
-   * prepared.
+   * in its window that it hasn't read, as unreadNoticesForPrimary counts
+   * them, and each one still queued for it. Writes still queued would wait
+   * for a boundary it never reaches, and the flush that finds it gone would
+   * drop them, so they land in its own window now, which Chronicle keeps for
+   * investigation. Its stream is over or cancelled, so it compiles nothing
+   * more. One path still stores after these writes: a `complete` that arrived
+   * while the agent still waited for tools awaits the spill of its last tool
+   * results, and stores them once that resolves, even if a watchdog has ended
+   * the run meanwhile. A tool boundary stores nothing for a round whose turn
+   * was stopped while its results were prepared.
    */
   private releaseWindow(agent: Agent): void {
     for (const metadata of this.unreadNoticesForPrimary(agent)) this.passNoticeToPrimary(agent.name, metadata);
@@ -21595,10 +21594,11 @@ export class AgentFramework {
    * takes in its place (passesToPrimary): its failed replies, and the channel
    * notices it was told it could act on. Those are the ones above the lower
    * of its consumed watermark and the point where the watermark's branch and
-   * the current one part (branchesPartAt), or every one, when it never
-   * compiled. The watermark moves at a compile, and at a tool boundary whose
-   * stream declares it carries the messages injected there
-   * (markContextConsumed). So a notice such a stream carried is under it.
+   * the current one part (branchesPartAt), or every one, when it has no
+   * watermark. The watermark is set when the agent is created, and moves at
+   * a compile, and at a tool boundary whose stream declares it carries the
+   * messages injected there (markContextConsumed). So a notice such a stream
+   * carried is under it.
    * One a boundary stored without sending (a turn a tool ended, a budget
    * restart) is above it, and so is one injected into a stream that doesn't
    * declare it carries injections, which may have dropped it: counted as
