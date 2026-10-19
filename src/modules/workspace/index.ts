@@ -40,7 +40,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
-import { IGNORED, NONBLOCK, OTHER_MOUNT, OUTSIDE_INCLUDE, ROOT_REPLACED, ROOT_UNAVAILABLE, beginsWithDir, type LevelFolds, checkDir, checkRoot, diskSpelling, filesystemTrustsCtime, foldsAtEach, includePatternReadable, inOtherMount, insideMount, leadsInto, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, namesHolder, namesNestedPlace, nestedAtReal, nestedHolder, type CheckedDir, type MountView, type NestedMount, parsedSpelling, passedOverAt, pathSegments, readPrefix, type LinkFound } from './observe.js';
+import { IGNORED, NONBLOCK, OTHER_MOUNT, OUTSIDE_INCLUDE, ROOT_REPLACED, ROOT_UNAVAILABLE, beginsWithDir, type LevelFolds, checkDir, checkRoot, diskSpelling, filesystemTrustsCtime, foldsAtEach, includePatternReadable, inOtherMount, insideMount, leadsInto, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, landing, namesHolder, namesNestedPlace, nestedAtReal, nestedHolder, type CheckedDir, type MountView, type NestedMount, parsedSpelling, passedOverAt, pathSegments, readPrefix, type LinkFound } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
 import {
   type MountRuntime,
@@ -137,11 +137,14 @@ class WorkspaceImageReadError extends Error {
  * which on a mount with an include is also the code for any path with a `..`
  * segment, and a path in another mount's directory nested in the one named
  * (`other_mount`), whose message names the mount that holds it and the path
- * to use there. A symlink among the path's directories leading into such a
- * directory is `other_mount` only where its refusal names that mount, for a
- * directory or a file that mount's include covers, and `parent_symlink`
- * otherwise. On a mount with an include, a link's message names its target
- * only where a tool could name it: a directory, or a file the include covers.
+ * to use there. A symlink on the path's way leading into such a directory is
+ * `other_mount` only where its refusal names that mount: a directory, or a
+ * file that mount's include covers, and through a link the mount follows, a
+ * name the include covers that ends the path past directories only, or any
+ * place, where that mount has no include. Anywhere else it is `parent_symlink` on a mount that doesn't follow
+ * symlinks, and `escape` on one that does, as a path that leaves the mount.
+ * On a mount with an include, a link's message names its target only where
+ * a tool could name it: a directory, or a file the include covers.
  * A `mount_unavailable` for a root whose realpath or stat fails otherwise
  * carries that errno, such as EACCES.
  */
@@ -314,9 +317,10 @@ function matchesPartialPrefix(buffer: Buffer, prefix: Buffer): boolean {
  * `escape` for a link leading outside the mount, the code a path resolving
  * outside it gets too; `other_mount` for one into a nested mount's directory
  * where the message names that mount (namesHolder), the code that mount's own
- * paths get; and `parent_symlink` for any other, which `symlink`, a file that
- * is itself a link, leaves apart. So the code says no more than the message:
- * a file the nested mount's include leaves out gets `parent_symlink`.
+ * paths get; and `parent_symlink` for any other, a link at the path itself
+ * into a nested mount's directory included, where any other such link gets
+ * `symlink`. So the code says no more than the message: a file the nested
+ * mount's include leaves out gets `parent_symlink`.
  */
 async function linkReadError(
   mount: { config: { name: string; path: string; include?: readonly string[] } },
@@ -2212,23 +2216,35 @@ export class WorkspaceModule implements Module {
    * The refusal for a path of `mount` that reaches a nested mount's directory
    * through a symlink on its way (nestedAtReal), or null where it doesn't. On
    * a mount that doesn't follow the link, the refusal is the link's own
-   * (linkWords), as the readers and pushes give it. A mount with nothing
-   * nested has nothing to find, so it pays nothing.
+   * (linkWords), as the readers and pushes give it. On one that does, a
+   * nested mount with an include judges the place by its view (landing),
+   * walked only where the path's real place isn't its spelling. A mount with
+   * nothing nested has nothing to find, so it pays nothing.
    */
   private async leadsIntoNested(mount: MountState, relativePath: string, path: string): Promise<Error | null> {
     const nested = this.nestedOf(mount.config.name);
     if (nested.length === 0) return null;
-    const real = await realBeneath(resolve(mount.config.path, relativePath));
+    const lexical = resolve(mount.config.path, relativePath);
+    const real = await realBeneath(lexical);
+    // A place no mount shows leaves this one, in the disk readers' words: the
+    // file tools refuse it here, before anything is stored or served there,
+    // with the words openContainedFile gives the same place.
+    const escape = new WorkspaceReadError('escape', `Symlink escape detected: ${path}`, 'realpath');
+    if (mount.config.followSymlinks === true && real !== lexical) {
+      // Through a link into a nested mount's directory with an include, that
+      // mount's view decides (landing).
+      const landed = await landing(mount.config.path, relativePath, nested);
+      if (landed) return landed.shown ? new NestedMountError(path, mount.config.name, landed.name, landed.use, 'leads into') : escape;
+    }
     const holder = nestedAtReal(real, nested);
     if (!holder) return null;
     if (mount.config.followSymlinks !== true) {
       const found = await linkOnTheWay({ root: mount.config.path, followSymlinks: false }, relativePath);
       if (found !== null) return await linkReadError(mount, found, path, nested);
     }
-    // A place the nested mount's include leaves out is no mount's, so the
-    // path leaves this one, in the disk readers' words (namesNestedPlace).
-    const directory = await stat(real).then((s) => s.isDirectory(), () => false);
-    if (!namesNestedPlace(holder.rest, holder.include, directory)) return new WorkspaceReadError('escape', `Symlink escape detected: ${path}`, 'realpath');
+    // Where the walk reached no place of a nested mount with an include, such
+    // as past a name the kernel can't enter, nothing there is shown.
+    if (holder.include !== undefined) return escape;
     return new NestedMountError(path, mount.config.name, holder.name, holder.use, 'leads into');
   }
 
@@ -2530,7 +2546,8 @@ export class WorkspaceModule implements Module {
    *    among the directories on its way beneath the mount's root, wherever it
    *    leads (linkOnTheWay), before anything resolves it: as `escape` for a
    *    link leading outside the mount, as `other_mount` for one into a nested
-   *    mount's directory, and as `parent_symlink` for any other.
+   *    mount's directory where its refusal names that mount, and as
+   *    `parent_symlink` for any other.
    * 2. `lstat` the lexical path — refuse directories; refuse a final-component
    *    symlink when the mount does not `followSymlinks`; refuse anything else
    *    that isn't a regular file, such as a FIFO, without opening it.
@@ -2684,12 +2701,18 @@ export class WorkspaceModule implements Module {
       if (resolvedThrough !== null) throw await linkReadError(mount, resolvedThrough, mountPrefixedPath, this.nestedOf(mount.config.name));
 
       const inside = isContainedPath(realMountRoot, realFilePath);
-      const holder = inside ? nestedAtReal(realFilePath, this.nestedOf(mount.config.name)) : undefined;
+      const escape = new WorkspaceReadError('escape', `Symlink escape detected: ${mountPrefixedPath}`, 'realpath');
+      if (!inside) throw escape;
+      // Through a link the mount follows, a nested mount with an include
+      // judges the place by its view (landing), as the parse did.
+      if (follow && realFilePath !== join(realMountRoot, relativePath)) {
+        const landed = await landing(mount.config.path, relativePath, this.nestedOf(mount.config.name));
+        if (landed) throw landed.shown ? new WorkspaceReadError('other_mount', leadsInto(mount.config.name, relativePath, landed), 'realpath') : escape;
+      }
+      const holder = nestedAtReal(realFilePath, this.nestedOf(mount.config.name));
       // A place in a nested mount's directory that its include leaves out is
       // no mount's, so the path leaves this one (namesNestedPlace).
-      if (!inside || (holder !== undefined && !namesNestedPlace(holder.rest, holder.include, false))) {
-        throw new WorkspaceReadError('escape', `Symlink escape detected: ${mountPrefixedPath}`, 'realpath');
-      }
+      if (holder !== undefined && !namesNestedPlace(holder.rest, holder.include, false)) throw escape;
       if (holder) throw new WorkspaceReadError('other_mount', leadsInto(mount.config.name, relativePath, holder), 'realpath');
 
       let pathStat: Stats;

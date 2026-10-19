@@ -137,7 +137,9 @@ export interface MountConfig {
    * path is followed: not one at the path itself, and not one among the
    * directories on its way beneath the mount's root, wherever it leads. A path
    * with a symlink among its directories is refused naming the link, and for
-   * a link inside the mount, its target. A mount root that is
+   * a link inside the mount, its target where a tool could name it: a
+   * directory, or a file the include of the mount it lies in covers, where
+   * that mount has one. A mount root that is
    * itself a symlink is still the root. With it, a symlink on a path is
    * followed while what it reaches stays inside the mount. Either way, a
    * listing or a sync's walk descends into no symlinked directory.

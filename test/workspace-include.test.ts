@@ -10,13 +10,14 @@
 
 import { describe, test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, sep } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework } from '../src/framework.js';
 import { WorkspaceModule, WorkspaceReadError } from '../src/modules/workspace/index.js';
-import { includePatternReadable, insideMount, parsedSpelling, pathSegments, provenAbsent, type Walk } from '../src/modules/workspace/observe.js';
+import { EffectFailed, unlinkContained, writeContained } from '../src/modules/workspace/effects.js';
+import { includePatternReadable, insideMount, parsedSpelling, pathSegments, provenAbsent, readPath, type MountView, type Walk } from '../src/modules/workspace/observe.js';
 import type { MountConfig } from '../src/modules/workspace/types.js';
 import type { ModuleContext } from '../src/types/module.js';
 
@@ -74,6 +75,27 @@ async function refused(m: WorkspaceModule, name: string, input: Record<string, u
   const res = await m.handleToolCall({ id: 't', name, input });
   assert.equal(res.success, false, `${name} ${JSON.stringify(input)} unexpectedly succeeded`);
   return String(res.error);
+}
+
+/** readFileFromDisk's refusal of `path`, as its code and message. */
+async function diskRefusal(m: WorkspaceModule, path: string): Promise<string> {
+  let message = '';
+  await assert.rejects(m.readFileFromDisk(path), (err: unknown) => {
+    message = `${(err as WorkspaceReadError).code}: ${String((err as Error).message)}`;
+    return err instanceof WorkspaceReadError;
+  });
+  return message;
+}
+
+/** A workspace with `work` and `inner` nested in it at `inner/`, whose include covers `*.json` only. */
+async function openNested(env: Env, followSymlinks: boolean): Promise<WorkspaceModule> {
+  const m = new WorkspaceModule({ mounts: [
+    { name: 'work', path: env.dir, mode: 'read-write', watch: 'never', followSymlinks },
+    { name: 'inner', path: join(env.dir, 'inner'), mode: 'read-write', watch: 'never', include: ['*.json'] },
+  ] });
+  m.initStore(env.store);
+  await m.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
+  return m;
 }
 
 async function listed(m: WorkspaceModule): Promise<string[]> {
@@ -506,24 +528,7 @@ describe('mount include', () => {
     symlinkSync(join(env.dir, 'inner/kept.json'), join(env.dir, 'k.json'));
     symlinkSync(join(env.dir, 'inner/missing.txt'), join(env.dir, 'm.txt'));
     symlinkSync(join(env.dir, 'inner/sub'), join(env.dir, 'd'));
-    const open = async (followSymlinks: boolean): Promise<WorkspaceModule> => {
-      const m = new WorkspaceModule({ mounts: [
-        { name: 'work', path: env.dir, mode: 'read-write', watch: 'never', followSymlinks },
-        { name: 'inner', path: join(env.dir, 'inner'), mode: 'read-write', watch: 'never', include: ['*.json'] },
-      ] });
-      m.initStore(env.store);
-      await m.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
-      return m;
-    };
-    const refusal = async (m: WorkspaceModule, path: string): Promise<string> => {
-      let message = '';
-      await assert.rejects(m.readFileFromDisk(path), (err: unknown) => {
-        message = `${(err as WorkspaceReadError).code}: ${String((err as Error).message)}`;
-        return err instanceof WorkspaceReadError;
-      });
-      return message;
-    };
-    const m = await open(true);
+    const m = await openNested(env, true);
     try {
       // The workspace holds h.txt from before disk made it a link to a file the inner mount's include leaves out.
       await call(m, 'sync', {});
@@ -532,18 +537,31 @@ describe('mount include', () => {
       // A file the inner mount's include leaves out, there or missing, is no mount's: the path leaves this one,
       // in the words each refusal has for that, naming neither the inner mount nor the file.
       for (const path of ['work/h.txt', 'work/m.txt', 'work/d/b.txt']) {
-        const left = await refusal(m, path);
+        const left = await diskRefusal(m, path);
         assert.equal(left, `escape: Symlink escape detected: ${path}`);
         const read = await refused(m, 'read', { path });
         assert.ok(read.includes(`Symlink escape detected: ${path}`) && !read.includes('inner'), read);
+        assert.deepEqual((await call(m, 'grep', { path, pattern: 'needle' })).skipped, [{ file: path, reason: `Symlink escape detected: ${path}` }]);
       }
+      // The sync says the link leaves the mount whether the file is there or not, and beneath a link to a
+      // directory, it names that directory, as a listing would, and not the file.
+      for (const link of ['h.txt', 'm.txt']) {
+        const synced = await call(m, 'sync', { path: `work/${link}` });
+        assert.deepEqual(synced.skipped, [{ mount: 'work', path: link, reason: 'disk could not be checked: a symlink that leaves the mount' }]);
+      }
+      assert.deepEqual((await call(m, 'sync', { path: 'work/d/b.txt' })).skipped, [
+        { mount: 'work', path: 'd/b.txt', reason: 'disk could not be checked: "work/d" leads into mount "inner", nested in mount "work": use "inner/sub" in its place' },
+      ]);
       const searched = await call(m, 'grep', { path: 'work', pattern: 'needle' });
       assert.equal(searched.totalMatches, 0);
       assert.deepEqual(searched.skipped.filter((s: { file: string }) => s.file === 'work/h.txt'), [{ file: 'work/h.txt', reason: 'Symlink escape detected: work/h.txt' }]);
       // A file the inner mount's include covers, and a directory, are that mount's, and named.
-      assert.match(await refusal(m, 'work/k.json'), /^other_mount: .*use "inner\/kept\.json"/);
-      assert.match(await refusal(m, 'work/d/a.json'), /^other_mount: .*use "inner\/sub\/a\.json"/);
-      assert.match(await refusal(m, 'work/d'), /^other_mount: .*use "inner\/sub"\./);
+      assert.match(await diskRefusal(m, 'work/k.json'), /^other_mount: .*use "inner\/kept\.json"/);
+      assert.match(await diskRefusal(m, 'work/d/a.json'), /^other_mount: .*use "inner\/sub\/a\.json"/);
+      assert.match(await diskRefusal(m, 'work/d'), /^other_mount: .*use "inner\/sub"\./);
+      assert.deepEqual((await call(m, 'ls', { path: 'work/d' })).incomplete, [
+        { path: 'd', reason: '"work/d" leads into mount "inner", nested in mount "work": use "inner/sub" in its place' },
+      ]);
       const synced = JSON.stringify((await call(m, 'sync', {})).skipped);
       assert.ok(synced.includes('use \\"inner/sub\\" in its place') && synced.includes('use \\"inner/kept.json\\" in its place'), synced);
       assert.ok(synced.includes('"path":"h.txt","reason":"disk could not be checked: a symlink that leaves the mount"') && !synced.includes('hidden'), synced);
@@ -551,14 +569,165 @@ describe('mount include', () => {
       await m.stop();
     }
     // A mount that doesn't follow links refuses the link itself, and names the target where the inner mount's include covers it.
-    const unfollowed = await open(false);
+    const unfollowed = await openNested(env, false);
     try {
-      const left = await refusal(unfollowed, 'work/h.txt');
+      const left = await diskRefusal(unfollowed, 'work/h.txt');
       assert.match(left, /^parent_symlink: .*"work\/h\.txt" is a symlink, which this mount does not follow/);
       assert.ok(!left.includes('hidden') && !left.includes('inner'), left);
-      assert.match(await refusal(unfollowed, 'work/k.json'), /^other_mount: .*use "inner\/kept\.json"/);
+      assert.match(await diskRefusal(unfollowed, 'work/k.json'), /^other_mount: .*use "inner\/kept\.json"/);
     } finally {
       await unfollowed.stop();
+    }
+  });
+
+  test("through a link a mount follows, a path beneath a place the nested mount's include leaves out, or beneath one that isn't there, names nothing of that mount, and the sync answers alike whether the place is there", async (t) => {
+    const env = new Env(t);
+    env.writeDisk('inner/hidden.txt', "not the inner mount's\n");
+    env.writeDisk('inner/sub/a.json', '{}\n');
+    symlinkSync(join(env.dir, 'inner/hidden.txt'), join(env.dir, 'h.txt'));
+    symlinkSync(join(env.dir, 'inner/missing.txt'), join(env.dir, 'm.txt'));
+    symlinkSync(join(env.dir, 'inner/sub2'), join(env.dir, 'd2'));
+    symlinkSync(join(env.dir, 'inner/new.json'), join(env.dir, 'n.json'));
+    env.writeDisk('inner/kept.json', '{}\n');
+    symlinkSync(join(env.dir, 'inner/kept.json'), join(env.dir, 'k.json'));
+    // A `..` after a file the include leaves out, or after a name that isn't there, climbs nowhere, as the
+    // kernel's lookup stops there (the targets are written as strings, since join would take the `..` out).
+    symlinkSync(`${env.dir}/inner/hidden.txt/../sub/a.json`, join(env.dir, 'up1.json'));
+    symlinkSync(`${env.dir}/inner/absent.txt/../sub/a.json`, join(env.dir, 'up2.json'));
+    // Entries of the inner mount's own that are links, which its include leaves out: one that leads nowhere,
+    // and one to its own directory. The outer mount's links go through them.
+    symlinkSync('missing.json', join(env.dir, 'inner/dl.txt'));
+    symlinkSync('sub', join(env.dir, 'inner/l2'));
+    symlinkSync(`${env.dir}/inner/dl.txt/..`, join(env.dir, 'v1'));
+    symlinkSync(`${env.dir}/inner/nothing.txt/..`, join(env.dir, 'v2'));
+    symlinkSync(join(env.dir, 'inner/l2'), join(env.dir, 'x'));
+    // The kernel can't enter a name that isn't there, even where a `..` follows it.
+    symlinkSync(`${env.dir}/nowhere/../inner/hidden.txt`, join(env.dir, 'y'));
+    const m = await openNested(env, true);
+    try {
+      for (const link of ['up1.json', 'up2.json']) {
+        assert.equal(await diskRefusal(m, `work/${link}`), `escape: Symlink escape detected: work/${link}`);
+        assert.deepEqual((await call(m, 'sync', { path: `work/${link}` })).skipped, [
+          { mount: 'work', path: link, reason: 'disk could not be checked: a symlink that leaves the mount' },
+        ]);
+      }
+      // Past an entry of the inner mount's that is a link, the walk goes no further: where that link leads is
+      // the inner mount's to show, and its include leaves the link out, whether it's there or not.
+      for (const link of ['v1', 'v2']) {
+        assert.equal(await diskRefusal(m, `work/${link}`), `escape: Symlink escape detected: work/${link}`);
+        assert.deepEqual((await call(m, 'sync', { path: `work/${link}` })).skipped, [
+          { mount: 'work', path: link, reason: 'disk could not be checked: a symlink that leaves the mount' },
+        ]);
+      }
+      assert.equal(await diskRefusal(m, 'work/x/a.json'), 'escape: Symlink escape detected: work/x/a.json');
+      assert.equal(await diskRefusal(m, 'work/y'), 'escape: Symlink escape detected: work/y');
+      assert.deepEqual((await call(m, 'ls', { path: 'work/x' })).incomplete, [
+        { path: 'x', reason: 'beneath a symlink that does not lead to a directory inside the mount' },
+      ]);
+      // A name the include covers, beneath a file it leaves out or a directory that isn't there, is no
+      // place of the inner mount's, and naming it would show the names on its way.
+      for (const path of ['work/h.txt/a.json', 'work/m.txt/a.json', 'work/d2/a.json']) {
+        assert.equal(await diskRefusal(m, path), `escape: Symlink escape detected: ${path}`);
+      }
+      // Nor is one beneath a name the include covers that isn't a directory, there or not: the path goes on past it.
+      for (const path of ['work/k.json/a.json', 'work/n.json/a.json']) {
+        assert.equal(await diskRefusal(m, path), `escape: Symlink escape detected: ${path}`);
+      }
+      // In a directory that's there, a name the include covers is the inner mount's, there or not.
+      assert.match(await diskRefusal(m, 'work/n.json'), /^other_mount: .*use "inner\/new\.json"/);
+      // Nothing is beneath a file the include leaves out, as nothing is beneath a link that leads nowhere.
+      for (const link of ['h.txt', 'm.txt']) {
+        assert.deepEqual((await call(m, 'sync', { path: `work/${link}/x.md` })).skipped, [
+          { mount: 'work', path: `${link}/x.md`, reason: 'disk could not be checked: beneath a symlink that does not lead to a directory inside the mount' },
+        ]);
+        assert.deepEqual((await call(m, 'ls', { path: `work/${link}` })).incomplete, [
+          { path: link, reason: 'beneath a symlink that does not lead to a directory inside the mount' },
+        ]);
+      }
+      // A link that leads nowhere, to a name the include covers, is named as that mount's, as the file tools name it.
+      assert.deepEqual((await call(m, 'sync', { path: 'work/n.json' })).skipped, [
+        { mount: 'work', path: 'n.json', reason: 'disk could not be checked: "work/n.json" leads into mount "inner", nested in mount "work": use "inner/new.json" in its place' },
+      ]);
+    } finally {
+      await m.stop();
+    }
+  });
+
+  test("through a link a mount follows, a nested mount without an include beside one with an include keeps every place there its own, as without any include", async (t) => {
+    const env = new Env(t);
+    env.writeDisk('plain/sub/a.txt', "the plain mount's\n");
+    env.writeDisk('plain/f.txt', "the plain mount's\n");
+    symlinkSync('sub', join(env.dir, 'plain/l2'));
+    symlinkSync(join(env.dir, 'plain/l2'), join(env.dir, 'px'));
+    symlinkSync(join(env.dir, 'plain/f.txt'), join(env.dir, 'pf'));
+    env.writeDisk('inner/kept.json', '{}\n');
+    const m = new WorkspaceModule({ mounts: [
+      { name: 'work', path: env.dir, mode: 'read-write', watch: 'never', followSymlinks: true },
+      { name: 'inner', path: join(env.dir, 'inner'), mode: 'read-write', watch: 'never', include: ['*.json'] },
+      { name: 'plain', path: join(env.dir, 'plain'), mode: 'read-write', watch: 'never' },
+    ] });
+    m.initStore(env.store);
+    await m.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
+    try {
+      // Past the plain mount's own link, and beneath its file, the place is the plain mount's, named as it reads.
+      assert.match(await diskRefusal(m, 'work/px/a.txt'), /^other_mount: .*use "plain\/sub\/a\.txt"/);
+      assert.match(await diskRefusal(m, 'work/pf/x.txt'), /^other_mount: .*use "plain\/f\.txt\/x\.txt"/);
+    } finally {
+      await m.stop();
+    }
+  });
+
+  test("a forced materialize over a link to a place the nested mount's include leaves out says it leaves the mount, whether anything is there or not", async (t) => {
+    const env = new Env(t);
+    env.writeDisk('inner/hidden.txt', "not the inner mount's\n");
+    env.writeDisk('inner/sub/a.json', '{}\n');
+    const links: Array<[string, string]> = [
+      ['h.txt', join(env.dir, 'inner/hidden.txt')],
+      ['m.txt', join(env.dir, 'inner/missing.txt')],
+      // Through a file the include leaves out, or a name that isn't there, the open fails ENOTDIR or ENOENT.
+      ['u1.json', `${env.dir}/inner/hidden.txt/../sub/a.json`],
+      ['u2.json', `${env.dir}/inner/absent.txt/../sub/a.json`],
+    ];
+    for (const [path] of links) env.writeDisk(path, `outer ${path}\n`);
+    const m = await openNested(env, true);
+    try {
+      await call(m, 'sync', {});
+      for (const [path, target] of links) {
+        await call(m, 'write', { path: `work/${path}`, content: `new ${path}\n` });
+        rmSync(join(env.dir, path));
+        symlinkSync(target, join(env.dir, path));
+      }
+      const forced = await call(m, 'materialize', { path: 'work', force: true });
+      assert.deepEqual(forced.skipped, links.map(([path]) => ({ mount: 'work', reason: `${path}: not written: a symlink that leaves the mount` })));
+      assert.equal(readFileSync(join(env.dir, 'inner/hidden.txt'), 'utf8'), "not the inner mount's\n");
+      assert.equal(existsSync(join(env.dir, 'inner/missing.txt')), false);
+    } finally {
+      await m.stop();
+    }
+  });
+
+  test("a walk through a link to a directory above a nested mount's directory passes over that directory, and names none of that mount's files", async (t) => {
+    const env = new Env(t);
+    env.writeDisk('a/sub/in/secret.txt', "not the inner mount's\n");
+    env.writeDisk('a/sub/in/kept.json', '{}\n');
+    env.writeDisk('a/sub/own.txt', "the outer mount's\n");
+    symlinkSync(join(env.dir, 'a'), join(env.dir, 'link'));
+    // With and without an include on the nested mount: its directory is another mount's either way.
+    for (const include of [['*.json'], undefined]) {
+      const m = new WorkspaceModule({ mounts: [
+        { name: 'work', path: env.dir, mode: 'read-write', watch: 'never', followSymlinks: true },
+        { name: 'inner', path: join(env.dir, 'a/sub/in'), mode: 'read-write', watch: 'never', ...(include ? { include } : {}) },
+      ] });
+      m.initStore(env.store);
+      await m.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
+      try {
+        const listing = await call(m, 'ls', { path: 'work/link/sub', recursive: true });
+        assert.deepEqual(listing.entries.map((e: { path: string }) => e.path), ['link/sub/own.txt'], JSON.stringify(include));
+        const answers = JSON.stringify([listing, await call(m, 'sync', { path: 'work/link/sub' }), await call(m, 'grep', { path: 'work/link/sub', pattern: 'mount' })]);
+        assert.ok(!answers.includes('secret') && !answers.includes('kept.json'), answers);
+      } finally {
+        await m.stop();
+      }
     }
   });
 
@@ -1001,5 +1170,114 @@ describe('mount include', () => {
     }
     // Where "/" is the separator, "\" is part of a name, so a pattern may hold one.
     if (sep === '/') assert.doesNotThrow(() => new WorkspaceModule({ mounts: [mount(['a\\b.json'])] }), 'a pattern holding "\\"');
+  });
+});
+
+describe("the checks where disk is acted on, called directly as a push and a read call them, name a nested place only where that mount's include covers it", () => {
+  // A path reaches these only when disk changes between the checks before them and the act, so each is
+  // called here with the link already there, as workspace-nested-mount-roots' own tests call them.
+  /** A mount following symlinks, with `inner` nested at `a/b`, its include covering `*.json`, and links into it. */
+  function rig(t: TestContext): { at: (path: string) => string; view: MountView; rootReal: string } {
+    const root = mkdtempSync(join(tmpdir(), 'af-ws-include-sites-'));
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    const at = (path: string): string => join(root, 'outer', path);
+    mkdirSync(at('a/b/sub'), { recursive: true });
+    writeFileSync(at('a/b/x.txt'), "the inner mount's, outside its include");
+    writeFileSync(at('a/b/kept.json'), "the inner mount's");
+    symlinkSync(at('a/b/x.txt'), at('hidden.txt'));
+    symlinkSync(at('a/b/kept.json'), at('kept.json'));
+    symlinkSync(at('a/b/sub'), at('d'));
+    // An entry of the inner mount's own, a link its include leaves out, and an outer link through it.
+    writeFileSync(at('a/b/sub/a.json'), "the inner mount's");
+    symlinkSync('sub', at('a/b/l2'));
+    symlinkSync(at('a/b/l2'), at('x'));
+    const nested = [{ dir: 'a/b', name: 'inner', real: realpathSync(at('a/b')), include: ['*.json'] }];
+    const view = { root: at(''), name: 'outer', followSymlinks: true, maxFileSize: 1 << 20, ignore: [], others: ['a/b'], nested } as MountView;
+    return { at, view, rootReal: realpathSync(at('')) };
+  }
+  const leaves = 'a symlink that leaves the mount';
+  const named = (path: string, use: string): string => `"outer/${path}" leads into mount "inner", nested in mount "outer": use "${use}" in its place`;
+
+  test('the located read', async (t) => {
+    const { view, rootReal } = rig(t);
+    assert.deepEqual(await readPath(view, rootReal, 'hidden.txt', 1 << 20), { kind: 'unobserved', reason: leaves });
+    assert.deepEqual(await readPath(view, rootReal, 'kept.json', 1 << 20), { kind: 'unobserved', reason: named('kept.json', 'inner/kept.json') });
+    // Past the inner mount's own link, nothing is that mount's to show, wherever the link leads.
+    assert.deepEqual(await readPath(view, rootReal, 'x/a.json', 1 << 20), { kind: 'unobserved', reason: leaves });
+  });
+
+  test('the contained write, which leaves the file as it was', async (t) => {
+    const { at, view, rootReal } = rig(t);
+    for (const [path, reason] of [['hidden.txt', leaves], ['kept.json', named('kept.json', 'inner/kept.json')], ['x/a.json', 'a parent path is not a directory']] as const) {
+      const err = await writeContained(view, rootReal, path, Buffer.from('outer wrote'), { kind: 'any' }).then(() => null, (e: unknown) => e);
+      assert.ok(err instanceof EffectFailed, String(err));
+      assert.equal(err.message, reason);
+    }
+    assert.equal(readFileSync(at('a/b/x.txt'), 'utf8'), "the inner mount's, outside its include");
+    assert.equal(readFileSync(at('a/b/kept.json'), 'utf8'), "the inner mount's");
+  });
+
+  test("the contained write asks where a file lies before it reads it, and refuses a link that leads nowhere into the nested directory as one that leaves", async (t) => {
+    const { at, view, rootReal } = rig(t);
+    // Expecting other bytes, the write would read the file to compare: where it lies is asked first.
+    const err = await writeContained(view, rootReal, 'hidden.txt', Buffer.from('outer wrote'), { kind: 'content', hash: 'not its hash' }).then(() => null, (e: unknown) => e);
+    assert.ok(err instanceof EffectFailed, String(err));
+    assert.equal(err.message, leaves);
+    // A link to a place the include leaves out that isn't there: the exclusive create meets the link.
+    symlinkSync(at('a/b/missing.txt'), at('missing.txt'));
+    const dangling = await writeContained(view, rootReal, 'missing.txt', Buffer.from('outer wrote'), { kind: 'any' }).then(() => null, (e: unknown) => e);
+    assert.ok(dangling instanceof EffectFailed, String(dangling));
+    assert.equal(dangling.message, leaves);
+    assert.equal(existsSync(at('a/b/missing.txt')), false);
+    // Through an entry of the inner mount's own, a link its include leaves out to a file it covers: the walk
+    // stops at that entry, so the place is refused as leaving, and nothing tells where the entry leads.
+    symlinkSync('kept.json', at('a/b/l3'));
+    symlinkSync(at('a/b/l3'), at('z.json'));
+    const through = await writeContained(view, rootReal, 'z.json', Buffer.from('outer wrote'), { kind: 'content', hash: 'not its hash' }).then(() => null, (e: unknown) => e);
+    assert.ok(through instanceof EffectFailed, String(through));
+    assert.equal(through.message, leaves);
+    assert.equal(readFileSync(at('a/b/kept.json'), 'utf8'), "the inner mount's");
+    // A mount that doesn't follow links refuses the link itself, as one it doesn't follow, wherever it leads.
+    const unfollowed = await writeContained({ ...view, followSymlinks: false }, rootReal, 'hidden.txt', Buffer.from('outer wrote'), { kind: 'any' }).then(() => null, (e: unknown) => e);
+    assert.ok(unfollowed instanceof EffectFailed, String(unfollowed));
+    assert.equal(unfollowed.message, 'a symlink, which this mount does not follow');
+  });
+
+  test('the contained unlink of a link to a file or a directory, which leaves the link', async (t) => {
+    const { at, view, rootReal } = rig(t);
+    for (const [path, reason] of [['hidden.txt', leaves], ['kept.json', named('kept.json', 'inner/kept.json')], ['d', named('d', 'inner/sub')]] as const) {
+      const err = await unlinkContained(view, rootReal, path, { kind: 'any' }).then(() => null, (e: unknown) => e);
+      assert.ok(err instanceof EffectFailed, String(err));
+      assert.equal(err.message, reason);
+      assert.ok(lstatSync(at(path)).isSymbolicLink(), `${path} is still there`);
+    }
+  });
+
+  test("the module's disk reads, past the parse that refuses first", async (t) => {
+    const env = new Env(t);
+    env.writeDisk('inner/hidden.txt', "not the inner mount's\n");
+    env.writeDisk('inner/kept.json', '{}\n');
+    env.writeDisk('inner/sub/a.json', '{}\n');
+    symlinkSync(join(env.dir, 'inner/hidden.txt'), join(env.dir, 'h.txt'));
+    symlinkSync(join(env.dir, 'inner/kept.json'), join(env.dir, 'k.json'));
+    symlinkSync('sub', join(env.dir, 'inner/l2'));
+    symlinkSync(join(env.dir, 'inner/l2'), join(env.dir, 'x'));
+    const m = await openNested(env, true);
+    try {
+      const internals = m as unknown as {
+        mounts: Map<string, unknown>;
+        openContainedFile(mount: unknown, relativePath: string, mountPrefixedPath: string): Promise<unknown>;
+      };
+      const code = async (relativePath: string): Promise<string> => {
+        const err = await internals.openContainedFile(internals.mounts.get('work'), relativePath, `work/${relativePath}`).then(() => null, (e: unknown) => e);
+        assert.ok(err instanceof WorkspaceReadError, String(err));
+        return `${err.code}: ${err.message}`;
+      };
+      assert.equal(await code('h.txt'), 'escape: Symlink escape detected: work/h.txt');
+      assert.match(await code('k.json'), /^other_mount: .*use "inner\/kept\.json"/);
+      assert.equal(await code('x/a.json'), 'escape: Symlink escape detected: work/x/a.json');
+    } finally {
+      await m.stop();
+    }
   });
 });

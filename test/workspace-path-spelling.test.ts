@@ -370,6 +370,39 @@ test('a link into a nested mount\'s directory configured in another spelling tha
   });
 });
 
+test('through a link that spells a nested mount\'s directory otherwise than disk, that mount\'s include judges the place', { skip: FOLDING_ONLY }, async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-nested-include-'));
+  const dir = join(root, 'mount');
+  mkdirSync(join(dir, 'inner'), { recursive: true });
+  writeFileSync(join(dir, 'inner', 'kept.json'), '{}\n');
+  writeFileSync(join(dir, 'inner', 'hidden.txt'), 'not the nested mount\'s\n');
+  // The links spell the nested directory in another case than disk and the
+  // configuration do, so it's known by which directory it is.
+  symlinkSync('INNER/kept.json', join(dir, 'k.json'));
+  symlinkSync('INNER/hidden.txt', join(dir, 'h.txt'));
+  const store = JsStore.openOrCreate({ path: join(root, 'store') });
+  const workspace = new WorkspaceModule({ mounts: [
+    { name: 'outer', path: dir, mode: 'read-write', watch: 'never', followSymlinks: true },
+    { name: 'nested', path: join(dir, 'inner'), mode: 'read-write', watch: 'never', include: ['*.json'] },
+  ] });
+  workspace.initStore(store);
+  await workspace.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
+  t.after(async () => { await workspace.stop(); store.close(); rmSync(root, { recursive: true, force: true }); });
+  const code = async (path: string): Promise<string> => {
+    let answer = '';
+    await assert.rejects(workspace.readFileFromDisk(path), (err: unknown) => {
+      assert.ok(err instanceof WorkspaceReadError, String(err));
+      answer = `${err.code}: ${err.message}`;
+      return true;
+    });
+    return answer;
+  };
+  assert.match(await code('outer/k.json'), /^other_mount: .*use "nested\/kept\.json"/);
+  assert.equal(await code('outer/h.txt'), 'escape: Symlink escape detected: outer/h.txt');
+  const synced = await workspace.handleToolCall({ id: 'sync', name: 'sync', input: { path: 'outer/h.txt' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+  assert.deepEqual((synced.data as { skipped: unknown[] }).skipped, [{ mount: 'outer', path: 'h.txt', reason: 'disk could not be checked: a symlink that leaves the mount' }]);
+});
+
 test('resolveAbsolutePath takes a nested mount\'s directory in any spelling disk folds to it as that mount\'s', { skip: FOLDING_ONLY }, async (t) => {
   const { workspace } = await setup(t, (d) => {
     mkdirSync(join(d, 'inner'), { recursive: true });
