@@ -663,7 +663,7 @@ describe('notices about an agent\'s own action', () => {
         '[channels] Now open: #one (c-1): your own message into the closed channel opened it. Your primary has been told and can close it.' }]));
       assert.equal(primary.mock.callCount(), 1, 'the primary is told too');
       assert.equal(JSON.stringify(primary.mock.calls[0]!.arguments[1]), JSON.stringify([{ type: 'text', text:
-        `[channels] Now open: #one (c-1): a message from your fork bound to missing-channel (${fork.name}) into the closed channel opened it, and that fork can't close it. ` +
+        `[channels] Now open: #one (c-1): a message from your fork in missing-channel, named ${fork.name}, into the closed channel opened it, and that fork can't close it. ` +
         "If you don't want it, use channel_close; your choice outranks policy." }]));
       assert.equal((primary.mock.calls[0]!.arguments[2] as { speaker?: unknown } | undefined)?.speaker, fork.name);
 
@@ -697,7 +697,7 @@ describe('notices about an agent\'s own action', () => {
         .filter((m) => JSON.stringify(m.content).includes('#home'));
       assert.equal(told.length, 1, 'the primary is told once');
       assert.equal((told[0]!.content[0] as { text: string }).text,
-        `[channels] Now open: #home (missing-channel): a message from your fork bound to missing-channel (${fork.name}) into the closed channel opened it; that fork has ended. ` +
+        `[channels] Now open: #home (missing-channel): a message from your fork in missing-channel, named ${fork.name}, into the closed channel opened it; that fork has ended. ` +
         "If you don't want it, use channel_close; your choice outranks policy.");
       assert.equal((told[0]!.metadata as { speaker?: unknown } | undefined)?.speaker, fork.name);
     });
@@ -713,7 +713,7 @@ describe('notices about an agent\'s own action', () => {
       const told = framework.getAgent('primary')!.getContextManager().getAllMessages()
         .filter((m) => JSON.stringify(m.content).includes('#one'));
       assert.equal(told.length, 1, 'only the notice of the time');
-      assert.match(JSON.stringify(told[0]!.content), new RegExp(`your fork bound to missing-channel \\(${fork.name}\\) into the closed channel opened it, and that fork can't close it`));
+      assert.match(JSON.stringify(told[0]!.content), new RegExp(`your fork in missing-channel, named ${fork.name}, into the closed channel opened it, and that fork can't close it`));
     });
 
     it('tells the primary, by name, of a channel an ended agent\'s send opened, and the primary\'s channel_close closes it', async (t) => {

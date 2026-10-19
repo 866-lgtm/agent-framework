@@ -2445,7 +2445,7 @@ test("where a reply's reader can't close a channel selected for opening, the pri
   const stays = " It stays selected for opening, because the host couldn't record undoing that: a later delivery or reconnect tries again";
   const again = " It's selected for opening again, because its server lists it as open by default: the host tries again";
   const byName = (first: string, again: string) => `[channels] Not open: #x (x). A reply from ${first} went out there, but opening the channel failed, and ${again} can't close it.`;
-  const forkByName = byName('your fork bound to y (fork)', 'that fork');
+  const forkByName = byName('your fork in y, named fork,', 'that fork');
   const told = (primary: string) => ` ${primary} has been told, and can withdraw that.`;
   const cases: Array<{
     why: string; name: string; agents: Array<[string, string[]]>; homes?: Array<[string, string]>; primary: string | null;
@@ -2455,14 +2455,14 @@ test("where a reply's reader can't close a channel selected for opening, the pri
     { why: 'a fork away from its home, selected again by its server', name: 'fork', agents: [['fork', []], ['primary', []]], homes: [['fork', 'y']],
       primary: 'primary', selectedForOpening: 'server-bootstrap',
       told: [
-        { text: facts + again + '.' + told('Your primary'), metadata: { system: true, kind: 'channel-notice' }, forAgent: 'fork' },
         { text: forkByName + again + ', and channel_close withdraws that.', metadata: { system: true, kind: 'channel-notice', speaker: 'fork' } },
+        { text: facts + again + '.' + told('Your primary'), metadata: { system: true, kind: 'channel-notice' }, forAgent: 'fork' },
       ] },
     { why: "an agent whose allowedTools leave channel_close out, the put-back unrecorded", name: 'helper', agents: [['helper', ['channel_close']], ['primary', []]],
       primary: 'primary', selectedForOpening: 'unrecorded',
       told: [
-        { text: facts + stays + '.' + told('primary') + ' channel_open tries again.', metadata: { system: true, kind: 'channel-notice' }, forAgent: 'helper' },
         { text: byName('helper', 'helper') + stays + ', and channel_close withdraws that. channel_open tries again.', metadata: { system: true, kind: 'channel-notice', speaker: 'helper' } },
+        { text: facts + stays + '.' + told('primary') + ' channel_open tries again.', metadata: { system: true, kind: 'channel-notice' }, forAgent: 'helper' },
       ] },
     { why: 'a reader who can close it, beside a primary that can too', name: 'helper', agents: [['helper', []], ['primary', []]],
       primary: 'primary', selectedForOpening: 'server-bootstrap',
@@ -2476,8 +2476,8 @@ test("where a reply's reader can't close a channel selected for opening, the pri
     { why: "a primary that can close it but not open it, the put-back unrecorded", name: 'fork', agents: [['fork', []], ['primary', ['channel_open']]],
       homes: [['fork', 'y']], primary: 'primary', selectedForOpening: 'unrecorded',
       told: [
-        { text: facts + stays + '.' + told('Your primary'), metadata: { system: true, kind: 'channel-notice' }, forAgent: 'fork' },
         { text: forkByName + stays + ', and channel_close withdraws that.', metadata: { system: true, kind: 'channel-notice', speaker: 'fork' } },
+        { text: facts + stays + '.' + told('Your primary'), metadata: { system: true, kind: 'channel-notice' }, forAgent: 'fork' },
       ] },
     { why: 'a fork away from its home, the channel left closed', name: 'fork', agents: [['fork', []], ['primary', []]], homes: [['fork', 'y']],
       primary: 'primary',
@@ -2498,6 +2498,8 @@ test("where a reply's reader can't close a channel selected for opening, the pri
     framework.primaryAgentName = c.primary;
     framework.usedEphemeralAgentNames = new Set();
     framework.conversationAgentHomes = new Map(c.homes ?? []);
+    // Forks are made where conversations are routed, here from the primary.
+    framework.conversationRouter = c.homes ? { templateAgent: 'primary' } : undefined;
     framework.addMessage = (_participant: string, content: Array<{ text: string }>, metadata: unknown, routed?: { forAgent?: string }) => {
       told.push({ text: content[0]!.text, metadata, ...(routed ? { forAgent: routed.forAgent } : {}) });
       return 'm';
@@ -2533,30 +2535,40 @@ test('the opened notice names channel_close only to a reader that can call it, s
   const fromReply = { notice: 'channel-opened', cause: 'opened-by-reply', channels: [{ channelId: 'x', label: '#x' }] };
   const cases: Array<{
     why: string; name?: string; cause?: 'opened-by-reply' | 'subscription-policy'; channels?: Array<{ channelId: string; label?: string }>;
-    agents: Array<[string, string[]]>; homes?: Array<[string, string]>; labels?: Array<[string, string]>; router?: boolean; primary: string | null;
+    agents: Array<[string, string[]]>; homes?: Array<[string, string]>; labels?: Array<[string, string]>; isolated?: string[];
+    router?: boolean; template?: string; primary: string | null;
     told: Array<{ text: string; metadata: unknown; forAgent?: string }>;
   }> = [
-    { why: 'a reader that can close it, whose window holds no channel traffic', name: 'helper', agents: [['helper', []], ['primary', []]], primary: 'primary',
-      told: [{ text: own + close, metadata: opened(fromReply), forAgent: 'helper' }] },
+    { why: "a second resident that can close it, which reads the residents' shared slot", name: 'helper', agents: [['helper', []], ['primary', []]], primary: 'primary',
+      told: [{ text: own + optOut + close, metadata: opened(fromReply), forAgent: 'helper' }] },
+    { why: 'a run that can close it, whose store is its own and holds no channel traffic', name: 'run', agents: [['run', []], ['primary', []]], isolated: ['run'], primary: 'primary',
+      told: [{ text: own + close, metadata: opened(fromReply), forAgent: 'run' }] },
     { why: 'a fork away from its home', name: 'fork', agents: [['fork', []], ['primary', []]], homes: [['fork', 'y']], router: true, primary: 'primary',
       told: [
-        { text: own + ' Your primary has been told and can close it.', metadata: { system: true, kind: 'channel-notice' }, forAgent: 'fork' },
-        { text: '[channels] Now open: #x (x): a message from your fork bound to y (fork) into the closed channel opened it, and that fork can\'t close it.' + close,
+        { text: "[channels] Now open: #x (x): a message from your fork in y, named fork, into the closed channel opened it, and that fork can't close it." + close,
           metadata: { system: true, kind: 'channel-notice', speaker: 'fork' } },
+        { text: own + ' Your primary has been told and can close it.', metadata: { system: true, kind: 'channel-notice' }, forAgent: 'fork' },
       ] },
     { why: 'a fork away from a home the registry labels', name: 'fork', agents: [['fork', []], ['primary', []]], homes: [['fork', 'y']], labels: [['y', '#dm-y']], router: true, primary: 'primary',
       told: [
-        { text: own + ' Your primary has been told and can close it.', metadata: { system: true, kind: 'channel-notice' }, forAgent: 'fork' },
-        { text: '[channels] Now open: #x (x): a message from your fork bound to #dm-y (y) (fork) into the closed channel opened it, and that fork can\'t close it.' + close,
+        { text: "[channels] Now open: #x (x): a message from your fork in #dm-y (y), named fork, into the closed channel opened it, and that fork can't close it." + close,
           metadata: { system: true, kind: 'channel-notice', speaker: 'fork' } },
+        { text: own + ' Your primary has been told and can close it.', metadata: { system: true, kind: 'channel-notice' }, forAgent: 'fork' },
+      ] },
+    { why: "a fork made from a template that isn't the primary", name: 'fork', agents: [['fork', []], ['primary', []], ['other', []]], homes: [['fork', 'y']],
+      router: true, template: 'other', primary: 'primary',
+      told: [
+        { text: "[channels] Now open: #x (x): a message from the fork in y, named fork, into the closed channel opened it, and that fork can't close it." + close,
+          metadata: { system: true, kind: 'channel-notice', speaker: 'fork' } },
+        { text: own + ' primary has been told and can close it.', metadata: { system: true, kind: 'channel-notice' }, forAgent: 'fork' },
       ] },
     { why: 'a fork at its home', name: 'fork', agents: [['fork', []], ['primary', []]], homes: [['fork', 'x']], router: true, primary: 'primary',
       told: [{ text: own + optOut + close, metadata: opened(fromReply), forAgent: 'fork' }] },
-    { why: 'an agent whose allowedTools leave channel_close out', name: 'helper', agents: [['helper', ['channel_close']], ['primary', []]], primary: 'primary',
+    { why: 'a second resident whose allowedTools leave channel_close out', name: 'helper', agents: [['helper', ['channel_close']], ['primary', []]], primary: 'primary',
       told: [
-        { text: own + ' primary has been told and can close it.', metadata: { system: true, kind: 'channel-notice' }, forAgent: 'helper' },
         { text: "[channels] Now open: #x (x): a message from helper into the closed channel opened it, and helper can't close it." + optOut + close,
           metadata: { system: true, kind: 'channel-notice', speaker: 'helper' } },
+        { text: own + optOut + ' primary has been told and can close it.', metadata: { system: true, kind: 'channel-notice' }, forAgent: 'helper' },
       ] },
     { why: "a primary that can't close it either", name: 'fork', agents: [['fork', []], ['primary', ['channel_close']]], homes: [['fork', 'y']], router: true, primary: 'primary',
       told: [{ text: own, metadata: { system: true, kind: 'channel-notice' }, forAgent: 'fork' }] },
@@ -2564,13 +2576,13 @@ test('the opened notice names channel_close only to a reader that can call it, s
       told: [{ text: own, metadata: { system: true, kind: 'channel-notice' }, forAgent: 'fork' }] },
     { why: 'the primary itself, without channel_close', name: 'primary', agents: [['primary', ['channel_close']]], primary: 'primary',
       told: [{ text: own + optOut, metadata: { system: true, kind: 'channel-notice' }, forAgent: 'primary' }] },
-    { why: 'several channels, one away from a fork\'s home', name: 'fork', channels: [{ channelId: 'y', label: '#y' }, { channelId: 'x', label: '#x' }],
+    { why: "several channels, one away from a fork's home", name: 'fork', channels: [{ channelId: 'y', label: '#y' }, { channelId: 'x', label: '#x' }],
       agents: [['fork', []], ['primary', []]], homes: [['fork', 'y']], router: true, primary: 'primary',
       told: [
+        { text: "[channels] Now open: #y (y), #x (x): a message from your fork in y, named fork, into the closed channel opened it, and that fork can't close them." + closeMany,
+          metadata: { system: true, kind: 'channel-notice', speaker: 'fork' } },
         { text: '[channels] Now open: #y (y), #x (x): your own message into the closed channel opened it. Your primary has been told and can close them.',
           metadata: { system: true, kind: 'channel-notice' }, forAgent: 'fork' },
-        { text: "[channels] Now open: #y (y), #x (x): a message from your fork bound to y (fork) into the closed channel opened it, and that fork can't close them." + closeMany,
-          metadata: { system: true, kind: 'channel-notice', speaker: 'fork' } },
       ] },
     { why: 'a policy admission, to the primary that can close it', cause: 'subscription-policy', agents: [['primary', []]], primary: 'primary',
       // Addressed to no agent of its own, so it carries no inputs to pass on.
@@ -2582,7 +2594,8 @@ test('the opened notice names channel_close only to a reader that can call it, s
     { why: "a policy admission, to a primary that can't close it", cause: 'subscription-policy', agents: [['primary', ['channel_close']]], primary: 'primary',
       told: [{ text: '[channels] Selected for opening by subscription policy: #x (x). This records the admission decision; channel_list shows current transport state.' + optOut,
         metadata: { system: true, kind: 'channel-notice' } }] },
-    { why: "a policy admission with no primary, to the first agent, which can't close it", cause: 'subscription-policy', agents: [['worker', ['channel_close']]], primary: null,
+    { why: "a policy admission with no primary, to the first agent, a run whose store is its own, which can't close it", cause: 'subscription-policy',
+      agents: [['worker', ['channel_close']]], isolated: ['worker'], primary: null,
       told: [{ text: '[channels] Selected for opening by subscription policy: #x (x). This records the admission decision; channel_list shows current transport state.' + optOut,
         metadata: { system: true, kind: 'channel-notice' } }] },
     { why: "an agent that has ended, with a primary that can't close it", name: 'gone', agents: [['primary', ['channel_close']]], primary: 'primary',
@@ -2600,7 +2613,10 @@ test('the opened notice names channel_close only to a reader that can call it, s
     framework.primaryAgentName = c.primary;
     framework.usedEphemeralAgentNames = new Set();
     framework.conversationAgentHomes = new Map(c.homes ?? []);
-    framework.conversationRouter = c.router ? {} : undefined;
+    framework.conversationRouter = c.router ? { templateAgent: c.template ?? 'primary' } : undefined;
+    // Residents read one shared slot; a fork's store, or a run's, is its own.
+    framework.sharedSlotAgents = new Set([...framework.agents.values()]
+      .filter((a: { name: string }) => !framework.conversationAgentHomes.has(a.name) && !(c.isolated ?? []).includes(a.name)));
     const labels = new Map(c.labels ?? []);
     framework.channelRegistry = { getDescriptor: (id: string) => (labels.has(id) ? { id, label: labels.get(id) } : undefined) };
     framework.addMessage = (_participant: string, content: Array<{ text: string }>, metadata: unknown, routed?: { forAgent?: string }) => {
@@ -2621,34 +2637,49 @@ test('the opened notice names channel_close only to a reader that can call it, s
   }
 });
 
-// Each notice is written on its own: a reader's notice that can't be
-// written leaves the primary's to be written still.
-test("a reader's notice that can't be written still leaves the primary's by-name notice written, for both notices", () => {
+// Each notice is written on its own: one that can't be written leaves the
+// other to be written still. The primary's is written first, and the
+// reader's says the primary was told only where the primary's landed.
+test("each channel notice is written on its own, and the reader's says the primary was told only where the primary's landed, for both notices", () => {
   for (const write of ['opened', 'reply'] as const) {
-    const told: Array<{ text: string; forAgent?: string }> = [];
-    const logged: string[] = [];
-    const framework = Object.create(AgentFramework.prototype) as any;
-    framework.agents = new Map([['fork', { name: 'fork', canUseTool: () => true }], ['primary', { name: 'primary', canUseTool: () => true }]]);
-    framework.primaryAgentName = 'primary';
-    framework.usedEphemeralAgentNames = new Set();
-    framework.conversationAgentHomes = new Map([['fork', 'y']]);
-    framework.addMessage = (_participant: string, content: Array<{ text: string }>, _metadata: unknown, routed?: { forAgent?: string }) => {
-      if (routed?.forAgent) throw new Error('store refused the write');
-      told.push({ text: content[0]!.text });
-      return 'm';
-    };
-    const error = console.error;
-    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
-    try {
-      if (write === 'opened') framework.recordChannelAutoOpenNotice('fork', [{ channelId: 'x', label: '#x' }], 'opened-by-reply');
-      else framework.recordReplyOpenFailedNotice('fork', { channelId: 'x', label: '#x' }, 'server-bootstrap');
-    } finally {
-      console.error = error;
+    for (const refused of ['reader', 'primary'] as const) {
+      const told: Array<{ text: string; forAgent?: string }> = [];
+      const logged: string[] = [];
+      const framework = Object.create(AgentFramework.prototype) as any;
+      framework.agents = new Map([['fork', { name: 'fork', canUseTool: () => true }], ['primary', { name: 'primary', canUseTool: () => true }]]);
+      framework.primaryAgentName = 'primary';
+      framework.usedEphemeralAgentNames = new Set();
+      framework.conversationAgentHomes = new Map([['fork', 'y']]);
+      framework.conversationRouter = { templateAgent: 'primary' };
+      framework.addMessage = (_participant: string, content: Array<{ text: string }>, _metadata: unknown, routed?: { forAgent?: string }) => {
+        // The reader's notice is addressed to the fork; the primary's to no one.
+        if ((refused === 'reader') === !!routed?.forAgent) throw new Error('store refused the write');
+        told.push({ text: content[0]!.text, ...(routed?.forAgent ? { forAgent: routed.forAgent } : {}) });
+        return 'm';
+      };
+      const error = console.error;
+      console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+      try {
+        if (write === 'opened') framework.recordChannelAutoOpenNotice('fork', [{ channelId: 'x', label: '#x' }], 'opened-by-reply');
+        else framework.recordReplyOpenFailedNotice('fork', { channelId: 'x', label: '#x' }, 'server-bootstrap');
+      } finally {
+        console.error = error;
+      }
+      const why = `${write}, the ${refused}'s write refused`;
+      assert.equal(told.length, 1, `${why}: the other notice is written`);
+      if (refused === 'reader') {
+        assert.equal(told[0]!.forAgent, undefined, why);
+        assert.match(told[0]!.text, /that fork can't close it/, why);
+      } else {
+        assert.equal(told[0]!.forAgent, 'fork', why);
+        assert.equal(told[0]!.text, write === 'opened'
+          ? '[channels] Now open: #x (x): your own message into the closed channel opened it.'
+          : "[channels] Not open: #x (x). Your reply there went out, but opening the channel failed. It's selected for opening again, because its server lists it as open by default: the host tries again.",
+        `${why}: the reader isn't told the primary was`);
+      }
+      assert.ok(logged.some((l) => l.startsWith(write === 'opened' ? 'recordChannelAutoOpenNotice failed:' : 'recordReplyOpenFailedNotice failed:')),
+        `${why}: the failure is logged`);
     }
-    assert.equal(told.length, 1, `${write}: the primary's notice is written`);
-    assert.match(told[0]!.text, /fork can't close it/, write);
-    assert.ok(logged.some((l) => l.startsWith(write === 'opened' ? 'recordChannelAutoOpenNotice failed:' : 'recordReplyOpenFailedNotice failed:')),
-      `${write}: the reader's failure is logged`);
   }
 });
 

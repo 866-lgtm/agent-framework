@@ -4,9 +4,19 @@
   it names. A conversation fork can close only its home channel, and an
   agent's `allowedTools` can leave `channel_close` out. Before, such an agent
   was told to use `channel_close`, and couldn't call it, or its call was
-  refused. Where an agent's
-  own send opened a channel it can't close, the primary is now told by name
-  too, if it can close it.
+  refused. Where an agent's own send opened a channel it can't close, the
+  primary is now told by name too, if it can close it, and the agent is told
+  that it was.
+- The opened notice says "What an open channel delivers to you depends on
+  its server" only to an agent whose window holds the channel's traffic.
+  Before, a conversation fork was told it of a channel other than its home,
+  whose messages never reach it.
+- The primary's notices name a conversation fork by the channel it's bound
+  to, then by its generated name. The notice of an open by an agent that has
+  ended says "a message from" it, where it said "opened by X's reply" whether
+  a reply or speech had opened the channel. The reply notice and speech's
+  failure notice say why a channel is selected for opening again with
+  "because", where they said "as".
 - When a conversation fork or an ephemeral run is released without reading a
   channel notice it could act on (a channel its own send opened, or a
   channel its reply couldn't open that is selected for opening), the primary
