@@ -3744,8 +3744,10 @@ export class WorkspaceModule implements Module {
     // `foo$` finds a CRLF file's line, as it does under ripgrep's --crlf, and
     // the line copies into an edit as read's do. ripgrep's --crlf still prints
     // the line with its CR.
+    let searchedCrlf = false;
     const search = (bytes: Buffer): Searched => {
       const { lines, crlfEnds, lfEnds } = fileText(bytes);
+      if (crlfEnds > 0) searchedCrlf = true;
       const found: GrepMatch[] = [];
       for (let i = 0; i < lines.length; i++) {
         if (regex.test(lines[i])) {
@@ -3886,6 +3888,9 @@ export class WorkspaceModule implements Module {
         pattern: input.pattern,
         results,
         totalMatches: results.reduce((sum, r) => sum + r.matches.length, 0),
+        // A pattern written for a CR can't find a CRLF end's, which lines as
+        // read shows them leave out, so the answer says why it didn't.
+        ...(searchedCrlf && namesCr(input.pattern) ? { note: CRLF_CR_NOTE } : {}),
         ...(skipped.length > 0 ? { skipped } : {}),
         ...(incomplete.length > 0 ? { incomplete } : {}),
       },
@@ -4760,6 +4765,21 @@ function inputProblem(
     }
   }
   return null;
+}
+
+const CRLF_CR_NOTE = 'The pattern names a CR, and a file searched has CRLF line ends. Lines are matched as read shows them, '
+  + 'which leaves out a CRLF end\'s CR unless the line\'s own text ends in a CR. read with offsetChars shows every CR.';
+
+/** Whether a grep pattern names a CR: a literal one, or `\r` whose backslash isn't itself escaped. */
+function namesCr(pattern: string): boolean {
+  for (let i = 0; i < pattern.length; i++) {
+    if (pattern[i] === '\r') return true;
+    if (pattern[i] === '\\') {
+      if (pattern[i + 1] === 'r') return true;
+      i++;
+    }
+  }
+  return false;
 }
 
 /**

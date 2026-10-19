@@ -411,9 +411,26 @@ test('grep matches and shows a CRLF file\'s lines without the CR, as read shows 
   assert.equal('lineEndings' in byFile['work/lf.txt'], false);
   // A BOM is no part of the first line, as read doesn't show it.
   assert.deepEqual(byFile['work/bom.txt'].matches, [{ line: 1, text: 'foo', context: ['foo'] }]);
-  // The cost: a pattern written to find the CR at a line's end no longer does.
-  const cr = await call('grep', { pattern: '\\r', path: 'work/crlf.txt' });
-  assert.deepEqual((cr.data as { results: unknown[] }).results, []);
+  // The cost: a pattern written to find the CR at a line's end no longer
+  // does, and the answer says why.
+  const note = "The pattern names a CR, and a file searched has CRLF line ends. Lines are matched as read shows them, "
+    + "which leaves out a CRLF end's CR unless the line's own text ends in a CR. read with offsetChars shows every CR.";
+  for (const pattern of ['\\r', '\r', 'o[\\r]?$', '\\\\\\r']) {
+    const cr = await call('grep', { pattern, path: 'work/crlf.txt' });
+    const data = cr.data as { results: Array<{ matches: unknown[] }>; note?: string };
+    assert.equal(data.note, note, JSON.stringify(pattern));
+    if (pattern !== 'o[\\r]?$') assert.deepEqual(data.results, [], JSON.stringify(pattern));
+  }
+  // A pattern that names no CR, and a CR pattern over files without a CRLF
+  // end, get no note.
+  for (const [pattern, path] of [['foo', 'work/crlf.txt'], ['\\\\r', 'work/crlf.txt'], ['\\r', 'work/lf.txt']]) {
+    const data = (await call('grep', { pattern, path })).data as object;
+    assert.equal('note' in data, false, JSON.stringify([pattern, path]));
+  }
+  writeFileSync(join(dir, 'lone.txt'), 'a\rb\n');
+  const lone = (await call('grep', { pattern: '\\r', path: 'work/lone.txt' })).data as { results: Array<{ matches: unknown[] }> };
+  assert.equal('note' in lone, false);
+  assert.deepEqual(lone.results[0].matches, [{ line: 1, text: 'a\rb' }]);
 });
 
 test('text copied from a read or a grep of a CRLF file matches in an edit, and the file keeps its line ends and BOM', async (t) => {
