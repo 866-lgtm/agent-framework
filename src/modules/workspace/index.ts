@@ -1525,7 +1525,7 @@ export class WorkspaceModule implements Module {
         inputSchema: {
           type: 'object' as const,
           properties: {
-            path: { type: 'string', description: 'Directory path (mount-prefixed, optional)' },
+            path: { type: 'string', description: 'Directory path (mount-prefixed, optional; without it, the mounts are listed, each with its include where it has one)' },
             recursive: { type: 'boolean', description: 'List recursively (default: false)' },
           },
         },
@@ -3451,11 +3451,13 @@ export class WorkspaceModule implements Module {
     const store = this.getStore();
 
     if (!input.path) {
-      // List all mounts
+      // List all mounts, each with its include where it has one, so the
+      // files a mount holds show before a path outside them is refused.
       const mounts = [...this.mounts.entries()].map(([name, m]) => ({
         name,
         path: m.config.path,
         mode: m.config.mode,
+        ...(m.config.include ? { include: [...m.config.include] } : {}),
       }));
       return { success: true, data: { mounts } };
     }

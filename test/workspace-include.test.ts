@@ -1204,6 +1204,19 @@ describe('mount include', () => {
     }
   });
 
+  test('ls without a path lists each mount with its include, where it has one', async (t) => {
+    const env = new Env(t);
+    const m = new WorkspaceModule({ mounts: [
+      { name: 'work', path: env.dir, mode: 'read-write', watch: 'never', include: ['gate.json', '*.md'] },
+      { name: 'plain', path: join(env.root, 'plain'), mode: 'read-only', watch: 'never' },
+    ] });
+    m.initStore(env.store);
+    assert.deepEqual((await call(m, 'ls', {})).mounts, [
+      { name: 'work', path: env.dir, mode: 'read-write', include: ['gate.json', '*.md'] },
+      { name: 'plain', path: join(env.root, 'plain'), mode: 'read-only' },
+    ]);
+  });
+
   test("a path in a nested mount's directory is that mount's, whether or not the outer include covers it: every tool names the mount that holds it", async (t) => {
     const env = new Env(t);
     env.writeDisk('gate.json', '{}\n');
