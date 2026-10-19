@@ -1407,9 +1407,12 @@ test("a reply's failed open whose put-back can't be recorded is still an opening
   const f = fixture();
   await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
   failAppend(f.registry, 1); // the open's own record goes through; the put-back's doesn't
+  const closes = f.calls.filter((c) => c.kind === 'close').length;
   const { answer } = await replyWhoseOpenFails(f);
   assert.deepEqual(answer, { status: 'open-failed', channelId: 'x', label: 'x', opening: true, staysSelected: true });
   assert.deepEqual(decision(f.registry), { state: 'open', source: 'opened-by-reply' }, 'the channel stays selected for opening');
+  await tick(); await tick();
+  assert.equal(f.calls.filter((c) => c.kind === 'close').length, closes, 'no close is sent: the decision stays open');
 });
 
 test("a channel registered from a push, with no decision on record, is put back as closed by default when speech's open fails", async () => {
@@ -1625,10 +1628,13 @@ test("when putting back the decision a failed open replaced can't be recorded, s
   const f = fixture();
   await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
   failAppend(f.registry, 1); // the open's own record goes through; the put-back's doesn't
+  const closes = f.calls.filter((c) => c.kind === 'close').length;
   const { outcome } = await speechWhoseOpenFails(f);
   assert.equal(outcome.status, 'failed');
   assert.match(outcome.reason ?? '', /^channel is closed and open failed: fixture lifecycle failure; the channel stays selected for opening, as the host couldn't record undoing that: ENOSPC/);
   assert.deepEqual(decision(f.registry), { state: 'open', source: 'opened-by-delivery' });
+  await tick(); await tick();
+  assert.equal(f.calls.filter((c) => c.kind === 'close').length, closes, 'no close is sent: the decision stays open');
 });
 
 test("channel_open and channel_close on a channel already so say what failed when the agent's decision can't be recorded", async () => {
