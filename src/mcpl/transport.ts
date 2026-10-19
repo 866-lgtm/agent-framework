@@ -504,7 +504,8 @@ function raceAbort<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
 export class WebSocketTransport extends McplTransport {
   readonly kind = 'websocket' as const;
 
-  private constructor(private readonly ws: WebSocket, serverId: string) {
+  private constructor(private readonly ws: WebSocket, config: McplServerConfig, dialed: string) {
+    const serverId = config.id;
     super(serverId);
 
     this.ws.on('message', (data: WebSocket.RawData, isBinary: boolean) => {
@@ -517,7 +518,9 @@ export class WebSocketTransport extends McplTransport {
       }
     });
 
-    this.ws.on('error', (err: Error) => this.reportError(err));
+    // The client's text can quote the url as dialed (Bun's does): reported
+    // masked, as a new error with no cause (clientErrorText).
+    this.ws.on('error', (err: Error) => this.reportError(new Error(clientErrorText(err, config, dialed))));
     this.ws.on('close', (code: number, reason: Buffer) => {
       const text = reason?.toString('utf8');
       this.markClosed(text ? { code, reason: text, reasonFromPeer: true } : { code, reason: 'websocket closed' });
@@ -568,7 +571,7 @@ export class WebSocketTransport extends McplTransport {
     try {
       ws = new WebSocket(url);
     } catch (err) {
-      throw new Error(`MCPL server "${config.id}" WebSocket connect failed: ${dialErrorText(err, config)} (${redacted})`);
+      throw new Error(`MCPL server "${config.id}" WebSocket connect failed: ${clientErrorText(err, config, url)} (${redacted})`);
     }
 
     // A failed dial can emit 'error' MORE THAN ONCE on the raw socket (seen
@@ -607,11 +610,11 @@ export class WebSocketTransport extends McplTransport {
         clearTimeout(timer);
         signal?.removeEventListener('abort', onAbort);
         ws.removeAllListeners('error'); // the instance re-attaches its own handlers
-        resolve(new WebSocketTransport(ws, config.id));
+        resolve(new WebSocketTransport(ws, config, url));
       });
 
       ws.once('error', (err: Error) => {
-        abandon(new Error(`MCPL server "${config.id}" WebSocket connect failed: ${dialErrorText(err, config)} (${redacted})`));
+        abandon(new Error(`MCPL server "${config.id}" WebSocket connect failed: ${clientErrorText(err, config, url)} (${redacted})`));
       });
     });
   }
@@ -640,27 +643,35 @@ export class WebSocketTransport extends McplTransport {
   }
 }
 
-/** A ws:// or wss:// url in a WebSocket client's text, to the next space,
- *  quote, bracket or parenthesis. */
-const WS_URL_IN_TEXT = /\bwss?:\/\/[^\s"'<>()[\]{}]+/gi;
+/** A ws:// or wss:// url in a WebSocket client's text, to the next space or
+ *  quote: brackets (an IPv6 host) and parentheses can be part of one. */
+const WS_URL_IN_TEXT = /\bwss?:\/\/[^\s"'<>`]+/gi;
 
 /**
- * A WebSocket client's error text for a failed dial (an Error under Node's
- * ws, an ErrorEvent under Bun's), as the dial's own error carries it. A client can quote the url as dialed: under Bun 1.4.3 a
- * refused or unreachable dial's message holds it whole, its user, password,
- * path and query, and the token, a static one or an access provider's. Each
- * url in it is shown as {@link redactUrl} shows one, and what's left goes
- * through {@link redactServerText}, which replaces the strings the
- * configuration and its dials know to be credentials (the dial has noted
- * what it sent by now) in their encoded and decoded forms. The error is a
- * new one with no `cause`, so the client's own error, message and stack,
- * isn't reachable from it.
+ * A WebSocket client's error text (an Error under Node's ws, an ErrorEvent
+ * under Bun's), as the transport's own errors carry it: a failed dial's, and
+ * one after the socket opened. A client can quote the url as dialed: under
+ * Bun 1.3.13 and 1.4.3 a refused or unreachable dial's message holds it
+ * whole, its user, password, path and query, and the token, a static one or
+ * an access provider's. In order, so a credential is replaced while it's
+ * whole: the url as dialed and as configured, wherever they occur, are
+ * shown as {@link redactUrl} shows them; then the strings the configuration
+ * and its dials know to be credentials (the dial has noted what it sent by
+ * now) are replaced, in their encoded and decoded forms
+ * ({@link redactServerText}); then any other ws(s) url left is shown as
+ * {@link redactUrl} shows it. The caller makes a new error of it with no
+ * `cause`, so the client's own error, message and stack, isn't reachable.
  */
-export function dialErrorText(err: unknown, config: McplServerConfig): string {
+export function clientErrorText(err: unknown, config: McplServerConfig, dialed: string): string {
   // Bun's ws emits an ErrorEvent, not an Error, its text in `message` too.
   const said = (err as { message?: unknown } | null)?.message;
-  const message = typeof said === 'string' ? said : String(err);
-  return redactServerText(message.replace(WS_URL_IN_TEXT, (found) => redactUrl(found)), config);
+  let text = typeof said === 'string' ? said : String(err);
+  const shown = redactUrl(config.url);
+  for (const url of [dialed, config.url]) {
+    if (url) text = text.split(url).join(shown);
+  }
+  text = redactServerText(text, config);
+  return text.replace(WS_URL_IN_TEXT, (found) => redactUrl(found));
 }
 
 /**
