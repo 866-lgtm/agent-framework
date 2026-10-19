@@ -8,9 +8,9 @@
  * the file behind the link, a write created or overwrote one there, and a
  * sync took its bytes in. A link among the parents that leads out of the
  * mount was refused before as well, and now gets the link's own answer. The
- * refusal names the link and where it leads, a target an include leaves out
- * apart, and only for a link to a directory inside the mount does it offer a
- * way out. A mount that follows
+ * refusal names the link and where it leads, a target an include leaves out,
+ * and a link one leaves out, apart, and only for a link to a directory inside
+ * the mount does it offer a way out. A mount that follows
  * links keeps following an inside one, and a root that is itself a link is
  * still the root.
  */
