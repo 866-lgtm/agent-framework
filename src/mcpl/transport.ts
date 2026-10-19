@@ -12,7 +12,9 @@
  *  - StdioTransport      — spawns `config.command` and speaks over stdin/stdout;
  *                          child stderr is surfaced as 'stderr' lines.
  *  - WebSocketTransport  — dials `config.url` (ws:// or wss://) with the `ws`
- *                          library, appending `?token=` when `config.token` is
+ *                          library, sending the credential as `?token=` (or
+ *                          as an Authorization header, `tokenTransport:
+ *                          'header'`) when `config.token` is
  *                          set; each WS text frame is one JSON-RPC line.
  */
 
@@ -525,8 +527,10 @@ export class WebSocketTransport extends McplTransport {
   }
 
   /**
-   * Dial `config.url` and resolve once the socket is OPEN. Appends `?token=`
-   * when `config.token` is set. Rejects on connect error / timeout (and tears
+   * Dial `config.url` and resolve once the socket is OPEN. Sends the
+   * credential (`config.token`, or the access provider's) as a `?token=`
+   * query parameter, or with `tokenTransport: 'header'` as an
+   * `Authorization: Bearer` header on the upgrade. Rejects on connect error / timeout (and tears
    * the socket down) so a failed dial never leaks an open handle. `signal`
    * ends a dial whose connection is closed meanwhile, at once, rather than
    * at the open timeout.
@@ -564,7 +568,11 @@ export class WebSocketTransport extends McplTransport {
     // Error strings travel: traces, logs, tool results the model reads. They
     // get the endpoint, never the credential.
     const redacted = redactUrl(config.url);
-    const ws = new WebSocket(url);
+    // In header mode the url carries no credential (buildWebSocketUrl): the
+    // upgrade request does.
+    const ws = config.tokenTransport === 'header' && token
+      ? new WebSocket(url, { headers: { Authorization: `Bearer ${token}` } })
+      : new WebSocket(url);
 
     // A failed dial can emit 'error' MORE THAN ONCE on the raw socket (seen
     // live 2026-08-03: an HTTP 502 upgrade-reject emits the "Expected 101"
@@ -638,7 +646,9 @@ export class WebSocketTransport extends McplTransport {
 /**
  * Build the dial URL: validate it's a ws(s):// URL the ws library will dial,
  * which refuses one with a fragment, and append the auth token as a `token`
- * query param when provided (preserving any existing query).
+ * query param when provided (preserving any existing query). With
+ * `tokenTransport: 'header'` no token is appended: the dial sends it as a
+ * header.
  */
 export function buildWebSocketUrl(config: McplServerConfig, tokenOverride?: string | null): string {
   if (!config.url) {
@@ -659,7 +669,8 @@ export function buildWebSocketUrl(config: McplServerConfig, tokenOverride?: stri
   if (parsed.hash) {
     throw new Error(`MCPL server "${config.id}": websocket url must not have a fragment, got "${parsed.hash}"`);
   }
-  const token = tokenOverride !== undefined ? tokenOverride : config.token;
+  const token = config.tokenTransport === 'header' ? null
+    : tokenOverride !== undefined ? tokenOverride : config.token;
   return urlAsDialed(parsed, token).toString();
 }
 

@@ -285,11 +285,23 @@ export interface McplServerConfig {
   /**
    * Bearer token for a network server. Where it travels depends on the
    * transport: on a ws(s):// url it is appended as a `token` query parameter
-   * (`?token=…`) on connect; to an http(s):// server it is sent as an
-   * `Authorization: Bearer` header and never put in the url. A legacy stdio
-   * server ignores it, and a modern stdio server refuses it.
+   * (`?token=…`) on connect, unless `tokenTransport` is `'header'`; to an
+   * http(s):// server it is sent as an `Authorization: Bearer` header and
+   * never put in the url. A legacy stdio server ignores it, and a modern
+   * stdio server refuses it.
    */
   token?: string;
+
+  /**
+   * How a ws(s):// server's credential, `token` or what `accessProvider`
+   * returns for the dial, is sent on the WebSocket upgrade. `'query'`, the
+   * default: as a `token` query parameter (`?token=…`). `'header'`: as an
+   * `Authorization: Bearer …` header, with no query parameter, so the
+   * credential stays out of the url and of the access logs that record it.
+   * Set only on a WebSocket server; an http(s):// server always sends the
+   * header, and a stdio server sends no credential.
+   */
+  tokenTransport?: 'query' | 'header';
 
   /**
    * Lazily resolves the connection credential at EVERY dial — first connect

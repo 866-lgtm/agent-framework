@@ -2,8 +2,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { WebSocketServer, WebSocket } from 'ws';
 import type { AddressInfo } from 'node:net';
+import type { IncomingMessage } from 'node:http';
 import { McplServerConnection, type McplConnectionCloseInfo } from '../src/mcpl/server-connection.js';
 import { buildWebSocketUrl, isWebSocketTransport, openTransport } from '../src/mcpl/transport.js';
+import { redactServerText, serverConfigProblems } from '../src/mcpl/protocol-family.js';
 import type { McplHostCapabilities } from '../src/mcpl/types.js';
 
 const HOST_CAPS: McplHostCapabilities = { version: '0.4', pushEvents: true, featureSets: true };
@@ -12,12 +14,12 @@ const HOST_CAPS: McplHostCapabilities = { version: '0.4', pushEvents: true, feat
  * A minimal in-process MCPL server over WebSocket: answers the initialize
  * handshake, tools/list, and an `echo` tools/call. One JSON-RPC message per WS
  * frame (as McplServerConnection sends). `onSocket` lets a test grab the raw
- * socket to simulate a mid-session drop.
+ * socket to simulate a mid-session drop, and the upgrade request it came on.
  */
-function startMockMcplWsServer(onSocket?: (ws: WebSocket) => void) {
+function startMockMcplWsServer(onSocket?: (ws: WebSocket, req: IncomingMessage) => void) {
   const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
-  wss.on('connection', (ws) => {
-    onSocket?.(ws);
+  wss.on('connection', (ws, req) => {
+    onSocket?.(ws, req);
     ws.on('message', (data) => {
       let msg: { id?: unknown; method?: string; params?: { name?: string; arguments?: Record<string, unknown> } };
       try {
@@ -85,6 +87,22 @@ test('buildWebSocketUrl validates protocol and appends the token as a query para
   // A url that doesn't parse can't be redacted, so the error doesn't echo it.
   assert.throws(() => buildWebSocketUrl({ id: 's', url: 'not a url ?token=sekret' }),
     (error: Error) => /invalid WebSocket url/.test(error.message) && !error.message.includes('sekret'));
+});
+
+test("buildWebSocketUrl appends no token with tokenTransport 'header', and 'query' is the default", () => {
+  assert.equal(
+    buildWebSocketUrl({ id: 's', url: 'wss://example.com/mcpl?v=2', token: 'sekret', tokenTransport: 'header' }),
+    'wss://example.com/mcpl?v=2',
+  );
+  // Nor a provider's token handed in for the dial.
+  assert.equal(
+    buildWebSocketUrl({ id: 's', url: 'wss://example.com/mcpl', tokenTransport: 'header' }, 'provided'),
+    'wss://example.com/mcpl',
+  );
+  assert.equal(
+    buildWebSocketUrl({ id: 's', url: 'wss://example.com/mcpl', token: 'sekret', tokenTransport: 'query' }),
+    'wss://example.com/mcpl?token=sekret',
+  );
 });
 
 test('buildWebSocketUrl refuses a url with a fragment, which the ws library refuses to dial', () => {
@@ -459,4 +477,107 @@ test('the buffered-event cap counts the drops of each pause: a later pause repor
   assert.deepEqual(flushes.map((line) => /; (\d+) dropped at cap\)$/.exec(line)?.[1]), ['150', '75']);
   const dropLogs = lines.filter((line) => line.includes('buffered-event cap'));
   assert.deepEqual(dropLogs.map((line) => /dropped (\d+) responder-less/.exec(line)?.[1]), ['1', '101', '1']);
+});
+
+/** A mock server that records each upgrade's Authorization header and query. */
+function recordingServer() {
+  const upgrades: Array<{ authorization: string | undefined; search: string }> = [];
+  const sockets: WebSocket[] = [];
+  const wss = startMockMcplWsServer((ws, req) => {
+    sockets.push(ws);
+    upgrades.push({ authorization: req.headers.authorization, search: new URL(req.url ?? '/', 'ws://x').search });
+  });
+  return { wss, upgrades, sockets };
+}
+
+test("tokenTransport 'header' sends the token as an Authorization header on the upgrade, with no query parameter", async () => {
+  const { wss, upgrades } = recordingServer();
+  await waitListening(wss);
+  try {
+    const conn = await McplServerConnection.connect(
+      { id: 'editor', url: `${wsUrl(wss)}?v=2`, token: 'tok-sekret', tokenTransport: 'header' },
+      HOST_CAPS,
+    );
+    conn.ready();
+    assert.deepEqual(upgrades, [{ authorization: 'Bearer tok-sekret', search: '?v=2' }]);
+    const result = await conn.sendToolsCall('echo', { text: 'over a header' });
+    assert.equal((result.content as Array<{ text?: string }>)[0].text, 'over a header');
+    await conn.close();
+  } finally {
+    wss.close();
+  }
+});
+
+test("the default, and tokenTransport 'query', send the token as ?token= and no Authorization header, as before", async () => {
+  for (const tokenTransport of [undefined, 'query'] as const) {
+    const { wss, upgrades } = recordingServer();
+    await waitListening(wss);
+    try {
+      const conn = await McplServerConnection.connect(
+        { id: 'editor', url: wsUrl(wss), token: 'tok-sekret', ...(tokenTransport ? { tokenTransport } : {}) },
+        HOST_CAPS,
+      );
+      assert.deepEqual(upgrades, [{ authorization: undefined, search: '?token=tok-sekret' }]);
+      await conn.close();
+    } finally {
+      wss.close();
+    }
+  }
+});
+
+test("tokenTransport 'header' carries an access provider's credential, fresh on each reconnect", async () => {
+  const { wss, upgrades, sockets } = recordingServer();
+  await waitListening(wss);
+  let conn: McplServerConnection | undefined;
+  try {
+    let dial = 0;
+    conn = await McplServerConnection.connect(
+      {
+        id: 'editor',
+        url: wsUrl(wss),
+        token: 'static-fallback',
+        tokenTransport: 'header',
+        reconnect: true,
+        reconnectIntervalMs: 100,
+        accessProvider: async () => `provided-${++dial}`,
+      },
+      HOST_CAPS,
+    );
+    const reconnected = new Promise<void>((resolve) => conn!.once('reconnect', () => resolve()));
+    conn.ready();
+    sockets[0].close(4001, 'token expired');
+    await withDeadline(reconnected, 5_000, "'reconnect' after a 4001 close");
+    assert.deepEqual(upgrades, [
+      { authorization: 'Bearer provided-1', search: '' },
+      { authorization: 'Bearer provided-2', search: '' },
+    ]);
+  } finally {
+    await conn?.close().catch(() => { /* already closed */ });
+    wss.close();
+  }
+});
+
+test("a header-mode token stays out of a failed dial's error, and the server's text has it replaced", async () => {
+  const config = { id: 'dead', url: 'ws://127.0.0.1:1/mcpl', token: 'tok-sekret-header', tokenTransport: 'header' as const };
+  await assert.rejects(McplServerConnection.connect(config, HOST_CAPS), (error: Error) => {
+    assert.match(error.message, /WebSocket connect (failed|timed out).*\(ws:\/\/127\.0\.0\.1:1\/mcpl\)/);
+    assert.ok(!error.message.includes('tok-sekret-header'), error.message);
+    return true;
+  });
+  assert.ok(!redactServerText('refused Bearer tok-sekret-header', config).includes('tok-sekret-header'));
+});
+
+test("tokenTransport is refused unless it is 'query' or 'header', on a ws(s):// server", () => {
+  assert.deepEqual(serverConfigProblems({ id: 's', url: 'wss://x/mcpl', tokenTransport: 'header' }), []);
+  assert.deepEqual(serverConfigProblems({ id: 's', url: 'wss://x/mcpl', tokenTransport: 'query' }), []);
+  assert.match(
+    serverConfigProblems({ id: 's', url: 'wss://x/mcpl', tokenTransport: 'cookie' as 'header' }).join(),
+    /tokenTransport must be 'query' or 'header', got "cookie"/,
+  );
+  for (const config of [{ id: 's', url: 'https://x/mcp' }, { id: 's', command: 'srv' }]) {
+    assert.match(
+      serverConfigProblems({ ...config, tokenTransport: 'header' }).join(),
+      /"tokenTransport" applies only to a ws\(s\):\/\/ server/,
+    );
+  }
 });

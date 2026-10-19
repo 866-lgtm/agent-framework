@@ -312,7 +312,7 @@ configuration chooses the family, and nothing is probed:
 
 | Configuration | Family | Transport |
 |---|---|---|
-| `url: 'ws://…'` / `'wss://…'` | MCPL (MCP `2024-11-05`) | WebSocket |
+| `url: 'ws://…'` / `'wss://…'` | MCPL (MCP `2024-11-05`) | WebSocket (`token` / `accessProvider` as `?token=`, or as bearer with `tokenTransport: 'header'`) |
 | `url: 'http://…'` / `'https://…'` | modern MCP | Streamable HTTP (`token` / `accessProvider` as bearer) |
 | `command` | MCPL | stdio |
 | `command` + `protocol: 'modern'` | modern MCP | stdio |
@@ -328,6 +328,15 @@ configuration chooses the family, and nothing is probed:
 
 A configuration with both `command` and `url` needs `transport` to say which
 one is used; without it, it is refused rather than silently ignoring one.
+
+A WebSocket server's credential, its `token` or what its `accessProvider`
+returns for a dial, goes as a `token` query parameter by default
+(`tokenTransport: 'query'`). With `tokenTransport: 'header'` it goes as an
+`Authorization: Bearer` header on the upgrade instead, with no query
+parameter, so it stays out of the url and of the access logs that record it;
+the provider still runs at every dial and reconnect. Switch a server to
+`'header'` once it reads the header. `tokenTransport` is refused on an
+http(s):// server, which always sends the header, and on a stdio server.
 
 A modern server's tools get the same prefix, `enabledTools`/`disabledTools`,
 class overrides and dispatch as an MCPL server's, and `listMcplServers()`
@@ -368,7 +377,7 @@ revisions the server says it supports ("none listed" for an empty list), or its 
 and when the list includes `2026-07-28` it says to configure the server with
 `protocol: 'modern'` (stdio) or reach it over http(s).
 
-Server and transport text the framework records has the server's configured credentials replaced, in both engines. That covers connection traces, console lines, stderr traces, ops alerts, and a tool call's failure as its caller, the model and the `tool:failed` trace get it. The credentials are those the configuration holds and those its dials sent: from the url as each dial sends it (a WebSocket dial sets the token in the query, which writes the whole query again, form-encoded, and an access provider's token can be in it), credential-like path segments and query names, credential-shaped or credential-named query values, and a WebSocket url's userinfo, in their encoded and decoded forms, replaced wherever they occur; every non-empty query parameter as its whole `name=value`, where no letter or digit adjoins it; the static `token`, and each token an access provider handed a dial, the newest sixteen, raw and url-encoded; and a stdio server's `env` values whose names have a part ending in a credential word, such as `GITHUB_TOKEN`, `PGPASSWORD` or `SESSION_COOKIE`, raw and url-encoded. A stdio server's command-line arguments aren't derived. Standalone strings shorter than eight characters stay unchanged because they may be ordinary words; short query values are still removed with their parameter names. Treat a submitted configuration as immutable while the server uses it: apply changes with `restartMcplServer(id, newConfig)`. Secrets neither the configuration holds nor a dial sent remain outside this filtering. JSON-RPC tool answers, and the error a host's own connect raises, pass through as sent.
+Server and transport text the framework records has the server's configured credentials replaced, in both engines. That covers connection traces, console lines, stderr traces, ops alerts, and a tool call's failure as its caller, the model and the `tool:failed` trace get it. The credentials are those the configuration holds and those its dials sent: from the url as each dial sends it (a WebSocket dial sets the token in the query, which writes the whole query again, form-encoded, and an access provider's token can be in it; with `tokenTransport: 'header'` it sets none), credential-like path segments and query names, credential-shaped or credential-named query values, and a WebSocket url's userinfo, in their encoded and decoded forms, replaced wherever they occur; every non-empty query parameter as its whole `name=value`, where no letter or digit adjoins it; the static `token`, and each token an access provider handed a dial, the newest sixteen, raw and url-encoded; and a stdio server's `env` values whose names have a part ending in a credential word, such as `GITHUB_TOKEN`, `PGPASSWORD` or `SESSION_COOKIE`, raw and url-encoded. A stdio server's command-line arguments aren't derived. Standalone strings shorter than eight characters stay unchanged because they may be ordinary words; short query values are still removed with their parameter names. Treat a submitted configuration as immutable while the server uses it: apply changes with `restartMcplServer(id, newConfig)`. Secrets neither the configuration holds nor a dial sent remain outside this filtering. JSON-RPC tool answers, and the error a host's own connect raises, pass through as sent.
 
 #### Feature sets
 

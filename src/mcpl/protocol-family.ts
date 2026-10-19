@@ -135,7 +135,7 @@ export function redactUrl(url: string | undefined): string {
  * runs where a throw has nowhere to go, such as inside a transport's 'error'
  * listener.
  */
-export function redactServerText(text: unknown, config: Pick<McplServerConfig, 'url' | 'token' | 'env'>): string {
+export function redactServerText(text: unknown, config: Pick<McplServerConfig, 'url' | 'token' | 'env' | 'tokenTransport'>): string {
   return serverTextRedactor(config)(text);
 }
 
@@ -146,7 +146,7 @@ export function redactServerText(text: unknown, config: Pick<McplServerConfig, '
  * line. A build that can't read the configuration withholds that call's
  * text, and the next call builds again.
  */
-export function serverTextRedactor(config: Pick<McplServerConfig, 'url' | 'token' | 'env'>): (text: unknown) => string {
+export function serverTextRedactor(config: Pick<McplServerConfig, 'url' | 'token' | 'env' | 'tokenTransport'>): (text: unknown) => string {
   let built = -1;
   let redact!: (text: unknown) => string;
   return (text) => {
@@ -232,7 +232,7 @@ export interface CredentialPattern {
  * that begins inside another configuration's, or shares its start, can't
  * leave any of that one in place.
  */
-export function serverCredentialPatterns(config: Pick<McplServerConfig, 'url' | 'token' | 'env'>): CredentialPattern[] {
+export function serverCredentialPatterns(config: Pick<McplServerConfig, 'url' | 'token' | 'env' | 'tokenTransport'>): CredentialPattern[] {
   // Strings replaced wherever they occur (after an escape or inside a longer
   // token too), and name=value pairs, replaced only where no letter or digit
   // adjoins them, so a pair such as v=2 leaves dev=2 alone. A pair's value is
@@ -329,7 +329,7 @@ export function serverCredentialPatterns(config: Pick<McplServerConfig, 'url' | 
   const configuredUrl = config.url ?? '';
   let url: URL | undefined;
   try { url = new URL(configuredUrl); } catch { /* Still remove the static token. */ }
-  if (url) addUrl(urlAsDialed(url, config.token));
+  if (url) addUrl(urlAsDialed(url, config.tokenTransport === 'header' ? null : config.token));
   // What the dials sent beyond that: urls dialed with an access provider's
   // token, and its tokens sent in a header.
   const sent = dialsSent.get(config);
@@ -580,6 +580,15 @@ export function serverConfigProblems(config: McplServerConfig): string[] {
     if (url.username || url.password) {
       problems.push(
         `MCP server "${config.id}": an http(s):// url can't carry userinfo (user:password@), since the HTTP client refuses such a url; give the credential as "token" or "accessProvider"`,
+      );
+    }
+  }
+  if (config.tokenTransport !== undefined) {
+    if (config.tokenTransport !== 'query' && config.tokenTransport !== 'header') {
+      problems.push(`MCP server "${config.id}": tokenTransport must be 'query' or 'header', got ${JSON.stringify(config.tokenTransport)}`);
+    } else if (binding.transport !== 'websocket') {
+      problems.push(
+        `MCP server "${config.id}": "tokenTransport" applies only to a ws(s):// server; an http(s):// server always sends its credential as a header, and a stdio server sends none`,
       );
     }
   }
