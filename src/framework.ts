@@ -147,9 +147,10 @@ import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
  *  closed for good, one removed, or one whose connect failed without
  *  reconnect, which this host doesn't bring back on its own. A server that's
  *  reconnecting stays registered, as does the stub a failed connect with
- *  reconnect leaves, and its closed connection answers the call instead. One
- *  this host is connecting to isn't registered yet, and
- *  mcplServerConnectingText answers for it. */
+ *  reconnect leaves, and its closed connection answers the call instead.
+ *  mcplServerConnectingText answers for one this host is connecting to: a
+ *  legacy server, which isn't registered yet, or a modern connection, which
+ *  is, until its first session is up. */
 function mcplServerGoneText(serverId: string, toolName: string): string {
   return `The "${serverId}" server that provides ${toolName} isn't connected, and this host won't reconnect to it on its own, ` +
     "so the call didn't run. If you need it, ask whoever runs this host.";
@@ -157,7 +158,9 @@ function mcplServerGoneText(serverId: string, toolName: string): string {
 
 /** A tool call refused while this host connects to its server, in a
  *  runtime connect or a restart's: the server's prefix routes calls to it
- *  before the server is registered, which it is once its connect is done. */
+ *  before a legacy server is registered, which it is once its connect is
+ *  done, and to a modern connection, registered before it starts, until its
+ *  first session is up (modernStillConnecting). */
 function mcplServerConnectingText(serverId: string, toolName: string): string {
   return `This host is connecting to the "${serverId}" server that provides ${toolName}, so the call didn't run. ` +
     'Try again in a moment.';

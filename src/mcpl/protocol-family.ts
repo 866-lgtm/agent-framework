@@ -118,9 +118,10 @@ export function redactUrl(url: string | undefined): string {
  * one can't be told from ordinary text, and it is replaced wherever it
  * occurs, after an escape or inside a longer token too. A query parameter is
  * also replaced as its whole name=value, only where no letter or digit
- * adjoins the pair, so v=2 leaves dev=2 alone; a short value goes only that
- * way. Every place one of these matches is replaced, overlapping places
- * included, and the replacement is never scanned again; text that may come
+ * adjoins the pair, so v=2 leaves dev=2 alone (a JSON escape before it, such
+ * as \n, isn't one); a short value goes only that way. Every place one of
+ * these matches is replaced, overlapping places included, and the
+ * replacement is never scanned again; text that may come
  * from several servers takes one pass over all their configurations'
  * strings (serverCredentialPatterns), so strings of different servers that
  * overlap are both replaced whole. A credential neither the configuration
@@ -318,8 +319,8 @@ export function serverCredentialPatterns(config: Pick<McplServerConfig, 'url' | 
   // Every string above, from every source, as written and as JSON encoders
   // write it: with JSON.stringify's escapes (a quote, a backslash, a control
   // character), and with its slashes escaped too, as some encoders write
-  // them. So a url's credential goes in each form a token's does, as in a
-  // log line that prints a server's JSON value as its JSON text, or a
+  // them. So a url's credential goes in JSON's forms as a token's does: in a
+  // log line that prints a server's JSON value as its JSON text, or in a
   // server's JSON that echoes a decoded url secret. A string replaced on its
   // own has at least 8 characters in each form it's replaced in.
   const withJsonForms = (values: Iterable<string>, floor: number): Set<string> => {
@@ -333,10 +334,15 @@ export function serverCredentialPatterns(config: Pick<McplServerConfig, 'url' | 
     return forms;
   };
   const escape = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // Where a pair or userinfo unit may start: where no letter or digit
+  // adjoins it, at the text's start or after any other character, or after a
+  // JSON escape that ends in one (\b \f \n \r \t, \uXXXX), as a value's JSON
+  // text writes a control character before it.
+  const start = String.raw`(?<=^|[^A-Za-z0-9]|\\[bfnrt]|\\u[0-9A-Fa-f]{4})`;
   return [
     ...[...withJsonForms(standalones, 8)].map(value => ({ value, source: escape(value) })),
-    ...[...withJsonForms(pairs, 0)].map(value => ({ value, source: `(?<![A-Za-z0-9])${escape(value)}(?![A-Za-z0-9])` })),
-    ...[...withJsonForms(userinfo, 0)].map(value => ({ value, source: `(?<![A-Za-z0-9])${escape(value)}(?=@)` })),
+    ...[...withJsonForms(pairs, 0)].map(value => ({ value, source: `${start}${escape(value)}(?![A-Za-z0-9])` })),
+    ...[...withJsonForms(userinfo, 0)].map(value => ({ value, source: `${start}${escape(value)}(?=@)` })),
   ];
 }
 

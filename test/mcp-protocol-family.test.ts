@@ -571,6 +571,25 @@ test("recorded server text: a url's credentials, pairs and userinfo as JSON.stri
   assert.equal(redactServerText('dial {"url":"wss://b\\"t:p\\"w@h/mcp"} failed', short), 'dial {"url":"wss://redacted@h/mcp"} failed');
 });
 
+test('recorded server text: a pair or userinfo unit after a JSON escape goes, as after the control character it stands for', () => {
+  const config = cfg({ url: 'wss://bot:pw@h/mcpl?key=abc' });
+  for (const escape of ['\\n', '\\t', '\\r', '\\b', '\\f', '\\u000b']) {
+    assert.equal(redactServerText(`{"said":"bad${escape}key=abc"}`, config), `{"said":"bad${escape}redacted"}`, escape);
+    assert.equal(redactServerText(`{"said":"dial${escape}bot:pw@h"}`, config), `{"said":"dial${escape}redacted@h"}`, escape);
+  }
+  // A letter or digit that's text, not an escape's end, still adjoins it.
+  assert.equal(redactServerText('monkey=abc', config), 'monkey=abc');
+  assert.equal(redactServerText('robot:pw@h', config), 'robot:pw@h');
+  // The case a JSON value's text makes: a string with a newline before the pair.
+  assert.equal(logValueRedacted({ said: 'bad\nkey=abc' }, (text) => redactServerText(text, config)), '"{\\"said\\":\\"bad\\\\nredacted\\"}"');
+});
+
+test('recorded server text: the floor applies to each form, so a seven-character token goes in its eight-character JSON form', () => {
+  const config = cfg({ token: 'ab"cdef' });
+  assert.equal(redactServerText('refused: ab"cdef', config), 'refused: ab"cdef');
+  assert.equal(redactServerText('refused: ab\\"cdef', config), 'refused: redacted');
+});
+
 test("a JSON value logged through logValueRedacted keeps no url credential, though its JSON text escapes the credential's quote", () => {
   const config = cfg({ url: 'wss://h/mcpl?password=secret%22key123' });
   const line = logValueRedacted({ said: 'secret"key123' }, (text) => redactServerText(text, config));

@@ -6,7 +6,8 @@
  * - an SDK-local rejection before dispatch is `not-sent` (0 calls on the wire);
  * - a result that fails validation is an answer that can't be used (1 call,
  *   answered), never a claimed server error;
- * - a JSON-RPC error on the wire is `error-response` with its code and data;
+ * - a JSON-RPC error on the wire is `error-response` with its data, and its
+ *   code goes to the log line;
  * - a call that ends after an `input_required` answer, before a final one, is
  *   `no-response`: at the deadline (with nothing in flight to cancel), with
  *   the connection gone, or when this client can't go on (PR #262 review);
@@ -731,10 +732,10 @@ test('failures are classified in order: nothing sent first, then the answers, th
   const logged = hostLog();
   const token = 'tok-0123456789abcdef';
   const connection = ModernMcpConnection.create({ id: 'raw', command: process.execPath, args: [SERVER, '', scratchLog()], protocol: 'modern', env: { API_TOKEN: token } });
-  const classify = (record: Record<string, unknown>, error: unknown, method = 'tools/call') =>
+  const classify = (record: Record<string, unknown>, error: unknown, method = 'tools/call', lost = false) =>
     (connection as unknown as {
-      requestFailure: (what: string, record: unknown, error: unknown, timeoutMs?: number) => Error;
-    }).requestFailure(method === 'tools/list' ? 'tools/list' : 'tools/call op', { method, handedOff: true, answer: 'none', continued: false, ...record }, error, 1000);
+      requestFailure: (what: string, record: unknown, error: unknown, timeoutMs?: number, lost?: boolean) => Error;
+    }).requestFailure(method === 'tools/list' ? 'tools/list' : 'tools/call op', { method, handedOff: true, answer: 'none', continued: false, ...record }, error, 1000, lost);
   const refused = () => new SdkHttpError(SdkErrorCode.ClientHttpAuthentication, 'Unauthorized', { status: 401 } as never);
   const outcome = (error: Error) => (error instanceof McplRequestError ? error.outcome : 'plain');
 
@@ -787,6 +788,18 @@ test('failures are classified in order: nothing sent first, then the answers, th
     'Listing changes nothing on the server, so it\'s safe to try again.');
   assert.doesNotMatch(listing.message, /took effect|Check its effect/);
   loggedLine(logged, /^MCP server "raw" didn't answer tools\/list within 1000ms; cancellation requested$/);
+
+  // A listing whose connection closed under it, and one this host's close
+  // cut off: the effect clause is the listing's.
+  const lostListing = classify({}, new Error('Connection closed'), 'tools/list', true);
+  assert.equal(outcome(lostListing), 'no-response');
+  assert.equal(lostListing.message, 'The connection to the "raw" server closed before it answered. ' +
+    'Listing changes nothing on the server, so it\'s safe to try again.');
+  (connection as unknown as { closedByHost: boolean }).closedByHost = true;
+  const closedListing = classify({}, new Error('Connection closed'), 'tools/list', true);
+  assert.equal(outcome(closedListing), 'no-response');
+  assert.equal(closedListing.message, 'The "raw" server didn\'t answer before this host closed its connection. ' +
+    'Listing changes nothing on the server, so it\'s safe to try again.');
 });
 
 test('a reconnect backoff never exceeds the timer limit', () => {
