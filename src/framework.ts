@@ -71,7 +71,7 @@ import type {
   SameRoundThinkTextPolicy,
   ModuleMessage,
 } from './types/index.js';
-import { heldHandle, heldWriteId, matchesMessageQuery } from './held-writes.js';
+import { asModuleRow, heldHandle, heldWriteId, matchesMessageQuery } from './held-writes.js';
 import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
@@ -20743,14 +20743,14 @@ export class AgentFramework {
     const cm = reader.getContextManager();
     const count = cm.getMessageCount();
     const last = count > 0 ? cm.getMessageWindow(count - 1, 1, { resolveBlobs: false }).messages[0]?.sequence ?? 0 : 0;
-    return writes.map((m, i) => ({
+    return writes.map((m, i) => asModuleRow({
       id: heldHandle(m.id),
       sequence: last + 1 + i,
       participant: m.participant,
       content: m.content,
       metadata: m.metadata,
       timestamp: new Date(m.heldAt),
-      held: true,
+      held: true as const,
     }));
   }
 
@@ -20808,8 +20808,10 @@ export class AgentFramework {
       return null;
     }
     const writeId = heldWriteId(id);
-    if (writeId === undefined) return agent.getContextManager().getMessage(id);
-    return this.heldRows(agent).find((row) => row.id === id) ?? this.landedRow(agent.getContextManager(), writeId);
+    const row = writeId === undefined
+      ? agent.getContextManager().getMessage(id)
+      : this.heldRows(agent).find((held) => held.id === id) ?? this.landedRow(agent.getContextManager(), writeId);
+    return row ? asModuleRow(row) : null;
   }
 
   private queryMessages(filter: MessageQuery): { messages: ModuleMessage[]; totalCount: number } {
@@ -20819,12 +20821,15 @@ export class AgentFramework {
     }
     const cm = agent.getContextManager();
     const held = this.heldRows(agent).filter((row) => matchesMessageQuery(row, filter));
-    if (held.length === 0) return cm.queryMessages(filter);
+    if (held.length === 0) {
+      const stored = cm.queryMessages(filter);
+      return { ...stored, messages: stored.messages.map(asModuleRow) };
+    }
     // The stored rows, then the held ones, reversed and cut to the limit as
     // the store's own query does it: it matches every row, then reverses,
     // then cuts.
     const { limit, reverse, ...match } = filter;
-    let messages: ModuleMessage[] = [...cm.queryMessages(match).messages, ...held];
+    let messages: ModuleMessage[] = [...cm.queryMessages(match).messages.map(asModuleRow), ...held];
     const totalCount = messages.length;
     if (reverse) messages = messages.reverse();
     if (limit !== undefined && limit < messages.length) messages = messages.slice(0, limit);
