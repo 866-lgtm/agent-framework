@@ -1645,9 +1645,10 @@ const EDITOR_FILE_REASON = "an editor's swap or backup file";
 
 /**
  * The walk's reason for a link it doesn't enter. On a mount with an include,
- * a link the include's names don't cover that leads to a directory is passed
- * over with it, by design, since the walk takes no name the include leaves
- * out as a file.
+ * a link the include's names don't cover is passed over with it, by design,
+ * since the walk takes no name the include leaves out as a file: on a mount
+ * that follows links, one that leads to a directory, and on one that
+ * doesn't, every one.
  */
 const LINK_NOT_WALKED = 'a symlink, not walked';
 
@@ -1941,13 +1942,17 @@ export async function walkScope(
       // (a regular file, a FIFO, a socket or a device) is noted as a file,
       // since nothing can lie beneath it.
       if (!entry.isDirectory() && (!insideMount(childRel, view.include) || (judgedDir !== rel && !insideMount(judgedDir === '' ? entry.name : `${judgedDir}/${entry.name}`, view.include)))) {
-        // A link that leads to a directory gets the reason a mount without an
-        // include gives it, a symlink the walk doesn't enter, since the same
-        // holds beneath it as beneath a directory: what's read through it is
-        // judged by its path and where it lands, so its own name doesn't put
-        // what lies there outside. That name is no covered file's, so the
-        // walk passes it over as it does one, rather than taking it.
-        if (entry.isSymbolicLink() && await stat(dir.at(entry.name)).then((info) => info.isDirectory(), () => false)) {
+        // A link gets the reason a mount without an include gives it, a
+        // symlink the walk doesn't enter, where that's what matters about it.
+        // On a mount that follows links, that's a link that leads to a
+        // directory, since the same holds beneath it as beneath a directory:
+        // what's read through it is judged by its path and where it lands, so
+        // its own name doesn't put what lies there outside. On one that
+        // doesn't, it's every link, since nothing reads through one there,
+        // and such a mount resolves none to say where it leads. The link's
+        // name is no covered file's, so the walk passes it over as it does
+        // one, rather than taking it.
+        if (entry.isSymbolicLink() && (!view.followSymlinks || await stat(dir.at(entry.name)).then((info) => info.isDirectory(), () => false))) {
           others.push([childRel, LINK_NOT_WALKED]);
           regions.push({ path: childRel, reason: LINK_NOT_WALKED, kind: 'ignored' });
           continue;

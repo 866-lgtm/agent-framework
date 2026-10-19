@@ -501,7 +501,7 @@ describe('mount include', () => {
     }
   });
 
-  test("a link the include's names don't cover that leads to a directory is reported as on a mount without an include, as a symlink not walked, while a link to a file or to nothing is outside the include", async (t) => {
+  test("a link the include's names don't cover is reported as on a mount without an include, as a symlink not walked, where it leads to a directory on a mount that follows links and wherever it leads on one that doesn't; a followed link to a file or to nothing is outside the include", async (t) => {
     const OUTSIDE_INCLUDE = "outside the mount's include";
     type Sync = { incomplete?: Array<{ path: string; reason: string }>; skipped?: Array<{ path: string; reason: string }>; passedOver?: Array<{ reason: string; count: number }> };
     type Entries = { entries: Array<{ path?: string; name?: string; type: string; state?: string; note?: string }> };
@@ -528,13 +528,16 @@ describe('mount include', () => {
         assert.equal(byPath(plain.incomplete)['link'], 'a symlink, not walked', JSON.stringify(plain));
         assert.equal(byPath(synced.incomplete)['link'], 'a symlink, not walked', label);
         assert.equal(byPath(synced.skipped)['link/a.json'], byPath(plain.skipped)['link/a.json'], `${label}; ${JSON.stringify(plain)}`);
+        // A link to a file, and one that leads nowhere, are judged by their names, which the include leaves out.
+        assert.equal(synced.passedOver?.find((p) => p.reason === OUTSIDE_INCLUDE)?.count, 2, label);
       } else {
-        // With nothing tracked beneath it, the link is counted with that reason, and the walk took everything else.
-        assert.equal(synced.passedOver?.find((p) => p.reason === 'a symlink, not walked')?.count, 1, label);
+        // A mount that follows no link resolves none to tell where it leads: with nothing tracked beneath them, the
+        // link to a directory, the one to a file and the one that leads nowhere are each counted with that reason,
+        // and the walk took everything else.
+        assert.equal(synced.passedOver?.find((p) => p.reason === 'a symlink, not walked')?.count, 3, label);
+        assert.equal(synced.passedOver?.find((p) => p.reason === OUTSIDE_INCLUDE), undefined, label);
         assert.deepEqual(synced.incomplete ?? [], [], label);
       }
-      // A link to a file, and one that leads nowhere, are judged by their names, which the include leaves out.
-      assert.equal(synced.passedOver?.find((p) => p.reason === OUTSIDE_INCLUDE)?.count, 2, label);
       // No listing takes the link's own name as a file, nor calls what lies beneath it outside the include.
       const listed = await call(m, 'ls', { path: 'work', recursive: true }) as Entries;
       assert.ok(!listed.entries.some((e) => (e.path ?? e.name) === 'link' && e.type === 'file'), JSON.stringify(listed));
