@@ -187,7 +187,9 @@ test('routeSpeech reports each delivered publish as mcpl:speech-routed, with not
   await registry.routeSpeech('cairn', 'first reply', registry.resolveLocus('cairn'));
   await registry.routeSpeech('cairn', 'second reply', registry.resolveLocus('cairn'));
 
-  const routed = traces.slice(before);
+  // The first publish also opens the channel, and says so in a trace of its
+  // own; every other trace the two sends give is checked.
+  const routed = traces.slice(before).filter((t) => t.type !== 'mcpl:channel-opened-by-send');
   assert.deepEqual(routed.map((t) => ({ type: t.type, channelId: t.channelId, text: t.text, delivered: t.delivered })), [
     { type: 'mcpl:speech-routed', channelId: 'ch-x', text: 'first reply', delivered: true },
     { type: 'mcpl:speech-routed', channelId: 'ch-x', text: 'second reply', delivered: true },
