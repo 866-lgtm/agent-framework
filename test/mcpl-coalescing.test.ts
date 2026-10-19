@@ -4,7 +4,7 @@
  *
  * Vector numbers refer to RFC-006 §14.
  */
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { fork } from 'node:child_process';
 import { once } from 'node:events';
@@ -1675,9 +1675,17 @@ test('R16b: a producer retry re-wakes a batch left asleep by a failed freeze', a
 /**
  * R17's harness: a coalescing fixture whose store fails while `failing` is
  * set, its recovery backoff at `baseMs`, and every traced recovery wake with
- * the monotonic time it was traced at.
+ * the timer that fired it: the delay it was armed with (`armedMs`), and when
+ * it was armed among the harness's steps (`armedAt`, beside the wake's own
+ * `tracedAt`). The spacing the coalescer controls is those two: each wake's
+ * timer armed after the wake before it, with the delay it's labelled with.
+ * When a timer fires is the host's: by `performance.now()` Node can fire one
+ * early, and on a CI runner one fired at least 1.3 ms early, so the wakes'
+ * measured spacing isn't checked. Every setTimeout is still a real one; the harness
+ * only counts each arming and notes, while a timer's callback runs, which
+ * arming it was.
  */
-async function storageOutage(t: { after: (fn: () => Promise<void>) => void }, baseMs: number) {
+async function storageOutage(t: TestContext, baseMs: number) {
   const f = await fixture();
   const coalescer = (f.framework as unknown as { pushCoalescer: { options: { recoveryBackoffMs?: number }; pendingBatches(): number; recovery: Map<string, { attempt: number; timer?: unknown }> } }).pushCoalescer;
   coalescer.options.recoveryBackoffMs = baseMs;
@@ -1689,10 +1697,25 @@ async function storageOutage(t: { after: (fn: () => Promise<void>) => void }, ba
   // One hook, in order: storage recovers before the fixture closes, so a
   // failed assertion doesn't add the close's own EIO to its report.
   t.after(async () => { outage.failing = false; await f.close(); });
-  const wakes: Array<{ attempt: number; delayMs: number; at: number }> = [];
+  // The arming of the timer whose callback is running, if one is: its delay,
+  // and its step, from one count of armings and wakes. A recovery wake is
+  // traced from inside its timer's callback (scheduleRecovery), so the trace
+  // can name the timer that fired it.
+  let step = 0;
+  let firing: { ms: number | undefined; at: number } | undefined;
+  const realSetTimeout = globalThis.setTimeout;
+  t.mock.method(globalThis, 'setTimeout', ((callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+    const arming = { ms, at: ++step };
+    return realSetTimeout(function (this: unknown) {
+      const outer = firing;
+      firing = arming;
+      try { callback.apply(this, args); } finally { firing = outer; }
+    }, ms);
+  }) as typeof setTimeout);
+  const wakes: Array<{ attempt: number; delayMs: number; armedMs: number | undefined; armedAt: number | undefined; tracedAt: number }> = [];
   f.framework.onTrace((e) => {
     if (e.type === 'mcpl:coalescing' && (e as { kind?: string }).kind === 'recovery-wake') {
-      wakes.push({ ...(e as unknown as { attempt: number; delayMs: number }), at: performance.now() });
+      wakes.push({ ...(e as unknown as { attempt: number; delayMs: number }), armedMs: firing?.ms, armedAt: firing?.at, tracedAt: ++step });
     }
   });
   f.alwaysRespond();
@@ -1714,28 +1737,31 @@ async function storageOutage(t: { after: (fn: () => Promise<void>) => void }, ba
       assert(wakes.length > before, 'each re-wake is a traced recovery wake');
     }
   };
-  /** Each wake's timer was armed after the wake before it was traced, so their gap is at least its delay. */
-  const assertSpacing = (from = 0) => {
-    for (let i = from + 1; i < wakes.length; i++) {
-      // Less a millisecond: Node may fire a timer up to 1 ms early.
-      assert(wakes[i].at - wakes[i - 1].at >= wakes[i].delayMs - 1,
-        `wake ${i + 1} came ${(wakes[i].at - wakes[i - 1].at).toFixed(1)} ms after the one before, under its ${wakes[i].delayMs} ms delay`);
+  /** Each wake came from a timer armed with the delay its trace names, after
+   *  the wake before it was traced. A trace made outside every timer's
+   *  callback names no timer, and fails this: `firing` is put back as each
+   *  callback ends, so a later trace, such as one from a microtask, doesn't
+   *  take that timer's arming. */
+  const assertArmed = () => {
+    assert.deepEqual(wakes.map((w) => w.armedMs), wakes.map((w) => w.delayMs), 'each wake was fired by a timer armed with its delay');
+    for (let i = 1; i < wakes.length; i++) {
+      assert((wakes[i].armedAt ?? 0) > wakes[i - 1].tracedAt, `wake ${i + 1}'s timer was armed after wake ${i} was traced`);
     }
   };
-  return { f, coalescer, outage, wakes, driveTo, assertSpacing };
+  return { f, coalescer, outage, wakes, driveTo, assertArmed };
 }
 
 test('R17: a persistent storage outage backs off (1×, 2×, 4× …) and the series resets on recovery', { timeout: 120_000 }, async (t) => {
-  const { f, coalescer, outage, wakes, driveTo, assertSpacing } = await storageOutage(t, 40);
+  const { f, coalescer, outage, wakes, driveTo, assertArmed } = await storageOutage(t, 40);
   await f.send('push/event', f.params('1', 'outage_fallback', { deferred: true, initial: true }));
   outage.failing = true;
   await driveTo(3);
   // Every wake is one more consecutive failure, and its delay doubles from the
-  // base, however the attempts fell across drains. The timers are spaced at
-  // least that far apart, not only labelled so.
+  // base, however the attempts fell across drains. The timers are armed with
+  // that delay, not only labelled so.
   assert.deepEqual(wakes.map((w) => w.attempt), wakes.map((_, i) => i + 1), 'consecutive failures count up');
   assert.deepEqual(wakes.map((w) => w.delayMs), wakes.map((_, i) => Math.min(40 * 2 ** i, 40 * 60)), 'and the delay doubles');
-  assertSpacing();
+  assertArmed();
   assert.equal(coalescer.pendingBatches(), 1);
   assert(!f.context().includes('outage_fallback'));
   outage.failing = false; // storage recovers
@@ -1745,12 +1771,13 @@ test('R17: a persistent storage outage backs off (1×, 2×, 4× …) and the ser
   assert.equal(coalescer.recovery.size, 0, 'the failure series is forgotten on success');
 
   // A second outage starts a new series: its first wake is attempt 1 again,
-  // at the base delay.
+  // at the base delay, and armed so.
   const second = wakes.length;
   await f.send('push/event', f.params('2', 'second_outage', { deferred: true }));
   outage.failing = true;
   await driveTo(second + 1);
   assert.deepEqual(wakes.slice(second, second + 1).map(({ attempt, delayMs }) => ({ attempt, delayMs })), [{ attempt: 1, delayMs: 40 }]);
+  assertArmed();
   outage.failing = false;
   await f.framework.runUntilIdle();
   assert(f.lastRequest().includes('second_outage'), 'delivered once storage recovered again');
@@ -1759,12 +1786,12 @@ test('R17: a persistent storage outage backs off (1×, 2×, 4× …) and the ser
 test('R17b: the backoff stops doubling at 60× its base', { timeout: 120_000 }, async (t) => {
   // A small base reaches the cap within a second: attempt 7 is the first
   // whose doubling (64×) passes it.
-  const { f, wakes, outage, driveTo, assertSpacing } = await storageOutage(t, 3);
+  const { f, wakes, outage, driveTo, assertArmed } = await storageOutage(t, 3);
   await f.send('push/event', f.params('1', 'capped_fallback', { deferred: true, initial: true }));
   outage.failing = true;
   await driveTo(8);
   assert.deepEqual(wakes.slice(0, 8).map((w) => w.delayMs), [3, 6, 12, 24, 48, 96, 180, 180]);
-  assertSpacing();
+  assertArmed();
 });
 
 // ---------------------------------------------------------------------------
