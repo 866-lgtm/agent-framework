@@ -590,8 +590,31 @@ test('deep recursion throws a catchable RangeError at the stack limit, which max
     depths.push(depth);
     e.dispose();
   }
-  // 64 KiB is an eighth of the default's 512 KiB.
-  assert.ok(depths[0] * 4 < depths[1], `depths ${depths.join(' and ')}`);
+  // 64 KiB is a third of the default's 192 KiB.
+  assert.ok(depths[0] * 2 < depths[1], `depths ${depths.join(' and ')}`);
+});
+
+test('recursion through getters, proxy traps and built-ins that call back gets the catchable RangeError at the most stack allowed, not a crash', async () => {
+  // Each level also takes the host's own stack, two to three times what QuickJS's check counts,
+  // so a limit too high lets the host's stack run out first and crash the engine.
+  const shapes: Record<string, string> = {
+    plain: 'function f() { depth++; return f() + 1 } f()',
+    getter: 'const o = { get x() { depth++; return o.x + 1 } }; o.x',
+    toString: 'const o = { toString() { depth++; return String(o) } }; String(o)',
+    map: 'function g() { depth++; return [0].map(g)[0] + 1 } g()',
+    ownKeys: 'const p = new Proxy({}, { ownKeys() { depth++; return Object.keys(p) } }); Object.keys(p)',
+    forOf: 'const it = { [Symbol.iterator]() { depth++; for (const x of it) {} return { next: () => ({ done: true }) } } }; for (const x of it) {}',
+    toJSON: 'const o = { toJSON() { depth++; return JSON.stringify(o) } }; JSON.stringify(o)',
+    generator: 'function* gen() { depth++; yield* gen() } [...gen()]',
+  };
+  for (const [shape, body] of Object.entries(shapes)) {
+    const { e } = await engine({}, { maxStackBytes: MAX_STACK_BYTES });
+    const s = e.start(PRELUDE, `let depth = 0;\ntry { ${body} } catch (err) { [err.name, err.message, depth] }`, 's.js');
+    const [name, message, depth] = fulfilled(s) as [string, string, number];
+    assert.deepEqual([name, message], ['RangeError', 'Maximum call stack size exceeded'], shape);
+    assert.ok(depth > 50, `${shape}: ${depth}`);
+    e.dispose();
+  }
 });
 
 test('limits outside their range are refused before anything loads', async () => {

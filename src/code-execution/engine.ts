@@ -109,13 +109,26 @@ export const MIN_MEMORY_BYTES = 4 * 1024 * 1024;
  * pointers arrive as, and no conversion is needed where the host reads them.
  */
 export const MAX_MEMORY_BYTES = 2048 * 1024 * 1024;
-export const DEFAULT_STACK_BYTES = 512 * 1024;
+/**
+ * The most QuickJS's stack limit may be, and its default. QuickJS measures its stack in the
+ * module's linear memory, but each level of a script's recursion also takes the host's own stack,
+ * about two to three times as much, and under Node that stack is about 984 KiB. Recursing through
+ * a getter, a proxy trap or a built-in that calls back (map, toString, for...of), the host's stack
+ * ran out first, crashing the engine, once QuickJS's limit passed about 320 KiB. At this limit,
+ * QuickJS's catchable RangeError comes first, with about two fifths of the host's stack to spare.
+ * Bun's stack is larger, and the same limit holds there, so a script ends the same way on either.
+ *
+ * The parser isn't held to it: it recurses in C, which the check barely sees, so under Node a
+ * script whose text nests function expressions 300 deep, or brackets 700 deep, crashes its run.
+ */
+export const MAX_STACK_BYTES = 192 * 1024;
+export const DEFAULT_STACK_BYTES = MAX_STACK_BYTES;
 /**
  * The deepest nesting of arrays and objects a result may have. QuickJS's stack check measures the
- * module's own stack, which the C recursion of JSON's parse and stringify barely uses, so nesting
- * about 10,000 deep overflows the host's stack first under Node (about 30,000 under Bun), and the
- * engine crashes. A deeper result is unfit, since the call took effect. A script's own data isn't
- * held to this, and nested that deep, it crashes its own run.
+ * module's own stack, which the C recursion of JSON's parse and stringify barely uses, so under
+ * Node nesting 5,000 to 10,000 deep overflows the host's stack first, and the engine crashes
+ * (under Bun, QuickJS's check comes first). A deeper result is unfit, since the call took effect.
+ * A script's own data isn't held to this, and nested that deep, it crashes its own run under Node.
  */
 export const MAX_RESULT_DEPTH = 2000;
 /** The most of the engine's own stdio a crash's message keeps. */
@@ -128,8 +141,6 @@ const DIAGNOSTICS_CHARS = 4096;
  * that gives its length.
  */
 const MAX_ENDING_BYTES = 2 ** 29 - 24;
-/** Leaves a quarter of the link-time stack for C frames between QuickJS's checks. */
-export const MAX_STACK_BYTES = LINK_STACK_BYTES - 256 * 1024;
 
 // interface.c's states and failures.
 const PENDING = 0, FULFILLED = 1, REJECTED = 2, INTERRUPTED = 3, HOST_FAILED = 4, UNFIT = 16;
