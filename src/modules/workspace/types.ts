@@ -81,8 +81,8 @@ export interface MountConfig {
    * refuse it before anything is stored), and a listing from where a link
    * leads passes over such a file. A covered path whose landing realpath
    * can't resolve, as for a loop or a directory this process can't search,
-   * is refused too, for a read and a write alike, since where it lands
-   * can't be judged.
+   * is refused too, by every file operation, a delete included, since
+   * where it lands can't be judged.
    *
    * A sync, materialize, grep, glob or ls that names a path the include
    * doesn't cover takes it as a directory, its scope, exactly where a listing

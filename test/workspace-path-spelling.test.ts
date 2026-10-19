@@ -1150,7 +1150,7 @@ test('on a disk that tells case apart, two drafts that differ only in case stay 
   assert.deepEqual(readdirSync(dir).sort(), ['DOCS', 'docs', 'src']);
 });
 
-test("only history the mount will write spells a draft's path: an entry the include leaves out, from before it, doesn't respell a covered one", { skip: FOLDING_ONLY }, async (t) => {
+test("only history the mount's include covers spells a draft's path: an entry the include leaves out, from before it, doesn't respell a covered one", { skip: FOLDING_ONLY }, async (t) => {
   const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-'));
   const dir = join(root, 'mount');
   mkdirSync(join(dir, 'NOTES'), { recursive: true });
@@ -1162,10 +1162,14 @@ test("only history the mount will write spells a draft's path: an entry the incl
   const before = new WorkspaceModule({ mounts: [{ name: 'work', path: dir, mode: 'read-write', watch: 'never' }] });
   before.initStore(store);
   await before.start(ctx);
-  assert.equal((await before.handleToolCall({ id: 's', name: 'sync', input: {} } as Parameters<WorkspaceModule['handleToolCall']>[0])).success, true);
+  const taken = JSON.stringify(await before.handleToolCall({ id: 's', name: 'sync', input: {} } as Parameters<WorkspaceModule['handleToolCall']>[0]));
+  assert.ok(taken.includes('"synced":["NOTES/old.bin"]'), `history takes in the entry that could spell the directory: ${taken}`);
   await before.stop();
-  // Disk no longer has the directory, so only history could spell it.
-  rmSync(join(dir, 'NOTES'), { recursive: true, force: true });
+  // Disk no longer has the directory, so only history could spell it. It's removed by the spelling the write
+  // names: a disk that keeps each spelling's lookup a while, as the test's passthrough does for a second,
+  // would otherwise still show `notes` there.
+  rmSync(join(dir, 'notes'), { recursive: true, force: true });
+  assert.ok(!existsSync(join(dir, 'notes')), 'disk has no directory to spell the draft');
   workspace = new WorkspaceModule({ mounts: [{ name: 'work', path: dir, mode: 'read-write', watch: 'never', include: ['notes/**'] }] });
   workspace.initStore(store);
   await workspace.start(ctx);
@@ -1175,4 +1179,36 @@ test("only history the mount will write spells a draft's path: an entry the incl
   assert.equal(read.success, true, String(read.error));
   const listed = JSON.stringify(await workspace.handleToolCall({ id: 'l', name: 'ls', input: { path: 'work', recursive: true } } as Parameters<WorkspaceModule['handleToolCall']>[0]));
   assert.ok(listed.includes('notes/new.md') && !listed.includes('NOTES'), listed);
+});
+
+test("history in a nested mount's directory that mount's include leaves out still spells a draft naming the directory, so the draft is that mount's though the directory isn't on disk", { skip: FOLDING_ONLY }, async (t) => {
+  const ctx = { isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext;
+  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-'));
+  const dir = join(root, 'mount');
+  mkdirSync(join(dir, 'inner'), { recursive: true });
+  writeFileSync(join(dir, 'inner', 'secret.md'), 'taken in before the nesting\n');
+  const store = JsStore.openOrCreate({ path: join(root, 'store') });
+  t.after(() => { if (!store.isClosed()) store.close(); rmSync(root, { recursive: true, force: true }); });
+  const before = new WorkspaceModule({ mounts: [{ name: 'work', path: dir, mode: 'read-write', watch: 'never' }] });
+  before.initStore(store);
+  await before.start(ctx);
+  const taken = JSON.stringify(await before.handleToolCall({ id: 's', name: 'sync', input: {} } as Parameters<WorkspaceModule['handleToolCall']>[0]));
+  assert.ok(taken.includes('"synced":["inner/secret.md"]'), `history takes in the entry that spells the directory: ${taken}`);
+  await before.stop();
+  // Removed by the spelling the write names, as in the test above.
+  rmSync(join(dir, 'INNER'), { recursive: true, force: true });
+  assert.ok(!existsSync(join(dir, 'INNER')), 'disk has no directory to spell the draft');
+  const workspace = new WorkspaceModule({ mounts: [
+    { name: 'work', path: dir, mode: 'read-write', watch: 'never' },
+    { name: 'inner', path: join(dir, 'inner'), mode: 'read-write', watch: 'never', include: ['keep.md'] },
+  ] });
+  workspace.initStore(store);
+  await workspace.start(ctx);
+  try {
+    const write = await workspace.handleToolCall({ id: 'w', name: 'write', input: { path: 'work/INNER/new.md', content: 'through the outer mount\n' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+    assert.equal(write.success, false, `the outer mount took ${JSON.stringify(write.data)}`);
+    assert.match(String(write.error), /lies in mount "inner", nested in mount "work".*use "inner\/new\.md"/);
+  } finally {
+    await workspace.stop();
+  }
 });

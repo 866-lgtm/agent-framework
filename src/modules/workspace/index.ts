@@ -398,8 +398,8 @@ async function realBeneath(given: string, links = 0, unresolved?: { code?: strin
   } catch (err) {
     const code = errnoOf(err);
     const parent = dirname(absolute);
-    if ((code !== 'ENOENT' && code !== 'ENOTDIR') || links >= LINKS_FOLLOWED || parent === absolute) {
-      if (unresolved) unresolved.code ??= links >= LINKS_FOLLOWED ? 'ELOOP' : code ?? 'EIO';
+    if ((code !== 'ENOENT' && code !== 'ENOTDIR') || links > LINKS_FOLLOWED || parent === absolute) {
+      if (unresolved) unresolved.code ??= links > LINKS_FOLLOWED ? 'ELOOP' : code ?? 'EIO';
       return resolve(absolute);
     }
     const place = await realBeneath(parent, links, unresolved);
@@ -2292,14 +2292,15 @@ export class WorkspaceModule implements Module {
     if (nested.length === 0 && !judged) return null;
     const unresolved: { code?: string } = {};
     const real = await realBeneath(resolve(mount.config.path, relativePath), 0, unresolved);
+    // Where realpath can't resolve the path, as for a loop or a directory
+    // this process can't search, where it lands can't be judged, and a
+    // promise about content fails closed: the path is refused, by every file
+    // operation, in the words a disk read gives a path it can't resolve,
+    // whatever the place realpath stopped short of would say.
+    if (judged && unresolved.code !== undefined) return new WorkspaceReadError('not_found', `Unable to resolve file: ${path}`, 'realpath', unresolved.code);
     const holder = nestedAtReal(real, nested);
     if (!holder) {
       if (!judged) return null;
-      // Where realpath can't resolve the path, as for a loop or a directory
-      // this process can't search, where it lands can't be judged, and a
-      // promise about content fails closed: the path is refused, in the
-      // words a disk read gives a path it can't resolve.
-      if (unresolved.code !== undefined) return new WorkspaceReadError('not_found', `Unable to resolve file: ${path}`, 'realpath', unresolved.code);
       const rootReal = await realBeneath(resolve(mount.config.path));
       if (!isContainedPath(rootReal, real) || await stat(real).then((info) => info.isDirectory(), () => false)) return null;
       return await coversLanding({ include: mount.config.include }, rootReal, real, relativePath) ? null : new WorkspaceReadError('escape', `Symlink escape detected: ${path}`, 'realpath');
@@ -2463,17 +2464,20 @@ export class WorkspaceModule implements Module {
   private entriesOf(mount: MountState): WorkspaceEntries {
     const store = this.getStore();
     const intents = this.intents.get(mount.config.name)!;
-    const own = { include: mount.config.include, nested: this.nestedOf(mount.config.name) };
     return {
       // An intent recorded at a path, such as a deletion disk hasn't been
       // given yet or a conflict, is the workspace's own name for the file
       // there, as an entry is, so the calls that settle it reach it.
       has: (path) => store.treeGet(mount.treeStateId, path) !== null || store.treeGet(intents.treeStateId, path) !== null,
-      // Only an entry the mount will write spells a draft's path: not a key no
-      // spelling names, such as `c/` or `a//b.txt` from an earlier version,
-      // nor one outside the include or in a nested mount's directory that
-      // mount's include leaves out, which no listing names (withinIncludes).
-      under: (prefix) => store.treeList(mount.treeStateId, prefix).map((entry) => entry.path).filter((path) => withinIncludes(own, path)),
+      // Only an entry this mount's include covers spells a draft's path
+      // (insideMount): not a key no spelling names, such as `c/` or `a//b.txt`
+      // from an earlier version, nor one the include leaves out, which would
+      // respell a covered draft into a name the include leaves out. An entry
+      // in a nested mount's directory that this mount's include covers
+      // spells one whatever that mount's include says, so on a disk that
+      // folds names, a draft naming the directory in another spelling takes
+      // the entry's spelling and is judged as in it.
+      under: (prefix) => store.treeList(mount.treeStateId, prefix).map((entry) => entry.path).filter((path) => insideMount(path, mount.config.include)),
       holder: (path) => this.holderOf(mount.config.name, path)?.name,
       rootFoldsCase: this.rootFoldsCase.get(mount.config.name) ?? false,
     };

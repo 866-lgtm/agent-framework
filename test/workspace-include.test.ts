@@ -11,7 +11,7 @@
 import { describe, test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, sep } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
@@ -1034,7 +1034,7 @@ describe('mount include', () => {
     }
   });
 
-  test("on a mount that follows links, a covered path whose landing realpath can't resolve is refused for a read and a write alike, so no copy history took in before the include through it is served and nothing is written through it", async (t) => {
+  test("on a mount that follows links, a covered path whose landing realpath can't resolve is refused by every file tool, so no copy history took in before the include through it is served and nothing is written through it", async (t) => {
     const env = new Env(t);
     env.writeDisk('secret.dat', "needle: not the mount's\n");
     symlinkSync('secret.dat', join(env.dir, 'c.json'));
@@ -1052,8 +1052,25 @@ describe('mount include', () => {
     await assert.rejects(m.readFileFromDisk('work/c.json'), (err: unknown) => err instanceof WorkspaceReadError && err.code === 'not_found');
     const written = await refused(m, 'write', { path: 'work/c.json', content: 'written through a loop\n' });
     assert.ok(written.includes('Unable to resolve file: work/c.json'), written);
+    const deleted = await refused(m, 'delete', { path: 'work/c.json' });
+    assert.ok(deleted.includes('Unable to resolve file: work/c.json'), deleted);
     assert.ok(lstatSync(join(env.dir, 'c.json')).isSymbolicLink() && lstatSync(join(env.dir, 'loop.json')).isSymbolicLink(), 'both links stay');
     assert.equal(readFileSync(join(env.dir, 'secret.dat'), 'utf8'), "needle: not the mount's\n");
+  });
+
+  test("on a mount that follows links, a covered path beneath a directory this process can't search is refused, since where it lands can't be told", { skip: process.platform === 'win32' || process.getuid?.() === 0 ? 'needs a directory permissions keep this process out of' : false }, async (t) => {
+    const env = new Env(t);
+    env.writeDisk('locked/x.json', '{}\n');
+    const m = await env.open({ followSymlinks: true, include: ['*.json'] });
+    chmodSync(join(env.dir, 'locked'), 0o000);
+    try {
+      for (const [name, input] of [['read', { path: 'work/locked/x.json' }], ['write', { path: 'work/locked/x.json', content: '[]\n' }]] as const) {
+        const why = await refused(m, name, input);
+        assert.ok(why.includes('Unable to resolve file: work/locked/x.json'), `${name}: ${why}`);
+      }
+    } finally {
+      chmodSync(join(env.dir, 'locked'), 0o755);
+    }
   });
 
   test("a path that meets no link is judged where it's named, whatever spelling realpath gives where it lands, and one through a link where it lands, as disk spells it", async (t) => {
@@ -1077,8 +1094,9 @@ describe('mount include', () => {
     // A landing spelled otherwise than folding makes it, with no link left on the way, as after a link was
     // swapped for a directory between the realpath and the walk, is judged where it lands too.
     assert.equal(await coversLanding(view, rootReal, join(rootReal, 'site', 'b.txt'), 'Docs/a.txt'), false);
-    // So is one where neither spelling is there at any level, which only the folding comparison tells apart:
-    // a file a write would create at `bb/new.txt` isn't one named `aa/new.txt`.
+    // So is one where neither spelling is there at any level and the two differ by more than folding, which
+    // the folding check before the level walk tells apart: a file a write would create at `bb/new.txt` isn't
+    // one named `aa/new.txt`.
     assert.equal(await coversLanding({ include: ['aa/**'] }, rootReal, join(rootReal, 'bb', 'new.txt'), 'aa/new.txt'), false);
     // Without an include, every file is covered.
     assert.equal(await coversLanding({}, rootReal, join(rootReal, 'site', 'b.txt'), 'via/b.txt'), true);
