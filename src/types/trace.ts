@@ -1,6 +1,7 @@
 import type { ProcessEvent } from './events.js';
 import type { ModuleProcessResponse } from './framework.js';
 import type { SessionUsage } from '../usage/types.js';
+import type { DraftReason } from '../prose-drafts.js';
 
 /**
  * Base for all trace events.
@@ -324,7 +325,13 @@ export type TraceEvent =
       messageId?: string;
     })
   /** RFC-006 coalescing decision record (received / displaced / removed /
-   *  rendered / revoked / render-cancelled / late-render / render-failed). */
+   *  rendered / revoked / render-cancelled / late-render / render-failed).
+   *  A late-render whose push/render had already timed out, its fallback
+   *  materialized, is recorded by the connection's wiring rather than the
+   *  coalescer: it names `serverId`, `featureSet`, `key` and, for a
+   *  channel-scoped subject, `channelId` instead of `subject`, carries a late
+   *  JSON-RPC error as `error` (`[code] message`, bounded), and its `eventId`
+   *  links it to the batch's render-failed. */
   | (TraceEventBase & {
       type: 'mcpl:coalescing';
       kind: string;
@@ -447,13 +454,16 @@ export type TraceEvent =
     })
 
   // Host-owned speech routing (ChannelRegistry.routeSpeech). One trace per
-  // delivered prose segment. `text` is the segment verbatim — the same content
+  // delivered prose segment, and one per publish the subconscious's
+  // speak_in_channel delivers (ChannelRegistry.publishForAgent): that one's
+  // conversationId is the speaking agent's name, and it carries no
+  // messageId. `text` is the segment verbatim — the same content
   // already on the bus chunk-by-chunk via inference:tokens, and mcpl:* traces
   // are 'ops'-scoped on the webui wire — and `messageId` is the surface's id
-  // for the posted message (when the MCPL server reports one). Together they
-  // give external taps the (channelId, messageId, text) tuple needed to edit
-  // a just-posted message, e.g. a TTS interruption truncating a reply to the
-  // words actually voiced.
+  // for the posted message (on routeSpeech's traces, when the MCPL server
+  // reports one). Together they give external taps the (channelId,
+  // messageId, text) tuple needed to edit a just-posted message, e.g. a TTS
+  // interruption truncating a reply to the words actually voiced.
   | (TraceEventBase & {
       type: 'mcpl:speech-routed';
       /** Agent / conversation whose speech was routed. */
@@ -464,7 +474,8 @@ export type TraceEvent =
       textLen: number;
       /** The routed prose segment, verbatim. */
       text: string;
-      /** Surface message id (e.g. Discord message id), when reported. */
+      /** Surface message id (e.g. Discord message id), when reported, on
+       *  routeSpeech's traces. speak_in_channel's carry none. */
       messageId?: string;
     })
   | (TraceEventBase & {
@@ -475,6 +486,12 @@ export type TraceEvent =
       channelId: string;
       reason: string;
       textLen: number;
+      /** `failed`: nothing was posted; `unknown`: the request was dispatched
+       *  and no valid receipt came back, so it may have been. */
+      outcome?: 'failed' | 'unknown';
+      /** The connector error's structured data, bounded (connectorText),
+       *  when it sent some: it may say what a multi-part send posted. */
+      detail?: string;
     })
 
   // Admin puppet: an operator executed a tool AS an agent and stored the
@@ -634,7 +651,7 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'mcpl:orphaned-response';
       serverId: string;
-      /** The JSON-RPC id of the late response whose pending request already timed out. */
+      /** The JSON-RPC id of the late response, whose request had already timed out or been ended by its transport's close. */
       responseId: string | number;
       /** Original request method when retained for mandatory-deadline visibility. */
       method?: string;
@@ -642,6 +659,8 @@ export type TraceEvent =
       hadState: boolean;
       /** True when the dropped response carried a server-managed `checkpoint`. */
       hadCheckpoint: boolean;
+      /** A late JSON-RPC error, as `[code] message`, bounded. */
+      error?: string;
     })
 
   // Ops / fleet observability. Everything the framework's opsAlert() escalates
@@ -674,7 +693,7 @@ export type TraceEvent =
       parkedAdmissions?: number;
       /** True when undrained turns were force-cancelled (abandon). */
       abandoned?: boolean;
-      /** Agents whose turn abandon could not cancel (token held, no stream). */
+      /** Agents whose turn the abandon had not ended when its grace ran out: a token held with no stream and no check ahead (a puppet tool turn, a store surgery's reservation, a turn finishing its last delivery), or a turn that hadn't reached its next check, the tool-result guard's wait for its speech included. A turn whose stream the abandon cancelled while it was still streaming isn't listed, even one still running when the grace ran out. */
       unabandonable?: string[];
     })
   | (TraceEventBase & {
@@ -688,6 +707,40 @@ export type TraceEvent =
       type: 'host:quiesced_boot';
       reason?: string;
       since?: number;
+    })
+
+  // Inbound acceptance observation (mcpl/inbound-source.ts): an installed
+  // InboundAcceptanceObserver threw. Delivery is unaffected; the observer's
+  // own coverage is interrupted for that acceptance.
+  | (TraceEventBase & {
+      type: 'inbound:observer-failed';
+      /** Envelope kind of the acceptance the observer failed on. */
+      kind: 'channel' | 'unscoped' | 'surface';
+      error: string;
+    })
+
+  // Held prose drafts (src/prose-drafts.ts): plain speech kept privately
+  // instead of sent; a resident's explicit resend; a deliberate dismissal.
+  | (TraceEventBase & {
+      type: 'prose:drafts-held';
+      agentName: string;
+      reason: DraftReason;
+      draftIds: string[];
+      textLen: number;
+    })
+  | (TraceEventBase & {
+      type: 'prose:draft-resent';
+      agentName: string;
+      draftId: string;
+      status: 'delivered' | 'failed' | 'unknown';
+      serverId: string;
+      channelId: string;
+      messageId?: string;
+    })
+  | (TraceEventBase & {
+      type: 'prose:drafts-dismissed';
+      agentName: string;
+      draftIds: string[];
     });
 
 /**

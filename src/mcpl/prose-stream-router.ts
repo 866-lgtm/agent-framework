@@ -16,8 +16,13 @@
  *
  * Suppression is fail-closed: text whose destination is unknown (explicit
  * mode before the first `>>`, unresolvable/ambiguous targets, `>>skip_reply`)
- * emits NOTHING — the delivery path will bounce/retain it; a stream consumer
- * must never see text that delivery would refuse to send.
+ * emits NOTHING — the delivery path will bounce/retain it. Text for a channel
+ * the `speakable` option refuses emits nothing either, and which servers see
+ * what is emitted is the registry's (sendOutgoingChunk). The stream can't
+ * know what delivery decides later: `speakable` is asked as the text is
+ * routed, so a channel declared inbound-only after its text was emitted, or
+ * one whose open then fails, is refused at delivery, though a consumer has
+ * seen the text.
  *
  * Three modes, mirroring proseRouting:
  *  - explicit: parse `>>` prefixes. A fresh turn's stream starts suppressed;
@@ -58,6 +63,14 @@ export class ProseStreamRouter {
       initialTarget: string | null;
       /** Resolve a `>>spec` to a channelId, or null (unresolved/ambiguous). */
       resolve: (spec: string) => string | null;
+      /** Whether speech may be published to this channel now. Text for a
+       *  channel it refuses is neither emitted nor kept for outgoing/complete,
+       *  so the stream's end can't carry it there should that change before
+       *  the stream ends. Asked as the text is routed, while delivery decides
+       *  when its round is admitted: text refused here stays out of the
+       *  stream even if the channel accepts speech again by then and the
+       *  round posts it. Every channel, when left out. */
+      speakable?: (channelId: string) => boolean;
     },
   ) {
     this.target = opts.initialTarget;
@@ -74,7 +87,8 @@ export class ProseStreamRouter {
    * this at each round's end, with the turn's destination: a private round's
    * prefixes, a `>>skip_reply` envelope and a target that didn't resolve all
    * leave that destination as it was, though the stream followed them while
-   * the round was written.
+   * the round was written. A target refused for its server's inbound-only
+   * declaration clears it.
    */
   retarget(target: string | null): void {
     this.target = target;
@@ -100,7 +114,7 @@ export class ProseStreamRouter {
   feed(delta: string): RoutedDelta[] {
     const out: RoutedDelta[] = [];
     for (const ch of delta) this.step(ch, out);
-    return coalesce(out);
+    return this.keep(out);
   }
 
   /**
@@ -127,7 +141,7 @@ export class ProseStreamRouter {
     this.held = '';
     this.token = '';
     if (this.opts.mode !== 'locus') this.state = 'line-start';
-    return coalesce(out);
+    return this.keep(out);
   }
 
   /** End of stream: the last segment ends. */
@@ -253,7 +267,17 @@ export class ProseStreamRouter {
   private emit(text: string, out: RoutedDelta[]): void {
     if (this.target === null || !text) return;
     out.push({ channelId: this.target, delta: text });
-    this.accumulated.set(this.target, (this.accumulated.get(this.target) ?? '') + text);
+  }
+
+  /**
+   * What one feed or segment end routed, less any channel `speakable`
+   * refuses, kept for outgoing/complete. A feed runs without yielding, so
+   * one answer per channel holds for all of it.
+   */
+  private keep(out: RoutedDelta[]): RoutedDelta[] {
+    const kept = coalesce(out).filter((d) => this.opts.speakable?.(d.channelId) ?? true);
+    for (const d of kept) this.accumulated.set(d.channelId, (this.accumulated.get(d.channelId) ?? '') + d.delta);
+    return kept;
   }
 }
 

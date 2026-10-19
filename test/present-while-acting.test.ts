@@ -1091,7 +1091,7 @@ describe('present while acting', () => {
       // fallback's re-inference. Messages arrive before that starts.
       const open: Routing = {
         locus: 'chan-turn', triggerChannel: 'chan-turn', engaged: new Set(['discord:guild:portables']),
-        destination: null, hybridHold: false, continuation: false, deliveries: [], suppressed: 0, arrivals: [],
+        destination: null, continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
       };
       internals.turnRouting.set('assistant', open);
       internals.openLogical.set('assistant', open);
@@ -1120,7 +1120,7 @@ describe('present while acting', () => {
     };
     const open: Routing = {
       locus: 'chan-turn', triggerChannel: 'chan-turn', engaged: new Set(),
-      destination: null, hybridHold: false, continuation: false, deliveries: [], suppressed: 0, arrivals: [],
+      destination: null, continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
     };
     internals.turnRouting.set('assistant', open);
     internals.openLogical.set('assistant', open);
@@ -1271,8 +1271,8 @@ describe('present while acting', () => {
       recordTurnCheckpoint(agentName: string): void;
     };
     const open: Routing = {
-      locus: 'chan-turn', engaged: new Set(), destination: null, hybridHold: false,
-      continuation: false, deliveries: [], suppressed: 0, arrivals: [],
+      locus: 'chan-turn', engaged: new Set(), destination: null,
+      continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
     };
     internals.openLogical.set('assistant', open);
     internals.recordTurnCheckpoint = () => { throw new Error('checkpoint failed'); };
@@ -1300,8 +1300,8 @@ describe('present while acting', () => {
     // live, and stop() ended every open turn. Its budget restart now runs,
     // and its stream fails and is retried.
     const turn: Routing = {
-      locus: 'chan-turn', triggerChannel: 'chan-turn', engaged: new Set(), destination: null, hybridHold: false,
-      continuation: false, deliveries: [], suppressed: 0, arrivals: [],
+      locus: 'chan-turn', triggerChannel: 'chan-turn', engaged: new Set(), destination: null,
+      continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
     };
     internals.turnRouting.set('assistant', turn);
     internals.pendingRequests.push({
@@ -1347,8 +1347,8 @@ describe('present while acting', () => {
     // Built by hand, as #312's silent-start test does: production runs no
     // silent turn while a prose turn is open.
     const open: Routing = {
-      locus: 'chan-turn', engaged: new Set(), destination: null, hybridHold: false,
-      continuation: false, deliveries: [], suppressed: 0, arrivals: [],
+      locus: 'chan-turn', engaged: new Set(), destination: null,
+      continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
     };
     internals.openLogical.set('assistant', open);
     internals.pendingRequests.push({
@@ -1561,6 +1561,7 @@ describe('present while acting', () => {
       framework.agents = new Map([['assistant', { proseRouting: 'locus' }]]);
       framework.channelRegistry = {
         handleChannelToolCall: () => new Promise((resolve) => { resolveOpen = resolve; }),
+        inboundOnlyServer: () => undefined,
       };
       framework.turnRouting = new Map([['assistant', calling]]);
       framework.openLogical = new Map([['assistant', calling]]);
@@ -1600,6 +1601,7 @@ describe('present while acting', () => {
       framework.agents = new Map([['assistant', { proseRouting: 'locus' }]]);
       framework.channelRegistry = {
         handleChannelToolCall: async () => ({ success: true, data: { channelId: 'discord:guild:observatory' } }),
+        inboundOnlyServer: () => undefined,
       };
       framework.turnRouting = new Map([['assistant', calling]]);
       if (!silent) framework.openLogical = new Map([['assistant', calling]]);
@@ -1711,8 +1713,13 @@ describe('present while acting', () => {
       .filter((b) => b.type === 'text')
       .map((b) => b.text ?? '')
       .filter((t) => t.startsWith('[delivered]'));
+    // The suppressed words are held as drafts, named in the receipt.
+    const drafts = (framework as unknown as { proseDrafts: { open(a: string): Array<{ id: string; text: string }> } })
+      .proseDrafts.open('assistant').reverse();
+    assert.deepEqual(drafts.map((d) => d.text), ['the reply that silencing will eat', 'trailing prose, also suppressed (sticky)']);
     assert.deepEqual(receipts, [
-      '[delivered] nothing — 2 plain-speech segment(s) suppressed (explicit send in the same round — resend with a send tool if it was meant to be heard)',
+      `[delivered] nothing — 2 plain-speech segment(s) held as drafts ${drafts.map((d) => d.id).join(', ')} ` +
+        '(not sent — drafts can resend them unchanged, or dismiss them)',
     ]);
 
     await framework.stop();
@@ -1752,8 +1759,12 @@ describe('present while acting', () => {
         .filter((b) => b.type === 'text')
         .map((b) => b.text ?? '')
         .filter((t) => t.startsWith('[delivered]'));
+      const drafts = (framework as unknown as { proseDrafts: { open(a: string): Array<{ id: string; text: string }> } })
+        .proseDrafts.open('assistant').reverse();
+      assert.deepEqual(drafts.map((d) => d.text), ['adjacent prose that must NOT auto-publish', 'trailing prose, also suppressed (sticky)']);
       assert.deepEqual(receipts, [
-        '[delivered] nothing — 2 plain-speech segment(s) suppressed (explicit send in the same round — resend with a send tool if it was meant to be heard)',
+        `[delivered] nothing — 2 plain-speech segment(s) held as drafts ${drafts.map((d) => d.id).join(', ')} ` +
+          '(not sent — drafts can resend them unchanged, or dismiss them)',
       ], `${verb}: suppression is visible in the receipt`);
 
       await framework.stop();
@@ -1814,6 +1825,117 @@ describe('present while acting', () => {
       JSON.stringify(results).includes('plain speech now lands in this channel'),
       'routing note present in the channel_open tool result',
     );
+
+    await framework.stop();
+  });
+
+  // -------------------------------------------------------------------------
+  // A channel its server declared inbound-only takes no plain speech (the
+  // registry refuses it), so every notice that says where plain speech goes
+  // says that instead. pocket-body's live transcript is one: another agent
+  // speaking in the room arrives there addressed.
+  // -------------------------------------------------------------------------
+
+  /** The stub registry answers that body:ears is inbound-only, declared by pocket-body. */
+  function declareEarsInboundOnly(framework: AgentFramework): Record<string, unknown> {
+    const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+    registry.inboundOnlyServer = (channelId: string) => (channelId === 'body:ears' ? 'pocket-body' : undefined);
+    return registry;
+  }
+
+  function assertSaysRefused(text: string | undefined, what: string): void {
+    assert.ok(text, `${what} was written`);
+    assert.ok(
+      text!.includes(
+        'pocket-body declared this channel inbound-only, so plain speech there is refused and stays in your archive. ' +
+          "To speak there, use pocket-body's own tools.",
+      ),
+      `${what} says plain speech there is refused, where it stays, and what to use instead: ${text}`,
+    );
+    assert.ok(!text!.includes('lands'), `${what} doesn't say the speech lands there: ${text}`);
+  }
+
+  it('the routing notice for a locus its server declared inbound-only says plain speech there is refused', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'one' }] as ContentBlock[]));
+
+    const framework = await createFramework();
+    stubChannelRegistry(framework);
+    declareEarsInboundOnly(framework);
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    (framework as unknown as { announceLocusIfChanged(agentName: string, locus: string | null): void })
+      .announceLocusIfChanged('assistant', 'body:ears');
+
+    const cm = (framework as unknown as {
+      agents: Map<string, { getContextManager(): { getAllMessages(): Array<{ content: Array<{ type: string; text?: string }> }> } }>;
+    }).agents.get('assistant')!.getContextManager();
+    const notices = cm.getAllMessages()
+      .flatMap((m) => m.content)
+      .map((b) => b.text ?? '')
+      .filter((t) => t.startsWith('[routing]'));
+    const notice = notices.at(-1);
+    assert.ok(notice?.startsWith('[routing] The conversation is now in body:ears.'), String(notice));
+    assertSaysRefused(notice, 'the routing notice');
+
+    await framework.stop();
+  });
+
+  it('an addressed arrival on an inbound-only channel re-pins there, and its notice says plain speech there is refused', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Station four, proceeding.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Answering the room.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    declareEarsInboundOnly(framework);
+    module.toolDelayMs = 25;
+    module.interjection = 'Linn, can you hear me?';
+    module.interjectionMetadata = { channelId: 'body:ears', tags: ['chat:addressed'] };
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    // The locus follows the conversation as before; the registry, not the
+    // pin, is what keeps the speech out of the channel.
+    assert.deepEqual(routed, [
+      { text: 'Station four, proceeding.', locus: 'chan-live-1' },
+      { text: 'Answering the room.', locus: 'body:ears' },
+    ]);
+    const wired = membrane.lastStream!.receivedToolResultOptions
+      .flatMap((o) => o?.injectedMessages ?? [])
+      .flatMap((m) => m.content as Array<{ type: string; text?: string }>)
+      .map((b) => b.text ?? '');
+    const notice = wired.find((t) => t.startsWith('[routing]'));
+    assert.ok(notice?.startsWith('[routing] The conversation moved to body:ears.'), String(notice));
+    assertSaysRefused(notice, 'the re-pin notice');
+
+    await framework.stop();
+  });
+
+  it('channel_open of an inbound-only channel says in its result that plain speech there is refused', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'channel_open', input: { channelId: 'body:ears' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Listening.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    stubChannelRegistry(framework);
+    const registry = declareEarsInboundOnly(framework);
+    registry.handleChannelToolCall = async () => ({ success: true, data: { channelId: 'body:ears', opened: true } });
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    const results = JSON.stringify(membrane.lastStream!.receivedToolResults.flat());
+    assertSaysRefused(results, 'the channel_open result');
 
     await framework.stop();
   });
