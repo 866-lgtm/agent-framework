@@ -27,7 +27,7 @@
 // nullcursor (nextCursor null), endless (a new cursor on every page, so the
 // list never ends), badlater (a well-formed first page, then a page with no
 // tools array). Tool `die` exits the process.
-import { appendFileSync, closeSync, existsSync, readFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, openSync, readFileSync } from 'node:fs';
 
 let mode = process.argv[2] ?? 'ok';
 const startLog = process.argv[3];
@@ -71,9 +71,12 @@ process.stdin.on('data', (chunk) => {
         process.stdin.removeAllListeners('data');
         process.stdin.removeAllListeners('end');
         // Node keeps a stdio descriptor open when its stream is destroyed, so
-        // the read end is closed by hand once the stream is done with it.
+        // the read end is closed by hand once the stream is done with it, and
+        // /dev/null takes fd 0 at once, as libuv assumes fds 0 to 2 stay taken
+        // (see deafen() in modern-raw-server.mjs).
         process.stdin.once('close', () => {
           try { closeSync(0); } catch { /* already closed */ }
+          openSync('/dev/null', 'r');
           process.stderr.write('deaf-ping: stdin closed\n');
           if (mode === 'deaf-ping-answered') {
             process.once('SIGUSR2', () => process.stdout.write(`${JSON.stringify(ping)}\n${JSON.stringify(ok)}\n`));

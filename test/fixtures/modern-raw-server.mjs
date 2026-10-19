@@ -29,7 +29,7 @@
 // vanish (exits without answering), deafen (answers, then closes its stdin and
 // stays up, so the next write to it fails with EPIPE).
 import { createInterface } from 'node:readline';
-import { appendFileSync, closeSync, existsSync, readFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, openSync, readFileSync } from 'node:fs';
 
 const [flagList = '', log] = process.argv.slice(2);
 const flags = new Set(flagList.split(',').filter(Boolean));
@@ -59,9 +59,13 @@ const discovered = (id) => result(id, {
  *  EPIPE; `then` runs once the read end is closed. */
 function deafen(then = () => {}) {
   // Node keeps a stdio descriptor open when its stream is destroyed, so
-  // the read end is closed by hand once the stream is done with it.
+  // the read end is closed by hand once the stream is done with it, and
+  // /dev/null takes fd 0 at once: libuv assumes fds 0 to 2 stay taken, and
+  // on macOS this sequence, with fd 0 left free, was aborted at its first
+  // stdout write by libuv's assertion `fd > STDERR_FILENO`.
   process.stdin.once('close', () => {
     try { closeSync(0); } catch { /* already closed */ }
+    openSync('/dev/null', 'r');
     note({ event: 'deaf' });
     then();
   });
