@@ -855,6 +855,15 @@ export class ChannelRegistry {
     return CapabilityGrant.of(this.serverRegistry.getServer(serverId)).has('channels.lifecycle');
   }
 
+  /** Whether a decided close holds words back from a channel: only where
+   *  the host directs the server's lifecycle. Without that grant the host
+   *  can't close the channel, and words go into a transport that is open,
+   *  as the open step's engagesDecidedClosed reads it too. */
+  private closeStands(entry: ChannelEntry): boolean {
+    return this.getDesiredState(entry.serverId, entry.descriptor.id) === 'closed' &&
+      this.directsLifecycle(entry.serverId);
+  }
+
   /** A registration's entry: nothing about its transport is known until a
    *  receipt for its target confirms it open or closed. */
   private registerEntry(key: string, serverId: string, descriptor: ChannelDescriptor): void {
@@ -2663,8 +2672,9 @@ export class ChannelRegistry {
   /**
    * Join outstanding lifecycle work without recording new intent. Retargeting
    * may have invalidated open confirmation while the decision remains pending.
-   * A close that settles during the wait remains authoritative; waiting for
-   * it is not an instruction to open the channel again.
+   * A close that settles during the wait remains authoritative where the host
+   * directs the server's lifecycle (closeStands); waiting for it is not an
+   * instruction to open the channel again.
    */
   private async waitForOpenChannel(entry: ChannelEntry): Promise<ChannelEntry> {
     const lifecycleKey = this.lifecycleKey(entry.serverId, entry.descriptor.id);
@@ -2686,7 +2696,7 @@ export class ChannelRegistry {
     }
     const current = this.channels.get(`${entry.serverId}:${entry.descriptor.id}`);
     if (!current) throw new Error('Channel registration was removed while delivery waited');
-    if (!current.open || this.getDesiredState(current.serverId, current.descriptor.id) === 'closed') {
+    if (!current.open || this.closeStands(current)) {
       throw new Error('Channel is not confirmed open for delivery, or was selected for closure while delivery waited');
     }
     return current;
@@ -3733,16 +3743,21 @@ export class ChannelRegistry {
    * may declare the channel inbound-only meanwhile, or a removal take it
    * away. So the check just before the publish, after every await, reads
    * the channel's registration as it is then, and refuses one that is gone
-   * or inbound-only. A removal during a wait already fails it there
-   * (waitForOpenChannel); the check also catches one made after the last
-   * wait, as the opening's notice can. Words refused after an open for a
-   * declaration leave the channel open, and the agent gets the failure for
-   * the words. An open by delivery (`openSource` 'opened-by-delivery', the
-   * default) that turned a closed channel open also gives the notice that
-   * it's open, which says how to close it. One that only
-   * reconfirmed the transport of a channel already decided open or tuned out
-   * changes no decision, and gives none. When the registration is gone, the
-   * failure says the channel was removed.
+   * or inbound-only, or whose server's grant no longer has channels.publish.
+   * A removal during a wait already fails it there (waitForOpenChannel); the
+   * check also catches one made after the last wait, as the opening's notice
+   * can. A registration nothing has confirmed open, such as one that
+   * replaced the one waited for or a retarget of it, or one whose close now
+   * stands (where the host directs the server's lifecycle), is treated as at
+   * the first wait: the words wait for its queued lifecycle work, and the
+   * check runs again on the registration that work leaves. Words refused
+   * after an open for a declaration leave the channel open, and the agent
+   * gets the failure for the words. An open by delivery (`openSource`
+   * 'opened-by-delivery', the default) that turned a closed channel open
+   * also gives the notice that it's open, which says how to close it.
+   * One that only reconfirmed the transport of a channel already decided
+   * open or tuned out changes no decision, and gives none. When the
+   * registration is gone, the failure says the channel was removed.
    *
    * Only the connector's `delivered: true` confirms a post. `failed` means
    * nothing was posted: the attempt stopped before the request was written,
@@ -3787,15 +3802,21 @@ export class ChannelRegistry {
       return { status: 'failed', destination, reason: `server "${entry.serverId}" not found`, at: at() };
     }
     // §14.1: channels/publish requires channels.publish in the grant. The
-    // host not sending is the enforcement.
-    if (!CapabilityGrant.of(server).has('channels.publish')) {
-      return {
-        status: 'failed',
-        destination,
-        reason: `channels.publish not in "${entry.serverId}"'s effective grant (§14.1)`,
-        at: at(),
-      };
-    }
+    // host not sending is the enforcement, here and at the last check.
+    const ungranted = (): PublishOutcome => ({
+      status: 'failed',
+      destination,
+      reason: `channels.publish not in "${entry.serverId}"'s effective grant (§14.1)`,
+      at: at(),
+    });
+    if (!CapabilityGrant.of(server).has('channels.publish')) return ungranted();
+
+    const prevented = (err: unknown): PublishOutcome => ({
+      status: 'failed',
+      destination,
+      reason: `lifecycle work prevented delivery: ${connectorText(err instanceof Error ? err.message : String(err))}`,
+      at: at(),
+    });
 
     // Lifecycle work already queued for the channel settles first: words go
     // out only into the channel it leaves, and fail visibly if it leaves
@@ -3804,12 +3825,7 @@ export class ChannelRegistry {
       try {
         entry = await this.waitForOpenChannel(entry);
       } catch (err) {
-        return {
-          status: 'failed',
-          destination,
-          reason: `lifecycle work prevented delivery: ${connectorText(err instanceof Error ? err.message : String(err))}`,
-          at: at(),
-        };
+        return prevented(err);
       }
     }
 
@@ -3867,14 +3883,35 @@ export class ChannelRegistry {
     // open's or any other: a registration that is gone, or inbound-only, at
     // this moment takes nothing. The entry is read from the map rather than
     // taken from the last wait: the opening's notice runs in between, and
-    // publish() resumes a microtask after the wait.
-    const current = this.channels.get(`${entry.serverId}:${entry.descriptor.id}`);
+    // publish() resumes a microtask after the wait. A registration nothing
+    // has confirmed open, such as one that replaced the one waited for
+    // (registered with open: false) or a retarget of it (marked unconfirmed),
+    // or one whose close now stands (closeStands), is treated as at the
+    // first wait: the words wait for its queued lifecycle work, and
+    // waitForOpenChannel refuses what that work leaves unconfirmed or with
+    // its close standing. The loop opens nothing itself. The check then runs
+    // again on the registration that stands. waitForOpenChannel returns
+    // only a registration it found open and whose close doesn't stand, or
+    // throws, so the loop ends unless the channel keeps changing.
+    const key = `${entry.serverId}:${entry.descriptor.id}`;
+    let current = this.channels.get(key);
+    while (current && !isInboundOnly(current) && (!current.open || this.closeStands(current))) {
+      try {
+        entry = await this.waitForOpenChannel(current);
+      } catch (err) {
+        return prevented(err);
+      }
+      current = this.channels.get(key);
+    }
     if (!current) {
       return { status: 'failed', destination, reason: 'the channel was removed before the words were published', at: at() };
     }
     if (isInboundOnly(current)) {
       return { status: 'failed', destination, reason: inboundOnlyReason(current), at: at() };
     }
+    // A grant reduced during any of the waits holds at once (§6.7): the
+    // words already on their way take it too.
+    if (!CapabilityGrant.of(server).has('channels.publish')) return ungranted();
 
     let result: unknown;
     try {
