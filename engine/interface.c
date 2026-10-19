@@ -86,11 +86,14 @@ static uint32_t next_id = 1;
  * case shows it). So QuickJS's own limit stays off, and these functions refuse ordinary
  * allocations at a soft limit OOM_HEADROOM under the limit. After a refusal, allocations may use
  * the headroom up to the limit, so that QuickJS can build the error and the script's handler can
- * run, and the next allocation that fits under the soft limit closes it again. So the first
- * out-of-memory error a script meets is a real one. A script that catches it and keeps allocating
- * without freeing spends the headroom itself, and an error after that can be a bare null:
- * keeping the headroom for the error alone would take QuickJS's own in_out_of_memory flag, which
- * its API doesn't expose.
+ * run, and the next allocation that fits under the soft limit closes it again. So a script that
+ * reaches the limit while the headroom is closed gets a real out-of-memory error. The host's
+ * buffers (engine_alloc) are held to the same limits, so a refused copy opens the headroom too,
+ * and the child's unfit error can still be copied in. Whatever runs while it's open can spend it:
+ * a script that catches the error and keeps allocating without freeing, or a result settled while
+ * the guest sits at the soft limit, whose copies and parse go in once the first copy's refusal
+ * has opened it. An out-of-memory error after that can be a bare null: keeping the headroom for
+ * the error alone would take QuickJS's own in_out_of_memory flag, which its API doesn't expose.
  */
 #define OOM_HEADROOM (64 * 1024)
 

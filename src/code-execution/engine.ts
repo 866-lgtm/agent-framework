@@ -121,9 +121,11 @@ export const MAX_RESULT_DEPTH = 2000;
 /** The most of the engine's own stdio a crash's message keeps. */
 const DIAGNOSTICS_CHARS = 4096;
 /**
- * The longest ending text the binding decodes: V8's longest string, in characters, which a text
- * of this many UTF-8 bytes can't exceed. A longer one couldn't be decoded, so it's answered as a
- * rejection that says so.
+ * The longest ending text the binding decodes, in UTF-8 bytes: V8's longest string, 2^29 - 24
+ * characters (Node's `buffer.constants.MAX_STRING_LENGTH`), which a text of this many bytes can't
+ * exceed. Node can't decode a longer one. Bun's longest string is 2^31 - 1, and the same bound
+ * holds there, so a script ends the same way on either. A longer text is answered as a rejection
+ * that gives its length.
  */
 const MAX_ENDING_BYTES = 2 ** 29 - 24;
 /** Leaves a quarter of the link-time stack for C frames between QuickJS's checks. */
@@ -402,8 +404,8 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
             : 'out of memory while reading what the script threw; throw something smaller, such as an Error with a shorter message' }
           : 'tooLong' in r
           ? { kind: 'rejected', name: 'RangeError', message: code === FULFILLED
-            ? `the script's return value is ${r.tooLong} bytes as JSON, more than can be read back; return less`
-            : `what the script threw is ${r.tooLong} bytes as JSON, more than can be read back; throw something smaller` }
+            ? `the script's return value is ${r.tooLong} bytes as JSON, more than the ${MAX_ENDING_BYTES} the engine reads back; return less`
+            : `what the script threw is ${r.tooLong} bytes as JSON, more than the ${MAX_ENDING_BYTES} the engine reads back; throw something smaller` }
           : r.kind === 0 ? { kind: 'fulfilled', json: undefined }
           : r.kind === 1 ? { kind: 'fulfilled', json: r.text }
           : errorState(r.text);

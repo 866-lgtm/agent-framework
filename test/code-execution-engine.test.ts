@@ -415,8 +415,8 @@ test('an ending longer than the binding can decode is answered with its length, 
   // The module's buffer here claims a text past V8's longest string; a real one needs a budget
   // of gigabytes.
   for (const [script, message] of [
-    ['({ ok: true })', 'the script\'s return value is 600000000 bytes as JSON, more than can be read back; return less'],
-    ['throw new Error("x")', 'what the script threw is 600000000 bytes as JSON, more than can be read back; throw something smaller'],
+    ['({ ok: true })', 'the script\'s return value is 600000000 bytes as JSON, more than the 536870888 the engine reads back; return less'],
+    ['throw new Error("x")', 'what the script threw is 600000000 bytes as JSON, more than the 536870888 the engine reads back; throw something smaller'],
   ]) {
     const { e } = await engineAround((ex, imports) => ({
       engine_result: () => {
