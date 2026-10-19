@@ -124,9 +124,15 @@ export type TraceEvent =
       blockType: 'text' | 'thinking' | 'tool_call' | 'tool_result';
       /** 0-indexed block position in the current assistant turn. */
       blockIndex: number;
-      /** The channel this stream shows typing in: the turn's locus as the
-       *  stream started (see inference:started), or in explicit mode the
-       *  channel the start's wake came from. */
+      /** The channel this stream shows typing in, the conversation the turn
+       *  is attending. Locus and hybrid mode: the turn's locus, which an
+       *  addressed re-pin or the agent's own `channel_open` can move between
+       *  rounds, so it can change within one stream; the indicator and these
+       *  traces follow it from the next round on, at the model's first
+       *  content in it or its retry after a refusal, and a tool result the
+       *  boundary reports carries the channel of the round it answers. In
+       *  hybrid mode a `>>>` envelope can send the text itself elsewhere.
+       *  Explicit mode: the channel the start's wake came from. */
       channelId?: string;
     })
   | (TraceEventBase & {
@@ -141,9 +147,15 @@ export type TraceEvent =
       phase: 'block_start' | 'block_complete';
       blockType: 'text' | 'thinking' | 'tool_call' | 'tool_result';
       blockIndex: number;
-      /** The channel this stream shows typing in: the turn's locus as the
-       *  stream started (see inference:started), or in explicit mode the
-       *  channel the start's wake came from. */
+      /** The channel this stream shows typing in, the conversation the turn
+       *  is attending. Locus and hybrid mode: the turn's locus, which an
+       *  addressed re-pin or the agent's own `channel_open` can move between
+       *  rounds, so it can change within one stream; the indicator and these
+       *  traces follow it from the next round on, at the model's first
+       *  content in it or its retry after a refusal, and a tool result the
+       *  boundary reports carries the channel of the round it answers. In
+       *  hybrid mode a `>>>` envelope can send the text itself elsewhere.
+       *  Explicit mode: the channel the start's wake came from. */
       channelId?: string;
     })
   | (TraceEventBase & {

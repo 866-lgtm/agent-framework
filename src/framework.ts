@@ -808,6 +808,14 @@ interface TurnRouting {
    */
   locus?: string;
   /**
+   * The channel the turn's typing indicator was last shown in, by any of its
+   * streams (showTurnTyping). A stream that hands the turn to a successor (a
+   * budget restart, a guard retry) leaves its indicator running, so a later
+   * start, or a move, that shows it elsewhere stops this one first, as after
+   * a re-pin.
+   */
+  typing?: string;
+  /**
    * Channels the turn sent into with a send tool (SEND_ENGAGEMENT_TOOLS): a
    * conversational follow-up in one of them is addressed by context, so it
    * re-pins the locus (2026-07-31 n=7: q's #portables reply, with no
@@ -14313,6 +14321,17 @@ export class AgentFramework {
   }
 
   /**
+   * Show the turn's typing indicator in `channelId`, stopping the one it last
+   * showed elsewhere: this stream's, or one an earlier stream of the turn
+   * left running when it handed the turn on.
+   */
+  private showTurnTyping(routing: TurnRouting, channelId: string): void {
+    if (routing.typing !== undefined && routing.typing !== channelId) this.channelRegistry?.stopTyping(routing.typing);
+    this.channelRegistry?.startTyping(channelId);
+    routing.typing = channelId;
+  }
+
+  /**
    * The channel of the turn's newest arrival whose message is still in the
    * agent's store (TurnRouting.arrivals). A message removed since it was
    * stored, such as an unread coalesced message its server retracted, moves
@@ -15673,14 +15692,16 @@ export class AgentFramework {
       // turn, which falls back to the global default rather than inheriting
       // a previous turn's channel.
       routing.triggerChannel = trigger?.channelId;
-      // FREEZE the turn's outbound locus now (turn-frozen routing): the home
-      // channel for forks, else the trigger channel, else the global default,
-      // which an ephemeral run never takes (takesGlobalFallback).
-      // Mid-turn injections must not redirect the agent's plain prose
-      // (ambient chatter and reactions hijacked it before, 2026-07-21), and
-      // the eager snapshot protects heartbeat turns from a moving
+      // Resolve the turn's outbound locus now: the home channel for forks,
+      // else the trigger channel, else the global default, which an
+      // ephemeral run never takes (takesGlobalFallback). Ambient mid-turn
+      // injections must not redirect the agent's plain prose (ambient
+      // chatter and reactions hijacked it before, 2026-07-21); only an
+      // addressed message, a follow-up in a channel the turn engaged
+      // (repinTurnLocus) or the agent's own channel_open moves it, between
+      // rounds. The eager snapshot protects heartbeat turns from a moving
       // defaultPublishChannel. Explicit mode uses a turn-scoped `>>` target
-      // and disabled mode has no prose target, so neither freezes or
+      // and disabled mode has no prose target, so neither resolves or
       // announces a locus. If the effective locus differs from the last one
       // announced, a durable `[routing]` notice goes into the window BEFORE
       // this turn compiles, so the agent always knows where its voice goes
@@ -15743,7 +15764,7 @@ export class AgentFramework {
       turnProseRouting === 'explicit'
         ? trigger?.channelId ?? null
         : turnLocus ?? null;
-    if (earlyTypingChannel) this.channelRegistry?.startTyping(earlyTypingChannel);
+    if (earlyTypingChannel) this.showTurnTyping(routing, earlyTypingChannel);
 
     try {
       const requestSnapshot = this.captureInferenceToolSnapshot(agent);
@@ -16294,22 +16315,40 @@ export class AgentFramework {
     let silenceBeforeRefusal: 'send' | 'private' | null | undefined;
 
     // Typing indicator: show "<agent> is typing…" for the whole duration of
-    // this turn. Started here (paired with the finally below, so it can never
-    // leak) and refreshed on a 7s interval by the ChannelRegistry until
-    // stopped on any exit path. Never moves mid-turn.
-    //   - locus mode: the frozen routing pin (where bare prose will land).
+    // this turn. Started at the turn's start, before the compile, and here,
+    // and refreshed on a 7s interval by the ChannelRegistry until the finally
+    // below stops it on an exit path that ends the turn. A stream that hands
+    // the turn to a successor leaves it running, and the successor's start
+    // stops it first if it shows elsewhere (showTurnTyping). Typing is
+    // presence, not delivery: it says "attending to the conversation here",
+    // whichever channel a `>>>` or `>>` envelope then sends the words to.
+    //   - locus and hybrid mode: the turn's locus, the conversation the turn
+    //     is attending. An addressed re-pin or the agent's own channel_open
+    //     can move it between rounds, and followTurnLocus (below) moves the
+    //     indicator with it at the next round's first content, or at its
+    //     retry after a refusal.
     //   - explicit mode: there is no locus — indicate on the TRIGGER channel
-    //     (where the wake came from). Typing is presence, not delivery, so
-    //     this doesn't violate never-guess: it says "attending to what you
-    //     sent here", which is true regardless of where the reply goes.
-    //     Heartbeat/no-trigger explicit turns show no indicator.
-    const typingChannel =
+    //     (where the wake came from). This doesn't violate never-guess: it
+    //     says "attending to what you sent here", which is true regardless
+    //     of where the reply goes. Heartbeat/no-trigger explicit turns show
+    //     no indicator.
+    let typingChannel =
       turnProseRouting === 'disabled'
         ? null
         : turnProseRouting === 'explicit'
           ? trigger?.channelId ?? null
           : resolveTurnLocus();
-    if (typingChannel) this.channelRegistry!.startTyping(typingChannel);
+    if (typingChannel) this.showTurnTyping(streamRouting, typingChannel);
+    // Locus and hybrid mode: move the indicator to the turn's locus when it
+    // has moved since the indicator last showed. Once a turn has a locus it
+    // always has one.
+    const followTurnLocus = (): void => {
+      if (turnProseRouting !== 'locus' && turnProseRouting !== 'hybrid') return;
+      const locus = resolveTurnLocus();
+      if (!locus || locus === typingChannel) return;
+      this.showTurnTyping(streamRouting, locus);
+      typingChannel = locus;
+    };
 
     // MCPL Spec 14.3 outgoing streaming: route text deltas to their
     // destination server AS THEY GENERATE (voice synthesis, live message
@@ -16501,6 +16540,16 @@ export class AgentFramework {
           break;
         }
         this.touchEphemeralRun(agent.name, true);
+        // The model's content in a round, or its retry after a refusal, comes
+        // after the boundary that may have moved the turn's locus: show the
+        // round where it is, before its traces name the channel. The results
+        // a tool boundary reports (XML tool mode's, or a result with an
+        // image) belong to the round before, and a response with nothing in
+        // it moves nothing, so a channel_open just before an empty final
+        // response doesn't start typing in a turn that is ending.
+        const modelContent = (event.type === 'tokens' && event.meta.type !== 'tool_result')
+          || (event.type === 'block' && event.event.block.type !== 'tool_result');
+        if (modelContent || event.type === 'retrying') followTurnLocus();
         switch (event.type) {
           case 'tokens': {
             const trace: Parameters<AgentFramework['emitTrace']>[0] = {
@@ -16509,9 +16558,9 @@ export class AgentFramework {
               content: event.content,
               blockType: event.meta.type,
               blockIndex: event.meta.blockIndex,
-              // Turn-frozen locus (same value as the typing indicator above):
-              // lets trace consumers tag every chunk with the channel this
-              // turn's prose is bound for, without re-deriving routing.
+              // The channel the typing indicator above shows, the conversation
+              // the turn is attending: lets trace consumers tag every chunk
+              // with it, without re-deriving routing.
               channelId: typingChannel ?? undefined,
             };
             // Delivery joins a round's text blocks with a newline
