@@ -40,10 +40,11 @@ export interface MountConfig {
    *   placed it, each call nests in it, as a start would now, every mount
    *   configured beneath its path, where that path leads beneath its root,
    *   and every other mount whose root, as that start placed it, lies
-   *   beneath where its root lies now. A mount configured elsewhere whose
-   *   own root has moved since, and the other mounts' own placements, wait
-   *   for the next start, so a direct root moved into another mount's
-   *   directory is still that mount's too.
+   *   beneath where its root lies now, or whose configured path lies
+   *   beneath a directory that start found there. A mount configured
+   *   elsewhere whose own root has moved since, and the other mounts' own
+   *   placements, wait for the next start, so a direct root moved into
+   *   another mount's directory is still that mount's too.
    *
    * A mount configured 'direct' runs as 'chronicle' from a start that finds
    * the store holding changes there that disk lacks, on the branch selected
@@ -151,7 +152,8 @@ export interface MountConfig {
    * include doesn't cover, and a listing that isn't recursive names each
    * directory directly beneath its path that disk has, and each that a
    * covered entry in history implies, with only the files the include
-   * covers. `ignore` still applies to what `include` covers.
+   * covers. A direct mount has no history (`backend`), so there disk alone
+   * decides each of these. `ignore` still applies to what `include` covers.
    *
    * On a disk that folds names, the parse reads a path in disk's spelling,
    * as the walk names what it lists, so a covered name whose file disk
