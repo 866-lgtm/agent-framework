@@ -131,6 +131,51 @@ test('HTTP: a deadline aborts the request stream, and the server sees the cancel
   assert.ok(events.includes('slow-aborted'), `server events: ${events.join(', ')}`);
 });
 
+test('HTTP: an argument JSON cannot write is refused before the wire, and raises no connection error (#556)', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const { url, seen, server } = await startServer(() => true);
+  cleanups.push(() => new Promise<void>((resolve) => { server.closeAllConnections?.(); server.close(() => resolve()); }));
+  const connection = await ModernMcpConnection.connect({ id: 'remote', url, token: 't' });
+  cleanups.push(() => connection.close());
+  const errors: string[] = [];
+  connection.on('error', (error: Error) => errors.push(error.message));
+  const toolCalls = () => seen.filter((s) => s.method === 'POST' && s.mcpMethod === 'tools/call').length;
+  const before = toolCalls();
+  await assert.rejects(connection.callTool('echo', { text: 'x', n: 1n }), (err: unknown) => {
+    assert.ok(err instanceof McplRequestError, String(err));
+    assert.equal(err.outcome, 'not-sent');
+    return true;
+  });
+  assert.equal(toolCalls(), before, 'no tools/call reached the server');
+  assert.deepEqual(errors, []);
+});
+
+test('HTTP: a request the server answers with HTTP 500 is reported once, to its caller and in one log line, not as a connection error (#556)', async (t) => {
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => lines.push(args.map(String).join(' ')));
+  const { url, server } = await startServer(() => true, (message, res) => {
+    if (message.method !== 'tools/call') return false;
+    res.writeHead(500, { 'content-type': 'text/plain' }).end('boom');
+    return true;
+  });
+  cleanups.push(() => new Promise<void>((resolve) => { server.closeAllConnections?.(); server.close(() => resolve()); }));
+  const connection = await ModernMcpConnection.connect({ id: 'remote', url, token: 't' });
+  cleanups.push(() => connection.close());
+  const failed = (err: unknown) => {
+    assert.ok(err instanceof McplRequestError, String(err));
+    assert.equal(err.outcome, 'no-response');
+    return true;
+  };
+  // With no listener of the host's, the connection logs an 'error' itself,
+  // so a second report would be a second line.
+  await assert.rejects(connection.callTool('echo', { text: 'x' }), failed);
+  assert.deepEqual(lines.filter((line) => line.includes('boom')), ['MCP server "remote" tools/call echo failed with HTTP 500: "Error POSTing to endpoint: boom"']);
+  const errors: string[] = [];
+  connection.on('error', (error: Error) => errors.push(error.message));
+  await assert.rejects(connection.callTool('echo', { text: 'x' }), failed);
+  assert.deepEqual(errors, []);
+});
+
 test('HTTP: a credential the server keeps refusing fails the connect, naming 401', async () => {
   const { url, server } = await startServer(() => false);
   cleanups.push(() => new Promise<void>((resolve) => { server.closeAllConnections?.(); server.close(() => resolve()); }));
