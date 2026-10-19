@@ -2,9 +2,11 @@ name: Engine
 
 # code_execution's engine module, src/code-execution/quickjs.wasm, is committed beside the sources
 # it's built from: the vendored quickjs-ng and engine/interface.c, built by engine/build.sh with a
-# pinned toolchain. This rebuilds it from them and fails unless the bytes are the committed ones,
-# so the module can't drift from its sources in either direction. It runs only when one of them
-# changes, since the toolchain is a 143 MB download.
+# pinned toolchain. This first copies the pinned quickjs-ng release with engine/vendor.sh and fails
+# unless that's the committed source, so the vendored copy is the release it names. Then it
+# rebuilds the module and fails unless the bytes are the committed ones, so the module can't drift
+# from its sources in either direction. It runs only when one of them changes, since the toolchain
+# is a 143 MB download.
 on:
   push:
     branches:
@@ -32,6 +34,18 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
+
+      # vendor.sh copies the pinned release's files over engine/quickjs-ng, so any difference from
+      # what's committed is an edit to the vendored source, or a pin it doesn't match.
+      - name: Copy the pinned quickjs-ng release and compare it with the committed source
+        run: |
+          engine/vendor.sh
+          changes=$(git status --porcelain -- engine/quickjs-ng)
+          if [ -n "$changes" ]; then
+            echo "$changes"
+            echo "::error::engine/quickjs-ng isn't the release engine/vendor.sh pins. Change the engine through vendor.sh's TAG and COMMIT, run it, and commit what it copies."
+            exit 1
+          fi
 
       # binaryen's wasm-opt comes from npm and runs under Node.
       - name: Setup Node.js
