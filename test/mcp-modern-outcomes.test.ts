@@ -63,9 +63,23 @@ const wire = (log: string): LogEntry[] =>
   existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l) as LogEntry) : [];
 const calls = (log: string, tool: string) => wire(log).filter((e) => e.method === 'tools/call' && e.tool === tool).length;
 
-async function until(cond: () => boolean, what: string, ms = 5000): Promise<void> {
-  const deadline = Date.now() + ms;
-  while (!cond() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+/**
+ * How long an `until` gives its event before it fails, naming what it
+ * awaited. It's sized for a hang, not for speed: no `until` here asserts how
+ * fast something happens, and the tests that do measure it themselves. A
+ * bound a few seconds above a designed duration (a launch's start and
+ * handshake, the transport's 2 s grace after SIGTERM and again after
+ * SIGKILL) can fail a correct run on a loaded machine; this one fails it
+ * only if the event is held back a whole minute. As the coalescing fixture's
+ * REPLY_DEADLINE_MS does, it turns a wait that never ends into a failure
+ * that names it, well inside the suite's own test timeout.
+ */
+const WAIT_MS = 60_000;
+
+async function until(cond: () => boolean, what: string): Promise<void> {
+  // The monotonic clock: a wall-clock step must not fail a wait that's on schedule.
+  const deadline = performance.now() + WAIT_MS;
+  while (!cond() && performance.now() < deadline) await new Promise((r) => setTimeout(r, 20));
   assert.ok(cond(), `in time: ${what}`);
 }
 
@@ -229,7 +243,7 @@ test('a lost transport whose child can\'t be reaped halts reconnecting (R1-1)', 
     await until(() => !alive(line.child.pid), 'the held child killed');
   });
   line.markClosed({ reason: 'stdio pipe failed' });
-  await until(() => errors.some((m) => /Not starting another launch while it may still be running/.test(m)), 'the launch held as unreaped', 8000);
+  await until(() => errors.some((m) => /Not starting another launch while it may still be running/.test(m)), 'the launch held as unreaped');
   assert.equal(connection.willReconnect, false);
   // No later attempt will come, so the halt is a permanent failure, which the
   // framework raises as an alert.
@@ -254,7 +268,7 @@ test("without reconnect, a lost transport whose child can't be reaped is a perma
     await until(() => !alive(line.child.pid), 'the held child killed');
   });
   line.markClosed({ reason: 'stdio pipe failed' });
-  await until(() => failures.length > 0, 'the permanent failure', 8000);
+  await until(() => failures.length > 0, 'the permanent failure');
   assert.equal(failures[0]!.permanent, true);
   assert.match(failures[0]!.error, /the previous launch could not be reaped/);
   assert.doesNotMatch(failures[0]!.error, /reconnecting/);
@@ -290,7 +304,7 @@ test("a 'close' listener that throws doesn't skip a lost transport's reap (R1-1)
     liveLine(connection).markClosed({ reason: 'stdio pipe failed' });
   } catch { /* the listener's own error, wherever it surfaces */ }
   // The child ignores SIGTERM, so its reap ends with SIGKILL after 2 s.
-  await until(() => !alive(first), "the lost child's reap", 8000);
+  await until(() => !alive(first), "the lost child's reap");
 });
 
 test('close() marks a connection closed at once, so a start() in the same turn launches nothing', async () => {
@@ -339,17 +353,17 @@ test('close() right after start() ends a modern stdio connect still spawning, wi
   const log = scratchLog();
   const pids = spawnedPids();
   const connection = ModernMcpConnection.create({ id: 'raw', command: process.execPath, args: [SERVER, 'hang-discover', log], protocol: 'modern' });
-  const began = Date.now();
+  const began = performance.now();
   const started = connection.start().then(() => null, (error: unknown) => error);
   await connection.close();
-  const tookMs = Date.now() - began;
+  const tookMs = performance.now() - began;
   assert.ok(tookMs < 15_000, `close() took ${tookMs} ms, not the discover probe's 30 s`);
   // The child may be ended before it can log its start, so its pid comes
   // from the spawn.
   assert.equal(pids.length, 1, 'one launch');
   assert.equal(alive(pids[0]!), false, 'the child is gone once close() resolved');
   await started;
-  const endedMs = Date.now() - began;
+  const endedMs = performance.now() - began;
   assert.ok(endedMs < 15_000, `the connect ended after ${endedMs} ms, not the discover probe's 30 s`);
   assert.equal(connection.isConnected, false);
 });
@@ -360,9 +374,12 @@ test('close() during a reconnect handshake ends the launch it was waiting on, an
   await connection.callTool('die', {});
   await until(() => wire(log).some((e) => e.launch === 2 && e.method === 'server/discover'), 'launch 2 waiting on discover');
   const second = wire(log).find((e) => e.launch === 2 && e.event === 'start')!;
+  const began = performance.now();
   await connection.close();
+  const tookMs = performance.now() - began;
+  assert.ok(tookMs < 15_000, `close() took ${tookMs} ms, not the connect's 30 s`);
   const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
-  await until(() => !alive(second.pid!), 'the hanging launch has exited', 3000);
+  assert.equal(alive(second.pid!), false, 'the hanging launch is gone once close() resolved');
   await new Promise((r) => setTimeout(r, 200));
   assert.equal(wire(log).filter((e) => e.event === 'start').length, 2, 'no launch after close');
   assert.equal(connection.isConnected, false);
@@ -371,7 +388,7 @@ test('close() during a reconnect handshake ends the launch it was waiting on, an
 test('an input_required continuation keeps its evidence: the second leg decides the outcome', async () => {
   const logged = hostLog();
   const log = scratchLog();
-  const connection = await connect('', log, { requestTimeoutMs: 600 });
+  const connection = await connect('', log);
   await connection.listTools();
   await assert.rejects(connection.callTool('cont', { leg2: 'error' }), (err: unknown) => {
     assert.ok(err instanceof McplRequestError, String(err));
@@ -381,16 +398,26 @@ test('an input_required continuation keeps its evidence: the second leg decides 
     return true;
   });
   loggedLine(logged, /^MCP server "raw" answered tools\/call cont with error -32603: /);
-  await assert.rejects(connection.callTool('cont', { leg2: 'hang' }), (err: unknown) => {
+  // Only the call meant to time out gets a short deadline, on a connection
+  // of its own: the call above, which must be answered, keeps the default.
+  // The deadline covers the whole call, leg 1's answer included, so it gives
+  // leg 1 the 1.5 s the deadline test below does.
+  const hangLog = scratchLog();
+  const hanging = await connect('', hangLog, { requestTimeoutMs: 1500 });
+  await hanging.listTools();
+  await assert.rejects(hanging.callTool('cont', { leg2: 'hang' }), (err: unknown) => {
     assert.ok(err instanceof McplRequestError, String(err));
     assert.equal(err.outcome, 'no-response');
-    assert.equal(err.message, 'The "raw" server didn\'t answer within 0.6 seconds, so whether the request took effect is unknown: ' +
+    assert.equal(err.message, 'The "raw" server didn\'t answer within 1.5 seconds, so whether the request took effect is unknown: ' +
       'this host asked it to cancel, and it may still complete on the server. ' +
       'Check its effect before trying again, since repeating something that changes state may do it twice.');
     return true;
   });
-  loggedLine(logged, /^MCP server "raw" didn't answer tools\/call cont within 600ms; cancellation requested$/);
-  assert.equal(calls(log, 'cont'), 4, 'two legs each');
+  loggedLine(logged, /^MCP server "raw" didn't answer tools\/call cont within 1500ms; cancellation requested$/);
+  assert.equal(calls(log, 'cont'), 2, 'two legs');
+  // The server logs a leg as it reads it, and the deadline doesn't wait
+  // for that, so the hang leg is awaited.
+  await until(() => calls(hangLog, 'cont') === 2, 'the second leg on the wire');
 });
 
 test('a deadline between continuation rounds is no-response, and claims no cancellation', async () => {
@@ -501,7 +528,7 @@ test('a result type this revision does not define, or none, is not a final answe
 
 test('concurrent continuations never cross their evidence', async () => {
   const log = scratchLog();
-  const connection = await connect('', log, { requestTimeoutMs: 2000 });
+  const connection = await connect('', log);
   await connection.listTools();
   const [failing, passing, failingToo] = await Promise.allSettled([
     connection.callTool('cont', { leg2: 'error' }),
@@ -578,7 +605,7 @@ test('a failed launch that cannot be reaped halts reconnecting; close() settles 
   connection.on('reconnect-failed', (f) => failures.push(f));
   connection.on('error', () => {});
   await connection.callTool('die', {});
-  await until(() => failures.some((f) => f.permanent), 'a permanent reconnect failure', 9000);
+  await until(() => failures.some((f) => f.permanent), 'a permanent reconnect failure');
   const halted = failures.find((f) => f.permanent)!;
   assert.match(halted.error, /the previous launch could not be reaped .*reconnecting is halted/);
   assert.equal(connection.willReconnect, false);
@@ -913,7 +940,7 @@ test('close() during a connect waits for that connect\'s own cleanup, and report
   await connection.close();
 });
 
-test('a server that closes its stdin and ignores SIGTERM is killed and reconnected, and a call made after the failure is refused as not sent', { timeout: 40_000 }, async () => {
+test('a server that closes its stdin and ignores SIGTERM is killed and reconnected, and a call made after the failure is refused as not sent', async () => {
   const logged = hostLog();
   const log = scratchLog();
   const connection = await connect('ignore-sigterm', log, { reconnect: true, reconnectIntervalMs: 30, reconnectMaxIntervalMs: 60, requestTimeoutMs: 30_000 });
@@ -936,14 +963,14 @@ test('a server that closes its stdin and ignores SIGTERM is killed and reconnect
   });
   loggedLine(logged, /^MCP server "raw" tools\/call plain not sent: ".*stdio pipe failed with write EPIPE"$/);
   // SIGKILL ends the child, and the connection reconnects as after any loss.
-  await until(() => wire(log).filter((e) => e.event === 'start').length === 2 && connection.isConnected, 'the next launch, connected', 15_000);
+  await until(() => wire(log).filter((e) => e.event === 'start').length === 2 && connection.isConnected, 'the next launch, connected');
   assert.equal(closes.length, 1, closes.join('; '));
   const outcome = await first;
   assert.ok(outcome instanceof McplRequestError && outcome.outcome !== 'not-sent', `the written call failed with the close: ${String(outcome)}`);
   assert.deepEqual((await connection.callTool('plain', {})).content, [{ type: 'text', text: 'plain' }], 'the next launch answers');
 });
 
-test("a server that closes its stdin and outlives SIGKILL too is held as a launch that can't be reaped: a permanent failure, no second launch, and close() retries", { timeout: 40_000 }, async () => {
+test("a server that closes its stdin and outlives SIGKILL too is held as a launch that can't be reaped: a permanent failure, no second launch, and close() retries", async () => {
   const log = scratchLog();
   const connection = await connect('', log, { reconnect: true, reconnectIntervalMs: 30, reconnectMaxIntervalMs: 60, requestTimeoutMs: 30_000 });
   connection.on('error', () => { /* the held launch, reported */ });
@@ -960,7 +987,7 @@ test("a server that closes its stdin and outlives SIGKILL too is held as a launc
   await connection.callTool('deafen', {});
   await until(() => wire(log).some((e) => e.event === 'deaf'), 'the server to close its stdin');
   void connection.callTool('plain', {}).catch(() => { /* its write meets EPIPE */ });
-  await until(() => failures.length > 0, 'the permanent failure', 12_000);
+  await until(() => failures.length > 0, 'the permanent failure');
   assert.equal(failures.length, 1);
   assert.equal(failures[0]!.permanent, true);
   assert.match(failures[0]!.error, /^its stdio pipe failed with write EPIPE; the previous launch could not be reaped \(stdio child \d+ of MCP server "raw" did not exit within 2000ms of SIGKILL; it could not be reaped\); reconnecting is halted$/);
