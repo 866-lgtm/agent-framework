@@ -424,12 +424,13 @@ describe('runEphemeralToCompletion settle signal', () => {
     return { framework, membrane, residentStreaming, inSlowEvent, push };
   }
 
-  it("a run whose turn stop() refuses ends with the refusal when its startup watchdog fires before stop()'s sweep", { timeout: 60_000 }, async () => {
+  it("a run whose turn stop() refuses ends with the refusal when its startup watchdog fires before stop()'s sweep", { timeout: 60_000 }, async (t) => {
     // stop() waits on a resident's stream until the test releases it, so its
     // sweep comes after that. Meanwhile the loop, finishing a slow event,
-    // takes the run's wake up and refuses its turn, and the run's startup
-    // watchdog fires first. Once stop() has begun, it says why the run ended,
-    // the framework is stopping, and what it saw, but blames no stalled loop.
+    // takes the run's wake up and refuses its turn, and then the run's
+    // startup watchdog fires. Once stop() has begun, it says why the run
+    // ended, the framework is stopping, and what it saw, but blames no
+    // stalled loop.
     const { tempDir, storePath } = tempStorePath('ephemeral-held-stop-startup-');
     let release!: () => void;
     const released = new Promise<void>((resolve) => { release = resolve; });
@@ -441,20 +442,45 @@ describe('runEphemeralToCompletion settle signal', () => {
       await residentStreaming;
       push('slow');
       await inSlowEvent;
-      // Well past the slow event's 100 ms, so the loop has taken the wake up
-      // and refused the turn before the watchdog fires.
+      // The run's startup watchdog stays a real 1 s timer, but its callback
+      // waits until the loop has taken the run's wake up, since on a slow host
+      // the loop can still be in the slow event when the timer comes due. The
+      // run sets the watchdog as it starts, before its first await.
+      const realSetTimeout = globalThis.setTimeout;
+      let wakeTaken!: () => void;
+      const taken = new Promise<void>((resolve) => { wakeTaken = resolve; });
+      let watchdogs = 0;
+      const timers = t.mock.method(globalThis, 'setTimeout', ((callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+        if (ms !== 1_000) return realSetTimeout(callback, ms, ...args);
+        watchdogs += 1;
+        return realSetTimeout(() => { void taken.then(() => callback(...args)); }, ms);
+      }) as unknown as typeof setTimeout);
       const run = framework.runEphemeralToCompletion(agent, contextManager, { startupTimeoutMs: 1_000 });
+      timers.mock.restore();
+      // A failure below is then reported alone, without the run's own
+      // rejection once stop()'s sweep ends it.
+      void run.catch(() => {});
+      assert.equal(watchdogs, 1, 'the run set its startup watchdog as it started');
+      const pending = () => (framework as unknown as { pendingRequests: Array<{ agentName: string }> }).pendingRequests;
+      assert.ok(pending().some((request) => request.agentName === agent.name), "the run's wake is queued");
       const stopped = framework.stop();
+      const deadline = performance.now() + 30_000;
+      while (pending().some((request) => request.agentName === agent.name)) {
+        assert.ok(performance.now() < deadline, "the loop didn't take the run's wake up within 30 s");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      wakeTaken();
       // The held stream is released only after this, so the sweep can't have
       // ended the run.
       await assert.rejects(run, /refused: the framework is stopping \(inference not started within 1000ms\)/);
-      const pending = (framework as unknown as { pendingRequests: Array<{ agentName: string }> }).pendingRequests;
-      assert.ok(!pending.some((request) => request.agentName === agent.name), "the loop took the run's wake up");
       release();
       await stopped;
       assert.equal(membrane.calls.length, 1, "the run's turn sent nothing");
     } finally {
       release();
+      // A check that failed before stop() would leave the framework running
+      // over a store about to be removed.
+      await framework.stop().catch(() => {});
       rmSync(tempDir, { recursive: true, force: true });
     }
   });
