@@ -67,6 +67,15 @@ class ToolboxModule implements Module {
   }
 }
 
+/**
+ * A stream message's channel as the test records it. Each delivery hands its
+ * stream the destination its publish went to, here the stub's server: one
+ * for any other server is recorded with it, so a delivery that loses its
+ * server fails the test.
+ */
+const streamedAt = (to: { serverId: string; channelId: string }) =>
+  (to.serverId === 'stub' ? to.channelId : `${to.channelId} (server ${to.serverId})`);
+
 /** Registry stub: two known channels (#alpha guild, laria's DM) + capture. */
 function stubRegistry(framework: AgentFramework, plan: Array<'delivered' | 'false' | 'unknown' | 'throw'> = []) {
   const routed: Array<{ text: string; locus: string | null }> = [];
@@ -104,7 +113,7 @@ function stubRegistry(framework: AgentFramework, plan: Array<'delivered' | 'fals
     routeSpeech: async (agent: string, text: string, locus?: string | null) => {
       const outcome = await deliverSpeech(agent, text, locus);
       return outcome.status === 'delivered'
-        ? { delivered: true, channelId: outcome.destination.channelId }
+        ? { delivered: true, serverId: outcome.destination.serverId, channelId: outcome.destination.channelId }
         : null;
     },
     resolveDestination: ({ channelId }: { channelId: string }) => ({ destination: { serverId: 'stub', channelId } }),
@@ -267,11 +276,11 @@ describe('explicit prose routing', () => {
     const chunks: Array<{ channelId: string; delta: string }> = [];
     const completes: Array<{ channelId: string; text: string }> = [];
     const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
-    registry.sendOutgoingChunk = ({ channelId }: { channelId: string }, _agent: string, _id: string, _index: number, delta: string) => {
-      chunks.push({ channelId, delta });
+    registry.sendOutgoingChunk = (to: { serverId: string; channelId: string }, _agent: string, _id: string, _index: number, delta: string) => {
+      chunks.push({ channelId: streamedAt(to), delta });
     };
-    registry.sendOutgoingComplete = ({ channelId }: { channelId: string }, _agent: string, _id: string, text: string) => {
-      completes.push({ channelId, text });
+    registry.sendOutgoingComplete = (to: { serverId: string; channelId: string }, _agent: string, _id: string, text: string) => {
+      completes.push({ channelId: streamedAt(to), text });
     };
     return { chunks, completes };
   }
@@ -2185,11 +2194,11 @@ describe('explicit prose routing', () => {
     registry.inboundOnlyServer = (channelId: string) => (channelId === 'body:ears' ? 'body' : undefined);
     const chunks: Array<{ channelId: string; delta: string }> = [];
     const completes: Array<{ channelId: string; text: string }> = [];
-    registry.sendOutgoingChunk = ({ channelId }: { channelId: string }, _agent: string, _inference: string, _index: number, delta: string) => {
-      chunks.push({ channelId, delta });
+    registry.sendOutgoingChunk = (to: { serverId: string; channelId: string }, _agent: string, _inference: string, _index: number, delta: string) => {
+      chunks.push({ channelId: streamedAt(to), delta });
     };
-    registry.sendOutgoingComplete = ({ channelId }: { channelId: string }, _agent: string, _inference: string, text: string) => {
-      completes.push({ channelId, text });
+    registry.sendOutgoingComplete = (to: { serverId: string; channelId: string }, _agent: string, _inference: string, text: string) => {
+      completes.push({ channelId: streamedAt(to), text });
     };
     feedTurn(framework, 2, [{ type: 'text', text: '>>skip_reply' }] as ContentBlock[]);
     trigger(framework);
