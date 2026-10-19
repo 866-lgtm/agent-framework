@@ -4319,17 +4319,16 @@ export class AgentFramework {
     for (const { wait, release } of released) {
       console.error(`[provider-wait] agent=${agentName} model=${wait.model} released by ${by} (${release})`);
     }
-    // The agent's context strategy may pace its own provider calls by the
-    // same stated wait. No released context-manager has
-    // releaseCompressionPause (0.16.0 doesn't), so this calls nothing in
-    // its strategies today. The release is the operator's word on that wait
-    // too, so it is offered to the lane with its scope even when no wait
-    // binds here: the lane can hold a pause after
-    // this framework's own wait is gone (the records read again, the wait
-    // passed, or it was released in another process). The strategy's own
-    // backoff stays, and the receipt still lists only waits released here.
-    // Read inside the try: the release is already recorded, so a strategy
-    // that throws must not keep the hold below from being released.
+    // The agent's context strategy may pace its own provider calls by the same
+    // stated wait. context-manager 0.16.0, this package's floor, has no
+    // releaseCompressionPause, so this calls nothing in its strategies. The
+    // release is the operator's word on that wait too, so it is offered to the
+    // lane with its scope even when no wait binds here: the lane can hold a
+    // pause after this framework's own wait is gone (the records read again,
+    // the wait passed, or it was released in another process). The strategy's
+    // own backoff stays, and the receipt still lists only waits released here.
+    // Read inside the try: the release is already recorded, so a strategy that
+    // throws must not keep the hold below from being released.
     try {
       const strategy = this.agents.get(agentName)?.getContextManager().getStrategy() as
         { releaseCompressionPause?: (model?: string) => boolean } | undefined;
@@ -11247,7 +11246,9 @@ export class AgentFramework {
     // applied: none of it is applied, its module state update and inference
     // request included, so no turn runs for content that was never stored,
     // and it doesn't count as accepting a surface's input. A line names the
-    // module, and the other modules' responses apply.
+    // module, and the other modules' responses apply. The trace and the
+    // process log list the responses that applied, so a view built on them
+    // doesn't show a refused response's messages as the event's.
     const applying = responses.filter(({ moduleName, response }) => {
       const refusal = malformedResponseContent(response);
       if (refusal !== null) {
@@ -11275,11 +11276,11 @@ export class AgentFramework {
     const durationMs = Date.now() - startTime;
 
     // Always emit trace for observability (UI needs this)
-    this.emitTrace({ type: 'process:completed', processEvent: event, responses, durationMs });
+    this.emitTrace({ type: 'process:completed', processEvent: event, responses: applying, durationMs });
 
     // Log to Chronicle (if enabled)
     if (this.processLoggingPersist) {
-      this.logProcessEvent(event, responses);
+      this.logProcessEvent(event, applying);
     }
   }
 
@@ -20367,9 +20368,10 @@ export class AgentFramework {
    * queued behind it to be stored alone. context-manager mends a tool_use
    * whose input isn't an object, so it refuses one only when that input has
    * no JSON form or the block itself is malformed. addMessage refuses such
-   * content before it's queued, so an entry meets this here only from a queue
-   * an earlier process persisted, or as puppetToolCall's pair, which it
-   * queues itself.
+   * content before it's queued, so an entry meets this here from a queue an
+   * earlier process persisted, as puppetToolCall's pair, which it queues
+   * itself, or when the strategy's chunking splits well-formed content into a
+   * shard the store refuses, which the store's error names.
    *
    * The hold is the queue's alone. A write that isn't deferred is stored at
    * once and can land ahead of a held entry: a fresh tool_result, whatever

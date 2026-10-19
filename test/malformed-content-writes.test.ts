@@ -62,11 +62,13 @@ async function harness(modules: Writer[]) {
   const errors: string[] = [];
   const error = console.error;
   console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+  const traces: Array<Record<string, unknown>> = [];
+  framework.onTrace((e) => { traces.push(e as unknown as Record<string, unknown>); });
   const window = () => framework.getAgent('assistant')!.getContextManager().getAllMessages()
     .map((m) => `${m.participant}: ${m.content.map((b) => (b.type === 'text' ? (b as { text: string }).text : `<${b.type}>`)).join(' ')}`);
   const queued = () => (framework as unknown as { deferredMessages: unknown[] }).deferredMessages.length;
   return {
-    framework, membrane, errors, window, queued,
+    framework, membrane, errors, traces, window, queued,
     close: async () => {
       console.error = error;
       await framework.stop();
@@ -152,6 +154,9 @@ test("a process response with a malformed message or edit is refused whole, queu
     e.startsWith(`[process-response-refused] module=${module} event=ping reason=malformed-content: `) && e.includes(where));
   assert.ok(refused('bad', 'addMessages[1]'), x.errors.join('\n'));
   assert.ok(refused('bad-edit', 'editMessages[0]'), x.errors.join('\n'));
+  const completed = x.traces.filter((e) => e.type === 'process:completed' && (e.processEvent as { type: string }).type === 'ping');
+  assert.deepEqual(completed.map((e) => (e.responses as Array<{ moduleName: string }>).map((r) => r.moduleName)), [['good']],
+    'the trace lists only the response that applied');
 });
 
 test("console input whose only message is refused isn't counted as accepted", async (t) => {
