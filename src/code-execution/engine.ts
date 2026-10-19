@@ -48,11 +48,16 @@ export interface EngineSlots {
 export type RunState =
   /** The queue is empty and the script hasn't settled: it awaits a call, or a promise nothing settles. */
   | { kind: 'pending' }
-  /** The script settled. `json` is JSON.stringify of its value, undefined when that gives none. */
+  /**
+   * The script settled. `json` is JSON.stringify of its value, undefined when that gives none. It's
+   * taken once: every later answer of this state carries the same text.
+   */
   | { kind: 'fulfilled'; json: string | undefined }
   /**
    * The prelude or the script threw, or its value couldn't be stringified (a BigInt, a cycle).
-   * A thrown non-Error value has name `''` and message `String(value)`.
+   * The fields are what was thrown: an Error's name, message and stack. A thrown value with no
+   * message of its own has name `''`, and as its message an object's JSON, or else
+   * `String(value)`.
    */
   | { kind: 'rejected'; name: string; message: string; stack?: string }
   /** `interrupt()` returned true while it ran. */
@@ -102,6 +107,8 @@ export const MIN_MEMORY_BYTES = 4 * 1024 * 1024;
  */
 export const MAX_MEMORY_BYTES = 2048 * 1024 * 1024;
 export const DEFAULT_STACK_BYTES = 512 * 1024;
+/** The most of the engine's own stdio a crash's message keeps. */
+const DIAGNOSTICS_CHARS = 4096;
 /** Leaves a quarter of the link-time stack for C frames between QuickJS's checks. */
 export const MAX_STACK_BYTES = LINK_STACK_BYTES - 256 * 1024;
 
@@ -224,7 +231,9 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
       for (let i = 0; i < iovsLen; i++) {
         const base = view.getUint32(bytes(iovs + i * 8, 8).byteOffset, true);
         const len = view.getUint32(iovs + i * 8 + 4, true);
-        if (diagnostics.length < 4096) diagnostics += text(base, len);
+        // Kept to DIAGNOSTICS_CHARS in all, clipped before decoding: each byte is at most a char.
+        const room = DIAGNOSTICS_CHARS - diagnostics.length;
+        if (room > 0) diagnostics += text(base, Math.min(len, room));
         total += len;
       }
       view.setUint32(bytes(written, 4).byteOffset, total, true);
@@ -285,6 +294,12 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
     if (typeof e.stack === 'string') state.stack = e.stack;
     return state;
   };
+  /**
+   * Each ending as it was first read. Reading one serializes the script's value or error in the
+   * guest, which can run the script's own code (a toJSON, a getter), and every settle after the
+   * script has ended answers that ending again: read once, that code runs once.
+   */
+  const endings = new Map<number, RunState>();
   /** Reads a state code into a RunState, or throws for the engine's own failures. */
   const toState = (code: number, what: string): RunState => {
     switch (code) {
@@ -294,11 +309,15 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
         return { kind: 'interrupted' };
       case FULFILLED:
       case REJECTED: {
+        const known = endings.get(code);
+        if (known) return { ...known };
         const r = result();
         if (!r) return { kind: 'rejected', name: 'InternalError', message: 'out of memory while reading the script\'s result' };
-        if (r.kind === 0) return { kind: 'fulfilled', json: undefined };
-        if (r.kind === 1) return { kind: 'fulfilled', json: r.text };
-        return errorState(r.text);
+        const state: RunState = r.kind === 0 ? { kind: 'fulfilled', json: undefined }
+          : r.kind === 1 ? { kind: 'fulfilled', json: r.text }
+          : errorState(r.text);
+        endings.set(code, state);
+        return { ...state };
       }
       case HOST_FAILED:
         broken = new EngineError(`a slot threw during ${what}: ${slotError instanceof Error ? slotError.message : String(slotError)}`, { cause: slotError });

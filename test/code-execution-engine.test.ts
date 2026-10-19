@@ -143,6 +143,25 @@ test('a thrown non-Error value is rejected with name \'\' and its string as the 
   e.dispose();
 });
 
+test('a thrown object with no message is rejected with its JSON as the message', async () => {
+  const { e } = await engine();
+  assert.deepEqual(e.start(PRELUDE, 'throw { why: "this failure should remain visible" }', 's.js'),
+    { kind: 'rejected', name: '', message: '{"why":"this failure should remain visible"}' });
+  e.dispose();
+});
+
+test('a script\'s value is serialized once, however many calls settle after it returns', async () => {
+  // Serializing runs the script's own code, here a toJSON that prints, and every settle after the
+  // script returned answers its ending again.
+  const { e, rec } = await engine();
+  const s = e.start(PRELUDE, 'let n = 0; tool("a"); tool("b"); ({ toJSON() { n++; print("serialized", n); return { n }; } })', 's.js');
+  assert.deepEqual(fulfilled(s), { n: 1 });
+  assert.deepEqual(fulfilled(e.settle(1, true, '1', UNFIT)), { n: 1 });
+  assert.deepEqual(fulfilled(e.settle(2, true, '2', UNFIT)), { n: 1 });
+  assert.deepEqual(rec.output, [[1, 'serialized 1\n']]);
+  e.dispose();
+});
+
 test('a rejection after an await is the script\'s rejection', async () => {
   const { e } = await engine();
   e.start(PRELUDE, 'await tool("t"); throw new RangeError("after")', 's.js');

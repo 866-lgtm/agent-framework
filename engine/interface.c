@@ -470,6 +470,17 @@ static JSValue error_json(JSValue v) {
         name = JS_GetPropertyStr(ctx, v, "name");
         message = JS_GetPropertyStr(ctx, v, "message");
         stack = JS_GetPropertyStr(ctx, v, "stack");
+        /* An object with no message of its own, such as a plain object thrown, is told by its
+           JSON, or by its string form when it has none, rather than left blank. */
+        if (JS_IsUndefined(message)) {
+            message = JS_JSONStringify(ctx, v, JS_UNDEFINED, JS_UNDEFINED);
+            if (JS_IsException(message)) {
+                JS_FreeValue(ctx, JS_GetException(ctx));
+                message = JS_UNDEFINED;
+            }
+            if (JS_IsUndefined(message))
+                message = JS_ToString(ctx, v);
+        }
     } else {
         message = JS_ToString(ctx, v);
     }
