@@ -176,7 +176,9 @@ interface SubjectState<E> {
   /** The agent's first view of the subject has ended: an occupant that may
    *  have been shown left it without handing a first view on
    *  (occupantLeaves). No later batch or birth of the subject is a first
-   *  view. */
+   *  view while the coalescer keeps this record. An idle subject's record can
+   *  be evicted (prune), and an `initial` occurrence after that starts the
+   *  subject afresh. */
   firstViewEnded?: true;
   touchedAt: number;
 }
@@ -214,6 +216,11 @@ export interface CoalescingReceiptRecord {
   subject: string;
   /** History the subject was created with, for a subject first seen by this receipt. */
   born?: SubjectState<unknown>['history'];
+  /** The subject's first view had ended by this acceptance
+   *  (SubjectState.firstViewEnded), so a crash before the snapshot flush
+   *  can't forget the end. A record written before this field existed has
+   *  none and reads as not ended, as a snapshot does. */
+  firstViewEnded?: true;
   /** The subject's pending batch AFTER this acceptance: the accepted work
    *  itself (so a crash before the snapshot flush cannot lose it while keeping
    *  the receipt that suppresses its retry), or `null` when the acceptance
@@ -567,6 +574,7 @@ export class PushCoalescer<E = unknown> {
     try {
       this.host.recordReceipt?.({
         key: receiptKey, result: entry.result, at: entry.at, subject, ...(born ? { born } : {}),
+        ...(state.firstViewEnded ? { firstViewEnded: true as const } : {}),
         batch: state.batch ? structuredClone({ latest: state.batch.latest as CoalescedOccurrence<unknown>, notices: state.batch.notices, dropped: state.batch.dropped }) : null,
       });
     } catch (error) {
@@ -1051,6 +1059,9 @@ export class PushCoalescer<E = unknown> {
       if (now - r.at > this.retryWindowMs) continue;
       this.receipts.set(r.key, { result: r.result, at: r.at, committed: true });
       if (r.born && !this.subjects.has(r.subject)) this.subjects.set(r.subject, { history: r.born, touchedAt: now });
+      // Nothing undoes a first view's end, so any record that carries it ends
+      // the subject's first view.
+      if (r.firstViewEnded) { const ended = this.subjects.get(r.subject); if (ended) ended.firstViewEnded = true; }
       // A birth fact is not proof the subject is still unread: the plain
       // occurrence this record acknowledged is in context (durable before the
       // record) and counts as read from recovery on, like a snapshot occupant.

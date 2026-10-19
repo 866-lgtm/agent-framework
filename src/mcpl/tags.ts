@@ -45,10 +45,10 @@ export function hasNonConversationalTag(tags: unknown): boolean {
 
 /**
  * True when a message is a marker by its tags. `firstView` is the host's own
- * mark (the message metadata's `firstView`) that the coalescer delivered the
- * message as the agent's first view of it, never a server's claim: an edit so
- * delivered counts as the message it replaced, while a reaction or deletion
- * stays a notice.
+ * mark that the coalescer delivered the message as the agent's first view of
+ * it (a stored message's metadata `firstView`, or in the channel registry the
+ * admission's receipt), never a server's claim: an edit so delivered counts
+ * as the message it replaced, while a reaction or deletion stays a notice.
  */
 export function isMarkerTagged(tags: unknown, firstView: boolean): boolean {
   return hasNonConversationalTag(firstView && Array.isArray(tags) ? tags.filter((t) => t !== 'chat:edited') : tags);

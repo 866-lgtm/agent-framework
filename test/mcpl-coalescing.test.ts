@@ -16,7 +16,7 @@ import type { ContentBlock, NormalizedRequest, StreamEvent, YieldingStream } fro
 import { MembraneError } from '@animalabs/membrane';
 import { createMockResponse, MockYieldingStream } from './helpers/mock-membrane.js';
 import { fixture, eventually, settles, crash, ok, TS, REPLY_DEADLINE_MS } from './helpers/coalescing-fixture.js';
-import { PushCoalescer, type CoalescerHost, type CoalescedOccurrence } from '../src/mcpl/push-coalescer.js';
+import { PushCoalescer, type CoalescerHost, type CoalescedOccurrence, type CoalescingReceiptRecord } from '../src/mcpl/push-coalescer.js';
 
 // ---------------------------------------------------------------------------
 // Plain coalescing, feature-set scope (vectors 1–6, 35)
@@ -2260,10 +2260,23 @@ test("#157: the render of a deferred notice that births its subject is the agent
   assert(isMarked(stored), "the render is the agent's first view");
 });
 
+/** What a stand-in host has removed. As in the framework, a removed
+ *  placement is no longer unread, and nothing can still be unshown in it, so
+ *  a first-view decision has to be taken before the removal. */
+function removals() {
+  const removed = new Set<string>();
+  const key = (p: { deferredId?: string; messageId?: string }) => p.deferredId ?? p.messageId ?? '';
+  return {
+    gone: (p: { deferredId?: string; messageId?: string }) => removed.has(key(p)),
+    remove: (p: { deferredId?: string; messageId?: string }) => { removed.add(key(p)); return true; },
+  };
+}
+
 test("#157: a render that lands unread in another agent's deferred queue keeps its first view, so an edit that replaces it is marked", async () => {
   const delivered: Array<{ eventId: string; firstView?: true }> = [];
+  const r = removals();
   const host: CoalescerHost<null> = {
-    isUnread: () => true, isUnshown: () => true, remove: () => true,
+    isUnread: (p) => !r.gone(p), isUnshown: (p) => !r.gone(p), remove: r.remove,
     // Every delivery lands in the deferred queue of an agent whose turn is alive.
     deliver: async (occ) => { delivered.push({ eventId: occ.eventId, ...(occ.firstView ? { firstView: true as const } : {}) }); return { agent: 'other', deferredId: `deferred-${delivered.length}` }; },
     wakeForBatch: async () => {}, wakeToRead: async () => {}, cancelWake: () => {}, authorized: () => true,
@@ -2287,8 +2300,9 @@ test("#157: a notice's render that lands while an earlier render of its subject 
   const delivered: Array<{ eventId: string; firstView?: true }> = [];
   let releaseFirst!: () => void;
   const firstRender = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  const r = removals();
   const host: CoalescerHost<null> = {
-    isUnread: () => true, isUnshown: () => true, remove: () => true,
+    isUnread: (p) => !r.gone(p), isUnshown: (p) => !r.gone(p), remove: r.remove,
     // Every delivery lands in the deferred queue of an agent whose turn is alive.
     deliver: async (occ) => { delivered.push({ eventId: occ.eventId, ...(occ.firstView ? { firstView: true as const } : {}) }); return { agent: 'other', deferredId: `deferred-${delivered.length}` }; },
     wakeForBatch: async () => {}, wakeToRead: async () => {}, cancelWake: () => {}, authorized: () => true,
@@ -2316,7 +2330,8 @@ test("#157: a notice's render that lands while an earlier render of its subject 
  *  delivery is then stored and so materialized for the assembling turn, or
  *  `unplaced` does, whose delivery is placed nowhere. The renders of `held`
  *  wait for `release`, and those of `blank` come back blank. `state` answers
- *  the host's read and shown questions for every placement.
+ *  the host's read and shown questions for every placement it hasn't removed
+ *  (removals).
  *  (slimepriestess's probe for #168, with the held renders and the other
  *  options added.) */
 function firstViewProbe(state: { shown: boolean; read: boolean }, { held = ['n1'], stored = [] as string[], unplaced = [] as string[], blank = [] as string[] } = {}) {
@@ -2325,8 +2340,9 @@ function firstViewProbe(state: { shown: boolean; read: boolean }, { held = ['n1'
   const gates = new Map(held.map((id) => [id, new Promise<void>((resolve) => { releases.set(id, resolve); })]));
   const started = new Map<string, () => void>();
   const renderStarted = new Map(held.map((id) => [id, new Promise<void>((resolve) => { started.set(id, resolve); })]));
+  const r = removals();
   const host: CoalescerHost<null> = {
-    isUnread: () => !state.read, isUnshown: () => !state.shown && !state.read, remove: () => true,
+    isUnread: (p) => !r.gone(p) && !state.read, isUnshown: (p) => !r.gone(p) && !state.shown && !state.read, remove: r.remove,
     deliver: async (occ) => {
       delivered.push({ eventId: occ.eventId, ...(occ.firstView ? { firstView: true as const } : {}) });
       if (unplaced.includes(occ.eventId)) return undefined;
@@ -2528,6 +2544,20 @@ test("#157: a snapshot keeps a subject's ended first view, so a restored coalesc
   assert.deepEqual(p.delivered.at(-1), { eventId: 'n2' });
 });
 
+for (const shown of [false, true]) test(`#157: the crash-window receipt records keep a subject's ended first view, so a coalescer restored from them alone ${shown ? 'gives the next batch no first view' : 'still gives the next batch its first view when nothing had shown the agent the last'}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [] });
+  const records: CoalescingReceiptRecord[] = [];
+  p.host.recordReceipt = (record) => { records.push(structuredClone(record)); };
+  await firstViewRetracted(p, state, shown);
+  // A crash before the throttled snapshot: only the records written at each acceptance survive.
+  const restored = new PushCoalescer<null>(p.host);
+  restored.restoreReceipts(records);
+  await restored.accept(p.occurrence('n2', { deferred: true }));
+  await restored.assemble('agent');
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'n2', ...(shown ? {} : { firstView: true as const }) });
+});
+
 test("#157: a receipt keeps an admission's first view in memory only, so a restored receipt has none", async () => {
   const state = { shown: false, read: false };
   const p = firstViewProbe(state, { held: [] });
@@ -2559,8 +2589,9 @@ test('#157: a plain edit that arrives while a first-view batch renders takes its
 
 for (const shown of [false, true]) test(`#157: a notice that displaces an unread first view ${shown ? 'that something may have shown the agent opens a batch whose render is no first view' : 'that nothing has shown the agent opens a batch whose render is the first view'}`, async () => {
   const delivered: Array<{ eventId: string; firstView?: true }> = [];
+  const r = removals();
   const host: CoalescerHost<null> = {
-    isUnread: () => true, isUnshown: () => !shown, remove: () => true,
+    isUnread: (p) => !r.gone(p), isUnshown: (p) => !r.gone(p) && !shown, remove: r.remove,
     deliver: async (occ) => { delivered.push({ eventId: occ.eventId, ...(occ.firstView ? { firstView: true as const } : {}) }); return { agent: 'agent', messageId: `stored-${delivered.length}` }; },
     wakeForBatch: async () => {}, wakeToRead: async () => {}, cancelWake: () => {}, authorized: () => true,
     audience: async () => ['agent'],
