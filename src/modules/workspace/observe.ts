@@ -473,35 +473,46 @@ function entryName(paths: readonly string[], prefix: string, segment: string): s
  * there and lists it otherwise. `dir` is listed only where a variant of
  * `segment`, its case flipped or its other Unicode normalization form, finds
  * the same file (device and inode) as `given`, the segment's own entry, as
- * on a disk that folds names. The last segment isn't looked up as given
- * unless the listing must settle it, so for it any variant found leads to
- * the listing: on a disk that tells spellings apart, that's only where `dir`
- * holds a variant as a name of its own. The name as given wins if it's
- * listed; otherwise the segment takes the listed name that folds to it and
- * is the same file, so the name returned reaches the file the segment does,
- * or is the segment as given. Names are compared as NFC in lower case first,
- * and only where none of those is the file, more loosely (foldedLoosely). A
- * directory that can't be listed, or a name that can't be looked up, leaves
- * the segment as given. `found` says whether disk has the segment: whether a
- * variant was found on disk (where `given` is the segment's own lookup, one
- * that is the same file), or, for a segment with no variant at all, no
- * letter to flip and one normalization form, whether it's there as given,
- * which is then looked up. `caseFolds` says what looking the segment up with
- * its case flipped showed of `dir`: that it folds case, that it tells case
- * apart, or nothing (null), for a segment with no letter to flip. For a
- * segment not looked up as given (`given` null), `caseFolds` is set from
- * whatever file the flipped spelling finds, which tells nothing of `dir`;
- * diskSpelling reads it only for directories, which are looked up as given.
+ * on a disk that folds names. The last segment isn't looked up as given, so
+ * for it any variant found leads to the listing: on a disk that tells
+ * spellings apart, that's only where `dir` holds a variant as a name of its
+ * own. The name as given wins if it's listed; otherwise the segment takes
+ * the listed name that folds to it and is the same file, so the name
+ * returned reaches the file the segment does, or is the segment as given.
+ * Names are compared as NFC in lower case first, and only where none of
+ * those is the file, more loosely (foldedLoosely). A directory that can't be
+ * listed, or a name that can't be looked up, leaves the segment as given. A
+ * segment with no variant at all, no letter to flip and one normalization
+ * form, is looked up as given and keeps its spelling; for a last segment
+ * with a letter that case maps, such as `ς`, the listing then says whether
+ * disk lists it as given. `found` says whether the lookups found disk's
+ * file: for a directory, its own lookup; for a last segment, whether a
+ * variant was found, which on a disk that tells spellings apart may be
+ * another file, or for one with no variant, whether disk has it as given, by
+ * the listing where it was read. `caseFolds` says what looking the segment
+ * up with its case flipped showed of `dir`: that it folds case, that it
+ * tells case apart, or nothing (null), for a segment with no letter to flip.
+ * For a segment not looked up as given (`given` null), `caseFolds` is set
+ * from whatever file the flipped spelling finds, which tells nothing of
+ * `dir`; diskSpelling reads it only for directories, which are looked up as
+ * given.
  */
 async function listedName(dir: string, segment: string, given: BigIntStats | null): Promise<{ name: string; found: boolean; caseFolds: boolean | null }> {
   const flipped = flippedCase(segment);
   const variants = new Set([flipped, segment.normalize('NFC'), segment.normalize('NFD')]);
   variants.delete(segment);
   // A segment with no variant to try, such as `2024` or `ς`, is looked up
-  // as given, the only way to learn that disk has it.
+  // as given, the only way to learn that disk has it. A last segment with a
+  // letter that case maps, as `ς` does, can reach a file disk lists in
+  // another spelling, such as `σ`, on a disk that folds more than case
+  // pairs, so there the listing settles whether disk lists it as given.
   if (variants.size === 0) {
     const own = given ?? await lstat(join(dir, segment), { bigint: true }).catch(() => null);
-    return { name: segment, found: own !== null, caseFolds: null };
+    if (given !== null || own === null || (segment.toLowerCase() === segment && segment.toUpperCase() === segment)) {
+      return { name: segment, found: own !== null, caseFolds: null };
+    }
+    const listed = await readdir(dir).catch(() => null);
+    return { name: segment, found: listed?.includes(segment) ?? true, caseFolds: null };
   }
   let folds = false;
   let caseFolds: boolean | null = flipped === segment ? null : false;

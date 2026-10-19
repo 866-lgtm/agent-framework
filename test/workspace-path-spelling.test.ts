@@ -568,6 +568,15 @@ test('the step takes an entry\'s name where disk has nothing, keeps an entry\'s 
   // entry spells it.
   writeFileSync(join(root, 'src', '\u03c2'), '');
   assert.equal(await diskSpelling(root, 'src/\u03c2', entriesOf(['src/\u03a3'])), 'src/\u03c2', 'disk lists \u03c2 as given');
+  // Where disk has nothing for it, a draft's spelling stands, and where disk
+  // lists it in another spelling, the listing settles it.
+  mkdirSync(join(root, 'nv'));
+  assert.equal(await diskSpelling(root, 'nv/\u03c2', entriesOf(['nv/\u03a3'])), 'nv/\u03a3', 'disk has no \u03c2 here');
+  await t.test('a name with no variant that disk lists in a spelling only a fuller folding joins', { skip: FINAL_SIGMA_FOLDING_ONLY }, async () => {
+    mkdirSync(join(root, 'fs'));
+    writeFileSync(join(root, 'fs', '\u03c3'), '');
+    assert.equal(await diskSpelling(root, 'fs/\u03c2', entriesOf(['fs/\u03c3'])), 'fs/\u03c3', 'disk lists \u03c3, which an entry spells');
+  });
   // A path that names an entry reads no other entry, even where disk lacks
   // its directory or spells it otherwise.
   let listings = 0;
@@ -716,6 +725,34 @@ test('a stop made while start reads whether a mount\'s root folds case leaves th
   const listed = await ls();
   assert.equal(listed.success, false);
   assert.match(String(listed.error), /The workspace has stopped/);
+});
+
+test('a restart takes no call while it reads whether a mount\'s root folds case', async (t) => {
+  const { workspace, ls } = nestedWorkspace(t, 'never');
+  let saved: unknown = null;
+  const ctx = { isRestart: false, getState: () => saved, setState: (state: unknown) => { saved = state; }, pushEvent: () => {} };
+  await workspace.start(ctx as unknown as ModuleContext);
+  await workspace.stop();
+  const original = fs.promises.readdir;
+  let during: Promise<ToolResult> | undefined;
+  fs.promises.readdir = ((path: fs.PathLike, ...rest: unknown[]) => {
+    // Start lists the inner mount's root only for whether it folds case.
+    if (basename(String(path)) === 'inner') during ??= ls();
+    return (original as (...args: unknown[]) => unknown)(path, ...rest);
+  }) as typeof fs.promises.readdir;
+  syncBuiltinESMExports();
+  try {
+    await workspace.start({ ...ctx, isRestart: true } as unknown as ModuleContext);
+  } finally {
+    fs.promises.readdir = original;
+    syncBuiltinESMExports();
+  }
+  assert.notEqual(during, undefined, 'start listed a root');
+  const answer = await during!;
+  assert.equal(answer.success, false);
+  assert.match(String(answer.error), /The workspace has stopped/);
+  const after = await ls();
+  assert.equal(after.success, true, String(after.error));
 });
 
 test('on a disk that tells case apart, two drafts that differ only in case stay two files', { skip: CASE_SENSITIVE_ONLY }, async (t) => {
