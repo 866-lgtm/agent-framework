@@ -4066,7 +4066,8 @@ export class ChannelRegistry {
    * after an open for a declaration leave the channel open, and the agent
    * gets the failure for the words. An open by delivery (`openSource`
    * 'opened-by-delivery', the default) that turned a closed channel open
-   * also gives the notice that it's open, which says how to close it.
+   * also gives the notice that it's open, which says how to close it to a
+   * reader that can.
    * One that only reconfirmed the transport of a channel already decided
    * open or tuned out changes no decision, and gives none. When the
    * registration is gone, the failure says the channel was removed.

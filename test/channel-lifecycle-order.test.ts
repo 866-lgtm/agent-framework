@@ -2477,28 +2477,6 @@ test('the opened notice names channel_close only to a reader that can call it, a
   }
 });
 
-// A body the store took as more than one message (a sharded body) carries
-// the same metadata on each of its copies, and is one notice to pass on.
-test("a sharded notice is passed on once: the release's scan takes one copy of each body", () => {
-  const framework = Object.create(AgentFramework.prototype) as any;
-  const passOn = { notice: 'channel-opened', cause: 'opened-by-reply', channels: [{ channelId: 'x', label: '#x' }] };
-  const stored = [
-    { sequence: 1, metadata: { system: true, kind: 'channel-notice', passOn }, bodyGroupId: 'g-1' },
-    { sequence: 2, metadata: { system: true, kind: 'channel-notice', passOn }, bodyGroupId: 'g-1' },
-    { sequence: 3, metadata: { system: true, kind: 'channel-notice', passOn } },
-    { sequence: 4, metadata: { system: true, kind: 'discord-send-failed', channelId: 'x' }, bodyGroupId: 'g-2' },
-    { sequence: 5, metadata: { system: true, kind: 'discord-send-failed', channelId: 'x' }, bodyGroupId: 'g-2' },
-  ];
-  const agent = {
-    name: 'fork',
-    getConsumedWatermark: () => undefined,
-    getContextManager: () => ({ getAllMessages: () => stored }),
-  };
-  const unread = framework.unreadNoticesForPrimary(agent) as Array<{ kind?: string }>;
-  assert.deepEqual(unread.map((m) => m.kind), ['channel-notice', 'channel-notice', 'discord-send-failed'],
-    'one per body: the two shards of g-1 once, the unsharded notice, and g-2 once');
-});
-
 // Each notice is written on its own: a reader's notice that can't be
 // written leaves the primary's to be written still.
 test("a reader's notice that can't be written still leaves the primary's by-name notice written, for both notices", () => {

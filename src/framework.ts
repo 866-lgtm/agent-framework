@@ -9,7 +9,7 @@ import {
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStream, DetailedUsage, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
-import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks } from '@animalabs/context-manager';
+import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks, continuesBody } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SILENT_HEARTBEAT_SEPARATOR, type RequestOnlyPrompt, type RequestOnlyStamps } from './silent-heartbeat.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
@@ -4041,11 +4041,10 @@ export class AgentFramework {
     // once the host stops, so its unread pass runs here: each notice stored
     // unread in that window that the primary takes in its place (a failed
     // reply, or a channel notice its reader could act on) goes to the primary
-    // now, deferred while
-    // quiesced like any write, so it waits in the queue with the rest. What
-    // was queued for that agent stays queued, as a gone agent's. Each
-    // release's pass is a step of its own: one that throws fails the stop()
-    // and leaves the others, and the flush below, to run.
+    // now, deferred while quiesced like any write, so it waits in the queue
+    // with the rest. What was queued for that agent stays queued, as a gone
+    // agent's. Each release's pass is a step of its own: one that throws fails
+    // the stop() and leaves the others, and the flush below, to run.
     for (const agent of this.releasesAfterResume.values()) {
       step(() => {
         for (const metadata of this.unreadNoticesForPrimary(agent)) this.passNoticeToPrimary(agent.name, metadata);
@@ -21551,8 +21550,7 @@ export class AgentFramework {
    * The agent never reads its window again, so every failed-reply notice it
    * never read, and every channel notice it could act on and never read, is
    * passed to the primary, by name, once (passesToPrimary): each one stored
-   * in its window above its consumed watermark (flushed there at its turn's
-   * end, or stored while it was idle) and not heard at a tool boundary, and
+   * in its window above its consumed watermark (unreadNoticesForPrimary), and
    * each one still queued for it. Writes still
    * queued would wait for a boundary it never reaches, and the flush that
    * finds it gone would drop them, so they land in its own window now, which
@@ -21600,9 +21598,12 @@ export class AgentFramework {
    * the current one part (branchesPartAt), or every one, when it never
    * compiled. The watermark moves at a compile, and at a tool boundary whose
    * stream declares it carries the messages injected there
-   * (markContextConsumed), so a notice the live stream heard is under it, and
-   * one a boundary stored without sending (a turn a tool ended, a budget
-   * restart, a stream that may drop injections) is above it.
+   * (markContextConsumed). So a notice such a stream carried is under it.
+   * One a boundary stored without sending (a turn a tool ended, a budget
+   * restart) is above it, and so is one injected into a stream that doesn't
+   * declare it carries injections, which may have dropped it: counted as
+   * unread, it goes to the primary even if the agent heard it, rather than to
+   * no one where the stream dropped it.
    */
   private unreadNoticesForPrimary(agent: Agent): MessageMetadata[] {
     try {
@@ -21612,16 +21613,14 @@ export class AgentFramework {
         ? Math.min(watermark.sequence, this.branchesPartAt(watermark.branch, cm.currentBranch().name))
         : Number.NEGATIVE_INFINITY;
       // A body the store took as more than one message (a sharded body)
-      // carries the same metadata on each of its copies, and is one notice.
-      const bodies = new Set<string>();
-      return cm.getAllMessages()
-        .filter((m) => {
-          if (m.sequence <= floor || !passesToPrimary(m.metadata)) return false;
-          if (m.bodyGroupId === undefined) return true;
-          if (bodies.has(m.bodyGroupId)) return false;
-          bodies.add(m.bodyGroupId);
-          return true;
-        })
+      // carries the same metadata on each of its shards, and is one notice,
+      // so a shard that continues the body before it isn't taken again. Which
+      // messages make up a body is context-manager's rule (continuesBody,
+      // pairwise in store order): a group id names the text, so the same text
+      // stored twice is two bodies under one id.
+      const messages = cm.getAllMessages();
+      return messages
+        .filter((m, i) => m.sequence > floor && passesToPrimary(m.metadata) && !continuesBody(messages[i - 1], m))
         .map((m) => m.metadata as MessageMetadata);
     } catch (err) {
       // A release must complete whatever its window's read meets.

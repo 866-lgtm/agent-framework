@@ -718,7 +718,7 @@ describe('notices about an agent\'s own action', () => {
     it('tells the primary, by name, of a channel an ended agent\'s send opened, and the primary\'s channel_close closes it', async (t) => {
       const state = internals(framework);
       const channels = (state.channelRegistry as unknown as { channels: Map<string, { open: boolean }> }).channels;
-      // The channel the ended run's reply opened, on a server that lets it close.
+      // The channel the ended run's send opened, on a server that lets it close.
       channels.set('srv:opened-1', { serverId: 'srv', descriptor: { id: 'opened-1', type: 'srv', label: '#opened' }, open: true } as never);
       const closed: unknown[] = [];
       const server = {
@@ -742,7 +742,7 @@ describe('notices about an agent\'s own action', () => {
         .dispatchChannelToolCall('primary', { id: 'close-1', name: 'channel_close', input: { channelId: 'opened-1' } });
       for (let i = 0; i < 50 && channels.get('srv:opened-1')!.open; i++) await new Promise((resolve) => setImmediate(resolve));
       assert.deepEqual(closed, [{ channelId: 'opened-1' }]);
-      assert.equal(channels.get('srv:opened-1')!.open, false, 'the channel the reply opened is closed');
+      assert.equal(channels.get('srv:opened-1')!.open, false, 'the channel the send opened is closed');
     });
 
     it('tells no one, logged, of a channel an ended agent\'s send opened when there is no primary', async (t) => {
@@ -862,6 +862,35 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(entry.forAgent, undefined, 'now the primary\'s');
       assert.equal(entry.metadata?.speaker, 'conversation-gone');
       assert.match(JSON.stringify(entry.content), /A reply by conversation-gone \(12 chars\) could not be delivered/);
+    });
+
+    it('counts a body the store shards as one notice, and the same text stored again as a notice of its own', async () => {
+      const state = internals(framework) as unknown as { unreadNoticesForPrimary(agent: unknown): Array<{ tag?: unknown }> };
+      const agent = framework.getAgent('secondary')!;
+      const cm = agent.getContextManager();
+      // Shard every notice into one message per block, as a strategy's ingress
+      // chunking does. The group id names the text, as context-manager's
+      // chunker's does, so the same text shards under the same id each time
+      // it's stored.
+      (cm as unknown as { strategy: Record<string, unknown> }).strategy.chunkIngressMessage = (_participant: string, content: ContentBlock[]) =>
+        content.length > 1
+          ? {
+            bodyGroupId: `bg-${content.map((block) => (block as { text?: string }).text).join('')}`,
+            shards: content.map((block, shardIndex) => ({ content: [block], shardIndex })),
+          }
+          : null;
+      const notice = (tag: string, words: string) => cm.addMessage('user',
+        [{ type: 'text', text: `[discord-send-failed] ${words}` }, { type: 'text', text: ' and the rest of it' }],
+        { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', tag } as never);
+
+      notice('first', 'the same words');
+      notice('second', 'the same words');
+      notice('third', 'other words');
+
+      const stored = cm.getAllMessages().filter((m) => (m.metadata as { kind?: unknown } | undefined)?.kind === 'discord-send-failed');
+      assert.deepEqual(stored.map((m) => m.shardIndex), [0, 1, 0, 1, 0, 1], 'each body is stored as two shards');
+      assert.equal(stored[2]!.bodyGroupId, stored[0]!.bodyGroupId, 'the same text is stored again under the same group id');
+      assert.deepEqual(state.unreadNoticesForPrimary(agent).map((m) => m.tag), ['first', 'second', 'third']);
     });
 
     it('counts as read, across branches, only what an agent\'s window shares with the branch it read up to the point they part', async () => {
