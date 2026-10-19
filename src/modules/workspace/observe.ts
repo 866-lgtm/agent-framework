@@ -305,6 +305,20 @@ export function namesNestedPlace(rest: string, include: readonly string[] | unde
 }
 
 /**
+ * Whether a path of a mount is one its passes decide and its listings may
+ * name: inside its include, and, in a nested mount's directory, a place
+ * that mount names (namesNestedPlace), its directory included. History the
+ * mount took in before another was nested there, which that mount's
+ * include leaves out, is no mount's, so no pass decides it, and no listing
+ * names it or a directory only it implies.
+ */
+export function withinIncludes(view: Pick<MountView, 'include' | 'nested'>, path: string): boolean {
+  if (!insideMount(path, view.include)) return false;
+  const holder = nestedHolder(path, view.nested ?? []);
+  return holder === undefined || path === holder.dir || namesNestedPlace(path.slice(holder.dir.length + 1), holder.include, false);
+}
+
+/**
  * The path a mount's include judges for `given`, one of the mount's paths,
  * which landed at `real`, its canonical path, inside the mount and in no
  * nested mount's directory. The include is the operator's statement of which
@@ -315,17 +329,22 @@ export function namesNestedPlace(rest: string, include: readonly string[] | unde
  * path otherwise only as a disk that folds names does, with disk's stored
  * names on macOS and Windows where a path keeps a workspace entry's
  * spelling, so where the spellings differ only so, a link is looked for on
- * the way (linkOnTheWay's walk); none found, the path is judged as named.
- * Otherwise, or where a link or a directory it couldn't ask lies on the way,
- * the landing is judged, as disk spells it, since realpath keeps the
- * spelling a link's target gives, which on a disk that folds names need not
- * be disk's (diskSpelling). So a link swapped for a directory between the
- * realpath and the walk can only make the landing judged.
+ * the way (linkOnTheWay's walk), and the path as named must be the landing's
+ * own file; both so, the path is judged as named. Otherwise, or where a link
+ * or a directory it couldn't ask lies on the way, the landing is judged, as
+ * disk spells it, since realpath keeps the spelling a link's target gives,
+ * which on a disk that folds names need not be disk's (diskSpelling). So a
+ * link swapped for a directory between the realpath and the walk can only
+ * make the landing judged: on a disk that tells case apart, the directory's
+ * file at the named path is another file than the one the link led to.
  */
 export async function judgedAt(root: string, rootReal: string, real: string, given: string): Promise<string> {
   const landed = relative(rootReal, real).split(sep).join('/');
   if (landed === given) return given;
-  if (foldedLoosely(landed) === foldedLoosely(given) && (await linkOnTheWay({ root, followSymlinks: false }, given)) === null) return given;
+  if (foldedLoosely(landed) === foldedLoosely(given) && (await linkOnTheWay({ root, followSymlinks: false }, given)) === null) {
+    const [named, landing] = await Promise.all([join(rootReal, given), real].map((at) => stat(at, { bigint: true }).catch(() => null)));
+    if (named && landing && sameFile(named, landing)) return given;
+  }
   return diskSpelling(rootReal, landed);
 }
 
@@ -1942,16 +1961,17 @@ export async function walkScope(
       // (a regular file, a FIFO, a socket or a device) is noted as a file,
       // since nothing can lie beneath it.
       if (!entry.isDirectory() && (!insideMount(childRel, view.include) || (judgedDir !== rel && !insideMount(judgedDir === '' ? entry.name : `${judgedDir}/${entry.name}`, view.include)))) {
-        // A link gets the reason a mount without an include gives it, a
-        // symlink the walk doesn't enter, where that's what matters about it.
-        // On a mount that follows links, that's a link that leads to a
-        // directory, since the same holds beneath it as beneath a directory:
-        // what's read through it is judged by its path and where it lands, so
-        // its own name doesn't put what lies there outside. On one that
-        // doesn't, it's every link, since nothing reads through one there,
-        // and such a mount resolves none to say where it leads. The link's
-        // name is no covered file's, so the walk passes it over as it does
-        // one, rather than taking it.
+        // The walk enters no link. A link gets the reason a mount without an
+        // include gives it, a symlink the walk doesn't enter, where that's
+        // what matters about it. On a mount that follows links, that's a link
+        // that leads to a directory: a name or an extension glob can cover
+        // what lies beneath it, as beneath a directory, and what's read
+        // through it is judged by its path and where it lands, so its own
+        // name doesn't put what lies there outside. On one that doesn't, it's
+        // every link, since nothing reads through one there, and such a mount
+        // resolves none to say where it leads. The link's name is no covered
+        // file's, so the walk passes it over as it does one, rather than
+        // taking it.
         if (entry.isSymbolicLink() && (!view.followSymlinks || await stat(dir.at(entry.name)).then((info) => info.isDirectory(), () => false))) {
           others.push([childRel, LINK_NOT_WALKED]);
           regions.push({ path: childRel, reason: LINK_NOT_WALKED, kind: 'ignored' });

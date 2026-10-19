@@ -527,6 +527,7 @@ describe('mount include', () => {
         const plain = await call(await open(follow), 'sync', {}) as Sync;
         assert.equal(byPath(plain.incomplete)['link'], 'a symlink, not walked', JSON.stringify(plain));
         assert.equal(byPath(synced.incomplete)['link'], 'a symlink, not walked', label);
+        assert.equal(byPath(plain.skipped)['link/a.json'], 'disk could not be checked: a symlink, not walked', JSON.stringify(plain));
         assert.equal(byPath(synced.skipped)['link/a.json'], byPath(plain.skipped)['link/a.json'], `${label}; ${JSON.stringify(plain)}`);
         // A link to a file, and one that leads nowhere, are judged by their names, which the include leaves out.
         assert.equal(synced.passedOver?.find((p) => p.reason === OUTSIDE_INCLUDE)?.count, 2, label);
@@ -1031,8 +1032,11 @@ describe('mount include', () => {
     const view = { root, include: ['Docs/**', 'via/**'] };
     const rootReal = realpathSync(root);
     // On macOS and Windows realpath gives disk's stored names, which can differ from a workspace entry's
-    // spelling the parse kept: here it lands spelled otherwise, with no link on the way.
-    assert.equal(await coversLanding(view, rootReal, join(rootReal, 'docs', 'a.txt'), 'Docs/a.txt'), true);
+    // spelling the parse kept: here it lands spelled otherwise, with no link on the way, which only a disk that
+    // folds names gives, where both spellings are the one file.
+    if (existsSync(join(root, 'docs'))) {
+      assert.equal(await coversLanding(view, rootReal, join(rootReal, 'docs', 'a.txt'), 'Docs/a.txt'), true);
+    }
     // Through a link, where it lands is judged, and the include doesn't cover `site/b.txt`.
     assert.equal(await coversLanding(view, rootReal, join(rootReal, 'site', 'b.txt'), 'via/b.txt'), false);
     // A landing spelled otherwise than folding makes it, with no link left on the way, as after a link was
@@ -1048,20 +1052,36 @@ describe('mount include', () => {
       symlinkSync('VX', join(root, 'vx'));
       assert.equal(await coversLanding({ root, include: ['vx/**'] }, rootReal, join(rootReal, 'VX', 'c.txt'), 'vx/c.txt'), false);
     }
+    // Where disk tells case apart, a link `qz` to `QZ` swapped for a directory `qz` between the realpath and the
+    // walk leaves no link on the way, but the path as named is another file than the one the link led to, so the
+    // landing is judged.
+    mkdirSync(join(root, 'QZ'));
+    writeFileSync(join(root, 'QZ', 'c.txt'), "where the link led, not the mount's\n");
+    if (!existsSync(join(root, 'qz'))) {
+      mkdirSync(join(root, 'qz'));
+      writeFileSync(join(root, 'qz', 'c.txt'), 'what the directory put in its place holds\n');
+      assert.equal(await coversLanding({ root, include: ['qz/**'] }, rootReal, join(rootReal, 'QZ', 'c.txt'), 'qz/c.txt'), false);
+    }
   });
 
   test("history the outer mount took in where a nested mount now holds the directory is no mount's where that mount's include leaves it out: no listing, sync or grep names it", async (t) => {
     const env = new Env(t);
     env.writeDisk('inner/secret.txt', "needle: not the inner mount's\n");
+    env.writeDisk('inner/private/p.txt', "not the inner mount's either\n");
     env.writeDisk('inner/k.json', '{}\n');
     const before = await env.open();
     await call(before, 'sync', {});
     assert.ok(env.tree().includes('inner/secret.txt'), `taken in before the mount was nested: ${env.tree()}`);
     await env.stop(before);
+    // Only history implies `inner/private` now.
+    rmSync(join(env.dir, 'inner/private'), { recursive: true, force: true });
     const m = await openNested(env, false);
     try {
       const listing = JSON.stringify(await call(m, 'ls', { path: 'work', recursive: true }));
-      assert.ok(!listing.includes('secret'), listing);
+      assert.ok(!listing.includes('secret') && !listing.includes('private'), listing);
+      // Nor does a listing of that mount's directory name a directory only such history implies.
+      const there = JSON.stringify(await call(m, 'ls', { path: 'work/inner' }));
+      assert.ok(!there.includes('private') && !there.includes('secret'), there);
       const synced = JSON.stringify(await call(m, 'sync', {}));
       assert.ok(!synced.includes('secret'), synced);
       assert.equal((await call(m, 'grep', { path: 'work', pattern: 'needle' })).totalMatches, 0);
@@ -1493,8 +1513,9 @@ describe('mount include', () => {
     for (const entry of ['sub/file.txt', 'foo*', '*', '*.', '*.js*', 'a/*/**', '/**', '', '.', '..', './**', '../**', 'a/../**', undefined]) {
       refusal([entry], `; ${JSON.stringify(entry) ?? String(entry)} is none of these`);
     }
-    // A value JSON can't write is shown as JavaScript writes it, not thrown on.
+    // A value JSON can't write is shown as JavaScript writes it, not thrown on, inside a value too.
     refusal([1n], '; 1n is none of these');
+    refusal({ pattern: 1n }, ', not [object Object]');
     refusal(['gate.json', 'foo*'], '; "foo*" is none of these');
     for (const good of [['gate.json'], ['*.md', 'gate.js'], ['docs/**'], ['a/b/**']]) {
       assert.doesNotThrow(() => new WorkspaceModule({ mounts: [mount(good)] }), JSON.stringify(good));
@@ -1583,6 +1604,19 @@ describe("the checks where disk is acted on, called directly as a push and a rea
       assert.equal(err.message, reason);
       assert.ok(lstatSync(at(path)).isSymbolicLink(), `${path} is still there`);
     }
+  });
+
+  test("the contained unlink of a regular file reached through a link among its directories, where a nested mount's root lies, which leaves the file", async (t) => {
+    const { at, view, rootReal } = rig(t);
+    // A nested mount whose root disk has as a regular file, in a directory the outer mount reaches through a
+    // link: the directory is the outer mount's, and the file at the root is that mount's place.
+    mkdirSync(at('c'));
+    writeFileSync(at('c/f'), "at the nested mount's root");
+    symlinkSync(at('c'), at('e'));
+    const filed = { ...view, others: [...view.others, 'c/f'], nested: [...(view.nested ?? []), { dir: 'c/f', name: 'filed', real: join(rootReal, 'c', 'f'), include: ['*.json'] }] } as MountView;
+    const err = await unlinkContained(filed, rootReal, 'e/f', { kind: 'any' }).then(() => null, (e: unknown) => e);
+    assert.ok(err instanceof EffectFailed, String(err));
+    assert.equal(readFileSync(at('c/f'), 'utf8'), "at the nested mount's root");
   });
 
   test("the module's disk reads, past the parse that refuses first", async (t) => {

@@ -371,7 +371,7 @@ test("a covered name whose file disk spells otherwise is outside the include, ju
   assert.match(String(read.error), /"work\/gate\.json" is outside the mount's include/);
 });
 
-test("a segment on a path's way that isn't a directory and that the include doesn't cover keeps the caller's spelling in a refusal", { skip: FOLDING_ONLY }, async (t) => {
+test("a segment on a path's way that isn't a directory and that the include doesn't cover is named as disk spells it, as every answer but the include's own refusal names a path", { skip: FOLDING_ONLY }, async (t) => {
   const { workspace, dir } = await setup(t, (d) => [
     { name: 'work', path: d, mode: 'read-write', watch: 'never', include: ['*.json'] },
   ]);
@@ -379,24 +379,25 @@ test("a segment on a path's way that isn't a directory and that the include does
   mkdirSync(join(dir, 'real'));
   writeFileSync(join(dir, 'real', 'a.json'), '{}\n');
   symlinkSync('real', join(dir, 'link'));
-  for (const [path, given, disk, segment] of [['work/SECRET.TXT/a.json', 'SECRET.TXT', 'secret.txt', 'secret.txt'], ['work/LINK/a.json', 'LINK', '"work/link"', 'link']] as const) {
+  for (const [path, disk] of [['work/SECRET.TXT/a.json', 'secret.txt'], ['work/LINK/a.json', '"work/link"']] as const) {
+    // Nothing beneath it is served, and the refusal names the segment in the one spelling, disk's.
     const read = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
     assert.equal(read.success, false, path);
-    assert.ok(String(read.error).includes(given) && !String(read.error).includes(disk), `${path}: ${read.error}`);
+    assert.ok(String(read.error).includes(disk), `${path}: ${read.error}`);
     let message = '';
     await assert.rejects(workspace.readFileFromDisk(path), (err: unknown) => { message = String((err as Error).message); return err instanceof WorkspaceReadError; });
-    assert.ok(message.includes(given) && !message.includes(disk), `${path}: ${message}`);
-    // A delete's answer, and what a sync of the path says it skipped, name it the same way.
+    assert.ok(message.includes(disk), `${path}: ${message}`);
     const deleted = await workspace.handleToolCall({ id: 'delete', name: 'delete', input: { path } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
     assert.equal(deleted.success, false, path);
-    assert.ok(String(deleted.error).includes(given) && !String(deleted.error).includes(disk), `${path}: ${deleted.error}`);
-    const synced = JSON.stringify(await workspace.handleToolCall({ id: 'sync', name: 'sync', input: { path } } as Parameters<WorkspaceModule['handleToolCall']>[0]));
-    assert.ok(!synced.includes(`${segment}/a.json`) && !synced.includes(`work/${segment}`), `${path}: ${synced}`);
-    if (segment === 'link') assert.ok(synced.includes('LINK/a.json'), `the sync names what it skipped as given: ${synced}`);
+    assert.ok(String(deleted.error).includes(disk), `${path}: ${deleted.error}`);
   }
+  // The include's own refusal answers the path asked about, as given.
+  const outside = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path: 'work/SECRET.TXT' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+  assert.equal(outside.success, false);
+  assert.match(String(outside.error), /"work\/SECRET\.TXT" is outside the mount's include/);
 });
 
-test("a path is judged as disk spells it, where the answer keeps the caller's spelling of an uncovered link on its way", { skip: FOLDING_ONLY }, async (t) => {
+test("a path is judged as disk spells it, and the include's own refusal shows it as given", { skip: FOLDING_ONLY }, async (t) => {
   const { workspace, dir } = await setup(t, (d) => [
     { name: 'work', path: d, mode: 'read-write', watch: 'never', followSymlinks: true, include: ['LINK/**', 'real/**'] },
   ]);
@@ -442,6 +443,8 @@ test("a key no spelling names, as an earlier version stored, spells no path a wr
 test("past the innermost nested mount's directory a path stays as given, with two levels nested", { skip: FOLDING_ONLY }, async (t) => {
   const { workspace } = await setup(t, (d) => {
     mkdirSync(join(d, 'a', 'b'), { recursive: true });
+    // Disk has the file, so taken as disk spells it the tail would be `x.txt`.
+    writeFileSync(join(d, 'a', 'b', 'x.txt'), 'the inner mount\'s\n');
     return [
       { name: 'work', path: d, mode: 'read-write', watch: 'never' },
       { name: 'inner1', path: join(d, 'a'), mode: 'read-write', watch: 'never' },

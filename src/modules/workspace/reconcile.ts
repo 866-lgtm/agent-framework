@@ -59,14 +59,11 @@ import {
   OTHER_MOUNT,
   ROOT_REPLACED,
   type Walk,
-  insideMount,
   fingerprintVouches,
   ignoreBeneath,
   inOtherMount,
   locateRoot,
   looksBinary,
-  namesNestedPlace,
-  nestedHolder,
   observePath,
   passedOverAt,
   passedOverBetween,
@@ -75,6 +72,7 @@ import {
   readPath,
   sniffImageMime,
   walkScope,
+  withinIncludes,
 } from './observe.js';
 import { EffectFailed, type Expect, chainOf, chmodContained, narrowedTo, syncDirectories, unlinkContained, writeContained } from './effects.js';
 
@@ -866,11 +864,7 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
   // that mount's include leaves out, such as history taken in before the
   // mount was nested there: it's no mount's (namesNestedPlace).
   const candidates = new Set<string>();
-  const inside = (p: string): boolean => {
-    if (!insideMount(p, mount.view.include)) return false;
-    const holder = nestedHolder(p, mount.view.nested ?? []);
-    return holder === undefined || p === holder.dir || namesNestedPlace(p.slice(holder.dir.length + 1), holder.include, false);
-  };
+  const inside = (p: string): boolean => withinIncludes(mount.view, p);
   let walk: Walk | null = null;
   if (scope.kind === 'paths') {
     for (const p of scope.paths) if (inside(p)) candidates.add(p);
@@ -1159,8 +1153,8 @@ export async function reconcilePass(
       // it, so it's always named. Another mount's directory met beneath the
       // scope is passed over by design even where this mount's tree holds
       // copies there: no tool of this mount syncs, pushes or clears them
-      // (listings show them, naming their holder), so naming the directory
-      // as unreached would never clear.
+      // (listings show those that mount's include covers, naming their
+      // holder), so naming the directory as unreached would never clear.
       const wholeScope = scope.kind === 'dir' && scope.dir !== '' && region.path === scope.dir;
       const unreached = hides && region.reason !== OTHER_MOUNT;
       if (region.kind === 'error' || region.kind === 'cap' || unreached || wholeScope) result.incomplete.push({ path: region.path, reason: region.reason });

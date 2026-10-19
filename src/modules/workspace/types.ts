@@ -56,8 +56,9 @@ export interface MountConfig {
    * beneath a directory of that name. A subtree is named with `dir/**`.
    *
    * It's the mount's boundary for content: no workspace path reads, stores,
-   * serves or writes back a file or link it doesn't cover, and no tool lists,
-   * matches or names one, beyond echoing a path it was given. A walk passes
+   * serves or writes back a file it doesn't cover, and no tool lists,
+   * matches or names one, beyond echoing a path it was given, which it may
+   * spell as disk does. A walk passes
    * over one and counts it under `passedOver`, no pass decides a change the
    * watcher reports there, and a materialize doesn't write it back even when
    * the workspace's history holds it. A materialize that names a directory
@@ -91,15 +92,16 @@ export interface MountConfig {
    * with only the files the include covers. `ignore` still applies to what
    * `include` covers.
    *
-   * On a disk that folds names, a path is judged as disk spells it, as the
-   * walk judges what it lists, so a covered name whose file disk spells
-   * otherwise is outside the mount, and its refusal shows the path as given.
-   * A path that names one of the workspace's entries exactly, or does once
-   * its directories take disk's spelling, keeps the entry's spelling, as the
-   * parse gives it, and a segment on a path's way that isn't a directory and
-   * that the include doesn't cover keeps the caller's spelling, so no
-   * refusal names it otherwise. Where a followed path lands is judged as
-   * disk spells it, and a path that meets no link as named.
+   * On a disk that folds names, the parse reads a path in disk's spelling,
+   * as the walk names what it lists, so a covered name whose file disk
+   * spells otherwise is outside the mount, and the include's refusal shows
+   * the path as given. A path that names one of the workspace's entries
+   * exactly, or does once its directories take disk's spelling, keeps the
+   * entry's spelling, as the parse gives it. Other answers name a path as
+   * the parse spells it, a name the include leaves out included, since how
+   * disk spells a name the caller gave is no content of that file. Where a
+   * followed path lands is judged as disk spells it there, and a path that
+   * meets no link where the parse names it.
    * `resolveAbsolutePath`, which is synchronous, judges the include on the
    * path as given and follows no link: on such a disk it returns the path to
    * a covered name's file that disk spells otherwise, and null for a covered

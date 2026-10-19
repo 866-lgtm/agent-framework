@@ -592,11 +592,14 @@ export async function unlinkContained(view: MountView, rootReal: string, rel: st
     throw new EffectFailed('a directory', false);
   } else if (!info.isFile()) {
     throw new EffectFailed('not a regular file', false);
-  } else if (!(await coversLanding(view, rootReal, target, rel))) {
+  } else {
     // A regular file reached through a link among its directories lands
-    // where the mount's own include may leave it out, which is judged too,
-    // before anything reads it for a hash (coversLanding).
-    throw new EffectFailed(view.followSymlinks ? 'a symlink that leaves the mount' : NOT_FOLLOWED, false);
+    // where the mount may not act: in a nested mount's directory, or on a
+    // file the mount's own include leaves out. It's judged as the create and
+    // the opened file's check judge it, before anything reads it for a hash
+    // (refusedLanding).
+    const refused = await refusedLanding(view, rootReal, rel, target);
+    if (refused !== null) throw new EffectFailed(refused, false);
   }
   if (expect.kind === 'content' && (await hashAt(target, file, noFollowFlag(view))) !== expect.hash) throw new EffectFailed(CHANGED, false);
   const gone = await moved(root, parent);
