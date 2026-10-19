@@ -43,7 +43,7 @@ jobs:
           changes=$(git status --porcelain -- engine/quickjs-ng)
           if [ -n "$changes" ]; then
             echo "$changes"
-            echo "::error::engine/quickjs-ng isn't the release engine/vendor.sh pins. Change the engine through vendor.sh's TAG and COMMIT, run it, and commit what it copies."
+            echo "::error::engine/quickjs-ng isn't the release engine/vendor.sh pins, with the patches in engine/patches. Change the engine through vendor.sh's pin or a patch, run vendor.sh, and commit what it copies."
             exit 1
           fi
 

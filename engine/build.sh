@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Builds src/code-execution/quickjs.wasm, code_execution's engine, from the vendored quickjs-ng
 # (engine/quickjs-ng, copied by vendor.sh) and engine/interface.c, with a pinned toolchain:
-# wasi-sdk 32 and binaryen 130.0.0's wasm-opt, which runs once. The same sources and toolchain
-# give the same bytes on any machine, which CI checks against the committed module.
+# wasi-sdk 32, checked against the sha256 below, and binaryen 130.0.0's wasm-opt from npm, pinned
+# by version (npm checks it against the registry's integrity hash), which runs once. The toolchain
+# is fetched into ENGINE_TOOLCHAIN_DIR (default ~/.cache/agent-framework-engine).
 #
-# The toolchain is fetched into ENGINE_TOOLCHAIN_DIR (default ~/.cache/agent-framework-engine) and
-# checked against the hashes below. The pinned wasi-sdk is the x86_64 Linux build; elsewhere, set
-# WASI_SDK to an install of wasi-sdk 32, whose output may then differ from the committed module.
+# On x86_64 Linux, the same sources and toolchain have given the same bytes on two machines, and CI
+# rebuilds there and compares the result with the committed module. The pinned wasi-sdk is the
+# x86_64 Linux build; elsewhere, set WASI_SDK to an install of wasi-sdk 32, whose output may then
+# differ from the committed module.
 #
 # Usage: engine/build.sh [OUT]   (OUT defaults to src/code-execution/quickjs.wasm)
 set -euo pipefail
@@ -17,8 +19,11 @@ BINARYEN_VERSION=130.0.0
 
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(dirname "$here")
-out=${1:-$root/src/code-execution/quickjs.wasm}
-cache=${ENGINE_TOOLCHAIN_DIR:-$HOME/.cache/agent-framework-engine}
+# Paths given relative to where this was run from, since it changes directory before it uses them.
+absolute() { case $1 in /*) printf '%s\n' "$1" ;; *) printf '%s\n' "$PWD/$1" ;; esac; }
+out=$(absolute "${1:-$root/src/code-execution/quickjs.wasm}")
+cache=$(absolute "${ENGINE_TOOLCHAIN_DIR:-$HOME/.cache/agent-framework-engine}")
+if [ -n "${WASI_SDK:-}" ]; then WASI_SDK=$(absolute "$WASI_SDK"); fi
 mkdir -p "$cache"
 
 if [ -z "${WASI_SDK:-}" ]; then
@@ -80,4 +85,7 @@ done
 "$WASM_OPT" -Oz --strip-debug --strip-producers "$build/linked.wasm" -o "$build/quickjs.wasm"
 mkdir -p "$(dirname "$out")"
 cp "$build/quickjs.wasm" "$out"
-echo "$(sha256sum "$out" | cut -d' ' -f1)  $(wc -c < "$out") bytes  $out"
+# macOS has shasum, not sha256sum.
+if command -v sha256sum >/dev/null; then sum=$(sha256sum "$out"); else sum=$(shasum -a 256 "$out"); fi
+size=$(wc -c < "$out")
+echo "${sum%% *}  ${size// /} bytes  $out"
