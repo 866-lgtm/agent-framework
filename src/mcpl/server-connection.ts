@@ -21,6 +21,7 @@ import {
   MODERN_MCP_PROTOCOL_VERSION,
   checkServerConfig,
   redactServerText,
+  serverTextRedactor,
 } from './protocol-family.js';
 
 import type {
@@ -529,8 +530,8 @@ export class McplServerConnection extends EventEmitter {
 
   // Event buffering: control-plane traffic can be released independently from
   // inference-bearing data-plane traffic. This lets a server finish its own
-  // registration (and answer host tools/call requests) while startup/reconnect
-  // reconciliation keeps agent wakes behind a durable barrier.
+  // registration (and answer host tools/call requests) while its data plane
+  // stays held, as through a quiesce.
   private controlPlaneReady = false;
   private dataPlaneReady = false;
   private bufferedEvents: HeldItem[] = [];
@@ -568,6 +569,13 @@ export class McplServerConnection extends EventEmitter {
 
   // Reconnect state (adapted from Anarchid/agent-framework@mcpl-module-proto)
   private config: McplServerConfig | null = null;
+  /** The redactor of the server's text for `config`, made at its first error
+   *  answer, by when `config` is set, and kept: a framework-launched child's
+   *  `env` is a getter that reads the awareness ledger, so a redactor built
+   *  per answer would read it per answer (#540's review, R1-2). It builds
+   *  again only after a build that failed, which withholds that line, or once
+   *  a dial notes something new (serverTextRedactor). */
+  private redactor: ((text: unknown) => string) | null = null;
   private hostCapabilities: McplHostCapabilities | null = null;
   private reconnectEnabled = false;
   private reconnectIntervalMs = 5000;
@@ -666,8 +674,8 @@ export class McplServerConnection extends EventEmitter {
         `(long pause backlog${dropped > 0 ? `; ${dropped} dropped at cap` : ''})`,
       );
     }
-    // Re-enter the gate for every buffered item. A control handler (notably
-    // tools/list_changed) may install a newer data-plane barrier while this
+    // Re-enter the gate for every buffered item. A control handler (a
+    // host/command quiesce, say) may pause the data plane while this
     // snapshot is being flushed; later data items must observe that pause.
     this.flushHeld(pending);
   }
@@ -831,9 +839,8 @@ export class McplServerConnection extends EventEmitter {
 
   /**
    * Close the data plane synchronously while leaving an already-released
-   * control plane live. Used before list-change reconciliation so no new
-   * inference event can beat barrier installation. A reconnect closes both
-   * planes instead.
+   * control plane live. Used by quiesce, and by reconnectAfterFailure before
+   * its teardown. A reconnect closes both planes instead.
    */
   pauseDataPlane(): void {
     this.dataPlaneReady = false;
@@ -841,8 +848,8 @@ export class McplServerConnection extends EventEmitter {
 
   /**
    * Override emit to buffer server→host events until the corresponding plane
-   * is ready. Lifecycle events always pass through so reconnect can install a
-   * new data-plane gate before the fresh transport is exposed.
+   * is ready. Lifecycle events always pass through so the reconnect listener
+   * runs before the fresh transport's buffered traffic is released.
    */
   override emit(event: string | symbol, ...args: unknown[]): boolean {
     const name = typeof event === 'string' ? event : '';
@@ -1895,9 +1902,8 @@ export class McplServerConnection extends EventEmitter {
     // boundary resets, so control traffic too (a server's channels/register
     // right after initialize) must wait for the new grant rather than be
     // refused against the empty one. The reconnect lifecycle event bypasses
-    // buffering; its framework listener installs the awareness barrier,
-    // re-establishes the grant (§5.3 policy responses are never buffered),
-    // and then opens the planes.
+    // buffering; its framework listener re-establishes the grant (§5.3
+    // policy responses are never buffered), and then opens the planes.
     this.controlPlaneReady = false;
     this.dataPlaneReady = false;
     this.resetPolicyForTransportBoundary();
@@ -1920,6 +1926,18 @@ export class McplServerConnection extends EventEmitter {
   // ==========================================================================
   // Private: message sending
   // ==========================================================================
+
+  /**
+   * A request refused before anything is kept for it, as `error`, with its
+   * operator's line logged after the refusal: a host logger that throws then
+   * loses that line, and can't turn the refusal into a throw from the call.
+   */
+  private static refused(error: McplRequestError, line: string): Promise<never> {
+    return new Promise((_, reject) => {
+      reject(error);
+      console.error(line);
+    });
+  }
 
   /**
    * Send a JSON-RPC request and return a promise that resolves with the result
@@ -1958,14 +1976,16 @@ export class McplServerConnection extends EventEmitter {
     // pipe's error are the operator's, so they go to the log.
     const pipeFailure = this.transport?.pipeFailure;
     if (pipeFailure) {
-      console.error(`MCPL server "${this.id}": ${method} not sent, since its stdio pipe failed: ${logDetail(pipeFailure.message)}`);
-      return Promise.reject(new McplRequestError(
-        `The request wasn't sent: this host can no longer write to the "${this.id}" server, so nothing ran. ` +
-          (this.willReconnect
-            ? 'This host is reconnecting to it; try again later.'
-            : "This host won't reconnect to it on its own. If you need it, ask whoever runs this host."),
-        'not-sent',
-      ));
+      return McplServerConnection.refused(
+        new McplRequestError(
+          `The request wasn't sent: this host can no longer write to the "${this.id}" server, so nothing ran. ` +
+            (this.willReconnect
+              ? 'This host is reconnecting to it; try again later.'
+              : "This host won't reconnect to it on its own. If you need it, ask whoever runs this host."),
+          'not-sent',
+        ),
+        `MCPL server "${this.id}": ${method} not sent, since its stdio pipe failed: ${logDetail(pipeFailure.message)}`,
+      );
     }
 
     const id = this.nextRequestId++;
@@ -1975,6 +1995,23 @@ export class McplServerConnection extends EventEmitter {
       id,
       params,
     };
+    // A request JSON can't write (a BigInt, a cycle) never leaves this host,
+    // and calling again fails the same way, so it's refused before anything
+    // is kept for it, in the modern engine's words (#556). The method, id and
+    // the serializer's words are the operator's.
+    let line: string;
+    try {
+      line = JSON.stringify(request);
+    } catch (err) {
+      return McplServerConnection.refused(
+        new McplRequestError(
+          `The request wasn't sent: this host couldn't send it to the "${this.id}" server, so nothing ran. ` +
+            'If calling it again fails, ask whoever runs this host.',
+          'not-sent',
+        ),
+        `MCPL server "${this.id}": ${method} (id=${id}) not sent, since it can't be written as JSON: ${logDetail(err instanceof Error ? err.message : err)}`,
+      );
+    }
 
     return new Promise((resolve, reject) => {
       const pending: PendingRequest = { resolve, reject, method };
@@ -2017,20 +2054,21 @@ export class McplServerConnection extends EventEmitter {
       }
       this.pendingRequests.set(id, pending);
       try {
-        this.transport!.writeLine(JSON.stringify(request));
+        this.transport!.writeLine(line);
       } catch (err) {
         // A synchronous write rejection sent no request. Remove its pending
         // state and watchdog before reporting that it is safe to retry. The
-        // method, id and the transport's words are the operator's.
+        // method, id and the transport's words are the operator's, logged
+        // after the refusal, as refused() logs.
         this.pendingRequests.delete(id);
         if (pending.timer) clearTimeout(pending.timer);
-        console.error(
-          `MCPL server "${this.id}": writing ${method} (id=${id}) failed: ${logDetail(err instanceof Error ? err.message : err)}`,
-        );
         reject(new McplRequestError(
           `The request wasn't sent: this host couldn't write it to the "${this.id}" server, so nothing ran. Try again later.`,
           'not-sent',
         ));
+        console.error(
+          `MCPL server "${this.id}": writing ${method} (id=${id}) failed: ${logDetail(err instanceof Error ? err.message : err)}`,
+        );
       }
     });
   }
@@ -2414,7 +2452,7 @@ export class McplServerConnection extends EventEmitter {
       ));
       console.error(
         `MCPL server "${this.id}" answered ${pending.method} (id=${response.id}) with error ${logValue(response.error.code)}: ` +
-        logValueRedacted(response.error.message, (text) => redactServerText(text, this.config ?? {})),
+        logValueRedacted(response.error.message, (this.redactor ??= serverTextRedactor(this.config ?? {}))),
       );
     } else {
       pending.resolve(response.result);

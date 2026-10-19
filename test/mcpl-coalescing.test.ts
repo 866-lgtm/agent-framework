@@ -12,10 +12,11 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type { ContentBlock, NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
-import type { StreamEvent, YieldingStream } from '@animalabs/membrane';
 import { createMockResponse, MockYieldingStream } from './helpers/mock-membrane.js';
 import { fixture, eventually, settles, crash, ok, TS, REPLY_DEADLINE_MS } from './helpers/coalescing-fixture.js';
+import { PushCoalescer, type CoalescerHost, type CoalescedOccurrence, type CoalescingReceiptRecord } from '../src/mcpl/push-coalescer.js';
 
 // ---------------------------------------------------------------------------
 // Plain coalescing, feature-set scope (vectors 1–6, 35)
@@ -1787,4 +1788,1100 @@ for (const reader of ['other', 'agent'] as const) test(`R18 (${reader} read it):
   const del = await f.send('push/event', f.params('3', 'deletion_notice', { retract: true }));
   assert.equal(del.result.coalesce.outcome, 'noted');
   assert(f.context().includes('read_by_one') && f.context().includes('deletion_notice') && !f.context().includes('later_edit'));
+});
+
+// ---------------------------------------------------------------------------
+// #157's markers: an edit the agent sees first is the message it replaced
+// ---------------------------------------------------------------------------
+
+type Fixture = Awaited<ReturnType<typeof fixture>>;
+
+/**
+ * A turn, started by a mention in `chat`, with one round per `during` that
+ * sends explicitly (channel_publish), then a round that speaks. Each sending
+ * round streams only once its `during` has run: the first while the turn is
+ * live, each later one after the previous round's tool boundary. So what a
+ * `during` delivers reaches the agent at its round's tool boundary.
+ */
+async function sendThenSpeak(f: Fixture, ...during: Array<() => Promise<void>>) {
+  const gates = during.map(() => {
+    const gate = {} as { open: () => void; opened: Promise<void>; reached: () => void; atGate: Promise<void> };
+    gate.opened = new Promise<void>((resolve) => { gate.open = resolve; });
+    gate.atGate = new Promise<void>((resolve) => { gate.reached = resolve; });
+    return gate;
+  });
+  let first: MockYieldingStream | undefined;
+  (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: unknown) => {
+    f.membrane.calls.push(request as never);
+    if (first) return new MockYieldingStream([ok()]);
+    const stream = new MockYieldingStream([
+      ...during.map((_, i) => createMockResponse([{ type: 'tool_use', id: `p${i}`, name: 'channel_publish', input: { content: `explicit_send_${i}` } }] as ContentBlock[], 'tool_use')),
+      createMockResponse([{ type: 'text', text: 'prose_reply' }] as ContentBlock[]),
+    ]);
+    first = stream;
+    let provided = 0;
+    const provide = stream.provideToolResults.bind(stream);
+    stream.provideToolResults = (results, options) => { provided++; provide(results, options); };
+    const inner = stream[Symbol.asyncIterator].bind(stream);
+    (stream as unknown as Record<symbol, unknown>)[Symbol.asyncIterator] = async function* () {
+      gates[0].reached();
+      await gates[0].opened;
+      const it = inner();
+      let streamed = 0;
+      while (true) {
+        const n = await it.next();
+        if (n.done) return;
+        // A later sending round's first event: hold it until its `during` ran.
+        if (provided > streamed && provided < gates.length) {
+          streamed = provided;
+          gates[streamed].reached();
+          await gates[streamed].opened;
+        }
+        yield n.value;
+      }
+    };
+    return stream;
+  };
+  await f.send('channels/incoming', { messages: [f.channel('c1', 'question', { initial: true }, 'chat', 'm1')] });
+  const run = f.framework.runUntilIdle();
+  for (const [i, deliver] of during.entries()) {
+    await gates[i].atGate;
+    await deliver();
+    gates[i].open();
+  }
+  await run;
+  const posted = f.published.map((p) => JSON.stringify(p.content));
+  return {
+    /** What each tool boundary injected, in order. */
+    injected: first!.receivedToolResultOptions.map((o) => JSON.stringify(o?.injectedMessages ?? [])),
+    sent: during.every((_, i) => posted.some((c) => c.includes(`explicit_send_${i}`))),
+    replied: posted.some((c) => c.includes('prose_reply')),
+  };
+}
+
+const unreadFollowUp = (f: Fixture, initial = true) =>
+  f.send('channels/incoming', { messages: [f.channel('c2', 'follow_up_wiht_typo', initial ? { initial: true } : {}, 'chat', 'm2')] });
+const pushTagged = async (f: Fixture, tags: string[], eventId = 'e2', text = 'follow_up_fixed') =>
+  (await f.send('push/event', { ...f.params(eventId, text, { channelId: 'chat', key: 'message:m2' }), tags })).result.coalesce.outcome as string;
+
+/** A follow-up the agent hasn't been shown, then its edit, in each lane; returns the edit's outcome. */
+const followUpThenEdit: Record<string, (f: Fixture) => Promise<string>> = {
+  'channel-scoped push': async (f) => {
+    await unreadFollowUp(f);
+    return pushTagged(f, ['chat:edited']);
+  },
+  'channel message': async (f) => {
+    await unreadFollowUp(f);
+    return (await f.send('channels/incoming', { messages: [{ ...f.channel('e2', 'follow_up_fixed', {}, 'chat', 'm2'), tags: ['chat:edited'] }] })).result.results[0].coalesce.outcome;
+  },
+  'feature-set push': async (f) => {
+    await f.send('push/event', { ...f.params('c2', 'follow_up_wiht_typo', { key: 'message:m2', initial: true }), tags: ['chat:mention'] });
+    return (await f.send('push/event', { ...f.params('e2', 'follow_up_fixed', { key: 'message:m2' }), tags: ['chat:edited'] })).result.coalesce.outcome;
+  },
+};
+
+for (const [lane, arrive] of Object.entries(followUpThenEdit)) test(`#157 (${lane}): an edit of a follow-up the agent hasn't been shown is its first view, so the reply after an explicit send routes`, async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  let outcome: string | undefined;
+  const r = await sendThenSpeak(f, async () => { outcome = await arrive(f); });
+  assert.equal(outcome, 'replaced');
+  assert(r.injected[0].includes('follow_up_fixed') && !r.injected[0].includes('follow_up_wiht_typo'), 'the edit alone reached the boundary');
+  assert(r.sent, 'the explicit send posted');
+  assert(r.replied, 'the reply to the follow-up posted');
+});
+
+for (const tag of ['chat:reaction', 'chat:reaction-remove', 'chat:deleted']) test(`#157: a ${tag} occurrence that replaced an unread follow-up is still a notice about it, so the prose after an explicit send stays withheld`, async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  let outcome: string | undefined;
+  const r = await sendThenSpeak(f, async () => { await unreadFollowUp(f); outcome = await pushTagged(f, [tag], 'e2', `${tag}_notice`); });
+  assert.equal(outcome, 'replaced');
+  assert(r.injected[0].includes(`${tag}_notice`), 'the notice reached the boundary');
+  assert(r.sent, 'the explicit send posted');
+  assert(!r.replied, 'the prose after the send stayed withheld');
+});
+
+test('#157: an edit of an edit, after the agent read the message, stays a marker, so the prose after an explicit send stays withheld', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  const outcomes: string[] = [];
+  const r = await sendThenSpeak(f, async () => {
+    for (const [eventId, text] of [['e1', 'question_edited_once'], ['e2', 'question_edited_twice']]) {
+      outcomes.push((await f.send('push/event', { ...f.params(eventId, text, { channelId: 'chat', key: 'message:m1' }), tags: ['chat:edited'] })).result.coalesce.outcome);
+    }
+  });
+  assert.deepEqual(outcomes, ['appended', 'replaced'], 'the agent had read the question, and the second edit replaced the unread first');
+  assert(r.injected[0].includes('question_edited_twice') && !r.injected[0].includes('question_edited_once'), 'the second edit alone reached the boundary');
+  assert(r.sent, 'the explicit send posted');
+  assert(!r.replied, 'the prose after the send stayed withheld');
+});
+
+test('#157: an edit of a follow-up the agent was shown at a tool boundary stays a marker, so the prose after the next explicit send stays withheld', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  const r = await sendThenSpeak(f, async () => { await unreadFollowUp(f); }, async () => { await pushTagged(f, ['chat:edited']); });
+  assert(r.injected[0].includes('follow_up_wiht_typo'), 'the first boundary showed the agent the follow-up');
+  assert(r.injected[1].includes('follow_up_fixed'), 'the second boundary showed it the edit');
+  assert(r.sent, 'both explicit sends posted');
+  assert(!r.replied, 'the prose after the second send stayed withheld');
+});
+
+test('#157: an edit of an edit of a follow-up the agent was shown at a tool boundary stays a marker, so the prose after the next explicit send stays withheld', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  const r = await sendThenSpeak(f, async () => { await unreadFollowUp(f); }, async () => {
+    await pushTagged(f, ['chat:edited'], 'e2', 'follow_up_fixed');
+    await pushTagged(f, ['chat:edited'], 'e3', 'follow_up_fixed_again');
+  });
+  assert(r.injected[0].includes('follow_up_wiht_typo'), 'the first boundary showed the agent the follow-up');
+  assert(r.injected[1].includes('follow_up_fixed_again') && !r.injected[1].includes('"firstView":true'), 'the second boundary showed it the last edit, unmarked');
+  assert(r.sent, 'both explicit sends posted');
+  assert(!r.replied, 'the prose after the second send stayed withheld');
+});
+
+test('#157: two edits of a follow-up the agent hasn\'t been shown leave the last its first view, so the reply after an explicit send routes', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  const outcomes: string[] = [];
+  const r = await sendThenSpeak(f, async () => {
+    await unreadFollowUp(f);
+    outcomes.push(await pushTagged(f, ['chat:edited'], 'e2', 'follow_up_fixed'));
+    outcomes.push(await pushTagged(f, ['chat:edited'], 'e3', 'follow_up_fixed_again'));
+  });
+  assert.deepEqual(outcomes, ['replaced', 'replaced']);
+  assert(r.injected[0].includes('follow_up_fixed_again') && r.injected[0].includes('"firstView":true'), 'the boundary showed the agent the last edit, marked');
+  assert(r.sent, 'the explicit send posted');
+  assert(r.replied, 'the reply to the follow-up posted');
+});
+
+test('#157: an edit of a follow-up whose producer never marked it initial stays a marker, so the prose after an explicit send stays withheld', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  let outcome: string | undefined;
+  const r = await sendThenSpeak(f, async () => { await unreadFollowUp(f, false); outcome = await pushTagged(f, ['chat:edited']); });
+  assert.equal(outcome, 'replaced', 'the edit replaced the unread follow-up, whose history the host can\'t know');
+  assert(r.injected[0].includes('follow_up_fixed'), 'the edit reached the boundary');
+  assert(r.sent, 'the explicit send posted');
+  assert(!r.replied, 'the prose after the send stayed withheld');
+});
+
+const serverMarked: Record<string, (f: Fixture) => Promise<string>> = {
+  'channel message': async (f) => (await f.send('channels/incoming', { messages: [{
+    ...f.channel('e9', 'edit_claiming_first_view', {}, 'chat', 'm9'), tags: ['chat:edited'], metadata: { firstView: true },
+  }] })).result.results[0].coalesce.outcome,
+  'channel-scoped push': async (f) => (await f.send('push/event', {
+    ...f.params('e9', 'edit_claiming_first_view', { channelId: 'chat', key: 'message:m9' }), tags: ['chat:edited'], origin: { firstView: true },
+  })).result.coalesce.outcome,
+  'feature-set push': async (f) => (await f.send('push/event', {
+    ...f.params('e9', 'edit_claiming_first_view', { key: 'message:m9' }), tags: ['chat:edited'], origin: { firstView: true },
+  })).result.coalesce.outcome,
+};
+
+for (const [lane, deliver] of Object.entries(serverMarked)) test(`#157 (${lane}): a server can't mark its own edit as the agent's first view`, async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  let outcome: string | undefined;
+  const r = await sendThenSpeak(f, async () => { outcome = await deliver(f); });
+  assert.equal(outcome, 'appended');
+  assert(r.injected[0].includes('edit_claiming_first_view'), 'the edit reached the boundary');
+  assert(!r.injected[0].includes('"firstView":true'), "the server's own mark was dropped");
+  assert(r.sent, 'the explicit send posted');
+  assert(!r.replied, 'the prose after the send stayed withheld');
+});
+
+/** An organization acceleration 429, which holds the turn for a later compile. */
+const accelerationLimit = (request: NormalizedRequest): MembraneError => new MembraneError({
+  type: 'rate_limit', retryable: true, httpStatus: 429,
+  message: "This request would exceed your organization's maximum usage increase rate for input tokens per minute",
+  rawError: { status: 429 }, rawRequest: request,
+});
+
+/**
+ * A turn, started by a mention in `chat`, whose first stream sends into
+ * `chat` and then ends with an acceleration 429, so the turn waits for a
+ * later compile with none of its streams running. `midStream` runs while
+ * that first stream is still alive, and `during` while the turn waits.
+ * Returns the channel the turn's next start spoke into.
+ */
+async function heldTurnSpeaksInto(f: Fixture, during: () => Promise<void>, midStream?: () => Promise<void>): Promise<unknown> {
+  let streams = 0;
+  (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: NormalizedRequest) => {
+    f.membrane.calls.push(request as never);
+    if (++streams > 1) return new MockYieldingStream([createMockResponse([{ type: 'text', text: 'prose_after_hold' }] as ContentBlock[])]);
+    const stream = new MockYieldingStream([
+      createMockResponse([{ type: 'tool_use', id: 'p0', name: 'channel_publish', input: { channelId: 'chat', content: 'explicit_send' } }] as ContentBlock[], 'tool_use'),
+      createMockResponse([] as ContentBlock[]),
+    ]);
+    const iterate = stream[Symbol.asyncIterator].bind(stream);
+    (stream as unknown as Record<symbol, unknown>)[Symbol.asyncIterator] = async function* () {
+      for await (const event of { [Symbol.asyncIterator]: iterate }) {
+        if ((event as { type?: string }).type === 'complete') { await midStream?.(); yield { type: 'error' as const, error: accelerationLimit(request) }; return; }
+        yield event;
+      }
+    };
+    return stream;
+  };
+  await f.send('channels/incoming', { messages: [f.channel('c1', 'question', { initial: true }, 'chat', 'm1')] });
+  await f.framework.runUntilIdle();
+  const internals = f.framework as unknown as {
+    providerAccelerationCooldowns: Map<string, { until: number }>;
+    releaseProviderAccelerationCooldown(agentName: string): void;
+  };
+  const hold = internals.providerAccelerationCooldowns.get('agent');
+  assert.ok(hold, 'the turn is held after its first stream');
+  await during();
+  hold.until = Date.now();
+  internals.releaseProviderAccelerationCooldown('agent');
+  await f.framework.runUntilIdle();
+  assert.equal(streams, 2, 'one deferred compile');
+  return f.published.find((p) => JSON.stringify(p.content).includes('prose_after_hold'))?.channelId;
+}
+
+test("#157: an edit that addresses the agent, of a follow-up stored while the turn waits out a capacity hold and not yet seen, moves the turn to the follow-up's channel", async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register(); await f.register('other');
+  let outcome: string | undefined;
+  const channel = await heldTurnSpeaksInto(f, async () => {
+    await f.send('channels/incoming', { messages: [{ ...f.channel('q1', 'follow_up_wiht_typo', { initial: true }, 'other', 'mq'), tags: ['chat:ambient', 'chat:from-human'] }] });
+    outcome = (await f.send('push/event', {
+      ...f.params('e1', 'follow_up_fixed @agent', { channelId: 'other', key: 'message:mq' }), tags: ['chat:edited', 'chat:mention'],
+    })).result.coalesce.outcome;
+  });
+  assert.equal(outcome, 'replaced', 'the edit replaced the follow-up the agent had not seen');
+  assert.equal(channel, 'other');
+});
+
+test('#157: an edit of a follow-up stored at once, which a turn then read, is appended as a marker, so the prose after an explicit send stays withheld', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  // Stored at once, with no turn alive. The turn it wakes shows it to the agent in its compile.
+  await f.send('channels/incoming', { messages: [{ ...f.channel('c2', 'follow_up_wiht_typo', { initial: true }, 'chat', 'm2'), tags: ['chat:ambient', 'chat:from-human'] }] });
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 1, 'one turn ran');
+  assert(JSON.stringify(f.membrane.calls[0]).includes('follow_up_wiht_typo'), "that turn's compile showed the agent the follow-up");
+  let outcome: string | undefined;
+  const r = await sendThenSpeak(f, async () => { outcome = await pushTagged(f, ['chat:edited']); });
+  assert.equal(outcome, 'appended', 'the edit came after the agent read the follow-up, so it replaced nothing');
+  assert(r.injected[0].includes('follow_up_fixed') && !r.injected[0].includes('"firstView":true'), 'the edit reached the boundary unmarked');
+  assert(r.sent, 'the explicit send posted');
+  assert(!r.replied, 'the prose after the send stayed withheld');
+});
+
+test('#157: an edit admitted while a compile is assembling a message stored at once stays a marker, so the prose after an explicit send stays withheld', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  // The question is stored at once and wakes the turn. The edit is admitted
+  // after the compile has assembled it and before the compile returns, so
+  // the question still counts as unread.
+  const cm = f.framework.getAgent('agent')!.getContextManager() as unknown as { compile: (...args: unknown[]) => Promise<unknown> };
+  const compile = cm.compile.bind(cm);
+  let shown = false;
+  let edited = false;
+  cm.compile = async (...args: unknown[]) => {
+    const result = await compile(...args);
+    if (!edited) {
+      edited = true;
+      shown = JSON.stringify(result).includes('question');
+      await f.send('push/event', { ...f.params('e1', 'question_edited', { channelId: 'chat', key: 'message:m1' }), tags: ['chat:edited'] });
+    }
+    return result;
+  };
+  const r = await sendThenSpeak(f, async () => {});
+  assert(shown, 'the compile assembled the question');
+  assert(r.injected[0].includes('question_edited') && !r.injected[0].includes('"firstView":true'), 'the edit reached the boundary unmarked');
+  assert(r.sent, 'the explicit send posted');
+  assert(!r.replied, 'the prose after the send stayed withheld');
+});
+
+/** A message in an agent's store whose text includes `text`. */
+const storedWith = (f: Fixture, text: string, agent = 'agent') =>
+  f.framework.getAgent(agent)!.getContextManager().getAllMessages().find((m) => JSON.stringify(m.content).includes(text));
+const isMarked = (message: { metadata?: unknown } | undefined) => (message?.metadata as { firstView?: unknown } | undefined)?.firstView === true;
+
+test("#157: a compile of an agent with a store of its own leaves another agent's message stored at once unseen, so its edit is still marked", async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close); await f.register();
+  // Stored at once in the agent's store, waking no turn.
+  await f.send('push/event', f.params('d1', 'doc_unseen', { initial: true }));
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 0, 'nothing has compiled yet');
+  // An ephemeral agent, whose store is its own, runs a turn.
+  const helper = await f.framework.createEphemeralAgent({ name: 'helper', model: 'test', systemPrompt: 'Do the task.' });
+  t.after(helper.cleanup);
+  helper.contextManager.addMessage('User', [{ type: 'text', text: 'helper_task' }]);
+  const run = f.framework.runEphemeralToCompletion(helper.agent, helper.contextManager);
+  await f.framework.runUntilIdle();
+  await run;
+  assert.equal(f.membrane.calls.length, 1, "the helper's compile ran");
+  assert(!JSON.stringify(f.membrane.calls[0]).includes('doc_unseen'), "the helper's request doesn't hold the agent's message");
+  const edit = await f.send('push/event', { ...f.params('d2', 'doc_edited'), tags: ['chat:edited'] });
+  assert.equal(edit.result.coalesce.outcome, 'replaced');
+  assert(isMarked(storedWith(f, 'doc_edited')), "the edit is the agent's first view");
+});
+
+test("#157: another resident's compile that assembles a message stored at once in the shared slot shows it, so an edit admitted during that compile isn't marked", async (t) => {
+  const f = await fixture({ agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }, { name: 'other', model: 'test', systemPrompt: 'test' }], server: { shouldTriggerInference: () => true } }); t.after(f.close);
+  // The edit is admitted after the other resident's compile has assembled
+  // the message and before that compile returns.
+  const cm = f.framework.getAgent('other')!.getContextManager() as unknown as { compile: (...args: unknown[]) => Promise<unknown> };
+  const compile = cm.compile.bind(cm);
+  let shown = false;
+  let edited = false;
+  cm.compile = async (...args: unknown[]) => {
+    const result = await compile(...args);
+    if (!edited) {
+      edited = true;
+      shown = JSON.stringify(result).includes('doc_unseen');
+      await f.send('push/event', { ...f.params('d2', 'doc_edited'), tags: ['chat:edited'] });
+    }
+    return result;
+  };
+  await f.send('push/event', f.params('d1', 'doc_unseen', { initial: true }));
+  const internals = f.framework as unknown as { pendingRequests: Array<{ agentName: string }> };
+  internals.pendingRequests = internals.pendingRequests.filter((r) => r.agentName === 'other');
+  f.alwaysRespond();
+  await f.framework.runUntilIdle();
+  assert(shown, "the other resident's compile assembled the message");
+  const stored = storedWith(f, 'doc_edited');
+  assert(stored, 'the edit is stored');
+  assert(!isMarked(stored), "the edit isn't marked as the agent's first view");
+});
+
+test("#157: an edit that addresses the agent, of a follow-up that arrived during the turn and was flushed when the turn was held, moves the turn to the follow-up's channel", async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register(); await f.register('other');
+  let outcome: string | undefined;
+  const channel = await heldTurnSpeaksInto(f, async () => {
+    assert(storedWith(f, 'follow_up_wiht_typo'), 'the hold flushed the follow-up into the store');
+    outcome = (await f.send('push/event', {
+      ...f.params('e1', 'follow_up_fixed @agent', { channelId: 'other', key: 'message:mq' }), tags: ['chat:edited', 'chat:mention'],
+    })).result.coalesce.outcome;
+  }, async () => {
+    // The follow-up arrives while the first stream runs, so it waits in the deferred queue.
+    await f.send('channels/incoming', { messages: [{ ...f.channel('q1', 'follow_up_wiht_typo', { initial: true }, 'other', 'mq'), tags: ['chat:ambient', 'chat:from-human'] }] });
+    assert(!storedWith(f, 'follow_up_wiht_typo'), 'the follow-up was deferred, not stored at once');
+  });
+  assert.equal(outcome, 'replaced', 'the edit replaced the follow-up the agent had not seen');
+  assert.equal(channel, 'other');
+});
+
+test("#157: an edit of a follow-up that arrived during a turn and was flushed at the turn's end, before any compile showed it, is the agent's first view", async (t) => {
+  // The question wakes the turn. The follow-up and its edit wake nothing, so
+  // no compile shows the follow-up after the flush.
+  const f = await fixture({ server: { shouldTriggerInference: (content: string) => !content.includes('follow_up') } }); t.after(f.close); await f.register();
+  let streams = 0;
+  (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: NormalizedRequest) => {
+    f.membrane.calls.push(request as never);
+    const stream = new MockYieldingStream([createMockResponse([{ type: 'text', text: 'answer' }] as ContentBlock[])]);
+    if (++streams > 1) return stream;
+    const iterate = stream[Symbol.asyncIterator].bind(stream);
+    (stream as unknown as Record<symbol, unknown>)[Symbol.asyncIterator] = async function* () {
+      for await (const event of { [Symbol.asyncIterator]: iterate }) {
+        // The follow-up arrives after the turn's last round, so no tool
+        // boundary drains it: it waits for the turn-end flush.
+        if ((event as { type?: string }).type === 'complete') {
+          await f.send('push/event', f.params('d1', 'follow_up_wiht_typo', { initial: true }));
+          assert(!storedWith(f, 'follow_up_wiht_typo'), 'the follow-up was deferred, not stored at once');
+        }
+        yield event;
+      }
+    };
+    return stream;
+  };
+  await f.send('channels/incoming', { messages: [f.channel('c1', 'question', { initial: true }, 'chat', 'm1')] });
+  await f.framework.runUntilIdle();
+  assert.equal(streams, 1, 'one turn ran');
+  assert(storedWith(f, 'follow_up_wiht_typo'), "the turn-end flush stored the follow-up");
+  assert(!f.membrane.calls.some((c) => JSON.stringify(c).includes('follow_up_wiht_typo')), 'no request held the follow-up');
+  const edit = await f.send('push/event', { ...f.params('d2', 'follow_up_fixed'), tags: ['chat:edited'] });
+  assert.equal(edit.result.coalesce.outcome, 'replaced');
+  assert(isMarked(storedWith(f, 'follow_up_fixed')), "the edit is the agent's first view");
+});
+
+test("#157: an edit admitted while the agent's compileContext is assembling a message stored at once stays a marker", async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close); await f.register();
+  // Stored at once, waking no turn.
+  await f.send('push/event', f.params('d1', 'doc_unseen', { initial: true }));
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 0, 'no turn ran');
+  const agent = f.framework.getAgent('agent')!;
+  const cm = agent.getContextManager() as unknown as { compile: (...args: unknown[]) => Promise<unknown> };
+  const compile = cm.compile.bind(cm);
+  let shown = false;
+  let outcome: string | undefined;
+  cm.compile = async (...args: unknown[]) => {
+    const result = await compile(...args);
+    shown = JSON.stringify(result).includes('doc_unseen');
+    outcome = (await f.send('push/event', { ...f.params('d2', 'doc_edited'), tags: ['chat:edited'] })).result.coalesce.outcome;
+    return result;
+  };
+  await agent.compileContext();
+  assert(shown, 'compileContext assembled the message');
+  assert.equal(outcome, 'replaced', 'the message still counted as unread while compileContext ran');
+  const stored = storedWith(f, 'doc_edited');
+  assert(stored, 'the edit is stored');
+  assert(!isMarked(stored), "the edit isn't the agent's first view");
+});
+
+for (const method of ['compileContext', 'compileWithInjections'] as const) test(`#157: a committing ${method} that throws gives its shown mark back, so an edit of a message stored at once is still the agent's first view`, async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close); await f.register();
+  // Stored at once, waking no turn.
+  await f.send('push/event', f.params('d1', 'doc_unseen', { initial: true }));
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 0, 'no turn ran');
+  const agent = f.framework.getAgent('agent')!;
+  const cm = agent.getContextManager() as unknown as { compile: (...args: unknown[]) => Promise<unknown> };
+  const compile = cm.compile;
+  cm.compile = async () => { throw new Error('compile_failed'); };
+  await assert.rejects(agent[method](), /compile_failed/);
+  cm.compile = compile;
+  const edit = await f.send('push/event', { ...f.params('d2', 'doc_edited'), tags: ['chat:edited'] });
+  assert.equal(edit.result.coalesce.outcome, 'replaced');
+  const stored = storedWith(f, 'doc_edited');
+  assert(stored, 'the edit is stored');
+  assert(isMarked(stored), "the edit is the agent's first view");
+});
+
+test("#157: a compile that throws after a tool boundary has moved the shown mark leaves the boundary's move, so an edit of a message stored at once is a marker", async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close); await f.register();
+  await f.send('push/event', f.params('d1', 'doc_unseen', { initial: true }));
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 0, 'no turn ran');
+  const agent = f.framework.getAgent('agent')!;
+  const cm = agent.getContextManager() as unknown as { compile: (...args: unknown[]) => Promise<unknown> };
+  const compile = cm.compile;
+  // A boundary of another turn injects while the compile runs, then the compile fails.
+  cm.compile = async () => { agent.markContextShown(); throw new Error('compile_failed'); };
+  await assert.rejects(agent.compileContext(), /compile_failed/);
+  cm.compile = compile;
+  const edit = await f.send('push/event', { ...f.params('d2', 'doc_edited'), tags: ['chat:edited'] });
+  assert.equal(edit.result.coalesce.outcome, 'replaced', 'the message is still unread');
+  const stored = storedWith(f, 'doc_edited');
+  assert(stored, 'the edit is stored');
+  assert(!isMarked(stored), "the edit isn't the agent's first view");
+});
+
+test('#157: a tool boundary that cannot read the store counts every message as shown, so an edit of a message stored at once is a marker', async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close); await f.register();
+  await f.send('push/event', f.params('d1', 'doc_unseen', { initial: true }));
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 0, 'no turn ran');
+  const agent = f.framework.getAgent('agent')!;
+  const cm = agent.getContextManager() as unknown as { currentBranch: () => unknown };
+  const currentBranch = cm.currentBranch;
+  cm.currentBranch = () => { throw new Error('store_unreadable'); };
+  agent.markContextShown();
+  cm.currentBranch = currentBranch;
+  const edit = await f.send('push/event', { ...f.params('d2', 'doc_edited'), tags: ['chat:edited'] });
+  assert.equal(edit.result.coalesce.outcome, 'replaced', 'the message is still unread');
+  const stored = storedWith(f, 'doc_edited');
+  assert(stored, 'the edit is stored');
+  assert(!isMarked(stored), "the edit isn't the agent's first view");
+});
+
+test("#157: a dry-run preview shows the agent nothing, so an edit of a message stored at once after one is still its first view", async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close); await f.register();
+  await f.send('push/event', f.params('d1', 'doc_unseen', { initial: true }));
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 0, 'no turn ran');
+  const preview = await f.framework.previewActivation('agent');
+  assert(JSON.stringify(preview).includes('doc_unseen'), 'the preview assembled the message');
+  const edit = await f.send('push/event', { ...f.params('d2', 'doc_edited'), tags: ['chat:edited'] });
+  assert.equal(edit.result.coalesce.outcome, 'replaced');
+  const stored = storedWith(f, 'doc_edited');
+  assert(stored, 'the edit is stored');
+  assert(isMarked(stored), "the edit is the agent's first view");
+});
+
+test("#157: the render of a deferred notice that births its subject is the agent's first view, so an edit tag on it doesn't make it a marker", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await f.send('push/event', { ...f.params('n1', 'fallback_text', { deferred: true, initial: true }), tags: ['chat:edited'] });
+  await f.framework.runUntilIdle();
+  assert.equal(f.renders.length, 1, 'the notice rendered at assembly');
+  const stored = storedWith(f, 'document_diff');
+  assert(stored, 'the render is stored');
+  assert(isMarked(stored), "the render is the agent's first view");
+});
+
+/** What a stand-in host has removed. As in the framework, a removed
+ *  placement is no longer unread, and nothing can still be unshown in it, so
+ *  a first-view decision has to be taken before the removal. */
+function removals() {
+  const removed = new Set<string>();
+  const key = (p: { deferredId?: string; messageId?: string }) => p.deferredId ?? p.messageId ?? '';
+  return {
+    gone: (p: { deferredId?: string; messageId?: string }) => removed.has(key(p)),
+    remove: (p: { deferredId?: string; messageId?: string }) => { removed.add(key(p)); return true; },
+  };
+}
+
+test("#157: a render that lands unread in another agent's deferred queue keeps its first view, so an edit that replaces it is marked", async () => {
+  const delivered: Array<{ eventId: string; firstView?: true }> = [];
+  const r = removals();
+  const host: CoalescerHost<null> = {
+    isUnread: (p) => !r.gone(p), isUnshown: (p) => !r.gone(p), remove: r.remove,
+    // Every delivery lands in the deferred queue of an agent whose turn is alive.
+    deliver: async (occ) => { delivered.push({ eventId: occ.eventId, ...(occ.firstView ? { firstView: true as const } : {}) }); return { agent: 'other', deferredId: `deferred-${delivered.length}` }; },
+    wakeForBatch: async () => {}, wakeToRead: async () => {}, cancelWake: () => {}, authorized: () => true,
+    audience: async () => ['agent', 'other'],
+    render: async () => ({ content: [{ type: 'text', text: 'document_diff' }] }),
+    audit: () => {}, save: () => {},
+  };
+  const coalescer = new PushCoalescer<null>(host);
+  const occurrence = (eventId: string, flags: Partial<CoalescedOccurrence<null>>): CoalescedOccurrence<null> => ({
+    serverId: 'editor', binding: 'binding', scope: { kind: 'featureSet', id: 'doc' }, key: 'document', eventId, timestamp: TS,
+    retract: false, deferred: false, initial: false, content: [{ type: 'text', text: eventId }], event: null, ...flags,
+  });
+  await coalescer.accept(occurrence('n1', { deferred: true, initial: true }));
+  await coalescer.assemble('agent');
+  const edit = await coalescer.accept(occurrence('e1', { tags: ['chat:edited'] }));
+  assert.equal(edit.coalesce?.outcome, 'replaced', 'the edit replaced the unread render');
+  assert.deepEqual(delivered, [{ eventId: 'n1', firstView: true }, { eventId: 'e1', firstView: true }], 'the render and the edit that replaced it are each marked');
+});
+
+test("#157: a notice's render that lands while an earlier render of its subject waits unread in a deferred queue is no first view", async () => {
+  const delivered: Array<{ eventId: string; firstView?: true }> = [];
+  let releaseFirst!: () => void;
+  const firstRender = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  const r = removals();
+  const host: CoalescerHost<null> = {
+    isUnread: (p) => !r.gone(p), isUnshown: (p) => !r.gone(p), remove: r.remove,
+    // Every delivery lands in the deferred queue of an agent whose turn is alive.
+    deliver: async (occ) => { delivered.push({ eventId: occ.eventId, ...(occ.firstView ? { firstView: true as const } : {}) }); return { agent: 'other', deferredId: `deferred-${delivered.length}` }; },
+    wakeForBatch: async () => {}, wakeToRead: async () => {}, cancelWake: () => {}, authorized: () => true,
+    audience: async () => ['agent', 'other'],
+    render: async (occ) => { if (occ.eventId === 'n1') await firstRender; return { content: [{ type: 'text', text: `diff_${occ.eventId}` }] }; },
+    audit: () => {}, save: () => {},
+  };
+  const coalescer = new PushCoalescer<null>(host);
+  const occurrence = (eventId: string, flags: Partial<CoalescedOccurrence<null>>): CoalescedOccurrence<null> => ({
+    serverId: 'editor', binding: 'binding', scope: { kind: 'featureSet', id: 'doc' }, key: 'document', eventId, timestamp: TS,
+    retract: false, deferred: false, initial: false, content: [{ type: 'text', text: eventId }], event: null, ...flags,
+  });
+  await coalescer.accept(occurrence('n1', { deferred: true, initial: true }));
+  const first = coalescer.assemble('agent');
+  // A second notice arrives while the first batch renders, so it opens a new batch.
+  await coalescer.accept(occurrence('n2', { deferred: true }));
+  releaseFirst();
+  await first;
+  await coalescer.assemble('agent');
+  assert.deepEqual(delivered, [{ eventId: 'n1', firstView: true }, { eventId: 'n2' }], 'only the first render is the first view');
+});
+
+/** A coalescer whose every delivery lands in the deferred queue of 'other',
+ *  an agent whose turn is alive, unless `stored` names the event, whose
+ *  delivery is then stored and so materialized for the assembling turn, or
+ *  `unplaced` does, whose delivery is placed nowhere. The renders of `held`
+ *  wait for `release`, and those of `blank` come back blank. `state` answers
+ *  the host's read and shown questions for every placement it hasn't removed
+ *  (removals), and its `shownEvents` and `readEvents`, when given, for the
+ *  placements of the events they name.
+ *  (slimepriestess's probe for #168, with the held renders and the other
+ *  options added.) */
+function firstViewProbe(state: { shown: boolean; read: boolean; shownEvents?: Set<string>; readEvents?: Set<string> }, { held = ['n1'], stored = [] as string[], unplaced = [] as string[], blank = [] as string[] } = {}) {
+  const delivered: Array<{ eventId: string; firstView?: true }> = [];
+  // Each placement's event, for the per-event read and shown answers.
+  const eventOf = new Map<string, string>();
+  const named = (p: { deferredId?: string; messageId?: string }, events?: Set<string>) => events?.has(eventOf.get(p.deferredId ?? p.messageId ?? '') ?? '') === true;
+  const releases = new Map<string, () => void>();
+  const gates = new Map(held.map((id) => [id, new Promise<void>((resolve) => { releases.set(id, resolve); })]));
+  const started = new Map<string, () => void>();
+  const renderStarted = new Map(held.map((id) => [id, new Promise<void>((resolve) => { started.set(id, resolve); })]));
+  const r = removals();
+  const host: CoalescerHost<null> = {
+    isUnread: (p) => !r.gone(p) && !state.read && !named(p, state.readEvents),
+    isUnshown: (p) => !r.gone(p) && !state.shown && !state.read && !named(p, state.shownEvents) && !named(p, state.readEvents),
+    remove: r.remove,
+    deliver: async (occ) => {
+      delivered.push({ eventId: occ.eventId, ...(occ.firstView ? { firstView: true as const } : {}) });
+      if (unplaced.includes(occ.eventId)) return undefined;
+      const placement = stored.includes(occ.eventId)
+        ? { agent: 'agent', messageId: `stored-${delivered.length}` }
+        : { agent: 'other', deferredId: `deferred-${delivered.length}` };
+      eventOf.set(placement.messageId ?? placement.deferredId!, occ.eventId);
+      return placement;
+    },
+    wakeForBatch: async () => {}, wakeToRead: async () => {}, cancelWake: () => {}, authorized: () => true,
+    audience: async () => ['agent', 'other'],
+    render: async (occ) => {
+      started.get(occ.eventId)?.();
+      await gates.get(occ.eventId);
+      return { content: [{ type: 'text', text: blank.includes(occ.eventId) ? ' ' : `diff_${occ.eventId}` }] };
+    },
+    audit: () => {}, save: () => {},
+  };
+  const coalescer = new PushCoalescer<null>(host);
+  const occurrence = (eventId: string, flags: Partial<CoalescedOccurrence<null>>): CoalescedOccurrence<null> => ({
+    serverId: 'editor', binding: 'binding', scope: { kind: 'featureSet', id: 'doc' }, key: 'document', eventId, timestamp: TS,
+    retract: false, deferred: false, initial: false, content: [{ type: 'text', text: eventId }], event: null, ...flags,
+  });
+  return {
+    coalescer, host, delivered, occurrence,
+    release: (id: string) => releases.get(id)!(),
+    renderStarted: (id: string) => renderStarted.get(id)!,
+  };
+}
+
+/** n1's render lands in 'other''s deferred queue as a first view, after n2
+ *  opened a batch of the same subject during that render. */
+async function firstViewQueuedWithBatchPending(p: ReturnType<typeof firstViewProbe>): Promise<void> {
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  const first = p.coalescer.assemble('agent');
+  await p.coalescer.accept(p.occurrence('n2', { deferred: true }));
+  p.release('n1');
+  await first;
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }], "n1's render is the agent's first view");
+}
+
+for (const shown of [false, true]) test(`#157: a notice after a queued first-view render joins the pending batch and leaves the render in place, the batch's render joins its run unmarked, and a plain edit that displaces the run ${shown ? 'the agent was shown is no first view' : 'nothing has shown is the first view'}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state);
+  await firstViewQueuedWithBatchPending(p);
+  // Shown at a boundary whose stream doesn't declare what it carries
+  // injected: still unread, but no longer unshown.
+  state.shown = shown;
+  const n3 = await p.coalescer.accept(p.occurrence('n3', { deferred: true, tags: ['chat:edited'] }));
+  assert.equal(n3.coalesce?.outcome, 'replaced', 'n3 joined the pending batch');
+  await p.coalescer.assemble('agent');
+  // A render is a delta the next one builds on (RFC-006 §5.2): n1 stays, and
+  // the batch's render joins its run. The run holds the first view, in n1.
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }, { eventId: 'n3' }]);
+  const e1 = await p.coalescer.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
+  assert.equal(e1.coalesce?.outcome, 'replaced', 'e1 displaced the run');
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'e1', ...(shown ? {} : { firstView: true as const }) },
+    shown ? 'the agent was shown the run, so the edit is no first view' : 'nothing showed the run, so the edit takes its first view');
+});
+
+for (const shown of [false, true]) test(`#157: a render that settles while a first-view render is queued joins its run unmarked, and a retraction of the run ${shown ? 'the agent was shown leaves the next batch no first view' : 'nothing had shown leaves the next batch the first view'}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: ['n1', 'n2'] });
+  await firstViewQueuedWithBatchPending(p);
+  // n2's batch renders, held, so no batch is pending when n3 arrives.
+  const second = p.coalescer.assemble('agent');
+  await settles(p.renderStarted('n2'), "n2's render");
+  state.shown = shown;
+  const n3 = await p.coalescer.accept(p.occurrence('n3', { deferred: true, tags: ['chat:edited'] }));
+  assert.equal(n3.coalesce?.outcome, 'first', 'n3 opened a batch beside the queued render, which stays');
+  p.release('n2');
+  await second;
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }, { eventId: 'n2' }], "n2's render joined n1's run unmarked");
+  const r1 = await p.coalescer.accept(p.occurrence('r1', { retract: true, content: [] }));
+  assert.equal(r1.coalesce?.outcome, 'retracted');
+  // Later versions haven't been shown, whatever happened to the run.
+  state.shown = false;
+  await p.coalescer.accept(p.occurrence('n4', { deferred: true }));
+  await p.coalescer.assemble('agent');
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'n4', ...(shown ? {} : { firstView: true as const }) });
+});
+
+test("#157: a batch opened during a render whose content the turn then read has a render that is no first view", async () => {
+  const state = { shown: false, read: false };
+  // n1's render is stored where the assembling turn's compile reads it, so
+  // that turn consumes it.
+  const p = firstViewProbe(state, { stored: ['n1'] });
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  const first = p.coalescer.assemble('agent');
+  await p.coalescer.accept(p.occurrence('n2', { deferred: true }));
+  p.release('n1');
+  await first;
+  await p.coalescer.assemble('agent');
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }, { eventId: 'n2' }], "n2's batch opened before the agent read n1, but its render comes after");
+});
+
+test('#157: a plain edit that takes the place of a pending first-view batch after the agent read an earlier render is no first view', async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state);
+  await firstViewQueuedWithBatchPending(p);
+  state.read = true;
+  const e1 = await p.coalescer.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
+  assert.equal(e1.coalesce?.outcome, 'replaced');
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'e1' });
+});
+
+/** n1's render lands in 'other''s deferred queue as the agent's first view,
+ *  and `shown` says whether the agent is then shown it. n2 opens a batch
+ *  beside it, which follows the run's agent and is no first view, since the
+ *  run holds it; that batch starts rendering for 'other'; n3 opens a new
+ *  batch during that render. Returns the held assembly, wrapped, since an
+ *  async function returning it would wait for it. */
+async function firstViewEndedDuringRender(p: ReturnType<typeof firstViewProbe>, state: { shown: boolean }, shown: boolean) {
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  await p.coalescer.assemble('agent');
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }], "n1's render is the agent's first view");
+  state.shown = shown;
+  const n2 = await p.coalescer.accept(p.occurrence('n2', { deferred: true }));
+  assert.equal(n2.coalesce?.outcome, 'first', 'n2 opened a batch beside the queued render, which stays');
+  const second = p.coalescer.assemble('other');
+  await settles(p.renderStarted('n2'), "n2's render");
+  const n3 = await p.coalescer.accept(p.occurrence('n3', { deferred: true }));
+  assert.equal(n3.coalesce?.outcome, 'first', 'n3 opened a new batch during the render');
+  return { second };
+}
+
+for (const shown of [false, true]) test(`#157: a plain edit that takes the place of a batch opened during a render beside a queued first-view render displaces that run too, and ${shown ? 'is no first view when the agent was shown it' : 'is the first view when nothing had shown it'}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: ['n2'] });
+  const { second } = await firstViewEndedDuringRender(p, state, shown);
+  const e1 = await p.coalescer.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
+  assert.equal(e1.coalesce?.outcome, 'replaced', "e1 took the pending batch's place");
+  p.release('n2');
+  await second;
+  assert.equal(p.delivered.at(-1)?.eventId, 'e1');
+  assert.equal(p.delivered.at(-1)?.firstView === true, !shown);
+});
+
+for (const shown of [false, true]) test(`#157: beside a queued first-view render, a batch whose render comes back blank and a later batch's render leave the run its first view, so a plain edit that displaces the run ${shown ? 'the agent was shown is no first view' : 'nothing had shown is the first view'}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: ['n2'], blank: ['n2'] });
+  const { second } = await firstViewEndedDuringRender(p, state, shown);
+  p.release('n2');
+  await second;
+  assert.equal(p.delivered.length, 1, "n2's blank render delivered nothing");
+  await p.coalescer.assemble('agent');
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'n3' }, "n3's render joined n1's run unmarked");
+  const e1 = await p.coalescer.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
+  assert.equal(e1.coalesce?.outcome, 'replaced', 'e1 displaced the run');
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'e1', ...(shown ? {} : { firstView: true as const }) });
+});
+
+/** n1's render lands in 'other''s deferred queue as the agent's first view;
+ *  `shown` says whether the agent is then shown it, and a retraction
+ *  withdraws it. */
+/** A run of n1, the agent's first view, and n3's render, which joined it
+ *  unmarked, both queued for 'other'. */
+async function firstViewRunOfTwo(p: ReturnType<typeof firstViewProbe>): Promise<void> {
+  await firstViewQueuedWithBatchPending(p);
+  await p.coalescer.accept(p.occurrence('n3', { deferred: true, tags: ['chat:edited'] }));
+  await p.coalescer.assemble('agent');
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }, { eventId: 'n3' }], "n3's render joined n1's run unmarked");
+}
+
+/** Runs whose renders the agent may have seen differently: only a run none
+ *  of whose renders may have been shown, and none of whose renders has left
+ *  it read, hands its first view on. */
+const runMixes: Record<string, { shownEvents?: string[]; readEvents?: string[] }> = {
+  'its newest render shown and its oldest not': { shownEvents: ['n3'] },
+  'its oldest render shown and its newest not': { shownEvents: ['n1'] },
+  'its newest render read and its oldest not': { readEvents: ['n3'] },
+};
+const runEndings: Record<string, (p: ReturnType<typeof firstViewProbe>) => Promise<string>> = {
+  'a plain edit that displaces it is': async (p) => {
+    const e1 = await p.coalescer.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
+    assert.equal(e1.coalesce?.outcome, 'replaced', 'e1 displaced what is left of the run');
+    return 'e1';
+  },
+  'a retraction of it leaves the next batch': async (p) => {
+    await p.coalescer.accept(p.occurrence('r1', { retract: true, content: [] }));
+    await p.coalescer.accept(p.occurrence('n4', { deferred: true }));
+    await p.coalescer.assemble('agent');
+    return 'n4';
+  },
+};
+for (const [mix, seen] of Object.entries(runMixes)) for (const [ending, end] of Object.entries(runEndings)) test(`#157: with a run of renders that has ${mix}, ${ending} no first view`, async () => {
+  const state = { shown: false, read: false, shownEvents: new Set<string>(), readEvents: new Set<string>() };
+  const p = firstViewProbe(state);
+  await firstViewRunOfTwo(p);
+  for (const id of seen.shownEvents ?? []) state.shownEvents.add(id);
+  for (const id of seen.readEvents ?? []) state.readEvents.add(id);
+  const next = await end(p);
+  assert.deepEqual(p.delivered.at(-1), { eventId: next }, 'something of the run may have been shown');
+});
+
+async function firstViewRetracted(p: ReturnType<typeof firstViewProbe>, state: { shown: boolean }, shown: boolean) {
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  await p.coalescer.assemble('agent');
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }], "n1's render is the agent's first view");
+  state.shown = shown;
+  const r1 = await p.coalescer.accept(p.occurrence('r1', { retract: true, content: [] }));
+  assert.equal(r1.coalesce?.outcome, 'retracted');
+  // Later versions haven't been shown, whatever happened to n1.
+  state.shown = false;
+}
+
+for (const shown of [false, true]) test(`#157: after a retraction withdraws a first-view render ${shown ? 'the agent was shown, the next batch is no first view' : 'nothing had shown, the next batch is the first view'}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [] });
+  await firstViewRetracted(p, state, shown);
+  await p.coalescer.accept(p.occurrence('n2', { deferred: true }));
+  await p.coalescer.assemble('agent');
+  assert.equal(p.delivered.at(-1)?.eventId, 'n2');
+  assert.equal(p.delivered.at(-1)?.firstView === true, !shown);
+});
+
+for (const shown of [false, true]) test(`#157: after a retraction withdraws a first-view render ${shown ? 'the agent was shown, a plain birth is no first view, nor its edit' : 'nothing had shown, a plain birth is the first view, and so is its edit'}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [] });
+  await firstViewRetracted(p, state, shown);
+  const p1 = await p.coalescer.accept(p.occurrence('p1', {}));
+  assert.equal(p1.coalesce?.outcome, 'first');
+  const e1 = await p.coalescer.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
+  assert.equal(e1.coalesce?.outcome, 'replaced', 'e1 replaced the unread birth');
+  assert.equal(p.delivered.at(-1)?.eventId, 'e1');
+  assert.equal(p.delivered.at(-1)?.firstView === true, !shown);
+});
+
+for (const shown of [false, true]) test(`#157: a plain occurrence that displaces a first-view render ${shown ? 'the agent was shown and is placed nowhere leaves the next batch no first view' : 'nothing had shown and is placed nowhere leaves the next batch the first view'}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [], unplaced: ['p1'] });
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  await p.coalescer.assemble('agent');
+  state.shown = shown;
+  const p1 = await p.coalescer.accept(p.occurrence('p1', { tags: ['chat:edited'] }));
+  assert.equal(p1.coalesce?.outcome, 'replaced');
+  assert.equal(p.delivered.at(-1)?.eventId, 'p1');
+  state.shown = false;
+  await p.coalescer.accept(p.occurrence('n2', { deferred: true }));
+  await p.coalescer.assemble('agent');
+  assert.equal(p.delivered.at(-1)?.eventId, 'n2');
+  assert.equal(p.delivered.at(-1)?.firstView === true, !shown);
+});
+
+test("#157: a snapshot keeps a subject's ended first view, so a restored coalescer's next batch is no first view", async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [] });
+  await firstViewRetracted(p, state, true);
+  const snapshot = p.coalescer.snapshot();
+  assert.equal((snapshot.subjects[0] as { firstViewEnded?: unknown }).firstViewEnded, true, 'the snapshot carries the end');
+  const restored = new PushCoalescer<null>(p.host);
+  restored.restore(snapshot);
+  await restored.accept(p.occurrence('n2', { deferred: true }));
+  await restored.assemble('agent');
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'n2' });
+});
+
+/** n1's render lands in 'other''s deferred queue as the agent's first view;
+ *  `shown` says whether the agent is then shown it, and a plain edit
+ *  displaces it. */
+async function firstViewDisplacedByPlain(p: ReturnType<typeof firstViewProbe>, state: { shown: boolean }, shown: boolean) {
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  await p.coalescer.assemble('agent');
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }], "n1's render is the agent's first view");
+  state.shown = shown;
+  const p1 = await p.coalescer.accept(p.occurrence('p1', { tags: ['chat:edited'] }));
+  assert.equal(p1.coalesce?.outcome, 'replaced', 'p1 displaced the queued render');
+  // Later versions haven't been shown, whatever happened to n1.
+  state.shown = false;
+}
+
+const firstViewEndings = { 'a retraction': firstViewRetracted, 'a plain occurrence that displaces it': firstViewDisplacedByPlain };
+
+for (const [ending, end] of Object.entries(firstViewEndings)) for (const shown of [false, true]) test(`#157: the crash-window receipt records keep a subject's ended first view after ${ending}, so a coalescer restored from them alone ${shown ? 'gives the next batch no first view' : 'still gives the next batch its first view when nothing had shown the agent the last'}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [] });
+  const records: CoalescingReceiptRecord[] = [];
+  p.host.recordReceipt = (record) => { records.push(structuredClone(record)); };
+  await end(p, state, shown);
+  // A crash before the throttled snapshot: only the records written at each acceptance survive.
+  const restored = new PushCoalescer<null>(p.host);
+  restored.restoreReceipts(records);
+  await restored.accept(p.occurrence('n2', { deferred: true }));
+  await restored.assemble('agent');
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'n2', ...(shown ? {} : { firstView: true as const }) });
+});
+
+for (const shown of [false, true]) test(`#157: a snapshot taken before a subject's first view ended, with the records written after it, ${shown ? 'gives the next batch no first view' : 'still gives the next batch its first view when nothing had shown the agent the last'}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [] });
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  // The last snapshot holds the subject with its batch pending; the records after it are the crash window's.
+  const snapshot = p.coalescer.snapshot();
+  const records: CoalescingReceiptRecord[] = [];
+  p.host.recordReceipt = (record) => { records.push(structuredClone(record)); };
+  await p.coalescer.assemble('agent');
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }], "n1's render is the agent's first view");
+  state.shown = shown;
+  const r1 = await p.coalescer.accept(p.occurrence('r1', { retract: true, content: [] }));
+  assert.equal(r1.coalesce?.outcome, 'retracted');
+  state.shown = false;
+  assert.equal(records.length, 1, "the retraction's record is the only one after the snapshot");
+  const restored = new PushCoalescer<null>(p.host);
+  restored.restore(snapshot);
+  restored.restoreReceipts(records);
+  await restored.accept(p.occurrence('n2', { deferred: true }));
+  await restored.assemble('agent');
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'n2', ...(shown ? {} : { firstView: true as const }) });
+});
+
+for (const shown of [false, true]) test(`#157: a snapshot that holds a first-view batch, restored with the records after it once their retry window has passed, ${shown ? "gives that batch's render no first view when a record ends the first view" : "leaves that batch's render the first view when nothing had shown the agent the last"}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [] });
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  // The last snapshot holds n1's batch pending, as the agent's first view.
+  const snapshot = p.coalescer.snapshot();
+  const records: CoalescingReceiptRecord[] = [];
+  p.host.recordReceipt = (record) => { records.push(structuredClone(record)); };
+  await p.coalescer.assemble('agent');
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }], "n1's render is the agent's first view");
+  state.shown = shown;
+  await p.coalescer.accept(p.occurrence('r1', { retract: true, content: [] }));
+  state.shown = false;
+  // The host comes back two hours after the crash. Past their retry window
+  // the records' batch facts aren't read, so the snapshot's batch is back,
+  // and the end a record carries holds for it too.
+  const later = Date.now() + 2 * 3_600_000;
+  const restored = new PushCoalescer<null>({ ...p.host, now: () => later });
+  restored.restore(snapshot);
+  restored.restoreReceipts(records);
+  await restored.assemble('agent');
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'n1', ...(shown ? {} : { firstView: true as const }) });
+});
+
+for (const shown of [false, true]) test(`#157: crash-window records restored after their retry window has passed ${shown ? "still end the first view, so the edit of a later initial plain occurrence is no first view" : "leave the edit of a later initial plain occurrence the first view when nothing had shown the agent the last"}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [] });
+  const records: CoalescingReceiptRecord[] = [];
+  p.host.recordReceipt = (record) => { records.push(structuredClone(record)); };
+  await firstViewRetracted(p, state, shown);
+  // The host comes back two hours after the crash: every record is past the default one-hour retry window.
+  const later = Date.now() + 2 * 3_600_000;
+  const restored = new PushCoalescer<null>({ ...p.host, now: () => later });
+  restored.restoreReceipts(records);
+  await restored.accept(p.occurrence('p1', { initial: true }));
+  const e1 = await restored.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
+  assert.equal(e1.coalesce?.outcome, 'replaced', 'e1 replaced the unread p1');
+  // A birth carries no mark of its own (it isn't an edit); its edit carries the first view it hands on.
+  assert.deepEqual(p.delivered.slice(-2), [
+    { eventId: 'p1' },
+    { eventId: 'e1', ...(shown ? {} : { firstView: true as const }) },
+  ]);
+});
+
+test("#157: a receipt keeps an admission's first view in memory only, so a restored receipt has none", async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [] });
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  await p.coalescer.assemble('agent');
+  await p.coalescer.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'e1', firstView: true });
+  assert.equal(p.coalescer.receiptFirstView('editor', 'binding', 'e1'), true, "the receipt records e1's first view");
+  assert.equal(p.coalescer.receiptFirstView('editor', 'binding', 'n1'), false, "n1's admission delivered nothing");
+  const snapshot = p.coalescer.snapshot();
+  for (const [, entry] of snapshot.receipts) assert.deepEqual(Object.keys(entry).sort(), ['at', 'result'], "a snapshot's receipt is its declared shape");
+  const restored = new PushCoalescer<null>(p.host);
+  restored.restore(snapshot);
+  assert.equal(restored.receiptFirstView('editor', 'binding', 'e1'), false, 'a restored receipt has no first view');
+});
+
+test('#157: a plain edit that arrives while a first-view batch renders takes its place as the first view', async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state);
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  const first = p.coalescer.assemble('agent');
+  await settles(p.renderStarted('n1'), "n1's render");
+  const e1 = await p.coalescer.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
+  assert.equal(e1.coalesce?.outcome, 'replaced', 'e1 cancelled the render and took its place');
+  p.release('n1');
+  await first;
+  assert.deepEqual(p.delivered, [{ eventId: 'e1', firstView: true }]);
+});
+
+for (const shown of [false, true]) test(`#157: a notice that displaces an unread first view ${shown ? 'that something may have shown the agent opens a batch whose render is no first view' : 'that nothing has shown the agent opens a batch whose render is the first view'}`, async () => {
+  const delivered: Array<{ eventId: string; firstView?: true }> = [];
+  const r = removals();
+  const host: CoalescerHost<null> = {
+    isUnread: (p) => !r.gone(p), isUnshown: (p) => !r.gone(p) && !shown, remove: r.remove,
+    deliver: async (occ) => { delivered.push({ eventId: occ.eventId, ...(occ.firstView ? { firstView: true as const } : {}) }); return { agent: 'agent', messageId: `stored-${delivered.length}` }; },
+    wakeForBatch: async () => {}, wakeToRead: async () => {}, cancelWake: () => {}, authorized: () => true,
+    audience: async () => ['agent'],
+    render: async () => ({ content: [{ type: 'text', text: 'document_diff' }] }),
+    audit: () => {}, save: () => {},
+  };
+  const coalescer = new PushCoalescer<null>(host);
+  const occurrence = (eventId: string, flags: Partial<CoalescedOccurrence<null>>): CoalescedOccurrence<null> => ({
+    serverId: 'editor', binding: 'binding', scope: { kind: 'featureSet', id: 'doc' }, key: 'document', eventId, timestamp: TS,
+    retract: false, deferred: false, initial: false, content: [{ type: 'text', text: eventId }], event: null, ...flags,
+  });
+  await coalescer.accept(occurrence('p1', { initial: true }));
+  const notice = await coalescer.accept(occurrence('n1', { deferred: true, tags: ['chat:edited'] }));
+  assert.equal(notice.coalesce?.outcome, 'replaced', 'the notice displaced the unread birth');
+  await coalescer.assemble('agent');
+  assert.deepEqual(delivered, [{ eventId: 'p1' }, { eventId: 'n1', ...(shown ? {} : { firstView: true as const }) }]);
+});
+
+test("#157: a plain edit that takes the place of a pending notice that birthed its subject is the agent's first view, and so is an edit of that edit", async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close);
+  // The notice waits as a batch: no turn assembles it.
+  await f.send('push/event', f.params('n1', 'fallback_text', { deferred: true, initial: true }));
+  await f.framework.runUntilIdle();
+  assert.equal(f.renders.length, 0, 'nothing rendered the notice');
+  const first = await f.send('push/event', { ...f.params('e1', 'doc_edit_one'), tags: ['chat:edited'] });
+  assert.equal(first.result.coalesce.outcome, 'replaced', "the edit took the batch's place");
+  const one = storedWith(f, 'doc_edit_one');
+  assert(one, 'the edit is stored');
+  assert(isMarked(one), "the edit is the agent's first view");
+  const second = await f.send('push/event', { ...f.params('e2', 'doc_edit_two'), tags: ['chat:edited'] });
+  assert.equal(second.result.coalesce.outcome, 'replaced', 'the second edit replaced the first, unread');
+  const two = storedWith(f, 'doc_edit_two');
+  assert(two, 'the second edit is stored');
+  assert(isMarked(two), "the second edit is the agent's first view too");
+});
+
+test("#157: a notice that births its subject and is still pending at a restart is still the agent's first view after it", async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close);
+  await f.send('push/event', f.params('n1', 'fallback_text', { deferred: true, initial: true }));
+  await f.framework.runUntilIdle();
+  assert.equal(f.renders.length, 0, 'nothing rendered the notice');
+  await f.framework.stop(); await f.create();
+  await f.framework.runUntilIdle();
+  assert.equal(f.renders.length, 0, 'nothing rendered the notice after the restart');
+  const edit = await f.send('push/event', { ...f.params('e1', 'doc_edit_one'), tags: ['chat:edited'] });
+  assert.equal(edit.result.coalesce.outcome, 'replaced', "the edit took the restored batch's place");
+  const stored = storedWith(f, 'doc_edit_one');
+  assert(stored, 'the edit is stored');
+  assert(isMarked(stored), "the edit is the agent's first view");
+});
+
+type IncomingAnchor = { buildChannelContext: (agent?: string) => { incoming?: { channelId: string; messageId: string } } | undefined };
+const incomingAnchor = (f: Fixture) => (f.framework as unknown as { channelRegistry: IncomingAnchor }).channelRegistry.buildChannelContext('agent')?.incoming;
+
+test("#157: a channel edit that is the agent's first view moves context.incoming to its message, as the message would", async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close); await f.register(); await f.register('other');
+  await f.send('channels/incoming', { messages: [f.channel('a1', 'question_wiht_typo', { initial: true }, 'other', 'ma')] });
+  await f.send('channels/incoming', { messages: [f.channel('b1', 'unrelated', { initial: true }, 'chat', 'mb')] });
+  assert.equal(incomingAnchor(f)?.messageId, 'mb', 'the later message is the anchor');
+  const edit = await f.send('channels/incoming', { messages: [{ ...f.channel('a2', 'question_fixed', {}, 'other', 'ma'), tags: ['chat:edited'] }] });
+  assert.equal(edit.result.results[0].coalesce.outcome, 'replaced', 'the edit replaced the question the agent had not seen');
+  assert(!('firstView' in edit.result.results[0]), "the host's mark isn't in the answer to the server");
+  assert(isMarked(storedWith(f, 'question_fixed')), "the edit is the agent's first view");
+  assert.equal(incomingAnchor(f)?.channelId, 'other', "the anchor moved to the edit's channel");
+  assert.equal(incomingAnchor(f)?.messageId, 'ma', "and to the edit's message");
+});
+
+test("#157: a channel edit that is the agent's first view moves context.incoming to its message when its acceptance is retried after a failed commit", async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close); await f.register(); await f.register('other');
+  await f.send('channels/incoming', { messages: [f.channel('a1', 'question_wiht_typo', { initial: true }, 'other', 'ma')] });
+  await f.send('channels/incoming', { messages: [f.channel('b1', 'unrelated', { initial: true }, 'chat', 'mb')] });
+  assert.equal(incomingAnchor(f)?.messageId, 'mb', 'the later message is the anchor');
+  // The edit's acceptance commit fails once, after its delivery (R10's seam),
+  // so the server retries, and the retry is answered from the receipt.
+  const internals = f.framework as unknown as { commitCoalescingDurable: () => Promise<void> };
+  const commit = internals.commitCoalescingDurable.bind(internals);
+  internals.commitCoalescingDurable = () => { internals.commitCoalescingDurable = commit; return Promise.reject(new Error('EIO simulated')); };
+  const message = { ...f.channel('a2', 'question_fixed', {}, 'other', 'ma'), tags: ['chat:edited'] };
+  const first = await f.send('channels/incoming', { messages: [message] });
+  assert.equal(first.result.results[0].accepted, false, 'the failed commit leaves the edit unacknowledged');
+  const delivered = storedWith(f, 'question_fixed');
+  assert(isMarked(delivered), "the edit was delivered as the agent's first view");
+  assert.equal(incomingAnchor(f)?.messageId, 'mb', 'an unacknowledged acceptance moves no anchor');
+  const retry = await f.send('channels/incoming', { messages: [message] });
+  // A second admission would replace the first attempt's delivery of a2
+  // itself, and say so.
+  assert.equal(retry.result.results[0].coalesce.outcome, 'replaced');
+  assert.equal(retry.result.results[0].coalesce.priorEventId, 'a1', "the retry is answered from the first attempt's receipt");
+  assert.equal(storedWith(f, 'question_fixed')?.id, delivered!.id, 'and delivers nothing again');
+  assert(!('firstView' in retry.result.results[0]), "the host's mark isn't in the answer to the server");
+  assert.equal(incomingAnchor(f)?.channelId, 'other', "the anchor moved to the edit's channel");
+  assert.equal(incomingAnchor(f)?.messageId, 'ma', "and to the edit's message");
+});
+
+test("#157: a channel edit after an earlier edit that was the agent's first view, of a message the agent has since read, leaves context.incoming where it was", async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close); await f.register(); await f.register('other');
+  await f.send('channels/incoming', { messages: [f.channel('a1', 'question_wiht_typo', { initial: true }, 'other', 'ma')] });
+  await f.send('channels/incoming', { messages: [f.channel('b1', 'unrelated', { initial: true }, 'chat', 'mb')] });
+  await f.send('channels/incoming', { messages: [{ ...f.channel('a2', 'question_fixed', {}, 'other', 'ma'), tags: ['chat:edited'] }] });
+  assert.equal(incomingAnchor(f)?.messageId, 'ma', "the first-view edit moved the anchor to its message");
+  await f.send('channels/incoming', { messages: [f.channel('c1', 'later', { initial: true }, 'chat', 'mc')] });
+  await f.framework.getAgent('agent')!.compileContext();
+  // Each admission records only its own delivery's mark.
+  const edit = await f.send('channels/incoming', { messages: [{ ...f.channel('a3', 'question_fixed_again', {}, 'other', 'ma'), tags: ['chat:edited'] }] });
+  assert.equal(edit.result.results[0].coalesce.outcome, 'appended', 'the agent had read the edit');
+  assert.equal(incomingAnchor(f)?.messageId, 'mc', 'the marker left the anchor at the later message');
+});
+
+test('#157: a channel edit of a message the agent has read leaves context.incoming where it was', async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close); await f.register(); await f.register('other');
+  await f.send('channels/incoming', { messages: [f.channel('a1', 'question_wiht_typo', { initial: true }, 'other', 'ma')] });
+  await f.framework.getAgent('agent')!.compileContext();
+  await f.send('channels/incoming', { messages: [f.channel('b1', 'unrelated', { initial: true }, 'chat', 'mb')] });
+  const edit = await f.send('channels/incoming', { messages: [{ ...f.channel('a2', 'question_fixed', {}, 'other', 'ma'), tags: ['chat:edited'] }] });
+  assert.equal(edit.result.results[0].coalesce.outcome, 'appended', 'the agent had read the question');
+  assert.equal(incomingAnchor(f)?.messageId, 'mb', 'the marker left the anchor at the later message');
 });
