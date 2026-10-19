@@ -68,6 +68,19 @@ class ChannelOpenOvertakenError extends Error {}
  *  recorded: the decision to open stays, so the channel stays selected for
  *  opening, and reconciliation may open it later. */
 class ChannelOpenPutBackUnrecordedError extends Error {}
+/** The failure of an open by speech or a reply whose put-back restored a
+ *  pure default that the channel's current descriptor, or the subscription
+ *  policy, lifts: the channel is selected for opening again, and `by` says
+ *  which. */
+class ChannelOpenSelectedAgainError extends Error {
+  constructor(message: string, readonly by: Exclude<SelectedForOpening, 'unrecorded'>, options?: ErrorOptions) {
+    super(message, options);
+  }
+}
+/** Why a channel is selected for opening after a failed open by speech or a
+ *  reply: its put-back couldn't be recorded, or the server's latest
+ *  announcement or the subscription policy lifted the default it restored. */
+export type SelectedForOpening = 'unrecorded' | 'server-bootstrap' | 'subscription-policy';
 const CHANNEL_LIFECYCLE_LOG_ID = 'mcpl/channel-lifecycle';
 
 /** The sources of a decision the agent itself made: channel_open and
@@ -2608,17 +2621,19 @@ export class ChannelRegistry {
   private closeSubstitutedChannel(serverId: string, channelId: string): void {
     if (!this.channels.has(`${serverId}:${channelId}`)) return;
     if (this.getDesiredState(serverId, channelId) !== 'closed') return;
-    this.closeThroughQueue(serverId, channelId);
+    this.applyThroughQueue(serverId, channelId);
   }
 
   /**
-   * Carry out a channel's closed decision through its lifecycle queue, for a
+   * Carry out a channel's decision through its lifecycle queue, for a
    * transport the server may have opened without the host's knowing: one it
    * opened for another channel's request (closeSubstitutedChannel), or one a
-   * failed open's request may have reached (openChannelNow). A failure is
-   * reported as a trace; the decision stands.
+   * failed open's request may have reached (openChannelNow). The decision is
+   * a closed one, except after a failed open whose put-back the server's
+   * latest announcement or the policy lifted. A failure is reported as a
+   * trace; the decision stands.
    */
-  private closeThroughQueue(serverId: string, channelId: string): void {
+  private applyThroughQueue(serverId: string, channelId: string): void {
     this.applyDesiredChannelState(serverId, channelId).catch((err) => {
       // Removal while queued is cancellation, as in reconcileChannels, and
       // exhausted convergence emitted its own diagnostic.
@@ -2627,7 +2642,7 @@ export class ChannelRegistry {
           err instanceof ChannelLifecycleConvergenceError) return;
       this.emitTraceFn({
         type: 'mcpl:channel-reconcile-failed',
-        serverId, channelId, desired: 'closed', error: (err as Error).message,
+        serverId, channelId, desired: this.getDesiredState(serverId, channelId), error: (err as Error).message,
       });
     });
   }
@@ -2872,12 +2887,17 @@ export class ChannelRegistry {
    * is closed and the open failed, isn't later put into it by that decision.
    * That holds only while the record is still the one it wrote: a decision
    * made meanwhile stands, and the failure then comes as a
-   * ChannelOpenOvertakenError. And since a failed request may have reached
-   * the server, the put-back's close is carried out on the wire too. An open
-   * by speech or a reply that can't send its request, on a server without
-   * channels.lifecycle, writes nothing. Automatic delivery needs open
-   * transport, not a change of attention: preserve tune-out epochs both
-   * before and during the round-trip.
+   * ChannelOpenOvertakenError. Where the decision put back is a pure default,
+   * nobody had decided, so the channel then follows its server's latest
+   * announcement and the policy: a re-announcement during the round-trip
+   * found the open's own record and lifted nothing. If they select it for
+   * opening, the failure says so (ChannelOpenSelectedAgainError). And since
+   * a failed request may have reached the server, the decision that stands
+   * is carried out on the wire too. An open by speech or a reply that can't
+   * send its request, on a server without channels.lifecycle, writes
+   * nothing. Automatic delivery needs open transport, not a change of
+   * attention: preserve tune-out epochs both before and during the
+   * round-trip.
    *
    * `opened` says whether this call turned a closed channel open, which is
    * what the delivery and reply notices tell the resident. Reconfirming the
@@ -2934,15 +2954,44 @@ export class ChannelRegistry {
           );
         }
         // The decision put back is a closed one: an open that turned the
-        // channel open replaced no open decision. The failed request may have
-        // reached the server, so the close is carried out through the queue,
-        // as a decline's is, unless other lifecycle work for the channel is
-        // queued, which carries it out anyway. (An incidental open gets here
-        // only where the host directs the lifecycle: see the grant check
-        // above.)
+        // channel open replaced no open decision. Where it's a pure default,
+        // nobody had decided, so the channel follows its server's latest
+        // announcement and the policy, not the ones from before the open: a
+        // re-announcement during the round-trip found the open's own record
+        // and lifted nothing. The lift is ensureInitialDesiredState's own,
+        // which leaves every real decision alone. One that can't be recorded
+        // leaves the default, closed.
         const current = this.channels.get(`${entry.serverId}:${entry.descriptor.id}`);
+        let selectedAgain: Exclude<SelectedForOpening, 'unrecorded'> | undefined;
+        if (current) {
+          try {
+            this.ensureInitialDesiredState(entry.serverId, current.descriptor);
+          } catch (liftErr) {
+            console.error(
+              `[channel] ${entry.serverId}:${logValue(entry.descriptor.id)}: the lift after a failed open couldn't be recorded:`,
+              liftErr,
+            );
+          }
+          const now = this.desiredStates.get(key);
+          if (now?.state === 'open' && (now.source === 'server-bootstrap' || now.source === 'subscription-policy')) {
+            selectedAgain = now.source;
+          }
+        }
+        // The failed request may have reached the server, so the decision
+        // that stands is carried out through the queue, as a decline's close
+        // is, unless other lifecycle work for the channel is queued, which
+        // carries it out anyway. (An incidental open gets here only where the
+        // host directs the lifecycle: see the grant check above.)
         if (current && !this.lifecycleOutstanding.has(key)) {
-          this.closeThroughQueue(entry.serverId, entry.descriptor.id);
+          this.applyThroughQueue(entry.serverId, entry.descriptor.id);
+        }
+        if (selectedAgain) {
+          throw new ChannelOpenSelectedAgainError(
+            `${err instanceof Error ? err.message : String(err)}; the channel is selected for opening again, as ` +
+              (selectedAgain === 'server-bootstrap' ? 'its server announces it open' : 'the subscription policy admits it'),
+            selectedAgain,
+            { cause: err },
+          );
         }
       }
       throw err;
@@ -3141,9 +3190,11 @@ export class ChannelRegistry {
    * transport of a channel already selected open or tuned out. It isn't one
    * either where a decision made during its round-trip replaced it
    * (ChannelOpenOvertakenError), or where queued lifecycle work left the
-   * channel closed before any open was sent. `staysSelected` says the
-   * put-back couldn't be recorded, so the channel stays selected for opening
-   * (ChannelOpenPutBackUnrecordedError).
+   * channel closed before any open was sent. `selectedForOpening` says the
+   * channel is selected for opening after the failure, and why: the put-back
+   * couldn't be recorded (ChannelOpenPutBackUnrecordedError), or the server's
+   * latest announcement or the policy lifted the default it restored
+   * (ChannelOpenSelectedAgainError).
    */
   async openIfClosedForSend(
     rawChannelId: string,
@@ -3153,7 +3204,7 @@ export class ChannelRegistry {
     channelId?: string;
     label?: string;
     opening?: boolean;
-    staysSelected?: true;
+    selectedForOpening?: SelectedForOpening;
   }> {
     let matches = [...this.channels.values()].filter(
       (e) => e.descriptor.id === rawChannelId && (!serverId || e.serverId === serverId),
@@ -3201,9 +3252,10 @@ export class ChannelRegistry {
       });
       const current = this.channels.get(`${entry.serverId}:${entry.descriptor.id}`);
       return { status: 'open-failed', channelId: entry.descriptor.id, opening,
-        // Where the put-back couldn't be recorded, the channel stays selected
-        // for opening, and the agent is told so, as speech's failure says.
-        ...(err instanceof ChannelOpenPutBackUnrecordedError ? { staysSelected: true as const } : {}),
+        // Where the channel is selected for opening after the failure, the
+        // agent is told so and why, as speech's failure says.
+        ...(err instanceof ChannelOpenPutBackUnrecordedError ? { selectedForOpening: 'unrecorded' as const } : {}),
+        ...(err instanceof ChannelOpenSelectedAgainError ? { selectedForOpening: err.by } : {}),
         ...(current ? { label: current.descriptor.label } : {}) };
     }
   }

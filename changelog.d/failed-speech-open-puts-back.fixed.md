@@ -6,10 +6,14 @@
   that says it's open and how to close it. A decision made while the open
   was out stands. Since the failed request may have reached the server, as
   when its answer is lost to a timeout, the host also closes the channel on
-  the server. Where the host can't record putting the decision back, the
-  decision stays, no close is sent, and the failure says the channel stays
-  selected for opening. `channel_open`'s own decision still outlives a
-  failed open, as its failure says.
+  the server. Where the decision put back means nobody had decided, the
+  channel then follows its server's latest announcement and the
+  subscription policy, which a re-announcement during the open couldn't
+  apply: if they select it for opening, the host tries the open again, and
+  the failure says why. Where the host can't record putting the decision
+  back, the decision stays, no close is sent, and the failure says the
+  channel stays selected for opening. `channel_open`'s own decision still
+  outlives a failed open, as its failure says.
 - A reply into a closed channel whose open fails now tells the agent that
   the reply went out and opening the channel failed, and that
   `channel_open` tries again, where the agent can call it: a conversation
@@ -18,11 +22,15 @@
   (`channels.lifecycle`), and only when no decision about the channel, such
   as the agent closing it, was made while the open was out. A reply whose
   open only reconfirms a channel the agent already has open gets none.
-  Where the host couldn't record putting the channel's decision back, the
-  notice says the channel stays selected for opening, as speech's failure
-  does, and, in `channel_open`'s own failure's words, that a later delivery
-  or reconnect tries again and `channel_close` withdraws that, where the
-  agent can call it. Before, the failure reached only the logs.
+  Where the channel is selected for opening after the failure, the notice
+  says so and why, as speech's failure does, and that `channel_close`
+  withdraws that, where the agent can call it: where the host couldn't
+  record putting the channel's decision back, in `channel_open`'s own
+  failure's words, a later delivery or reconnect tries again; where the
+  server's latest announcement or the policy selected it again, the host
+  tries again itself. If the replying agent has ended by then, or can't
+  close the channel, as a fork away from its home can't, the primary is
+  told by name. Before, the failure reached only the logs.
 - On a server without `channels.lifecycle`, an open by speech or a reply,
   which fails there before any request is sent, no longer records a decision.
 - `channel_open` on a channel that's already open, and `channel_close` on one
