@@ -264,8 +264,10 @@ export class ConversationRouter {
     return Array.from(this.bindings.values());
   }
 
-  /** Bindings whose idle TTL has elapsed. Does not unbind — the framework
-   * runs the closure turn first, then calls unbind(). */
+  /** Bindings whose idle TTL has elapsed. Does not unbind: the framework
+   * unbinds each one first, so the channel's next message goes to a newer
+   * fork, or nowhere, and then runs the old fork's closure turn
+   * (sweepExpiredConversations). */
   expired(now = Date.now()): ConversationBinding[] {
     const ttl = this.idleTtlMs;
     return this.getBindings().filter((b) => now - b.lastActivity >= ttl);
