@@ -1667,7 +1667,10 @@ export class HistoryModule implements Module {
     // /newtopic keeps its id (a new message gets a fresh one) and stays
     // indexed. Check every hit against the CURRENT branch before it goes back
     // to the model — getMessage/getSummary rebuild on branch switch, so an
-    // undone message or a summary minted on another branch answers null.
+    // undone message, or a summary this branch doesn't hold, answers null.
+    // A branch made from an earlier point, as an undo makes one, can mint a
+    // summary id another branch already used, so a summary hit can still be
+    // ranked by that other summary's text.
     // k is small, so this is at most `limit` local lookups.
     // A message hit whose current text has nothing left to index (edited
     // blank, delete not yet applied) is dropped too, so its stale snippet is
@@ -1679,8 +1682,10 @@ export class HistoryModule implements Module {
     // A message hit's snippet is rebuilt from the CURRENT local text, never
     // the remote copy: an edit not yet synced (or one the index never got)
     // must not leak a passage the edit removed. Only the ranking can be stale.
-    // A summary hit's snippet is rebuilt from the local summary too, so a
-    // service that keeps only vectors and ids (no text) still yields one.
+    // A summary hit's snippet is rebuilt from the local summary too: a
+    // service that keeps only vectors and ids (no text) still yields one, and
+    // a summary whose id another branch also minted never shows that
+    // branch's text.
     const currentText = new Map<string, string>();
     const keep = (h: { id: string }): 'ok' | 'offBranch' | 'stale' => {
       const msgId = /^msg:(.+)$/.exec(h.id)?.[1];
@@ -1698,7 +1703,11 @@ export class HistoryModule implements Module {
         if (!s) return 'offBranch';
         // Cut as summaryToItem cuts the text it indexes.
         const text = safeSlice(s.content.trim(), 0, this.semanticCfg!.maxChars ?? 32_000);
-        if (text) currentText.set(h.id, text);
+        // Nothing to index, so the index's text for this id is another
+        // summary's, such as one another branch minted under the same id,
+        // and the hit is dropped rather than show it.
+        if (!text) return 'stale';
+        currentText.set(h.id, text);
         return 'ok';
       }
       return 'ok';
@@ -1789,7 +1798,7 @@ export class HistoryModule implements Module {
           lastError: this.indexer?.lastError ?? null,
           /** Hits the index returned for messages/summaries not on the current branch (undone, checked out past). */
           droppedOffBranch,
-          /** Hits for messages whose current text has nothing indexable (edited blank; the index keeps such a message until its delete goes through, and on a service without /delete it never does). */
+          /** Hits for messages or summaries whose current text has nothing indexable (a message edited blank, which the index keeps until its delete goes through, and on a service without /delete it never does; a summary empty after trimming, whose id another branch's summary holds in the index). */
           droppedStale,
           /** When too few hits were on this branch and searching again for more failed: why, and whether calling again can help. */
           searchAgainError,
