@@ -519,6 +519,7 @@ import type {
   BeforeInferenceParams,
   PushEventParams,
   McplInferenceRequestParams,
+  InferenceChunkParams,
   ChannelsRegisterParams,
   ChannelsChangedParams,
   ChannelsIncomingParams,
@@ -21437,10 +21438,6 @@ export class AgentFramework {
       this.featureSetManager,
       inferenceRouting ?? null,
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
-      (serverId, params) => {
-        const server = this.mcplServerRegistry!.getServer(serverId);
-        server?.sendInferenceChunk(params);
-      },
     );
 
     // Checkpoint manager (Step 8), built and loaded at the top
@@ -22047,9 +22044,88 @@ export class AgentFramework {
   }
 
   /**
+   * Per connection, the transport epoch whose §5.3 policy exchange is in
+   * flight: a connect's, from when the registry hands the connection back,
+   * or a reconnect's, from its 'reconnect' event. Until the exchange settles,
+   * that transport's traffic must wait for its grant, so a gate that opens
+   * every connection's planes meanwhile (another server's list change, a
+   * resume, an awareness sync, startup's staged open) passes it by
+   * (mcplPlanesMayOpen), and the exchange's own caller opens them once it
+   * settles (openMcplPlanesAfterExchange).
+   */
+  private readonly mcplPolicyExchanges = new WeakMap<McplServerConnection, number>();
+
+  /** Whether a gate may open this connection's planes: no policy exchange is
+   *  in flight on its current transport (see mcplPolicyExchanges). */
+  private mcplPlanesMayOpen(connection: McplServerConnection): boolean {
+    const exchange = this.mcplPolicyExchanges.get(connection);
+    return exchange === undefined || exchange !== connection.transportEpoch;
+  }
+
+  /**
+   * Run a connection's §5.3 policy exchange with its planes held: it is
+   * marked in flight for the transport it runs on, so no gate releases that
+   * transport's traffic before its grant exists. With `epoch`, it runs only
+   * on that transport: a runtime connect passes the one it registered, and
+   * if that transport is gone, the exchange isn't run, since a reconnect
+   * that adopts a next transport, if one comes, runs that one's. With
+   * `closeOnFailure`, as for a runtime connect or restart, an exchange that
+   * throws closes the connection for good, through the registry, before it
+   * lifts the marker: left live, the connection would be half registered,
+   * and unmarked before its close, a gate completing in between would let
+   * out what it held with no grant. A close that fails keeps the connection
+   * registered, but closed for good, it readies nothing but its own reports.
+   * Without `closeOnFailure`, as for a reconnect or a staged startup connect,
+   * an exchange that throws leaves the connection live with the grant it
+   * reached, empty if the policy step itself threw, and the marker lifts.
+   */
+  private async settlePolicyExchange(
+    config: import('./mcpl/types.js').McplServerConfig,
+    connection: McplServerConnection,
+    opts: { closeOnFailure?: boolean; epoch?: number } = {},
+  ): Promise<void> {
+    const epoch = opts.epoch ?? connection.transportEpoch;
+    if (connection.transportEpoch !== epoch) {
+      // Gone, closed or replaced: a marker left for it no longer matches.
+      console.error(`[mcpl] ${config.id}: its transport closed before its policy exchange; the next transport, if one comes, negotiates its own`);
+      return;
+    }
+    this.mcplPolicyExchanges.set(connection, epoch);
+    try {
+      await this.registerMcplServerFeatures(config, connection);
+    } catch (error) {
+      if (opts.closeOnFailure) await this.closeFailedRuntimeConnect(connection, 'policy registration');
+      throw error;
+    } finally {
+      // A newer transport's exchange may have taken the marker over.
+      if (this.mcplPolicyExchanges.get(connection) === epoch) this.mcplPolicyExchanges.delete(connection);
+    }
+  }
+
+  /**
+   * Open a connection's planes once its exchange has settled, when the gate
+   * its connect or reconnect installed was replaced during the exchange: the
+   * newer gate passed the connection by, and if it has completed, nothing
+   * else would open it. A connection whose transport dropped meanwhile is
+   * readied as any gate readies one between transports, so its own reports
+   * go on. How far follows what is held now: while a gate is up, only the
+   * control plane opens, since a gate holds data planes alone, and its
+   * completion, which no longer passes this connection by, opens the data
+   * plane; a quiesced host (issue #122) likewise opens only control planes;
+   * otherwise both open.
+   */
+  private openMcplPlanesAfterExchange(connection: McplServerConnection): void {
+    if (!this.mcplPlanesMayOpen(connection)) return;
+    if (this.discordAwarenessBarrier !== null || this.quiesced) connection.readyControlPlane();
+    else connection.ready();
+  }
+
+  /**
    * Install one framework-global Discord-awareness generation before releasing
    * any inference-bearing event. With pending work or a drain still running,
-   * every MCPL data plane is paused while all control planes remain live.
+   * every MCPL data plane is paused while the control planes remain live,
+   * but for a connection whose policy exchange is in flight, which neither
+   * the release nor the completion opens (mcplPlanesMayOpen).
    * With neither, ready() runs synchronously so request responders preserve
    * their historical same-stack behavior.
    */
@@ -22079,7 +22155,9 @@ export class AgentFramework {
     if (this.discordAwarenessBarrier !== barrier) return;
     if (barrier.requiresBarrier) {
       for (const connection of this.mcplServerRegistry?.getAllServers() ?? []) {
-        connection.readyControlPlane();
+        // A connection whose policy exchange is in flight stays closed; its
+        // exchange opens it (openMcplPlanesAfterExchange).
+        if (this.mcplPlanesMayOpen(connection)) connection.readyControlPlane();
       }
       return;
     }
@@ -22098,6 +22176,10 @@ export class AgentFramework {
       // check sits AFTER this guard: readyControlPlane can also synchronously
       // flush a control event that installs a newer barrier.)
       if (this.discordAwarenessBarrier !== null) return false;
+      // A connection whose policy exchange is in flight stays closed, both
+      // planes, until its grant exists: its exchange opens it
+      // (openMcplPlanesAfterExchange).
+      if (!this.mcplPlanesMayOpen(connection)) continue;
       // Host quiesce (issue #122): this is the single point every barrier
       // completion and reconnect flow funnels through, so holding here keeps
       // data planes paused across awareness drains and reconnects for the
@@ -22340,10 +22422,25 @@ export class AgentFramework {
       });
     }
     let connection: McplServerConnection;
+    // The transport the connect registered, which its own exchange is for.
+    let registeredEpoch = 0;
     const abort = new AbortController();
     this.legacyConnectAborts().set(config.id, abort);
     try {
-      connection = await this.mcplServerRegistry.addServer(connectionConfig, this.mcplHostCapabilities, abort.signal);
+      // Its policy exchange is in flight from its registration, through a
+      // runtime connect's awareness accounting, until the exchange settles: a
+      // gate that completes meanwhile (a resume, another server's list change
+      // or reconnect) passes the connection by, so nothing opens its planes
+      // before its grant exists.
+      connection = await this.mcplServerRegistry.addServer(
+        connectionConfig,
+        this.mcplHostCapabilities,
+        abort.signal,
+        (registering) => {
+          registeredEpoch = registering.transportEpoch;
+          this.mcplPolicyExchanges.set(registering, registeredEpoch);
+        },
+      );
     } catch (error) {
       // Ended by stop() or by a disconnect of its id (its abort): said as a
       // modern connect ended that way says it, with the handshake's own
@@ -22379,6 +22476,9 @@ export class AgentFramework {
       } catch (error) {
         cleanup = `; its cleanup also failed: ${error instanceof Error ? error.message : String(error)}`;
       }
+      // Removed, or closed for good if its removal failed, it readies
+      // nothing but its own reports, so its exchange marker lifts now.
+      this.mcplPolicyExchanges.delete(connection);
       throw new Error(`MCP server "${config.id}" was not connected: ${why}${cleanup}`);
     }
 
@@ -22390,8 +22490,14 @@ export class AgentFramework {
       // Staged startup: both planes are closed, so the §5.3 policy
       // round-trip cannot let any buffered traffic slip — establish the
       // grant now, before staging ever releases.
-      await this.registerMcplServerFeatures(config, connection);
-      this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
+      await this.settlePolicyExchange(config, connection);
+      // Announced while the transport it registered still serves, checked
+      // now. One whose transport dropped meanwhile, or a stub that has none
+      // yet, is announced by the first reconnect still connected once its
+      // attempt settles, granted or not.
+      if (connection.transportEpoch === registeredEpoch && connection.isConnected) {
+        this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
+      }
       return connection;
     }
 
@@ -22428,7 +22534,10 @@ export class AgentFramework {
       // a failed connect never reports a released data plane. (The reverse
       // order let a push arrive during the policy await and get flushed by
       // teardown.)
+      // Its exchange marker lifts only after the close, so no gate opens it
+      // in between; closed for good, it readies nothing but its own reports.
       await this.closeFailedRuntimeConnect(connection, 'awareness accounting');
+      this.mcplPolicyExchanges.delete(connection);
       await this.failMcplDataPlaneGate(awarenessBarrier, `connect of MCPL server "${config.id}"`, error);
       throw error;
     }
@@ -22437,25 +22546,39 @@ export class AgentFramework {
     // completes: the grant is established (or knowingly left empty) before
     // ANY buffered traffic (control or data) flows. complete() then
     // ready()s both planes through the admission gate.
+    // On the transport the connect registered: one that closed or was
+    // replaced during the accounting has no exchange here, and a reconnect
+    // that adopts a next transport, if one comes, runs that one's.
     try {
-      await this.registerMcplServerFeatures(config, connection);
+      await this.settlePolicyExchange(config, connection, { closeOnFailure: true, epoch: registeredEpoch });
     } catch (error) {
       // A policy registration that throws would leave the new connection
       // live and half registered, and the gate standing over every other
-      // server's data. So close the connection for good through the
-      // registry, as the catch above does, then complete the gate rather
-      // than fail it: accounting succeeded, so nothing calls for a recycle.
-      // A close that fails keeps the connection registered, but a connection
-      // closed for good readies nothing, so this completion, and any later
-      // one, leaves it paused.
+      // server's data. So the exchange has closed the connection for good
+      // through the registry, as the catch above does, before lifting its
+      // marker; complete the gate rather than fail it: accounting succeeded,
+      // so nothing calls for a recycle. A close that fails keeps the
+      // connection registered, but a connection closed for good readies
+      // nothing but its own reports, so this completion, and any later one,
+      // leaves it paused.
       // Every exit of a runtime connect settles the gate it installed.
-      await this.closeFailedRuntimeConnect(connection, 'policy registration');
       this.completeMcplDataPlaneGate(awarenessBarrier);
       throw error;
     }
+    // Its own gate opens it while that gate is current. A newer gate that
+    // replaced it during the exchange passed the connection by, whether or
+    // not its transport still serves.
+    const replaced = this.discordAwarenessBarrier !== awarenessBarrier;
     this.completeMcplDataPlaneGate(awarenessBarrier);
+    if (replaced) this.openMcplPlanesAfterExchange(connection);
 
-    this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
+    // Announced while the transport it registered still serves, checked
+    // now, after the completion's flush. One whose transport dropped
+    // meanwhile, or a stub that has none yet, is announced by the first
+    // reconnect still connected once its attempt settles, granted or not.
+    if (connection.transportEpoch === registeredEpoch && connection.isConnected) {
+      this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
+    }
     return connection;
   }
 
@@ -22463,8 +22586,11 @@ export class AgentFramework {
    *  most one queued behind it (announcements coalesce), floor between
    *  completed fetches. Exceeding the floor drops the excess with a
    *  diagnostic — the host bounds the rate; it never depends on server
-   *  coalescing. */
-  private manifestRefreshState: Map<string, { inFlight: boolean; queued: boolean; lastCompletedAt: number }> = new Map();
+   *  coalescing. A queued refresh runs only on the transport of the latest
+   *  announcement it holds (`queuedEpoch`): the next transport's initialize
+   *  and policy exchange start afresh, and its own announcements queue
+   *  their own. */
+  private manifestRefreshState: Map<string, { inFlight: boolean; queued: boolean; lastCompletedAt: number; queuedEpoch?: number }> = new Map();
   private static readonly MANIFEST_FETCH_FLOOR_MS = 5_000;
 
   /**
@@ -22519,6 +22645,7 @@ export class AgentFramework {
       // fetch is always of the CURRENT manifest, so N announcements need at
       // most one trailing fetch (§17.8).
       st.queued = true;
+      st.queuedEpoch = connection.transportEpoch;
       return;
     }
     const sinceLast = Date.now() - st.lastCompletedAt;
@@ -22529,15 +22656,20 @@ export class AgentFramework {
           const cur = this.manifestRefreshState.get(connection.id);
           if (cur?.queued && !cur.inFlight) {
             cur.queued = false;
-            this.rerunManifestRefresh(connection, announce, recorded);
+            if (cur.queuedEpoch === connection.transportEpoch) this.rerunManifestRefresh(connection, announce, recorded);
           }
         }, AgentFramework.MANIFEST_FETCH_FLOOR_MS - sinceLast).unref?.();
       }
+      st.queuedEpoch = connection.transportEpoch;
       return;
     }
 
     st.inFlight = true;
     try {
+      // A manifest, and the policy negotiated for it, belong to the transport
+      // they came on: one that closes meanwhile installs nothing, since the
+      // next transport's initialize and policy exchange start afresh.
+      const epoch = connection.transportEpoch;
       // §17.4 fetch. A server that cannot answer keeps its previous
       // manifest in force — an unparseable/failed fetch teaches nothing and
       // narrows nothing (§17.5 step 1).
@@ -22546,6 +22678,10 @@ export class AgentFramework {
         fetched = await connection.sendManifestRequest();
       } catch (err) {
         console.error(`[mcpl] ${connection.id}: mcpl/manifest fetch failed — previous manifest stands (§17.5): ${recorded(err instanceof Error ? err.message : err)}`);
+        return;
+      }
+      if (connection.transportEpoch !== epoch) {
+        console.error(`[mcpl] ${connection.id}: mcpl/manifest answer arrived after its transport closed; not applied`);
         return;
       }
       if (!fetched || typeof fetched !== 'object') {
@@ -22613,6 +22749,10 @@ export class AgentFramework {
       let closeForGood = false;
       try {
         const receipt = await connection.sendFeatureSetsUpdateRequest(updateParams);
+        if (connection.transportEpoch !== epoch) {
+          console.error(`[mcpl] ${connection.id}: post-manifest policy answer arrived after its transport closed; not applied`);
+          return;
+        }
         if (receipt && receipt.accepted === false) {
           const refusal = AgentFramework.policyRefusalFields(receipt, recorded);
           const fallback = refusal.fallback;
@@ -22636,6 +22776,10 @@ export class AgentFramework {
           negotiated = true;
         }
       } catch {
+        if (connection.transportEpoch !== epoch) {
+          console.error(`[mcpl] ${connection.id}: post-manifest policy Request ended by its transport's close; not applied`);
+          return;
+        }
         console.error(`[mcpl] ${connection.id} did not answer post-manifest policy — expansion does not activate (§6.7); interim state stands`);
       }
       if (closeForGood) {
@@ -22679,8 +22823,10 @@ export class AgentFramework {
       st.lastCompletedAt = Date.now();
       if (st.queued) {
         st.queued = false;
-        setTimeout(() => { this.rerunManifestRefresh(connection, announce, recorded); },
-          AgentFramework.MANIFEST_FETCH_FLOOR_MS).unref?.();
+        const queuedEpoch = st.queuedEpoch;
+        setTimeout(() => {
+          if (connection.transportEpoch === queuedEpoch) this.rerunManifestRefresh(connection, announce, recorded);
+        }, AgentFramework.MANIFEST_FETCH_FLOOR_MS).unref?.();
       }
     }
   }
@@ -22723,6 +22869,8 @@ export class AgentFramework {
     // uses one derivation, whatever becomes of the server meanwhile (removed,
     // or replaced by a restart).
     const recorded = serverTextRedactor(config);
+    // A grant belongs to the transport it was negotiated on.
+    const epoch = connection.transportEpoch;
 
     // §5.4: compute the effective grant from the (config-masked)
     // advertisement. Not yet active — expansion activates only after the
@@ -22755,6 +22903,12 @@ export class AgentFramework {
     let closeForGood = false;
     try {
       const receipt = await connection.sendFeatureSetsUpdateRequest(updateParams);
+      if (connection.transportEpoch !== epoch) {
+        // The transport this exchange was for is gone: its answer grants
+        // nothing to any next one, which negotiates its own.
+        console.error(`[mcpl] ${config.id}: policy answer arrived after its transport closed; not applied`);
+        return;
+      }
       if (receipt && receipt.accepted === false) {
         // The fallback the host takes, which is the one logged; the server's
         // reason is its own text.
@@ -22786,6 +22940,10 @@ export class AgentFramework {
         }
       }
     } catch (err) {
+      if (connection.transportEpoch !== epoch) {
+        console.error(`[mcpl] ${config.id}: its transport closed during the initial policy Request; the next one, if one comes, negotiates its own`);
+        return;
+      }
       // A pre-0.5 server treats the Request as a notification and never
       // answers. §6.7: an unanswered expansion simply does not activate —
       // grant stays empty, connection is effectively MCP-only. This WILL
@@ -23643,7 +23801,12 @@ export class AgentFramework {
     // Handle server-initiated inference requests (Step 6)
     onRequest('inference-request', async (
       params: McplInferenceRequestParams,
-      responder?: { id: string | number; respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
+      responder?: {
+        id: string | number;
+        respond: (result: unknown) => void;
+        respondError: (code: number, message: string) => void;
+        sendChunk?: (chunk: InferenceChunkParams) => void;
+      },
     ) => {
       // RFC-006 §5.3 / SPEC §10.7: no inference from inside a render.
       if (this.pushCoalescer?.isRendering(connection.id)) {
@@ -23666,6 +23829,9 @@ export class AgentFramework {
           respond: responder.respond,
           respondError: responder.respondError,
           requestId: responder.id,
+          // Chunks go out on the transport the request came on, as its
+          // answer does.
+          ...(responder.sendChunk ? { sendChunk: responder.sendChunk } : {}),
         });
       }
     });
@@ -23819,36 +23985,53 @@ export class AgentFramework {
     connection.on('reconnect', (info?: { attempts?: number }) => {
       // Install the barrier synchronously so any inbound event emitted after
       // reconnect observes it before doing work that could wake an agent. The
-      // connection paused its data plane before wiring the fresh transport.
+      // connection closed both planes before wiring the fresh transport.
       const awarenessBarrier = this.installMcplDataPlaneGate();
       // Async: the §5.3 policy Request must be answered (re-establishing the
-      // grant) before the data-plane barrier releases — otherwise the first
-      // post-reconnect events land while the grant is still empty and are
-      // rejected fail-closed instead of delivered.
+      // grant) before either plane opens — otherwise the first post-reconnect
+      // traffic, control included (the server's channels/register), lands
+      // while the grant is still empty and is rejected fail-closed instead of
+      // delivered. The exchange is marked in flight for this transport
+      // synchronously, here (settlePolicyExchange), so no other gate opens
+      // the planes meanwhile.
+      const epoch = connection.transportEpoch;
       const reregistered = (async () => {
         try {
           const config = this.mcplServerConfigs.get(connection.id);
-          if (config) {
-            await this.registerMcplServerFeatures(config, connection);
-          }
+          if (config) await this.settlePolicyExchange(config, connection);
         } catch (error) {
           console.error(
             `MCPL server "${connection.id}" re-registration after reconnect failed:`,
             recorded(error instanceof Error ? error.message : error),
           );
         }
+        // Settled, granted or not (an unanswered or refused policy leaves the
+        // grant empty and the connection MCP-only, as at initial connect). A
+        // transport that dropped meanwhile isn't relisted or announced here:
+        // its close reported it gone, and a next reconnect, if one comes,
+        // relists and announces it.
+        // Its own gate opens it while that gate is current. A newer gate that
+        // replaced it during the exchange passed the connection by, whether
+        // or not its transport still serves: a connection between transports
+        // is readied as any gate readies one, so its own reports go on.
+        const replaced = this.discordAwarenessBarrier !== awarenessBarrier;
         this.releaseMcplDataPlaneGate(awarenessBarrier);
-        this.handleToolsListChanged(connection.id);
+        if (replaced) this.openMcplPlanesAfterExchange(connection);
+        // Relisted while this transport still serves, checked after the
+        // release's flush, whose listeners can close it.
+        if (connection.transportEpoch === epoch && connection.isConnected) this.handleToolsListChanged(connection.id);
       })();
       // The gate completes, and the data planes go ready, only once both the
       // awareness drain and the re-registration have finished. A drain can
       // settle first (one already running, or little to send), and the grant
       // must exist before the first data-plane event flows.
       void Promise.all([awarenessBarrier.promise, reregistered]).then(() => {
-        if (
-          awarenessBarrier.requiresBarrier
-          && !this.completeMcplDataPlaneGate(awarenessBarrier)
-        ) return;
+        if (awarenessBarrier.requiresBarrier) this.completeMcplDataPlaneGate(awarenessBarrier);
+        // Announced while this transport is still the connection's, whether
+        // its own gate completed or a newer one replaced it. One that dropped
+        // meanwhile, even after its exchange, has had its close's
+        // module:removed, and a next reconnect, if one comes, announces it.
+        if (connection.transportEpoch !== epoch || !connection.isConnected) return;
         this.emitTrace({
           type: 'mcpl:server-reconnected',
           serverId: connection.id,

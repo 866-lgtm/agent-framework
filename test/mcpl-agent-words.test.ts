@@ -288,6 +288,7 @@ test("a call while this host connects to the tool's server says so, and after a 
     channelRegistry: null,
     discordAwarenessOutbox: null,
     discordAwarenessEmoji: '🔕',
+    mcplPolicyExchanges: new WeakMap(),
     wireMcplEvents: () => {},
     registerMcplServerFeatures: async () => {},
   });
@@ -355,6 +356,7 @@ test('a second connect, or a restart into the id, of a server whose connect is i
     channelRegistry: null,
     discordAwarenessOutbox: null,
     discordAwarenessEmoji: '🔕',
+    mcplPolicyExchanges: new WeakMap(),
     wireMcplEvents: () => {},
     registerMcplServerFeatures: async () => {},
   });

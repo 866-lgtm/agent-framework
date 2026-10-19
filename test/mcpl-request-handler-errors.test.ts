@@ -159,16 +159,19 @@ test('a failed error response is traced without an escaping rejection', async ()
   assert.match(failures[0].responseError, /error response transport failed/);
 });
 
-test('inference responders retain request IDs and successful handling stays synchronous', async () => {
+test('inference responders retain request IDs and their transport\'s chunk sender, and successful handling stays synchronous', async () => {
   const { framework, connection, traces } = harness();
   framework.inferenceRouter = {
     handleInferenceRequest(_server: string, _params: unknown, reply: any) {
       assert.equal(reply.requestId, 17);
+      reply.sendChunk({ requestId: 17, index: 0, delta: 'a' });
       reply.respond({ accepted: true });
     },
   };
-  const reply = responder();
+  const chunks: unknown[] = [];
+  const reply = { ...responder(), sendChunk: (chunk: unknown) => { chunks.push(chunk); } };
   connection.emit('inference-request', {}, reply);
+  assert.deepEqual(chunks, [{ requestId: 17, index: 0, delta: 'a' }], 'chunks go out through the request\'s own sender');
   assert.deepEqual(reply.results, [{ accepted: true }]);
   await settle();
   assert.equal(reply.errors.length, 0);
