@@ -15,6 +15,13 @@ test('fileText gives the lines read shows, where each starts, and what the text 
   assert.deepEqual(lines('a\r\nb\r\n'), ['a', 'b']);
   assert.deepEqual(lines('a\rb\r\n\r\n'), ['a\rb', '']);
   assert.deepEqual(lines('a\r'), ['a\r'], 'a CR that ends the text ends no line');
+  // A line whose own text ends in a CR keeps its line end's CR too, so text
+  // copied from it keeps the CR an edit would read as part of the line end.
+  const crKept = fileText(Buffer.from('x\r\r\ny\r\nz\r\r\n'));
+  assert.deepEqual(crKept.lines, ['x\r\r', 'y', 'z\r\r']);
+  assert.deepEqual([crKept.crlfEnds, crKept.lfEnds, crKept.crKept], [3, 0, 2]);
+  assert.equal(fileText(Buffer.from('\r\r\n')).crKept, 1);
+  assert.equal(fileText(Buffer.from('a\r\n\r\n')).crKept, 0, 'an empty line after a CRLF end is no CR of its own');
 
   const crlf = fileText(Buffer.from('one\r\ntwo\nthree'));
   assert.deepEqual(crlf.starts, [0, 5, 9]);

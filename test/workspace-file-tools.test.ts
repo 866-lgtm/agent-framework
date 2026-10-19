@@ -435,6 +435,29 @@ test('text copied from a read or a grep of a CRLF file matches in an edit, and t
   assert.deepEqual(disk('w.txt'), Buffer.concat([bom, Buffer.from('ONE\r\nTWO\r\nTHREE\r\n')]));
 });
 
+test('lines whose own text ends in a CR, copied from a read, edit the lines they came from', async (t) => {
+  const { dir, call, disk } = setup(t, { autoMaterialize: true });
+  // Lines 1 and 2 end in a CR before their CRLF end; lines 3 and 4 hold the
+  // same text with a CRLF end alone.
+  writeFileSync(join(dir, 'cr.txt'), 'x\r\r\ny\r\r\nx\r\ny\r\n');
+  const page = (await call('read', { path: 'work/cr.txt' })).data as { content: string; note: string };
+  assert.equal(page.note, 'Line ends are CRLF, shown without the CR, except on 2 lines whose own text ends in a CR, which show both CRs. '
+    + 'An edit matches text as read shows it, and keeps the CRLF ends.');
+  const copied = page.content.split('\n').slice(0, 2).map((line) => line.slice(line.indexOf('\t') + 1)).join('\n');
+  assert.equal(copied, 'x\r\r\ny\r\r');
+  const edit = await call('edit', { path: 'work/cr.txt', oldString: copied, newString: 'Q\nR' });
+  assert.equal(edit.success, true, edit.error);
+  assert.equal(disk('cr.txt')!.toString(), 'Q\r\nR\r\nx\r\ny\r\n');
+  // A grep match's text copies the same way.
+  writeFileSync(join(dir, 'one.txt'), 'w\r\r\nw\r\n');
+  const found = await call('grep', { pattern: '^w', path: 'work/one.txt' });
+  const texts = (found.data as { results: Array<{ matches: Array<{ text: string }> }> }).results[0].matches.map((m) => m.text);
+  assert.deepEqual(texts, ['w\r\r', 'w']);
+  const second = await call('edit', { path: 'work/one.txt', oldString: texts[0], newString: 'V' });
+  assert.equal(second.success, true, second.error);
+  assert.equal(disk('one.txt')!.toString(), 'V\r\nw\r\n');
+});
+
 test('an offset or limit that is not a whole number of at least 1 is refused', async (t) => {
   const { dir, call } = setup(t);
   writeFileSync(join(dir, 'nl.txt'), 'a\nb\n');

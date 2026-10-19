@@ -19,7 +19,10 @@ export interface FileText {
    * Its lines, as read shows them and grep searches them: without the BOM, a
    * CR before a line feed dropped, and a final line end ending the last line
    * rather than starting an empty one. So "a\r\nb\r\n" is two lines, and an
-   * empty text has none.
+   * empty text has none. A line whose own text ends in a CR keeps its line
+   * end's CR too, as stored: an edit reads a CR before a line feed in its old
+   * text as part of the line end, so text copied from "a\r" and the next line
+   * would lose the CR that is the line's own.
    */
   lines: string[];
   /** Where each line starts in `raw`. */
@@ -28,6 +31,8 @@ export interface FileText {
   /** How many line ends were CRLF, and how many a bare LF. */
   crlfEnds: number;
   lfEnds: number;
+  /** How many lines with a CRLF end keep its CR, since their own text ends in a CR. */
+  crKept: number;
   /** Whether the bytes are valid UTF-8; where they aren't, `raw` holds U+FFFD. */
   utf8: boolean;
 }
@@ -39,6 +44,7 @@ export function fileText(bytes: Buffer): FileText {
   const starts: number[] = [];
   let crlfEnds = 0;
   let lfEnds = 0;
+  let crKept = 0;
   // A BOM decodes to the single code unit U+FEFF.
   for (let at = bom ? 1 : 0; at < raw.length;) {
     const lf = raw.indexOf('\n', at);
@@ -49,10 +55,12 @@ export function fileText(bytes: Buffer): FileText {
     }
     const crlf = lf > at && raw.charCodeAt(lf - 1) === 13;
     if (crlf) crlfEnds++; else lfEnds++;
-    lines.push(raw.slice(at, crlf ? lf - 1 : lf));
+    const keepsCr = crlf && lf - 1 > at && raw.charCodeAt(lf - 2) === 13;
+    if (keepsCr) crKept++;
+    lines.push(raw.slice(at, crlf && !keepsCr ? lf - 1 : lf));
     at = lf + 1;
   }
-  return { raw, lines, starts, bom, crlfEnds, lfEnds, utf8: isUtf8(bytes) };
+  return { raw, lines, starts, bom, crlfEnds, lfEnds, crKept, utf8: isUtf8(bytes) };
 }
 
 /** How long a line read shows before it cuts the line. */

@@ -15,9 +15,13 @@ export const DEFAULT_READ_LINE_LIMIT = 2000;
 export function textNotes(file: FileText): string[] {
   const notes: string[] = [];
   if (file.crlfEnds > 0) {
+    // A line whose own text ends in a CR shows its line end's CR too (fileText).
+    const kept = file.crKept > 0
+      ? `, except on ${file.crKept} ${file.crKept === 1 ? 'line whose own text ends in a CR, which shows' : 'lines whose own text ends in a CR, which show'} both CRs`
+      : '';
     notes.push(file.lfEnds > 0
-      ? `Line ends are mixed, ${file.crlfEnds} CRLF and ${file.lfEnds} LF, and a CRLF end is shown without its CR. An edit matches text as read shows it, and keeps each line's end.`
-      : 'Line ends are CRLF, shown without the CR. An edit matches text as read shows it, and keeps the CRLF ends.');
+      ? `Line ends are mixed, ${file.crlfEnds} CRLF and ${file.lfEnds} LF, and a CRLF end is shown without its CR${kept}. An edit matches text as read shows it, and keeps each line's end.`
+      : `Line ends are CRLF, shown without the CR${kept}. An edit matches text as read shows it, and keeps the CRLF ends.`);
   }
   if (file.bom) notes.push('The file starts with a UTF-8 BOM, which isn\'t shown. An edit keeps it.');
   if (!file.utf8) notes.push(NOT_UTF8);
