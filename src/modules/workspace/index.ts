@@ -2214,7 +2214,7 @@ export class WorkspaceModule implements Module {
       if (!judged) return null;
       const rootReal = await realBeneath(resolve(mount.config.path));
       if (!isContainedPath(rootReal, real) || await stat(real).then((info) => info.isDirectory(), () => false)) return null;
-      return await coversLanding(mount.config.include, rootReal, real, relativePath) ? null : new WorkspaceReadError('escape', `Symlink escape detected: ${path}`, 'realpath');
+      return await coversLanding({ root: mount.config.path, include: mount.config.include }, rootReal, real, relativePath) ? null : new WorkspaceReadError('escape', `Symlink escape detected: ${path}`, 'realpath');
     }
     if (mount.config.followSymlinks !== true) {
       const found = await linkOnTheWay({ root: mount.config.path, followSymlinks: false }, relativePath);
@@ -2716,7 +2716,7 @@ export class WorkspaceModule implements Module {
       // no mount's, so the path leaves this one (namesNestedPlace), and so
       // does one reaching a file this mount's own include leaves out
       // (coversLanding).
-      const own = holder === undefined && inside && !(await coversLanding(mount.config.include, realMountRoot, realFilePath, relativePath));
+      const own = holder === undefined && inside && !(await coversLanding({ root: mount.config.path, include: mount.config.include }, realMountRoot, realFilePath, relativePath));
       if (!inside || own || (holder !== undefined && !namesNestedPlace(holder.rest, holder.include, false))) {
         throw new WorkspaceReadError('escape', `Symlink escape detected: ${mountPrefixedPath}`, 'realpath');
       }

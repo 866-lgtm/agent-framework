@@ -247,7 +247,7 @@ export async function writeContained(
     // Beneath a link the mount follows, a covered path can land where the
     // mount's own include leaves a file out, which is no file of this
     // mount's (coversLanding), so nothing is made there.
-    if (!(await coversLanding(view.include, rootReal, target, rel))) throw new EffectFailed(view.followSymlinks ? 'a symlink that leaves the mount' : NOT_FOLLOWED, false);
+    if (!(await coversLanding(view, rootReal, target, rel))) throw new EffectFailed(view.followSymlinks ? 'a symlink that leaves the mount' : NOT_FOLLOWED, false);
     try {
       // Exclusive: never follows a symlink, never takes over a file that
       // appeared since planning saw none. At the mode it's given, which the
@@ -412,7 +412,7 @@ async function checkOpened(
     // through a link this mount doesn't follow, the link is what's refused.
     if (holder) throw new EffectFailed(namesNestedPlace(holder.rest, holder.include, false) ? leadsInto(view.name, rel, holder) : view.followSymlinks ? leaves : NOT_FOLLOWED, touched);
     // So is a file this mount's own include leaves out (coversLanding).
-    if (!(await coversLanding(view.include, rootReal, real, rel))) throw new EffectFailed(view.followSymlinks ? leaves : NOT_FOLLOWED, touched);
+    if (!(await coversLanding(view, rootReal, real, rel))) throw new EffectFailed(view.followSymlinks ? leaves : NOT_FOLLOWED, touched);
     return real;
   };
   if (expect.kind === 'content') {
@@ -573,7 +573,7 @@ export async function unlinkContained(view: MountView, rootReal: string, rel: st
     if (!through.isFile()) throw new EffectFailed(through.isDirectory() ? 'a symlink to a directory, not walked' : 'not a regular file', false);
     // One leading to a file this mount's own include leaves out leaves the
     // mount too, and that file isn't read for a hash (coversLanding).
-    if (!(await coversLanding(view.include, rootReal, real, rel))) throw new EffectFailed('a symlink that leaves the mount', false);
+    if (!(await coversLanding(view, rootReal, real, rel))) throw new EffectFailed('a symlink that leaves the mount', false);
     file = through;
   } else if (info.isDirectory()) {
     throw new EffectFailed('a directory', false);

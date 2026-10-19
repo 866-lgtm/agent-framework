@@ -302,25 +302,36 @@ export function namesNestedPlace(rest: string, include: readonly string[] | unde
 }
 
 /**
- * Whether a mount's own include covers the file at `real`, the canonical
- * path one of its paths, `given`, lands on, inside the mount and in no nested
- * mount's directory. The include is the operator's statement of which files'
- * content the workspace holds, and a link is a path, not a grant of content,
- * so where a followed path lands is judged as where it's named, as a nested
- * mount's place is (namesNestedPlace): a file the include leaves out there is
- * no file of this mount's, and a path that reaches it through a link is
- * refused as one that leaves the mount, in the words each such refusal
- * already has (nestedAtReal's callers). It's judged as disk spells it, as a
- * path given directly is: a path that meets no link lands where it's named,
- * in the spelling its parse gave it, but through a link realpath keeps the
- * spelling the link's target gives, which on a disk that folds names need
- * not be disk's (diskSpelling). A mount without an include covers every
- * file.
+ * The path a mount's include judges for `given`, one of the mount's paths,
+ * which landed at `real`, its canonical path, inside the mount and in no
+ * nested mount's directory. The include is the operator's statement of which
+ * files' content the workspace holds, and a link is a path, not a grant of
+ * content, so where a followed path lands is judged as where it's named, as
+ * a nested mount's place is (namesNestedPlace). A path that meets no link
+ * lands where it's named, and is judged as named. realpath can spell such a
+ * path otherwise, with disk's stored names on macOS and Windows where the
+ * parse kept a workspace entry's spelling, so where the spellings differ a
+ * link is looked for on the way (linkOnTheWay's walk), and only one found,
+ * or a directory on the way it couldn't ask, makes the landing the path
+ * judged. That's judged as disk spells it, since realpath keeps the spelling
+ * a link's target gives, which on a disk that folds names need not be disk's
+ * (diskSpelling).
  */
-export async function coversLanding(include: readonly string[] | undefined, rootReal: string, real: string, given: string): Promise<boolean> {
-  if (include === undefined) return true;
+export async function judgedAt(root: string, rootReal: string, real: string, given: string): Promise<string> {
   const landed = relative(rootReal, real).split(sep).join('/');
-  return insideMount(landed === given ? landed : await diskSpelling(rootReal, landed), include);
+  if (landed === given || (await linkOnTheWay({ root, followSymlinks: false }, given)) === null) return given;
+  return diskSpelling(rootReal, landed);
+}
+
+/**
+ * Whether a mount's own include covers the file one of its paths, `given`,
+ * lands on at `real` (judgedAt): a file it leaves out there is no file of
+ * this mount's, and a path that reaches it through a link is refused as one
+ * that leaves the mount, in the words each such refusal already has
+ * (nestedAtReal's callers). A mount without an include covers every file.
+ */
+export async function coversLanding(view: Pick<MountView, 'root' | 'include'>, rootReal: string, real: string, given: string): Promise<boolean> {
+  return view.include === undefined || insideMount(await judgedAt(view.root, rootReal, real, given), view.include);
 }
 
 /**
@@ -1166,13 +1177,13 @@ export async function observePath(view: MountView, rootReal: string, relativePat
     // file of this mount's (coversLanding). It's judged here, and not only
     // where the file is opened, since a pass takes a copy whose fingerprint
     // the stat vouches for without opening it.
-    if (!(await coversLanding(view.include, rootReal, real, relativePath))) return { kind: 'unobserved', reason: 'a symlink that leaves the mount' };
+    if (!(await coversLanding(view, rootReal, real, relativePath))) return { kind: 'unobserved', reason: 'a symlink that leaves the mount' };
     info = target;
   } else if (info.isDirectory()) {
     return { kind: 'unobserved', reason: 'a directory' };
   } else if (!info.isFile()) {
     return { kind: 'unobserved', reason: 'not a regular file' };
-  } else if (!(await coversLanding(view.include, rootReal, join(placement.inside, basename(lexical)), relativePath))) {
+  } else if (!(await coversLanding(view, rootReal, join(placement.inside, basename(lexical)), relativePath))) {
     // So is one reached through a link among its directories.
     return { kind: 'unobserved', reason: 'a symlink that leaves the mount' };
   }
@@ -1234,7 +1245,7 @@ async function openContained(
     // through a link this mount doesn't follow, the link is what's refused.
     if (holder) return { kind: 'unobserved', reason: namesNestedPlace(holder.rest, holder.include, false) ? leadsInto(view.name, relativePath, holder) : view.followSymlinks ? leaves : NOT_FOLLOWED };
     // So is a file this mount's own include leaves out (coversLanding).
-    if (!(await coversLanding(view.include, rootReal, real, relativePath))) return { kind: 'unobserved', reason: view.followSymlinks ? leaves : NOT_FOLLOWED };
+    if (!(await coversLanding(view, rootReal, real, relativePath))) return { kind: 'unobserved', reason: view.followSymlinks ? leaves : NOT_FOLLOWED };
     const named = await stat(real, { bigint: true }).catch(() => null);
     if (named === null || named.dev !== info.dev || named.ino !== info.ino) {
       return { kind: 'unobserved', reason: 'the file changed while it was read' };
@@ -1887,12 +1898,10 @@ export async function walkScope(
     }
     entries.sort((a, b) => compareNames(a.name, b.name));
     // A scope named through a link is listed from where the link leads, so
-    // where this directory lies elsewhere than its path, a file in it is
-    // judged where it lies as well as by its path, as coversLanding judges
-    // where a path lands, with the directory's spelling on disk read once
-    // for the listing.
-    const lies = view.include === undefined ? rel : relative(rootReal, dir.real).split(sep).join('/');
-    const landedDir = lies === rel ? null : await diskSpelling(rootReal, lies);
+    // a file in it is judged where it lies as well as by its path, as
+    // coversLanding judges where a path lands (judgedAt, once for the
+    // listing).
+    const judgedDir = view.include === undefined ? rel : await judgedAt(view.root, rootReal, dir.real, rel);
     const leaves: Array<[string, boolean]> = [];
     const subdirs: string[] = [];
     const others: Array<[string, string]> = [];
@@ -1915,7 +1924,7 @@ export async function walkScope(
       // extension glob in include can match beneath it. Anything but a link
       // (a regular file, a FIFO, a socket or a device) is noted as a file,
       // since nothing can lie beneath it.
-      if (!entry.isDirectory() && (!insideMount(childRel, view.include) || (landedDir !== null && !insideMount(landedDir === '' ? entry.name : `${landedDir}/${entry.name}`, view.include)))) {
+      if (!entry.isDirectory() && (!insideMount(childRel, view.include) || (judgedDir !== rel && !insideMount(judgedDir === '' ? entry.name : `${judgedDir}/${entry.name}`, view.include)))) {
         others.push([childRel, OUTSIDE_INCLUDE]);
         if (!entry.isSymbolicLink()) otherFiles.push(childRel);
         regions.push({ path: childRel, reason: OUTSIDE_INCLUDE, kind: 'ignored' });

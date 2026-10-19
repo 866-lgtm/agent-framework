@@ -18,7 +18,7 @@ import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework } from '../src/framework.js';
 import { WorkspaceModule, WorkspaceReadError } from '../src/modules/workspace/index.js';
 import { EffectFailed, unlinkContained, writeContained } from '../src/modules/workspace/effects.js';
-import { includePatternReadable, insideMount, parsedSpelling, pathSegments, provenAbsent, readPath, type MountView, type Walk } from '../src/modules/workspace/observe.js';
+import { coversLanding, includePatternReadable, insideMount, parsedSpelling, pathSegments, provenAbsent, readPath, type MountView, type Walk } from '../src/modules/workspace/observe.js';
 import type { MountConfig } from '../src/modules/workspace/types.js';
 import type { ModuleContext } from '../src/types/module.js';
 
@@ -965,6 +965,25 @@ describe('mount include', () => {
     for (const path of ['work', 'work/x.json', 'work/docs', 'work/docs/x.txt']) {
       assert.equal((await call(m, 'grep', { path, pattern: 'needle' })).totalMatches, 0, `grep ${path}`);
     }
+  });
+
+  test("a path that meets no link is judged where it's named, whatever spelling realpath gives where it lands, and one through a link where it lands, as disk spells it", async (t) => {
+    const root = mkdtempSync(join(tmpdir(), 'af-ws-include-landing-'));
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    mkdirSync(join(root, 'Docs'));
+    writeFileSync(join(root, 'Docs', 'a.txt'), 'covered\n');
+    mkdirSync(join(root, 'site'));
+    writeFileSync(join(root, 'site', 'b.txt'), "not the mount's\n");
+    symlinkSync('site', join(root, 'via'));
+    const view = { root, include: ['Docs/**', 'via/**'] };
+    const rootReal = realpathSync(root);
+    // On macOS and Windows realpath gives disk's stored names, which can differ from a workspace entry's
+    // spelling the parse kept: here it lands spelled otherwise, with no link on the way.
+    assert.equal(await coversLanding(view, rootReal, join(rootReal, 'docs', 'a.txt'), 'Docs/a.txt'), true);
+    // Through a link, where it lands is judged, and the include doesn't cover `site/b.txt`.
+    assert.equal(await coversLanding(view, rootReal, join(rootReal, 'site', 'b.txt'), 'via/b.txt'), false);
+    // Without an include, every file is covered.
+    assert.equal(await coversLanding({ root }, rootReal, join(rootReal, 'site', 'b.txt'), 'via/b.txt'), true);
   });
 
   test("on a mount that doesn't follow links, a link at the path itself is `symlink` however the path is spelled", async (t) => {
