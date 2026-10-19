@@ -146,29 +146,20 @@ export interface SurgeryMarkerFacts {
  * - `queued` — one add request per mark is recorded, and delivered when its
  *   route is up: a pass starts at once unless the host is stopping, and a
  *   later one (a reconnect, a tools-list change or the next start) takes
- *   what remains. The record is durable, unless `error` says writing the
- *   activation didn't complete: then an operating system crash or a power
- *   failure before the ledger's next write could lose it. If a delivery pass
- *   fails, the requests stay recorded and the `discord-awareness-delivery`
- *   ops alert says so. The same alert names the marks a pass, or a start,
- *   gave up on: refused by Discord for good, or after three unconfirmed
- *   attempts. It is not a delivery claim: what Discord answers is kept in
- *   the awareness ledger.
- * - `not-scheduled` — the body change landed, but the batch was never
- *   recorded, or recording it as active failed and it was retired: none of
- *   its marks will be delivered.
- * - `unresolved` — the ledger could record neither the activation nor the
- *   retirement, or could not be read back to say whether the batch was
- *   recorded at all. `batchId` names the batch, whose scheduling outcome is
- *   unresolved: if its activation reached the ledger where this process
- *   couldn't read it back, its marks go out from the next start; otherwise
- *   none of them is sent. Nothing here can say which.
+ *   what remains. If a delivery pass fails, the requests stay recorded and
+ *   the `discord-awareness-delivery` ops alert says so. The same alert names
+ *   the marks a pass, or a start, gave up on: refused by Discord for good,
+ *   or after three unconfirmed attempts. It is not a delivery claim: what
+ *   Discord answers is kept in the awareness ledger.
+ * - `not-scheduled` — the body change landed, but recording the batch as
+ *   active failed, or it was never recorded: none of its marks will be
+ *   delivered. `error` says why, and whether the batch was retired or stays
+ *   prepared for a start to retire.
  */
 export type SurgeryMarkerReceipt = SurgeryMarkerFacts & (
   | { status: 'none'; queued: 0 }
-  | { status: 'queued'; queued: number; batchId: string; error?: string }
+  | { status: 'queued'; queued: number; batchId: string }
   | { status: 'not-scheduled'; queued: 0; error: string }
-  | { status: 'unresolved'; queued: 0; batchId: string; error: string }
 );
 
 /** What a surgery would remove and which messages each marks scope covers. */

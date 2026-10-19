@@ -36,6 +36,8 @@ import { AgentFramework } from '../src/framework.js';
 import { McplRequestError } from '../src/mcpl/server-connection.js';
 import { OperatorLog } from '../src/operator-log.js';
 
+/** A batch's status as the ledger holds it, or undefined when it holds no such batch. */
+const statusOf = (outbox: DiscordAwarenessOutbox, batchId: string) => outbox.batches().find((batch) => batch.id === batchId)?.status;
 const ref = (messageId: string, channel = 'c1'): DiscordAwarenessRef =>
   ({ serverId: 'discord', channelId: `discord:g1:${channel}`, messageId });
 
@@ -50,6 +52,8 @@ interface Harness {
   path: string;
   /** What each version 2 rewrite by an instance open() made announced, in order. */
   announced: DiscordAwarenessImportedUnsent[][];
+  /** Each directory a write couldn't sync after its rename, as reported. */
+  unsynced: string[];
   /** A fresh instance over the same file: what a restarted process reads. */
   open(opts?: { announceImport?: (unsent: DiscordAwarenessImportedUnsent[]) => void }): DiscordAwarenessOutbox;
   /** The file as written now. */
@@ -64,8 +68,13 @@ function withLedger(fn: (outbox: DiscordAwarenessOutbox, h: Harness) => void | P
     const store = JsStore.openOrCreate({ path: join(dir, 'store') });
     const path = defaultDiscordAwarenessOutboxPath(join(dir, 'store'));
     const h: Harness = {
-      store, dir, path, announced: [],
-      open: (opts = {}) => new DiscordAwarenessOutbox(path, { store, announceImport: (unsent) => { h.announced.push(unsent); }, ...opts }),
+      store, dir, path, announced: [], unsynced: [],
+      open: (opts = {}) => new DiscordAwarenessOutbox(path, {
+        store,
+        announceImport: (unsent) => { h.announced.push(unsent); },
+        onUnsyncedWrite: (directory) => { h.unsynced.push(directory); },
+        ...opts,
+      }),
       file: () => JSON.parse(readFileSync(path, 'utf8')),
       entry: (messageId, emoji = '💤') => h.file().entries.find((e: any) => e.messageId === messageId && e.emoji === emoji),
     };
@@ -73,6 +82,7 @@ function withLedger(fn: (outbox: DiscordAwarenessOutbox, h: Harness) => void | P
       await fn(h.open(), h);
     } finally {
       if (existsSync(dirname(path))) chmodSync(dirname(path), 0o700);
+      chmodSync(join(dir, 'store'), 0o700);
       if (!store.isClosed()) store.close();
       rmSync(dir, { recursive: true, force: true });
     }
@@ -99,7 +109,7 @@ async function answer(
   outbox: DiscordAwarenessOutbox,
   messageId: string,
   outcome: DiscordAwarenessOutcome,
-  detail: { permanent?: boolean; error?: string } = {},
+  detail: { permanent?: boolean } = {},
 ) {
   const request = await outbox.claim('discord', (candidate) => candidate.messageId !== messageId);
   assert.ok(request, `a request for ${messageId} is owed`);
@@ -151,6 +161,11 @@ test('selection: none marks nothing; addressed means the chat:addressed tag; ref
   // Scope still applies to authorized refs.
   const frozenAddressed = selectDiscordAwarenessRefs(messages, { scope: 'addressed', refs: [ref('b1'), ref('a2', 'dm')] });
   assert.deepEqual(frozenAddressed.refs.map((r) => r.messageId), ['a2']);
+  // A message stored twice is addressed if either copy says so, in either order.
+  for (const copies of [[['chat:addressed'], []], [[], ['chat:addressed']]]) {
+    const twice = copies.map((tags) => ({ metadata: { ...ref('c1'), tags } }));
+    assert.deepEqual(selectDiscordAwarenessRefs(twice, { scope: 'addressed' }).refs.map((r) => r.messageId), ['c1']);
+  }
 });
 
 test('the ledger is compact version 3 JSON where 0.22.x kept its own: a prepare is on disk when it returns, and activation owes one add per ref', withLedger(async (outbox, h) => {
@@ -205,7 +220,6 @@ test('a start activates nothing: it retires what interrupted surgeries left, kee
   assert.deepEqual(restarted.pendingSuppressionsFor('suppress/cairn'), [], 'only on its exact branch');
   const m3 = h.entry('m3');
   assert.deepEqual([m3.sending, m3.confirmed, m3.mayLand, m3.attempts], [undefined, 'unknown', ['add'], 1]);
-  assert.equal(m3.lastError, 'the previous process ended before an answer was recorded');
   assert.deepEqual(restarted.due('discord').map((r) => r.messageId), ['m3'], 'still owed, so sent again');
   assert.equal(batches(restarted).find((v) => v.id === active.id)?.mayStillLand, 1);
 }));
@@ -252,7 +266,7 @@ test('an answer ends what is owed only for the act its request served', withLedg
   const remove = (await outbox.claim('discord'))!;
   assert.equal(remove.action, 'remove');
   await activeBatch(outbox, [ref('m1')], { targetBranch: 'rollback/cairn/2' });
-  assert.equal(await outbox.recordOutcome(remove, 'unknown', { error: 'did not respond' }), false);
+  assert.equal(await outbox.recordOutcome(remove, 'unknown'), false);
   const unanswered = h.entry('m1');
   assert.deepEqual([unanswered.confirmed, unanswered.mayLand, unanswered.attempts], ['unknown', ['remove'], 0]);
   assert.deepEqual(outbox.due('discord').map((r) => r.action), ['add']);
@@ -272,12 +286,34 @@ test('cancel takes its act out of each reaction it wants: one no act wants is ow
   assert.equal(h.entry('m1').confirmed, 'present');
   assert.deepEqual(outbox.due('discord'), []);
 
-  const receipt = await outbox.cancel(second.id);
-  assert.deepEqual(receipt, { target: second.id, kind: 'batch', cancelled: 0, confirmed: 1, mayStillLand: 0 });
-  // A repeated cancel writes nothing, and its receipt is still today's.
+  assert.deepEqual(await outbox.cancel(second.id), { target: second.id, kind: 'batch', cancelled: 0, confirmed: 1, mayStillLand: 0 });
+  // A repeated cancel finds nothing the act still wants, and writes nothing.
   const before = readFileSync(h.path, 'utf8');
-  assert.deepEqual(await outbox.cancel(second.id), receipt);
+  assert.deepEqual(await outbox.cancel(second.id), { target: second.id, kind: 'batch', cancelled: 0, confirmed: 0, mayStillLand: 0 });
   assert.equal(readFileSync(h.path, 'utf8'), before);
+}));
+
+test("a cancelled retract's receipt counts every reaction it still wants, a later retract's too", withLedger(async (outbox) => {
+  const batch = await activeBatch(outbox, [ref('m1'), ref('m2')]);
+  await answer(outbox, 'm1', 'confirmed');
+  await answer(outbox, 'm2', 'confirmed');
+  const older = await outbox.retract(batch.id);
+  await answer(outbox, 'm1', 'confirmed');
+  await outbox.retract('all');
+  // Both reactions are the newer retract's too, and still the older one's:
+  // its removal of m1 was confirmed, and m2's is still owed.
+  assert.deepEqual(await outbox.cancel(older.requestId),
+    { target: older.requestId, kind: 'retract', cancelled: 0, confirmed: 1, mayStillLand: 0 });
+}));
+
+test("a cancelled batch's receipt leaves out a reaction its activation left to a later retract", withLedger(async (outbox) => {
+  const chosen = (await outbox.prepare(input([ref('m1')])))!;
+  // A retract after the choice reaches the prepared batch's ref, and its
+  // removal goes unanswered.
+  await outbox.retract('all');
+  await answer(outbox, 'm1', 'unknown');
+  assert.equal(await outbox.activate(chosen.id), 0, 'the retract decides m1');
+  assert.deepEqual(await outbox.cancel(chosen.id), { target: chosen.id, kind: 'batch', cancelled: 0, confirmed: 0, mayStillLand: 0 });
 }));
 
 test('cancelling a batch its surgery has not activated stops every mark: its activation is refused, and it settles not scheduled', withLedger(async (outbox) => {
@@ -289,7 +325,7 @@ test('cancelling a batch its surgery has not activated stops every mark: its act
   const settled = await outbox.settleActivation(batch.id);
   assert.equal(settled.status, 'not-scheduled');
   assert.match((settled as { error: string }).error, /was cancelled before activation/);
-  assert.equal(outbox.batchStatus(batch.id), 'retired');
+  assert.equal(statusOf(outbox, batch.id), 'retired');
   assert.deepEqual(outbox.due('discord').map((r) => r.messageId), ['m1']);
 }));
 
@@ -305,13 +341,13 @@ test('a retract owes a removal for every selected reaction, whatever was answere
 
 test('three unconfirmed attempts at one act end it, and a refusal for good ends it at once; one refused before it left the host does not count', withLedger(async (outbox, h) => {
   const batch = await activeBatch(outbox, [ref('m1'), ref('m2')]);
-  assert.equal((await answer(outbox, 'm1', 'failed', { error: 'You are being rate limited.' })).ended, false);
+  assert.equal((await answer(outbox, 'm1', 'failed')).ended, false);
   assert.equal((await answer(outbox, 'm1', 'unknown')).ended, false);
-  assert.equal((await answer(outbox, 'm1', 'not-sent', { error: 'connection closed' })).ended, false);
+  assert.equal((await answer(outbox, 'm1', 'not-sent')).ended, false);
   assert.equal(h.entry('m1').attempts, 2);
   assert.equal((await answer(outbox, 'm1', 'failed')).ended, true);
   assert.deepEqual([h.entry('m1').failed, h.entry('m1').due], [true, null]);
-  assert.equal((await answer(outbox, 'm2', 'failed', { permanent: true, error: 'Unknown Message' })).ended, true);
+  assert.equal((await answer(outbox, 'm2', 'failed', { permanent: true })).ended, true);
   assert.deepEqual(outbox.due('discord'), []);
   assert.equal(batches(outbox)[0].reactions.failed, 2);
   // A new act owes a request again.
@@ -512,6 +548,17 @@ test('a file of another version, or not the shape version 3 promises, is refused
     ["an entry's request on the wire", { ...valid, entries: [{ ...entry, sending: { action: 'react', due: 2 } }] }, /Invalid Discord awareness ledger/],
     ["an entry's answer", { ...valid, entries: [{ ...entry, confirmed: 'maybe' }] }, /Invalid Discord awareness ledger/],
     ['a retract', { ...valid, retracts: [{ id: 'r', target: 'all', at: 1, keys: 1 }] }, /Invalid Discord awareness ledger/],
+    ['a version written as text', { ...valid, version: '3' }, /is version "3", which this build can't read: it reads versions 2 and 3$/],
+    ["a batch's ref", { ...valid, batches: [{ ...batch, refs: [{ serverId: 'discord', messageId: 'm1' }] }] }, /Invalid Discord awareness ledger/],
+    ["a batch's removal interval", { ...valid, batches: [{ ...batch, suppressionIntervals: [{ fromId: 1, toId: 'i' }] }] }, /Invalid Discord awareness ledger/],
+    ["a batch's cancellation", { ...valid, batches: [{ ...batch, cancelled: { at: 'now' } }] }, /Invalid Discord awareness ledger/],
+    ["a batch's count of 0.22.x's adds", { ...valid, batches: [{ ...batch, legacyAdded: '1' }] }, /Invalid Discord awareness ledger/],
+    ["an entry's wishers", { ...valid, entries: [{ ...entry, wantedBy: ['b', 2] }] }, /Invalid Discord awareness ledger/],
+    ["an entry's attempts", { ...valid, entries: [{ ...entry, attempts: null }] }, /Invalid Discord awareness ledger/],
+    ["an entry's retract moment", { ...valid, entries: [{ ...entry, retracted: '1' }] }, /Invalid Discord awareness ledger/],
+    ["the due its request serves", { ...valid, entries: [{ ...entry, sending: { action: 'add' } }] }, /Invalid Discord awareness ledger/],
+    ["an entry's actions that may land", { ...valid, entries: [{ ...entry, mayLand: ['react'] }] }, /Invalid Discord awareness ledger/],
+    ["an entry's failure", { ...valid, entries: [{ ...entry, failed: 'yes' }] }, /Invalid Discord awareness ledger/],
   ];
   for (const [what, ledger, refusal] of cases) {
     writeLedger(h, ledger);
@@ -579,67 +626,135 @@ test("a write that fails leaves the file as it was, and the act's change with it
   assert.equal(retracts(outbox).length, 1);
 }));
 
-test("an activation that reached the file before its write failed is queued, with the write's error", { skip: asRoot }, withLedger(async (outbox, h) => {
+test("a write whose directory, or the directory's parent, can't be synced after its rename stands, and is reported", { skip: asRoot }, withLedger(async (outbox, h) => {
   const batch = (await outbox.prepare(input([ref('m1')])))!;
-  // The rename lands, and syncing the directory can't open it.
+  // The rename lands, and syncing the ledger's directory can't open it.
   chmodSync(dirname(h.path), 0o300);
   const settled = await outbox.settleActivation(batch.id);
   chmodSync(dirname(h.path), 0o700);
-  assert.equal(settled.status, 'queued', JSON.stringify(settled));
-  assert.equal(settled.status === 'queued' ? settled.queued : -1, 1);
-  assert.match(settled.error ?? '', /EACCES/);
-  assert.equal(h.open().batchStatus(batch.id), 'active');
-}));
-
-test('a retirement that reached the file before its write failed reads back as retired', { skip: asRoot }, withLedger(async (outbox, h) => {
-  const batch = (await outbox.prepare(input([ref('m1')])))!;
-  chmodSync(dirname(h.path), 0o300);
-  await assert.rejects(outbox.discard(batch.id), /EACCES/);
-  assert.equal(outbox.batchStatus(batch.id), 'retired');
-}));
-
-test("a write syncs its directory's parent too: one whose parent can't be synced reads back as written", { skip: asRoot }, withLedger(async (outbox, h) => {
-  const batch = (await outbox.prepare(input([ref('m1')])))!;
-  // The rename lands and the ledger's directory syncs; its parent, the
-  // store's directory, can't be opened to sync.
-  const parent = dirname(dirname(h.path));
-  chmodSync(parent, 0o300);
+  assert.deepEqual(settled, { status: 'queued', queued: 1 });
+  assert.equal(statusOf(h.open(), batch.id), 'active', 'in the file');
+  assert.deepEqual(h.unsynced, [dirname(h.path)]);
+  // Its parent, the store's directory, can't be opened to sync.
+  const other = (await outbox.prepare(input([ref('m2')], { targetBranch: 'rollback/cairn/2' })))!;
+  chmodSync(dirname(dirname(h.path)), 0o300);
   try {
-    await assert.rejects(outbox.discard(batch.id), /EACCES/);
+    assert.equal(await outbox.discard(other.id), true);
   } finally {
-    chmodSync(parent, 0o700);
+    chmodSync(dirname(dirname(h.path)), 0o700);
   }
-  assert.equal(outbox.batchStatus(batch.id), 'retired');
+  assert.equal(statusOf(h.open(), other.id), 'retired', 'in the file');
+  assert.deepEqual(h.unsynced, [dirname(h.path), dirname(dirname(h.path))]);
 }));
 
-test('a prepare whose write failed says what the ledger may hold, and retires a batch that reached it', { skip: asRoot }, withLedger(async (outbox, h) => {
+test("a prepare whose write failed leaves the ledger as it was, and says why", { skip: asRoot }, withLedger(async (outbox, h) => {
   await outbox.prepare(input([ref('m0')]));
   const dir = dirname(h.path);
-  // Nothing reached the file.
+  // The temporary file can't be made.
   chmodSync(dir, 0o500);
   await assert.rejects(outbox.prepare(input([ref('m1')])), (error: Error) => /^recording awareness batch \S+ failed: [^;]*EACCES[^;]*$/.test(error.message));
-  // It reached the file, and is retired at once (the store's sync before
-  // that retirement gives the directory back).
-  chmodSync(dir, 0o300);
-  const sync = h.store.sync.bind(h.store);
-  (h.store as any).sync = () => { chmodSync(dir, 0o700); return sync(); };
-  await assert.rejects(outbox.prepare(input([ref('m2')])), /; it reached the ledger and is retired$/);
-  (h.store as any).sync = sync;
-  // The file can't be read back.
+  // Nor can it without search permission, and the file can't be read back.
   chmodSync(dir, 0o200);
-  await assert.rejects(outbox.prepare(input([ref('m3')])),
-    /; the ledger can't be read back, so it may hold the batch, and if so the next start retires it, none of its marks sent$/);
+  await assert.rejects(outbox.prepare(input([ref('m2')])), (error: Error) => /^recording awareness batch \S+ failed: /.test(error.message));
   chmodSync(dir, 0o700);
-  assert.deepEqual(h.open().batches().map((b) => [b.refs[0]!.messageId, b.status]), [['m0', 'prepared'], ['m2', 'retired']]);
+  assert.deepEqual(h.open().batches().map((b) => [b.refs[0]!.messageId, b.status]), [['m0', 'prepared']]);
+  assert.deepEqual(outbox.batches().map((b) => b.refs[0]!.messageId), ['m0'], 'nor does memory hold them');
 }));
 
-test('acts run one at a time: a reaction is claimed again only after its answer is written', withLedger(async (outbox) => {
+test('acts run one at a time: an act starts only once the write before it is done, so a reaction is claimed again only after its answer is written', withLedger(async (outbox) => {
   await activeBatch(outbox, [ref('m1')]);
   const first = (await outbox.claim('discord'))!;
-  const answered = outbox.recordOutcome(first, 'failed', { error: 'You are being rate limited.' });
+  // Hold the answer's write.
+  const internals = outbox as unknown as { persist: (...args: unknown[]) => Promise<void> };
+  const persist = internals.persist;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let writes = 0;
+  internals.persist = async function (this: unknown, ...args: unknown[]) {
+    if (writes++ === 0) await held;
+    return persist.apply(this, args);
+  };
+  const answered = outbox.recordOutcome(first, 'failed');
   const next = outbox.claim('discord');
+  await new Promise((resolve) => setImmediate(resolve));
+  // The answer is made, and its write held: the claim hasn't started, so the
+  // reaction is owed and not on the wire again.
+  assert.equal(writes, 1);
+  assert.deepEqual(outbox.due('discord').map((request) => request.messageId), ['m1']);
+  release();
   assert.equal(await answered, false);
   assert.deepEqual(await next, first, 'claimed once the refusal was written, for the same act');
+  assert.equal(writes, 2);
+}));
+
+test("a claim records as unanswered its server's request still on the wire, whose answer couldn't be written, and asks again", { skip: asRoot }, withLedger(async (outbox, h) => {
+  await activeBatch(outbox, [ref('m1'), { ...ref('m2'), serverId: 'discord-2' }]);
+  const other = (await outbox.claim('discord-2'))!;
+  const request = (await outbox.claim('discord'))!;
+  // The answer's write fails, so the file still holds the request on the wire.
+  chmodSync(dirname(h.path), 0o500);
+  await assert.rejects(outbox.recordOutcome(request, 'confirmed'), /EACCES/);
+  chmodSync(dirname(h.path), 0o700);
+  assert.deepEqual(h.entry('m1').sending, { action: 'add', due: request.due });
+  assert.deepEqual(outbox.due('discord'), [], 'nothing is owed while it is marked on the wire');
+  // The server's next claim releases it: it may have landed, and the add is asked again.
+  const again = (await outbox.claim('discord'))!;
+  assert.deepEqual([again.messageId, again.due], ['m1', request.due]);
+  assert.deepEqual([h.entry('m1').mayLand, h.entry('m1').attempts, h.entry('m1').confirmed], [['add'], 1, 'unknown']);
+  // Another server's request on the wire is its own pass's.
+  assert.deepEqual(h.entry('m2').sending, { action: 'add', due: other.due });
+}));
+
+test('an act that throws after changing the document leaves memory as the file holds it', withLedger(async (outbox, h) => {
+  const left = (await outbox.prepare(input([ref('m1')])))!;
+  const restarted = h.open();
+  await assert.rejects(restarted.recoverAtStartup(() => { throw new Error('injected announce failure'); }), /injected announce failure/);
+  assert.equal(statusOf(restarted, left.id), 'prepared', 'not retired in memory either');
+  assert.deepEqual((await restarted.recoverAtStartup()).retired.map((r) => r.batchId), [left.id]);
+}));
+
+test('one channel spelled two ways is one reaction: a retract under one spelling decides an older choice under the other', withLedger(async (outbox, h) => {
+  const placed = await activeBatch(outbox, [{ serverId: 'discord', channelId: 'c1', messageId: 'm1' }]);
+  await answer(outbox, 'm1', 'confirmed');
+  const later = (await outbox.prepare(input([{ serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm1' }], { targetBranch: 'rollback/cairn/2' })))!;
+  await outbox.retract(placed.id);
+  assert.equal(await outbox.activate(later.id), 0, 'the retract decides the reaction, however its channel is spelled');
+  assert.equal(h.file().entries.length, 1);
+}));
+
+test('reactions on one message by other routes or emoji are separate entries', withLedger(async (outbox, h) => {
+  await activeBatch(outbox, [ref('m1'), { ...ref('m1'), serverId: 'discord-2' }]);
+  await activeBatch(outbox, [ref('m1')], { emoji: '🫥', targetBranch: 'rollback/cairn/2' });
+  assert.equal(h.file().entries.length, 3);
+  assert.deepEqual(outbox.due().map((r) => `${r.serverId}:${r.emoji}`).sort(), ['discord-2:💤', 'discord:💤', 'discord:🫥']);
+}));
+
+test('a new act owes its request with fresh attempts, and a confirmation clears them', withLedger(async (outbox, h) => {
+  const batch = await activeBatch(outbox, [ref('m1')]);
+  await answer(outbox, 'm1', 'failed');
+  assert.equal(h.entry('m1').attempts, 1);
+  await outbox.retract(batch.id);
+  assert.deepEqual([h.entry('m1').attempts, h.entry('m1').due !== null], [0, true], 'the retract owes a removal with fresh attempts');
+  await answer(outbox, 'm1', 'failed');
+  await answer(outbox, 'm1', 'confirmed');
+  assert.deepEqual([h.entry('m1').attempts, h.entry('m1').due, h.entry('m1').confirmed], [0, null, 'absent']);
+}));
+
+test('a request never answered stays one that may land after a later one is confirmed', withLedger(async (outbox, h) => {
+  await activeBatch(outbox, [ref('m1')]);
+  await answer(outbox, 'm1', 'unknown');
+  await answer(outbox, 'm1', 'confirmed');
+  assert.deepEqual([h.entry('m1').mayLand, h.entry('m1').confirmed], [['add'], 'present']);
+  assert.equal(batches(outbox)[0]!.mayStillLand, 1);
+}));
+
+test('an answer is refused for a request not on the wire, for another act, or for the other action', withLedger(async (outbox) => {
+  await activeBatch(outbox, [ref('m1')]);
+  const request = (await outbox.claim('discord'))!;
+  await assert.rejects(outbox.recordOutcome({ ...request, action: 'remove' }, 'confirmed'), /No remove for discord:g1:c1\/m1 is on the wire/);
+  await assert.rejects(outbox.recordOutcome({ ...request, due: request.due - 1 }, 'confirmed'), /No add for discord:g1:c1\/m1 is on the wire/);
+  await outbox.recordOutcome(request, 'confirmed');
+  await assert.rejects(outbox.recordOutcome(request, 'confirmed'), /No add for discord:g1:c1\/m1 is on the wire/, 'already answered');
 }));
 
 test('the store is synced before a write that activates, completes or retires a batch, and a failed sync writes nothing', withLedger(async (outbox, h) => {
@@ -683,17 +798,16 @@ test('a retract request can be cancelled by the id its receipt returned, even af
   assert.equal(retracts(restarted)[0].cancelled?.by, 'op');
 }));
 
-test('outside error text is bounded before it is written', withLedger(async (outbox, h) => {
+test('outside error text is bounded, at the default bound and at a small one', () => {
   assert.equal(boundDiscordAwarenessText('short'), 'short');
   const huge = `${'x'.repeat(300)}${'界'.repeat(500_000)}😀tail`;
   const bounded = boundDiscordAwarenessText(huge);
   assert.ok(bounded.length <= 500, `bounded to ${bounded.length}`);
   assert.match(bounded, /chars omitted/);
   assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(bounded), 'no lone surrogate');
-  await activeBatch(outbox, [ref('m1')]);
-  await answer(outbox, 'm1', 'failed', { error: huge });
-  assert.ok(h.entry('m1').lastError.length <= 500);
-}));
+  // A bound smaller than the marker keeps no head, rather than nearly all of it.
+  assert.ok(boundDiscordAwarenessText('y'.repeat(1_000), 40).length < 100);
+});
 
 test('a bounded text never splits a surrogate pair at either cut', () => {
   // At the default bound of 500 the head is cut at 360 code units and the
@@ -746,6 +860,9 @@ function drainingFramework(outbox: DiscordAwarenessOutbox, connection: (id: stri
   const framework = Object.create(AgentFramework.prototype) as any;
   framework.discordAwarenessOutbox = outbox;
   framework.discordAwarenessDrains = new Map();
+  framework.discordAwarenessDrainsJoined = new Set();
+  framework.operatorOperations = new Set();
+  framework.mcplServerConfigs = new Map();
   framework.discordAwarenessDeadlineMs = 1000;
   framework.mcplServerRegistry = { getServer: (id: string) => connection(id) };
   framework.operatorLog = new OperatorLog(undefined);
@@ -753,40 +870,77 @@ function drainingFramework(outbox: DiscordAwarenessOutbox, connection: (id: stri
   return framework;
 }
 
+test("the framework's cancel and retract are operator operations, which stop() waits for", withLedger(async (outbox) => {
+  const batch = await activeBatch(outbox, [ref('m1')]);
+  const framework = drainingFramework(outbox, () => null);
+  for (const [label, act] of [
+    ['awareness:cancel', () => framework.cancelDiscordAwareness(batch.id)],
+    ['awareness:retract', () => framework.retractDiscordAwareness(batch.id)],
+  ] as const) {
+    const pending = act();
+    assert.deepEqual([...framework.operatorOperations].map((op: { label: string }) => op.label), [label]);
+    await muted(() => pending);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(framework.operatorOperations.size, 0);
+  }
+}));
+
 test('framework drain classifies outcomes from what reached the server', async () => {
   const h = storeHarness();
   try {
-    await activeBatch(h.outbox, ['m1', 'm2', 'm3', 'm4', 'm5', 'm6', 'm7'].map((m) => ref(m)));
+    const all = ['m1', 'm2', 'm3', 'm4', 'm5', 'm6', 'm7', 'm8', 'm9', 'm10'];
+    await activeBatch(h.outbox, all.map((m) => ref(m)));
     const calls: string[] = [];
+    const channels = new Set<unknown>();
     let connected = true;
     const connection = {
       get isConnected() { return connected; },
       sendToolsCallWithDeadline: async (name: string, args: Record<string, unknown>) => {
         calls.push(`${name}:${args.messageId}`);
+        channels.add(args.channelId);
         if (args.messageId === 'm2') return { isError: true, content: [{ type: 'text', text: 'Unknown Message' }] };
         if (args.messageId === 'm3') throw new McplRequestError('Cannot send request: connection to "discord" is closed', 'not-sent');
         if (args.messageId === 'm4') throw new McplRequestError('did not respond', 'no-response');
         if (args.messageId === 'm6') throw new McplRequestError('Internal error', 'error-response');
         if (args.messageId === 'm7') throw new TypeError('transport went away');
+        // A refusal no retry can change, answered as a JSON-RPC error.
+        if (args.messageId === 'm8') throw new McplRequestError('The "discord" server answered with an error: Unknown Message', 'error-response');
+        // One whose words say so only past what the bound keeps.
+        if (args.messageId === 'm9') return { isError: true, content: [{ type: 'text', text: `${'x'.repeat(400)} Unknown Channel ${'y'.repeat(400)}` }] };
+        // The server's own words, carrying its configured token.
+        if (args.messageId === 'm10') throw new McplRequestError('rejected token sekrit-token-value-123', 'no-response');
         return { content: [{ type: 'text', text: 'Reaction applied' }] };
       },
     };
     const framework = drainingFramework(h.outbox, () => connection);
+    framework.mcplServerConfigs.set('discord', { id: 'discord', command: 'unused', token: 'sekrit-token-value-123' });
     const alerts: Array<{ kind: string; message: string }> = [];
     framework.opsAlert = (kind: string, _agent: string, message: string) => { alerts.push({ kind, message }); };
-    await muted(() => framework.drainDiscordAwarenessOutbox('discord'));
-    assert.deepEqual(calls.sort(), ['m1', 'm2', 'm3', 'm4', 'm5', 'm6', 'm7'].map((m) => `add_reaction:${m}`));
+    const logged: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      await framework.drainDiscordAwarenessOutbox('discord');
+    } finally {
+      console.error = error;
+    }
+    assert.deepEqual(calls.sort(), all.map((m) => `add_reaction:${m}`).sort());
+    assert.deepEqual([...channels], ['c1'], 'sent to the Discord channel id');
     assert.equal(h.entry('m1').confirmed, 'present');
     assert.deepEqual([h.entry('m2').failed, h.entry('m2').due], [true, null], 'Discord said the message is gone: final');
+    assert.deepEqual([h.entry('m8').failed, h.entry('m8').due, h.entry('m8').mayLand], [true, null, undefined], 'a JSON-RPC refusal no retry can change: final');
+    assert.deepEqual([h.entry('m9').failed, h.entry('m9').due], [true, null], 'classified on the whole text');
+    assert.ok(logged.some((line) => line.includes('m10') && line.includes('rejected token')), logged.join('\n'));
+    assert.ok(!logged.some((line) => line.includes('sekrit-token-value-123')), 'the configured token is redacted from the log');
     assert.deepEqual([h.entry('m3').attempts, h.entry('m3').mayLand], [0, undefined], 'never written: still owed, no attempt');
-    for (const m of ['m4', 'm6', 'm7']) {
+    for (const m of ['m4', 'm6', 'm7', 'm10']) {
       // A JSON-RPC error may come after the server acted, and an error the
       // connection did not classify may follow a write.
       assert.deepEqual([h.entry(m).confirmed, h.entry(m).mayLand, h.entry(m).attempts], ['unknown', ['add'], 1], `${m}: written, no answer`);
     }
     assert.equal(alerts.length, 1, 'one alert for the pass');
     assert.equal(alerts[0].kind, 'discord-awareness-delivery');
-    assert.match(alerts[0].message, /^Nothing more is sent for 1 awareness mark\(s\) on discord: .*add discord:g1:c1\/m2: failed: Unknown Message/);
+    assert.match(alerts[0].message, /^Nothing more is sent for 3 awareness mark\(s\) on discord: .*add discord:g1:c1\/m2: failed: Unknown Message/);
 
     // A disconnected route leaves its work queued without writing anything.
     connected = false;
@@ -798,7 +952,7 @@ test('framework drain classifies outcomes from what reached the server', async (
     connected = true;
     calls.length = 0;
     await muted(() => framework.drainDiscordAwarenessOutbox('discord'));
-    assert.deepEqual(calls.sort(), ['add_reaction:m3', 'add_reaction:m4', 'add_reaction:m6', 'add_reaction:m7']);
+    assert.deepEqual(calls.sort(), ['add_reaction:m10', 'add_reaction:m3', 'add_reaction:m4', 'add_reaction:m6', 'add_reaction:m7']);
   } finally {
     h.cleanup();
   }
@@ -829,6 +983,85 @@ test('a drain whose route goes away stops claiming: the rest stays queued, with 
   }
 });
 
+test('a trigger that joined a pass whose route went away gets a pass of its own, on the connection that replaced it', async () => {
+  const h = storeHarness();
+  try {
+    await activeBatch(h.outbox, [ref('m1'), ref('m2')]);
+    const sent: string[] = [];
+    let framework: any;
+    let current: unknown;
+    const replacement = {
+      isConnected: true,
+      sendToolsCallWithDeadline: async (_name: string, args: Record<string, unknown>) => {
+        sent.push(`new:${args.messageId}`);
+        return { content: [{ type: 'text', text: 'Reaction applied' }] };
+      },
+    };
+    const original = {
+      isConnected: true,
+      sendToolsCallWithDeadline: async (_name: string, args: Record<string, unknown>) => {
+        sent.push(`old:${args.messageId}`);
+        // The server restarts while this request is out: its old connection
+        // goes, and the new one's delivery joins the pass still running.
+        original.isConnected = false;
+        current = replacement;
+        void framework.drainDiscordAwarenessOutbox('discord');
+        throw new McplRequestError('closed while awaiting response', 'no-response');
+      },
+    };
+    current = original;
+    framework = drainingFramework(h.outbox, () => current);
+    await muted(async () => {
+      await framework.drainDiscordAwarenessOutbox('discord');
+      const deadline = Date.now() + 5_000;
+      while (sent.length < 3 || framework.discordAwarenessDrains.size > 0) {
+        assert.ok(Date.now() < deadline, `timed out: ${JSON.stringify(sent)}`);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    });
+    assert.deepEqual(sent, ['old:m1', 'new:m1', 'new:m2']);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("a delivery whose ledger write fails is reported where it was started, and the next pass asks again", { skip: asRoot }, withLedger(async (outbox, h) => {
+  await activeBatch(outbox, [ref('m1')]);
+  const connection = {
+    isConnected: true,
+    sendToolsCallWithDeadline: async (): Promise<unknown> => {
+      // The ledger's directory refuses the answer's write.
+      chmodSync(dirname(h.path), 0o500);
+      return { content: [{ type: 'text', text: 'Reaction applied' }] };
+    },
+  };
+  const framework = drainingFramework(outbox, () => connection);
+  const alerts: Array<{ kind: string; message: string }> = [];
+  framework.opsAlert = (kind: string, _agent: string, message: string) => { alerts.push({ kind, message }); };
+  const logged: string[] = [];
+  const error = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+  try {
+    framework.deliverDiscordAwarenessInBackground('connect', 'host');
+    const deadline = Date.now() + 5_000;
+    while (alerts.length === 0) {
+      assert.ok(Date.now() < deadline, 'timed out waiting for the delivery alert');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  } finally {
+    console.error = error;
+    chmodSync(dirname(h.path), 0o700);
+  }
+  assert.equal(alerts[0]!.kind, 'discord-awareness-delivery');
+  assert.match(alerts[0]!.message, /^Awareness mark delivery after connect failed: .*outcome write.*EACCES/);
+  assert.ok(logged.some((line) => line.startsWith('[discord-awareness] delivery after connect failed: ')), logged.join('\n'));
+  assert.ok(h.entry('m1').sending, 'the file still holds the request on the wire');
+  // The next pass releases it: it may have landed, and the add is asked again.
+  connection.sendToolsCallWithDeadline = async () => ({ content: [{ type: 'text', text: 'Reaction applied' }] });
+  await muted(() => framework.drainDiscordAwarenessOutbox('discord'));
+  assert.deepEqual([h.entry('m1').confirmed, h.entry('m1').mayLand, h.entry('m1').due], ['present', ['add'], null]);
+}));
+
 test('a request written ahead as stop() begins is not sent, and stays owed', async () => {
   const h = storeHarness();
   try {
@@ -850,7 +1083,7 @@ test('a request written ahead as stop() begins is not sent, and stays owed', asy
     };
     await muted(() => framework.drainDiscordAwarenessOutbox('discord'));
     assert.deepEqual(calls, []);
-    assert.deepEqual([h.entry('m1').sending, h.entry('m1').attempts, h.entry('m1').lastError], [undefined, 0, 'the framework is stopping']);
+    assert.deepEqual([h.entry('m1').sending, h.entry('m1').attempts], [undefined, 0]);
     assert.equal(h.outbox.due('discord').length, 2);
   } finally {
     h.cleanup();
@@ -980,6 +1213,7 @@ test("the framework's retract and cancel each record their act in the operator l
   const batch = await activeBatch(outbox, [ref('m1')]);
   const framework = Object.create(AgentFramework.prototype) as any;
   framework.discordAwarenessOutbox = outbox;
+  framework.operatorOperations = new Set();
   framework.deliverDiscordAwarenessInBackground = () => {};
   const logged: Array<Record<string, any>> = [];
   framework.recordOperatorAction = (entry: Record<string, unknown>) => { logged.push(entry); return entry; };
@@ -1038,7 +1272,7 @@ test("framework finishes an interrupted suppression's removals and retires its m
     await muted(() => framework.resumePreparedDiscordSuppressions());
     assert.deepEqual(presentAtCompletion, [[]], 'completed once, with the interval already removed');
     assert.deepEqual(removals, ['i1..i2']);
-    assert.equal(h.outbox.batchStatus(batch.id), 'retired', "a start never activates a surgery's marks");
+    assert.equal(statusOf(h.outbox, batch.id), 'retired', "a start never activates a surgery's marks");
     assert.deepEqual(h.outbox.due('discord'), []);
     assert.deepEqual(alerts.map((alert) => [alert.kind, alert.agent]), [['discord-awareness-not-scheduled', 'cairn']]);
     assert.equal(
@@ -1102,7 +1336,7 @@ test('a resumed suppression removes a one-shard body as a range and a message ou
     };
     await muted(() => resumingFramework(h.outbox, 'recovery/cairn/suppressed', cm).resumePreparedDiscordSuppressions());
     assert.deepEqual(removals, ['shard..shard', 'plain']);
-    assert.equal(h.outbox.batchStatus(batch.id), 'retired', "a start never activates a surgery's marks");
+    assert.equal(statusOf(h.outbox, batch.id), 'retired', "a start never activates a surgery's marks");
   } finally {
     h.cleanup();
   }
@@ -1121,7 +1355,7 @@ test('a resumed suppression skips an interval that committed before the crash, a
       };
       const outcome = await muted(() => resumingFramework(h.outbox, 'recovery/cairn/suppressed', cm).resumePreparedDiscordSuppressions())
         .then(() => 'resumed', (error: Error) => error.message);
-      return { outcome, removals, status: h.outbox.batchStatus(batch.id) };
+      return { outcome, removals, status: statusOf(h.outbox, batch.id) };
     } finally {
       h.cleanup();
     }
@@ -1218,27 +1452,24 @@ test('each kind of retirement alert a start raises reaches the ops webhook for t
   }
 });
 
-test("the per-batch alerts of a surgery whose marks or resume record could not be settled each reach the ops webhook within its cooldown", async (t) => {
+test("the per-batch alerts of a surgery whose marks could not be scheduled, or whose batch could not be retired, each reach the ops webhook within its cooldown", async (t) => {
   const posts = await withWebhook(t, async () => {
     const framework = alertingFramework();
     const facts = { scope: 'all', unmarked: 0, notRemoved: 0 };
     // A marker batch whose activation couldn't be recorded, twice.
     for (const id of ['b1', 'b2']) framework.settledMarkerReceipt({ status: 'not-scheduled', error: 'injected' }, id, 1, 'rollback', 'cairn', facts);
-    // A suppression's resume record that could be neither closed nor retired, twice.
-    framework.discordAwarenessOutbox = { settleActivation: async () => ({ status: 'unresolved', error: 'injected' }) };
-    for (const id of ['s1', 's2']) await framework.activateSurgeryMarkers({ id, refs: [] }, 'suppress', 'cairn', facts);
     // A failed suppression whose batch couldn't be retired once its source was back, twice.
     framework.store = { currentBranch: () => ({ name: 'main' }), listBranches: () => [] };
-    framework.discordAwarenessOutbox = { discard: async () => { throw new Error('injected'); }, batchStatus: () => 'prepared' };
+    framework.discordAwarenessOutbox = { discard: async () => { throw new Error('injected'); } };
     for (const id of ['f1', 'f2']) {
       await framework.retireAfterRestore({ id, targetBranch: `recovery/cairn/${id}`, suppressionIntervals: [{ fromId: 'i', toId: 'i' }] }, 'main', 'cairn');
     }
   });
-  assert.equal(posts.length, 6, posts.join('\n'));
-  for (const [index, id] of ['b1', 'b2', 's1', 's2', 'f1', 'f2'].entries()) assert.match(posts[index]!, new RegExp(`batch ${id}\\b`));
+  assert.equal(posts.length, 4, posts.join('\n'));
+  for (const [index, id] of ['b1', 'b2', 'f1', 'f2'].entries()) assert.match(posts[index]!, new RegExp(`batch ${id}\\b`));
 });
 
-test("after a failed surgery, retiring its batch says what the ledger holds: retired, retired but not durable when the write didn't complete, or that it can't be read back", async () => {
+test("after a failed surgery, retiring its batch says whether it is retired, or stays prepared with what that leaves", async () => {
   const framework = Object.create(AgentFramework.prototype) as any;
   const alerts: string[] = [];
   framework.opsAlert = (kind: string) => { alerts.push(kind); };
@@ -1246,31 +1477,17 @@ test("after a failed surgery, retiring its batch says what the ledger holds: ret
   const batch = { id: 'f1', targetBranch: 'recovery/cairn/f1', suppressionIntervals: [{ fromId: 'i', toId: 'i' }] };
   framework.discordAwarenessOutbox = { discard: async () => true };
   assert.equal(await framework.retireAfterRestore(batch, 'main', 'cairn'), '; awareness batch f1 retired, none of its marks sent');
-  framework.discordAwarenessOutbox = {
-    discard: async () => { throw new Error('injected directory sync failure'); },
-    batchStatus: () => 'retired',
-  };
-  assert.equal(
-    await framework.retireAfterRestore(batch, 'main', 'cairn'),
-    '; awareness batch f1 is retired, none of its marks sent, but writing that didn\'t complete (injected directory sync '
-      + 'failure): an operating system crash or a power failure before the ledger\'s next write could lose it, and the '
-      + 'batch would then be prepared again at the next start, its removals pending for recovery/cairn/f1',
-  );
+  assert.deepEqual(alerts, []);
+  framework.discordAwarenessOutbox = { discard: async () => { throw new Error('injected write failure'); } };
   // A batch with no suppression has no removals to leave pending.
   assert.equal(
     await framework.retireAfterRestore({ id: 'f2', targetBranch: 'rollback/cairn/f2' }, 'main', 'cairn'),
-    '; awareness batch f2 is retired, none of its marks sent, but writing that didn\'t complete (injected directory sync '
-      + 'failure): an operating system crash or a power failure before the ledger\'s next write could lose it, and the '
-      + 'batch would then be prepared again at the next start',
+    '; awareness batch f2 could not be retired (injected write failure); it stays prepared, none of its marks to be sent, until the next start retires it',
   );
-  assert.deepEqual(alerts, [], 'retired: nothing is left unresolved');
-  framework.discordAwarenessOutbox = {
-    discard: async () => { throw new Error('injected write failure'); },
-    batchStatus: () => { throw new Error('injected unreadable ledger'); },
-  };
+  assert.deepEqual(alerts, []);
   assert.match(
     await framework.retireAfterRestore(batch, 'main', 'cairn'),
-    /^; awareness batch f1 could not be retired \(injected write failure\), and the ledger can't be read back to tell whether its retirement landed; if it didn't, it stays prepared, none of its marks to be sent\. Its removals stay pending for recovery\/cairn\/f1: a start on a branch with that name would finish them there and retire the batch$/,
+    /^; awareness batch f1 could not be retired \(injected write failure\); it stays prepared, none of its marks to be sent\. Its removals stay pending for recovery\/cairn\/f1: a start on a branch with that name would finish them there and retire the batch$/,
   );
   assert.deepEqual(alerts, ['discord-awareness-unresolved']);
 });
@@ -1330,7 +1547,7 @@ test('a start on a ledger it cannot read stops, naming the ledger read', withLed
     /accounting failed during startup reconciliation: Invalid Discord awareness ledger .*: it isn't JSON$/);
 }));
 
-test("a suppression's resume record closed with a write that didn't complete is logged, and a closed one says nothing", async () => {
+test("a suppression's resume record that could not be closed is logged, and a closed one says nothing", async () => {
   const logged: string[] = [];
   const framework = Object.create(AgentFramework.prototype) as any;
   framework.opsAlert = () => { throw new Error('no alert expected'); };
@@ -1338,7 +1555,7 @@ test("a suppression's resume record closed with a write that didn't complete is 
   const error = console.error;
   console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
   try {
-    framework.discordAwarenessOutbox = { settleActivation: async () => ({ status: 'queued', queued: 0, error: 'injected directory sync failure' }) };
+    framework.discordAwarenessOutbox = { settleActivation: async () => ({ status: 'not-scheduled', error: 'injected; it is retired instead, none of its marks sent' }) };
     assert.deepEqual(await framework.activateSurgeryMarkers({ id: 's1', refs: [] }, 'suppress', 'cairn', facts), { ...facts, status: 'none', queued: 0 });
     framework.discordAwarenessOutbox = { settleActivation: async () => ({ status: 'queued', queued: 0 }) };
     await framework.activateSurgeryMarkers({ id: 's2', refs: [] }, 'suppress', 'cairn', facts);
@@ -1346,9 +1563,8 @@ test("a suppression's resume record closed with a write that didn't complete is 
     console.error = error;
   }
   assert.deepEqual(logged, [
-    '[discord-awareness] agent=cairn: suppress applied, and its resume record (awareness batch s1, no marks) is closed, '
-      + "but writing that didn't complete (injected directory sync failure): an operating system crash or a power failure "
-      + "before the ledger's next write could lose it, and a start on this branch then finds its removals applied and closes it",
+    '[discord-awareness] agent=cairn: suppress applied, but its resume record (awareness batch s1, no marks) could not '
+      + 'be closed: injected; it is retired instead, none of its marks sent',
   ]);
 });
 
@@ -1379,6 +1595,8 @@ function hostCommandFramework(outbox: DiscordAwarenessOutbox | null, messages: A
   framework.discordAwarenessOutbox = outbox;
   framework.discordAwarenessEmoji = '🫥';
   framework.discordAwarenessDrains = new Map();
+  framework.discordAwarenessDrainsJoined = new Set();
+  framework.operatorOperations = new Set();
   framework.mcplServerRegistry = null;
   framework.moduleRegistry = { getModule: () => null };
   framework.lastVisiblePreview = async () => null;

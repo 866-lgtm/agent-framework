@@ -85,14 +85,17 @@ describe('surgery and awareness marks', () => {
   const answered = () => jsonl(eventsPath).filter((e) => e.event === 'reaction-answered').length;
   const calls = () => jsonl<{ name: string; args: { messageId: string; emoji: string } }>(callsPath);
 
-  async function start(withDiscord: boolean, awarenessDeadlineMs?: number): Promise<void> {
+  // Reactions the fake server holds stay held for as long as a test needs
+  // them to: the deadline is the longest the framework takes, unless a test
+  // means it to run out.
+  async function start(withDiscord: boolean, awarenessDeadlineMs = 60_000): Promise<void> {
     framework = await AgentFramework.create({
       storePath,
       membrane: new MockMembrane().asMembrane(),
       agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'You are a resident.' }],
       modules: [],
       maintenanceIntervalMs: 0,
-      ...(awarenessDeadlineMs ? { discordAwarenessDeadlineMs: awarenessDeadlineMs } : {}),
+      discordAwarenessDeadlineMs: awarenessDeadlineMs,
       ...(withDiscord ? {
         mcplServers: [{
           id: 'discord',
@@ -324,12 +327,11 @@ describe('surgery and awareness marks', () => {
     assert.deepEqual(record.refs, []);
 
     // When the record can be neither activated nor retired, it still
-    // schedules nothing, and the receipt says none, not unresolved; the
-    // operator hears that the ledger failed.
-    const alerts: Array<{ kind: string; message: string }> = [];
-    framework.onTrace((event) => {
-      if (event.type === 'ops:alert') alerts.push(event as unknown as { kind: string; message: string });
-    });
+    // schedules nothing, and the receipt says none; the log says what
+    // became of the record.
+    const logged: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
     const { activateIn, retireIn } = ledgerInternals;
     ledgerInternals.activateIn = async function () { throw new Error('injected ledger failure'); };
     ledgerInternals.retireIn = async function () { throw new Error('injected retire failure'); };
@@ -337,14 +339,18 @@ describe('surgery and awareness marks', () => {
     try {
       stuck = await framework.suppressMessages('resident', { messageIds: [other] });
     } finally {
+      console.error = error;
       ledgerInternals.activateIn = activateIn;
       ledgerInternals.retireIn = retireIn;
     }
     assert.deepEqual(stuck.markers, none);
     assert.ok(!cm().getAllMessages().some((m) => String(m.id) === other), 'the redaction stood');
-    assert.equal(outbox().batches().filter((batch) => batch.status === 'prepared').length, 1, 'its resume record is left prepared');
-    const alert = alerts.find((candidate) => candidate.kind === 'discord-awareness-unresolved');
-    assert.match(alert?.message ?? '', /suppress applied, but its resume record \(awareness batch \S+, no marks\) could not be closed \(.*\); it stays prepared, unless the ledger couldn't be read back and its closing reached it anyway; if it stays prepared, a start on this branch finds its removals applied and closes it$/);
+    const left = outbox().batches().filter((batch) => batch.status === 'prepared');
+    assert.equal(left.length, 1, 'its resume record is left prepared');
+    assert.ok(logged.some((line) => line === `[discord-awareness] agent=resident: suppress applied, but its resume record `
+      + `(awareness batch ${left[0]!.id}, no marks) could not be closed: injected ledger failure; retiring it also failed `
+      + `(injected retire failure), so it stays prepared, and the first start on ${left[0]!.targetBranch} finds its removals `
+      + 'applied and retires it, none of its marks sent'), logged.join('\n'));
   });
 
   it('a choice bound to previewed refs never widens to messages that arrive before it applies', async () => {
@@ -453,7 +459,7 @@ describe('surgery and awareness marks', () => {
     assert.equal(calls().length, 0, 'no reaction was ever sent');
   });
 
-  it('reports unresolved bookkeeping when the batch can be neither activated nor retired', async () => {
+  it('reports not-scheduled when the batch can be neither activated nor retired: it stays prepared, and a start retires it unsent', async () => {
     await start(false);
     const { tail } = seed(2);
     const { activateIn, retireIn } = ledgerInternals;
@@ -471,10 +477,15 @@ describe('surgery and awareness marks', () => {
       ledgerInternals.retireIn = retireIn;
     }
     assert.equal(cm().currentBranch().name, result.targetBranch, 'the rollback stands');
-    assert.equal(result.markers.status, 'unresolved');
-    const batches = outbox().batches();
-    assert.equal(batches.length, 1);
-    assert.equal(result.markers.status === 'unresolved' && result.markers.batchId, batches[0].id);
+    assert.equal(result.markers.status, 'not-scheduled');
+    assert.match(result.markers.status === 'not-scheduled' ? result.markers.error : '',
+      /^injected ledger failure; retiring it also failed \(injected retire failure\), so it stays prepared, and the next start retires it, none of its marks sent$/);
+    assert.deepEqual(outbox().batches().map((batch) => batch.status), ['prepared']);
+    // The next start retires it, none of its marks sent.
+    await framework.stop();
+    await start(false);
+    assert.deepEqual(outbox().batches().map((batch) => batch.status), ['retired']);
+    assert.deepEqual(entries(), []);
   });
 
   it('a suppression whose marker bookkeeping fails after the last redaction stands', async () => {
@@ -550,6 +561,14 @@ describe('surgery and awareness marks', () => {
         && error.message === 'marks need the awareness ledger, and this framework has none: it was created with neither storePath nor discordAwarenessOutboxPath',
     );
     assert.equal(cm().getAllMessages().length, 4, 'nothing was removed');
+    // A suppression refuses the same way.
+    const [first] = cm().getAllMessages();
+    await assert.rejects(
+      framework.suppressMessages('resident', { messageIds: [String(first!.id)], marks: { scope: 'all' } }),
+      (error: unknown) => error instanceof OperatorActionError && error.code === 'invalid'
+        && /^marks need the awareness ledger, and this framework has none/.test(error.message),
+    );
+    assert.equal(cm().getAllMessages().length, 4, 'nothing was suppressed');
     await framework.stop();
 
     const ledgerPath = join(dir, 'ledger.json');

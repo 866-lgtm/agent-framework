@@ -155,7 +155,8 @@ describe('stop() and Discord awareness drains', () => {
     const rest = ['m1', 'm2', 'm3'].filter((id) => id !== first);
     assert.deepEqual([entries[first].attempts, entries[first].confirmed, entries[first].mayLand], [1, 'unknown', ['add']],
       'the call in flight is recorded unanswered');
-    assert.match(entries[first].lastError ?? '', /didn't answer before this host closed its connection/);
+    assert.ok(log.some((line) => line.startsWith(`[discord-awareness] add discord:guild:discord/${first}: unknown`)
+      && /didn't answer before this host closed its connection/.test(line)), log.join('\n'));
     assert.deepEqual(rest.map((id) => [entries[id].attempts, entries[id].sending]), [[0, undefined], [0, undefined]],
       'what the drain had not sent is unrecorded');
     assert.deepEqual(due, ['m1', 'm2', 'm3'], 'and stays queued for the next start, with the unanswered add');

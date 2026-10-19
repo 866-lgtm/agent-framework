@@ -45,10 +45,13 @@ import { OperatorActionError } from '../operator-log.js';
  * memory, reads the file when it first needs it and again after a write
  * fails, and answers views from memory. Acts run one at a time, each written
  * before the next starts: compact JSON to a temporary file, synced, renamed
- * over the ledger, then the directory synced. A write that activates,
- * completes or retires a batch syncs the store first, so the ledger never
- * outlives the branch state it relies on. A write that fails reads the file
- * back, and the act reports from what the file holds.
+ * over the ledger, then the ledger's directory and its parent synced, by the
+ * rule the framework's own recovery files follow (writeRecoveryFile). A
+ * write that activates, completes or retires a batch syncs the store first,
+ * so the ledger never outlives the branch state it relies on. A write that
+ * throws has left the file as it was, and the act's change is dropped with
+ * it; a directory that can't be synced after the rename is reported
+ * (onUnsyncedWrite), and the write stands.
  */
 
 export const DEFAULT_DISCORD_AWARENESS_EMOJI = '💤';
@@ -63,7 +66,7 @@ export const DEFAULT_DISCORD_AWARENESS_EMOJI = '💤';
 export function boundDiscordAwarenessText(text: string, max = 500): string {
   if (text.length <= max) return text;
   const tailLength = Math.min(100, Math.floor(max / 4));
-  let head = text.slice(0, max - tailLength - 40);
+  let head = text.slice(0, Math.max(0, max - tailLength - 40));
   let tail = text.slice(text.length - tailLength);
   if (/[\uD800-\uDBFF]$/.test(head)) head = head.slice(0, -1);
   if (/^[\uDC00-\uDFFF]/.test(tail)) tail = tail.slice(1);
@@ -207,17 +210,13 @@ interface LedgerRetract {
 /**
  * What the ledger will do with a batch whose body change has landed:
  * - `queued`: it is active, its requests owed;
- * - `not-scheduled`: none of its marks will be sent (it was retired, or
- *   never recorded);
- * - `unresolved`: neither could be established. If its activation reached
- *   the file where this process can't read it back, its marks go out from
- *   the next start; otherwise that start retires it, none of them sent.
+ * - `not-scheduled`: none of its marks will be sent. It was retired, or it
+ *   couldn't be, and stays prepared for the next start to retire, or it was
+ *   never recorded; `error` says which, and why its activation failed.
  */
 export type DiscordAwarenessSettlement =
-  /** `error`: the activation is in the file, and writing it didn't complete. */
-  | { status: 'queued'; queued: number; error?: string }
-  | { status: 'not-scheduled'; error: string }
-  | { status: 'unresolved'; error: string };
+  | { status: 'queued'; queued: number }
+  | { status: 'not-scheduled'; error: string };
 
 export type DiscordAwarenessOutcome = 'confirmed' | 'failed' | 'not-sent' | 'unknown';
 
@@ -480,7 +479,6 @@ interface LedgerEntry extends DiscordAwarenessRef {
   mayLand?: DiscordAwarenessAction[];
   /** What was owed ended unconfirmed (see countAttempt). */
   failed?: boolean;
-  lastError?: string;
 }
 
 interface LedgerDocument {
@@ -520,6 +518,8 @@ export class DiscordAwarenessOutbox {
   private readonly store?: JsStore;
   /** Told what a version 2 ledger's rewrite drops, before it is written. */
   private readonly announceImport?: (unsent: DiscordAwarenessImportedUnsent[]) => void;
+  /** Told of a directory that couldn't be synced after a write's rename. */
+  private readonly onUnsyncedWrite: (directory: string, error: unknown) => void;
   /** The document, or null until it is read, and after a failed write
    *  whose file couldn't be read back: the next read tries again. */
   private state: LedgerState | null = null;
@@ -532,14 +532,24 @@ export class DiscordAwarenessOutbox {
    *   and retirements rely on, synced before each is written.
    * @param opts.announceImport told, before a version 2 ledger is rewritten
    *   as version 3, which batches' undelivered work that drops, none of it sent.
+   * @param opts.onUnsyncedWrite told of a directory that couldn't be synced
+   *   after a write's rename: the write stands, though an operating system
+   *   crash could lose it. Logged to stderr when not given.
    */
   constructor(
     path: string,
-    opts: { store?: JsStore; announceImport?: (unsent: DiscordAwarenessImportedUnsent[]) => void } = {},
+    opts: {
+      store?: JsStore;
+      announceImport?: (unsent: DiscordAwarenessImportedUnsent[]) => void;
+      onUnsyncedWrite?: (directory: string, error: unknown) => void;
+    } = {},
   ) {
     this.path = path;
     if (opts.store) this.store = opts.store;
     if (opts.announceImport) this.announceImport = opts.announceImport;
+    this.onUnsyncedWrite = opts.onUnsyncedWrite ?? ((directory, error) => {
+      console.error(`[discord-awareness] ${unsyncedWriteText(directory, path, error)}`);
+    });
   }
 
   // -- surgery side -----------------------------------------------------------
@@ -577,36 +587,14 @@ export class DiscordAwarenessOutbox {
       try {
         // On disk before the surgery's switch: if the surgery is interrupted,
         // a start finds the batch, retires it and alerts (recoverAtStartup),
-        // and finishes a suppression's removals.
+        // and finishes a suppression's removals. A write that fails leaves
+        // the file without it, so the surgery doesn't run.
         await this.persist(state);
       } catch (error) {
-        throw new Error(await this.failedPrepare(batch.id, error), { cause: error });
+        throw new Error(`recording awareness batch ${batch.id} failed: ${errorText(error)}`, { cause: error });
       }
       return structuredClone(batch);
     });
-  }
-
-  /**
-   * What a prepare whose write failed leaves, for the surgery's error (the
-   * surgery then doesn't run): nothing; the batch, retired at once when the
-   * file holds it; or a batch left prepared, which the next start retires,
-   * unsent. A suppression's batch also names removals for its target branch,
-   * which its surgery never created: until it's retired, a branch made under
-   * that name would have them applied at a start on it.
-   */
-  private async failedPrepare(batchId: string, error: unknown): Promise<string> {
-    const detail = `recording awareness batch ${batchId} failed: ${errorText(error)}`;
-    const retired = 'the next start retires it, none of its marks sent';
-    const state = this.state;
-    if (!state) return `${detail}; the ledger can't be read back, so it may hold the batch, and if so ${retired}`;
-    if (!state.batches.has(batchId)) return detail;
-    try {
-      await this.retireIn(state, batchId);
-      return `${detail}; it reached the ledger and is retired`;
-    } catch (retireError) {
-      return `${detail}; it reached the ledger, and retiring it also failed (${errorText(retireError)}), ` +
-        `so ${retired}`;
-    }
   }
 
   /**
@@ -654,15 +642,11 @@ export class DiscordAwarenessOutbox {
   /**
    * Activate a batch after its body change landed, and if that cannot be
    * recorded, retire it instead, so that what the caller reports is what
-   * the ledger will do. After a failure, what the file holds decides:
-   * - `queued`: the batch is active (including when the activation reached
-   *   the file and writing it didn't complete);
-   * - `not-scheduled`: it is retired, by this call or before it; none of its
-   *   marks will be sent;
-   * - `unresolved`: the file holds neither, as far as this process can read
-   *   it. If the activation reached it unseen, its marks go out from the
-   *   next start; otherwise that start retires the batch, unsent.
-   * Never throws.
+   * the ledger will do: `queued`, or `not-scheduled`. A batch that can be
+   * neither activated nor retired stays prepared in the file, since a write
+   * that fails leaves it as it was, and a start retires it, none of its
+   * marks sent: the next start, or for a suppression the first start on its
+   * branch, once it finds the removals applied. Never throws.
    */
   async settleActivation(batchId: string): Promise<DiscordAwarenessSettlement> {
     try {
@@ -673,32 +657,24 @@ export class DiscordAwarenessOutbox {
         } catch (error) {
           detail = errorText(error);
         }
-        // A failed write read the file back (persist): it decides.
-        if (this.state?.batches.get(batchId)?.status === 'prepared') {
+        // The file is as it was before the activation: the document read
+        // back after a failed write (persist), or unchanged by a refusal.
+        const batch = this.state?.batches.get(batchId);
+        if (batch?.status === 'prepared') {
           try {
-            await this.retireIn(this.state, batchId);
-            return { status: 'not-scheduled', error: detail } as const;
+            await this.retireIn(this.state!, batchId);
           } catch (error) {
-            detail += `; retiring it also failed: ${errorText(error)}`;
+            return { status: 'not-scheduled', error: `${detail}; retiring it also failed (${errorText(error)}), so ${leftPrepared(batch)}` } as const;
           }
+          return { status: 'not-scheduled', error: `${detail}; it is retired instead, none of its marks sent` } as const;
+        } else if (!this.state) {
+          return { status: 'not-scheduled', error: `${detail}; the ledger can't be read back, so ${leftPrepared()}` } as const;
         }
-        let current: LedgerState | null = null;
-        try {
-          current = this.loaded();
-        } catch (error) {
-          detail += `; reading the ledger back also failed: ${errorText(error)}`;
-        }
-        const status = current?.batches.get(batchId)?.status;
-        if (current && status === 'active') {
-          // In the file, so delivered, but not known to be on stable storage.
-          return { status: 'queued', queued: owedBy(current, batchId), error: detail } as const;
-        }
-        if (status === 'retired') return { status: 'not-scheduled', error: detail } as const;
-        return { status: 'unresolved', error: detail } as const;
+        return { status: 'not-scheduled', error: detail } as const;
       });
     } catch (error) {
       // The act never ran: the ledger can't be read.
-      return { status: 'unresolved', error: errorText(error) };
+      return { status: 'not-scheduled', error: `${errorText(error)}; ${leftPrepared()}` };
     }
   }
 
@@ -721,14 +697,6 @@ export class DiscordAwarenessOutbox {
     // body) is synced first, so a crash can never keep the retirement while
     // losing the state it relies on.
     await this.persist(state, { afterCommittedState: true });
-  }
-
-  /** A batch's status as the ledger holds it now, or undefined when it holds
-   *  no such batch. Throws when the ledger can't be read. A write can reach
-   *  the file before it fails, so after a failed discard this says whether
-   *  the retirement is there. */
-  batchStatus(batchId: string): DiscordAwarenessBatchStatus | undefined {
-    return this.loaded().batches.get(batchId)?.status;
   }
 
   /**
@@ -775,9 +743,9 @@ export class DiscordAwarenessOutbox {
    * Each retirement is reported in `retired`, and the store is synced before
    * any is written. `announce` is told what it retires and records
    * unanswered before that is written: each is written once, so a notice
-   * given after the write would be lost for good if the write landed and the
-   * process ended, or the write failed after landing, before the notice. If
-   * the write doesn't land, the next start says it again.
+   * given after the write would be lost for good if the process ended
+   * between the two. If the write doesn't land, the next start says it
+   * again.
    */
   async recoverAtStartup(
     announce?: (planned: { retired: DiscordAwarenessRetirement[]; unknownAttempts: number; givenUp: number }) => void,
@@ -788,7 +756,7 @@ export class DiscordAwarenessOutbox {
       for (const entry of state.doc.entries) {
         if (!entry.sending) continue;
         unknownAttempts++;
-        if (recordUnanswered(entry, 'the previous process ended before an answer was recorded')) givenUp++;
+        if (recordUnanswered(entry)) givenUp++;
       }
       const retired: DiscordAwarenessRetirement[] = [];
       for (const batch of state.doc.batches) {
@@ -828,18 +796,17 @@ export class DiscordAwarenessOutbox {
       const retract = state.retracts.get(target);
       const batch = state.batches.get(target);
       if (!retract && !batch) {
-        throw new DiscordAwarenessRefusal(`Discord awareness batch or retract request not found: ${target}`);
+        throw new DiscordAwarenessRefusal(
+          `Discord awareness batch or retract request not found: ${target}; the marks list (listDiscordAwareness()) names them`,
+        );
       }
       const kind = retract ? 'retract' : 'batch';
       const subject = (retract ?? batch)!;
       const wanted = retract ? 'absent' : 'present';
-      // The reactions the act reached: a retract's, those it is the latest
-      // retract on; a batch's, its refs, once it was activated.
-      const reached = retract
-        ? state.doc.entries.filter((entry) => entry.retracted === retract.moment)
-        : batch!.status === 'active'
-          ? batch!.refs.flatMap((ref) => state.entries.get(markKey(ref, batch!.emoji)) ?? [])
-          : [];
+      // The reactions the act still wants: those no later act has taken
+      // over. A prepared batch wants none yet, and a cancelled act none any
+      // more.
+      const reached = state.doc.entries.filter((entry) => entry.wantedBy.includes(target));
       const receipt: DiscordAwarenessCancelReceipt = {
         target,
         kind,
@@ -847,12 +814,12 @@ export class DiscordAwarenessOutbox {
         confirmed: reached.filter((entry) => entry.confirmed === wanted).length,
         mayStillLand: reached.filter(mayStillLand).length,
       };
-      // A repeated cancel writes nothing; its receipt is still today's.
+      // A repeated cancel finds nothing the act still wants, and writes nothing.
       if (subject.cancelled) return receipt;
       subject.cancelled = { at: Date.now(), ...(by ? { by } : {}) };
       if (batch?.status === 'prepared') {
-        // Its surgery is still running, or its bookkeeping unresolved: none
-        // of its marks was requested, and none will be.
+        // Its surgery is still running, or it was left for a start to
+        // retire: none of its marks was requested, and none will be.
         receipt.cancelled = batch.refs.length;
       } else {
         for (const entry of state.doc.entries) {
@@ -905,7 +872,11 @@ export class DiscordAwarenessOutbox {
         for (const entry of state.doc.entries) select(entry, entry.emoji);
       } else {
         const batch = state.batches.get(target);
-        if (!batch) throw new DiscordAwarenessRefusal(`Discord awareness batch not found: ${target}`);
+        if (!batch) {
+          throw new DiscordAwarenessRefusal(
+            `Discord awareness batch not found: ${target}; the marks list (listDiscordAwareness()) names them, or retract all`,
+          );
+        }
         for (const ref of batch.refs) select(ref, batch.emoji);
       }
       const retract: LedgerRetract = {
@@ -959,14 +930,30 @@ export class DiscordAwarenessOutbox {
    * until its answer is written. `skip` excludes requests already tried in
    * this pass. Resolves once the write-ahead is on disk, with the request to
    * send, or null when nothing is owed.
+   *
+   * A delivery pass claims only once its last request's answer is written,
+   * so a request of this server still marked on the wire here is one whose
+   * answer couldn't be written. It is recorded as unanswered first, as a
+   * start records one an earlier process left: it may land, and what it
+   * served is owed again.
    */
   async claim(
     serverId: string,
     skip: (request: DiscordAwarenessRequest) => boolean = () => false,
   ): Promise<DiscordAwarenessRequest | null> {
     return this.act(async (state) => {
+      let released = false;
+      for (const entry of state.doc.entries) {
+        if (entry.sending && entry.serverId === serverId) {
+          recordUnanswered(entry);
+          released = true;
+        }
+      }
       const request = owedRequests(state, serverId).find((candidate) => !skip(candidate));
-      if (!request) return null;
+      if (!request) {
+        if (released) await this.persist(state);
+        return null;
+      }
       const entry = state.entries.get(markKey(request, request.emoji))!;
       entry.sending = { action: request.action, due: request.due };
       await this.persist(state);
@@ -985,7 +972,7 @@ export class DiscordAwarenessOutbox {
   async recordOutcome(
     request: DiscordAwarenessRequest,
     outcome: DiscordAwarenessOutcome,
-    detail: { permanent?: boolean; error?: string } = {},
+    detail: { permanent?: boolean } = {},
   ): Promise<boolean> {
     return this.act(async (state) => {
       const entry = state.entries.get(markKey(request, request.emoji));
@@ -994,7 +981,6 @@ export class DiscordAwarenessOutbox {
           `No ${request.action} for ${request.channelId}/${request.messageId} is on the wire to record an answer for`,
         );
       }
-      const error = detail.error !== undefined ? boundDiscordAwarenessText(detail.error) : undefined;
       let ended = false;
       if (outcome === 'confirmed') {
         delete entry.sending;
@@ -1002,13 +988,11 @@ export class DiscordAwarenessOutbox {
         if (request.due === entry.due) {
           entry.due = null;
           entry.attempts = 0;
-          delete entry.lastError;
         }
       } else if (outcome === 'unknown') {
-        ended = recordUnanswered(entry, error);
+        ended = recordUnanswered(entry);
       } else {
         delete entry.sending;
-        if (error !== undefined) entry.lastError = error;
         // A request refused before it left the host isn't an attempt.
         if (outcome === 'failed') ended = countAttempt(entry, request.due, detail.permanent === true);
       }
@@ -1085,9 +1069,28 @@ export class DiscordAwarenessOutbox {
    * version 3 by the first act, before the act's own change.
    */
   private act<T>(fn: (state: LedgerState) => Promise<T>): Promise<T> {
-    const run = this.queue.then(async () => fn(this.state ?? await this.open()));
+    const run = this.queue.then(async () => {
+      const state = this.state ?? await this.open();
+      try {
+        return await fn(state);
+      } catch (error) {
+        // An act that throws has left the file as it was, so whatever it
+        // changed in memory goes too: the document is read back.
+        this.forget();
+        throw error;
+      }
+    });
     this.queue = run.catch(() => undefined);
     return run;
+  }
+
+  /** Drop the document held in memory and read the file back; if it can't
+   *  be read, the next read tries again. */
+  private forget(): void {
+    this.state = null;
+    try {
+      this.loaded();
+    } catch { /* unread: the next read tries again */ }
   }
 
   /**
@@ -1100,9 +1103,8 @@ export class DiscordAwarenessOutbox {
     if (read.version === 3) return (this.state = read.state);
     const { state, unsent } = migrateLedger(read.document);
     // Said before it's written: the rewrite is made once, so a notice given
-    // after it would be lost for good if the write landed and the process
-    // ended, or the write failed after landing, before the notice. If the
-    // write doesn't land, the next act says it again.
+    // after it would be lost for good if the process ended between the two.
+    // If the write doesn't land, the next act says it again.
     if (unsent.length > 0) {
       console.error(
         `[discord-awareness] rewriting ${this.path} as version 3: ${unsent.length} batch(es) had marks ` +
@@ -1114,7 +1116,7 @@ export class DiscordAwarenessOutbox {
       );
       this.announceImport?.(unsent);
     }
-    await writeLedgerFile(this.path, state.doc);
+    await writeLedgerFile(this.path, state.doc, this.onUnsyncedWrite);
     return (this.state = state);
   }
 
@@ -1135,19 +1137,17 @@ export class DiscordAwarenessOutbox {
   }
 
   /**
-   * Write the document. If that fails, the file is read back, so that what
-   * it holds decides what the act reports; if it can't be read, the next
-   * read tries again. `afterCommittedState` syncs the store first.
+   * Write the document. A write that throws has left the file as it was, so
+   * the act's change, already made in memory, is dropped: the document is
+   * read back from the file, and if it can't be read, the next read tries
+   * again. `afterCommittedState` syncs the store first.
    */
   private async persist(state: LedgerState, opts: { afterCommittedState?: boolean } = {}): Promise<void> {
     try {
       if (opts.afterCommittedState) this.store?.sync();
-      await writeLedgerFile(this.path, state.doc);
+      await writeLedgerFile(this.path, state.doc, this.onUnsyncedWrite);
     } catch (error) {
-      this.state = null;
-      try {
-        this.loaded();
-      } catch { /* unread: the next read tries again */ }
+      this.forget();
       throw error;
     }
   }
@@ -1188,14 +1188,13 @@ function owe(entry: LedgerEntry, moment: number): void {
  * on the wire (recoverAtStartup) are recorded. Returns whether that ended
  * what is owed.
  */
-function recordUnanswered(entry: LedgerEntry, error: string | undefined): boolean {
+function recordUnanswered(entry: LedgerEntry): boolean {
   const sent = entry.sending!;
   delete entry.sending;
   const mayLand = entry.mayLand ?? [];
   if (!mayLand.includes(sent.action)) mayLand.push(sent.action);
   entry.mayLand = mayLand;
   entry.confirmed = 'unknown';
-  if (error !== undefined) entry.lastError = error;
   return countAttempt(entry, sent.due, false);
 }
 
@@ -1248,10 +1247,6 @@ function owedRequests(state: LedgerState, serverId?: string): DiscordAwarenessRe
 }
 
 /** Requests a batch's activation made owed that are still owed. */
-function owedBy(state: LedgerState, batchId: string): number {
-  return state.doc.entries.filter((entry) => entry.due !== null && entry.wantedBy.includes(batchId)).length;
-}
-
 function emptyCounts(): Record<DiscordAwarenessReactionState, number> {
   return { queued: 0, sending: 0, present: 0, absent: 0, unknown: 0, failed: 0, untouched: 0 };
 }
@@ -1271,6 +1266,15 @@ function isPendingSuppression(batch: DiscordAwarenessBatch): boolean {
 
 function errorText(error: unknown): string {
   return boundDiscordAwarenessText(error instanceof Error ? error.message : String(error));
+}
+
+/** What becomes of a batch left prepared after its surgery's body landed:
+ *  none of its marks is ever sent. */
+function leftPrepared(batch?: DiscordAwarenessBatch): string {
+  if (!batch) return 'it stays prepared, and a start that can read the ledger retires it, none of its marks sent';
+  return batch.suppressionIntervals?.length
+    ? `it stays prepared, and the first start on ${batch.targetBranch} finds its removals applied and retires it, none of its marks sent`
+    : 'it stays prepared, and the next start retires it, none of its marks sent';
 }
 
 // ---------------------------------------------------------------------------
@@ -1325,7 +1329,7 @@ function readLedger(path: string):
     );
   }
   throw new Error(
-    `Discord awareness ledger ${path} is ${version === undefined ? 'of no version' : `version ${String(version)}`}, ` +
+    `Discord awareness ledger ${path} is ${version === undefined ? 'of no version' : `version ${JSON.stringify(version)}`}, ` +
       'which this build can\'t read: it reads versions 2 and 3',
   );
 }
@@ -1343,11 +1347,19 @@ function indexed(doc: LedgerDocument): LedgerState {
  * Write the document: compact JSON to a temporary file beside the ledger,
  * synced, renamed over it, then its directory synced, for the ledger's entry
  * in it, and that directory's parent, for the directory's own entry, which
- * is new when a write, this one or an earlier one, had to make it, as the
- * framework's writeRecoveryFile does. Serialized before the first await, so
- * the text is the document as the act left it.
+ * is new when a write, this one or an earlier one, had to make it. This is
+ * the framework's writeRecoveryFile rule. A failure before the rename removes
+ * the temporary file and throws, leaving the ledger as it was. A directory
+ * that can't be synced after it is reported, and the write stands: the new
+ * ledger is in place, though an operating system crash could lose it.
+ * Serialized before the first await, so the text is the document as the act
+ * left it.
  */
-async function writeLedgerFile(path: string, doc: LedgerDocument): Promise<void> {
+async function writeLedgerFile(
+  path: string,
+  doc: LedgerDocument,
+  onUnsynced: (directory: string, error: unknown) => void,
+): Promise<void> {
   const text = `${JSON.stringify(doc)}\n`;
   const directory = dirname(path);
   await mkdir(directory, { recursive: true });
@@ -1365,18 +1377,21 @@ async function writeLedgerFile(path: string, doc: LedgerDocument): Promise<void>
     await unlink(temporary).catch(() => undefined);
     throw error;
   }
-  await syncDirectory(directory);
-  await syncDirectory(dirname(directory));
+  for (const synced of [directory, dirname(directory)]) {
+    try {
+      await syncDirectory(synced);
+    } catch (error) {
+      onUnsynced(synced, error);
+    }
+  }
 }
 
 /**
- * Sync a directory, so its entries reach the disk. As in the framework's
- * syncRecoveryDirectory, there's none on win32, where a directory can't be
+ * Sync a directory, so its entries reach the disk, as the framework's
+ * syncRecoveryDirectory does: not on win32, where a directory can't be
  * opened, and a sync refused with EINVAL or EBADF, the answer where the
  * filesystem can't sync a directory, is let go, since it would come again on
- * every write. Any other failure fails the write it belongs to, where
- * syncRecoveryDirectory raises an alert instead: the act then reports from
- * what the file holds, as a write that didn't complete.
+ * every write. Any other failure throws, for the write to report.
  */
 async function syncDirectory(directory: string): Promise<void> {
   if (process.platform === 'win32') return;
@@ -1389,6 +1404,12 @@ async function syncDirectory(directory: string): Promise<void> {
   } finally {
     await handle.close();
   }
+}
+
+/** The report of a directory that couldn't be synced, in the words of the
+ *  framework's recovery-sync alert. */
+export function unsyncedWriteText(directory: string, path: string, error: unknown): string {
+  return `syncing ${directory} failed, so ${path} may not survive a crash: ${errorText(error)}`;
 }
 
 const isString = (value: unknown): value is string => typeof value === 'string';
@@ -1429,8 +1450,7 @@ function isLedgerDocument(value: unknown): value is LedgerDocument {
       && isOptional(entry.sending, (sending) => isRecord(sending) && isAction(sending.action) && isNumber(sending.due))
       && isOptional(entry.confirmed, (confirmed) => confirmed === 'present' || confirmed === 'absent' || confirmed === 'unknown')
       && isOptional(entry.mayLand, (mayLand) => Array.isArray(mayLand) && mayLand.every(isAction))
-      && isOptional(entry.failed, (failed) => typeof failed === 'boolean')
-      && isOptional(entry.lastError, isString));
+      && isOptional(entry.failed, (failed) => typeof failed === 'boolean'));
 }
 
 // ---------------------------------------------------------------------------
@@ -1499,7 +1519,8 @@ function isLegacyEntry(value: unknown): boolean {
  * scope `legacy`, and keep, of what the old ledger recorded about each ref's
  * attempts, only how many refs the last attempt saw added (`legacyAdded`):
  * never a judgment about what is on Discord. No entries are made: a retract
- * of a batch, or of `all`, reaches its refs. The work the old ledger had
+ * of a batch reaches its refs, and one of `all` the refs of every batch it
+ * activated, the only ones 0.22.x marked. The work the old ledger had
  * still to do (its pending adds and removals, and every mark of a batch it
  * never activated) is dropped, none of it sent, and returned in `unsent`:
  * it was queued before marks were an explicit choice, so nobody chose it. A
@@ -1538,12 +1559,17 @@ function migrateLedger(
       // writer cleared it on success and set it on failure, and nothing else
       // touched it. `deliveryStatus` was its reconciliation state, rewritten
       // by branch switches without any request.
-      legacyAdded: raw.refs
-        .filter((entry) => !!entry.attempts && entry.lastAction === 'add' && entry.lastError === undefined).length,
+      legacyAdded: new Set(raw.refs
+        .filter((entry) => !!entry.attempts && entry.lastAction === 'add' && entry.lastError === undefined)
+        .map((entry) => refKey(entry))).size,
     });
     let adds = 0;
     let removals = 0;
+    const counted = new Set<string>();
     for (const entry of raw.refs) {
+      // A ref listed twice is one ref.
+      if (counted.has(refKey(entry))) continue;
+      counted.add(refKey(entry));
       // What 0.22.x had still to do for this ref, dropped here.
       if ((!legacyActive || entry.deliveryStatus === 'pending') && (!legacyActive || entry.desired || entry.markerPresent)) {
         if (entry.desired || !legacyActive) adds++;
@@ -1577,8 +1603,16 @@ function dedupeRefs(refs: DiscordAwarenessRef[]): DiscordAwarenessRef[] {
   return [...deduped.values()];
 }
 
+/** The Discord channel id a ref's channel names: its last part, when it's
+ *  spelled `discord:<guild>:<channel>`. Delivery sends it, and keys use it. */
+export function discordChannelOf(channelId: string): string {
+  return channelId.startsWith('discord:') ? channelId.split(':').at(-1)! : channelId;
+}
+
+/** A ref's key, by its channel's Discord id, so one channel spelled two ways
+ *  is one channel. */
 function refKey(ref: DiscordAwarenessRef): string {
-  return `${ref.serverId}\0${ref.channelId}\0${ref.messageId}`;
+  return `${ref.serverId}\0${discordChannelOf(ref.channelId)}\0${ref.messageId}`;
 }
 
 function markKey(ref: DiscordAwarenessRef, emoji: string): string {

@@ -18,21 +18,26 @@
     framework with an app-owned `store` and no `storePath` has no awareness
     ledger unless `discordAwarenessOutboxPath` names one, and refuses a marks
     choice (`invalid`) rather than place none.
+  - **Receipts (`markers`):** their `status` is `none`, `queued` or
+    `not-scheduled`. `unresolved` is gone: a batch that can be neither
+    activated nor retired stays prepared, and a start retires it, none of
+    its marks sent, so it is `not-scheduled`, whose `error` says so.
+    Receipts now also carry `scope`, `unmarked` and `notRemoved`.
   - **Unchanged:** the body change itself (fork, switch, redaction), the
-    receipt's `status` values, the emoji (`discordAwarenessEmoji`) and the
-    reaction deadline (`discordAwarenessDeadlineMs`). Marks already on Discord
-    are left alone. Receipts (`markers`) now also carry `scope`, `unmarked`
-    and `notRemoved`.
+    emoji (`discordAwarenessEmoji`) and the reaction deadline
+    (`discordAwarenessDeadlineMs`). Marks already on Discord are left
+    alone.
   - discord-mcpl 0.3.0's `/hide` reacts 💤 to every message in `hiddenRefs`
     itself, whatever this framework does: those marks are its own, outside
     the ledger.
 - **Code using `DiscordAwarenessOutbox` directly:** the ledger is version 3,
   a table with one entry per reaction. The constructor takes the path and,
   for the sync before a write that activates, completes or retires a batch,
-  the store: `new DiscordAwarenessOutbox(path, { store? })`. Every call that
+  the store, with a callback told of a directory a write couldn't sync:
+  `new DiscordAwarenessOutbox(path, { store?, onUnsyncedWrite? })`. Every call that
   writes is async and resolves once its write is on disk; the views
-  (`view()`, `batches()`, `due()`, `batchStatus()` and
-  `pendingSuppressionsFor()`) read memory. `pending()`,
+  (`view()`, `batches()`, `due()` and `pendingSuppressionsFor()`) read
+  memory. `pending()`,
   `reconcileForBranch()`, `activatePreparedForBranch()`,
   `preparedSuppressionsForBranch()`, `recordSuccess()`, `recordFailure()`
   and `acknowledge()` are gone. Use `claim()` and `recordOutcome()`,

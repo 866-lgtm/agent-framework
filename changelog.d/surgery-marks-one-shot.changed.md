@@ -19,10 +19,12 @@
   completed suppression or a retired batch) now syncs the store first.
   Previously a crash could keep marks active for a rollback the store had
   lost. Every ledger write is now durable too: the file is synced before it
-  replaces the ledger, and the directory after. Previously an operating
-  system crash or a power failure could lose a write the host had already
-  acted on. Writes leave the event loop free while the disk works: only
-  serializing the ledger runs on it.
+  replaces the ledger, and its directory and that directory's parent after,
+  as the framework's recovery files are. Previously an operating system
+  crash or a power failure could lose a write the host had already acted
+  on. A directory that can't be synced raises the `recovery-sync` ops alert,
+  and the write stands. Writes leave the event loop free while the disk
+  works: only serializing the ledger runs on it.
 - Awareness delivery no longer holds MCPL traffic. Previously every MCPL
   data plane waited at startup, at reconnect, at a runtime
   `connectMcplServer` or `restartMcplServer`, at a tools list change, at

@@ -241,7 +241,7 @@ For old stores whose messages lack `metadata.serverId`, supply
 normal agent host must be stopped while this command has the Chronicle store
 open.
 
-For stdio MCPL children, the framework defaults `DISCORD_SUPPRESSED_REACTIONS_BASELINE` to the reactions it places: its refusal markers, the Discord adapter's default awareness marker, the configured awareness marker, and every retained outbox emoji. This covers later removals and replays after a configuration change. Suppression is by emoji, so members' own reactions with those emoji stop reaching the agent too. The default is derived at each spawn of a child (its first connect, each automatic reconnect, a restart), so the next child spawned gets the markers retained since the last spawn. When the awareness ledger exists but can't be read, a runtime connect reads it first and refuses before anything is registered or spawned (a startup connect, whose routing is staged beforehand, before anything spawns), and a restart refuses before it stops the running child. An automatic reconnect of a child that takes the default fails and retries rather than spawn it without the default. A value with tokens in the server's env (case-insensitive on Windows), or one intentionally inherited with `inheritEnv: true`, takes precedence, and the framework logs that it replaces the default. A value with no tokens, as discord-mcpl's parser reads them, counts as unset, since the adapter would read it as suppression off. The parser splits on commas and keeps a token only when its normalizer leaves something of it, after stripping U+FE0F, trimming, and stripping one leading and one trailing colon: so a blank value, commas alone, `:`, `::` or a lone U+FE0F (say from `${A},${B}` or `:${NAME}:` with the variables empty) has no tokens. The adapter's filters file and legacy operator env still take precedence over this variable, and they are where an operator turns suppression off.
+For stdio MCPL children, the framework defaults `DISCORD_SUPPRESSED_REACTIONS_BASELINE` to the reactions it places: its refusal markers, the Discord adapter's default awareness marker, the configured awareness marker, and every retained outbox emoji. This covers later removals and replays after a configuration change. Suppression is by emoji, so members' own reactions with those emoji stop reaching the agent too. The default is derived at each spawn of a child (its first connect, each automatic reconnect, a restart), so the next child spawned gets the markers retained since the last spawn. The ledger is read once and held, and read from its file again only after a write to it failed. When it can't be read, a runtime connect of a child that takes the default refuses before anything is registered or spawned (a startup connect, whose routing is staged beforehand, before anything spawns), and a restart of one refuses before it stops the running child; a child with a baseline of its own, and a WebSocket server, connect and restart whatever the ledger's state. An automatic reconnect of a child that takes the default fails and retries rather than spawn it without the default. A value with tokens in the server's env (case-insensitive on Windows), or one intentionally inherited with `inheritEnv: true`, takes precedence, and the framework logs that it replaces the default. A value with no tokens, as discord-mcpl's parser reads them, counts as unset, since the adapter would read it as suppression off. The parser splits on commas and keeps a token only when its normalizer leaves something of it, after stripping U+FE0F, trimming, and stripping one leading and one trailing colon: so a blank value, commas alone, `:`, `::` or a lone U+FE0F (say from `${A},${B}` or `:${NAME}:` with the variables empty) has no tokens. The adapter's filters file and legacy operator env still take precedence over this variable, and they are where an operator turns suppression off.
 
 `framework.getPlacedReactionBaseline()` returns a fresh snapshot of that default for other embeddings, including separately managed WebSocket adapters. It returns suppression tokens, with a custom emoji as its bare ID, not marker payloads for adding, removing or replaying a reaction. An unreadable awareness ledger throws instead of producing a partial snapshot. Hosts that previously supplied a refusal-only default must stop supplying it to adopt this framework-derived default; an explicit operator choice should remain intact.
 
@@ -483,7 +483,7 @@ const result = await framework.rollbackToMessage('cairn', {
   messageId,
   marks: { scope: 'addressed', refs: preview.scopes.addressed.refs },
 });
-// result.markers: { status: 'none' | 'queued' | 'not-scheduled' | 'unresolved', ... }
+// result.markers: { status: 'none' | 'queued' | 'not-scheduled', ... }
 ```
 
 - **`marks`** is `'none'` (the default), or `{ scope: 'addressed' | 'all', refs? }`.
@@ -494,12 +494,10 @@ const result = await framework.rollbackToMessage('cairn', {
   choice is recorded in the operator log.
 - **The surgery returns once marks are scheduled**, never after Discord has
   accepted them. `result.markers` says whether they were scheduled (`queued`
-  with a count and batch id), not chosen or not in scope (`none`), not to be
-  delivered because recording the batch failed after the body change and it
-  was retired or never recorded (`not-scheduled`), or `unresolved` (neither
-  activation nor retirement could be recorded, or the ledger could not be
-  read back to say whether the batch was; it names a batch the next start
-  may still deliver). Every receipt also counts the removed messages left
+  with a count and batch id), not chosen or not in scope (`none`), or not to
+  be delivered because recording the batch as active failed after the body
+  change (`not-scheduled`, whose `error` says why, and whether the batch was
+  retired or stays prepared for a start to retire). Every receipt also counts the removed messages left
   unmarked. Marker bookkeeping never fails or undoes an applied rollback or
   suppression; a batch that can't be recorded before the body change stops
   the surgery before anything changes (`failed`).
@@ -516,7 +514,12 @@ const result = await framework.rollbackToMessage('cairn', {
   is missing, or the message takes no more reactions); a pass that gives up
   on marks raises one `discord-awareness-delivery` ops alert, and so does a
   start whose reconciliation gives up on any. A JSON-RPC error answer, which
-  may come after the server acted, counts as unanswered.
+  may come after the server acted, counts as unanswered, unless it is such a
+  refusal. A mark whose request failed in a way a retry could change is sent
+  again by the next delivery pass: after a surgery, a retract, a start, a
+  connect or reconnect of its route, a tools-list change, or an operator's
+  sync, and a trigger that meets a pass already running has that pass try
+  it once more before it ends.
 - **Marks are one-shot.** Switching branches, a turn undo, a redo and
   restarts never request a mark or a removal of their own: what goes out is what a surgery
   (the marks chosen for it) or a retract recorded, and a start's delivery
@@ -533,11 +536,17 @@ const result = await framework.rollbackToMessage('cairn', {
   later. Between opposite wishes for one reaction, the later act wins: a
   surgery's marks carry the moment of its choice, even when activation comes
   later, so a retract made in between prevails, and cancelling it revives
-  nothing. A write that activates, completes or retires a batch syncs the
-  store first, so it never outlives the change it certifies. A ledger that
-  can't be read, or holds a version this build doesn't read, stops a start;
-  in a running host, nothing is sent while it can't be read, the delivery
-  alert says so, and the controls refuse.
+  nothing. A write goes to a temporary file renamed over the ledger, synced
+  with its directory and that directory's parent, as the framework's own
+  recovery files are: one that fails leaves the ledger as it was, and a
+  directory that can't be synced after the rename raises the `recovery-sync`
+  ops alert while the write stands. A write that activates, completes or
+  retires a batch syncs the store first, so it never outlives the change it
+  certifies. A ledger that can't be read, or holds a version this build
+  doesn't read, stops a start. A running host holds the ledger in memory and
+  reads the file again only after a write failed; while it then can't be
+  read, nothing is sent, the delivery alert says so, and the controls
+  refuse.
 - **A start never activates a surgery's marks.** A batch an interrupted
   surgery left prepared is retired at the next start, none of its marks
   sent. One that had marks to apply raises a `discord-awareness-not-scheduled` ops alert that names the

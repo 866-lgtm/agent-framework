@@ -297,27 +297,17 @@ export async function createOfflineRecoveryBranch(
             await outbox.discard(batch.id);
             retire = `; awareness batch ${batch.id} retired, none of its marks sent${redo}`;
           } catch (discardError) {
-            // None of its marks is ever sent: a start retires it. A
-            // suppression's removals stay pending for its target branch: a
-            // start on a branch with that name finishes them. A retirement
-            // can reach the file before its write fails, so what the ledger
-            // holds decides, as in the host's retireAfterRestore.
+            // None of its marks is ever sent: a start retires it. A write that
+            // fails leaves the batch as it was, prepared, as in the host's
+            // retireAfterRestore. A suppression's removals stay pending for
+            // its target branch: a start on a branch with that name finishes
+            // them.
             const detail = boundDiscordAwarenessText(
               discardError instanceof Error ? discardError.message : String(discardError),
             );
-            let landed: boolean | undefined;
-            try {
-              landed = outbox.batchStatus(batch.id) === 'retired';
-            } catch { /* unknown */ }
-            const kept = `; awareness batch ${batch.id} could not be retired (${detail})` + (landed === undefined
-              ? ', and the ledger can\'t be read back to tell whether its retirement landed; if it didn\'t, it stays '
-              : '; it stays ') + 'prepared, none of its marks to be sent';
-            if (landed) {
-              retire = `; awareness batch ${batch.id} is retired, none of its marks sent, but writing that didn't ` +
-                `complete (${detail}): an operating system crash or a power failure before the ledger's next write ` +
-                'could lose it, and the batch would then be prepared again at the next ' +
-                `start${suppression.intervals.length > 0 ? `, its removals pending for ${targetBranch}` : ''}${redo}`;
-            } else if (suppression.intervals.length === 0) {
+            const kept = `; awareness batch ${batch.id} could not be retired (${detail}); it stays prepared, none of ` +
+              'its marks to be sent';
+            if (suppression.intervals.length === 0) {
               retire = `${kept}, until the next start retires it${redo}`;
             } else {
               let forked = true;
@@ -357,32 +347,13 @@ export async function createOfflineRecoveryBranch(
     if (batch) {
       const settled = await outbox.settleActivation(batch.id);
       if (batch.refs.length > 0) {
-        // A queued settlement's error: recorded, so delivered, but writing
-        // it didn't complete, as the host's receipt says too.
         markers = settled.status === 'queued'
-          ? {
-            ...facts, status: 'queued', queued: settled.queued, batchId: batch.id,
-            ...(settled.error === undefined ? {} : { error: settled.error }),
-          }
-          : settled.status === 'not-scheduled'
-            ? { ...facts, status: 'not-scheduled', queued: 0, error: settled.error }
-            : { ...facts, status: 'unresolved', queued: 0, batchId: batch.id, error: settled.error };
-      } else if (settled.status === 'queued') {
+          ? { ...facts, status: 'queued', queued: settled.queued, batchId: batch.id }
+          : { ...facts, status: 'not-scheduled', queued: 0, error: settled.error };
+      } else if (settled.status === 'not-scheduled') {
         // A suppression-only batch carries no marks, and its activation
-        // closes the body's resume record: say if writing that didn't complete.
-        if (settled.error !== undefined) {
-          suppressionRecord = `the resume record (awareness batch ${batch.id}, no marks) is closed, but writing ` +
-            `that didn't complete (${settled.error}): an operating system crash or a power failure before the ` +
-            `ledger's next write could lose it, and a start on ${targetBranch} then finds its removals applied and ` +
-            'closes it';
-        }
-      } else {
-        // If closing it failed, say what's left.
-        suppressionRecord = `the resume record (awareness batch ${batch.id}, no marks) could not be closed ` +
-          `(${settled.error}); ` + (settled.status === 'not-scheduled'
-            ? 'it was retired instead, so nothing is left to resume'
-            : 'it stays prepared, unless the ledger couldn\'t be read back and its closing reached it anyway; ' +
-              `if it stays prepared, a start on ${targetBranch} finds its removals applied and closes it`);
+        // closes the body's resume record: if that failed, say what became of it.
+        suppressionRecord = `the resume record (awareness batch ${batch.id}, no marks) could not be closed: ${settled.error}`;
       }
     }
     return { ...result, discordMarkersQueued: markers.queued, markers, ...(suppressionRecord ? { suppressionRecord } : {}) };

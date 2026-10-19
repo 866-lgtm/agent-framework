@@ -124,6 +124,8 @@ test('startup does not wait for queued marks, and channel traffic flows while th
     await waitFor('the queued add to reach the server', () => jsonl(paths.calls).length >= 1);
     await waitFor('the channel traffic to be answered', () =>
       jsonl(paths.events).some((event) => event.event === 'probe-answered'));
+    assert.deepEqual(jsonl(paths.events).filter((event) => event.event === 'probe-answered').map((event) => event.error), [null],
+      'answered, not refused');
     assert.equal(
       jsonl(paths.events).filter((event) => event.event === 'reaction-answered').length,
       0,
@@ -138,15 +140,40 @@ test('startup does not wait for queued marks, and channel traffic flows while th
   }
 });
 
-test('the mandatory awareness deadline still bounds a hung reaction with requestTimeoutMs: 0', async () => {
+test("an operator's sync that meets a running pass has it try once more what it already tried", async () => {
   const { dir, entry, paths, queueMarks, config } = setup();
+  let framework: AgentFramework | undefined;
+  try {
+    await queueMarks(['m1', 'm2']);
+    // Every reaction is held, so each goes unanswered at the 300 ms deadline.
+    framework = await AgentFramework.create(config({ awarenessDeadlineMs: 300 }));
+    // The start's pass sends m1, which goes unanswered, then m2.
+    await waitFor('the pass to send m1 and then m2', () => jsonl(paths.calls).length >= 2);
+    assert.equal(entry('m1')!.attempts, 1, 'm1 went unanswered once, and is owed again');
+    // The sync joins the pass while m2 is on the wire.
+    await framework.syncDiscordAwarenessMarkers();
+    const sent = jsonl(paths.calls).map((call) => (call.args as { messageId: string }).messageId);
+    assert.deepEqual(sent, ['m1', 'm2', 'm1', 'm2'], 'the pass tried each once more before the sync returned');
+    assert.deepEqual([entry('m1')!.attempts, entry('m2')!.attempts], [2, 2]);
+  } finally {
+    writeFileSync(paths.hold, '1');
+    await framework?.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the mandatory awareness deadline still bounds a hung reaction with requestTimeoutMs: 0', async (t) => {
+  const { dir, entry, paths, queueMarks, config } = setup();
+  const logged: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
   let framework: AgentFramework | undefined;
   try {
     await queueMarks(['m1']);
     framework = await AgentFramework.create(config({ requestTimeoutMs: 0, awarenessDeadlineMs: 150 }));
     await waitFor('the hung add to be recorded unanswered', () => entry('m1')?.confirmed === 'unknown');
     assert.deepEqual(entry('m1')!.mayLand, ['add']);
-    assert.match(entry('m1')!.lastError ?? '', /didn't answer within/);
+    assert.ok(logged.some((line) => line.startsWith('[discord-awareness] add discord:g1:c1/m1: unknown') && /didn't answer within/.test(line)),
+      logged.join('\n'));
   } finally {
     writeFileSync(paths.hold, '1');
     await framework?.stop();

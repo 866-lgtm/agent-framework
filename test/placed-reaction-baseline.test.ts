@@ -323,7 +323,8 @@ describe('placed-reaction baseline', () => {
     const failures: string[] = [];
     connection.on('reconnect-failed', ({ error }) => { failures.push(error); });
     breakLedger(fw);
-    // Each spawn reads the ledger for the child's default, so a reconnect
+    // Each spawn derives the child's default from the ledger, which, with its
+    // document dropped (breakLedger), is read from the file, so a reconnect
     // fails there, and its failure is recorded with the same configuration.
     await connection.sendToolsCall('crash', {}).catch(() => {});
     const waitFor = async (condition: () => boolean, what: string): Promise<void> => {

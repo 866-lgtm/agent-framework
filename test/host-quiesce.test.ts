@@ -1,9 +1,7 @@
 /**
  * Host quiesce/maintenance mode (issue #122) — deterministic state-machine
  * coverage, plus an end-to-end MCPL leg with a child server and crash cases
- * whose crash a child process stages (both below). How a reconnect and a
- * runtime connect hold and open their planes across a quiesce is covered by
- * the mcpl-reconnect-registration and mcpl-reconnect-events suites.
+ * whose crash a child process stages (both below).
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
