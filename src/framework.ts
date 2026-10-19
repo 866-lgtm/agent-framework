@@ -298,6 +298,23 @@ const isConversationalInjection = (metadata?: MessageMetadata): boolean => {
 };
 
 /**
+ * Where a module's process response holds content context-manager won't
+ * store, in a message it adds or an edit it makes, in the words of the
+ * store's own refusal; null when it holds none.
+ */
+function malformedResponseContent(response: EventResponse): string | null {
+  const writes = [
+    ...(response.addMessages ?? []).map((msg, i) => [`addMessages[${i}]`, msg.content] as const),
+    ...(response.editMessages ?? []).map((edit, i) => [`editMessages[${i}]`, edit.content] as const),
+  ];
+  for (const [where, content] of writes) {
+    const places = malformedContentPlaces(content);
+    if (places.length > 0) return new MalformedContentError(`${where} refused`, places).message;
+  }
+  return null;
+}
+
+/**
  * Rough token estimate for the blocks a continuation round is about to
  * append to the live wire (issue #92 physical-window projection): the
  * spilled tool-result strings at chars/4, a flat per-image cost for native
@@ -11225,20 +11242,29 @@ export class AgentFramework {
       }
     }
 
+    // A response holding content context-manager won't store, in a message
+    // it adds or an edit it makes, is refused whole before any response is
+    // applied: none of it is applied, its module state update and inference
+    // request included, so no turn runs for content that was never stored,
+    // and it doesn't count as accepting a surface's input. A line names the
+    // module, and the other modules' responses apply.
+    const applying = responses.filter(({ moduleName, response }) => {
+      const refusal = malformedResponseContent(response);
+      if (refusal !== null) {
+        console.error(`[process-response-refused] module=${moduleName} event=${event.type} reason=malformed-content: ${logDetail(refusal)}`);
+      }
+      return refusal === null;
+    });
+
     // Apply responses. Console/API input is conversation from a non-channel
     // surface: one acceptance per event, whose envelope every message the
     // modules add for it carries.
     const surface = this.surfaceSourceFor(event);
-    if (surface && responses.some(({ response }) => (response.addMessages?.length ?? 0) > 0)) {
+    if (surface && applying.some(({ response }) => (response.addMessages?.length ?? 0) > 0)) {
       this.noteInboundAccepted(surface);
     }
-    for (const { moduleName, response } of responses) {
-      try {
-        await this.applyProcessResponse(response, event, moduleName, surface);
-      } catch (error) {
-        if (!(error instanceof MalformedContentError)) throw error;
-        console.error(`[process-response-refused] module=${moduleName} event=${event.type} reason=malformed-content: ${logDetail(error.message)}`);
-      }
+    for (const { moduleName, response } of applying) {
+      await this.applyProcessResponse(response, event, moduleName, surface);
     }
 
     // Handle tool calls specially
@@ -11264,15 +11290,6 @@ export class AgentFramework {
     /** The event's surface envelope, when it is console/API input. */
     surface?: InboundSource,
   ): Promise<void> {
-    // A response with a message context-manager won't store is refused whole,
-    // before any of it is applied: none of its messages is added and its
-    // inference request isn't queued, so nothing runs a turn for content that
-    // was never stored. The caller logs it and goes on with the other
-    // modules' responses.
-    for (const [i, msg] of (response.addMessages ?? []).entries()) {
-      const malformed = malformedContentPlaces(msg.content);
-      if (malformed.length > 0) throw new MalformedContentError(`addMessages[${i}] refused`, malformed);
-    }
     // Add messages. Only the framework writes the inbound envelope: one a
     // module's metadata carries (echoed from a server's event, say) is
     // dropped, and a surface event's messages carry the framework's own.

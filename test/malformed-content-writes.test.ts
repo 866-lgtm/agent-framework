@@ -24,11 +24,13 @@ const text = (t: string): ContentBlock[] => [{ type: 'text', text: t } as Conten
 const MALFORMED = [{ type: 'text', text: 5 }] as unknown as ContentBlock[];
 
 /** A module with one tool, `act`, that runs `during` while the turn waits
- *  for it, and that answers a `ping` with `onPing`'s response. */
+ *  for it, and that answers an external message with `onExternal`'s response
+ *  and a `ping` with `onPing`'s. */
 class Writer implements Module {
   readonly name: string;
   ctx!: ModuleContext;
   during: (() => void) | null = null;
+  onExternal: EventResponse = { addMessages: [{ participant: 'Antra', content: text('go') }], requestInference: true };
   onPing: EventResponse = {};
   constructor(name = 'writer') { this.name = name; }
   async start(ctx: ModuleContext): Promise<void> { this.ctx = ctx; }
@@ -43,7 +45,7 @@ class Writer implements Module {
     return { success: true, data: { ok: true } };
   }
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
-    if (event.type === 'external-message') return { addMessages: [{ participant: 'Antra', content: text('go') }], requestInference: true };
+    if (event.type === 'external-message') return this.onExternal;
     if ((event as { type: string }).type === 'ping') return this.onPing;
     return {};
   }
@@ -131,17 +133,41 @@ test("an edit of a held write to malformed content throws and leaves the write a
   assert.equal(window.at(-1), 'assistant: Done.', 'and the turn went on past its tool boundary');
 });
 
-test("a process response with a malformed message is refused whole, queueing no inference, and other modules' responses still apply", async (t) => {
+test("a process response with a malformed message or edit is refused whole, queueing no inference, and other modules' responses still apply", async (t) => {
   const bad = new Writer('bad');
+  const badEdit = new Writer('bad-edit');
   const good = new Writer('good');
   bad.onPing = { addMessages: [{ participant: 'Antra', content: text('first') }, { participant: 'Antra', content: MALFORMED }], requestInference: true };
+  badEdit.onPing = { addMessages: [{ participant: 'Edit', content: text('before the edit') }], editMessages: [{ messageId: 'm-any', content: MALFORMED }] };
   good.onPing = { addMessages: [{ participant: 'Good', content: text('from good') }] };
-  const x = await harness([bad, good]); t.after(x.close);
+  const x = await harness([bad, badEdit, good]); t.after(x.close);
   x.framework.pushEvent({ type: 'ping', source: 'test' } as unknown as ProcessEvent);
   await x.framework.runUntilIdle();
   const window = x.window();
   assert.ok(!window.includes('Antra: first'), `none of the refused response's messages was added:\n${window.join('\n')}`);
+  assert.ok(!window.includes('Edit: before the edit'), 'nor of the one whose edit is refused');
   assert.ok(window.includes('Good: from good'), 'the other module\'s response was applied');
   assert.equal(x.membrane.calls.length, 0, 'no inference ran');
-  assert.ok(x.errors.some((e) => e.startsWith('[process-response-refused] module=bad event=ping reason=malformed-content: ') && e.includes('addMessages[1]')), x.errors.join('\n'));
+  const refused = (module: string, where: string) => x.errors.some((e) =>
+    e.startsWith(`[process-response-refused] module=${module} event=ping reason=malformed-content: `) && e.includes(where));
+  assert.ok(refused('bad', 'addMessages[1]'), x.errors.join('\n'));
+  assert.ok(refused('bad-edit', 'editMessages[0]'), x.errors.join('\n'));
+});
+
+test("console input whose only message is refused isn't counted as accepted", async (t) => {
+  const writer = new Writer();
+  const x = await harness([writer]); t.after(x.close);
+  const accepted: unknown[] = [];
+  (x.framework as unknown as { inboundAcceptanceObserver: unknown }).inboundAcceptanceObserver = {
+    inboundAccepted: (source: unknown) => accepted.push(source),
+  };
+  writer.onExternal = { addMessages: [{ participant: 'user', content: text('hello') }] };
+  x.framework.pushEvent({ type: 'external-message', source: 'tui', content: 'hello', metadata: {} } as unknown as ProcessEvent);
+  await x.framework.runUntilIdle();
+  assert.equal(accepted.length, 1, 'input a module turns into a message is accepted');
+  writer.onExternal = { addMessages: [{ participant: 'user', content: MALFORMED }] };
+  x.framework.pushEvent({ type: 'external-message', source: 'tui', content: 'hello', metadata: {} } as unknown as ProcessEvent);
+  await x.framework.runUntilIdle();
+  assert.equal(accepted.length, 1, 'input whose message is refused is not');
+  assert.ok(x.errors.some((e) => e.startsWith('[process-response-refused] module=writer event=external-message')), x.errors.join('\n'));
 });
