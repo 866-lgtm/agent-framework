@@ -28,9 +28,11 @@ import { confirmAbsent, fingerprintVouches, filesystemTrustsCtime, fsTypeTrustsC
 import { EffectFailed, syncDirectories, unlinkContained, writeContained } from '../src/modules/workspace/effects.js';
 import { pushPaths, settleAdoptionBeforeMutation } from '../src/modules/workspace/reconcile.js';
 import type { MountConfig, WorkspaceConfig } from '../src/modules/workspace/types.js';
+import type { FsChange } from '../src/modules/workspace/watcher.js';
 import type { ModuleContext } from '../src/types/module.js';
 import type { ProcessEvent } from '../src/types/events.js';
 import { changedAfterFstat, withFileHandle } from './helpers/file-handle.js';
+import { changesFlow, isProbe } from './helpers/watcher-flow.js';
 
 const FAULT_FIXTURE = join(import.meta.dirname, 'fixtures/workspace-fault.mjs');
 const TREE = 'workspace/work/tree';
@@ -732,6 +734,24 @@ async function until(ok: () => boolean, what: string, ms = 5000): Promise<void> 
   assert.fail(what);
 }
 
+/**
+ * Waits until each named mount's watcher hands `m` a change, so what a test
+ * writes there next is written while changes are delivered: ready says
+ * chokidar's first scan is done, not that the platform delivers events
+ * (changesFlow). Its probes land in each mount's root, where the mount takes
+ * them in, so a test's results leave them out (isProbe).
+ */
+async function watchersFlow(m: WorkspaceModule, roots: Record<string, string>): Promise<void> {
+  const heard = new Map(Object.keys(roots).map((name) => [name, [] as FsChange[][]]));
+  const internals = m as unknown as { handleFsChanges(mount: string, changes: FsChange[]): Promise<void> };
+  const handle = internals.handleFsChanges.bind(m);
+  internals.handleFsChanges = (mount, changes) => {
+    heard.get(mount)?.push(changes);
+    return handle(mount, changes);
+  };
+  for (const [name, root] of Object.entries(roots)) await changesFlow(root, heard.get(name)!, []);
+}
+
 describe("editors' swap and backup files are passed over by name (connectome-host #278)", () => {
 
   test('a sync without a path passes over them by their own whole name, wherever they are, and counts them', async (t) => {
@@ -1025,6 +1045,7 @@ describe('a mount nested inside another', () => {
     const deepTree = () => env.store.treeList('workspace/deep/tree').map((e: { path: string }) => e.path).sort();
     await until(() => !!mount.watcherReadyAt && !!deep.watcherReadyAt && tree().includes('top.txt') && deepTree().includes('inner.txt'),
       'both watchers are ready and their catch-up scans ran');
+    await watchersFlow(m, { work: env.dir, deep: env.disk('a/b') });
     // The inner mount takes its new file in, so the change has reached the
     // watchers; the outer mount's own new file, written after it, is taken
     // in after that. (MountWatcher's own test pins the outer watcher's filter.)
@@ -1032,7 +1053,8 @@ describe('a mount nested inside another', () => {
     await until(() => deepTree().includes('new.txt'), 'the inner mount takes its new file in');
     env.writeDisk('later.txt', 'outer');
     await until(() => tree().includes('later.txt'), 'the outer mount takes its own new file in');
-    assert.deepEqual(tree(), ['later.txt', 'top.txt']);
+    // The handshake's probe in the outer mount's root is its own; one beneath a/b would be the inner mount's.
+    assert.deepEqual(tree().filter((p) => p.includes('/') || !isProbe(p)), ['later.txt', 'top.txt']);
   });
 });
 
@@ -1408,6 +1430,7 @@ describe("an editor's save by rename, with the watcher running", () => {
     const mount = (m as any).mounts.get('work');
     const blob = () => env.store.treeGet(TREE, 'gate.json')?.blobHash;
     await until(() => !!mount.watcherReadyAt && blob() !== undefined, 'the watcher is ready and the catch-up scan took gate.json');
+    await watchersFlow(m, { work: env.dir });
     const v1 = blob();
     env.events.length = 0;
 
@@ -1426,7 +1449,7 @@ describe("an editor's save by rename, with the watcher running", () => {
 
     const v2 = blob();
     env.writeDisk('gate.json', 'v3');
-    await until(() => blob() !== v2, 'a later edit of the new file is taken in');
+    await until(() => blob() !== undefined && blob() !== v2, 'a later edit of the new file is taken in');
   });
 });
 

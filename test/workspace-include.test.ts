@@ -20,7 +20,9 @@ import { WorkspaceModule, WorkspaceReadError } from '../src/modules/workspace/in
 import { EffectFailed, unlinkContained, writeContained } from '../src/modules/workspace/effects.js';
 import { coversLanding, includePatternReadable, insideMount, parsedSpelling, pathSegments, provenAbsent, readPath, type MountView, type Walk } from '../src/modules/workspace/observe.js';
 import type { MountConfig } from '../src/modules/workspace/types.js';
+import type { FsChange } from '../src/modules/workspace/watcher.js';
 import type { ModuleContext } from '../src/types/module.js';
+import { changesFlow, isProbe } from './helpers/watcher-flow.js';
 
 const TREE = 'workspace/work/tree';
 const OUTSIDE = "outside the mount's include";
@@ -1517,6 +1519,7 @@ describe('mount include', () => {
       // one, before its first await, so the turns counted across its call are its batch's own: anything else
       // the watcher hands over meanwhile, as macOS's watcher may with a late event, counts only for itself.
       const batches: Array<{ paths: string[]; handled: Promise<void>; turns: number }> = [];
+      const heard: FsChange[][] = [];
       const passes: string[][] = [];
       let turns = 0;
       const handle = internals.handleFsChanges.bind(m);
@@ -1524,6 +1527,7 @@ describe('mount include', () => {
         const before = turns;
         const handled = handle(mount, changes);
         batches.push({ paths: changes.map((c) => c.path), handled, turns: turns - before });
+        heard.push(changes as FsChange[]);
         return handled;
       };
       const withMount = internals.withMount.bind(m);
@@ -1532,19 +1536,25 @@ describe('mount include', () => {
       const pass = internals.passUnlocked.bind(m);
       internals.passUnlocked = (mount, scope) => { if (scope.kind === 'paths') passes.push(scope.paths ?? []); return pass(mount, scope); };
       const named = (path: string): boolean => events.some((e) => e.paths?.includes(path));
+      // Ready says chokidar's first scan is done, not that the platform
+      // delivers events: on macOS a file written before then goes unreported,
+      // so the test waits until changes flow. Its probes lie outside the
+      // include too, so a batch of them takes no turn of the mount either.
+      await changesFlow(env.dir, heard, []);
       events.length = 0;
       turns = 0;
       env.writeDisk('notes.txt', 'outside the include\n');
       await until(() => batches.some((b) => b.paths.includes('notes.txt')), 'the watcher reports the uncovered file');
-      // Its batch's handling has ended, so whatever it would take, it has taken.
-      const withIt = batches.filter((b) => b.paths.includes('notes.txt'));
-      for (const b of withIt) await b.handled;
+      // Each batch's handling has ended, so whatever it would take, it has taken.
+      for (const b of batches) await b.handled;
       const seen = JSON.stringify(batches.map((b) => ({ paths: b.paths, turns: b.turns })));
-      // A batch of nothing but the uncovered file takes no turn of the mount. One that hands it over beside
-      // something the include covers takes its turn for that, and its pass leaves the uncovered file out.
-      for (const b of withIt) {
-        if (b.paths.every((p) => p === 'notes.txt')) assert.equal(b.turns, 0, `no turn of the mount is taken for it: ${seen}`);
-      }
+      // A batch of nothing but uncovered paths, the uncovered file and the handshake's probes, takes no turn
+      // of the mount, and the handshake's own batches make sure there is one. A batch that hands the file
+      // over beside something the include covers takes its turn for that, and its pass leaves the uncovered
+      // file out.
+      const uncovered = batches.filter((b) => b.paths.every((p) => p === 'notes.txt' || isProbe(p)));
+      assert.ok(uncovered.length > 0, `a batch of uncovered paths came: ${seen}`);
+      for (const b of uncovered) assert.equal(b.turns, 0, `no turn of the mount is taken for it: ${seen}`);
       assert.ok(passes.every((paths) => !paths.includes('notes.txt')), `no pass of the mount names it: ${JSON.stringify(passes)}; ${seen}`);
       assert.ok(!named('work/notes.txt'), `and no event: ${JSON.stringify(events)}`);
       // A covered change, as a control: the watcher reports it, a pass takes it in, and its event goes out.
