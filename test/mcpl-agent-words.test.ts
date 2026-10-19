@@ -25,6 +25,8 @@ import {
 import { convertBlock } from '../src/mcpl/convert-block.js';
 import { toolResultDataToHistoryString } from '../src/tool-result-history.js';
 import { McplServerConnection } from '../src/mcpl/server-connection.js';
+import { WITHHELD_TEXT } from '../src/mcpl/protocol-family.js';
+import { logValue } from '../src/mcpl/log-value.js';
 import type { McplHostCapabilities, McplServerConfig } from '../src/mcpl/types.js';
 
 // ---------------------------------------------------------------------------
@@ -156,7 +158,7 @@ test("a server's error answer that echoes a credential reaches the caller as sen
   assert.ok(!lines.some((line) => line.includes(token)), 'no log line has the token');
 });
 
-test("an error answer settles its call when its log line can't be redacted, and that line prints none of the server's text", async (t) => {
+test("an error answer whose configuration can't be read settles its call, and its log line withholds the server's text", async (t) => {
   const errors = t.mock.method(console, 'error', () => {});
   // A stdio server's env, as the framework gives it, is a getter, which
   // throws once the reaction baseline's ledger can't be read.
@@ -174,7 +176,22 @@ test("an error answer settles its call when its log line can't be redacted, and 
     { message: 'The "words" server answered with an error: Missing Access' }), 'settled call');
   const lines = errors.mock.calls.map((call) => String(call.arguments[0]));
   assert.ok(!lines.some((line) => line.includes('Missing')), lines.join('\n'));
-  assert.ok(lines.some((line) => /inbound dispatch failed .*reaction-baseline ledger unreadable/.test(line)), lines.join('\n'));
+  assert.ok(lines.some((line) => /^MCPL server "words" answered tools\/call \(id=\d+\) with error -32000: /.test(line) && line.endsWith(logValue(WITHHELD_TEXT))), lines.join('\n'));
+});
+
+test("an error answer settles its call when writing its log line throws", async (t) => {
+  // A host's logger can throw. The call's entry and timer are gone by the
+  // time the line is written, so nothing else would settle it.
+  const errors = t.mock.method(console, 'error', (line: unknown) => {
+    if (String(line).includes(' answered tools/call ')) throw new Error('the logger is down');
+  });
+  const connection = await McplServerConnection.connect(config(), HOST_CAPS);
+  t.after(() => connection.close());
+  connection.ready();
+  await within(assert.rejects(connection.sendToolsCall('refuse', {}),
+    { message: 'The "words" server answered with an error: Missing Access' }), 'settled call');
+  const lines = errors.mock.calls.map((call) => String(call.arguments[0]));
+  assert.ok(lines.some((line) => /inbound dispatch failed .*the logger is down/.test(line)), lines.join('\n'));
 });
 
 test("a server that drops with a call pending says the outcome is unknown, and whether it's coming back", async (t) => {

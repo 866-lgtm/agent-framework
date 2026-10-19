@@ -128,6 +128,12 @@ export function redactUrl(url: string | undefined): string {
  * holds nor a dial of it sent, such as another origin's, is outside it, and
  * so are other encodings of the ones it holds. JSON-RPC answers, and the
  * error a host's own connect raises, pass as they are.
+ *
+ * A configuration that can't be read, such as one whose `env` is a getter
+ * that throws, says nothing of which strings to replace, so the whole text
+ * is withheld ({@link WITHHELD_TEXT}) rather than thrown on: a redaction
+ * runs where a throw has nowhere to go, such as inside a transport's 'error'
+ * listener.
  */
 export function redactServerText(text: unknown, config: Pick<McplServerConfig, 'url' | 'token' | 'env'>): string {
   return serverTextRedactor(config)(text);
@@ -137,7 +143,8 @@ export function redactServerText(text: unknown, config: Pick<McplServerConfig, '
  * {@link redactServerText} for one configuration, its strings found and its
  * pattern built once, and again once a dial has sent something new
  * ({@link noteDialSent}): for a connection's records, such as each stderr
- * line.
+ * line. A build that can't read the configuration withholds that call's
+ * text, and the next call builds again.
  */
 export function serverTextRedactor(config: Pick<McplServerConfig, 'url' | 'token' | 'env'>): (text: unknown) => string {
   let built = -1;
@@ -145,12 +152,22 @@ export function serverTextRedactor(config: Pick<McplServerConfig, 'url' | 'token
   return (text) => {
     const version = dialsSent.get(config)?.version ?? 0;
     if (version !== built) {
-      redact = credentialRedactor(serverCredentialPatterns(config));
+      let patterns: CredentialPattern[];
+      try {
+        patterns = serverCredentialPatterns(config);
+      } catch {
+        return WITHHELD_TEXT;
+      }
+      redact = credentialRedactor(patterns);
       built = version;
     }
     return redact(text);
   };
 }
+
+/** What a redaction gives in place of text when the configuration it
+ *  redacts with can't be read ({@link redactServerText}). */
+export const WITHHELD_TEXT = "[withheld: the server's configuration couldn't be read to redact this]";
 
 /**
  * What a configuration's dials sent that the configuration doesn't hold: the
@@ -306,8 +323,12 @@ export function serverCredentialPatterns(config: Pick<McplServerConfig, 'url' | 
       }
     }
   };
+  // Read before the parse's try: a configuration that can't be read throws,
+  // so its redaction withholds the text rather than redact it without the
+  // url's strings.
+  const configuredUrl = config.url ?? '';
   let url: URL | undefined;
-  try { url = new URL(config.url ?? ''); } catch { /* Still remove the static token. */ }
+  try { url = new URL(configuredUrl); } catch { /* Still remove the static token. */ }
   if (url) addUrl(urlAsDialed(url, config.token));
   // What the dials sent beyond that: urls dialed with an access provider's
   // token, and its tokens sent in a header.
