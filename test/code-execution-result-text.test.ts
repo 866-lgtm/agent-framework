@@ -87,7 +87,7 @@ describe('code_execution result text', () => {
     assert.ok(head.length + tail.length > 23_850, String(head.length + tail.length));
   });
 
-  it('falls at a line\'s end on each side of a cut, whatever the budget', () => {
+  it('falls at a line\'s end on each side of a cut, across eleven budgets in a row', () => {
     const stdout = numbered(3000, 'line');
     // Eleven budgets in a row: cut at the length each side is given, most of
     // them would fall mid-line, since each line is 11 characters.
@@ -178,15 +178,18 @@ describe('code_execution result text', () => {
     }
   });
 
-  it('is null when the streams\' room is under three cut markers', () => {
+  it('is null when the streams\' room is three cut markers or less', () => {
     assert.strictEqual(scriptEndTextWithin({ stdout: 'x'.repeat(1000), stderr: '', returnCode: 0 }, 60), null);
-    // Both streams cut, with room for two markers but not three: stderr's
-    // third couldn't hold its own marker.
-    const both = { stdout: 'o'.repeat(20_000), stderr: 'e'.repeat(20_000), returnCode: 0 };
+    // Both streams cut. With three markers' room, stderr's third would hold
+    // its count and nothing of its own; one more, and it keeps its end.
+    const both = { stdout: 'o'.repeat(20_000), stderr: `${'e'.repeat(19_999)}E`, returnCode: 0 };
     const fixed = 'exit code: 0\n'.length + 2 * ('--- stderr ---\n'.length + 1);
     const marker = '\n[… 20000 characters cut …]\n'.length;
-    assert.strictEqual(scriptEndTextWithin(both, fixed + 3 * marker - 1), null);
-    assert.ok(scriptEndTextWithin(both, fixed + 3 * marker) !== null);
+    assert.strictEqual(scriptEndTextWithin(both, fixed + 3 * marker), null);
+    const text = scriptEndTextWithin(both, fixed + 3 * marker + 1);
+    assert.ok(text !== null);
+    assert.ok(text.length <= fixed + 3 * marker + 1, String(text.length));
+    assert.strictEqual(cutOf(bodyOf(text, 'stderr')!).tail, 'E\n');
   });
 });
 
@@ -209,7 +212,6 @@ describe('code_execution result text, through the framework (real python3)', () 
       readSpill: (path: string) => Promise<string>,
       failWrites: (answer?: { success: false; error: string; isError: true; data?: unknown }) => void,
       wroteFor: (callId: string, days: string[]) => Promise<boolean>,
-      exists: (path: string) => Promise<boolean>,
     ) => Promise<void>,
   ): Promise<void> {
     const tempDir = mkdtempSync(join(tmpdir(), 'pytc-text-'));
@@ -229,7 +231,6 @@ describe('code_execution result text, through the framework (real python3)', () 
       ...(opts.toolResultInlineMaxChars !== undefined ? { toolResultInlineMaxChars: opts.toolResultInlineMaxChars } : {}),
     });
     workspace?.initStore(framework.getStore());
-    const exists = async (path: string) => 'data' in await workspace!.readBinary(path);
     try {
       await body(
         framework,
@@ -240,15 +241,14 @@ describe('code_execution result text, through the framework (real python3)', () 
         },
         (answer = { success: false, error: 'disk full', isError: true }) => { workspace!.writeBinary = async () => answer; },
         async (callId, days) => {
-          // This path's own name for the file, and the inline cap's spill's.
+          // The name this path gives the whole output's file. These calls are
+          // made in process, so nothing stores their results, and the inline
+          // cap's spill never runs here.
           for (const day of new Set(days)) {
-            for (const name of [`${day}-output-${callId}`, `${day}-${callId}`]) {
-              if (await exists(`files/tool-results/${name}.txt`)) return true;
-            }
+            if ('data' in await workspace!.readBinary(`files/tool-results/${day}-output-${callId}.txt`)) return true;
           }
           return false;
         },
-        exists,
       );
     } finally {
       await framework.stop();
@@ -273,10 +273,8 @@ describe('code_execution result text, through the framework (real python3)', () 
   const outputTail = 'import sys\nsys.stdout.write("x" * 30000)\nsys.stderr.write("an error line\\n")\nraise SystemExit(5)';
 
   it('a long stdout keeps stderr and the exit code in view, and the whole output goes to a file of its own', async () => {
-    await withFramework({ workspace: true }, async (framework, readSpill, _failWrites, _wroteFor, exists) => {
-      const days = [today()];
+    await withFramework({ workspace: true }, async (framework, readSpill) => {
       const r = await run(framework, 'ce-output-tail', { code: outputTail });
-      days.push(today());
       assert.strictEqual(r.success, true, JSON.stringify(r).slice(0, 300));
       const text = textOf(r);
       // The house default cap for a caller with no agent, filled by the cut.
@@ -289,12 +287,6 @@ describe('code_execution result text, through the framework (real python3)', () 
       const whole = await readSpill(notice[2]);
       assert.strictEqual(whole, `exit code: 1\n--- stderr ---\n${stderr}--- stdout ---\n${'x'.repeat(30_000)}\n`);
       assert.strictEqual(Number(notice[1]), whole.length);
-      // The inline cap's spill names its file without '-output', so a later
-      // spill of the cut text, at a cap lowered before storing, can't write
-      // over this one.
-      for (const day of new Set(days)) {
-        assert.strictEqual(await exists(`files/tool-results/${day}-ce-output-tail.txt`), false, day);
-      }
       // Hosts read the fields, whole, in structured.
       assert.deepStrictEqual(r.structured, { stdout: 'x'.repeat(30_000), stderr, return_code: 1 });
     });
@@ -311,7 +303,7 @@ describe('code_execution result text, through the framework (real python3)', () 
       assert.match(stderr, /\nscript stopped: it reached its 1s time limit\. [^\n]*To give it longer, pass time_limit_ms up to 600000 \(10 min\)\.\n$/);
       assert.ok(text.startsWith(`exit code: ${(r.structured as { return_code: number }).return_code}\n--- stderr ---\n`), text.slice(0, 120));
       assert.ok(text.indexOf('script stopped') < text.indexOf('--- stdout ---\nyyy'));
-      assert.match(text, /\n\[cut to fit; the whole output was \d+ chars, and with no writable workspace, what was cut was not retained\]$/);
+      assert.match(text, /\n\[cut to fit; the whole output was \d+ chars, and with no writable workspace mount without an include, what was cut was not retained\]$/);
     });
   });
 
@@ -353,7 +345,7 @@ describe('code_execution result text, through the framework (real python3)', () 
     });
   });
 
-  it('a cap too small for a cut of each stream returns the whole text, written nowhere, for the inline cap\'s spill', async () => {
+  it('a cap too small for a cut of each stream returns the whole text and writes nothing', async () => {
     // 50 tokens bound the cap at 200 characters, less than the notice alone.
     await withFramework({ workspace: true, agents: [agentWithTokenBound(50)] }, async (framework, _readSpill, _failWrites, wroteFor) => {
       const days = [today()];
@@ -361,7 +353,7 @@ describe('code_execution result text, through the framework (real python3)', () 
       days.push(today());
       const { stderr } = r.structured as { stderr: string };
       assert.strictEqual(textOf(r), `exit code: 1\n--- stderr ---\n${stderr}--- stdout ---\n${'x'.repeat(30_000)}\n`);
-      assert.strictEqual(await wroteFor('ce-tiny-cap', days), false, 'nothing is written here: the inline cap\'s spill writes its file when the result is stored');
+      assert.strictEqual(await wroteFor('ce-tiny-cap', days), false, 'nothing is written here: a model\'s call is then cut by the inline cap\'s spill, which writes its own file as the result is stored');
     });
   });
 

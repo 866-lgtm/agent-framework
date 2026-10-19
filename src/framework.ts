@@ -19447,8 +19447,9 @@ export class AgentFramework {
 
     // The model reads how the script ended as text, its ending first, within
     // the bound its caller reads whole: the one the call carries, as an
-    // in-process caller may set it, or else the agent's inline cap, as for
-    // any call (resultMaxCharsFor). Hosts read the fields in `structured`.
+    // in-process caller may set it, or else the one the framework gives the
+    // calls it dispatches (resultMaxCharsFor), the agent's inline cap. Hosts
+    // read the fields in `structured`.
     const cap = call.resultMaxChars ?? this.resultMaxCharsFor(agentName, call.id);
     const text = await this.scriptEndResultText(
       { stdout: exec.stdout, stderr: exec.stderr, returnCode: exec.returnCode, ...(capNote ? { timeLimitNote: capNote } : {}) },
@@ -19477,9 +19478,10 @@ export class AgentFramework {
    * which a long id can cut short, so a later spill of the cut text, as at a
    * cap lowered before the result is stored, can't write over it. The cut
    * leaves room for the longest notice it could end with, so it's decided
-   * before anything is written. A cap too small to hold a cut of each stream
-   * beside that notice leaves the whole text, unwritten, to the inline cap's
-   * spill, which keeps its head.
+   * before anything is written. When the cap can't hold a cut of each stream
+   * beside that notice, the whole text comes back, unwritten. On a model's
+   * call, the inline cap's spill then keeps its head as the result is stored;
+   * an in-process caller that set so small a bound gets the whole text.
    */
   private async scriptEndResultText(end: ScriptEnd, cap: number, callId: string): Promise<string> {
     const whole = scriptEndText(end);
@@ -19489,7 +19491,7 @@ export class AgentFramework {
       `[cut to fit; the whole output (${whole.length} chars): workspace file ${path}. ${this.spillPageAdvice(path, cap)}]`;
     const writeFailed = (path: string, error: string) =>
       `[cut to fit; writing the whole output (${whole.length} chars) to workspace file ${path} FAILED (${error.slice(0, 200)}); what was cut was not retained]`;
-    const noWorkspace = `[cut to fit; the whole output was ${whole.length} chars, and with no writable workspace, what was cut was not retained]`;
+    const noWorkspace = `[cut to fit; the whole output was ${whole.length} chars, and with no writable workspace mount without an include, what was cut was not retained]`;
     const place = this.toolResultFilePlace(label);
     const reserve = place
       ? Math.max(keptIn(place.path).length, writeFailed(place.path, 'x'.repeat(200)).length, noWorkspace.length)

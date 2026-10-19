@@ -6,8 +6,9 @@
  * end holds a traceback, and for a script the runner stopped, why it stopped,
  * which the runner writes on a line of its own after the script's own stderr.
  * Within a budget, each stream is cut to its head and its tail around a count
- * of what was cut, and stderr keeps a share of the room of its own, so however
- * long stdout runs, it can't push the exit code or stderr's end out of view.
+ * of what was cut, and stderr keeps a share of the room of its own, so in any
+ * budget that holds a cut of each stream, however long stdout runs, it can't
+ * push the exit code or stderr's end out of view.
  */
 
 export interface ScriptEnd {
@@ -28,8 +29,8 @@ export function scriptEndText(end: ScriptEnd): string {
  * keeps up to a third of the room the streams have, or more when stdout needs
  * less, and stdout takes the rest, each cut to its head and tail. stderr's
  * tail keeps its last line whole when the line fits its room. Returns null
- * when the streams' room is under three cut markers, a simple bound that keeps
- * stderr's third, when stderr is cut, at least its count.
+ * when the streams' room is three cut markers or less, so that stderr's share,
+ * when stderr is cut, keeps some of its own text beside its count.
  */
 export function scriptEndTextWithin(end: ScriptEnd, budget: number): string | null {
   const whole = scriptEndText(end);
@@ -37,7 +38,7 @@ export function scriptEndTextWithin(end: ScriptEnd, budget: number): string | nu
   const { stderr, stdout } = end;
   const marker = cutMarker(Math.max(stderr.length, stdout.length)).length;
   const room = budget - heading(end).length - labelLength('stderr', stderr) - labelLength('stdout', stdout);
-  if (room < 3 * marker) return null;
+  if (room <= 3 * marker) return null;
   const stderrRoom = Math.min(stderr.length, Math.max(Math.ceil(room / 3), room - stdout.length));
   return heading(end)
     + section('stderr', cutMiddle(stderr, stderrRoom, true))
