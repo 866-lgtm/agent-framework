@@ -87,13 +87,19 @@ static uint32_t next_id = 1;
  * allocations at a soft limit OOM_HEADROOM under the limit. After a refusal, allocations may use
  * the headroom up to the limit, so that QuickJS can build the error and the script's handler can
  * run, and the next allocation that fits under the soft limit closes it again. So a script that
- * reaches the limit while the headroom is closed gets a real out-of-memory error. The host's
- * buffers (engine_alloc) are held to the same limits, so a refused copy opens the headroom too,
- * and the child's unfit error can still be copied in. Whatever runs while it's open can spend it:
- * a script that catches the error and keeps allocating without freeing, or a result settled while
- * the guest sits at the soft limit, whose copies and parse go in once the first copy's refusal
- * has opened it. An out-of-memory error after that can be a bare null: keeping the headroom for
- * the error alone would take QuickJS's own in_out_of_memory flag, which its API doesn't expose.
+ * reaches the limit while the headroom is closed gets a real out-of-memory error, as long as
+ * building that error doesn't reach this allocator twice with the first fitting under the soft
+ * limit, which would close the headroom before the second. Most of what builds an error comes from
+ * blocks QuickJS's arenas already hold, which don't reach this allocator, so that's rare. The
+ * host's buffers (engine_alloc) are held to the same limits, so a refused copy opens the headroom
+ * too, and the child's unfit error can still be copied in. Whatever runs while it's open can spend
+ * it: a script that catches the error and goes on allocating without freeing, or a result settled
+ * while the guest sits at the soft limit, whose parse goes in once a copy's refusal has opened it.
+ * An out-of-memory error after that can be a bare null: keeping the headroom for the error alone
+ * would take QuickJS's own in_out_of_memory flag, which its API doesn't expose. And a promise
+ * reaction whose job QuickJS can't allocate is dropped (fulfill_or_reject_promise ignores
+ * JS_EnqueueJob's failure), so the await it would have resumed never settles, and the engine
+ * answers pending with no call in flight.
  */
 #define OOM_HEADROOM (64 * 1024)
 
@@ -389,21 +395,16 @@ int engine_start(const char *prelude, uint32_t prelude_len, const char *script, 
     return state();
 }
 
-/* Settles call `id`, then runs jobs. With ok, the call's promise resolves to the parsed JSON;
-   otherwise it rejects with it. A result the guest can't take rejects it with the parse of unfit
-   instead, the host's own error, and the state answered has ENGINE_UNFIT set: a null json, which
-   the host couldn't copy in, or a parse that fails, for want of memory or stack (or because it
-   isn't JSON, which a host's result never is). Any of these took effect without reaching the
-   script, which an error at the call's await would hide. A result nested deeper than the
-   binding's MAX_RESULT_DEPTH never gets here: under Node, its parse would overflow the host's
-   stack before QuickJS's own check saw the recursion. A parse that fails frees what it built,
-   so the small unfit error has room, unless the result's copy took the last of the memory; if
-   even it can't be copied in (a null unfit) or parsed, the call rejects with what that failure
-   gives. json and unfit, when not null, must end in a NUL at [len], as JS_ParseJSON requires. */
-EXPORT("engine_settle")
-int engine_settle(uint32_t id, int ok, const char *json, uint32_t json_len, const char *unfit,
+/* Frees one of the host's buffers, and forgets it. */
+static void release(char **buf) {
+    limited_free(NULL, *buf);
+    *buf = NULL;
+}
+
+/* engine_settle's work, which frees each buffer as soon as it's parsed. */
+static int settle(uint32_t id, int ok, char **json, uint32_t json_len, char **unfit,
                   uint32_t unfit_len) {
-    if (!started || (json && json[json_len] != '\0') || (unfit && unfit[unfit_len] != '\0'))
+    if (!started || (*json && (*json)[json_len] != '\0') || (*unfit && (*unfit)[unfit_len] != '\0'))
         return ENGINE_MISUSE;
     JSValue entry = JS_GetPropertyUint32(ctx, pending, id);
     if (JS_IsException(entry)) {
@@ -427,9 +428,10 @@ int engine_settle(uint32_t id, int ok, const char *json, uint32_t json_len, cons
 
     JSValue value = JS_UNDEFINED;
     bool resolve = ok != 0;
-    bool too_large = !json;
-    if (json) {
-        value = JS_ParseJSON(ctx, json, json_len, "<result>");
+    bool too_large = !*json;
+    if (*json) {
+        value = JS_ParseJSON(ctx, *json, json_len, "<result>");
+        release(json);
         if (JS_IsException(value)) {
             JS_FreeValue(ctx, JS_GetException(ctx));
             too_large = true;
@@ -437,8 +439,8 @@ int engine_settle(uint32_t id, int ok, const char *json, uint32_t json_len, cons
     }
     if (too_large) {
         resolve = false;
-        if (unfit) {
-            value = JS_ParseJSON(ctx, unfit, unfit_len, "<unfit>");
+        if (*unfit) {
+            value = JS_ParseJSON(ctx, *unfit, unfit_len, "<unfit>");
         } else {
             JS_ThrowOutOfMemory(ctx);
             value = JS_EXCEPTION;
@@ -446,6 +448,7 @@ int engine_settle(uint32_t id, int ok, const char *json, uint32_t json_len, cons
         if (JS_IsException(value))
             value = JS_GetException(ctx);
     }
+    release(unfit);
     JSValue fn = JS_GetPropertyUint32(ctx, entry, resolve ? 0 : 1);
     JS_FreeValue(ctx, entry);
     if (JS_IsException(fn)) {
@@ -463,6 +466,30 @@ int engine_settle(uint32_t id, int ok, const char *json, uint32_t json_len, cons
     run_jobs();
     int st = state();
     return too_large ? st | ENGINE_UNFIT : st;
+}
+
+/* Settles call `id`, then runs jobs. With ok, the call's promise resolves to the parsed JSON;
+   otherwise it rejects with it. A result the guest can't take rejects it with the parse of unfit
+   instead, the host's own error, and the state answered has ENGINE_UNFIT set: a null json, which
+   the host couldn't copy in, or a parse that fails, for want of memory or stack (or because it
+   isn't JSON, which a host's result never is). Any of these took effect without reaching the
+   script, which an error at the call's await would hide. A result nested deeper than the
+   binding's MAX_RESULT_DEPTH never gets here: under Node, a parse nested 5,000 to 10,000 deep
+   overflows the host's stack before QuickJS's own check sees the recursion, and the binding
+   refuses results well short of that.
+
+   json and unfit are the host's buffers from engine_alloc, each null or ending in a NUL at [len]
+   as JS_ParseJSON requires, and this frees both, whatever it returns: each as soon as it's
+   parsed, so the result's copy is gone before the unfit error is parsed and before the script's
+   code runs. A parse that fails frees what it built too. If even the unfit error can't be copied
+   in (a null unfit) or parsed, the call rejects with what that failure gives. */
+EXPORT("engine_settle")
+int engine_settle(uint32_t id, int ok, char *json, uint32_t json_len, char *unfit,
+                  uint32_t unfit_len) {
+    int st = settle(id, ok, &json, json_len, &unfit, unfit_len);
+    release(&json);
+    release(&unfit);
+    return st;
 }
 
 /* The text of a value or an error, for engine_result. Takes v. Returns a JS string, undefined,
@@ -585,11 +612,14 @@ static uint8_t *read_ending(int st) {
    [u32 kind][u32 length][UTF-8]. Kind 0: fulfilled with undefined (or a value JSON.stringify
    leaves out), no text. Kind 1: fulfilled, the value's JSON. Kind 2: an error, as JSON
    {name?, message?, stack?}: what the script threw, or why its value couldn't be stringified.
-   Returns 0 in any other state, or when it can't allocate. The ending is fixed before it's read.
-   The script's own code that serializing runs (a toJSON, a getter), and the jobs it queues, which
-   run before this returns, can't reach the host. A stop while it runs leaves the guest stopped,
-   and the binding answers that. Data nested deeper than the host's stack allows can overflow it
-   in JS_JSONStringify, which throws out of the module: the binding reports that as a crash. */
+   Returns 0 in any other state, when it can't allocate, or when a stop lands while the ending is
+   read, which leaves none to give. The ending is fixed before it's read. The script's own code
+   that serializing runs (a toJSON, a getter), and the jobs it queues, which run before this
+   returns, can't reach the host; a reaction it attaches to a promise still pending runs when that
+   settles, as the script's other continuations do after its ending. A stop or a failure in those
+   jobs comes after the ending was read, so this returns the ending, and later states say what
+   came after. Data nested deeper than the host's stack allows can overflow it in
+   JS_JSONStringify, which throws out of the module: the binding reports that as a crash. */
 EXPORT("engine_result")
 uint8_t *engine_result(void) {
     int st = state();
@@ -597,16 +627,23 @@ uint8_t *engine_result(void) {
         return NULL;
     reading = true;
     uint8_t *buf = read_ending(st);
-    run_jobs();
+    if (interrupted) {
+        /* What was read is the stop's error, not the ending. */
+        limited_free(NULL, buf);
+        buf = NULL;
+    } else {
+        run_jobs();
+    }
     reading = false;
     return buf;
 }
 
-/* Buffers the host fills for engine_start and engine_settle, and frees after engine_result.
-   They're held to the same limit as QuickJS's allocations: a result's copy and the value parsed
-   from it share the guest's memory, and with the copy outside the limit, the two together could
-   exhaust linear memory before the limit refused anything, so the parse's failure would look like
-   no refusal and an out-of-memory error couldn't be built. */
+/* Buffers the host fills for engine_start and engine_settle. The host frees engine_start's after
+   that call, and engine_result's once it has read it; engine_settle frees its own. They're held
+   to the same limit as QuickJS's allocations: a result's copy and the value parsed from it share
+   the guest's memory, and with the copy outside the limit, the two together could exhaust linear
+   memory before the limit refused anything, so the parse's failure would look like no refusal
+   and an out-of-memory error couldn't be built. */
 EXPORT("engine_alloc")
 void *engine_alloc(uint32_t size) {
     return limited_malloc(NULL, size ? size : 1);

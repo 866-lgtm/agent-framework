@@ -86,9 +86,13 @@ export interface Engine {
    * parsed, the child's own error (`ResultTooLarge`), and the answer has `unfit: true`: the call
    * took effect, and an error at its await would read as a failed call. Allowed after `fulfilled`,
    * for calls still in flight when a script returned. Throws for an id that isn't pending.
+   *
+   * Once a call has answered the script's ending, later calls answer it again, unless something
+   * came after it: a stop answers `interrupted`, a slot's failure throws, and a failure of
+   * QuickJS's own job machinery answers `rejected` with that failure.
    */
   settle(callId: number, ok: boolean, json: string | Uint8Array, unfitJson: string): SettleState;
-  /** Frees the engine's runtime. Nothing may be called after it. */
+  /** Frees the engine's runtime, unless the module trapped, which leaves it as it is. Nothing may be called after it. */
   dispose(): void;
 }
 
@@ -228,6 +232,8 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
   let busy = false;
   /** interrupt() has returned true: the guest is stopped for good. */
   let stopped = false;
+  /** The module trapped, so its state may be anything, and it isn't called again. */
+  let crashed = false;
 
   /**
    * A view of the module's memory. A corrupted guest could pass any pointer, and the view's own
@@ -330,6 +336,7 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
       out = fn();
     } catch (err) {
       if (err instanceof EngineError) throw err;
+      crashed = true;
       // A slot that failed first is why: the guest ran on, refused, until the module trapped.
       if (slotFailed) return slotFailure(what);
       const why = diagnostics.trim();
@@ -343,12 +350,12 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
   /** A thrown value as text, for a message: it may have no string form, or one that throws. */
   const describe = (err: unknown): string => {
     try {
-      return err instanceof Error ? err.message : String(err);
+      return String(err instanceof Error ? err.message : err);
     } catch {
       return 'a value with no string form';
     }
   };
-  /** Copies text, or UTF-8 bytes, into the module with the NUL its C expects. Caller frees. */
+  /** Copies text, or UTF-8 bytes, into the module with the NUL its C expects. The caller frees it, or hands it to engine_settle, which does. */
   const put = (value: string | Uint8Array): { ptr: number; len: number } => {
     const len = typeof value === 'string' ? Buffer.byteLength(value, 'utf8') : value.length;
     const ptr = ex.engine_alloc(len + 1);
@@ -405,18 +412,20 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
         const known = endings.get(code);
         if (known) return { ...known };
         const r = result();
-        // Reading runs the interrupt slot, which can throw, or stop the guest: then this call
-        // answers as any call does in which that happens.
+        // Reading runs the interrupt slot, which can throw, or stop the guest. A stop that lands
+        // while the ending itself is read leaves none to give (the module returns nothing), so
+        // this call answers as any call does in which that happens. One that lands in the jobs
+        // the read queued comes after a whole ending, which this call answers.
         if (slotFailed) return slotFailure(what);
-        if (stopped) return { kind: 'interrupted' };
+        if (!r && stopped) return { kind: 'interrupted' };
         const state: RunState = !r
           ? { kind: 'rejected', name: 'InternalError', message: code === FULFILLED
-            ? 'out of memory while serializing the script\'s return value; return less'
-            : 'out of memory while reading what the script threw; throw something smaller, such as an Error with a shorter message' }
+            ? 'out of memory while serializing the script\'s return value; return less, or let go of data the script no longer needs'
+            : 'out of memory while reading what the script threw; throw something smaller, such as an Error with a shorter message, or let go of data the script no longer needs' }
           : 'tooLong' in r
           ? { kind: 'rejected', name: 'RangeError', message: code === FULFILLED
-            ? `the script's return value is ${r.tooLong} bytes as JSON, more than the ${MAX_ENDING_BYTES} the engine reads back; return less`
-            : `what the script threw is ${r.tooLong} bytes as JSON, more than the ${MAX_ENDING_BYTES} the engine reads back; throw something smaller` }
+            ? `the script's return value comes to ${r.tooLong} bytes as text, more than the ${MAX_ENDING_BYTES} the engine reads back; return less`
+            : `what the script threw comes to ${r.tooLong} bytes as text, more than the ${MAX_ENDING_BYTES} the engine reads back; throw something smaller` }
           : r.kind === 0 ? { kind: 'fulfilled', json: undefined }
           : r.kind === 1 ? { kind: 'fulfilled', json: r.text }
           : errorState(r.text);
@@ -471,25 +480,35 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
         // The small error first, so a result that takes the last of the memory leaves it room,
         // and once more if refused: the refusal opens the allocator's headroom, which it fits in.
         // A copy the module can't make room for goes as a null pointer, and so does a result
-        // nested too deeply to parse.
+        // nested too deeply to parse. The module frees both copies, each as soon as it's parsed.
         let u = put(unfitJson);
         if (!u.ptr) u = put(unfitJson);
         const j = nestsDeeper(json, MAX_RESULT_DEPTH) ? { ptr: 0, len: 0 } : put(json);
-        try {
-          const code = ex.engine_settle(callId, ok ? 1 : 0, j.ptr, j.len, u.ptr, u.len);
-          if (code >= 0 && (code & UNFIT) !== 0) return { ...toState(code & ~UNFIT, 'settle()'), unfit: true };
-          return toState(code, 'settle()');
-        } finally {
-          if (j.ptr) ex.engine_free(j.ptr);
-          if (u.ptr) ex.engine_free(u.ptr);
-        }
+        const code = ex.engine_settle(callId, ok ? 1 : 0, j.ptr, j.len, u.ptr, u.len);
+        if (code >= 0 && (code & UNFIT) !== 0) return { ...toState(code & ~UNFIT, 'settle()'), unfit: true };
+        return toState(code, 'settle()');
       });
     },
     dispose() {
       if (disposed) return;
-      // Marked only once it's done, so a dispose() the engine refuses (from inside a slot) can be
-      // made again.
-      if (!broken) call('dispose()', () => ex.engine_dispose());
+      // Refused from inside a slot, it isn't marked done, so it can be made again.
+      if (busy) throw new EngineError('dispose() was called from inside one of the engine\'s slots, which may not call back into it');
+      // A module that trapped may have stopped anywhere, so it's left as it is. One that ended
+      // for a slot's failure, or for want of memory for its own state, is whole, and frees its
+      // runtime.
+      if (!crashed) {
+        busy = true;
+        try {
+          ex.engine_dispose();
+        } catch (err) {
+          crashed = true;
+          disposed = true;
+          broken = new EngineError(`the engine crashed in dispose(): ${describe(err)}`, { cause: err });
+          throw broken;
+        } finally {
+          busy = false;
+        }
+      }
       disposed = true;
     },
   };
