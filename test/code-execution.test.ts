@@ -1355,7 +1355,7 @@ describe("a round that runs code_execution is routed once its scripts return (re
         return { status: 'delivered', destination: { serverId: 'stub', channelId }, at: Date.now() };
       },
       resolveDestination: ({ channelId }: { channelId: string }) => ({ destination: { serverId: 'stub', channelId } }),
-      sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
+      sendOutgoingChunk: ({ channelId }: { channelId: string }, _agent: string, _id: string, _index: number, delta: string) => {
         log.push(`chunk:${delta}@${channelId}`);
       },
       handleChannelToolCall: async (name: string, input: Record<string, unknown> | undefined) => {

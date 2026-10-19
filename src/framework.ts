@@ -102,7 +102,7 @@ import { isSilentHeartbeatMarker, isVisiblyEmptyContent, NON_STRING_TEXT_PLACEHO
 import { parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
-import { ChannelRegistry, connectorText, journalToolDescription, type ChannelToolOrigin, type PublishDestination, type PublishOutcome } from './mcpl/channel-registry.js';
+import { ChannelRegistry, connectorText, destinationKey, journalToolDescription, type ChannelToolOrigin, type PublishDestination, type PublishOutcome } from './mcpl/channel-registry.js';
 import { KEEP_IDLE_MS, KEEP_NEWEST, ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftAttempt, type DraftReason, type DraftState, type InheritedRisk } from './prose-drafts.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import { INBOUND_SOURCE_KEY, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
@@ -947,10 +947,11 @@ function freshTurnRouting(): TurnRouting {
 
 /**
  * What a prose delivery tells its stream once a publish succeeds: the
- * channel and the text it published. The stream that queued the delivery
- * sends them on as its outgoing stream (MCPL Spec 14.3), so the stream
- * carries only what delivery published: nothing it withholds or holds as a
- * draft, and nothing whose publish failed or may not have gone out. A
+ * destination, its server and channel, and the text it published. The
+ * stream that queued the delivery sends them on as its outgoing stream
+ * (MCPL Spec 14.3), there and nowhere else, so the stream carries only what
+ * delivery published, where it published it: nothing it withholds or holds
+ * as a draft, and nothing whose publish failed or may not have gone out. A
  * publish succeeds when its outcome is `delivered`, which takes the
  * server's `delivered: true` (ChannelRegistry.publish). Nothing else is
  * streamed: a send refused before it goes out (such as for no channel, a
@@ -959,7 +960,7 @@ function freshTurnRouting(): TurnRouting {
  * response, a timeout, a lost connection, a reply that leaves `delivered`
  * out, or `delivered: false`).
  */
-type SpeechPublished = (channelId: string, text: string, messageId: string | undefined) => void;
+type SpeechPublished = (to: PublishDestination, text: string, messageId: string | undefined) => void;
 
 /**
  * How a round's prose is delivered: under which turn's routing, and how what
@@ -15229,7 +15230,7 @@ export class AgentFramework {
           this.recordProseDelivery(routing, outcome.status === 'delivered' ? { delivered: true, channelId: outcome.destination!.channelId } : null);
           if (outcome.status === 'delivered') {
             this.proseBounceStreaks.delete(agent.name);
-            round.onPublished?.(outcome.destination!.channelId, body, outcome.messageId);
+            round.onPublished?.(outcome.destination!, body, outcome.messageId);
           } else {
             delete routing.pin;
             routing.hybridHold = 'failed';
@@ -15270,7 +15271,7 @@ export class AgentFramework {
       try {
         const outcome = await this.channelRegistry!.routeSpeech(agent.name, envelope, target);
         this.recordProseDelivery(routing, outcome);
-        if (outcome?.delivered) round.onPublished?.(outcome.channelId, envelope, outcome.messageId);
+        if (outcome?.delivered) round.onPublished?.(outcome, envelope, outcome.messageId);
       } catch (err) {
         console.error('hybrid locus delivery failed:', err);
       }
@@ -15401,7 +15402,7 @@ export class AgentFramework {
       delivered = outcome.status === 'delivered';
       if (delivered) {
         this.proseBounceStreaks.delete(name);
-        round.onPublished?.(outcome.destination!.channelId, body, outcome.messageId);
+        round.onPublished?.(outcome.destination!, body, outcome.messageId);
       } else if (outcome.status === 'failed') {
         // Unknown deliveries are marker-only: offering a fresh draft would
         // invite a duplicate. Keep the authored body for the re-bounce rule.
@@ -16720,25 +16721,29 @@ export class AgentFramework {
     // and `channels/publish` stays the authoritative send.
     const outgoingInferenceId = `inf_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
     let outgoingIndex = 0;
-    // Per channel, everything this stream has sent there, which its
-    // `complete` carries.
-    const outgoingText = new Map<string, string>();
+    // Per destination, by its server and channel, everything this stream has
+    // sent there, which its `complete` carries. Two servers' channels with the
+    // same id are two destinations.
+    const outgoingText = new Map<string, { to: PublishDestination; text: string }>();
     // Set once the stream's `complete` has gone: no chunk follows it.
     let outgoingCompleted = false;
-    const streamSpeech: SpeechPublished = (channelId, text, messageId) => {
+    const streamSpeech: SpeechPublished = (published, text, messageId) => {
       if (outgoingCompleted) return;
-      // A later publish to the same channel is another message: a paragraph
+      const to = { serverId: published.serverId, channelId: published.channelId };
+      const key = destinationKey(to);
+      // A later publish to the same destination is another message: a paragraph
       // break keeps the two apart for a consumer that joins the chunks, so a
       // voice doesn't run "Let me look.Found it." together.
-      const sent = outgoingText.get(channelId);
+      const sent = outgoingText.get(key)?.text;
       const delta = sent === undefined ? text : `\n\n${text}`;
-      outgoingText.set(channelId, (sent ?? '') + delta);
+      outgoingText.set(key, { to, text: (sent ?? '') + delta });
       const index = outgoingIndex++;
-      this.channelRegistry?.sendOutgoingChunk(channelId, agent.name, outgoingInferenceId, index, delta);
+      this.channelRegistry?.sendOutgoingChunk(to, agent.name, outgoingInferenceId, index, delta);
       this.emitTrace({
         type: 'inference:published',
         agentName: agent.name,
-        channelId,
+        serverId: to.serverId,
+        channelId: to.channelId,
         inferenceId: outgoingInferenceId,
         index,
         text: delta,
@@ -16757,12 +16762,13 @@ export class AgentFramework {
       if (outgoingCompleted) return;
       outgoingCompleted = true;
       this.pendingOutgoingCompletes.delete(completeOutgoing);
-      for (const [channelId, text] of outgoingText) {
-        this.channelRegistry?.sendOutgoingComplete(channelId, agent.name, outgoingInferenceId, text);
+      for (const { to, text } of outgoingText.values()) {
+        this.channelRegistry?.sendOutgoingComplete(to, agent.name, outgoingInferenceId, text);
         this.emitTrace({
           type: 'inference:published_complete',
           agentName: agent.name,
-          channelId,
+          serverId: to.serverId,
+          channelId: to.channelId,
           inferenceId: outgoingInferenceId,
           text,
         });
@@ -16773,7 +16779,7 @@ export class AgentFramework {
       chainSpeech(async () => {
         const outcome = await this.channelRegistry!.routeSpeech(agent.name, text, locus);
         this.recordProseDelivery(streamRouting, outcome);
-        if (outcome?.delivered) streamSpeech(outcome.channelId, text, outcome.messageId);
+        if (outcome?.delivered) streamSpeech(outcome, text, outcome.messageId);
       }, 'mid-turn speech routing failed:');
     };
 
@@ -17810,7 +17816,7 @@ export class AgentFramework {
                     try {
                       const outcome = await this.channelRegistry.routeSpeech(agent.name, segment, locus);
                       this.recordProseDelivery(streamRouting, outcome);
-                      if (outcome?.delivered) streamSpeech(outcome.channelId, segment, outcome.messageId);
+                      if (outcome?.delivered) streamSpeech(outcome, segment, outcome.messageId);
                     } catch (err) {
                       console.error('speech routing failed:', err);
                     }
@@ -17908,7 +17914,7 @@ export class AgentFramework {
                   try {
                     const outcome = await this.channelRegistry.routeSpeech(agent.name, seg, locus);
                     this.recordProseDelivery(streamRouting, outcome);
-                    if (outcome?.delivered) streamSpeech(outcome.channelId, seg, outcome.messageId);
+                    if (outcome?.delivered) streamSpeech(outcome, seg, outcome.messageId);
                   } catch (err) {
                     console.error('speech routing failed:', err);
                   }

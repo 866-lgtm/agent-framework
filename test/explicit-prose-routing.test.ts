@@ -267,10 +267,10 @@ describe('explicit prose routing', () => {
     const chunks: Array<{ channelId: string; delta: string }> = [];
     const completes: Array<{ channelId: string; text: string }> = [];
     const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
-    registry.sendOutgoingChunk = (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
+    registry.sendOutgoingChunk = ({ channelId }: { channelId: string }, _agent: string, _id: string, _index: number, delta: string) => {
       chunks.push({ channelId, delta });
     };
-    registry.sendOutgoingComplete = (channelId: string, _agent: string, _id: string, text: string) => {
+    registry.sendOutgoingComplete = ({ channelId }: { channelId: string }, _agent: string, _id: string, text: string) => {
       completes.push({ channelId, text });
     };
     return { chunks, completes };
@@ -1733,7 +1733,7 @@ describe('explicit prose routing', () => {
     const routed = stubRegistry(framework);
     const gateway = framework as unknown as {
       deliverHybridProse(agent: unknown, text: string, locus: string, allowLocus: boolean,
-        round: { routing: RoutingState; notice: 'later'; onPublished?: (channelId: string, text: string) => void }): Promise<void>;
+        round: { routing: RoutingState; notice: 'later'; onPublished?: (to: { channelId: string }, text: string) => void }): Promise<void>;
       turnRouting: Map<string, RoutingState>;
     };
     const agent = framework.getAgent('assistant')!;
@@ -1762,7 +1762,7 @@ describe('explicit prose routing', () => {
     const routed = stubRegistry(framework);
     const gateway = framework as unknown as {
       deliverHybridProse(agent: unknown, text: string, locus: string, allowLocus: boolean,
-        round: { routing: RoutingState; notice: 'later'; onPublished?: (channelId: string, text: string) => void }): Promise<void>;
+        round: { routing: RoutingState; notice: 'later'; onPublished?: (to: { channelId: string }, text: string) => void }): Promise<void>;
       turnRouting: Map<string, RoutingState>;
     };
     const agent = framework.getAgent('assistant')!;
@@ -1776,7 +1776,7 @@ describe('explicit prose routing', () => {
         const round = {
           routing: queued,
           notice: 'later' as const,
-          onPublished: (channelId: string, text: string) => { streamed.push({ channelId, text }); },
+          onPublished: ({ channelId }: { channelId: string }, text: string) => { streamed.push({ channelId, text }); },
         };
         await gateway.deliverHybridProse(agent, '>>>#alpha first', 'chan-locus', true, round);
         await gateway.deliverHybridProse(agent, prefix, 'chan-locus', true, round);
@@ -2185,10 +2185,10 @@ describe('explicit prose routing', () => {
     registry.inboundOnlyServer = (channelId: string) => (channelId === 'body:ears' ? 'body' : undefined);
     const chunks: Array<{ channelId: string; delta: string }> = [];
     const completes: Array<{ channelId: string; text: string }> = [];
-    registry.sendOutgoingChunk = (channelId: string, _agent: string, _inference: string, _index: number, delta: string) => {
+    registry.sendOutgoingChunk = ({ channelId }: { channelId: string }, _agent: string, _inference: string, _index: number, delta: string) => {
       chunks.push({ channelId, delta });
     };
-    registry.sendOutgoingComplete = (channelId: string, _agent: string, _inference: string, text: string) => {
+    registry.sendOutgoingComplete = ({ channelId }: { channelId: string }, _agent: string, _inference: string, text: string) => {
       completes.push({ channelId, text });
     };
     feedTurn(framework, 2, [{ type: 'text', text: '>>skip_reply' }] as ContentBlock[]);

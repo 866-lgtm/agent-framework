@@ -394,10 +394,10 @@ test('explicit mode: a guard retry streams on to the sticky destination delivery
     routeSpeech: async (_agent: string, speech: string, channelId: string) => {
       routed.push({ text: speech, channelId }); return { delivered: true, channelId };
     },
-    sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
+    sendOutgoingChunk: ({ channelId }: { channelId: string }, _agent: string, _id: string, _index: number, delta: string) => {
       streamed.push({ channelId, delta });
     },
-    sendOutgoingComplete: (channelId: string, _agent: string, inferenceId: string, text: string) => {
+    sendOutgoingComplete: ({ channelId }: { channelId: string }, _agent: string, inferenceId: string, text: string) => {
       completed.push({ channelId, text, inferenceId });
     },
     getDefaultPublishChannel: () => null, isChannelOpen: () => true,
@@ -489,7 +489,7 @@ test('explicit mode: after a budget restart, the resumed reply streams where del
       order.push(`published:${text}`);
       return { delivered: true, channelId };
     },
-    sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
+    sendOutgoingChunk: ({ channelId }: { channelId: string }, _agent: string, _id: string, _index: number, delta: string) => {
       streamed.push({ channelId, delta });
       order.push(`chunk:${delta.trim()}`);
     },
@@ -552,7 +552,7 @@ test("explicit mode: a private round's prefix doesn't move where a budget restar
       routed.push({ text, channelId });
       return { delivered: true, channelId };
     },
-    sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
+    sendOutgoingChunk: ({ channelId }: { channelId: string }, _agent: string, _id: string, _index: number, delta: string) => {
       streamed.push({ channelId, delta });
     },
     handleChannelToolCall: async () => ({ success: true, data: { noted: true } }),
@@ -631,7 +631,7 @@ async function heldRestart(mode: 'explicit' | 'locus', texts: { first: string; s
       if (text.trim() === 'first') await firstHeld;
       return { delivered: true, channelId };
     },
-    sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
+    sendOutgoingChunk: ({ channelId }: { channelId: string }, _agent: string, _id: string, _index: number, delta: string) => {
       streamed.push({ channelId, delta });
     },
     getDefaultPublishChannel: () => null, isChannelOpen: () => true,
@@ -705,10 +705,10 @@ function explicitRegistry(h: Awaited<ReturnType<typeof harness>>) {
       routed.push({ text: text.trim(), channelId });
       return { delivered: true, channelId };
     },
-    sendOutgoingChunk: (channelId: string, _agent: string, inferenceId: string, _index: number, delta: string) => {
+    sendOutgoingChunk: ({ channelId }: { channelId: string }, _agent: string, inferenceId: string, _index: number, delta: string) => {
       streamed.push({ channelId, delta, inferenceId });
     },
-    sendOutgoingComplete: (channelId: string, _agent: string, inferenceId: string, text: string) => {
+    sendOutgoingComplete: ({ channelId }: { channelId: string }, _agent: string, inferenceId: string, text: string) => {
       completed.push({ channelId, text, inferenceId });
     },
     handleChannelToolCall: async () => ({ success: true, data: { noted: true } }),
@@ -1093,7 +1093,7 @@ for (const shape of ['text-only', 'trailing'] as const) {
         routed.push({ text: text.trim(), channelId });
         return { delivered: true, channelId };
       },
-      sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
+      sendOutgoingChunk: ({ channelId }: { channelId: string }, _agent: string, _id: string, _index: number, delta: string) => {
         streamed.push({ channelId, delta });
       },
       getDefaultPublishChannel: () => null, isChannelOpen: () => true,
