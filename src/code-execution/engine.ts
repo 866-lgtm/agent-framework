@@ -64,10 +64,11 @@ export type RunState =
    */
   | { kind: 'rejected'; name: string; message: string; stack?: string }
   /**
-   * Once the script was running, an exception escaped its promises and ended the run: a callback
-   * it gave `queueMicrotask` or a `FinalizationRegistry` threw, or one of QuickJS's own jobs
-   * failed, such as for want of memory to settle a promise. The fields are the exception's, as for
-   * `rejected`. Every later call answers the same, and no later result reaches the script.
+   * Once the script was running, an exception escaped its promises and ended the run, even after
+   * its own ending: a callback it gave `queueMicrotask` or a `FinalizationRegistry` threw, or a job
+   * failed in the engine itself; or the engine couldn't settle a call. The fields are the
+   * exception's, as for `rejected`, less any part a stop cut off while it was read. Every later
+   * call answers the same, a stop after it included, and no later result reaches the script.
    */
   | { kind: 'failed'; name: string; message: string; stack?: string }
   /** `interrupt()` returned true while it ran. */
@@ -76,10 +77,12 @@ export type RunState =
 /**
  * What `settle` answers: the run's state; `unfit` when the guest couldn't take the result, for
  * want of memory to copy it in or of memory or stack to parse it, and the call took the child's
- * own error instead; and `dropped` when the result never reached the script, because the run had
- * already ended (`interrupted` or `failed`) or the engine failed before it could deliver it.
- * Without `dropped`, the script got the result or the child's error, even if the run ended in the
- * jobs that followed.
+ * own error instead; and `dropped` when the call never took either, because the run had been
+ * stopped or had failed before this settle (`interrupted` or `failed`), or the step that hands it
+ * over was stopped or failed before it ran. Without `dropped`, the call's promise took the result
+ * or the child's error, and the script's own code runs with it, a `then` getter it put on
+ * Object.prototype included: a stop or failure in that code, or in the jobs after, leaves it
+ * taken. The two are never both set.
  */
 export type SettleState = RunState & { unfit?: true; dropped?: true };
 
@@ -101,7 +104,8 @@ export interface Engine {
    *
    * Once a call has answered the script's ending, later calls answer it again, unless something
    * came after it: a stop answers `interrupted`, a slot's failure throws, and an exception that
-   * escapes the script's promises answers `failed`.
+   * escapes the script's promises answers `failed`. One that escapes the jobs reading the ending
+   * queued is answered by the call that read it, in the ending's place.
    */
   settle(callId: number, ok: boolean, json: string | Uint8Array, unfitJson: string): SettleState;
   /** Frees the engine's runtime, unless the module trapped, which leaves it as it is. Nothing may be called after it. */
@@ -135,19 +139,23 @@ export const MAX_MEMORY_BYTES = 2048 * 1024 * 1024;
  * first in each of the 31, with about two fifths of the host's stack to spare. Bun's stack is
  * larger, and the same limit holds there, so recursion through calls ends the same way on either.
  *
- * Recursion in C that the check barely sees isn't held to it, and under Node crashes the run: a
- * script's text nesting function expressions 300 deep or brackets 700 deep (the parser), a chain
- * of 3,000 iterator helpers (each one's next calls the one before), and the script's own JSON
- * nested 5,000 to 10,000 deep (see MAX_RESULT_DEPTH).
+ * Recursion in C that the check barely sees isn't held to it, and under Node crashes the run, the
+ * host's stack running out: a script's text nesting function expressions 300 deep or brackets 700
+ * deep (the parser), a chain of 3,000 iterator helpers, and the script's own JSON nested about
+ * 10,000 deep (5,000 with V8's optimizing tier alone; see MAX_RESULT_DEPTH). Each iterator helper's
+ * next calls the one before directly, past QuickJS's checks, so under Bun, whose stack is larger,
+ * a chain of 30,000 runs the module's own 1 MiB stack out instead, and the module traps: the stack
+ * sits first in its memory, so an overflow wraps below address 0 to past the memory's end.
  */
 export const MAX_STACK_BYTES = 192 * 1024;
 export const DEFAULT_STACK_BYTES = MAX_STACK_BYTES;
 /**
  * The deepest nesting of arrays and objects a result may have. QuickJS's stack check measures the
  * module's own stack, which the C recursion of JSON's parse and stringify barely uses, so under
- * Node nesting 5,000 to 10,000 deep overflows the host's stack first, and the engine crashes
- * (under Bun, QuickJS's check comes first). A deeper result is unfit, since the call took effect.
- * A script's own data isn't held to this, and nested that deep, it crashes its own run under Node.
+ * Node nesting about 10,000 deep (5,000 with V8's optimizing tier alone) overflows the host's
+ * stack first, and the engine crashes (under Bun, QuickJS's check comes first). A deeper result
+ * is unfit, since the call took effect. A script's own data isn't held to this, and nested that
+ * deep, it crashes its own run under Node.
  */
 export const MAX_RESULT_DEPTH = 2000;
 /** The most of the engine's own stdio a crash's message keeps. */
@@ -156,8 +164,9 @@ const DIAGNOSTICS_CHARS = 4096;
  * The longest ending text the binding decodes, in UTF-8 bytes: V8's longest string, 2^29 - 24
  * characters (Node's `buffer.constants.MAX_STRING_LENGTH`), which a text of this many bytes can't
  * exceed. Node can't decode a longer one. Bun's longest string is 2^31 - 1, and the same bound
- * holds there, so a script ends the same way on either. A longer text is answered as a rejection
- * that gives its length.
+ * holds there, so a script ends the same way on either. A longer text is answered, as the state it
+ * belongs to (`rejected` for the script's own ending, `failed` for an exception that ended the
+ * run), with a RangeError that gives its length.
  */
 const MAX_ENDING_BYTES = 2 ** 29 - 24;
 
@@ -172,6 +181,7 @@ interface Exports {
   engine_start(prelude: number, preludeLen: number, script: number, scriptLen: number, filename: number): number;
   engine_settle(id: number, ok: number, json: number, jsonLen: number, unfit: number, unfitLen: number): number;
   engine_result(): number;
+  engine_state(): number;
   engine_alloc(size: number): number;
   engine_free(ptr: number): void;
   engine_dispose(): void;
@@ -352,8 +362,9 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
       out = fn();
     } catch (err) {
       if (err instanceof EngineError) throw err;
-      // A trap, or an exception in reading what the module returned: either way the module may
-      // have stopped partway, so dispose() leaves it as it is.
+      // A trap, or an exception in reading what the module returned, which it only throws when the
+      // module returned something it couldn't have made whole: either way the module can't be
+      // taken as whole, so dispose() leaves it as it is.
       crashed = true;
       // A slot that failed first is why: the guest ran on, refused, until the module trapped.
       if (slotFailed) return slotFailure(what);
@@ -417,8 +428,8 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
       long: (n: number) => `what the script threw comes to ${n} bytes as text, more than the ${MAX_ENDING_BYTES} the engine reads back; throw something smaller`,
     },
     [FAILED]: {
-      memory: 'out of memory while reading the exception that ended the run',
-      long: (n: number) => `the exception that ended the run comes to ${n} bytes as text, more than the ${MAX_ENDING_BYTES} the engine reads back`,
+      memory: 'out of memory while reading the exception that ended the run; throw something smaller, catch it in the callback that threw it, or let go of data the script no longer needs',
+      long: (n: number) => `the exception that ended the run comes to ${n} bytes as text, more than the ${MAX_ENDING_BYTES} the engine reads back; throw something smaller, or catch it in the callback that threw it`,
     },
   } as const;
   /**
@@ -449,11 +460,16 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
         if (known) return { ...known };
         const r = result();
         // Reading runs the interrupt slot, which can throw, or stop the guest. A stop that lands
-        // while the ending itself is read leaves none to give (the module returns nothing), so
-        // this call answers as any call does in which that happens. One that lands in the jobs
-        // the read queued comes after a whole ending, which this call answers.
+        // while the script's own ending is read leaves none to give (the module returns nothing),
+        // so this call answers as any call does in which that happens. One that lands in the jobs
+        // the read queued comes after a whole ending, which this call answers. An exception
+        // escaping those jobs ends the run after its ending, and is what this call answers. An
+        // exception that ended the run is read with the parts a stop cut off left out.
         if (slotFailed) return slotFailure(what);
-        if (!r && stopped) return { kind: 'interrupted' };
+        if (code !== FAILED) {
+          if (ex.engine_state() === FAILED) return toState(FAILED, what);
+          if (!r && stopped) return { kind: 'interrupted' };
+        }
         const kind = code === FAILED ? 'failed' : 'rejected';
         const state: RunState = !r ? { kind, name: 'InternalError', message: unread[code].memory }
           : 'tooLong' in r ? { kind, name: 'RangeError', message: unread[code].long(r.tooLong) }

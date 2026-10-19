@@ -75,8 +75,10 @@ done
 "$CC" "${CFLAGS[@]}" -Werror -c interface.c -o "$build/interface.o"
 
 # A reactor whose memory the host makes, so the host sets its maximum, the child's budget.
-# The stack sits first in memory, so QuickJS's limit beneath it is measured from address 0
-# and an overflow past it traps rather than writing over data.
+# The stack sits first in memory, at [0, 1 MiB), growing down from its top. QuickJS's limit is
+# set below the top as engine_init finds it, 192 KiB at most, and recursion its checks don't see
+# that runs past the stack's bottom wraps below address 0, past the memory's end, and traps
+# rather than writing over data.
 "$CC" --target=wasm32-wasip1 --sysroot="$SYSROOT" -Oz -flto -mexec-model=reactor \
   -lwasi-emulated-process-clocks -lwasi-emulated-signal \
   -Wl,--import-memory -Wl,--stack-first -Wl,-z,stack-size=1048576 -Wl,--strip-debug \

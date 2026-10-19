@@ -49,10 +49,11 @@ enum {
     ENGINE_HOST_FAILED = 4,  /* an import reported failure: the run is over, and the host refuses
                                 the guest's later calls and output and stops it at its next
                                 interrupt check */
-    ENGINE_FAILED = 5,       /* once the script was running, an exception escaped its promises: a
-                                job failed, or a callback it gave queueMicrotask or a
-                                FinalizationRegistry threw. The run is over, and engine_result has
-                                the exception */
+    ENGINE_FAILED = 5,       /* once the script was running, an exception escaped its promises (a
+                                callback it gave queueMicrotask or a FinalizationRegistry threw,
+                                or a job failed), or the engine failed to settle a call. The run
+                                is over, every later call answers this, and engine_result has the
+                                exception */
     ENGINE_MISUSE = -1,      /* called out of order, or with a malformed buffer */
     ENGINE_NO_MEMORY = -2,   /* the engine couldn't allocate its own state */
     ENGINE_UNKNOWN_CALL = -3 /* engine_settle named no pending call */
@@ -60,8 +61,9 @@ enum {
 /* Or'd into engine_settle's state when the result didn't fit and the call took the host's
    rejection instead. */
 #define ENGINE_UNFIT 16
-/* Or'd into engine_settle's state when the result never reached the script: the run had ended
-   before this settle, or the engine failed before it could deliver it. */
+/* Or'd into engine_settle's state when the call's promise never took the result, nor the host's
+   rejection: the run had been stopped or had failed before this settle, or the call that would
+   have handed it over was stopped or failed before it ran. Never with ENGINE_UNFIT. */
 #define ENGINE_DROPPED 32
 
 static JSRuntime *rt;
@@ -314,7 +316,7 @@ static void run_jobs(void) {
                FinalizationRegistry callback passes its throw on, and so does a failure of the
                job machinery itself, or an uncatchable error. */
             JSValue exc = JS_GetException(job_ctx);
-            if (interrupted)
+            if (interrupted || host_failed)
                 JS_FreeValue(ctx, exc);
             else
                 fail_with(exc, ENGINE_FAILED);
@@ -324,12 +326,14 @@ static void run_jobs(void) {
 }
 
 static int state(void) {
+    /* What ended the run comes first: nothing records a failure once the guest is stopped or an
+       import has failed, so a failure came before either, and stays the answer after one. */
+    if (failed)
+        return failure_state;
     if (interrupted)
         return ENGINE_INTERRUPTED;
     if (host_failed)
         return ENGINE_HOST_FAILED;
-    if (failed)
-        return failure_state;
     switch (JS_PromiseState(ctx, completion)) {
     case JS_PROMISE_FULFILLED:
         return ENGINE_FULFILLED;
@@ -467,15 +471,23 @@ static int settle(uint32_t id, int ok, char **json, uint32_t json_len, char **un
     if (JS_IsException(fn)) {
         JS_FreeValue(ctx, value);
         fail_with(JS_GetException(ctx), ENGINE_FAILED);
-        return state() | ENGINE_DROPPED | (too_large ? ENGINE_UNFIT : 0);
+        return state() | ENGINE_DROPPED;
     }
     JSValue r = JS_Call(ctx, fn, JS_UNDEFINED, 1, (JSValueConst *)&value);
     JS_FreeValue(ctx, fn);
     JS_FreeValue(ctx, value);
-    if (JS_IsException(r))
-        fail_with(JS_GetException(ctx), ENGINE_FAILED);
-    else
-        JS_FreeValue(ctx, r);
+    if (JS_IsException(r)) {
+        /* A promise's resolve and reject functions don't throw once they run (what reading a
+           result's `then` throws rejects the promise), so the call never ran: the interrupt check
+           on its way in stopped the guest, or there was no stack left to make it. */
+        JSValue exc = JS_GetException(ctx);
+        if (interrupted || host_failed)
+            JS_FreeValue(ctx, exc);
+        else
+            fail_with(exc, ENGINE_FAILED);
+        return state() | ENGINE_DROPPED;
+    }
+    JS_FreeValue(ctx, r);
     run_jobs();
     int st = state();
     return too_large ? st | ENGINE_UNFIT : st;
@@ -489,9 +501,11 @@ static int settle(uint32_t id, int ok, char **json, uint32_t json_len, char **un
    script, which an error at the call's await would hide. A result nested deeper than the
    binding's MAX_RESULT_DEPTH never gets here: under Node, a parse nested about 10,000 deep (5,000
    with V8's optimizing tier alone) overflows the host's stack before QuickJS's own check sees the
-   recursion, and the binding refuses results well short of that. When the run had already ended,
-   or the engine fails before it can deliver the result, the state answered has ENGINE_DROPPED
-   set: the result never reached the script.
+   recursion, and the binding refuses results well short of that. When the run had been stopped
+   or had failed before this settle, or the call that hands the result over is stopped or fails
+   before it runs, the state answered has ENGINE_DROPPED set: the call's promise never took the
+   result. Once it has, the script's own code runs with it, a `then` getter the script put on
+   Object.prototype included, and a stop or failure in that code leaves the result handed over.
 
    json and unfit are the host's buffers from engine_alloc, each null or ending in a NUL at [len]
    as JS_ParseJSON requires, and this frees both, whatever it returns: the result's copy as soon
@@ -629,14 +643,16 @@ static uint8_t *read_ending(int st) {
    JSON.stringify leaves out), no text. Kind 1: fulfilled, the value's JSON. Kind 2: an error, as
    JSON {name?, message?, stack?}: what the script threw, why its value couldn't be stringified,
    or the exception that ended the run.
-   Returns 0 in any other state, when it can't allocate, or when a stop lands while the ending is
-   read, which leaves none to give. The ending is fixed before it's read. The script's own code
-   that serializing runs (a toJSON, a getter), and the jobs it queues, which run before this
-   returns, can't reach the host; a reaction it attaches to a promise still pending runs when that
-   settles, as the script's other continuations do after its ending. A stop or a failure in those
-   jobs comes after the ending was read, so this returns the ending, and later states say what
-   came after. Data nested deeper than the host's stack allows can overflow it in
-   JS_JSONStringify, which throws out of the module: the binding reports that as a crash. */
+   Returns 0 in any other state, when it can't allocate, or when a stop lands while the script's
+   own ending is read, which leaves none to give. The ending is fixed before it's read. The
+   script's own code that serializing runs (a toJSON, a getter), and the jobs it queues, which run
+   before this returns, can't reach the host; a reaction it attaches to a promise still pending
+   runs when that settles, as the script's other continuations do after its ending. A stop in
+   those jobs comes after the ending was read, so this returns the ending; a failure there ends
+   the run after its ending, which engine_state then answers. An exception that ended the run is
+   what ended it however its read goes, so a stop while it's read leaves out the parts the stop
+   cut off, and the rest is returned. Data nested deeper than the host's stack allows can overflow
+   it in JS_JSONStringify, which throws out of the module: the binding reports that as a crash. */
 EXPORT("engine_result")
 uint8_t *engine_result(void) {
     int st = state();
@@ -644,7 +660,7 @@ uint8_t *engine_result(void) {
         return NULL;
     reading = true;
     uint8_t *buf = read_ending(st);
-    if (interrupted) {
+    if (interrupted && st != ENGINE_FAILED) {
         /* What was read is the stop's error, not the ending. */
         limited_free(NULL, buf);
         buf = NULL;
@@ -653,6 +669,14 @@ uint8_t *engine_result(void) {
     }
     reading = false;
     return buf;
+}
+
+/* The run's state as engine_start and engine_settle answer it, for the host to read again after
+   engine_result: the jobs reading an ending queues run before that returns, and an exception
+   escaping them ends the run after its ending. */
+EXPORT("engine_state")
+int engine_state(void) {
+    return started ? state() : ENGINE_MISUSE;
 }
 
 /* Buffers the host fills for engine_start and engine_settle. The host frees engine_start's after

@@ -439,17 +439,20 @@ test('a module trap after a slot\'s failure the script caught reports the slot\'
 test('an ending the module can\'t read out is answered as out of memory, and that answer is kept', async () => {
   // The module can't allocate the ending's text the first time it's read, which can't be made to
   // happen on cue; the binding mustn't read it again, which would run the script's serializing
-  // code again and could answer differently.
-  for (const [script, message] of [
-    ['tool("a"); tool("b"); ({ ok: true })', 'out of memory while serializing the script\'s return value; return less, or let go of data the script no longer needs'],
-    ['tool("a"); tool("b"); throw new Error("x")', 'out of memory while reading what the script threw; throw something smaller, such as an Error with a shorter message, or let go of data the script no longer needs'],
-  ]) {
+  // code again and could answer differently. A run that failed stays failed, and its later
+  // results are dropped.
+  for (const [script, kind, message] of [
+    ['tool("a"); tool("b"); ({ ok: true })', 'rejected', 'out of memory while serializing the script\'s return value; return less, or let go of data the script no longer needs'],
+    ['tool("a"); tool("b"); throw new Error("x")', 'rejected', 'out of memory while reading what the script threw; throw something smaller, such as an Error with a shorter message, or let go of data the script no longer needs'],
+    ['tool("a"); tool("b"); queueMicrotask(() => { throw new TypeError("x") }); 1', 'failed', 'out of memory while reading the exception that ended the run; throw something smaller, catch it in the callback that threw it, or let go of data the script no longer needs'],
+  ] as const) {
     let reads = 0;
     const { e } = await engineAround((ex) => ({ engine_result: () => (++reads === 1 ? 0 : ex.engine_result()) }));
-    const expected = { kind: 'rejected', name: 'InternalError', message };
+    const expected = { kind, name: 'InternalError', message };
+    const later = kind === 'failed' ? { ...expected, dropped: true } : expected;
     assert.deepEqual(e.start(PRELUDE, script, 's.js'), expected, script);
-    assert.deepEqual(e.settle(1, true, '1', UNFIT), expected, script);
-    assert.deepEqual(e.settle(2, true, '2', UNFIT), expected, script);
+    assert.deepEqual(e.settle(1, true, '1', UNFIT), later, script);
+    assert.deepEqual(e.settle(2, true, '2', UNFIT), later, script);
     assert.equal(reads, 1, script);
     e.dispose();
   }
@@ -458,11 +461,12 @@ test('an ending the module can\'t read out is answered as out of memory, and tha
 test('an ending longer than the binding can decode is answered with its length, not a crash', async () => {
   // The module's buffer here claims a text past V8's longest string; a real one needs a budget
   // of gigabytes. The buffer is freed all the same.
-  for (const [script, length, message] of [
-    ['({ ok: true })', 600_000_000, 'the script\'s return value comes to 600000000 bytes as text, more than the 536870888 the engine reads back; return less'],
-    ['throw new Error("x")', 600_000_000, 'what the script threw comes to 600000000 bytes as text, more than the 536870888 the engine reads back; throw something smaller'],
+  for (const [script, length, kind, message] of [
+    ['({ ok: true })', 600_000_000, 'rejected', 'the script\'s return value comes to 600000000 bytes as text, more than the 536870888 the engine reads back; return less'],
+    ['throw new Error("x")', 600_000_000, 'rejected', 'what the script threw comes to 600000000 bytes as text, more than the 536870888 the engine reads back; throw something smaller'],
+    ['queueMicrotask(() => { throw new TypeError("x") }); 1', 600_000_000, 'failed', 'the exception that ended the run comes to 600000000 bytes as text, more than the 536870888 the engine reads back; throw something smaller, or catch it in the callback that threw it'],
     // One byte past the bound is refused too.
-    ['({ ok: true })', 536_870_889, 'the script\'s return value comes to 536870889 bytes as text, more than the 536870888 the engine reads back; return less'],
+    ['({ ok: true })', 536_870_889, 'rejected', 'the script\'s return value comes to 536870889 bytes as text, more than the 536870888 the engine reads back; return less'],
   ] as const) {
     let ptr = 0;
     const freed: number[] = [];
@@ -476,7 +480,7 @@ test('an ending longer than the binding can decode is answered with its length, 
       },
       engine_free: (p) => { freed.push(p); return ex.engine_free(p); },
     }));
-    assert.deepEqual(e.start(PRELUDE, script, 's.js'), { kind: 'rejected', name: 'RangeError', message }, script);
+    assert.deepEqual(e.start(PRELUDE, script, 's.js'), { kind, name: 'RangeError', message }, script);
     assert.ok(ptr !== 0 && freed.includes(ptr), `${script}: the buffer is freed`);
     e.dispose();
   }
@@ -516,6 +520,38 @@ test('an exception that escapes the script\'s promises ends the run as failed, w
   const b = await engine();
   const t = b.e.start(PRELUDE, 'queueMicrotask(() => { throw new RangeError("after") }); 1', 's.js');
   assert.deepEqual([t.kind, (t as { name?: string }).name, (t as { message?: string }).message], ['failed', 'RangeError', 'after']);
+  b.e.dispose();
+});
+
+test('an exception that escapes the jobs reading the ending queued ends the run as failed, in the ending\'s place', async () => {
+  // With no call left to settle, the call that read the ending is the only answer the run gets.
+  const a = await engine();
+  const s = a.e.start(PRELUDE, '({ toJSON() { queueMicrotask(() => { throw new TypeError("in the read") }); return 1 } })', 's.js');
+  assert.deepEqual([s.kind, (s as { name?: string }).name, (s as { message?: string }).message], ['failed', 'TypeError', 'in the read']);
+  a.e.dispose();
+  // The same for what the script threw, read through a getter.
+  const b = await engine();
+  const t = b.e.start(PRELUDE, 'throw { get message() { queueMicrotask(() => { throw new RangeError("read") }); return "own" } }', 's.js');
+  assert.deepEqual([t.kind, (t as { name?: string }).name, (t as { message?: string }).message], ['failed', 'RangeError', 'read']);
+  b.e.dispose();
+});
+
+test('a stop while the exception that ended the run is read leaves the run failed, with the parts it cut off left out', async () => {
+  // The thrown object's name getter spins until the stop; its message is plain data. The run's
+  // own ending, kept first, doesn't stand: the failure came after it.
+  const thrower = 'queueMicrotask(() => { throw { get name() { for (;;) {} }, message: "m" } })';
+  let checks = 0;
+  const a = await engine({ interrupt: () => ++checks > 100 });
+  assert.equal(fulfilled(a.e.start(PRELUDE, `tool("a"); tool("b").then(() => ${thrower}); 1`, 's.js')), 1);
+  assert.deepEqual(a.e.settle(2, true, '2', UNFIT), { kind: 'failed', name: '', message: 'm' });
+  // Every later call answers it too, though the guest is stopped.
+  assert.deepEqual(a.e.settle(1, true, '1', UNFIT), { kind: 'failed', name: '', message: 'm', dropped: true });
+  a.e.dispose();
+  // Read out not at all (the module here gives nothing back), it's still the failure.
+  checks = 0;
+  const b = await engineAround((ex) => ({ engine_result: () => { ex.engine_free(ex.engine_result()); return 0; } }), { interrupt: () => ++checks > 100 });
+  const t = b.e.start(PRELUDE, `${thrower}; 1`, 's.js');
+  assert.deepEqual([t.kind, (t as { name?: string }).name], ['failed', 'InternalError']);
   b.e.dispose();
 });
 
@@ -575,9 +611,29 @@ test('a result\'s copy is freed once it\'s parsed, so the script\'s code after t
   assert.ok(tiny - big < 48, `${tiny} steps after a tiny result, ${big} after a 2 MiB one`);
 });
 
+test('the child\'s error\'s copy is freed once it\'s parsed, so the script\'s code after the call has its memory back', async () => {
+  // A result nested too deeply is unfit, and the call gets the child's error, here with a 2 MiB
+  // message. A script filling memory in 64 KiB steps after it gets as many steps as after a small
+  // one, less the 32 the message holds; a copy still held would take 32 more.
+  const deep = '['.repeat(MAX_RESULT_DEPTH + 1) + ']'.repeat(MAX_RESULT_DEPTH + 1);
+  async function steps(message: string) {
+    const { e } = await engine({}, { memoryMaxBytes: 16 * MiB });
+    e.start(PRELUDE, 'let m; try { await tool("t") } catch (err) { m = err.message } const keep = []; try { for (;;) keep.push("y".repeat(65536)) } catch {} [keep.length, m.length]', 's.js');
+    const s = e.settle(1, true, deep, JSON.stringify({ name: 'ResultTooLarge', message }));
+    assert.equal(s.unfit, true);
+    const [n, length] = fulfilled(s) as [number, number];
+    assert.equal(length, message.length);
+    e.dispose();
+    return n;
+  }
+  const small = await steps('z');
+  const big = await steps('z'.repeat(2 * MiB));
+  assert.ok(small - big < 48, `${small} steps after a small error, ${big} after a 2 MiB one`);
+});
+
 test('settling calls frees both copies, whether the result reaches the script or no call has its id', async () => {
-  // Measured through the module's allocator, as the largest block that fits: a copy kept on each
-  // of 2,000 settles of a 1 KiB result would take 2 MiB or more.
+  // Measured through the module's allocator, as the largest block that fits: either copy kept on
+  // each of 1,000 settles, with a 1 KiB result and a 1 KiB error, would take 1 MiB or more.
   let ex!: Exports;
   const { e } = await engineAround((real) => { ex = real; return {}; }, {}, { memoryMaxBytes: 16 * MiB });
   const largest = () => {
@@ -591,11 +647,12 @@ test('settling calls frees both copies, whether the result reaches the script or
   };
   e.start(PRELUDE, 'for (;;) await tool("t")', 's.js');
   const result = JSON.stringify('r'.repeat(1024));
+  const unfit = JSON.stringify({ name: 'ResultTooLarge', message: 'u'.repeat(1024) });
   let id = 1;
-  for (let i = 0; i < 200; i++) e.settle(id++, true, result, UNFIT);
+  for (let i = 0; i < 200; i++) e.settle(id++, true, result, unfit);
   const before = largest();
-  for (let i = 0; i < 1000; i++) e.settle(id++, true, result, UNFIT);
-  for (let i = 0; i < 1000; i++) assert.throws(() => e.settle(1_000_000 + i, true, result, UNFIT), /no pending call/);
+  for (let i = 0; i < 1000; i++) e.settle(id++, true, result, unfit);
+  for (let i = 0; i < 1000; i++) assert.throws(() => e.settle(1_000_000 + i, true, result, unfit), /no pending call/);
   const after = largest();
   assert.ok(before - after < 64 * 1024, `${before - after} bytes less room after 2,000 settles`);
   e.dispose();
@@ -603,6 +660,8 @@ test('settling calls frees both copies, whether the result reaches the script or
 
 test('an ending of exactly MAX_ENDING_BYTES is read, not refused', async () => {
   // The module's buffer here only claims that length, so reading it fails, which a refusal wouldn't.
+  // What the module returned can't be read, so dispose() leaves the module as it is.
+  let disposals = 0;
   const { e } = await engineAround((ex, imports) => ({
     engine_result: () => {
       const ptr = ex.engine_alloc(8);
@@ -611,9 +670,11 @@ test('an ending of exactly MAX_ENDING_BYTES is read, not refused', async () => {
       view.setUint32(ptr + 4, 536_870_888, true);
       return ptr;
     },
+    engine_dispose: () => { disposals++; ex.engine_dispose(); return 0; },
   }));
   assert.throws(() => e.start(PRELUDE, '1', 's.js'), (err: unknown) => err instanceof EngineError && /the engine crashed/.test(err.message));
   e.dispose();
+  assert.equal(disposals, 0);
 });
 
 test('a dispose() that traps throws an EngineError, and the engine is disposed all the same', async () => {
