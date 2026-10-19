@@ -102,7 +102,7 @@ export interface CoalescedOccurrence<E = unknown> {
    *  the agent may never have been shown (CoalescerHost.isUnshown), or the
    *  first delivery of a batch that opened on a first view (its render, or
    *  a plain occurrence that drops it). No other path sets it. */
-  replacesUnread?: boolean;
+  firstView?: boolean;
 }
 
 export interface DeferredNotice { eventId: string; timestamp: string; data?: unknown }
@@ -163,7 +163,7 @@ export interface AssemblyResult {
 interface SubjectState<E> {
   history: 'none' | 'some' | 'unknown';
   /** `firstView`: this occupant is the agent's first view of the subject,
-   *  as `replacesUnread` defines it, so nothing of the subject has been read:
+   *  as `firstView` defines it, so nothing of the subject has been read:
    *  a read takes the occupant away. Unknown counts as not one. In memory
    *  only: a snapshot's occupant comes back as read. */
   occupant?: { eventId: string; placement: CoalescingPlacement; firstView?: true };
@@ -196,7 +196,7 @@ export interface CoalescingSnapshot {
     /** The subject's first view has ended (SubjectState.firstViewEnded). A
      *  snapshot written before this field existed has none and reads as not
      *  ended, so once after an upgrade a subject whose first view had
-     *  already ended can give one delivery a spurious `replacesUnread`. */
+     *  already ended can give one delivery a spurious `firstView`. */
     firstViewEnded?: true;
     /** `firstView` only on a batch that wasn't rendering: one that was may
      *  have been shown. */
@@ -408,12 +408,12 @@ export class PushCoalescer<E = unknown> {
    *  written. An uncommitted receipt deduplicates effects but is not an
    *  acknowledgement until a commit succeeds. `firstView`: the admission it
    *  records handed its occurrence to the host's delivery marked as the
-   *  agent's first view (`replacesUnread`), whether or not the host placed
+   *  agent's first view (`firstView`), whether or not the host placed
    *  it, so a retry answered from it says so too. Kept in memory only: a
    *  receipt restored from a snapshot or the crash-window bridge reads as no
    *  first view. */
   private readonly receipts = new Map<string, ReceiptEntry>();
-  /** Set by a delivery that carries `replacesUnread`. admit() clears it before
+  /** Set by a delivery that carries `firstView`. admit() clears it before
    *  an admission's effects and reads it after them; every delivery runs
    *  under the lock, so between the two it is that admission's alone. */
   private deliveredFirstView = false;
@@ -472,10 +472,10 @@ export class PushCoalescer<E = unknown> {
     return (this.rendersInFlight.get(serverId) ?? 0) > 0;
   }
 
-  /** The host's delivery, noting one that carries `replacesUnread` for the
+  /** The host's delivery, noting one that carries `firstView` for the
    *  receipt of the admission it belongs to (deliveredFirstView). */
   private deliver(...args: Parameters<CoalescerHost<E>['deliver']>): ReturnType<CoalescerHost<E>['deliver']> {
-    if (args[0].replacesUnread) this.deliveredFirstView = true;
+    if (args[0].firstView) this.deliveredFirstView = true;
     return this.host.deliver(...args);
   }
 
@@ -718,7 +718,7 @@ export class PushCoalescer<E = unknown> {
         // The replacement follows the prior delivery's audience (§3.2).
         const placement = await this.deliver({
           ...occurrence, deliverTo: prior.placement.agent,
-          ...(firstView ? { replacesUnread: true } : {}),
+          ...(firstView ? { firstView: true } : {}),
         });
         state.occupant = placement ? { eventId: occurrence.eventId, placement, ...(firstView ? { firstView: true as const } : {}) } : undefined;
         if (placement) state.audienceAgent = placement.agent;
@@ -736,7 +736,7 @@ export class PushCoalescer<E = unknown> {
     // that view has ended, and so is an occurrence that takes a first-view
     // batch's place (a batch's own first view ends with the subject's).
     const firstView = hadBatch ? batchFirstView && state.history === 'none' : outcome === 'first' && !state.firstViewEnded;
-    const placement = await this.deliver(hadBatch && firstView ? { ...occurrence, replacesUnread: true } : occurrence);
+    const placement = await this.deliver(hadBatch && firstView ? { ...occurrence, firstView: true } : occurrence);
     state.occupant = placement ? { eventId: occurrence.eventId, placement, ...(firstView ? { firstView: true as const } : {}) } : undefined;
     if (placement) state.audienceAgent = placement.agent;
     return outcome;
@@ -961,7 +961,7 @@ export class PushCoalescer<E = unknown> {
         // The batch's first delivery is the agent's first view while nothing
         // of the subject has been read and no other version of it is placed.
         const firstView = batch.firstView === true && state.history === 'none' && !state.occupant;
-        const placement = await this.deliver({ ...occurrence, timestamp, content, ...(firstView ? { replacesUnread: true } : {}) }, content, assemblingFor);
+        const placement = await this.deliver({ ...occurrence, timestamp, content, ...(firstView ? { firstView: true } : {}) }, content, assemblingFor);
         if (placement?.deferredId) {
           // Landed in another agent's deferred queue (its turn is alive): still
           // unread there, so it stays replaceable and withdrawable. The turn

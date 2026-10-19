@@ -292,7 +292,7 @@ const silenceCauseOf = (calls: Array<{ name: string; input?: unknown }>): 'send'
  * sees: when the coalescer delivers a version of a message of which no
  * version may have been shown to the agent (still queued, or stored above
  * every reader's shown watermark), the host marks the delivery
- * (`replacesUnread`), and an edit so marked counts as the message it
+ * (`firstView`), and an edit so marked counts as the message it
  * replaced. A doubt counts as shown, so a message a scalar watermark covers
  * without having been shown gets no mark. A reaction or deletion so marked
  * is still a notice about that message and stays a marker. An edit of a
@@ -304,7 +304,7 @@ const isConversationalInjection = (metadata?: MessageMetadata): boolean => {
   if (!metadata) return true;
   const m = metadata as Record<string, unknown>;
   if (m.system === true) return false;
-  if (isMarkerTagged(m.tags, m.replacesUnread === true)) return false;
+  if (isMarkerTagged(m.tags, m.firstView === true)) return false;
   return true;
 };
 
@@ -587,8 +587,8 @@ interface CoalescedChannelEvent {
   /** RFC-006 §3.2: deliver into this agent only (replacement / notice audience). */
   deliverTo?: string;
   /** The coalescer's mark: the agent's first view of the message (see
-   *  CoalescedOccurrence.replacesUnread). */
-  replacesUnread?: boolean;
+   *  CoalescedOccurrence.firstView). */
+  firstView?: boolean;
   /** Host acceptance time (epoch ms), stamped where the message was admitted. */
   acceptedAt?: number;
   /** Framework-owned source envelope, frozen at a coalesced occurrence's
@@ -11355,7 +11355,7 @@ export class AgentFramework {
     eventId?: string;
     assemblingFor?: string;
     deliverTo?: string;
-    replacesUnread?: boolean;
+    firstView?: boolean;
     acceptedAt?: number;
     inboundSource?: InboundSource;
   }): Promise<CoalescingPlacement | undefined> {
@@ -11382,8 +11382,8 @@ export class AgentFramework {
     if (event.threadId) metadata.threadId = event.threadId;
     if (event.tags) metadata.tags = event.tags;
     // The coalescer's mark is the host's alone: a server's own is dropped.
-    if (event.replacesUnread === true) metadata.replacesUnread = true;
-    else delete metadata.replacesUnread;
+    if (event.firstView === true) metadata.firstView = true;
+    else delete metadata.firstView;
     // The inbound source envelope (mcpl/inbound-source.ts): frozen at the
     // occurrence's acceptance when the coalescer delivers, else stamped now
     // from this event. Written after the adapter's metadata, so an adapter
@@ -12621,7 +12621,7 @@ export class AgentFramework {
   ): Promise<CoalescingPlacement | undefined> {
     const coalescingSubject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
     const narrowing = occ.deliverTo ? { deliverTo: occ.deliverTo } : {};
-    const firstView = occ.replacesUnread ? { replacesUnread: true } : {};
+    const firstViewMark = occ.firstView ? { firstView: true } : {};
     // The envelope frozen at acceptance travels unchanged; this delivery only
     // adds the fact that it carries the rendered body.
     const frozenSource = (source: InboundSource | undefined): { inboundSource?: InboundSource } =>
@@ -12629,7 +12629,7 @@ export class AgentFramework {
         ? { inboundSource: materialized && source.kind !== 'surface' ? { ...source, materialized: true } : source }
         : {};
     if (occ.event.lane === 'channel') {
-      const event = { ...occ.event.event, coalescingSubject, ...narrowing, ...firstView, ...(assemblingFor ? { assemblingFor } : {}) };
+      const event = { ...occ.event.event, coalescingSubject, ...narrowing, ...firstViewMark, ...(assemblingFor ? { assemblingFor } : {}) };
       const placement = await this.handleMcplChannelIncoming(event);
       await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
       return placement;
@@ -12659,7 +12659,7 @@ export class AgentFramework {
         coalescingSubject,
         eventId: occ.eventId,
         ...narrowing,
-        ...firstView,
+        ...firstViewMark,
         ...(assemblingFor ? { assemblingFor } : {}),
         ...frozenSource(push.inboundSource),
       };
@@ -12677,7 +12677,7 @@ export class AgentFramework {
       // assembled; the wake that started it is not repeated.
       ...(assemblingFor ? { assemblingFor, triggerInference: false } : {}),
       ...(occ.deliverTo ? { targetAgents: [occ.deliverTo] } : {}),
-      ...firstView,
+      ...firstViewMark,
       ...frozenSource(occ.event.event.inboundSource),
     };
     const placement = this.handleMcplPushEvent(event);
@@ -12861,8 +12861,8 @@ export class AgentFramework {
       ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
     };
     // The coalescer's mark is the host's alone: a server's own is dropped.
-    if (event.replacesUnread === true) metadata.replacesUnread = true;
-    else delete metadata.replacesUnread;
+    if (event.firstView === true) metadata.firstView = true;
+    else delete metadata.firstView;
     // `origin.channelId` is the server-internal raw id (a bare Discord
     // snowflake) — unroutable as a locus and unresolvable by the agent. Store
     // the composite MCPL id instead wherever we can derive it, so anything

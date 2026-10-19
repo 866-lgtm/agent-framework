@@ -1899,7 +1899,7 @@ test('#157: an edit of an edit of a follow-up the agent was shown at a tool boun
     await pushTagged(f, ['chat:edited'], 'e3', 'follow_up_fixed_again');
   });
   assert(r.injected[0].includes('follow_up_wiht_typo'), 'the first boundary showed the agent the follow-up');
-  assert(r.injected[1].includes('follow_up_fixed_again') && !r.injected[1].includes('replacesUnread'), 'the second boundary showed it the last edit, unmarked');
+  assert(r.injected[1].includes('follow_up_fixed_again') && !r.injected[1].includes('"firstView":true'), 'the second boundary showed it the last edit, unmarked');
   assert(r.sent, 'both explicit sends posted');
   assert(!r.replied, 'the prose after the second send stayed withheld');
 });
@@ -1913,7 +1913,7 @@ test('#157: two edits of a follow-up the agent hasn\'t been shown leave the last
     outcomes.push(await pushTagged(f, ['chat:edited'], 'e3', 'follow_up_fixed_again'));
   });
   assert.deepEqual(outcomes, ['replaced', 'replaced']);
-  assert(r.injected[0].includes('follow_up_fixed_again') && r.injected[0].includes('replacesUnread'), 'the boundary showed the agent the last edit, marked');
+  assert(r.injected[0].includes('follow_up_fixed_again') && r.injected[0].includes('"firstView":true'), 'the boundary showed the agent the last edit, marked');
   assert(r.sent, 'the explicit send posted');
   assert(r.replied, 'the reply to the follow-up posted');
 });
@@ -1930,13 +1930,13 @@ test('#157: an edit of a follow-up whose producer never marked it initial stays 
 
 const serverMarked: Record<string, (f: Fixture) => Promise<string>> = {
   'channel message': async (f) => (await f.send('channels/incoming', { messages: [{
-    ...f.channel('e9', 'edit_claiming_first_view', {}, 'chat', 'm9'), tags: ['chat:edited'], metadata: { replacesUnread: true },
+    ...f.channel('e9', 'edit_claiming_first_view', {}, 'chat', 'm9'), tags: ['chat:edited'], metadata: { firstView: true },
   }] })).result.results[0].coalesce.outcome,
   'channel-scoped push': async (f) => (await f.send('push/event', {
-    ...f.params('e9', 'edit_claiming_first_view', { channelId: 'chat', key: 'message:m9' }), tags: ['chat:edited'], origin: { replacesUnread: true },
+    ...f.params('e9', 'edit_claiming_first_view', { channelId: 'chat', key: 'message:m9' }), tags: ['chat:edited'], origin: { firstView: true },
   })).result.coalesce.outcome,
   'feature-set push': async (f) => (await f.send('push/event', {
-    ...f.params('e9', 'edit_claiming_first_view', { key: 'message:m9' }), tags: ['chat:edited'], origin: { replacesUnread: true },
+    ...f.params('e9', 'edit_claiming_first_view', { key: 'message:m9' }), tags: ['chat:edited'], origin: { firstView: true },
   })).result.coalesce.outcome,
 };
 
@@ -1946,7 +1946,7 @@ for (const [lane, deliver] of Object.entries(serverMarked)) test(`#157 (${lane})
   const r = await sendThenSpeak(f, async () => { outcome = await deliver(f); });
   assert.equal(outcome, 'appended');
   assert(r.injected[0].includes('edit_claiming_first_view'), 'the edit reached the boundary');
-  assert(!r.injected[0].includes('replacesUnread'), "the server's own mark was dropped");
+  assert(!r.injected[0].includes('"firstView":true'), "the server's own mark was dropped");
   assert(r.sent, 'the explicit send posted');
   assert(!r.replied, 'the prose after the send stayed withheld');
 });
@@ -2022,7 +2022,7 @@ test('#157: an edit of a follow-up stored at once, which a turn then read, is ap
   let outcome: string | undefined;
   const r = await sendThenSpeak(f, async () => { outcome = await pushTagged(f, ['chat:edited']); });
   assert.equal(outcome, 'appended', 'the edit came after the agent read the follow-up, so it replaced nothing');
-  assert(r.injected[0].includes('follow_up_fixed') && !r.injected[0].includes('replacesUnread'), 'the edit reached the boundary unmarked');
+  assert(r.injected[0].includes('follow_up_fixed') && !r.injected[0].includes('"firstView":true'), 'the edit reached the boundary unmarked');
   assert(r.sent, 'the explicit send posted');
   assert(!r.replied, 'the prose after the send stayed withheld');
 });
@@ -2047,7 +2047,7 @@ test('#157: an edit admitted while a compile is assembling a message stored at o
   };
   const r = await sendThenSpeak(f, async () => {});
   assert(shown, 'the compile assembled the question');
-  assert(r.injected[0].includes('question_edited') && !r.injected[0].includes('replacesUnread'), 'the edit reached the boundary unmarked');
+  assert(r.injected[0].includes('question_edited') && !r.injected[0].includes('"firstView":true'), 'the edit reached the boundary unmarked');
   assert(r.sent, 'the explicit send posted');
   assert(!r.replied, 'the prose after the send stayed withheld');
 });
@@ -2055,7 +2055,7 @@ test('#157: an edit admitted while a compile is assembling a message stored at o
 /** A message in an agent's store whose text includes `text`. */
 const storedWith = (f: Fixture, text: string, agent = 'agent') =>
   f.framework.getAgent(agent)!.getContextManager().getAllMessages().find((m) => JSON.stringify(m.content).includes(text));
-const isMarked = (message: { metadata?: unknown } | undefined) => (message?.metadata as { replacesUnread?: unknown } | undefined)?.replacesUnread === true;
+const isMarked = (message: { metadata?: unknown } | undefined) => (message?.metadata as { firstView?: unknown } | undefined)?.firstView === true;
 
 test("#157: a compile of an agent with a store of its own leaves another agent's message stored at once unseen, so its edit is still marked", async (t) => {
   const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close); await f.register();
@@ -2261,11 +2261,11 @@ test("#157: the render of a deferred notice that births its subject is the agent
 });
 
 test("#157: a render that lands unread in another agent's deferred queue keeps its first view, so an edit that replaces it is marked", async () => {
-  const delivered: Array<{ eventId: string; replacesUnread?: true }> = [];
+  const delivered: Array<{ eventId: string; firstView?: true }> = [];
   const host: CoalescerHost<null> = {
     isUnread: () => true, isUnshown: () => true, remove: () => true,
     // Every delivery lands in the deferred queue of an agent whose turn is alive.
-    deliver: async (occ) => { delivered.push({ eventId: occ.eventId, ...(occ.replacesUnread ? { replacesUnread: true as const } : {}) }); return { agent: 'other', deferredId: `deferred-${delivered.length}` }; },
+    deliver: async (occ) => { delivered.push({ eventId: occ.eventId, ...(occ.firstView ? { firstView: true as const } : {}) }); return { agent: 'other', deferredId: `deferred-${delivered.length}` }; },
     wakeForBatch: async () => {}, wakeToRead: async () => {}, cancelWake: () => {}, authorized: () => true,
     audience: async () => ['agent', 'other'],
     render: async () => ({ content: [{ type: 'text', text: 'document_diff' }] }),
@@ -2280,17 +2280,17 @@ test("#157: a render that lands unread in another agent's deferred queue keeps i
   await coalescer.assemble('agent');
   const edit = await coalescer.accept(occurrence('e1', { tags: ['chat:edited'] }));
   assert.equal(edit.coalesce?.outcome, 'replaced', 'the edit replaced the unread render');
-  assert.deepEqual(delivered, [{ eventId: 'n1', replacesUnread: true }, { eventId: 'e1', replacesUnread: true }], 'the render and the edit that replaced it are each marked');
+  assert.deepEqual(delivered, [{ eventId: 'n1', firstView: true }, { eventId: 'e1', firstView: true }], 'the render and the edit that replaced it are each marked');
 });
 
 test("#157: a notice's render that lands while an earlier render of its subject waits unread in a deferred queue is no first view", async () => {
-  const delivered: Array<{ eventId: string; replacesUnread?: true }> = [];
+  const delivered: Array<{ eventId: string; firstView?: true }> = [];
   let releaseFirst!: () => void;
   const firstRender = new Promise<void>((resolve) => { releaseFirst = resolve; });
   const host: CoalescerHost<null> = {
     isUnread: () => true, isUnshown: () => true, remove: () => true,
     // Every delivery lands in the deferred queue of an agent whose turn is alive.
-    deliver: async (occ) => { delivered.push({ eventId: occ.eventId, ...(occ.replacesUnread ? { replacesUnread: true as const } : {}) }); return { agent: 'other', deferredId: `deferred-${delivered.length}` }; },
+    deliver: async (occ) => { delivered.push({ eventId: occ.eventId, ...(occ.firstView ? { firstView: true as const } : {}) }); return { agent: 'other', deferredId: `deferred-${delivered.length}` }; },
     wakeForBatch: async () => {}, wakeToRead: async () => {}, cancelWake: () => {}, authorized: () => true,
     audience: async () => ['agent', 'other'],
     render: async (occ) => { if (occ.eventId === 'n1') await firstRender; return { content: [{ type: 'text', text: `diff_${occ.eventId}` }] }; },
@@ -2308,7 +2308,7 @@ test("#157: a notice's render that lands while an earlier render of its subject 
   releaseFirst();
   await first;
   await coalescer.assemble('agent');
-  assert.deepEqual(delivered, [{ eventId: 'n1', replacesUnread: true }, { eventId: 'n2' }], 'only the first render is the first view');
+  assert.deepEqual(delivered, [{ eventId: 'n1', firstView: true }, { eventId: 'n2' }], 'only the first render is the first view');
 });
 
 /** A coalescer whose every delivery lands in the deferred queue of 'other',
@@ -2320,7 +2320,7 @@ test("#157: a notice's render that lands while an earlier render of its subject 
  *  (slimepriestess's probe for #168, with the held renders and the other
  *  options added.) */
 function firstViewProbe(state: { shown: boolean; read: boolean }, { held = ['n1'], stored = [] as string[], unplaced = [] as string[], blank = [] as string[] } = {}) {
-  const delivered: Array<{ eventId: string; replacesUnread?: true }> = [];
+  const delivered: Array<{ eventId: string; firstView?: true }> = [];
   const releases = new Map<string, () => void>();
   const gates = new Map(held.map((id) => [id, new Promise<void>((resolve) => { releases.set(id, resolve); })]));
   const started = new Map<string, () => void>();
@@ -2328,7 +2328,7 @@ function firstViewProbe(state: { shown: boolean; read: boolean }, { held = ['n1'
   const host: CoalescerHost<null> = {
     isUnread: () => !state.read, isUnshown: () => !state.shown && !state.read, remove: () => true,
     deliver: async (occ) => {
-      delivered.push({ eventId: occ.eventId, ...(occ.replacesUnread ? { replacesUnread: true as const } : {}) });
+      delivered.push({ eventId: occ.eventId, ...(occ.firstView ? { firstView: true as const } : {}) });
       if (unplaced.includes(occ.eventId)) return undefined;
       return stored.includes(occ.eventId)
         ? { agent: 'agent', messageId: `stored-${delivered.length}` }
@@ -2363,7 +2363,7 @@ async function firstViewQueuedWithBatchPending(p: ReturnType<typeof firstViewPro
   await p.coalescer.accept(p.occurrence('n2', { deferred: true }));
   p.release('n1');
   await first;
-  assert.deepEqual(p.delivered, [{ eventId: 'n1', replacesUnread: true }], "n1's render is the agent's first view");
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }], "n1's render is the agent's first view");
 }
 
 for (const shown of [false, true]) test(`#157: a notice that displaces a queued first-view render ${shown ? 'the agent was shown, and joins a pending batch, leaves that batch no first view' : 'nothing has shown, and joins a pending batch, leaves that batch its first view'}`, async () => {
@@ -2377,7 +2377,7 @@ for (const shown of [false, true]) test(`#157: a notice that displaces a queued 
   assert.equal(n3.coalesce?.outcome, 'replaced', 'n3 displaced the queued render and joined the pending batch');
   await p.coalescer.assemble('agent');
   assert.equal(p.delivered[1]?.eventId, 'n3');
-  assert.equal(p.delivered[1]?.replacesUnread === true, !shown, shown ? 'the agent was shown n1, so the batch\'s render is no first view' : 'nothing showed n1, so the batch\'s render is still the first view');
+  assert.equal(p.delivered[1]?.firstView === true, !shown, shown ? 'the agent was shown n1, so the batch\'s render is no first view' : 'nothing showed n1, so the batch\'s render is still the first view');
 });
 
 for (const shown of [false, true]) test(`#157: a notice that displaces a queued first-view render ${shown ? 'the agent was shown leaves a batch already rendering no first view' : 'nothing has shown leaves a batch already rendering its first view'}`, async () => {
@@ -2393,7 +2393,7 @@ for (const shown of [false, true]) test(`#157: a notice that displaces a queued 
   p.release('n2');
   await second;
   assert.equal(p.delivered[1]?.eventId, 'n2');
-  assert.equal(p.delivered[1]?.replacesUnread === true, !shown, shown ? 'the agent was shown n1, so the rendering batch\'s render is no first view' : 'nothing showed n1, so the rendering batch\'s render is still the first view');
+  assert.equal(p.delivered[1]?.firstView === true, !shown, shown ? 'the agent was shown n1, so the rendering batch\'s render is no first view' : 'nothing showed n1, so the rendering batch\'s render is still the first view');
 });
 
 test("#157: a batch opened during a render whose content the turn then read has a render that is no first view", async () => {
@@ -2407,7 +2407,7 @@ test("#157: a batch opened during a render whose content the turn then read has 
   p.release('n1');
   await first;
   await p.coalescer.assemble('agent');
-  assert.deepEqual(p.delivered, [{ eventId: 'n1', replacesUnread: true }, { eventId: 'n2' }], "n2's batch opened before the agent read n1, but its render comes after");
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }, { eventId: 'n2' }], "n2's batch opened before the agent read n1, but its render comes after");
 });
 
 test('#157: a plain edit that takes the place of a pending first-view batch after the agent read an earlier render is no first view', async () => {
@@ -2428,7 +2428,7 @@ test('#157: a plain edit that takes the place of a pending first-view batch afte
 async function firstViewEndedDuringRender(p: ReturnType<typeof firstViewProbe>, state: { shown: boolean }, shown: boolean) {
   await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
   await p.coalescer.assemble('agent');
-  assert.deepEqual(p.delivered, [{ eventId: 'n1', replacesUnread: true }], "n1's render is the agent's first view");
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }], "n1's render is the agent's first view");
   state.shown = shown;
   const n2 = await p.coalescer.accept(p.occurrence('n2', { deferred: true }));
   assert.equal(n2.coalesce?.outcome, 'replaced', 'n2 displaced the queued render');
@@ -2448,7 +2448,7 @@ for (const shown of [false, true]) test(`#157: a plain edit that takes the place
   p.release('n2');
   await second;
   assert.equal(p.delivered.at(-1)?.eventId, 'e1');
-  assert.equal(p.delivered.at(-1)?.replacesUnread === true, !shown);
+  assert.equal(p.delivered.at(-1)?.firstView === true, !shown);
 });
 
 for (const shown of [false, true]) test(`#157: after a displaced first-view render ${shown ? 'the agent was shown, a batch opened while its successor rendered blank is no first view' : 'nothing had shown, a batch opened while its successor rendered blank is the first view'}`, async () => {
@@ -2460,7 +2460,7 @@ for (const shown of [false, true]) test(`#157: after a displaced first-view rend
   assert.equal(p.delivered.length, 1, "n2's blank render delivered nothing");
   await p.coalescer.assemble('agent');
   assert.equal(p.delivered.at(-1)?.eventId, 'n3');
-  assert.equal(p.delivered.at(-1)?.replacesUnread === true, !shown);
+  assert.equal(p.delivered.at(-1)?.firstView === true, !shown);
 });
 
 /** n1's render lands in 'other''s deferred queue as the agent's first view;
@@ -2469,7 +2469,7 @@ for (const shown of [false, true]) test(`#157: after a displaced first-view rend
 async function firstViewRetracted(p: ReturnType<typeof firstViewProbe>, state: { shown: boolean }, shown: boolean) {
   await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
   await p.coalescer.assemble('agent');
-  assert.deepEqual(p.delivered, [{ eventId: 'n1', replacesUnread: true }], "n1's render is the agent's first view");
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }], "n1's render is the agent's first view");
   state.shown = shown;
   const r1 = await p.coalescer.accept(p.occurrence('r1', { retract: true, content: [] }));
   assert.equal(r1.coalesce?.outcome, 'retracted');
@@ -2484,7 +2484,7 @@ for (const shown of [false, true]) test(`#157: after a retraction withdraws a fi
   await p.coalescer.accept(p.occurrence('n2', { deferred: true }));
   await p.coalescer.assemble('agent');
   assert.equal(p.delivered.at(-1)?.eventId, 'n2');
-  assert.equal(p.delivered.at(-1)?.replacesUnread === true, !shown);
+  assert.equal(p.delivered.at(-1)?.firstView === true, !shown);
 });
 
 for (const shown of [false, true]) test(`#157: after a retraction withdraws a first-view render ${shown ? 'the agent was shown, a plain birth is no first view, nor its edit' : 'nothing had shown, a plain birth is the first view, and so is its edit'}`, async () => {
@@ -2496,7 +2496,7 @@ for (const shown of [false, true]) test(`#157: after a retraction withdraws a fi
   const e1 = await p.coalescer.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
   assert.equal(e1.coalesce?.outcome, 'replaced', 'e1 replaced the unread birth');
   assert.equal(p.delivered.at(-1)?.eventId, 'e1');
-  assert.equal(p.delivered.at(-1)?.replacesUnread === true, !shown);
+  assert.equal(p.delivered.at(-1)?.firstView === true, !shown);
 });
 
 for (const shown of [false, true]) test(`#157: a plain occurrence that displaces a first-view render ${shown ? 'the agent was shown and is placed nowhere leaves the next batch no first view' : 'nothing had shown and is placed nowhere leaves the next batch the first view'}`, async () => {
@@ -2512,7 +2512,7 @@ for (const shown of [false, true]) test(`#157: a plain occurrence that displaces
   await p.coalescer.accept(p.occurrence('n2', { deferred: true }));
   await p.coalescer.assemble('agent');
   assert.equal(p.delivered.at(-1)?.eventId, 'n2');
-  assert.equal(p.delivered.at(-1)?.replacesUnread === true, !shown);
+  assert.equal(p.delivered.at(-1)?.firstView === true, !shown);
 });
 
 test("#157: a snapshot keeps a subject's ended first view, so a restored coalescer's next batch is no first view", async () => {
@@ -2534,7 +2534,7 @@ test("#157: a receipt keeps an admission's first view in memory only, so a resto
   await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
   await p.coalescer.assemble('agent');
   await p.coalescer.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
-  assert.deepEqual(p.delivered.at(-1), { eventId: 'e1', replacesUnread: true });
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'e1', firstView: true });
   assert.equal(p.coalescer.receiptFirstView('editor', 'binding', 'e1'), true, "the receipt records e1's first view");
   assert.equal(p.coalescer.receiptFirstView('editor', 'binding', 'n1'), false, "n1's admission delivered nothing");
   const snapshot = p.coalescer.snapshot();
@@ -2554,14 +2554,14 @@ test('#157: a plain edit that arrives while a first-view batch renders takes its
   assert.equal(e1.coalesce?.outcome, 'replaced', 'e1 cancelled the render and took its place');
   p.release('n1');
   await first;
-  assert.deepEqual(p.delivered, [{ eventId: 'e1', replacesUnread: true }]);
+  assert.deepEqual(p.delivered, [{ eventId: 'e1', firstView: true }]);
 });
 
 for (const shown of [false, true]) test(`#157: a notice that displaces an unread first view ${shown ? 'that something may have shown the agent opens a batch whose render is no first view' : 'that nothing has shown the agent opens a batch whose render is the first view'}`, async () => {
-  const delivered: Array<{ eventId: string; replacesUnread?: true }> = [];
+  const delivered: Array<{ eventId: string; firstView?: true }> = [];
   const host: CoalescerHost<null> = {
     isUnread: () => true, isUnshown: () => !shown, remove: () => true,
-    deliver: async (occ) => { delivered.push({ eventId: occ.eventId, ...(occ.replacesUnread ? { replacesUnread: true as const } : {}) }); return { agent: 'agent', messageId: `stored-${delivered.length}` }; },
+    deliver: async (occ) => { delivered.push({ eventId: occ.eventId, ...(occ.firstView ? { firstView: true as const } : {}) }); return { agent: 'agent', messageId: `stored-${delivered.length}` }; },
     wakeForBatch: async () => {}, wakeToRead: async () => {}, cancelWake: () => {}, authorized: () => true,
     audience: async () => ['agent'],
     render: async () => ({ content: [{ type: 'text', text: 'document_diff' }] }),
@@ -2576,7 +2576,7 @@ for (const shown of [false, true]) test(`#157: a notice that displaces an unread
   const notice = await coalescer.accept(occurrence('n1', { deferred: true, tags: ['chat:edited'] }));
   assert.equal(notice.coalesce?.outcome, 'replaced', 'the notice displaced the unread birth');
   await coalescer.assemble('agent');
-  assert.deepEqual(delivered, [{ eventId: 'p1' }, { eventId: 'n1', ...(shown ? {} : { replacesUnread: true as const }) }]);
+  assert.deepEqual(delivered, [{ eventId: 'p1' }, { eventId: 'n1', ...(shown ? {} : { firstView: true as const }) }]);
 });
 
 test("#157: a plain edit that takes the place of a pending notice that birthed its subject is the agent's first view, and so is an edit of that edit", async (t) => {

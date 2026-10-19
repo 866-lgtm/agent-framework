@@ -578,9 +578,9 @@ interface ChannelRegistryOptions {
    * the event the ordinary path would have queued. The handler decides
    * replace / append / withdraw and returns the per-message result. Throws a
    * `CoalesceError` for a malformed or unauthorized occurrence. `firstView`
-   * says the coalescer delivered the message as the agent's first view of it
-   * (`replacesUnread`); it is the host's own, and isn't in the answer to the
-   * server.
+   * says the coalescer delivered the message as the agent's first view of it,
+   * with the delivery's own `firstView` mark; it is the host's own, and isn't
+   * in the answer to the server.
    */
   handleCoalescedIncoming?: (
     serverId: string,

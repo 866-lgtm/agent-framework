@@ -26,7 +26,7 @@ const CORE_IMPLIES: Readonly<Record<string, readonly string[]>> = {
  * retarget the default publish channel. An edit can also be the first
  * version of a message the agent sees, and then counts as that message:
  * isMarkerTagged reads the host's mark for the case the coalescer knows
- * (`replacesUnread`), for isConversationalInjection and for the channel
+ * (`firstView`), for isConversationalInjection and for the channel
  * registry's publish channel and reply anchor. Tags are
  * still never authority (§16.6): this set only ever WITHHOLDS default
  * conversational treatment, it never grants anything.
@@ -45,9 +45,10 @@ export function hasNonConversationalTag(tags: unknown): boolean {
 
 /**
  * True when a message is a marker by its tags. `firstView` is the host's own
- * mark that the coalescer delivered the message as the agent's first view of
- * it (`replacesUnread`), never a server's claim: an edit so delivered counts
- * as the message it replaced, while a reaction or deletion stays a notice.
+ * mark (the message metadata's `firstView`) that the coalescer delivered the
+ * message as the agent's first view of it, never a server's claim: an edit so
+ * delivered counts as the message it replaced, while a reaction or deletion
+ * stays a notice.
  */
 export function isMarkerTagged(tags: unknown, firstView: boolean): boolean {
   return hasNonConversationalTag(firstView && Array.isArray(tags) ? tags.filter((t) => t !== 'chat:edited') : tags);
