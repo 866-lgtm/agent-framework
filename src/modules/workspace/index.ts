@@ -43,7 +43,7 @@ import { BranchIntents } from './branch-intent.js';
 import { IGNORED, NONBLOCK, OTHER_MOUNT, ROOT_REPLACED, ROOT_UNAVAILABLE, checkDir, checkRoot, diskSpelling, filesystemTrustsCtime, inOtherMount, leadsInto, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, nestedAtReal, nestedHolder, passedOverAt, readPrefix, type CheckedDir, type LinkFound, type MountView, type NestedMount } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
 import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../../tool-result-history.js';
-import { type EditSpec, type FilePlan, decodeForEdit, hintBudget, planFile } from './edit-plan.js';
+import { type EditSpec, type FilePlan, countBudget, decodeForEdit, hintBudget, planFile } from './edit-plan.js';
 import { type EditProblem, type EditTool, cutLine, editList, editReceipt, fitted, refusalText } from './edit-text.js';
 import {
   type MountRuntime,
@@ -3290,6 +3290,7 @@ export class WorkspaceModule implements Module {
         // Nothing below awaits until the commit's push.
         const maxSize = mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
         const hints = hintBudget();
+        const counts = countBudget(maxSize);
         const notes: string[] = [];
         const pushes = this.pushesOnCommit(mount);
         const plans: Array<{ target: EditTarget; plan: FilePlan; mode: number; backOnDisk: string | null; conflictNote: string | null }> = [];
@@ -3375,7 +3376,7 @@ export class WorkspaceModule implements Module {
             continue;
           }
           if (!target.specs.length) continue;
-          const planned = planFile(file, blob, target.specs, hints, maxSize);
+          const planned = planFile(file, blob, target.specs, hints, maxSize, counts);
           if ('problems' in planned) {
             // One at a time: a call of many edits can have more problems
             // than a spread passes as arguments.

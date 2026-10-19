@@ -11,7 +11,7 @@
  * and EditMany tools' answers.
  */
 
-import { type Change, type FilePlan, type MatchProblem, SHOWN_MATCHES } from './edit-plan.js';
+import { type Change, type FilePlan, type Leaves, type MatchProblem, SHOWN_MATCHES } from './edit-plan.js';
 import { MAX_LINE_CHARS, jsonLength, numberedLine, safeCut } from './text.js';
 
 /** The tool a call came through, which words its refusals and receipt. */
@@ -100,6 +100,14 @@ function firstEdit(problem: EditProblem): number {
 
 const plural = (count: number, one: string, many = `${one}s`) => (count === 1 ? one : many);
 
+/** How a refusal names a reading of an old text, by what it leaves out (readingsOf). */
+const READS: Record<Leaves, string> = {
+  nothing: 'as given',
+  cr: "with its last CR read as its CRLF line end's",
+  bom: "with its BOM read as the file's own",
+  both: "with its BOM read as the file's own and its last CR as a CRLF line end's",
+};
+
 /** A problem as an agent reads it, without the label edit_many puts before it. */
 function problemText(problem: EditProblem, tool: EditTool): string {
   switch (problem.kind) {
@@ -127,10 +135,17 @@ function problemText(problem: EditProblem, tool: EditTool): string {
       const differs = typeof expected === 'number' && (problem.atLeast ? found > expected : found !== expected);
       const hint = overlapping
         ? 'Include more of the text around it to single out the text you mean.'
-        : typeof expected === 'number' && found > expected
-          ? `Include more of the text around it to single out the ${expected === 1 ? 'one' : 'ones'} you mean, or set occurrences to ${found} if every one should change.`
-          : `Set occurrences to ${found} if those are all.`;
-      return `${occurs}${quotes}${differs ? `, not ${expected}` : ''}${overlap}. ${hint}\n${problem.shown}`;
+        : problem.spent
+          ? `Include more of the text around it to single out the ${expected === 1 ? 'one' : 'ones'} you mean.`
+          : typeof expected === 'number' && found > expected
+            ? `Include more of the text around it to single out the ${expected === 1 ? 'one' : 'ones'} you mean, or set occurrences to ${found} if every one should change.`
+            : `Set occurrences to ${found} if those are all.`;
+      // Why a count is a floor goes on a line of its own, so a cut first line
+      // (cutLine) keeps the hint.
+      const floor = problem.spent && !overlapping
+        ? `This call counted as many occurrences as one call may, so ${found} is a floor: sent in a call of its own, the edit has every one counted.\n`
+        : '';
+      return `${occurs}${quotes}${differs ? `, not ${expected}` : ''}${overlap}. ${hint}\n${floor}${problem.shown}`;
     }
     case 'clash': {
       const [a, b] = problem.edits;
@@ -139,17 +154,18 @@ function problemText(problem: EditProblem, tool: EditTool): string {
         : `edits ${a + 1} and ${b + 1} overlap in ${problem.path} (from line ${problem.line}); give each its own stretch of text, or make them one edit.`;
     }
     case 'crowded':
-      return `they find ${problem.found.toLocaleString('en-US')} occurrences between them in ${problem.path}, whose text, with its line ends read as LF, is ${problem.length.toLocaleString('en-US')} UTF-16 code units long, `
-        + 'so some of their matches overlap; give each its own stretch of text.';
+      return `they ask for ${problem.asked.toLocaleString('en-US')} occurrences between them in ${problem.path}, whose text, with its line ends read as LF, is ${problem.length.toLocaleString('en-US')} UTF-16 code units long, `
+        + 'so some of their matches would overlap; give each its own stretch of text.';
     case 'same':
       return `oldString and newString are the same once the BOM or the line end's CR that oldString carries is read as ${problem.path}'s own, which the file keeps, so there's nothing to change.`;
     case 'readings': {
       const carries = problem.bom && problem.cr ? 'starts with a BOM and ends in a CR' : problem.bom ? 'starts with a BOM' : 'ends in a CR';
-      const readAs = problem.bom && problem.cr
-        ? "with them read as the file's BOM and a CRLF line end's CR"
-        : problem.bom ? "with that BOM read as the file's own" : "with that CR read as its CRLF line end's";
-      const hint = problem.cr ? 'Include the line end after it to say which.' : 'Include more of the text after it to say which.';
-      return `oldString ${carries}, and occurs in ${problem.path} both as given (${countLines(problem.asGiven)}) and ${readAs} (${countLines(problem.readAs)}), so which you mean can't be told. ${hint}`;
+      const ways = problem.readings.map((reading) => `${READS[reading.leaves]} (${countLines(reading)})`);
+      const list = ways.length < 3 ? ways.join(' and ') : `${ways.slice(0, -1).join(', ')} and ${ways.at(-1)}`;
+      // The lines of each reading follow on a line of their own, so however
+      // long they run, a cut first line (cutLine) keeps the hint.
+      return `oldString ${carries}, and occurs in ${problem.path} read more than one way, so which you mean can't be told. `
+        + `Include more of the text around it, such as the line before or after it, to say which.\nIt occurs ${list}.`;
     }
   }
 }
@@ -341,15 +357,16 @@ export function shownRegions(plan: FilePlan, budget: { left: number }, maxChars:
       last.end = Math.max(last.end, region.end);
     } else regions.push(region);
   }
-  // A line shows as read shows the stored bytes. A CR before a line feed in
-  // the updated text is the line's own, so the line shows its CRLF end's CR
-  // too, as a line of the old text does (shownLine), unless the edit put that
-  // CR before a bare LF: on disk the two are then a CRLF end, which read shows
-  // without the CR. The new bytes tell these apart by the CRs before the line
-  // feed, read only for a line whose own text ends in a CR, at a place that
-  // moves forward with the regions' lines. A file's line n is line n of its
-  // bytes, after a BOM's three, since both hold the same line feeds.
-  let byteAt = plan.bom ? 3 : 0;
+  // A line shows as the stored bytes hold it, its CRLF end's CR left out
+  // unless the line's own text ends in a CR, as a line of the old text shows
+  // (shownLine). A CR before a line feed in the updated text is the line's
+  // own, unless the edit put it before a bare LF: on disk the two are then a
+  // CRLF end, and the line's own text doesn't end in it. The new bytes tell
+  // these apart by the CRs before the line feed, read only for a line whose
+  // text ends in a CR, at a place that moves forward with the regions' lines.
+  // A file's line n is line n of its bytes, since both hold the same line
+  // feeds, and a BOM's bytes are neither a line feed nor a CR.
+  let byteAt = 0;
   let byteLine = 1;
   const asStored = (text: string, n: number, beforeLf: boolean): string => {
     if (!beforeLf || !text.endsWith('\r')) return text;
