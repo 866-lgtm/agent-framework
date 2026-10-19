@@ -838,6 +838,10 @@ export class ChannelRegistry {
   // target before confirming anything. Unlike the tail, which settles a few
   // microtasks after its operation's last check, this drops at that check.
   private lifecycleOutstanding = new Map<string, number>();
+  // The removal count each channel's newest outstanding operation was queued
+  // under. Where it's older than its server's, every operation still
+  // outstanding for the channel cancels when it would run.
+  private lifecycleQueuedRemovals = new Map<string, number>();
   // Losing an open receipt does not confirm closure. Keep that distinction
   // private while preserving the public open:boolean availability projection.
   private unconfirmedChannelTargets = new WeakSet<ChannelEntry>();
@@ -2461,6 +2465,7 @@ export class ChannelRegistry {
     const removals = this.serverRemovals.get(serverId) ?? 0;
     const previous = this.channelLifecycleTails.get(lifecycleKey) ?? Promise.resolve();
     this.lifecycleOutstanding.set(lifecycleKey, (this.lifecycleOutstanding.get(lifecycleKey) ?? 0) + 1);
+    this.lifecycleQueuedRemovals.set(lifecycleKey, removals);
     const operation = previous.catch(() => {}).then(
       () => this.runLifecycleOperation(serverId, channelId, removals, options),
     );
@@ -2605,8 +2610,20 @@ export class ChannelRegistry {
       // on, nothing it does will open a new target.
       const left = (this.lifecycleOutstanding.get(lifecycleKey) ?? 1) - 1;
       if (left > 0) this.lifecycleOutstanding.set(lifecycleKey, left);
-      else this.lifecycleOutstanding.delete(lifecycleKey);
+      else {
+        this.lifecycleOutstanding.delete(lifecycleKey);
+        this.lifecycleQueuedRemovals.delete(lifecycleKey);
+      }
     }
+  }
+
+  /** Whether lifecycle work already outstanding for the channel will carry out
+   *  its current decision: some is, and the newest was queued since its
+   *  server's registrations were last removed, so it won't cancel when it
+   *  would run. Each operation reads the decision when it runs. */
+  private outstandingWorkCarriesOut(serverId: string, key: string): boolean {
+    return this.lifecycleOutstanding.has(key) &&
+      this.lifecycleQueuedRemovals.get(key) === (this.serverRemovals.get(serverId) ?? 0);
   }
 
   /**
@@ -2979,10 +2996,11 @@ export class ChannelRegistry {
         }
         // The failed request may have reached the server, so the decision
         // that stands is carried out through the queue, as a decline's close
-        // is, unless other lifecycle work for the channel is queued, which
-        // carries it out anyway. (An incidental open gets here only where the
-        // host directs the lifecycle: see the grant check above.)
-        if (current && !this.lifecycleOutstanding.has(key)) {
+        // is, unless other lifecycle work for the channel is queued that will
+        // carry it out anyway: work queued before its server's registrations
+        // were removed cancels instead. (An incidental open gets here only
+        // where the host directs the lifecycle: see the grant check above.)
+        if (current && !this.outstandingWorkCarriesOut(entry.serverId, key)) {
           this.applyThroughQueue(entry.serverId, entry.descriptor.id);
         }
         if (selectedAgain) {

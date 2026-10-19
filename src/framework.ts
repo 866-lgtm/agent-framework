@@ -14417,22 +14417,23 @@ export class AgentFramework {
    * does, and its advice is judged for that agent. Where the channel stays
    * closed, an agent that has ended is told nothing, and nor is anyone in
    * its place: nothing follows from the failure. Where it's selected for
-   * opening, the primary is told by name in its place, as the opened notice
-   * tells it of an open by an agent that has ended: no channel opens without
-   * someone who can close it being told. It names channel_open as the way to
-   * try again only to an agent that can call it: a conversation fork's
-   * channel_open is refused outright (dispatchChannelToolCall), and an
-   * agent's allowedTools can leave it out. Where the channel is selected for
-   * opening, it says so and why, as speech's failure does, and what that
-   * means: where the host couldn't record putting the channel's decision
-   * back, in channel_open's own failure's words, a later delivery or
-   * reconnect tries again; where the server's latest announcement or the
-   * subscription policy lifted the default put back, the host tries again
-   * itself, so channel_open isn't named. Either way channel_close withdraws
-   * that, named only to an agent that can call it here (a fork may close
-   * only its home channel). Where the reader can't, the primary is told by
-   * name too, if it's registered, isn't the reader and can close it, by the
-   * same rule. System message, as the opened notice is.
+   * opening, the primary is told by name in its place, if one is registered,
+   * as the opened notice tells it of an open by an agent that has ended, so
+   * an agent that could close the channel hears it may open. It names
+   * channel_open as the way to try again only to an agent that can call it:
+   * a conversation fork's channel_open is refused outright
+   * (dispatchChannelToolCall), and an agent's allowedTools can leave it out.
+   * Where the channel is selected for opening, it says so and why, as
+   * speech's failure does, and what that means: where the host couldn't
+   * record putting the channel's decision back, in channel_open's own
+   * failure's words, a later delivery or reconnect tries again; where the
+   * server's latest announcement or the subscription policy lifted the
+   * default put back, the host tries again itself, so channel_open isn't
+   * named. Either way channel_close withdraws that, named only to an agent
+   * that can call it here (a fork may close only its home channel). Where
+   * the reader can't, the primary is told by name too, if it's registered,
+   * isn't the reader and can close it. System message, as the opened notice
+   * is.
    */
   private recordReplyOpenFailedNotice(
     agentName: string | undefined,
@@ -14488,8 +14489,9 @@ export class AgentFramework {
     }
     // Where the reader can't close a channel selected for opening, as a fork
     // away from its home can't, or an agent whose allowedTools leave
-    // channel_close out, the primary is told by name too, where it can close
-    // it: no channel opens without someone who can close it being told.
+    // channel_close out, the primary is told by name too, where it's
+    // registered and can close it, so an agent that could close the channel
+    // hears it may open.
     const primaryHome = primary !== undefined ? this.conversationAgentHomes.get(primary) : undefined;
     if (
       !ended && selectedForOpening !== undefined && who !== undefined && !canClose &&
@@ -24982,6 +24984,11 @@ export class AgentFramework {
             extractChannelIdFromToolResult(result.content) ??
             (typeof args.channelId === 'string' ? (args.channelId as string) : undefined);
           if (target) {
+            // Whether the host directs the server's lifecycle is read before
+            // the open, not after its failure: a transport that drops while the
+            // open is out clears the grant before the failure arrives, and the
+            // notice below is for that failure too.
+            const directs = this.channelRegistry.directsLifecycle(serverId);
             this.channelRegistry
               .openIfClosedForSend(target, serverId)
               .then(({ status, channelId, label, opening, selectedForOpening }) => {
@@ -25017,7 +25024,7 @@ export class AgentFramework {
                   // open changes nothing the agent was told. Without
                   // channels.lifecycle the server opens and closes its own
                   // channels, and channel_open can't open one either.
-                  const tell = opening === true && this.channelRegistry?.directsLifecycle(serverId) === true;
+                  const tell = opening === true && directs;
                   console.error(
                     `[channel] ${agentName}: ${toolName} delivered to ${target} but the open-on-send failed` +
                       (tell ? '; the agent is told' : ''),

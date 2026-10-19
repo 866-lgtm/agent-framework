@@ -28,9 +28,11 @@
   record putting the channel's decision back, in `channel_open`'s own
   failure's words, a later delivery or reconnect tries again; where the
   server's latest announcement or the policy selected it again, the host
-  tries again itself. If the replying agent has ended by then, or can't
-  close the channel, as a fork away from its home can't, the primary is
-  told by name. Before, the failure reached only the logs.
+  tries again itself. Where the channel is selected for opening and the
+  replying agent has ended, the primary is told by name instead, if one is
+  registered; where the replying agent can't close the channel, as a fork
+  away from its home can't, the primary is told by name too, if it can.
+  Before, the failure reached only the logs.
 - On a server without `channels.lifecycle`, an open by speech or a reply,
   which fails there before any request is sent, no longer records a decision.
 - `channel_open` on a channel that's already open, and `channel_close` on one
