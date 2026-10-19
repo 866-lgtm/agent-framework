@@ -1233,7 +1233,7 @@ test("a render placed in a live turn's deferred queue isn't read by the resident
   assert(f.lastRequest().includes('document_diff'), "the primary's turn read the render once its queue was flushed");
 });
 
-test("a render placed in a live turn's deferred queue leaves the wakes of a newer batch of its subject as they are", async (t) => {
+test("a render placed in a live turn's deferred queue takes a newer batch of its subject, and its wakes, to its agent", async (t) => {
   const f = await fixture({ agents: TWO_RESIDENTS }); t.after(f.close);
   f.alwaysRespond();
   let release!: (value: unknown) => void;
@@ -1249,7 +1249,8 @@ test("a render placed in a live turn's deferred queue leaves the wakes of a newe
   const internals = f.framework as unknown as TurnInternals;
   // As above, the primary's turn is alive and 'other''s assembly renders the
   // batch, here held. A notice during the render opens a newer batch of the
-  // subject, which wakes its audience.
+  // subject, which wakes its audience. Once the render lands in the
+  // primary's queue, the newer batch follows the primary, wakes included.
   internals.activeTurnTokens.set('agent', -1);
   try {
     const pass = internals.processInferenceRequests();
@@ -1259,8 +1260,8 @@ test("a render placed in a live turn's deferred queue leaves the wakes of a newe
     assert.deepEqual(woken, ['agent', 'other']);
     release({ content: [{ type: 'text', text: 'first_render' }] });
     await settles(pass, 'the scheduler pass');
-    assert.deepEqual(internals.pendingRequests.map((r) => r.agentName).sort(), [...woken, 'agent'].sort(),
-      "the newer batch's wakes are as they were, beside the primary's wake for the render");
+    assert.deepEqual(internals.pendingRequests.map((r) => r.agentName), ['agent', 'agent'],
+      "the newer batch's wake is the primary's now, beside the primary's wake for the render");
   } finally {
     endStandInTurn(internals);
   }
@@ -1302,7 +1303,33 @@ test("a render placed in a live turn's deferred queue wakes its agent though a n
   assert(f.lastRequest().includes('first_render'), "the primary's turn read the render");
 });
 
-test("a render placed in a live turn's deferred queue keeps its agent's wake when another agent's assembly freezes a newer batch of its subject that gives nothing", async (t) => {
+test("a notice after a render landed unread in a live turn's deferred queue leaves it there, and the turn reads it before the newer render (#548)", async (t) => {
+  const f = await fixture({ agents: TWO_RESIDENTS }); t.after(f.close);
+  f.alwaysRespond();
+  let renders = 0;
+  f.renderer(() => Promise.resolve({ content: [{ type: 'text', text: ++renders > 1 ? 'second_render' : 'first_render' }] }));
+  await f.send('push/event', f.params('1', 'first_fallback', { deferred: true, initial: true }));
+  const internals = f.framework as unknown as TurnInternals;
+  // The primary's turn is alive, so 'other''s assembly places the render in
+  // the primary's deferred queue, unread. A notice then arrives. The render
+  // is a delta the next one builds on (RFC-006 §5.2), so it stays, and the
+  // notice's batch follows the primary.
+  internals.activeTurnTokens.set('agent', -1);
+  try {
+    await settles(internals.processInferenceRequests(), 'the scheduler pass');
+    assert.equal(renders, 1, "'other''s assembly rendered the first batch");
+    await f.send('push/event', f.params('2', 'second_fallback', { deferred: true }));
+    assert.deepEqual(internals.pendingRequests.map((r) => r.agentName), ['agent', 'agent'], "the render's wake and the newer batch's, both the primary's");
+  } finally {
+    endStandInTurn(internals);
+  }
+  await settles(f.framework.runUntilIdle(), 'the drain');
+  assert.equal(f.membrane.calls.length, 1);
+  const request = f.lastRequest();
+  assert(request.includes('first_render') && request.indexOf('first_render') < request.indexOf('second_render'), 'one call read the first render, then the second');
+});
+
+test("a render placed in a live turn's deferred queue takes a newer batch of its subject to its agent, so another agent's assembly leaves that batch and the render's wake alone", async (t) => {
   const f = await fixture({ agents: TWO_RESIDENTS }); t.after(f.close);
   f.alwaysRespond();
   const withdrawn = withdrawals(f);
@@ -1319,9 +1346,11 @@ test("a render placed in a live turn's deferred queue keeps its agent's wake whe
   const internals = f.framework as unknown as TurnInternals;
   // As above: the primary's turn is alive, 'other''s assembly renders the
   // batch into the primary's queue, and a notice during the render opens a
-  // newer batch, which wakes both. In the next pass the primary is still
-  // busy, and 'other''s assembly freezes the newer batch, whose render is
-  // empty: the freeze withdraws the subject's wakes, and nothing is placed.
+  // newer batch, which wakes both. Once the render lands, the newer batch
+  // follows the primary, whose queue holds the render it builds on (RFC-006
+  // §5.2), wakes included. In the next pass the primary is still busy, and
+  // 'other' has no wake left for the batch: the batch waits, with its wake,
+  // for the primary.
   internals.activeTurnTokens.set('agent', -1);
   try {
     const pass = internals.processInferenceRequests();
@@ -1330,12 +1359,14 @@ test("a render placed in a live turn's deferred queue keeps its agent's wake whe
     release({ content: [{ type: 'text', text: 'first_render' }] });
     await settles(pass, 'the first pass');
     await settles(internals.processInferenceRequests(), 'the second pass');
-    assert.deepEqual(withdrawn, ['other', 'other']);
-    assert.deepEqual(internals.pendingRequests.map((r) => r.agentName), ['agent'], "the primary's wake for the render outlived the newer batch's freeze");
+    assert.deepEqual(withdrawn, ['other'], "only 'other''s turn that rendered the first batch, which gave it nothing");
+    assert.equal(renders, 1, "'other''s assembly didn't render the newer batch");
+    assert.deepEqual(internals.pendingRequests.map((r) => r.agentName), ['agent', 'agent'], "the primary's wakes for the render and for the newer batch both wait for its turn");
   } finally {
     endStandInTurn(internals);
   }
   await settles(f.framework.runUntilIdle(), "the primary's turn");
+  assert.equal(renders, 2, "the primary's assembly rendered the newer batch, which gave nothing");
   assert.equal(f.membrane.calls.length, 1);
   assert(f.lastRequest().includes('first_render'), "the primary's turn read the render");
 });
@@ -2382,7 +2413,7 @@ async function firstViewQueuedWithBatchPending(p: ReturnType<typeof firstViewPro
   assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }], "n1's render is the agent's first view");
 }
 
-for (const shown of [false, true]) test(`#157: a notice that displaces a queued first-view render ${shown ? 'the agent was shown, and joins a pending batch, leaves that batch no first view' : 'nothing has shown, and joins a pending batch, leaves that batch its first view'}`, async () => {
+for (const shown of [false, true]) test(`#157: a notice after a queued first-view render joins the pending batch and leaves the render in place, the batch's render joins its run unmarked, and a plain edit that displaces the run ${shown ? 'the agent was shown is no first view' : 'nothing has shown is the first view'}`, async () => {
   const state = { shown: false, read: false };
   const p = firstViewProbe(state);
   await firstViewQueuedWithBatchPending(p);
@@ -2390,13 +2421,18 @@ for (const shown of [false, true]) test(`#157: a notice that displaces a queued 
   // injected: still unread, but no longer unshown.
   state.shown = shown;
   const n3 = await p.coalescer.accept(p.occurrence('n3', { deferred: true, tags: ['chat:edited'] }));
-  assert.equal(n3.coalesce?.outcome, 'replaced', 'n3 displaced the queued render and joined the pending batch');
+  assert.equal(n3.coalesce?.outcome, 'replaced', 'n3 joined the pending batch');
   await p.coalescer.assemble('agent');
-  assert.equal(p.delivered[1]?.eventId, 'n3');
-  assert.equal(p.delivered[1]?.firstView === true, !shown, shown ? 'the agent was shown n1, so the batch\'s render is no first view' : 'nothing showed n1, so the batch\'s render is still the first view');
+  // A render is a delta the next one builds on (RFC-006 §5.2): n1 stays, and
+  // the batch's render joins its run. The run holds the first view, in n1.
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }, { eventId: 'n3' }]);
+  const e1 = await p.coalescer.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
+  assert.equal(e1.coalesce?.outcome, 'replaced', 'e1 displaced the run');
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'e1', ...(shown ? {} : { firstView: true as const }) },
+    shown ? 'the agent was shown the run, so the edit is no first view' : 'nothing showed the run, so the edit takes its first view');
 });
 
-for (const shown of [false, true]) test(`#157: a notice that displaces a queued first-view render ${shown ? 'the agent was shown leaves a batch already rendering no first view' : 'nothing has shown leaves a batch already rendering its first view'}`, async () => {
+for (const shown of [false, true]) test(`#157: a render that settles while a first-view render is queued joins its run unmarked, and a retraction of the run ${shown ? 'the agent was shown leaves the next batch no first view' : 'nothing had shown leaves the next batch the first view'}`, async () => {
   const state = { shown: false, read: false };
   const p = firstViewProbe(state, { held: ['n1', 'n2'] });
   await firstViewQueuedWithBatchPending(p);
@@ -2405,11 +2441,17 @@ for (const shown of [false, true]) test(`#157: a notice that displaces a queued 
   await settles(p.renderStarted('n2'), "n2's render");
   state.shown = shown;
   const n3 = await p.coalescer.accept(p.occurrence('n3', { deferred: true, tags: ['chat:edited'] }));
-  assert.equal(n3.coalesce?.outcome, 'replaced', 'n3 displaced the queued render');
+  assert.equal(n3.coalesce?.outcome, 'first', 'n3 opened a batch beside the queued render, which stays');
   p.release('n2');
   await second;
-  assert.equal(p.delivered[1]?.eventId, 'n2');
-  assert.equal(p.delivered[1]?.firstView === true, !shown, shown ? 'the agent was shown n1, so the rendering batch\'s render is no first view' : 'nothing showed n1, so the rendering batch\'s render is still the first view');
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }, { eventId: 'n2' }], "n2's render joined n1's run unmarked");
+  const r1 = await p.coalescer.accept(p.occurrence('r1', { retract: true, content: [] }));
+  assert.equal(r1.coalesce?.outcome, 'retracted');
+  // Later versions haven't been shown, whatever happened to the run.
+  state.shown = false;
+  await p.coalescer.accept(p.occurrence('n4', { deferred: true }));
+  await p.coalescer.assemble('agent');
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'n4', ...(shown ? {} : { firstView: true as const }) });
 });
 
 test("#157: a batch opened during a render whose content the turn then read has a render that is no first view", async () => {
@@ -2437,17 +2479,18 @@ test('#157: a plain edit that takes the place of a pending first-view batch afte
 });
 
 /** n1's render lands in 'other''s deferred queue as the agent's first view,
- *  and `shown` says whether the agent is then shown it. n2 displaces it, and
- *  n2's batch starts rendering for 'other', whose audience it took; n3 opens
- *  a new batch during that render. Returns the held assembly, wrapped, since
- *  an async function returning it would wait for it. */
+ *  and `shown` says whether the agent is then shown it. n2 opens a batch
+ *  beside it, which follows the run's agent and is no first view, since the
+ *  run holds it; that batch starts rendering for 'other'; n3 opens a new
+ *  batch during that render. Returns the held assembly, wrapped, since an
+ *  async function returning it would wait for it. */
 async function firstViewEndedDuringRender(p: ReturnType<typeof firstViewProbe>, state: { shown: boolean }, shown: boolean) {
   await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
   await p.coalescer.assemble('agent');
   assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }], "n1's render is the agent's first view");
   state.shown = shown;
   const n2 = await p.coalescer.accept(p.occurrence('n2', { deferred: true }));
-  assert.equal(n2.coalesce?.outcome, 'replaced', 'n2 displaced the queued render');
+  assert.equal(n2.coalesce?.outcome, 'first', 'n2 opened a batch beside the queued render, which stays');
   const second = p.coalescer.assemble('other');
   await settles(p.renderStarted('n2'), "n2's render");
   const n3 = await p.coalescer.accept(p.occurrence('n3', { deferred: true }));
@@ -2455,7 +2498,7 @@ async function firstViewEndedDuringRender(p: ReturnType<typeof firstViewProbe>, 
   return { second };
 }
 
-for (const shown of [false, true]) test(`#157: a plain edit that takes the place of a batch opened during the render that followed a displaced first-view render ${shown ? 'the agent was shown is no first view' : 'nothing had shown is the first view'}`, async () => {
+for (const shown of [false, true]) test(`#157: a plain edit that takes the place of a batch opened during a render beside a queued first-view render displaces that run too, and ${shown ? 'is no first view when the agent was shown it' : 'is the first view when nothing had shown it'}`, async () => {
   const state = { shown: false, read: false };
   const p = firstViewProbe(state, { held: ['n2'] });
   const { second } = await firstViewEndedDuringRender(p, state, shown);
@@ -2467,7 +2510,7 @@ for (const shown of [false, true]) test(`#157: a plain edit that takes the place
   assert.equal(p.delivered.at(-1)?.firstView === true, !shown);
 });
 
-for (const shown of [false, true]) test(`#157: after a displaced first-view render ${shown ? 'the agent was shown, a batch opened while its successor rendered blank is no first view' : 'nothing had shown, a batch opened while its successor rendered blank is the first view'}`, async () => {
+for (const shown of [false, true]) test(`#157: beside a queued first-view render, a batch whose render comes back blank and a later batch's render leave the run its first view, so a plain edit that displaces the run ${shown ? 'the agent was shown is no first view' : 'nothing had shown is the first view'}`, async () => {
   const state = { shown: false, read: false };
   const p = firstViewProbe(state, { held: ['n2'], blank: ['n2'] });
   const { second } = await firstViewEndedDuringRender(p, state, shown);
@@ -2475,8 +2518,10 @@ for (const shown of [false, true]) test(`#157: after a displaced first-view rend
   await second;
   assert.equal(p.delivered.length, 1, "n2's blank render delivered nothing");
   await p.coalescer.assemble('agent');
-  assert.equal(p.delivered.at(-1)?.eventId, 'n3');
-  assert.equal(p.delivered.at(-1)?.firstView === true, !shown);
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'n3' }, "n3's render joined n1's run unmarked");
+  const e1 = await p.coalescer.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
+  assert.equal(e1.coalesce?.outcome, 'replaced', 'e1 displaced the run');
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'e1', ...(shown ? {} : { firstView: true as const }) });
 });
 
 /** n1's render lands in 'other''s deferred queue as the agent's first view;
