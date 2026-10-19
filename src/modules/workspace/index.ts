@@ -1387,12 +1387,13 @@ export class WorkspaceModule implements Module {
         description: 'Read a file from the workspace. Returns content with line numbers. '
           + 'Reads at most 2000 lines per call by default — use offset/limit to page through larger files — '
           + 'and stops sooner where a page would pass the result limit; the note says where to continue. '
-          + 'A line over 2000 characters is cut, with the offsetChars that reads the rest. '
+          + 'A line over 2000 characters is cut, with the offsetChars where its rest starts and how many characters the rest has; '
+          + 'read the rest with that count as limitChars. '
           + 'A line page shows CRLF line ends without the CR, and no BOM; its note says when the file has either, '
-          + 'or isn\'t valid UTF-8. '
+          + 'or isn\'t valid UTF-8. A line whose own text ends in a CR shows its line end\'s CR too. '
           + 'For long lines or spill files, use offsetChars/limitChars instead: returns the stored text as it is, '
           + 'BOM and CRs included, without line numbers, with nextOffsetChars (null at EOF), stopped at the result limit too. '
-          + 'When a page stops at the result limit, its note gives the offsetChars and limitChars that read the rest of what you asked for. '
+          + 'When a character page stops at the result limit, its note gives the offsetChars and limitChars that read the rest of what you asked for. '
           + 'Otherwise, continue from nextOffsetChars with the same limitChars. '
           + 'Character offsets count UTF-16 code units; do not mix character and line parameters.',
         inputSchema: {
@@ -1539,8 +1540,8 @@ export class WorkspaceModule implements Module {
           + '(conflicting-disk); or, once disk has changed since the conflict was recorded, that recorded version '
           + '(recorded-disk). Disk versions it could not search are listed as skipped: disk-only files (binary or '
           + 'over the size limit), and a conflict\'s disk version that is binary, oversize, or newer than the one recorded. '
-          + 'In a file with CRLF line ends, each line is matched and shown without its CR, as read shows it, '
-          + 'and the file\'s result says lineEndings. A BOM isn\'t part of the first line.',
+          + 'In a file with CRLF line ends, each line is matched and shown as read shows it, without its line end\'s CR '
+          + 'unless its own text ends in a CR, and the file\'s result says lineEndings. A BOM isn\'t part of the first line.',
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -3747,10 +3748,11 @@ export class WorkspaceModule implements Module {
     const skipped: Array<{ file: string; reason: string; size?: number; mimeType?: string }> = [];
     const incomplete: Array<{ path: string; reason: string }> = [];
 
-    // Lines as read shows them: a CR before a line feed is left out, for
-    // matching as well as display, so `foo$` finds a CRLF file's line, as it
-    // does under ripgrep's --crlf, and the line copies into an edit as read's
-    // do. ripgrep's --crlf still prints the line with its CR.
+    // Lines as read shows them (fileText): a CRLF end's CR is left out, for
+    // matching as well as display, unless the line's own text ends in a CR, so
+    // `foo$` finds a CRLF file's line, as it does under ripgrep's --crlf, and
+    // the line copies into an edit as read's do. ripgrep's --crlf still prints
+    // the line with its CR.
     const search = (bytes: Buffer): Searched => {
       const { lines, crlfEnds, lfEnds } = fileText(bytes);
       const found: GrepMatch[] = [];
