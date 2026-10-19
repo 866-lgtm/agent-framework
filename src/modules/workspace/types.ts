@@ -49,7 +49,8 @@ export interface MountConfig {
    * ignore list where its config names none; `ls` without a path, and
    * `status`, give its `backend` as 'chronicle' and that list. A mount that
    * ran direct and runs as 'chronicle' again takes in what disk changed
-   * meanwhile, as after any time away.
+   * meanwhile as its listings, searches and syncs reach it, as an unwatched
+   * 'chronicle' mount does after any time away.
    */
   backend?: 'chronicle' | 'direct';
   /**
@@ -61,8 +62,8 @@ export interface MountConfig {
    *   the round goes on. Each scan walks from the mount's start, so on a
    *   mount over its `walkCap` it covers the first `walkCap` entries every
    *   time, and files past them come in as `walkCap` describes
-   * - 'never': no background reads; listings and lazy reads still observe
-   *   the paths they show
+   * - 'never': no background reads; listings still observe the paths they
+   *   show, and a read observes a path the store doesn't hold
    */
   watch?: 'always' | 'on-agent-action' | 'never';
   /** Debounce window in ms for watch: 'always' mode (default: 300) */
@@ -195,9 +196,10 @@ export interface MountState {
   /** The mount config */
   config: MountConfig;
   /**
-   * Whether the mount runs direct this session (`MountConfig.backend`), as
-   * initStore decided: a mount configured direct runs as 'chronicle' while
-   * the store holds changes there that disk lacks.
+   * Whether the mount runs direct (`MountConfig.backend`), as the workspace
+   * decides when initStore gives the store and again at each start: a mount
+   * configured direct runs as 'chronicle' while the store holds changes
+   * there that disk lacks.
    */
   direct: boolean;
   /** Tree state ID in Chronicle */

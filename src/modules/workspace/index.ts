@@ -925,6 +925,9 @@ export class WorkspaceModule implements Module {
       const treeStateId = `workspace/${mount.name}/tree`;
       const intentTreeStateId = `workspace/${mount.name}/intent`;
       const direct = mount.backend === 'direct';
+      // A mount configured direct that ran as 'chronicle' runs direct only
+      // once chooseKinds finds nothing held there.
+      const ranStoreBacked = direct && made!.has(treeStateId) && made!.has(intentTreeStateId);
       if (!direct) {
         for (const id of [treeStateId, intentTreeStateId]) {
           ensureStateRegistered(store, {
@@ -938,7 +941,7 @@ export class WorkspaceModule implements Module {
 
       mounts.set(mount.name, {
         config: mount,
-        direct,
+        direct: direct && !ranStoreBacked,
         treeStateId,
         intentTreeStateId,
         lastMaterializedSeq: 0,
@@ -948,7 +951,7 @@ export class WorkspaceModule implements Module {
         watcherReadyAt: null,
         watcherError: null,
       });
-      if (!direct || (made!.has(treeStateId) && made!.has(intentTreeStateId))) {
+      if (!direct || ranStoreBacked) {
         intents.set(mount.name, new BranchIntents(store, intentTreeStateId));
       }
     }
@@ -980,20 +983,28 @@ export class WorkspaceModule implements Module {
    * is named for the last way set here.
    */
   private chooseKinds(): void {
-    this.notDirect = new Map();
+    // Every mount is decided before any is set, so a read of the store that
+    // throws leaves the decisions as they were.
+    const decided = new Map<string, Array<{ path: string; what: string }>>();
     for (const [name, state] of this.mounts) {
       if (state.config.backend !== 'direct') continue;
-      state.direct = true;
-      if (!this.intents.has(name)) continue;
+      // One with no states from a 'chronicle' run holds nothing.
+      if (!this.intents.has(name)) {
+        decided.set(name, []);
+        continue;
+      }
       const held = this.heldChanges(state);
       const what = new Map<string, string>();
       for (const path of held.owed) what.set(path, 'changed in the workspace');
       for (const path of held.unreadable) what.set(path, UNREADABLE_INTENT);
       for (const path of held.deletions) what.set(path, 'deleted in the workspace');
       for (const path of held.conflicts) what.set(path, 'in conflict');
-      if (what.size === 0) continue;
-      state.direct = false;
-      this.notDirect.set(name, [...what].sort(([a], [b]) => a.localeCompare(b)).map(([path, label]) => ({ path, what: label })));
+      decided.set(name, [...what].sort(([a], [b]) => a.localeCompare(b)).map(([path, label]) => ({ path, what: label })));
+    }
+    this.notDirect = new Map();
+    for (const [name, held] of decided) {
+      this.mounts.get(name)!.direct = held.length === 0;
+      if (held.length > 0) this.notDirect.set(name, held);
     }
   }
 
@@ -1394,37 +1405,39 @@ export class WorkspaceModule implements Module {
 
   /**
    * Say, for whoever runs the host, which mounts configured direct run as
-   * 'chronicle' this session (chooseKinds), which changes the store holds
-   * there that disk lacks are why, and the two ways to start one direct: on
-   * stderr, and as one ops alert for them all (the framework's failures log,
-   * its `ops:alert` trace and, where one is set, its webhook, which posts
-   * one alert of a kind per cooldown and only the start and end of a long
-   * one). So the ways out come before the list of what's held.
+   * 'chronicle' this session (chooseKinds), what the workspace holds there
+   * that keeps them so, and the two ways to start one direct: on stderr,
+   * and as one ops alert for them all (the framework's failures log, its
+   * `ops:alert` trace and, where one is set, its webhook, which posts one
+   * alert of a kind per cooldown and keeps only the start and end of a long
+   * one). So the words of fixed length, what's happening and the ways out,
+   * come first, and the mounts and what they hold after them.
    */
   private sayNotDirect(): void {
     const mounts = [...this.notDirect];
-    const names = mounts.map(([name]) => `"${name}"`);
-    const named = names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+    const one = mounts.length === 1;
     // An intent the workspace can't read may hold a change or may not, so
     // it's counted as what it is.
-    const unreadable = (paths: Array<{ what: string }>) => paths.filter((h) => h.what === UNREADABLE_INTENT).length;
     const counted = (paths: Array<{ what: string }>) => {
-      const u = unreadable(paths);
+      const u = paths.filter((h) => h.what === UNREADABLE_INTENT).length;
       const c = paths.length - u;
       return [
         c > 0 ? `${c} change${c === 1 ? '' : 's'} that disk lacks` : '',
         u > 0 ? `${u} intent${u === 1 ? '' : 's'} it can't read` : '',
       ].filter((part) => part !== '').join(' and ');
     };
-    const why = mounts.length === 1
-      ? `Mount ${named} runs as 'chronicle' this session, not direct: there the workspace holds ${counted(mounts[0]![1])}.`
-      : `Mounts ${named} run as 'chronicle' this session, not direct: there the workspace holds changes that disk lacks` +
-        `${mounts.some(([, paths]) => unreadable(paths) > 0) ? " or intents it can't read" : ''} (` +
-        `${mounts.map(([name, held]) => `${held.length} in "${name}"`).join(', ')}).`;
+    const each = mounts.map(([name, paths]) => `"${name}" (${counted(paths)})`);
+    const which = one
+      ? `Mount "${mounts[0]![0]}" holds ${counted(mounts[0]![1])}`
+      : `Mounts ${each.slice(0, -1).join(', ')} and ${each[each.length - 1]} hold`;
     const held = mounts.flatMap(([name, paths]) => paths.map((h) => `"${name}/${h.path}" (${h.what})`));
-    const message = `${why} To start ${mounts.length === 1 ? 'it' : 'one'} direct, settle each: sync its path to take disk's copy, ` +
-      "or materialize it with the mount configured 'chronicle' and read-write, as materialize's answer directs. " +
-      `The first start that finds none starts it direct. Held: ${held.slice(0, 10).join(', ')}` +
+    const message = (one
+      ? "A mount configured direct runs as 'chronicle' this session, keeping what the workspace holds there in view. " +
+        'To start it direct, settle each held change: '
+      : "Mounts configured direct run as 'chronicle' this session, keeping what the workspace holds there in view. " +
+        'To start a mount direct, settle each change held at it: ') +
+      "sync its path to take disk's copy, or configure the mount 'chronicle' and read-write, materialize it, " +
+      `and follow materialize's answer. Its next start then runs it direct. ${which}: ${held.slice(0, 10).join(', ')}` +
       `${held.length > 10 ? `, and ${held.length - 10} more` : ''}.`;
     console.warn(`[workspace] ${message}`);
     this.ctx?.notifyOps?.('workspace-mount-not-direct', 'framework', message, { held: Object.fromEntries(mounts.map(([name, paths]) => [name, paths.length])) });
@@ -4621,11 +4634,15 @@ function stateView(report: PathReport): Record<string, unknown> {
 /** A lone UTF-16 surrogate, which UTF-8 can't store: in `u` mode, a pair is one code point. */
 const LONE_SURROGATE = /\p{Cs}/u;
 
-/** Why a direct mount's read stopped when another directory was put at its root as it read. */
-const DIRECT_ROOT_REPLACED = 'the mount root was replaced while the file was read: reading it again reads the directory there now';
+/** Why a direct mount's read stopped when it found another directory put at its root as it opened the file. */
+const DIRECT_ROOT_REPLACED = 'the mount root was replaced as the file was opened: reading it again reads the directory there now';
 
-/** How the alert that a mount configured direct runs as 'chronicle' names an intent the workspace can't read. */
-const UNREADABLE_INTENT = "its workspace intent can't be read";
+/**
+ * How the alert that a mount configured direct runs as 'chronicle' names an
+ * intent the workspace can't read: materialize doesn't select one with no
+ * workspace entry, and a sync of its path replaces it.
+ */
+const UNREADABLE_INTENT = "its workspace intent can't be read; a sync of the path settles it";
 
 /**
  * A mount's watch mode as it runs. A mount configured direct watches

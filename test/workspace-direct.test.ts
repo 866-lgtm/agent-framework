@@ -480,25 +480,64 @@ test('grep on a direct mount that follows links names a link to a directory as i
   ]);
 });
 
+test("grep on a direct mount names a link to a directory it can't open as its listing does, and a file it can't open by the open's reason", { skip: IS_ROOT ? 'root opens everything' : false }, async (t) => {
+  const env = new Env(t);
+  env.file('shut/x.ts', 'needle\n');
+  env.file('noperm.txt', 'needle\n');
+  symlinkSync(join(env.ref, 'shut'), join(env.ref, 'linkshut'));
+  const m = await env.open({ followSymlinks: true, ignore: ['shut'] });
+  chmodSync(join(env.ref, 'shut'), 0o311);
+  chmodSync(join(env.ref, 'noperm.txt'), 0o000);
+  try {
+    const listed = await data<{ entries: Array<{ path: string }> }>(m, 'ls', { path: 'ref', recursive: true });
+    assert.deepEqual(listed.entries.find((e) => e.path === 'linkshut'), { path: 'linkshut', note: 'a symlink to a directory, not walked' });
+    assert.deepEqual((await data<{ skipped?: unknown[] }>(m, 'grep', { pattern: 'needle' })).skipped, [
+      { file: 'ref/linkshut', reason: 'a symlink to a directory, not walked' },
+      { file: 'ref/noperm.txt', reason: 'cannot open (EACCES)' },
+    ]);
+  } finally {
+    chmodSync(join(env.ref, 'shut'), 0o755);
+    chmodSync(join(env.ref, 'noperm.txt'), 0o644);
+  }
+});
+
 test("grep's results come in path order, however its reads finish", async (t) => {
   const env = new Env(t);
   const names = Array.from({ length: 40 }, (_, i) => `f${String(i).padStart(2, '0')}.txt`);
   for (const name of [...names].reverse()) env.file(`many/${name}`, `${name} needle\n`.repeat(1 + (names.indexOf(name) % 7) * 500));
   const m = await env.open();
-  // The first file's reads are held back, so it finishes after the rest.
+  // The first file's reads wait until the other fifteen files read beside
+  // it have been read, so it finishes after them.
   const first = String(statSync(join(env.ref, 'many', names[0]!), { bigint: true }).ino);
   const slow = new WeakSet<object>();
+  const read = new WeakSet<object>();
+  let othersRead = 0;
+  let fifteenRead!: () => void;
+  const fifteen = new Promise<void>((resolve) => { fifteenRead = resolve; });
+  let readBeforeFirst = -1;
   const result = await withFileHandle({
     stat: (stat) => async function (this: object, ...args: unknown[]) {
       const seen = await stat.apply(this, args);
       if (String(seen.ino) === first) slow.add(this);
       return seen;
     },
-    read: (read) => async function (this: object, ...args: unknown[]) {
-      if (slow.has(this)) await new Promise((resolve) => setTimeout(resolve, 50));
-      return read.apply(this, args);
+    read: (original) => async function (this: object, ...args: unknown[]) {
+      if (slow.has(this)) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([fifteen, new Promise((resolve) => { timer = setTimeout(resolve, 5000); })]);
+        clearTimeout(timer);
+        readBeforeFirst = othersRead;
+        return original.apply(this, args);
+      }
+      const answer = await original.apply(this, args);
+      if (!read.has(this)) {
+        read.add(this);
+        if (++othersRead === 15) fifteenRead();
+      }
+      return answer;
     },
   }, () => data<{ results: Array<{ file: string }> }>(m, 'grep', { pattern: 'needle' }));
+  assert.ok(readBeforeFirst >= 15, `${readBeforeFirst} other files were read before the first`);
   assert.deepEqual(result.results.map((r) => r.file), names.map((name) => `ref/many/${name}`));
 });
 
@@ -559,7 +598,7 @@ test("grep gives a skipped file's size as its reads found it, when the file chan
   assert.deepEqual(shrunk.skipped, [{ file: 'ref/bin.dat', reason: 'binary: a NUL in its first 8 KB', size: 4 }]);
 });
 
-test('a direct read whose root is replaced as it reads says to read again', async (t) => {
+test('a direct read that finds its root replaced as it opens the file says to read again', async (t) => {
   const env = new Env(t);
   env.file('a.txt', 'a\n');
   const m = await env.open();
@@ -567,7 +606,7 @@ test('a direct read whose root is replaced as it reads says to read again', asyn
     renameSync(env.ref, `${env.ref}-before`);
     mkdirSync(env.ref);
   }, () => failure(m, 'read', { path: 'ref/a.txt' }));
-  assert.equal(error, 'Mount unavailable: ref: the mount root was replaced while the file was read: reading it again reads the directory there now');
+  assert.equal(error, 'Mount unavailable: ref: the mount root was replaced as the file was opened: reading it again reads the directory there now');
   assert.equal(await failure(m, 'read', { path: 'ref/a.txt' }), 'File not found: ref/a.txt');
 });
 
@@ -730,13 +769,11 @@ test("a mount the store holds changes on that disk lacks runs as 'chronicle', sa
   const warned = t.mock.method(console, 'warn', () => {});
   const held = await env.open({ walkCap: 1 });
   warned.mock.restore();
-  // The ways out come before the list of what's held, so a webhook that
-  // keeps only a long alert's start and end still gives them.
-  const message = 'Mount "ref" runs as \'chronicle\' this session, not direct: there the workspace holds 4 changes that disk lacks. '
-    + 'To start it direct, settle each: sync its path to take disk\'s copy, or materialize it with the mount configured '
-    + '\'chronicle\' and read-write, as materialize\'s answer directs. The first start that finds none starts it direct. '
-    + 'Held: "ref/both.ts" (in conflict), "ref/deleted.ts" (deleted in the workspace), "ref/dot.img" (in conflict), '
-    + '"ref/drafted.ts" (changed in the workspace).';
+  const message = "A mount configured direct runs as 'chronicle' this session, keeping what the workspace holds there in view. "
+    + "To start it direct, settle each held change: sync its path to take disk's copy, or configure the mount 'chronicle' "
+    + "and read-write, materialize it, and follow materialize's answer. Its next start then runs it direct. "
+    + 'Mount "ref" holds 4 changes that disk lacks: "ref/both.ts" (in conflict), "ref/deleted.ts" (deleted in the workspace), '
+    + '"ref/dot.img" (in conflict), "ref/drafted.ts" (changed in the workspace).';
   assert.deepEqual(env.alerts, [{ kind: 'workspace-mount-not-direct', agent: 'framework', message, data: { held: { ref: 4 } } }]);
   assert.deepEqual(warned.mock.calls.map((c) => c.arguments), [[`[workspace] ${message}`]]);
   // As a 'chronicle' mount, unwatched, with no catch-up scan to take turns
@@ -788,15 +825,14 @@ test("the changes that keep a mount from starting direct are named ten at a time
 
   await env.open();
   assert.equal(env.alerts.length, 1);
-  const unreadable = (path: string) => `"ref/${path}" (its workspace intent can't be read)`;
+  const unreadable = (path: string) => `"ref/${path}" (its workspace intent can't be read; a sync of the path settles it)`;
   const shown = [unreadable('aa.ts'), unreadable('d00.ts'), ...Array.from({ length: 8 }, (_, i) => `"ref/d0${i + 1}.ts" (changed in the workspace)`)];
   // An intent it can't read is counted as one, not as a change.
-  assert.ok(env.alerts[0]!.message.startsWith("Mount \"ref\" runs as 'chronicle' this session, not direct: there the workspace holds 10 changes that disk lacks and 2 intents it can't read. "), env.alerts[0]!.message);
-  assert.ok(env.alerts[0]!.message.endsWith(`Held: ${shown.join(', ')}, and 2 more.`), env.alerts[0]!.message);
+  assert.ok(env.alerts[0]!.message.endsWith(`Mount "ref" holds 10 changes that disk lacks and 2 intents it can't read: ${shown.join(', ')}, and 2 more.`), env.alerts[0]!.message);
   assert.deepEqual(env.alerts[0]!.data, { held: { ref: 12 } });
 });
 
-test('each kind of change the store holds keeps a mount configured direct from starting direct on its own', async (t) => {
+test('each kind of change the store holds keeps a mount configured direct from starting direct on its own, until a sync of its path settles it', async (t) => {
   const cases: Array<[string, (env: Env) => Promise<void>, string, string]> = [
     ['a workspace deletion', async (env) => {
       env.file('gone.ts', 'kept on disk\n');
@@ -812,16 +848,23 @@ test('each kind of change the store holds keeps a mount configured direct from s
     ["an intent that can't be read", async (env) => {
       await env.close(await env.openChronicle());
       env.store.treeSet('workspace/ref/intent', 'u.ts', { blobHash: 'f'.repeat(64), size: 2, mode: 0 });
-    }, "1 intent it can't read", `"ref/u.ts" (its workspace intent can't be read)`],
+    }, "1 intent it can't read", `"ref/u.ts" (its workspace intent can't be read; a sync of the path settles it)`],
   ];
   for (const [kind, hold, counted, named] of cases) {
     const env = new Env(t);
     await hold(env);
     const m = await env.open();
     assert.equal(env.alerts.length, 1, kind);
-    assert.ok(env.alerts[0]!.message.startsWith(`Mount "ref" runs as 'chronicle' this session, not direct: there the workspace holds ${counted}. `), env.alerts[0]!.message);
-    assert.ok(env.alerts[0]!.message.endsWith(`Held: ${named}.`), env.alerts[0]!.message);
+    assert.ok(env.alerts[0]!.message.endsWith(`Mount "ref" holds ${counted}: ${named}.`), env.alerts[0]!.message);
     assert.equal((await data<Record<string, Record<string, unknown>>>(m, 'status')).ref!.backend, 'chronicle', kind);
+
+    // The alert's way out: a sync of the path, then the next start is direct.
+    await data(m, 'sync', { path: named.slice(1, named.indexOf('"', 1)) });
+    await env.close(m);
+    env.alerts = [];
+    const again = await env.open();
+    assert.deepEqual(env.alerts, [], kind);
+    assert.equal((await data<Record<string, Record<string, unknown>>>(again, 'status')).ref!.backend, 'direct', kind);
   }
 });
 
@@ -837,19 +880,40 @@ test('mounts configured direct that the store holds changes on are named in one 
 
   const both = await env.open({}, [{ name: 'other', path: other, mode: 'read-only', backend: 'direct' }]);
   assert.equal(env.alerts.length, 1);
-  assert.ok(env.alerts[0]!.message.startsWith('Mounts "ref" and "other" run as \'chronicle\' this session, not direct: there the workspace holds '
-    + 'changes that disk lacks (1 in "ref", 2 in "other"). To start one direct, settle each:'), env.alerts[0]!.message);
-  assert.ok(env.alerts[0]!.message.endsWith('Held: "ref/a.ts" (changed in the workspace), "other/b.ts" (changed in the workspace), '
-    + '"other/c.ts" (changed in the workspace).'), env.alerts[0]!.message);
+  assert.equal(env.alerts[0]!.message, "Mounts configured direct run as 'chronicle' this session, keeping what the workspace holds there in view. "
+    + "To start a mount direct, settle each change held at it: sync its path to take disk's copy, or configure the mount 'chronicle' "
+    + "and read-write, materialize it, and follow materialize's answer. Its next start then runs it direct. "
+    + 'Mounts "ref" (1 change that disk lacks) and "other" (2 changes that disk lacks) hold: "ref/a.ts" (changed in the workspace), '
+    + '"other/b.ts" (changed in the workspace), "other/c.ts" (changed in the workspace).');
   assert.deepEqual(env.alerts[0]!.data, { held: { ref: 1, other: 2 } });
   await env.close(both);
 
-  // An intent it can't read, in either mount, is named as one.
+  // An intent it can't read, in either mount, is counted as one.
   env.store.treeSet('workspace/other/intent', 'u.ts', { blobHash: 'f'.repeat(64), size: 2, mode: 0 });
   env.alerts = [];
   await env.open({}, [{ name: 'other', path: other, mode: 'read-only', backend: 'direct' }]);
-  assert.ok(env.alerts[0]!.message.startsWith('Mounts "ref" and "other" run as \'chronicle\' this session, not direct: there the workspace holds '
-    + "changes that disk lacks or intents it can't read (1 in \"ref\", 3 in \"other\"). "), env.alerts[0]!.message);
+  assert.ok(env.alerts[0]!.message.includes("Mounts \"ref\" (1 change that disk lacks) and \"other\" (2 changes that disk lacks and 1 intent it can't read) hold: "), env.alerts[0]!.message);
+});
+
+test("the alert's ways out come within the start a webhook keeps of it, however many mounts it names and however long their names", async (t) => {
+  const env = new Env(t);
+  const extra = ['another-checkout-whose-name-is-rather-long', 'a-third-checkout-with-a-long-name-too'].map((name) => {
+    mkdirSync(join(env.root, name));
+    return { name, path: join(env.root, name) };
+  });
+  const chronicle = await env.open({ backend: 'chronicle', mode: 'read-write', watch: 'never' }, extra.map((m) => ({ ...m, mode: 'read-write' as const, watch: 'never' as const })));
+  for (const name of ['ref', ...extra.map((m) => m.name)]) await data(chronicle, 'write', { path: `${name}/draft.ts`, content: 'draft\n' });
+  await env.close(chronicle);
+
+  await env.open({}, extra.map((m) => ({ ...m, mode: 'read-only' as const, backend: 'direct' as const })));
+  const message = env.alerts[0]!.message;
+  // The framework's webhook keeps the first 346 characters of an alert over
+  // 500, with its end (framework.ts, OPS_WEBHOOK_MESSAGE_MAX_CHARS and
+  // boundFailureText).
+  assert.ok(message.length > 500, `${message.length}`);
+  const last = 'Its next start then runs it direct.';
+  const at = message.indexOf(last);
+  assert.ok(at >= 0 && at + last.length <= 340, `${at}`);
 });
 
 test('a start of the same module decides again whether a mount configured direct runs direct', async (t) => {
@@ -868,6 +932,79 @@ test('a start of the same module decides again whether a mount configured direct
   assert.equal(env.alerts.length, 2, 'the start that finds none says nothing');
   assert.equal((await data<Record<string, Record<string, unknown>>>(m, 'status')).ref!.backend, 'direct');
   assert.equal((await data<{ content: string }>(m, 'read', { path: 'ref/drafted.ts' })).content, '     1\tdisk');
+});
+
+test('whichever of start and initStore comes first, a mount configured direct is decided once the store is given, and said once', async (t) => {
+  const env = new Env(t);
+  env.file('drafted.ts', 'disk\n');
+  const chronicle = await env.openChronicle();
+  await data(chronicle, 'write', { path: 'ref/drafted.ts', content: 'draft\n' });
+  await env.close(chronicle);
+  const config = { mounts: [{ name: 'ref', path: env.ref, mode: 'read-only' as const, backend: 'direct' as const }] };
+  const status = async (m: WorkspaceModule) => (await data<Record<string, Record<string, unknown>>>(m, 'status')).ref!.backend;
+
+  // The host's order: start, then initStore.
+  const host = new WorkspaceModule(config);
+  try {
+    await host.start(env.context());
+    assert.deepEqual(env.alerts, []);
+    host.initStore(env.store);
+    assert.equal(env.alerts.length, 1);
+    assert.equal(await status(host), 'chronicle');
+    assert.equal((await data<{ content: string }>(host, 'read', { path: 'ref/drafted.ts' })).content, '     1\tdraft');
+  } finally {
+    await host.stop();
+  }
+
+  // The store first: decided before start, so a read between the two reads
+  // the change, and start says so once.
+  env.alerts = [];
+  const early = new WorkspaceModule(config);
+  try {
+    early.initStore(env.store);
+    assert.equal(await status(early), 'chronicle');
+    assert.equal((await data<{ content: string }>(early, 'read', { path: 'ref/drafted.ts' })).content, '     1\tdraft');
+    await early.start(env.context());
+    assert.equal(env.alerts.length, 1);
+    await data(early, 'sync', { path: 'ref/drafted.ts' });
+  } finally {
+    await early.stop();
+  }
+
+  // With nothing held, a mount that ran as 'chronicle' is direct from
+  // initStore on.
+  const settled = new WorkspaceModule(config);
+  try {
+    settled.initStore(env.store);
+    assert.equal(await status(settled), 'direct');
+  } finally {
+    await settled.stop();
+  }
+});
+
+test("a decision that can't read the store leaves a mount that ran as 'chronicle' as it was, never direct", async (t) => {
+  const env = new Env(t);
+  env.file('drafted.ts', 'disk\n');
+  const chronicle = await env.openChronicle();
+  await data(chronicle, 'write', { path: 'ref/drafted.ts', content: 'draft\n' });
+  await env.close(chronicle);
+  type Deciding = { heldChanges: () => never };
+  const unreadable = () => { throw new Error('the evidence could not be read'); };
+
+  // At a later start, the earlier decision stands, and the start fails.
+  const m = await env.open();
+  const atStart = t.mock.method(m as unknown as Deciding, 'heldChanges', unreadable);
+  await assert.rejects(env.restart(m), /the evidence could not be read/);
+  atStart.mock.restore();
+  assert.equal((await data<Record<string, Record<string, unknown>>>(m, 'status')).ref!.backend, 'chronicle');
+  assert.equal((await data<{ content: string }>(m, 'read', { path: 'ref/drafted.ts' })).content, '     1\tdraft');
+
+  // At initStore, before any decision has been made, it isn't direct.
+  const fresh = new WorkspaceModule({ mounts: [{ name: 'ref', path: env.ref, mode: 'read-only', backend: 'direct' }] });
+  const atInit = t.mock.method(fresh as unknown as Deciding, 'heldChanges', unreadable);
+  assert.throws(() => fresh.initStore(env.store), /the evidence could not be read/);
+  atInit.mock.restore();
+  assert.equal((await data<{ content: string }>(fresh, 'read', { path: 'ref/drafted.ts' })).content, '     1\tdraft');
 });
 
 test('changes held on a branch not selected at the start keep no mount from starting direct', async (t) => {
@@ -946,21 +1083,39 @@ test("a direct mount's listings pass over another mount's directory, naming the 
 });
 
 test('inOrder hands each result on in order, at most `width` at once', async () => {
-  const running = { now: 0, most: 0 };
+  const settle: Array<() => void> = [];
+  const settled: number[] = [];
   const order: number[] = [];
-  const delays = [30, 5, 20, 1, 10, 2, 25, 3];
-  await workspaceModule.inOrder(delays.map((_, i) => i), 3, async (i) => {
-    running.now++;
-    running.most = Math.max(running.most, running.now);
-    await new Promise((resolve) => setTimeout(resolve, delays[i]));
-    running.now--;
-    return i * 10;
+  let running = 0;
+  let most = 0;
+  const done = workspaceModule.inOrder([0, 1, 2, 3, 4, 5, 6, 7], 3, (i) => {
+    running++;
+    most = Math.max(most, running);
+    return new Promise<number>((resolve) => {
+      settle[i] = () => {
+        running--;
+        settled.push(i);
+        resolve(i * 10);
+      };
+    });
   }, (result, i) => {
     assert.equal(result, i * 10);
     order.push(i);
   });
+  // Each window's works settle last to first, so each settles before the
+  // ones ahead of it are handed on.
+  const turn = () => new Promise((resolve) => setImmediate(resolve));
+  for (const window of [[2, 1, 0], [5, 4, 3], [7, 6]]) {
+    await turn();
+    for (const i of window) {
+      settle[i]!();
+      await turn();
+    }
+  }
+  await done;
+  assert.deepEqual(settled, [2, 1, 0, 5, 4, 3, 7, 6]);
   assert.deepEqual(order, [0, 1, 2, 3, 4, 5, 6, 7]);
-  assert.equal(running.most, 3);
+  assert.equal(most, 3);
 });
 
 test('inOrder lets each result go once it has handed it on', async () => {
