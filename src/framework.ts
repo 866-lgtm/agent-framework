@@ -3124,6 +3124,10 @@ export class AgentFramework {
               ? framework.agents.get(framework.primaryAgentName) : undefined;
             return primary ? primary.getContextManager().getAllMessages() : [];
           },
+          getDeferredMessages: () => framework.deferredMessages
+            .filter((m) => (m.forAgent ?? framework.primaryAgentName) === framework.primaryAgentName)
+            .sort(bySeq)
+            .map((m) => ({ participant: m.participant, content: m.content, metadata: m.metadata as Record<string, unknown> | undefined })),
           currentSequence: () => framework.store.currentSequence(),
           setSubconsciousAnchor: (sequence) =>
             framework.subconsciousStrategy?.setAnchor(sequence),
@@ -10898,6 +10902,12 @@ export class AgentFramework {
           // #155). So the drain stops at the first such message, which waits
           // with everything queued behind it — the queue keeps its order —
           // for the turn-end flush, where no reply follows it in this stream.
+          //
+          // A message a tune-out holds from the residents is drained and
+          // stored like any other, but not injected: every resident's
+          // viewFilter leaves it out of the next compile as well, so the
+          // window's compiled prefix and the live request still match without
+          // it (#232 gap 5).
           //
           // A stream that declares it can't carry injected messages
           // (supportsInjectedMessages false: membrane's XML prefill path)
@@ -20137,8 +20147,9 @@ export class AgentFramework {
     // (activeStreams is kept as a belt-and-suspenders backstop.) Deferred
     // messages flush at the next turn's START (before its compile — riding
     // their own wake), at the agent's next tool boundary (where they are
-    // ALSO injected into the live stream — hear-while-acting), or in
-    // driveStream's finally when the turn ends.
+    // ALSO injected into the live stream — hear-while-acting — all but a
+    // message a tune-out holds from the residents), or in driveStream's
+    // finally when the turn ends.
     // Quiesce (issue #122): the window exists to run compression/refold
     // against a FROZEN context — module events and api message.send must not
     // append mid-surgery. Deferred here, flushed by resume(). tool_result
