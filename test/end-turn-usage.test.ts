@@ -223,19 +223,16 @@ describe('tool-ended turn usage accounting', () => {
       assert.equal(snapshot.inferenceCount, 2);
       // Both ephemeral runs count in the one shared entry; the traces and the
       // inference log attribute each stream to its own agent.
-      const shared = snapshot.byAgent.map(({ usage, ...entry }) => ({
-        ...entry,
-        usage: { ...usage, estimatedCost: usage.estimatedCost && { ...usage.estimatedCost, total: Math.round(usage.estimatedCost.total * 100) / 100 } },
-      }));
+      const shared = snapshot.byAgent.map(({ usage: { estimatedCost, ...tokens }, ...entry }) => ({ ...entry, tokens, currency: estimatedCost?.currency }));
       assert.deepEqual(shared, [{
         agentName: EPHEMERAL_USAGE_NAME,
-        usage: {
-          inputTokens: 350, outputTokens: 75, cacheCreationTokens: 75, cacheReadTokens: 130,
-          estimatedCost: { total: 0.11, currency: 'USD' },
-        },
+        tokens: { inputTokens: 350, outputTokens: 75, cacheCreationTokens: 75, cacheReadTokens: 130 },
+        currency: 'USD',
         inferenceCount: 2,
         ephemeral: true,
       }]);
+      // The two streams' costs, 0.03 and 0.08.
+      assert.ok(Math.abs(snapshot.byAgent[0].usage.estimatedCost!.total - 0.11) < 1e-10);
       assert.deepEqual(f.traces.filter((e) => e.type === 'usage:updated').map((e) => e.agentName), ['alice', 'bob']);
       const logs = f.framework.queryInferenceLogs();
       assert.equal(logs.total, 2);

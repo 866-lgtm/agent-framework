@@ -7,10 +7,13 @@ function snapshotUsage(usage: SessionUsage): SessionUsage {
   };
 }
 
+/** Add one count into a tally. `mixedCurrencies`: what's added is itself a
+ *  tally in which two currencies met, as a stored entry being folded can be. */
 function accumulateUsage(
   target: SessionUsage,
   tokens: { inputTokens: number; outputTokens: number; cacheCreationTokens: number; cacheReadTokens: number },
-  estimatedCost?: { total: number; currency: string }
+  estimatedCost?: { total: number; currency: string },
+  mixedCurrencies = false,
 ): void {
   // A provider's usage can lack a count (membrane 0.5.87's Bedrock stream
   // takes a message_delta's output count as reported); adding it would make
@@ -20,14 +23,16 @@ function accumulateUsage(
   target.outputTokens += count(tokens.outputTokens);
   target.cacheCreationTokens += count(tokens.cacheCreationTokens);
   target.cacheReadTokens += count(tokens.cacheReadTokens);
+  // Costs in two currencies can't be summed, and a cost counted after they
+  // met is only part of this tally's, so once they meet the cost stays absent.
+  if (target.mixedCurrencies) return;
+  if (mixedCurrencies || (estimatedCost && target.estimatedCost && target.estimatedCost.currency !== estimatedCost.currency)) {
+    target.estimatedCost = undefined;
+    target.mixedCurrencies = true;
+    return;
+  }
   if (estimatedCost) {
-    if (!target.estimatedCost) {
-      target.estimatedCost = { total: 0, currency: estimatedCost.currency };
-    } else if (target.estimatedCost.currency !== estimatedCost.currency) {
-      // Mixed currencies — drop cost tracking rather than produce garbage
-      target.estimatedCost = undefined;
-      return;
-    }
+    target.estimatedCost ??= { total: 0, currency: estimatedCost.currency };
     target.estimatedCost.total += estimatedCost.total;
   }
 }
@@ -47,9 +52,13 @@ function parseUsage(raw: unknown): SessionUsage | null {
     outputTokens,
     cacheCreationTokens: typeof o.cacheCreationTokens === 'number' ? o.cacheCreationTokens : 0,
     cacheReadTokens: typeof o.cacheReadTokens === 'number' ? o.cacheReadTokens : 0,
-    estimatedCost: o.estimatedCost && typeof o.estimatedCost === 'object'
-      ? { total: (o.estimatedCost as any).total, currency: (o.estimatedCost as any).currency }
-      : undefined,
+    ...(o.mixedCurrencies === true
+      ? { mixedCurrencies: true as const }
+      : {
+          estimatedCost: o.estimatedCost && typeof o.estimatedCost === 'object'
+            ? { total: (o.estimatedCost as any).total, currency: (o.estimatedCost as any).currency }
+            : undefined,
+        }),
   };
 }
 
@@ -68,7 +77,7 @@ const emptyUsage = (): SessionUsage => ({ inputTokens: 0, outputTokens: 0, cache
 
 /** Add one tally's stored usage and inference count into another. */
 function addTally(target: Tally, usage: SessionUsage, inferenceCount: number): void {
-  accumulateUsage(target.usage, usage, usage.estimatedCost);
+  accumulateUsage(target.usage, usage, usage.estimatedCost, usage.mixedCurrencies === true);
   target.inferenceCount += inferenceCount;
 }
 
@@ -128,6 +137,16 @@ export class UsageTracker {
           }
         }
       }
+    }
+    // The totals count every entry's inferences, so stored entries whose
+    // costs are in two currencies, or one where two met, mean two met in the
+    // totals too. A record written before mixedCurrencies shows it only so.
+    const tallies = [...this.byAgent.values(), ...(this.ephemeral ? [this.ephemeral] : [])].map((tally) => tally.usage);
+    const currencies = new Set(tallies.flatMap((usage) => (usage.estimatedCost ? [usage.estimatedCost.currency] : [])));
+    if (this.totals.estimatedCost) currencies.add(this.totals.estimatedCost.currency);
+    if (!this.totals.mixedCurrencies && (currencies.size > 1 || tallies.some((usage) => usage.mixedCurrencies))) {
+      this.totals.estimatedCost = undefined;
+      this.totals.mixedCurrencies = true;
     }
   }
 

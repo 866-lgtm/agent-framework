@@ -2839,7 +2839,8 @@ export class AgentFramework {
 
     // Restore persisted usage data (if any) from prior session. The names it
     // never folds into the shared ephemeral entry: the configured agents', and
-    // the subconscious's when one is configured.
+    // the subconscious's when one is configured, enabled or not, since a
+    // subconscious disabled now may have run and left its own entry.
     framework.restoreUsageState([
       ...config.agents.map((agent) => String(agent.name)),
       ...(config.subconscious ? [String(config.subconscious.name ?? 'Subconscious')] : []),
@@ -7264,13 +7265,14 @@ export class AgentFramework {
    *  take it as holding nothing, and its first write would replace it.
    *
    *  A stored entry restores into the shared ephemeral entry, rather than
-   *  under its own name, when it was an ephemeral agent's from before they
-   *  shared one entry, its name having an ephemeral agent's namespace in the
-   *  store (subagent/<name>, as createEphemeralAgent opens it), or when it is
-   *  the shared entry an earlier framework wrote back without its mark. A name
-   *  a persistent agent has keeps its entry either way: one in `configured`,
-   *  or one with a resident's or a conversation agent's namespace
-   *  (agents/<name>, conversations/<name>). */
+   *  under its own name, when it is marked as the shared entry, when it was an
+   *  ephemeral agent's from before they shared one entry, its name having an
+   *  ephemeral agent's namespace in the store (subagent/<name>, as
+   *  createEphemeralAgent opens it), or when it is the shared entry an earlier
+   *  framework wrote back without its mark. A name a persistent agent has keeps
+   *  an unmarked entry either way: one in `configured`, or one with a
+   *  resident's or a conversation agent's namespace (agents/<name>,
+   *  conversations/<name>). */
   private restoreUsageState(configured: readonly string[]): void {
     const refuse = (problem: string, cause?: unknown): Error => new Error(
       `the usage totals (${FRAMEWORK_STATE_ID}, usage) ${problem}. The framework doesn't start without them, ` +

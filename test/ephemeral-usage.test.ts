@@ -135,6 +135,12 @@ describe('ephemeral agents share one usage entry', () => {
       entry(EPHEMERAL_USAGE_NAME, 1000, { cost: 0.1, inferences: 5 }),
       entry('helper', 30), entry('former', 4), entry('conv-a', 6), entry('Subconscious', 7), entry('unknown', 5),
     ];
+    // The totals and the count as that release kept them: the entries' sums.
+    state.usage.totals = {
+      inputTokens: 1352, outputTokens: 8, cacheCreationTokens: 10, cacheReadTokens: 60,
+      estimatedCost: { total: 0.13, currency: 'USD' },
+    };
+    state.usage.inferenceCount = 12;
     store.setStateJson('framework/state', state);
     await framework.stop();
 
@@ -162,8 +168,45 @@ describe('ephemeral agents share one usage entry', () => {
       const shared = byAgent.find((a) => a.ephemeral)!.usage;
       assert.deepEqual([shared.outputTokens, shared.cacheCreationTokens, shared.cacheReadTokens, shared.estimatedCost?.currency], [3, 10, 60, 'USD']);
       assert.ok(Math.abs(shared.estimatedCost!.total - 0.13) < 1e-10);
+      // It moves entries only: the totals and the count stay as stored.
+      const { totals, inferenceCount } = framework.getSessionUsage();
+      assert.deepEqual([totals.inputTokens, totals.outputTokens, totals.cacheCreationTokens, totals.cacheReadTokens, totals.estimatedCost?.currency, inferenceCount],
+        [1352, 8, 10, 60, 'USD', 12]);
+      assert.ok(Math.abs(totals.estimatedCost!.total - 0.13) < 1e-10);
     } finally {
       await framework.stop();
+    }
+  });
+
+  it("keeps a configured subconscious's own name out of the fold, whatever it's called and whether or not it's enabled", async (t) => {
+    const storePath = tempStore(t);
+    // An ephemeral agent once ran as "Dreamer", leaving subagent/Dreamer.
+    const membrane = new MockMembrane();
+    let framework = await frameworkOn(storePath, membrane);
+    await runEphemeral(framework, membrane, 'Dreamer');
+    const store = framework.getStore();
+    const state = store.getStateJson('framework/state') as { usage: StoredUsage & Record<string, unknown> };
+    const usage = { inputTokens: 7, outputTokens: 1, cacheCreationTokens: 0, cacheReadTokens: 0 };
+    // The subconscious named "Dreamer" kept its own entry.
+    state.usage.byAgent = [{ agentName: 'Dreamer', usage, inferenceCount: 1 }];
+    state.usage.totals = usage;
+    state.usage.inferenceCount = 1;
+    store.setStateJson('framework/state', state);
+    await framework.stop();
+
+    for (const enabled of [false, true]) {
+      framework = await AgentFramework.create({
+        storePath,
+        membrane: new MockMembrane().asMembrane(),
+        modules: [],
+        agents: [resident()],
+        subconscious: { enabled, name: 'Dreamer', systemPrompt: 'You are the subconscious.' },
+      });
+      try {
+        assert.deepEqual(framework.getSessionUsage().byAgent.map((a) => [a.agentName, a.ephemeral, a.usage.inputTokens]), [['Dreamer', undefined, 7]], `enabled: ${enabled}`);
+      } finally {
+        await framework.stop();
+      }
     }
   });
 
