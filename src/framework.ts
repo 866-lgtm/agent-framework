@@ -24927,10 +24927,13 @@ export class AgentFramework {
       error?: { code: unknown; message: unknown };
     }) => {
       // A late JSON-RPC error is recorded as the connection words a live one,
-      // `[code] message`, bounded and with its control characters replaced,
-      // since the server wrote it.
+      // `[code] message`: redacted as the server's text, as an on-time
+      // answer's record is, and then bounded with its control characters
+      // replaced, since the server wrote it. Redacting first keeps a
+      // credential the cut or a replaced character would split whole for the
+      // redactor.
       const error = info.error === undefined ? {} : {
-        error: boundedForLog(`[${describeCause(info.error.code)}] ${describeCause(info.error.message)}`, 500),
+        error: boundedForLog(recorded(`[${describeCause(info.error.code)}] ${describeCause(info.error.message)}`), 500),
       };
       // A push/render answered after its timeout, when the batch's fallback
       // was already materialized: RFC-006's audit records the discarded

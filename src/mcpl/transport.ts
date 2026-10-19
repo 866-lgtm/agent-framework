@@ -23,7 +23,7 @@ import { StringDecoder } from 'node:string_decoder';
 import WebSocket from 'ws';
 
 import type { McplServerConfig } from './types.js';
-import { WITHHELD_TEXT, describeCredentialError, noteDialSent, redactServerText, redactUrl, resolveServerBinding, urlAsDialed } from './protocol-family.js';
+import { WITHHELD_TEXT, describeCredentialError, maskedError, noteDialSent, redactServerText, redactUrl, resolveServerBinding, serverTextRedactor, urlAsDialed, type Redaction } from './protocol-family.js';
 import { assertBooleanSetting } from '../config-checks.js';
 import { logDetail } from './log-value.js';
 
@@ -91,6 +91,21 @@ export abstract class McplTransport extends EventEmitter {
    * child's stderr, and '' for a transport that has none.
    */
   get stderrTail(): string {
+    return '';
+  }
+
+  /**
+   * {@link stderrTail} as an error a host gets carries it: the same
+   * characters, redacted with `redact`. The stream's last
+   * {@link STDERR_WINDOW_CHARS} are redacted together and the tail is taken
+   * from where it begins in them, so a credential that begins before the
+   * tail and reaches into it is matched whole and replaced whole
+   * ({@link Redaction}'s `from`). That holds for a credential of up to
+   * 14,336 characters, the window less the tail: a longer one that began
+   * before the window can't be matched, and the tail keeps what it holds of
+   * it. '' for a transport that has no diagnostic stream.
+   */
+  stderrTailRedacted(_redact: Redaction): string {
     return '';
   }
 
@@ -230,8 +245,18 @@ export function buildChildEnv(
   return merged;
 }
 
-/** The most of a stdio child's stderr a transport keeps for {@link McplTransport.stderrTail}. */
+/** The most of a stdio child's stderr that {@link McplTransport.stderrTail} gives. */
 export const STDERR_TAIL_CHARS = 2_048;
+
+/** The most of a stdio child's stderr a transport keeps, for
+ *  {@link McplTransport.stderrTail} and
+ *  {@link McplTransport.stderrTailRedacted}: eight tails, so a credential of
+ *  up to 14,336 characters that reaches into the tail, a private key's PEM
+ *  of 8,192 bits (about 6,500 characters) included, is whole in it. */
+export const STDERR_WINDOW_CHARS = 8 * STDERR_TAIL_CHARS;
+
+/** A redaction that replaces nothing: the raw tail. */
+const unredacted: Redaction = (text, from = 0) => String(text).slice(from);
 
 /**
  * How long a refusal at a stdio child's exit waits for the child's stderr to
@@ -251,13 +276,28 @@ export class StdioTransport extends McplTransport {
   readonly kind = 'stdio' as const;
   /** The first error on the child's stdin or stdout, named in the close reason. */
   private pipeError: Error | undefined;
-  private stderrEnd = '';
-  private stderrCut = false;
+  /** The stream's last STDERR_WINDOW_CHARS, raw. */
+  private stderrWindow = '';
   /** True once the child's stderr has ended or closed. */
   private stderrDone = false;
 
   override get stderrTail(): string {
-    return (this.stderrCut ? '…' : '') + this.stderrEnd;
+    return this.stderrTailRedacted(unredacted);
+  }
+
+  override stderrTailRedacted(redact: Redaction): string {
+    // A child that wrote nothing has no tail, whatever its redaction.
+    if (this.stderrWindow === '') return '';
+    // The tail begins at its raw place in the window, so a redaction that
+    // shortens the window can't move its edge back toward the window's own
+    // cut. Something before the tail was dropped whenever the window is
+    // longer than the tail, which it always is once the window was cut.
+    const from = Math.max(0, this.stderrWindow.length - STDERR_TAIL_CHARS);
+    const cut = from > 0;
+    let kept = redact(this.stderrWindow, from);
+    // A cut between a surrogate pair's halves drops the low half too.
+    if (cut && /^[\uDC00-\uDFFF]/.test(kept)) kept = kept.slice(1);
+    return (cut ? '…' : '') + kept;
   }
 
   override get pipeFailure(): Error | undefined {
@@ -300,12 +340,8 @@ export class StdioTransport extends McplTransport {
     let carry = '';
     const decoder = new StringDecoder('utf8');
     const received = (text: string) => {
-      const end = this.stderrEnd + text;
-      this.stderrCut ||= end.length > STDERR_TAIL_CHARS;
-      let kept = end.slice(-STDERR_TAIL_CHARS);
-      // A cut between a surrogate pair's halves drops the low half too.
-      if (/^[\uDC00-\uDFFF]/.test(kept) && end.length > STDERR_TAIL_CHARS) kept = kept.slice(1);
-      this.stderrEnd = kept;
+      const window = this.stderrWindow + text;
+      this.stderrWindow = window.slice(-STDERR_WINDOW_CHARS);
       const lines = (carry + text).split('\n');
       carry = lines.pop() ?? '';
       for (const l of lines) if (l.length > 0) this.pushStderr(l);
@@ -374,10 +410,33 @@ export class StdioTransport extends McplTransport {
         `MCPL server "${config.id}": stdio transport requires "command" (none provided)`,
       );
     }
-    const child = spawn(config.command, config.args ?? [], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: buildChildEnv(config),
-    });
+    // Node's error for a launch that failed reaches the host, and its words
+    // and its other properties (`spawnargs`, `path`) can repeat a credential
+    // the configuration holds. So it's handed on as its name and redacted
+    // words (maskedError), with its code, which says what failed. What
+    // spawn() refuses at once is one of the configuration's own arguments or
+    // options, which Node quotes after " Received", cut to 128 characters: a
+    // credential across that cut couldn't be matched, so the words stop
+    // before the quote, still saying which value Node refused and why.
+    const failed = (err: NodeJS.ErrnoException, refusedAtOnce: boolean): Error => {
+      const redact = serverTextRedactor(config).now();
+      const message = err instanceof Error ? err.message : String(err);
+      const words = refusedAtOnce ? message.split(' Received')[0] : message;
+      const shown = Object.assign(new Error(words), { name: err instanceof Error ? err.name : 'Error' });
+      const cause = Object.assign(maskedError(shown, redact), err.code === undefined ? {} : { code: err.code });
+      return new Error(`MCPL server "${config.id}" could not be started: ${redact(words)}`, { cause });
+    };
+    // The child's environment is read first, outside that: a configuration
+    // whose `env` can't be read throws the framework's own error, such as
+    // its awareness ledger's, which the framework acts on: its startup ends
+    // on it, and a reconnect reports it.
+    const env = buildChildEnv(config);
+    let child: ChildProcess;
+    try {
+      child = spawn(config.command, config.args ?? [], { stdio: ['pipe', 'pipe', 'pipe'], env });
+    } catch (error) {
+      throw failed(error as NodeJS.ErrnoException, true);
+    }
     // Node reports a failed spawn (a command that doesn't exist, say) as an
     // 'error' on a tick after spawn() returns, and no 'exit' follows. It is
     // settled here, where it is listened for. A caller that listens only once
@@ -385,12 +444,10 @@ export class StdioTransport extends McplTransport {
     // from a timer callback, as a reconnect is: Node runs that tick before the
     // caller's promise continuation, and throws an 'error' nothing listens for.
     await new Promise<void>((resolve, reject) => {
-      const failed = (err: Error) => {
-        reject(new Error(`MCPL server "${config.id}" could not be started: ${err.message}`, { cause: err }));
-      };
-      child.once('error', failed);
+      const fail = (err: NodeJS.ErrnoException) => reject(failed(err, false));
+      child.once('error', fail);
       child.once('spawn', () => {
-        child.off('error', failed);
+        child.off('error', fail);
         resolve();
       });
     });
