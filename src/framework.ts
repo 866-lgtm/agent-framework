@@ -724,7 +724,11 @@ const DEFERRED_WRITES_PERSIST_CAP_CHARS = 4 * 1024 * 1024;
  *  with no stream). */
 /** One entry of the deferred-write queue (see AgentFramework.deferredMessages). */
 interface DeferredWrite {
+  /** Durable identity, stamped on the stored message as its
+   *  deferredWriteId: a flush interrupted by a crash replays its batch at
+   *  the next boot, which skips each entry that already landed by it. */
   id: string;
+  /** Order stamp (see deferredSeq). */
   seq: number;
   participant: string;
   content: ContentBlock[];
@@ -736,10 +740,9 @@ interface DeferredWrite {
    *  module reads it as the held row's timestamp (heldRows). */
   heldAt: number;
   /** Set when a write of this entry threw and its store couldn't be read
-   *  back to tell whether it landed (writeDrainedInOrder): before it's
+   *  to tell whether it landed (writeDrainedInOrder): before it's
    *  written again, the store is searched for its id. Persisted with the
-   *  entry, and a hand-off of such an entry has boot scan its agent's whole
-   *  store (handOffDeferredWrites). */
+   *  entry, so after a restart it's still looked up first. */
   landing?: 'unknown';
 }
 const bySeq = (a: { seq: number }, b: { seq: number }): number => a.seq - b.seq;
@@ -2504,22 +2507,7 @@ export class AgentFramework {
    * could occupy and dedups against all of it — never a fixed tail.
    */
   private deferredScanFrom = new Map<string, number>();
-  private deferredMessages: Array<{
-    /** Durable identity, stamped on the stored message as its
-     *  deferredWriteId: a flush interrupted by a crash replays its batch at
-     *  the next boot, which skips each entry that already landed by it. */
-    id: string;
-    /** Order stamp (see deferredSeq). */
-    seq: number;
-    participant: string;
-    content: ContentBlock[];
-    metadata?: MessageMetadata;
-    /** Delivery target (registry name). Absent = the primary agent —
-     *  the historical behavior of every existing caller. */
-    forAgent?: string;
-    /** When the framework first held the write (DeferredWrite.heldAt). */
-    heldAt: number;
-  }> = [];
+  private deferredMessages: DeferredWrite[] = [];
 
   // Turn-alive markers (2026-07-31 Mythos phantom-skip incident): agentName →
   // token of the turn currently in progress. Set at startAgentStream ENTRY —
@@ -6580,10 +6568,6 @@ export class AgentFramework {
         const cm = agent.getContextManager() as unknown as { getMessageCount?: () => number; getAllMessages: () => unknown[] };
         count = typeof cm.getMessageCount === 'function' ? cm.getMessageCount() : cm.getAllMessages().length;
       } catch { count = 0; }
-      // An entry whose earlier write may have landed (landing unknown) could
-      // be anywhere before the store's present count, so boot scans the
-      // agent's whole store for it.
-      if (entry.landing === 'unknown') count = 0;
       const prev = this.deferredScanFrom.get(target!);
       this.deferredScanFrom.set(target!, prev === undefined ? count : Math.min(prev, count));
     }
@@ -11429,7 +11413,11 @@ export class AgentFramework {
           // them in the live conversation — same participant, same content
           // blocks, same metadata, and compile() emits recent messages
           // verbatim, so the next turn's compiled prefix byte-matches the
-          // live request (prompt-cache safe).
+          // live request (prompt-cache safe). A write that threw after it was
+          // stored, whose landing couldn't be read, is the exception: it's
+          // carried at the flush that finds it, after what was stored since,
+          // so there the store and the live request differ
+          // (writeDrainedInOrder).
           //
           // The queue is drained ONLY at the target agent's own boundary:
           // draining at another agent's boundary would store the messages
@@ -13332,7 +13320,17 @@ export class AgentFramework {
    *  in the deferred queue is both. */
   private isUnreadPlacement(p: CoalescingPlacement, by: 'consumed' | 'shown' = 'consumed'): boolean {
     this.resolvePlacement(p);
-    if (p.deferredId) return this.deferredMessages.some((m) => m.id === p.deferredId);
+    if (p.deferredId) {
+      const held = this.deferredMessages.find((m) => m.id === p.deferredId);
+      if (!held) return false;
+      if (held.landing !== 'unknown') return true;
+      // A held write whose landing is unknown may also be stored, and that
+      // copy may have been read or shown: its own row answers. A store that
+      // can't be searched is a doubt, which counts as read and as shown.
+      let copy: { agent: Agent; row: StoredMessage } | null;
+      try { copy = this.landedCopyOfHeld(held); } catch { return false; }
+      return copy ? this.isUnreadStoredMessage(copy.agent, copy.row.id, by) : true;
+    }
     if (!p.messageId) return false;
     const agent = this.agents.get(p.agent);
     return !!agent && this.isUnreadStoredMessage(agent, p.messageId, by);
@@ -13389,9 +13387,28 @@ export class AgentFramework {
   private removePlacement(p: CoalescingPlacement): boolean {
     this.resolvePlacement(p);
     if (p.deferredId) {
-      const before = this.deferredMessages.length;
+      const held = this.deferredMessages.find((m) => m.id === p.deferredId);
+      if (!held) return false;
+      // A held write whose landing is unknown may also be stored: its stored
+      // copy goes too, but only where that row's own check says nothing may
+      // have shown it (the held entry reads as unshown whatever its copy
+      // went through). Where something may have, or the store can't be
+      // searched, nothing is removed.
+      if (held.landing === 'unknown') {
+        let copy: { agent: Agent; row: StoredMessage } | null;
+        try { copy = this.landedCopyOfHeld(held); } catch { return false; }
+        if (copy) {
+          if (!this.isUnreadStoredMessage(copy.agent, copy.row.id, 'shown')) return false;
+          try {
+            removeStoredMessage(copy.agent.getContextManager(), copy.row.id);
+          } catch (err) {
+            console.error(`[coalescing] could not remove unread message ${copy.row.id} for ${copy.agent.name}:`, err);
+            return false;
+          }
+          this.emitTrace({ type: 'message:removed', messageId: copy.row.id, source: 'mcpl:coalescing' });
+        }
+      }
       this.deferredMessages = this.deferredMessages.filter((m) => m.id !== p.deferredId);
-      if (this.deferredMessages.length === before) return false;
       if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
       return true;
     }
@@ -21271,9 +21288,11 @@ export class AgentFramework {
       // back to tell whether it landed. It's looked up by its id before it's
       // written again: found, it counts as written, as when the readback
       // works; not found, it's written; and while the store can't be
-      // searched, it stays queued, holding what's behind it.
-      if (msg.landing === 'unknown') {
-        const found = agent ? this.landedCopiesById(agent, msg.id) : undefined;
+      // searched, it stays queued, holding what's behind it. An entry whose
+      // agent isn't registered has no store to look in: it's written, and
+      // addMessage drops it, as it does an unmarked one.
+      if (msg.landing === 'unknown' && agent) {
+        const found = this.landedCopiesById(agent, msg.id);
         if (found === undefined) {
           cut.add(target);
           this.requeueDrained(ordered.slice(i).filter((m) => targetOf(m) === target));
@@ -21366,7 +21385,7 @@ export class AgentFramework {
    *  which is already back in the queue; with a count, one stored before the
    *  throw (for a sharded body, how many of its shards), or, with
    *  `foundLater`, one an earlier write of which landed and was found by its
-   *  id; with `'unknown'`, one whose store couldn't be read back to tell
+   *  id; with `'unknown'`, one whose store couldn't be read to tell
    *  whether it landed, back in the queue to be looked up first; and with
    *  `'still-unknown'`, one that still can't be looked up. Logging mustn't
    *  fail the flush that met it, so a thrown value that has no text is
@@ -21389,12 +21408,12 @@ export class AgentFramework {
       : 'it was stored';
     let what: string;
     if (outcome === 'unknown') {
-      what = `threw, and its store couldn't be read back to tell whether it was stored; ${held}, and is looked up ` +
+      what = `threw, and its store couldn't be read to tell whether it was stored; ${held}, and is looked up ` +
         `by its id before it's written again: ${reason}`;
     } else if (outcome === 'still-unknown') {
       what = `still can't be looked up by its id, to tell whether an earlier write of it was stored; ${held}`;
     } else if (outcome?.foundLater) {
-      what = `was found by its id: ${stored(outcome)} by an earlier write whose landing couldn't be read back; what ` +
+      what = `was found by its id: ${stored(outcome)} by an earlier write whose landing was unknown; what ` +
         `was stored counts as written and isn't stored again`;
     } else if (outcome) {
       what = `threw after ${stored(outcome)}; what was stored counts as written and isn't stored again: ${reason}`;
@@ -21494,7 +21513,11 @@ export class AgentFramework {
    * one still queued for it. Writes still
    * queued would wait for a boundary it never reaches, and the flush that
    * finds it gone would drop them, so they land in its own window now, which
-   * Chronicle keeps for investigation. Its stream is over or cancelled, so it
+   * Chronicle keeps for investigation. One whose earlier write may have
+   * landed (`landing` unknown) is looked up there by its id first: found,
+   * it's neither stored again nor passed to the primary; where the store
+   * can't be searched, it's stored anyway, with a line saying it may now be
+   * stored twice. Its stream is over or cancelled, so it
    * compiles nothing more. One path still stores after these writes: a
    * `complete` that arrived while the agent still waited for tools awaits
    * the spill of its last tool results, and stores them once that resolves,
@@ -21509,6 +21532,27 @@ export class AgentFramework {
     const cm = agent.getContextManager();
     const forPrimary: DeferredWrite[] = [];
     for (const msg of queued) {
+      // An entry whose earlier write may have landed (landing unknown) is
+      // looked up by its id first, as a drain does (writeDrainedInOrder).
+      // Found, it's neither stored again nor passed on below: the loop above
+      // has passed its stored copy if the agent hadn't read it. When the
+      // store can't be searched, it's written anyway, since no later flush
+      // will try again, and a copy its deferredWriteId tells apart costs
+      // less than a write lost without a trace.
+      if (msg.landing === 'unknown') {
+        const found = this.landedCopiesById(agent, msg.id);
+        if (found && found.length > 0) {
+          this.logDeferredWriteError(msg, `release of ${agent.name}`, undefined,
+            { count: found.length, sharded: found[0]!.bodyGroupId !== undefined, foundLater: true });
+          continue;
+        }
+        if (found === undefined) {
+          console.error(
+            `[deferral] release of ${agent.name}: deferred write ${describeDeferredWrite(msg)} is stored though its ` +
+            `store couldn't be searched for an earlier copy, so it may now be stored twice`,
+          );
+        }
+      }
       try {
         cm.addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id));
       } catch (err) {
@@ -21785,6 +21829,17 @@ export class AgentFramework {
     return cm.queryMessages({ metadata: { deferredWriteId: writeId } }).messages[0] ?? null;
   }
 
+  /** The row a held write whose landing is unknown (DeferredWrite.landing)
+   *  was already stored as, if its target's store holds one, found as
+   *  landedRow finds it; null for any other held write. Throws when the
+   *  store can't be searched. */
+  private landedCopyOfHeld(msg: DeferredWrite): { agent: Agent; row: StoredMessage } | null {
+    if (msg.landing !== 'unknown') return null;
+    const agent = this.deliveryAgent(msg.forAgent);
+    const row = agent ? this.landedRow(agent.getContextManager(), msg.id) : null;
+    return agent && row ? { agent, row } : null;
+  }
+
   /** Whether the agent has nothing left to read of a deferred write, on
    *  evidence only: the row it landed as is at or below the agent's consumed
    *  watermark on its current branch, or it's in neither the queue (drained
@@ -21828,6 +21883,12 @@ export class AgentFramework {
     if (writeId !== undefined) {
       const held = this.heldWritesFor(agent).find((m) => m.id === writeId);
       if (held) {
+        // A held write whose landing is unknown may also be stored: its
+        // stored copy takes the edit too, so the flush that finds that copy
+        // carries the edit. It's looked up first, so a store that can't be
+        // searched throws here with nothing changed.
+        const copy = this.landedCopyOfHeld(held);
+        if (copy) copy.agent.getContextManager().editMessage(copy.row.id, content);
         held.content = content;
         if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
         return;
@@ -21843,7 +21904,13 @@ export class AgentFramework {
       throw new Error('No agents configured');
     }
     const writeId = heldWriteId(id);
-    if (writeId !== undefined && this.heldWritesFor(agent).some((m) => m.id === writeId)) {
+    const held = writeId !== undefined ? this.heldWritesFor(agent).find((m) => m.id === writeId) : undefined;
+    if (held) {
+      // A held write whose landing is unknown may also be stored: its stored
+      // copy goes too. It's looked up first, so a store that can't be
+      // searched throws here with nothing changed.
+      const copy = this.landedCopyOfHeld(held);
+      if (copy) removeStoredMessage(copy.agent.getContextManager(), copy.row.id);
       this.deferredMessages = this.deferredMessages.filter((m) => m.id !== writeId);
       if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
       return;
@@ -21879,7 +21946,16 @@ export class AgentFramework {
     // the store's own query does it: it matches every row, then reverses,
     // then cuts.
     const { limit, reverse, ...match } = filter;
-    let messages: ModuleMessage[] = [...cm.queryMessages(match).messages.map(asModuleRow), ...held];
+    // A held write whose landing is unknown may also be stored: it's shown
+    // once, as its held row, whose handle reaches its stored copy too.
+    const marked = new Set(this.heldWritesFor(agent).filter((m) => m.landing === 'unknown').map((m) => m.id));
+    const shownHeld = new Set(held.map((row) => heldWriteId(row.id)).filter((id) => id !== undefined && marked.has(id)));
+    let messages: ModuleMessage[] = [
+      ...cm.queryMessages(match).messages
+        .filter((m) => !shownHeld.has(m.metadata?.deferredWriteId as string))
+        .map(asModuleRow),
+      ...held,
+    ];
     const totalCount = messages.length;
     if (reverse) messages = messages.reverse();
     if (limit !== undefined && limit < messages.length) messages = messages.slice(0, limit);

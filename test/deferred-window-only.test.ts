@@ -15,7 +15,9 @@
  * injected, since the next compile leaves it out too
  * (module-rows-held-from-residents). A provider that binds signed thinking
  * to its prefix (context-manager #155) refuses a reply whose stored prefix
- * holds a message its request didn't.
+ * holds a message its request didn't. One write is the exception: one that
+ * threw after it was stored, whose landing couldn't be read, is carried at
+ * the flush that finds it by its id, after what the turn stored since.
  *
  * A message the stream carried has been read: RFC-006's consumed watermark
  * covers it, so a coalesced replacement can no longer remove it. Only a
@@ -43,6 +45,7 @@ import type {
   ToolResult,
 } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
+import { heldHandle } from '../src/held-writes.js';
 import { AutobiographicalStrategy } from '@animalabs/context-manager';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import type { ContentBlock } from '@animalabs/membrane';
@@ -612,9 +615,13 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
       await framework.runUntilIdle();
     } finally { console.error = error; }
-    assert.equal(windowOf(framework).filter((line) => line === 'Antra: look left').length, 1, 'stored once');
-    assert.equal(windowOf(framework).filter((line) => line === 'Antra: look right').length, 1);
-    assert.ok(errors.some((e) => e.includes("threw, and its store couldn't be read back to tell whether it was stored")
+    assert.deepEqual(windowOf(framework).slice(-4), [
+      'user: <tool_result>',
+      'Antra: look left',
+      'assistant: Done.',
+      'Antra: look right',
+    ], 'stored once, where its first write landed, and what was queued behind it at the turn end');
+    assert.ok(errors.some((e) => e.includes("threw, and its store couldn't be read to tell whether it was stored")
       && e.includes('strategy failed')), errors.join('\n'));
     assert.ok(errors.some((e) => e.includes('was found by its id: it was stored by an earlier write')), errors.join('\n'));
     await framework.stop();
@@ -625,15 +632,22 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     return framework as unknown as {
       writeDrainedInOrder(
         entries: DeferredEntry[], where: string, write: (msg: DeferredEntry) => string,
+        onLanded?: (msg: DeferredEntry, id: string) => void,
       ): Map<DeferredEntry, { id: string; content: ContentBlock[] }>;
-      handOffDeferredWrites(entries: DeferredEntry[]): void;
+      releaseWindow(agent: unknown): void;
+      addMessage(participant: string, content: ContentBlock[], metadata: unknown, opts: unknown): string;
+      editMessage(id: string, content: ContentBlock[]): void;
+      removeMessage(id: string): void;
+      queryMessages(filter: unknown): { messages: Array<{ content: ContentBlock[]; held?: true }> };
+      isUnreadPlacement(placement: { agent: string; deferredId?: string }, by?: 'consumed' | 'shown'): boolean;
+      removePlacement(placement: { agent: string; deferredId?: string }): boolean;
       deferredMessages: DeferredEntry[];
-      deferredScanFrom: Map<string, number>;
       deferredWritesPersisted: boolean;
     };
   }
   type DeferredEntry = {
-    id: string; seq: number; participant: string; content: ContentBlock[]; heldAt: number; landing?: 'unknown';
+    id: string; seq: number; participant: string; content: ContentBlock[]; heldAt: number;
+    metadata?: unknown; forAgent?: string; landing?: 'unknown';
   };
   const entry = (id: string, said: string): DeferredEntry => ({ id, seq: 1, participant: 'Antra', content: text(said), heldAt: Date.now() });
   /** A write that stores the entry as the framework does, under its id, then throws. */
@@ -655,15 +669,40 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     const msg = entry('w-count', 'look left');
     const error = console.error;
     console.error = () => {};
+    let marked: string | undefined;
+    let writes = 0;
+    let written: Map<DeferredEntry, { id: string; content: ContentBlock[] }>;
+    const landed: Array<[string, string]> = [];
     try {
       internals.writeDrainedInOrder([msg], 'test', storedThenThrows(framework));
-      assert.equal(msg.landing, 'unknown');
-      let writes = 0;
-      const written = internals.writeDrainedInOrder([msg], 'test', () => { writes++; return 'again'; });
-      assert.equal(writes, 0, 'found by its id, it is not written again');
-      assert.ok(written.get(msg)?.id, 'it counts as written, under the id it was stored with');
+      marked = msg.landing;
+      written = internals.writeDrainedInOrder([msg], 'test', (m) => {
+        writes++;
+        return framework.getAgent('assistant')!.getContextManager().addMessage(m.participant, m.content, { deferredWriteId: m.id } as never);
+      }, (m, id) => { landed.push([m.id, id]); });
     } finally { console.error = error; }
-    assert.equal(windowOf(framework).filter((line) => line === 'Antra: look left').length, 1);
+    assert.equal(windowOf(framework).filter((line) => line === 'Antra: look left').length, 1, 'stored once');
+    assert.equal(writes, 0, 'found by its id, it is not written again');
+    const [copy] = framework.getAgent('assistant')!.getContextManager().queryMessages({ metadata: { deferredWriteId: 'w-count' } } as never).messages;
+    assert.equal(written.get(msg)?.id, copy!.id, 'it counts as written, under the id its copy was stored with');
+    assert.deepEqual(landed, [['w-count', copy!.id]], 'what landed is noted, as for a write found by its readback');
+    assert.equal(marked, 'unknown', 'the throw left its landing unknown');
+    await framework.stop();
+  });
+
+  it("a drained write whose landing is unknown, found by its id, is carried as its store holds it, not as it was queued", async () => {
+    const framework = await createFramework();
+    const internals = drainInternals(framework);
+    // A body whose first part landed before the throw stopped its write.
+    framework.getAgent('assistant')!.getContextManager().addMessage('Antra', text('part one'), { deferredWriteId: 'w-part' } as never);
+    const msg = { ...entry('w-part', 'part one'), content: [...text('part one'), ...text('part two')], landing: 'unknown' as const };
+    const error = console.error;
+    console.error = () => {};
+    let written: Map<DeferredEntry, { id: string; content: ContentBlock[] }>;
+    try {
+      written = internals.writeDrainedInOrder([msg], 'test', () => { throw new Error('written again'); });
+    } finally { console.error = error; }
+    assert.deepEqual(written.get(msg)?.content, text('part one'), 'what the store holds');
     await framework.stop();
   });
 
@@ -689,16 +728,18 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     cm.queryMessages = function () { throw new Error('search failed'); };
     const internals = drainInternals(framework);
     const first = { ...entry('w-held', 'look left'), landing: 'unknown' as const };
-    const second = { ...entry('w-behind', 'look right'), seq: 2 };
+    // Another target's entry, queued between them, isn't held by them.
+    const other = { ...entry('w-other', 'elsewhere'), seq: 2, forAgent: 'gone-fork' };
+    const second = { ...entry('w-behind', 'look right'), seq: 3 };
     const errors: string[] = [];
     const error = console.error;
     console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
-    let writes = 0;
+    const writes: string[] = [];
     try {
-      const written = internals.writeDrainedInOrder([first, second], 'test', () => { writes++; return 'x'; });
-      assert.equal(written.size, 0);
+      const written = internals.writeDrainedInOrder([first, other, second], 'test', (m) => { writes.push(m.id); return 'x'; });
+      assert.deepEqual([...written.keys()].map((m) => m.id), ['w-other']);
     } finally { console.error = error; }
-    assert.equal(writes, 0, 'neither is written');
+    assert.deepEqual(writes, ['w-other'], "only the other target's entry is written");
     assert.deepEqual(internals.deferredMessages.map((m) => m.id), ['w-held', 'w-behind'], 'both are back in the queue');
     assert.equal(first.landing, 'unknown');
     assert.ok(errors.some((e) => e.includes("still can't be looked up by its id")), errors.join('\n'));
@@ -706,18 +747,180 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     await framework.stop();
   });
 
-  it("a hand-off of an entry whose landing is unknown has boot scan its agent's whole store", async () => {
+  it("a drained write whose landing is unknown, for an agent that isn't registered, is dropped as an unmarked one is, not held", async () => {
+    const framework = await createFramework();
+    const internals = drainInternals(framework);
+    const gone = { ...entry('w-gone', 'look left'), forAgent: 'gone-fork', landing: 'unknown' as const };
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    let written: Map<DeferredEntry, { id: string; content: ContentBlock[] }>;
+    try {
+      written = internals.writeDrainedInOrder([gone], 'test', (m) => internals.addMessage(m.participant, m.content, m.metadata, {
+        fromQueue: { id: m.id, seq: m.seq, heldAt: m.heldAt }, forAgent: m.forAgent,
+      }));
+    } finally { console.error = error; }
+    assert.ok(written.has(gone), 'it leaves the drain');
+    assert.deepEqual(internals.deferredMessages.map((m) => m.id), [], 'nothing is held');
+    assert.ok(!errors.some((e) => e.includes("still can't be looked up by its id")), errors.join('\n'));
+    await framework.stop();
+  });
+
+  it("a write whose landing is unknown keeps its mark across a restart, so it isn't stored a second time after it", async () => {
     const framework = await createFramework();
     const internals = drainInternals(framework);
     internals.deferredWritesPersisted = true;
-    const cm = framework.getAgent('assistant')!.getContextManager();
-    cm.addMessage('Antra', text('earlier'));
-    internals.handOffDeferredWrites([entry('w-known', 'one')]);
-    const from = internals.deferredScanFrom.get('assistant');
-    assert.ok(from !== undefined && from > 0, `a known entry is scanned for from the store's count, ${from}`);
-    internals.handOffDeferredWrites([{ ...entry('w-unknown', 'two'), seq: 2, landing: 'unknown' }]);
-    assert.equal(internals.deferredScanFrom.get('assistant'), 0);
+    const cm = framework.getAgent('assistant')!.getContextManager() as unknown as {
+      addMessage(participant: string, content: ContentBlock[], metadata?: unknown): string;
+      queryMessages: (...args: unknown[]) => unknown;
+    };
+    // Its first write landed; the hand-off at stop() records the store's
+    // count after it, so boot's check for landed writes starts past it.
+    cm.addMessage('Antra', text('look left'), { deferredWriteId: 'w-rt' });
+    internals.deferredMessages.push({ ...entry('w-rt', 'look left'), landing: 'unknown' });
+    cm.queryMessages = () => { throw new Error('search failed'); };
+    const error = console.error;
+    console.error = () => {};
+    try { await framework.stop(); } finally { console.error = error; }
+    assert.deepEqual(internals.deferredMessages.map((m) => [m.id, m.landing]), [['w-rt', 'unknown']], 'held through stop()');
+
+    const reopened = await createFramework();
+    assert.equal(windowOf(reopened).filter((line) => line === 'Antra: look left').length, 1, 'stored once');
+    await reopened.stop();
+  });
+
+  it("a released window doesn't store a write whose landing is unknown a second time, when its store holds it", async () => {
+    const framework = await createFramework();
+    const internals = drainInternals(framework);
+    const agent = framework.getAgent('assistant')!;
+    const cm = agent.getContextManager();
+    const copies = (id: string): number => cm.queryMessages({ metadata: { deferredWriteId: id } } as never).messages.length;
+    cm.addMessage('Antra', text('look left'), { deferredWriteId: 'w-rel' } as never);
+    internals.deferredMessages.push({ ...entry('w-rel', 'look left'), landing: 'unknown' });
+    internals.deferredMessages.push({ ...entry('w-rel-2', 'look right'), seq: 2, landing: 'unknown' });
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try { internals.releaseWindow(agent); } finally { console.error = error; }
+    assert.equal(copies('w-rel'), 1, 'found by its id, it is not stored again');
+    assert.equal(copies('w-rel-2'), 1, 'not found, it is stored');
+    assert.ok(errors.some((e) => e.includes('release of assistant') && e.includes('was found by its id')), errors.join('\n'));
     await framework.stop();
+  });
+
+  it("a released window doesn't pass a failed reply on a second time when its store holds the reply's copy", async () => {
+    const framework = await createFramework();
+    const internals = drainInternals(framework);
+    const agent = framework.getAgent('assistant')!;
+    const cm = agent.getContextManager();
+    const failed = { kind: 'discord-send-failed', channelId: 'c1', reason: 'gone', textLen: 5, outcome: 'failed' };
+    // Its earlier write landed. The release's first pass reads that copy as
+    // unread and passes it on; the queued entry mustn't be passed again.
+    cm.addMessage('assistant', text('hello'), { ...failed, deferredWriteId: 'w-fail' } as never);
+    internals.deferredMessages.push({ ...entry('w-fail', 'hello'), participant: 'assistant', metadata: failed, landing: 'unknown' });
+    const error = console.error;
+    console.error = () => {};
+    try { internals.releaseWindow(agent); } finally { console.error = error; }
+    const notices = cm.queryMessages({} as never).messages.filter((m) => (m.metadata as { speaker?: unknown } | undefined)?.speaker === 'assistant');
+    assert.equal(notices.length, 1, 'the primary is told once');
+    await framework.stop();
+  });
+
+  it("a released window stores a write whose landing is unknown while its store can't be searched, saying it may now be stored twice", async () => {
+    const framework = await createFramework();
+    const internals = drainInternals(framework);
+    const agent = framework.getAgent('assistant')!;
+    const cm = agent.getContextManager() as unknown as { queryMessages: (...args: unknown[]) => unknown };
+    const query = cm.queryMessages;
+    cm.queryMessages = () => { throw new Error('search failed'); };
+    internals.deferredMessages.push({ ...entry('w-blind', 'look left'), landing: 'unknown' });
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try { internals.releaseWindow(agent); } finally { console.error = error; }
+    cm.queryMessages = query;
+    assert.equal(windowOf(framework).filter((line) => line === 'Antra: look left').length, 1, 'stored');
+    assert.ok(errors.some((e) => e.includes('w-blind') && e.includes('may now be stored twice')), errors.join('\n'));
+    await framework.stop();
+  });
+
+  /** A held write whose landing is unknown, whose first write did land. */
+  function heldAndStored(framework: AgentFramework, id: string, said: string): void {
+    framework.getAgent('assistant')!.getContextManager().addMessage('Antra', text(said), { deferredWriteId: id } as never);
+    drainInternals(framework).deferredMessages.push({ ...entry(id, said), landing: 'unknown' });
+  }
+  const copiesOf = (framework: AgentFramework, id: string): string[] => framework.getAgent('assistant')!.getContextManager()
+    .queryMessages({ metadata: { deferredWriteId: id } } as never).messages
+    .map((m) => m.content.map((b) => (b as { text?: string }).text ?? '').join(''));
+
+  it("a module's edit of a held write whose landing is unknown reaches its stored copy, so the flush that finds it carries the edit", async () => {
+    const framework = await createFramework();
+    const internals = drainInternals(framework);
+    heldAndStored(framework, 'w-ed', 'look left');
+    internals.editMessage(heldHandle('w-ed'), text('look up'));
+    const error = console.error;
+    console.error = () => {};
+    let written: Map<DeferredEntry, { id: string; content: ContentBlock[] }>;
+    try {
+      written = internals.writeDrainedInOrder(internals.deferredMessages.splice(0), 'test', () => { throw new Error('written again'); });
+    } finally { console.error = error; }
+    assert.deepEqual(copiesOf(framework, 'w-ed'), ['look up'], 'stored once, edited');
+    assert.deepEqual([...written.values()].map((w) => w.content), [text('look up')], 'carried as edited');
+    await framework.stop();
+  });
+
+  it("a module's removal of a held write whose landing is unknown removes its stored copy too", async () => {
+    const framework = await createFramework();
+    const internals = drainInternals(framework);
+    heldAndStored(framework, 'w-rm', 'look left');
+    internals.removeMessage(heldHandle('w-rm'));
+    assert.deepEqual(copiesOf(framework, 'w-rm'), []);
+    assert.deepEqual(internals.deferredMessages.map((m) => m.id), []);
+    await framework.stop();
+  });
+
+  it("a module's edit or removal of a held write whose landing is unknown throws with nothing changed while its store can't be searched", async () => {
+    const framework = await createFramework();
+    const internals = drainInternals(framework);
+    heldAndStored(framework, 'w-blind', 'look left');
+    const cm = framework.getAgent('assistant')!.getContextManager() as unknown as { queryMessages: (...args: unknown[]) => unknown };
+    const query = cm.queryMessages;
+    cm.queryMessages = () => { throw new Error('search failed'); };
+    try {
+      assert.throws(() => internals.editMessage(heldHandle('w-blind'), text('look up')), /search failed/);
+      assert.throws(() => internals.removeMessage(heldHandle('w-blind')), /search failed/);
+    } finally { cm.queryMessages = query; }
+    assert.deepEqual(internals.deferredMessages.map((m) => [m.id, m.content]), [['w-blind', text('look left')]], 'still held, unedited');
+    assert.deepEqual(copiesOf(framework, 'w-blind'), ['look left'], 'its copy unchanged');
+    await framework.stop();
+  });
+
+  it("a module's query shows a held write whose landing is unknown once, as its held row", async () => {
+    const framework = await createFramework();
+    const internals = drainInternals(framework);
+    heldAndStored(framework, 'w-q', 'look left');
+    const rows = internals.queryMessages({}).messages
+      .filter((m) => m.content.some((b) => (b as { text?: string }).text === 'look left'))
+      .map((m) => (m.held ? 'held' : 'stored'));
+    assert.deepEqual(rows, ['held']);
+    await framework.stop();
+  });
+
+  it("the coalescer removes a held write whose landing is unknown with its stored copy only where that copy may never have been shown", async () => {
+    for (const shown of [false, true]) {
+      const framework = await createFramework();
+      const internals = drainInternals(framework);
+      const agent = framework.getAgent('assistant')!;
+      if (!shown) agent.markContextShown();
+      heldAndStored(framework, 'w-co', 'look left');
+      if (shown) agent.markContextShown();
+      const placement = { agent: 'assistant', deferredId: 'w-co' };
+      assert.equal(internals.isUnreadPlacement({ ...placement }, 'shown'), !shown, `unshown as its copy is (${shown ? 'shown' : 'not shown'})`);
+      assert.equal(internals.removePlacement({ ...placement }), !shown);
+      assert.deepEqual(copiesOf(framework, 'w-co'), shown ? ['look left'] : [], shown ? 'a copy that may have been shown stays' : 'its copy goes');
+      assert.deepEqual(internals.deferredMessages.map((m) => m.id), shown ? ['w-co'] : [], shown ? 'nothing is removed' : 'and the held entry');
+      await framework.stop();
+    }
   });
 
   /** Shard a message whose first block is `marker` into one shard per block,
