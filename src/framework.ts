@@ -3417,6 +3417,16 @@ export class AgentFramework {
             .filter((m) => (m.forAgent ?? framework.primaryAgentName) === framework.primaryAgentName)
             .sort(bySeq)
             .map((m) => ({ participant: m.participant, content: m.content, metadata: m.metadata as Record<string, unknown> | undefined })),
+          // Every reader of the shared slot compiles the dump with its own
+          // strategy, so the dump fits the smallest of their bounds.
+          residentMessageChars: () => {
+            let chars: number | undefined;
+            for (const reader of framework.sharedSlotAgents) {
+              const bound = framework.strategyDerivedToolResultChars(reader);
+              if (bound !== undefined && (chars === undefined || bound < chars)) chars = bound;
+            }
+            return chars;
+          },
           currentSequence: () => framework.store.currentSequence(),
           setSubconsciousAnchor: (sequence) =>
             framework.subconsciousStrategy?.setAnchor(sequence),
@@ -5454,7 +5464,7 @@ export class AgentFramework {
   }
 
   /** RFC-005 host-mediated reference fetcher (lazy; needs server configs +
-   *  a writable workspace mount for storage). */
+   *  a read-write workspace mount without an include for storage). */
   private referenceFetcherInstance?: ReferenceFetcher;
   private getReferenceFetcher(): ReferenceFetcher {
     if (!this.referenceFetcherInstance) {
@@ -5485,7 +5495,7 @@ export class AgentFramework {
           }
           const mount = this.firstWritableMountName(workspace);
           if (!mount) {
-            console.error(`[refs] couldn't store ${fileName}: no workspace mount is writable`);
+            console.error(`[refs] couldn't store ${fileName}: no writable workspace mount without an include`);
             return null;
           }
           const path = `${mount}/refs/${fileName}`;
@@ -15203,8 +15213,8 @@ export class AgentFramework {
    * (dispatchChannelToolCall), and an agent's allowedTools can leave it out.
    * Where the channel is selected for opening, it says so and why, as
    * speech's failure does, and what that means: where the host couldn't
-   * record putting the channel's decision back, in channel_open's own
-   * failure's words, a later delivery or reconnect tries again; where the
+   * record putting the channel's decision back, a later delivery or
+   * reconnect tries again; where the
    * server's latest announcement or the subscription policy lifted the
    * default put back, the host tries again itself, so channel_open isn't
    * named. Either way channel_close withdraws that, named only to an agent
@@ -19660,10 +19670,11 @@ export class AgentFramework {
     // The agent's time_limit_ms (already capped) shortens the lifetime; it never extends it.
     const lifetimeMs = timeLimitMs ?? cfg?.backgroundMaxLifetimeMs ?? 86_400_000;
 
-    // Journal: a file under the agent's first read-write workspace mount so
-    // their existing read/grep/shell tools work on it. Python appends
-    // directly to the materialized path; watch-mode mounts sync it back to
-    // the chronicle tree on their usual cadence.
+    // Journal: a file under the agent's first read-write workspace mount
+    // without an include (firstWritableMountName), so their existing
+    // read/grep/shell tools work on it. The runner appends the script's output
+    // to the materialized path as it reads it; watch-mode mounts sync it back
+    // to the chronicle tree on their usual cadence.
     let logPath: string | null = null;
     let logAbsPath: string | null = null;
     const workspace = this.getWorkspaceModule();
@@ -19724,7 +19735,7 @@ export class AgentFramework {
       data: {
         status: 'background script started',
         script_id: scriptId,
-        log: logPath ?? 'no writable workspace mount — output is not retrievable; only wake_agent() reaches you',
+        log: logPath ?? 'not kept in a file: background script logs go to a writable workspace mount without an include, and this setup has none. wake_agent() reaches you, and if the script dies, the last of its output reaches you too',
         lifetime_hours: Math.round(lifetimeMs / 3_600_000 * 10) / 10,
         lifetime: formatLimit(lifetimeMs), // exact for short limits, which lifetime_hours rounds to 0
         note: 'The script dies if the host process restarts. Manage with code_execution {"action": "list"|"cancel"}.',
@@ -19732,13 +19743,19 @@ export class AgentFramework {
     };
   }
 
-  /** First read-write mount name, or null. */
+  /**
+   * The first read-write mount without an include, or null. The framework
+   * keeps its own files there (`tool-results/`, `refs/`,
+   * `background-scripts/`). A mount with an include holds only the files it
+   * names, so it would refuse them, and a setup whose only writable mount
+   * has one is treated as having none.
+   */
   private firstWritableMountName(workspace: WorkspaceModule): string | null {
     const mounts = (workspace as unknown as {
-      getMounts?: () => Array<{ name: string; mode: string }>;
+      getMounts?: () => Array<{ name: string; mode: string; include?: readonly string[] }>;
     }).getMounts?.();
     if (mounts) {
-      const rw = mounts.find((m) => m.mode !== 'read-only');
+      const rw = mounts.find((m) => m.mode !== 'read-only' && m.include === undefined);
       return rw?.name ?? null;
     }
     return null;
@@ -19877,7 +19894,7 @@ export class AgentFramework {
    * file (readable with the agent's own tools — deterministic name, kept
    * until the workspace owner deletes it) and replaced by a truncated head +
    * a trailing file reference. Falls back to EXPLICIT plain truncation when
-   * there is no writable workspace. Cap resolution lives in
+   * there is no read-write mount without an include. Cap resolution lives in
    * resolveToolResultInlineCap; callers pass the resolved cap.
    */
   /**
@@ -19956,8 +19973,8 @@ export class AgentFramework {
   }
 
   /** Where a tool result labelled `label` is written: `<first writable
-   *  mount>/tool-results/<label>.txt`, or null when there is no writable
-   *  workspace. */
+   *  mount without an include>/tool-results/<label>.txt` (see
+   *  firstWritableMountName), or null when there is no such mount. */
   private toolResultFilePlace(label: string): { workspace: WorkspaceModule; path: string; safeLabel: string } | null {
     const workspace = this.getWorkspaceModule();
     const mountName = workspace ? this.firstWritableMountName(workspace) : null;
@@ -20031,7 +20048,8 @@ export class AgentFramework {
   /**
    * Write one tool result's text to its tool-results file (see
    * toolResultFilePlace): the one place both the inline cap's spill and the
-   * guard's withheld originals go. null when there is no writable workspace.
+   * guard's withheld originals go. null when there is no writable mount
+   * without an include.
    * A failed write is reported, traced and logged here, never thrown. With a
    * branch, the file lands on that branch or isn't written (see writeBinary).
    */
@@ -20134,7 +20152,7 @@ export class AgentFramework {
     }
     return {
       text: head
-        + '\n\n[truncated — original was ' + content.length + ' chars; no writable workspace, full content not retained]'
+        + '\n\n[truncated — original was ' + content.length + ' chars; no writable workspace mount without an include, full content not retained]'
         + kept,
       filePath: null,
     };
@@ -22745,6 +22763,19 @@ export class AgentFramework {
         // speech dispatch that comes after the run's release still counts.
         takesGlobalFallback: (conversationId) => this.usedEphemeralAgentNames.get(conversationId) !== 'run',
         eventGatePresent: this.eventGate !== null,
+        // A channel tool reads the connect and restart marks a tool call's
+        // "connecting" text reads (mcplConnectInFlight, mcplServerAbsentText).
+        // This host is connecting to a server while a connect or restart of
+        // the id it connects is in flight, through the restart's disconnect
+        // of a connection registered under that id, and while the registered
+        // connection's current transport's policy exchange is
+        // (mcplPlanesMayOpen), however that exchange then ends. A closed
+        // connection has no exchange to wait for.
+        serverConnecting: (serverId) => {
+          if (this.mcplConnectInFlight(serverId)) return true;
+          const connection = this.mcplServerRegistry?.getServer(serverId);
+          return connection?.isConnected === true && !this.mcplPlanesMayOpen(connection);
+        },
         // A text-only turn whose speech couldn't be delivered must not vanish
         // silently: record a `[discord-send-failed]` marker in chronicle so the
         // agent sees, on her next turn, that her reply didn't reach the human,
@@ -25802,9 +25833,15 @@ export class AgentFramework {
    *  is in flight (mcpServerOps) or a restart holds the id, and "gone"
    *  otherwise. */
   private mcplServerAbsentText(serverId: string, toolName: string): string {
-    return this.mcpServerOps?.get(serverId)?.kind === 'connect' || this.restartClaims().ids.has(serverId)
+    return this.mcplConnectInFlight(serverId)
       ? mcplServerConnectingText(serverId, toolName)
       : mcplServerGoneText(serverId, toolName);
+  }
+
+  /** Whether a connect of this server id is in flight (mcpServerOps), or a
+   *  restart holds the id: this host is connecting to it. */
+  private mcplConnectInFlight(serverId: string): boolean {
+    return this.mcpServerOps?.get(serverId)?.kind === 'connect' || this.restartClaims().ids.has(serverId);
   }
 
   /** A modern connection a connect still under way registered: it registers
