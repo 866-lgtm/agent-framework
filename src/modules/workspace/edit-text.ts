@@ -10,7 +10,7 @@
  * and EditMany tools' answers.
  */
 
-import { type Change, type FilePlan, type MatchProblem, SHOWN_MATCHES } from './edit-plan.js';
+import { type Change, type FilePlan, type MatchProblem, SHOWN_MATCHES, shownLine } from './edit-plan.js';
 import { MAX_LINE_CHARS, jsonLength, numberedLine, safeCut } from './text.js';
 
 /** The tool a call came through, which words its refusals and receipt. */
@@ -345,7 +345,11 @@ export function shownRegions(plan: FilePlan, budget: { left: number }, maxChars:
     for (let lineStart = region.start, n = region.from; fits && lineStart < region.end; n++) {
       const newline = plan.updated.indexOf('\n', lineStart);
       const lineEnd = newline === -1 || newline >= region.end ? region.end : newline;
-      const text = plan.updated.slice(lineStart, lineEnd);
+      // A line whose own text ends in a CR shows its CRLF end's CR too
+      // (shownLine). Where the edit itself puts a CR before a bare LF, disk
+      // then holds the two as a CRLF end, and this shows the line with two
+      // CRs.
+      const text = shownLine(plan.updated.slice(lineStart, lineEnd), lineEnd === newline);
       // A line too long to show whole shows its start, or, where edits' first
       // changes start on it, a stretch from shortly before each.
       const columns = text.length > MAX_LINE_CHARS ? firsts.filter((first) => first.line === n).map((first) => first.at - lineStart) : [];

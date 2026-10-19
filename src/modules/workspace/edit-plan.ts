@@ -293,7 +293,21 @@ function closestRegion(value: string, needle: string, budget: HintBudget): strin
   if (bestScore <= 0) return '';
   const from = Math.max(0, best - 3);
   const to = Math.min(lines.length, best + 4);
-  return `Closest region (line ${best + 1}, similarity ${bestScore.toFixed(2)}):\n${numbered(lines.slice(from, to), from + 1)}`;
+  // Every line comes before a line feed but a last one the text doesn't end with.
+  const shown = lines.slice(from, to).map((line, k) => shownLine(line, from + k < lines.length - 1 || value.endsWith('\n')));
+  return `Closest region (line ${best + 1}, similarity ${bestScore.toFixed(2)}):\n${numbered(shown, from + 1)}`;
+}
+
+/**
+ * A line of the text edits are matched in, as an answer shows it: one whose
+ * own text ends in a CR, before a line feed, shows its line end's CR too, as
+ * read shows such a line. Matching reads a CR before a line feed in old text
+ * as part of the line end, so text copied across the line with one CR would
+ * match the same text with CRLF ends alone. In that text a CR before a line
+ * feed is always such a line's own, since lineEnds made each CRLF a line feed.
+ */
+export function shownLine(text: string, beforeLf: boolean): string {
+  return beforeLf && text.endsWith('\r') ? `${text}\r` : text;
 }
 
 /** How many matches a refusal names by line and shows. */
@@ -327,7 +341,7 @@ function matchedLines(value: string, starts: number[], lines: number[]): string 
       from = safeCut(value, from);
       to = safeCut(value, to);
     }
-    shown.push(`${String(line).padStart(6)}\t${from > lineFrom ? '…' : ''}${value.slice(from, to)}${to < lineTo ? '…' : ''}`);
+    shown.push(`${String(line).padStart(6)}\t${from > lineFrom ? '…' : ''}${shownLine(value.slice(from, to), to === lineTo && newline !== -1)}${to < lineTo ? '…' : ''}`);
   });
   return shown.join('\n');
 }

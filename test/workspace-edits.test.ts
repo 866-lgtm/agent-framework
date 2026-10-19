@@ -2,7 +2,8 @@
 // count that differs shows the lines that matched, CRLF and a BOM are kept,
 // and edit_many stores every edit or none. Each answer keeps to the length
 // its call's result may have (ToolCall.resultMaxChars), unless its head and
-// its last line alone are longer.
+// its last line alone are longer; edit's receipt keeps its path and notes
+// whatever their length, and where they alone are longer it shows no region.
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -239,6 +240,28 @@ test('CRLF line ends in oldString and newString are read as LF, so a file keeps 
   await file('crlf.txt', 'a\r\nb\r\n');
   dataOf(await call('edit', { path: 'work/crlf.txt', oldString: 'a\r\nb', newString: 'A\r\nB' }));
   assert.equal(await stored('crlf.txt'), 'A\r\nB\r\n');
+});
+
+test("a line whose own text ends in a CR shows its CRLF end's CR too, so lines copied across it from a receipt or a closest region edit where they came from", async (t) => {
+  const { call, stored, file } = setup(t);
+  // Lines 2 and 3 end in a CR before their CRLF end; lines 5 and 6 hold the
+  // same text with a CRLF end alone. Copied with one CR each, lines 2 and 3
+  // would read as "xx\nyy" before a CRLF end, which is lines 5 and 6.
+  const text = 'aa\r\nxx\r\r\nyy\r\r\nbb\r\nxx\r\nyy\r\n';
+  const linesTwoAndThree = (listing: string) => listing.split('\n').filter((line) => /^ {5}[23]\t/.test(line)).map((line) => line.slice(7)).join('\n');
+  await file('r.txt', text);
+  const receipt = dataOf(await call('edit', { path: 'work/r.txt', oldString: 'aa', newString: 'AA' }));
+  assert.equal(linesTwoAndThree(receipt.changed as string), 'xx\r\r\nyy\r\r');
+  dataOf(await call('edit', { path: 'work/r.txt', oldString: linesTwoAndThree(receipt.changed as string), newString: 'XX\nYY' }));
+  assert.equal(await stored('r.txt'), 'AA\r\nXX\r\nYY\r\nbb\r\nxx\r\nyy\r\n');
+  await file('h.txt', text);
+  const miss = errorOf(await call('edit', { path: 'work/h.txt', oldString: 'xx\nqq', newString: 'z' }));
+  assert.match(miss, /Closest region \(line 2, /);
+  dataOf(await call('edit', { path: 'work/h.txt', oldString: linesTwoAndThree(miss), newString: 'XX\nYY' }));
+  assert.equal(await stored('h.txt'), 'aa\r\nXX\r\nYY\r\nbb\r\nxx\r\nyy\r\n');
+  // A count refusal shows the lines it names the same way.
+  await file('c.txt', text);
+  assert.ok(errorOf(await call('edit', { path: 'work/c.txt', oldString: 'yy', newString: 'z' })).includes('     3\tyy\r\r\n     6\tyy'));
 });
 
 test('replacing a whole file with nothing stores no bytes, and its receipt shows and names no line', async (t) => {
@@ -1058,12 +1081,11 @@ test('a receipt names a region too long to show by its lines without building it
   assert.ok(sliced < 5_000, `sliced ${sliced} code units`);
 });
 
-test('a receipt keeps to its cap with the longest notes it adds after its budget: twenty regions of eight-digit lines', () => {
-  // Two files of 10,000,400 lines, each with 25 edits far apart near its end:
-  // past what the regions may take, the note naming them lists twenty
-  // ranges of eight-digit line numbers.
-  const lines = 10_000_400;
-  const marks = Array.from({ length: 25 }, (_, k) => lines - 400 + k * 15);
+/**
+ * The plan of a file of `lines` empty lines but for `m<line>` on each line
+ * in `marks`, which ascend, with an edit of each to `M<line>`.
+ */
+function markedPlan(lines: number, marks: number[]): FilePlan {
   const parts: string[] = [];
   let at = 0;
   for (const mark of marks) {
@@ -1074,11 +1096,40 @@ test('a receipt keeps to its cap with the longest notes it adds after its budget
   const bytes = Buffer.from(parts.join(''));
   const planned = planFile(decodeForEdit(bytes)!, bytes, marks.map((mark, index) => ({ index, oldText: `m${mark}`, newText: `M${mark}`, expected: 1 })));
   assert.ok('plan' in planned);
-  const files = [0, 1].map((i) => ({ path: `work/f${i}.txt`, plan: planned.plan, notes: i ? [`Disk's copy of work/f${i}.txt had changed.`] : [] }));
+  return planned.plan;
+}
+
+test('a receipt keeps to its cap with the longest notes it adds after its budget: twenty regions of eight-digit lines', () => {
+  // Two files of 10,000,400 lines, each with 25 edits far apart near its end:
+  // past what the regions may take, the note naming them lists twenty
+  // ranges of eight-digit line numbers.
+  const lines = 10_000_400;
+  const plan = markedPlan(lines, Array.from({ length: 25 }, (_, k) => lines - 400 + k * 15));
+  const files = [0, 1].map((i) => ({ path: `work/f${i}.txt`, plan, notes: i ? [`Disk's copy of work/f${i}.txt had changed.`] : [] }));
   for (let maxChars = 700; maxChars <= 1_700; maxChars++) {
     const length = JSON.stringify(editReceipt('edit_many', files, 50, maxChars)).length;
     if (length > maxChars) assert.fail(`${length} characters at a cap of ${maxChars}`);
   }
+});
+
+test("a receipt keeps aside the longest note any of its files could add, not its last file's", () => {
+  // A file of 100,500 lines with 25 edits far apart near its end, then a file
+  // of one edit: past what the regions may take, the first file's note lists
+  // twenty ranges of six-digit lines, where the last file's would name line 1.
+  const lines = 100_500;
+  const files = [
+    { path: 'work/long.txt', plan: markedPlan(lines, Array.from({ length: 25 }, (_, k) => lines - 400 + k * 15)), notes: [] },
+    { path: 'work/short.txt', plan: markedPlan(1, [1]), notes: [] },
+  ];
+  const twenty = /lines \d{6}–\d{6}(?:, \d{6}–\d{6}){19}/;
+  let named = 0;
+  for (let maxChars = 700; maxChars <= 1_700; maxChars++) {
+    const receipt = editReceipt('edit_many', files, 26, maxChars);
+    const length = JSON.stringify(receipt).length;
+    if (length > maxChars) assert.fail(`${length} characters at a cap of ${maxChars}`);
+    if (twenty.test(receipt.changed as string)) named++;
+  }
+  assert.ok(named > 0, "no receipt named twenty of the first file's regions");
 });
 
 test("edit_many's receipt keeps to its cap with a last line that counts each of the four things it leaves out", () => {
@@ -1120,6 +1171,28 @@ test('a receipt keeps aside only what its own call can add: one edit of a file o
     assert.match(receipt.changed as string, start, tool);
     assert.ok(JSON.stringify(receipt).length <= whole + 300);
   }
+});
+
+test("what a receipt keeps aside doesn't grow with a line's length: twenty edits of a long line show their region with what twenty of a short one need", () => {
+  // For the note naming the region of twenty edits on one line, a receipt
+  // keeps aside twenty ranges that end by line 3, however long the line. Kept
+  // aside as twenty ranges as wide as the file is long in code units, it took
+  // 120 characters more for the long line than for the short one.
+  const start = Array.from({ length: 20 }, (_, k) => `m${k}|`.padEnd(50, 'a')).join('');
+  const showsAt = (text: string) => {
+    const bytes = Buffer.from(text);
+    const planned = planFile(decodeForEdit(bytes)!, bytes, Array.from({ length: 20 }, (_, k) => ({ index: k, oldText: `m${k}|`, newText: `M${k}|`, expected: 1 })));
+    assert.ok('plan' in planned);
+    const files = [{ path: 'work/line.txt', plan: planned.plan, notes: [] }];
+    const whole = JSON.stringify(editReceipt('edit_many', files, 20, 1_000_000)).length;
+    // Whether the region shows with `spare` characters past the whole receipt.
+    return (spare: number) => /^work\/line\.txt\n {5}1\t/.test(editReceipt('edit_many', files, 20, whole + spare).changed as string);
+  };
+  const short = showsAt(start);
+  const long = showsAt(start + 'a'.repeat(1_000_000));
+  let spare = 0;
+  while (!short(spare)) if (++spare > 2_000) assert.fail("the short line's region never showed");
+  assert.ok(long(spare), `the long line's region needs more than the ${spare} characters the short line's does`);
 });
 
 test("one call's misses share one search for closest regions across its files", async (t) => {
