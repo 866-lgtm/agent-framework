@@ -135,8 +135,10 @@ function problemText(problem: EditProblem, tool: EditTool): string {
       const differs = typeof expected === 'number' && (problem.atLeast ? found > expected : found !== expected);
       const hint = overlapping
         ? 'Include more of the text around it to single out the text you mean.'
-        : problem.spent
-          ? `Include more of the text around it to single out the ${expected === 1 ? 'one' : 'ones'} you mean.`
+        : problem.spent && !differs
+          ? `Whether it occurs the ${expected} ${plural(expected as number, 'time')} it asks for can't be told from this call.`
+          : problem.spent
+            ? `Include more of the text around it to single out the ${expected === 1 ? 'one' : 'ones'} you mean.`
           : typeof expected === 'number' && found > expected
             ? `Include more of the text around it to single out the ${expected === 1 ? 'one' : 'ones'} you mean, or set occurrences to ${found} if every one should change.`
             : `Set occurrences to ${found} if those are all.`;

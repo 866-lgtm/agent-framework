@@ -8,8 +8,8 @@ import {
   type EditSpec,
   type FilePlan,
   type MatchProblem,
-  COUNT_MAX,
   HINT_MAX_CHARS,
+  COUNT_MAX,
   countBudget,
   decodeForEdit,
   hintBudget,
@@ -160,6 +160,68 @@ test("a call counts occurrences past what its edits need only within its budget,
   planFile(decodeForEdit(bytes)!, bytes, Array.from({ length: 200 }, (_, k) => spec(k, 'a', 'b')));
   const used = process.cpuUsage(before);
   assert.ok((used.user + used.system) / 1000 < 2_000, `${(used.user + used.system) / 1000} ms of CPU`);
+});
+
+test("a crowded edit whose count the budget stopped short of its ask, or at it, is named by that count where the crowded check names none", () => {
+  // Asking 1,500, 1,500 and 900 of a text 2,000 long, the edits are crowded.
+  // At a budget of 2,000, the first two count all 1,000 of theirs, which
+  // leaves 40, and are count problems; the third runs it out at 61. What's
+  // left, 900, fits the text, so no crowded problem names it, and its count
+  // does (Abigail-2676's case).
+  const bytes = Buffer.from('ab'.repeat(1_000));
+  const counted = (asked: number) => {
+    const planned = planFile(decodeForEdit(bytes)!, bytes, [spec(0, 'a', 'x', 1_500), spec(1, 'b', 'y', 1_500), spec(2, 'ab', 'z', asked)], hintBudget(), Infinity, countBudget(2_000));
+    assert.ok('problems' in planned);
+    return planned.problems.map((p) => p.kind === 'count' && [p.edit, p.found, p.atLeast, p.spent]);
+  };
+  assert.deepEqual(counted(900), [[0, 1_000, false, false], [1, 1_000, false, false], [2, 61, true, true]]);
+  // A count the budget stopped at just what the edit asks for is a floor too.
+  assert.deepEqual(counted(61), [[0, 1_000, false, false], [1, 1_000, false, false], [2, 61, true, true]]);
+});
+
+test("an edit's count in a call of its own is exact, in a text longer than the call's limit", () => {
+  // As in a file stored before its mount's limit was lowered: the budget is
+  // raised to the text's length, which no count passes.
+  const bytes = Buffer.from('a'.repeat(1_500));
+  const planned = planFile(decodeForEdit(bytes)!, bytes, [spec(0, 'a', 'b')], hintBudget(), Infinity, countBudget(1_000));
+  assert.ok('problems' in planned);
+  assert.deepEqual(planned.problems.map((p) => p.kind === 'count' && [p.found, p.atLeast, p.spent]), [[1_500, false, false]]);
+});
+
+test("crowded edits among which one replaces every occurrence ask for as many as it finds", () => {
+  const bytes = Buffer.from(`${'x'.repeat(100)}\n`);
+  assert.deepEqual(planFile(decodeForEdit(bytes)!, bytes, [spec(0, 'x', 'a', 'all'), spec(1, 'x', 'b', 100), spec(2, 'x', 'c', 100)]),
+    { problems: [{ kind: 'crowded', edits: [0, 1, 2], asked: 300, length: 101 }] });
+});
+
+test("a miss's closest region is the line most like the first 2,000 code units of the old text's first line, its bigrams each counted as often as that line has them", () => {
+  // Line 2 is the old text's first 2,000 code units; line 3 its next 3,000.
+  const words = (from: number, count: number) => Array.from({ length: count }, (_, k) => `w${from + k}`).join(' ');
+  const head = words(0, 500).slice(0, 2_000);
+  const tail = words(5_000, 700).slice(0, 3_000);
+  const region = (text: string, oldText: string) => {
+    const found = problems(text, [spec(0, oldText, 'z')]);
+    assert.equal(found[0]?.kind, 'miss');
+    const line = /Closest region \(line (\d+), /.exec((found[0] as { hint: string }).hint);
+    return line ? Number(line[1]) : undefined;
+  };
+  assert.equal(region(`intro\n${head}\n${tail}\n`, `${head}${tail}q`), 2);
+  // "abab..." has the old text's "ab" five times, which counts once: line 2,
+  // "abcx", shares two of "abcd"'s three bigrams and is closer.
+  assert.equal(region('ababababab\nabcx\n', 'abcd'), 2);
+});
+
+test("a miss's closest region over 100,000 lines that share a bigram with the old text takes no longer than a pass over them", () => {
+  const text = 'abc\n'.repeat(100_000);
+  const before = process.cpuUsage();
+  assert.equal(problems(text, [spec(0, 'abd', 'z')])[0]?.kind, 'miss');
+  const used = process.cpuUsage(before);
+  assert.ok((used.user + used.system) / 1000 < 2_000, `${(used.user + used.system) / 1000} ms of CPU`);
+});
+
+test("in a file with no CRLF line end, the size floor is exact for an old text with line feeds", () => {
+  const bytes = Buffer.from('a\nb\n');
+  assert.deepEqual(planFile(decodeForEdit(bytes)!, bytes, [spec(0, 'a\n', 'bbb\n')], hintBudget(), 5), { tooLarge: 6 });
 });
 
 test('a replaceAll that would grow its file past maxBytes is refused in a small heap', () => {
