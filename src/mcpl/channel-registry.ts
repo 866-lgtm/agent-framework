@@ -3700,13 +3700,14 @@ export class ChannelRegistry {
    * lifecycle work and the open await the server, and a channels/changed
    * update, a re-register or the open's own answer (applyOpenDeclaration)
    * may declare the channel inbound-only meanwhile, or a removal take it
-   * away, so both are checked again just before the publish, after every
-   * await. A removal during a wait already fails it (waitForOpenChannel);
-   * the check also catches one made after the last wait, as the opening's
-   * notice can. Words refused after an open for a declaration leave the
-   * channel open: the agent gets the notice that it's open, which says how
-   * to close it, and the failure for the words. A channel removed
-   * meanwhile is gone, and the failure names the removal.
+   * away. So the check just before the publish, after every await, reads
+   * the channel's registration as it is then, and refuses one that is gone
+   * or inbound-only. A removal during a wait already fails it there
+   * (waitForOpenChannel); the check also catches one made after the last
+   * wait, as the opening's notice can. Words refused after an open for a
+   * declaration leave the channel open: the agent gets the notice that it's
+   * open, which says how to close it, and the failure for the words. When
+   * the registration is gone, the failure says the channel was removed.
    *
    * Only the connector's `delivered: true` confirms a post. `failed` means
    * nothing was posted: the attempt stopped before the request was written,
@@ -3828,10 +3829,10 @@ export class ChannelRegistry {
     }
 
     // Checked again here, after every await above, the lifecycle work's, the
-    // open's or any other: nothing is published to a channel removed or
-    // declared inbound-only meanwhile. The entry is read from the map rather
-    // than taken from the last wait: the opening's notice runs in between,
-    // and publish() resumes a microtask after the wait.
+    // open's or any other: a registration that is gone, or inbound-only, at
+    // this moment takes nothing. The entry is read from the map rather than
+    // taken from the last wait: the opening's notice runs in between, and
+    // publish() resumes a microtask after the wait.
     const current = this.channels.get(`${entry.serverId}:${entry.descriptor.id}`);
     if (!current) {
       return { status: 'failed', destination, reason: 'the channel was removed before the words were published', at: at() };

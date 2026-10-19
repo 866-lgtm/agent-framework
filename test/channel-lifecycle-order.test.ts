@@ -407,6 +407,8 @@ test("an open answered for another channel applies nothing of its answer to the 
   f.declares.set('original', 'inbound');
   await f.registry.handleChanged('test', { added: [descriptor('x')] });
   assert.equal((await f.tool('open')).success, false);
+  assert.ok(f.traces.some((e) => e.type === 'mcpl:channel-open-substituted' && e.channelId === 'x'),
+    'the open reached the server and was answered for another channel');
   assert.equal(f.registry.inboundOnlyServer('x', 'test'), undefined, "the other channel's declaration isn't applied");
 });
 

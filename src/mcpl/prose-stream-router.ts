@@ -18,7 +18,9 @@
  * mode before the first `>>`, unresolvable/ambiguous targets, `>>skip_reply`)
  * emits NOTHING — the delivery path will bounce/retain it; a stream consumer
  * must never see text that delivery would refuse to send. Text for a channel
- * the `speakable` option refuses emits nothing either.
+ * the `speakable` option refuses emits nothing either. `speakable` is asked
+ * as the text is routed, so a channel declared inbound-only after its text
+ * was emitted is refused at delivery, though a consumer has seen the text.
  *
  * Three modes, mirroring proseRouting:
  *  - explicit: parse `>>` prefixes. A fresh turn's stream starts suppressed;
@@ -83,7 +85,8 @@ export class ProseStreamRouter {
    * this at each round's end, with the turn's destination: a private round's
    * prefixes, a `>>skip_reply` envelope and a target that didn't resolve all
    * leave that destination as it was, though the stream followed them while
-   * the round was written.
+   * the round was written. A target refused for its server's inbound-only
+   * declaration clears it.
    */
   retarget(target: string | null): void {
     this.target = target;
