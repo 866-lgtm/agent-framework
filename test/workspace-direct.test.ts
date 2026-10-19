@@ -1173,6 +1173,64 @@ test("a mount configured beneath a moved direct root, through a directory there 
   assert.deepEqual(await answers(moved), fromStart);
 });
 
+test("a mount configured beneath a moved direct root is nested beneath each directory on the way that's the root, the second among them, and no other", async (t) => {
+  const env = new Env(t);
+  // `work` is configured at `link/x/y/work`. At `b`, `x` is a directory and
+  // `x/y` leads to `..`, `b` itself, and `work` to `.`: a start with `ref` at
+  // `b` nests `work` at `x/y/work` and, beneath `x/y`, at `work`, and not
+  // beneath `x`, which isn't `b`, so `y/work` is `ref`'s own.
+  const a = join(env.root, 'a');
+  const b = join(env.root, 'b');
+  mkdirSync(join(a, 'x', 'y', 'work'), { recursive: true });
+  mkdirSync(join(b, 'x'), { recursive: true });
+  mkdirSync(join(b, 'y', 'work'), { recursive: true });
+  writeFileSync(join(b, 'file.txt'), 'b file\n');
+  writeFileSync(join(b, 'y', 'work', 'own.txt'), 'b own\n');
+  symlinkSync('..', join(b, 'x', 'y'));
+  symlinkSync('.', join(b, 'work'));
+  const link = join(env.root, 'link');
+  symlinkSync(a, link);
+  const mounts: [Partial<MountConfig>, MountConfig[]] = [{ path: link, followSymlinks: true }, [{ name: 'work', path: join(link, 'x', 'y', 'work'), mode: 'read-only', backend: 'direct' }]];
+  const moved = await env.open(...mounts);
+  rmSync(link);
+  symlinkSync(b, link);
+  const started = await new Env(t).open(...mounts);
+  const answers = async (m: WorkspaceModule) => ({
+    read: await call(m, 'read', { path: 'ref/work/file.txt' }),
+    own: await call(m, 'read', { path: 'ref/y/work/own.txt' }),
+  });
+  const fromStart = await answers(started);
+  assert.match(fromStart.read.error ?? '', /lies in mount "work", nested in mount "ref"/);
+  assert.equal((fromStart.own.data as { content: string }).content, '     1\tb own');
+  assert.deepEqual(await answers(moved), fromStart);
+});
+
+test("a direct root moved to a directory beneath its own configured path nests no mount by where the last start found a directory beneath that path", async (t) => {
+  const env = new Env(t);
+  // `work` is configured at `link/sub/work`. The start, with `link` at `a`,
+  // finds `link/sub` at `a/sub`; then `link` leads to `a/sub`, where
+  // `sub/work` is `work`'s directory and `work` is `ref`'s own.
+  const a = join(env.root, 'a');
+  mkdirSync(join(a, 'sub', 'sub', 'work'), { recursive: true });
+  mkdirSync(join(a, 'sub', 'work'), { recursive: true });
+  writeFileSync(join(a, 'sub', 'work', 'own.txt'), 'sub own\n');
+  const link = join(env.root, 'link');
+  symlinkSync(a, link);
+  const mounts: [Partial<MountConfig>, MountConfig[]] = [{ path: link }, [{ name: 'work', path: join(link, 'sub', 'work'), mode: 'read-only', backend: 'direct' }]];
+  const moved = await env.open(...mounts);
+  rmSync(link);
+  symlinkSync(join(a, 'sub'), link);
+  const started = await new Env(t).open(...mounts);
+  const answers = async (m: WorkspaceModule) => ({
+    own: await call(m, 'read', { path: 'ref/work/own.txt' }),
+    nested: await call(m, 'read', { path: 'ref/sub/work/x.txt' }),
+  });
+  const fromStart = await answers(started);
+  assert.equal((fromStart.own.data as { content: string }).content, '     1\tsub own');
+  assert.match(fromStart.nested.error ?? '', /lies in mount "work", nested in mount "ref"/);
+  assert.deepEqual(await answers(moved), fromStart);
+});
+
 test("a mount configured beneath a direct root moved to a directory above its configured path is nested beneath that directory too, as a start there nests it", async (t) => {
   const env = new Env(t);
   // `ref` is configured at `b/link`, which leads first to `a` and then to
@@ -1223,6 +1281,59 @@ test("a mount configured at a moved direct root's own path is nested nowhere in 
   const fromStart = await answers(started);
   assert.equal((fromStart.read.data as { content: string }).content, '     1\tsub f');
   assert.equal(fromStart.disk, 'read');
+  assert.deepEqual(await answers(moved), fromStart);
+});
+
+test("a mount configured at a moved direct root's own path is nested beneath a directory above that path that's the root now, as a start there nests it", async (t) => {
+  const env = new Env(t);
+  // `ref` and `twin` are both configured at `b/link`, which leads first to
+  // `b/sub` and then to `.`, `b` itself: a start there nests `twin` in `ref`
+  // at `link`, beneath `b`, the directory above `b/link`.
+  const b = join(env.root, 'b');
+  mkdirSync(join(b, 'sub'), { recursive: true });
+  writeFileSync(join(b, 'f.txt'), 'b f\n');
+  const link = join(b, 'link');
+  symlinkSync(join(b, 'sub'), link);
+  const mounts: [Partial<MountConfig>, MountConfig[]] = [{ path: link, followSymlinks: true }, [{ name: 'twin', path: link, mode: 'read-only', backend: 'direct' }]];
+  const moved = await env.open(...mounts);
+  rmSync(link);
+  symlinkSync('.', link);
+  const started = await new Env(t).open(...mounts);
+  const answers = async (m: WorkspaceModule) => ({
+    read: await call(m, 'read', { path: 'ref/link/f.txt' }),
+    own: (await data<{ content: string }>(m, 'read', { path: 'ref/f.txt' })).content,
+  });
+  const fromStart = await answers(started);
+  assert.match(fromStart.read.error ?? '', /lies in mount "twin", nested in mount "ref"/);
+  assert.deepEqual(await answers(moved), fromStart);
+});
+
+test("a mount configured beneath a direct root whose path's own directory above leads elsewhere now is nested as a start there nests it", async (t) => {
+  const env = new Env(t);
+  // `ref` is configured at `current/ref` and `work` at `current/ref/work`.
+  // `current` leads first to `a` and then to `b`, where `ref` and `work` lead
+  // to `.`: a start there finds `current` at `b`, the root, and nests `work`
+  // at `work` and, beneath `current`, at `ref/work`.
+  const a = join(env.root, 'a');
+  const b = join(env.root, 'b');
+  mkdirSync(join(a, 'ref', 'work'), { recursive: true });
+  mkdirSync(b, { recursive: true });
+  writeFileSync(join(b, 'file.txt'), 'b file\n');
+  symlinkSync('.', join(b, 'ref'));
+  symlinkSync('.', join(b, 'work'));
+  const current = join(env.root, 'current');
+  symlinkSync(a, current);
+  const mounts: [Partial<MountConfig>, MountConfig[]] = [{ path: join(current, 'ref'), followSymlinks: true }, [{ name: 'work', path: join(current, 'ref', 'work'), mode: 'read-only', backend: 'direct' }]];
+  const moved = await env.open(...mounts);
+  rmSync(current);
+  symlinkSync(b, current);
+  const started = await new Env(t).open(...mounts);
+  const answers = async (m: WorkspaceModule) => ({
+    through: await call(m, 'read', { path: 'ref/ref/work/file.txt' }),
+    read: await call(m, 'read', { path: 'ref/work/file.txt' }),
+  });
+  const fromStart = await answers(started);
+  assert.match(fromStart.through.error ?? '', /lies in mount "work", nested in mount "ref"/);
   assert.deepEqual(await answers(moved), fromStart);
 });
 
@@ -1485,6 +1596,22 @@ test("a direct mount whose root is gone, beneath a link, keeps the start's place
   const m = await env.open({ path: join(link, 'ref') }, [{ name: 'work', path: join(a, 'ref', 'work'), mode: 'read-only', backend: 'direct' }]);
   assert.match(await failure(m, 'read', { path: 'ref/work/file.txt' }), /lies in mount "work", nested in mount "ref"/);
   rmSync(join(a, 'ref'), { recursive: true, force: true });
+  assert.match(await failure(m, 'read', { path: 'ref/work/file.txt' }), /lies in mount "work", nested in mount "ref"/);
+});
+
+test("a direct mount whose root now leads through a file keeps the start's placement, as one that's gone does", async (t) => {
+  const env = new Env(t);
+  // The start, with `link` at `a`, nests `work` at `work`; then `link` leads
+  // beneath a file, where nothing can be.
+  const a = join(env.root, 'a');
+  mkdirSync(join(a, 'work'), { recursive: true });
+  writeFileSync(join(env.root, 'plain'), 'a file\n');
+  const link = join(env.root, 'link');
+  symlinkSync(a, link);
+  const m = await env.open({ path: link }, [{ name: 'work', path: join(a, 'work'), mode: 'read-only', backend: 'direct' }]);
+  assert.match(await failure(m, 'read', { path: 'ref/work/file.txt' }), /lies in mount "work", nested in mount "ref"/);
+  rmSync(link);
+  symlinkSync(join(env.root, 'plain', 'sub'), link);
   assert.match(await failure(m, 'read', { path: 'ref/work/file.txt' }), /lies in mount "work", nested in mount "ref"/);
 });
 

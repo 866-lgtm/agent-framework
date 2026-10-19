@@ -49,7 +49,11 @@ import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } fr
 import { sameRootIdentity, type Fingerprint, type RootIdentity } from './disk-agreement.js';
 
 export interface MountView {
-  /** Mount root as configured. */
+  /**
+   * The directory its readers read beneath: the mount's root as configured,
+   * or, for a direct mount, the root its view resolved (diskView), so a
+   * walk opens what it judges beneath one root.
+   */
   root: string;
   /** The mount's name, which a tool puts before a path in the mount. */
   name: string;

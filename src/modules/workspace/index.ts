@@ -372,6 +372,48 @@ function nestedDir(from: string, to: string): string | undefined {
   return rel.split(sep).join('/');
 }
 
+/** Each directory above `path`, innermost first, to the filesystem's root. */
+function ancestorsOf(path: string): string[] {
+  const dirs: string[] = [];
+  for (let dir = dirname(path); ; dir = dirname(dir)) {
+    dirs.push(dir);
+    if (dirname(dir) === dir) return dirs;
+  }
+}
+
+/**
+ * Where a mount is nested in an outer mount, as a start places it: at its
+ * directory as configured beneath the outer mount's configured path
+ * (`outerPath`), beneath each directory above its configured path that is
+ * the outer root on disk (`above`, each with where it lies on disk), and
+ * where its real root (`real`) lies beneath the outer root (`outerReal`),
+ * each also as disk spells it beneath `spellAt`. Its real root is claimed
+ * where it doesn't hold the outer root, which it would otherwise claim
+ * whole. Undefined where it's nested nowhere.
+ */
+async function placementOf(
+  outerPath: string,
+  outerReal: string,
+  innerPath: string,
+  real: string,
+  above: ReadonlyArray<{ dir: string; real: string }>,
+  spellAt: string,
+): Promise<{ configured: string | undefined; fromRoots: Array<{ dir: string; root: string }>; spellings: Array<{ dir: string; root: string }>; claims: boolean } | undefined> {
+  const configured = nestedDir(outerPath, innerPath);
+  const throughRoot = above.filter((a) => a.real === outerReal).map((a) => nestedDir(a.dir, innerPath));
+  const fromRoots: Array<{ dir: string; root: string }> = [];
+  for (const dir of [configured, ...throughRoot, nestedDir(outerReal, real)]) {
+    if (dir !== undefined && !fromRoots.some((s) => s.dir === dir)) fromRoots.push({ dir, root: join(outerPath, ...dir.split('/')) });
+  }
+  if (fromRoots.length === 0) return undefined;
+  const spellings = [...fromRoots];
+  for (const found of fromRoots) {
+    const dir = await diskSpelling(spellAt, found.dir);
+    if (!spellings.some((s) => s.dir === dir)) spellings.push({ dir, root: join(outerPath, ...dir.split('/')) });
+  }
+  return { configured, fromRoots, spellings, claims: !isContainedPath(real, outerReal) };
+}
+
 /** A mount nested in another, as the outer mount's otherMounts holds it. */
 interface NestedMountEntry {
   name: string;
@@ -1162,8 +1204,11 @@ export class WorkspaceModule implements Module {
    * since it promises what's at its root now and keeps no evidence to check
    * that against (MountConfig.backend), and its root as realpath resolves it,
    * or as given where that fails, as a pass's runtime takes it. The view
-   * reads beneath that root, so a walk or a read judges and opens its files
-   * beneath one root, however its configured path is repointed meanwhile.
+   * reads beneath that root, so a walk, a listing and grep's reads judge
+   * and open their files beneath one root, however its configured path is
+   * repointed meanwhile. A read of one file goes through openContainedFile
+   * instead, which refuses it once its root is no longer the directory it
+   * checked.
    */
   private async diskView(mount: MountState): Promise<{ view: MountView; rootReal: string; moved: NestedMount[] | null }> {
     const root = resolve(mount.config.path);
@@ -2366,10 +2411,7 @@ export class WorkspaceModule implements Module {
       const given = resolve(mount.path);
       reals.set(mount.name, await realBeneath(given));
       const dirs: Array<{ dir: string; real: string }> = [];
-      for (let dir = dirname(given); ; dir = dirname(dir)) {
-        dirs.push({ dir, real: await realBeneath(dir) });
-        if (dirname(dir) === dir) break;
-      }
+      for (const dir of ancestorsOf(given)) dirs.push({ dir, real: await realBeneath(dir) });
       above.set(mount.name, dirs);
     }
     const nesting = new Map<string, NestedMountEntry[]>();
@@ -2379,23 +2421,9 @@ export class WorkspaceModule implements Module {
       for (const inner of this.config.mounts) {
         if (outer === inner) continue;
         const real = reals.get(inner.name)!;
-        const innerPath = resolve(inner.path);
-        const configured = nestedDir(outerPath, innerPath);
-        const fromRoots: Array<{ dir: string; root: string }> = [];
-        // Its directory as configured, read against this mount's root as
-        // configured and from each directory above it that is this mount's
-        // root on disk, and its real root against this mount's.
-        const throughRoot = above.get(inner.name)!.filter((a) => a.real === outerReal).map((a) => nestedDir(a.dir, innerPath));
-        for (const dir of [configured, ...throughRoot, nestedDir(outerReal, real)]) {
-          if (dir !== undefined && !fromRoots.some((s) => s.dir === dir)) fromRoots.push({ dir, root: join(outerPath, ...dir.split('/')) });
-        }
-        if (fromRoots.length === 0) continue;
-        const spellings = [...fromRoots];
-        for (const found of fromRoots) {
-          const dir = await diskSpelling(outerPath, found.dir);
-          if (!spellings.some((s) => s.dir === dir)) spellings.push({ dir, root: join(outerPath, ...dir.split('/')) });
-        }
-        const claims = !isContainedPath(real, outerReal);
+        const at = await placementOf(outerPath, outerReal, resolve(inner.path), real, above.get(inner.name)!, outerPath);
+        if (at === undefined) continue;
+        const { configured, fromRoots, spellings, claims } = at;
         nesting.set(outer.name, [...(nesting.get(outer.name) ?? []), { name: inner.name, ...(claims ? { real } : {}), fromRoots, spellings }]);
         const placed = fromRoots.filter((s) => s.dir !== configured);
         if (placed.length > 0) {
@@ -2441,21 +2469,24 @@ export class WorkspaceModule implements Module {
    * for themselves, and judge the include and the nesting again beneath it.
    * So a root repointed during a call can change which answer or refusal a
    * path gets, but nothing a read or a walk serves is a file the include
-   * leaves out, or in another mount's directory as its own nesting places it,
-   * except that on a disk that folds names a read judges the include by the
+   * leaves out, nothing a walk serves lies in another mount's directory as
+   * its own nesting places it, and nothing a read serves lies in the
+   * directory of a mount its own nesting claims by real root. Whoever writes
+   * the disk can race a read in two ways, as a rename during a call can on
+   * any mount. On a disk that folds names, a read judges the include by the
    * path as its parse spelled it, so a root repointed between the two can
-   * have it serve a file the new root spells otherwise, as a rename during a
-   * call can on any mount (sameLevels). A mount configured beneath its
-   * configured path lies where that path now leads, as a start would place
-   * it: at its configured directory, beneath each directory on the way there
-   * that resolves to `rootReal` (realBeneath), and where its directory
-   * resolves beneath `rootReal`, its real root, each also as disk spells it
-   * (diskSpelling). Any other mount lies where the last start placed it: it's
-   * nested where its real root lies beneath `rootReal`, and where its
-   * configured path lies beneath a directory that start found at `rootReal`.
-   * A mount configured at this mount's own path lies where its root does, so
-   * it's nested nowhere in it. Each carries its own include, as nestedOf
-   * gives it. It resolves nothing but directories beneath this mount's own
+   * have it serve a file the new root spells otherwise (sameLevels). And a
+   * mount nested by its directories alone, since its real root holds this
+   * one, is judged by the parse's nesting, so a root repointed between a
+   * read's parse and its open can have it serve a path in that mount's
+   * directory. Each mount is placed as a start places it (placementOf), from
+   * where its real root and the directories above its configured path lie on
+   * disk. For a mount configured at this mount's own path or beneath it,
+   * that's where they lie now: beneath `rootReal` where they lie beneath this
+   * mount's path, and the directories above this mount's path as resolving
+   * that path finds them. For any other mount, it's where the last start
+   * found them. Each carries its own include, as nestedOf gives it. It
+   * resolves nothing but this mount's own path and directories beneath its
    * root, so a share elsewhere that doesn't answer holds only its own calls,
    * unless such a directory is a link into it, where that mount's files lie.
    * What it leaves to the next start: a mount configured elsewhere whose own
@@ -2477,52 +2508,41 @@ export class WorkspaceModule implements Module {
     if (!there) return null;
     const outerPath = resolve(mount.config.path);
     const nested: NestedMount[] = [];
-    // A real root that holds this mount's own would claim its every path, so
-    // such a mount is nested by its directories alone, as a start nests it.
-    const at = (dir: string, name: string, real: string): NestedMount => ({
-      dir, name, ...(isContainedPath(real, rootReal) ? {} : { real }), include: this.mounts.get(name)?.config.include,
-    });
-    const add = (dirs: Array<string | undefined>, name: string, real: string) => {
-      for (const dir of dirs) {
-        if (dir !== undefined && !nested.some((n) => n.name === name && n.dir === dir)) nested.push(at(dir, name, real));
-      }
-    };
+    // The directories above this mount's own path, as they lie on disk now,
+    // resolved as resolving the path itself does.
+    let ownAbove: Array<{ dir: string; real: string }> | undefined;
+    const aboveOwn = async () => ownAbove ??= await Promise.all(ancestorsOf(outerPath).map(async (dir) => ({ dir, real: await realBeneath(dir) })));
     for (const inner of this.config.mounts) {
       if (inner.name === mount.config.name) continue;
       const innerPath = resolve(inner.path);
-      // A mount configured at this mount's own path lies where this root
-      // does, so a start nests it nowhere in it.
-      if (innerPath === outerPath) continue;
-      // Each directory above its configured path that is this root on disk,
-      // as a start finds it (readNesting's throughRoot): one beneath this
-      // mount's configured path where it resolves beneath this root now, and
-      // one above it where the last start found it.
-      const above = (placedAbove.get(inner.name) ?? []).filter((a) => nestedDir(outerPath, a.dir) === undefined && a.real === rootReal).map((a) => nestedDir(a.dir, innerPath));
       const configured = nestedDir(outerPath, innerPath);
-      if (configured !== undefined) {
-        const real = await realBeneath(join(rootReal, ...configured.split('/')));
-        const segments = configured.split('/');
-        const between: string[] = [];
-        for (let i = 1; i < segments.length; i++) {
-          if (await realBeneath(join(rootReal, ...segments.slice(0, i))) === rootReal) between.push(segments.slice(i).join('/'));
+      let real: string | undefined;
+      let above: ReadonlyArray<{ dir: string; real: string }>;
+      if (configured !== undefined || innerPath === outerPath) {
+        // A mount configured on this mount's own path, or beneath it, lies
+        // where that path now leads: its real root, and each directory above
+        // it, resolved now, beneath this root where they lie beneath it.
+        const segments = configured?.split('/') ?? [];
+        real = segments.length === 0 ? rootReal : await realBeneath(join(rootReal, ...segments));
+        const beneath: Array<{ dir: string; real: string }> = [];
+        for (let i = segments.length - 1; i >= 1; i--) {
+          beneath.push({ dir: join(outerPath, ...segments.slice(0, i)), real: await realBeneath(join(rootReal, ...segments.slice(0, i))) });
         }
-        add([configured, ...between, ...above, nestedDir(rootReal, real)], inner.name, real);
-        continue;
+        // This mount's own path, which is the root, would add only the
+        // configured directory, which placementOf adds anyway.
+        above = [...beneath, ...await aboveOwn()];
+      } else {
+        // Any other mount lies where the last start found it and the
+        // directories above its path. One leading here only since, as
+        // through this mount's own link, waits for the next start.
+        real = placedRoots.get(inner.name);
+        if (real === undefined) continue;
+        above = placedAbove.get(inner.name) ?? [];
       }
-      // Any other mount, as the last start placed it: where its real root
-      // lies beneath this root, and where its configured path lies beneath a
-      // directory that start found to be where this root now lies. One that
-      // leads here only since, as through this mount's own link, waits for
-      // the next start.
-      const real = placedRoots.get(inner.name);
-      if (real === undefined) continue;
-      add([nestedDir(rootReal, real), ...above], inner.name, real);
-    }
-    // Each directory as disk spells it too, as a start adds it, so a path
-    // parsePath has respelled is judged on a disk that folds names.
-    for (const n of [...nested]) {
-      const dir = await diskSpelling(rootReal, n.dir);
-      if (!nested.some((m) => m.name === n.name && m.dir === dir)) nested.push({ ...n, dir });
+      const at = await placementOf(outerPath, rootReal, innerPath, real, above, rootReal);
+      if (at === undefined) continue;
+      const include = this.mounts.get(inner.name)?.config.include;
+      for (const s of at.spellings) nested.push({ dir: s.dir, name: inner.name, ...(at.claims ? { real } : {}), include });
     }
     return nested;
   }
@@ -2614,10 +2634,10 @@ export class WorkspaceModule implements Module {
    * on a file this mount's include leaves out. A mount with nothing nested,
    * and without both an include and links followed, has nothing to find, so
    * it pays nothing. The caller gives the nesting and the root to judge by
-   * (`nested`, `root`): a direct mount's file operation those its parse
-   * found, so where the path lands, and any link on its way, is judged
-   * beneath the root that parse resolved; otherwise the start's nesting and
-   * the configured path.
+   * (`nested`, `root`). A direct mount's file operation gives those its
+   * parse found, so where the path lands, and any link on its way, is judged
+   * beneath the root that parse resolved; any other caller gives the start's
+   * nesting and the configured path.
    */
   private async landingRefusal(mount: MountState, relativePath: string, path: string, nested: readonly NestedMount[], root: string): Promise<Error | null> {
     const judged = mount.config.followSymlinks === true && mount.config.include !== undefined;
