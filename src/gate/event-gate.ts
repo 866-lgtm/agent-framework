@@ -1822,7 +1822,7 @@ export class EventGate {
       this.config = beside ? write.config : without ? (starting?.config ?? { ...DEFAULT_CONFIG }) : read.config;
       this.configText = read.text;
       const start = beside ? 'beside' : without && starting ? { notUsed: notUsedClause(without, starting) } : undefined;
-      const asStarted = start ? readConfig(JSON.parse(read.text), 'gate.json', start) : null;
+      const asStarted = start ? readConfig(parseGateJson(read.text), 'gate.json', start) : null;
       this.configNote = asStarted && 'sentences' in asStarted ? loadNote(asStarted.sentences) : read.note;
       this.configError = this.configNote;
       this.configSource = beside || starting?.config && without ? 'initial' : without ? 'default' : 'file';
@@ -2122,7 +2122,7 @@ export class EventGate {
     // While the rules in force aren't gate.json's, configText is the text a
     // start ran them beside or in place of, so its rules aren't the ones in force.
     const text = this.configText !== undefined && this.configSource === 'file'
-      ? readConfig(JSON.parse(this.configText), 'gate.json')
+      ? readConfig(parseGateJson(this.configText), 'gate.json')
       : undefined;
     const inForce = text && !('refused' in text) && !('noList' in text.listed)
       ? { top: text.listed.top, rules: [...text.listed.rules] }

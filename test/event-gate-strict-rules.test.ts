@@ -1849,6 +1849,59 @@ test('a reconcile whose write leaves gate.json unable to load runs what it read 
   assert.deepEqual(landed.getStatus().errors, [`gate.json loaded. ${mutedSaid}`, `In the host's starting rules, ${mutedSaid}`]);
 });
 
+test('a gate.json saved with a BOM reads as the same file without one: at a later start beside it, through a wake_add_rule, and as the text in force once it is gone', async (t) => {
+  // UTF-8 with a leading U+FEFF, as some Windows editors save it. A later start
+  // over a gate.json with no rule list runs the host's starting rules beside it,
+  // and its note is read from the file's text.
+  const besideText = JSON.stringify({ default: 'skip', policies: 'x' });
+  const starting = { default: 'always', policies: [MENTIONS] };
+  const plain = makeGate(tempDir(t), { file: besideText, initialConfig: starting });
+  const bom = makeGate(tempDir(t), { file: `\uFEFF${besideText}`, initialConfig: starting });
+  t.after(() => { plain.gate.dispose(); bom.gate.dispose(); });
+  assert.equal(bom.gate.getStatus().configSource, 'initial');
+  assert.deepEqual(names(bom.gate), ['mentions']);
+  assert.deepEqual(bom.gate.getStatus().errors, plain.gate.getStatus().errors);
+
+  // Once a BOM gate.json that loaded is gone, a change builds on its text,
+  // the text in force, so the rule its operator added by hand stays.
+  const byHand = { name: 'by-hand', match: { tagsAny: ['chat:dm'] }, behavior: 'always' };
+  const handText = `\uFEFF${JSON.stringify({ default: 'defer', policies: [MENTIONS, byHand] }, null, 2)}`;
+  const gone = makeGate(tempDir(t), { file: handText });
+  t.after(() => gone.gate.dispose());
+  rmSync(gone.configPath);
+  gone.gate.addPolicy({ name: 'watch', match: { tagsAny: ['chat:watch'] }, behavior: 'always' });
+  assert.deepEqual(onDisk(gone.configPath).policies.map((p) => p.name), ['mentions', 'by-hand', 'watch']);
+
+  // Through wake_add_rule, the file is edited: the rule added by hand stays,
+  // and nothing is kept.
+  const dir = mkdtempSync(join(tmpdir(), 'gate-strict-'));
+  const configPath = join(dir, 'gate.json');
+  writeFileSync(configPath, handText);
+  const membrane = new MockMembrane();
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: membrane.asMembrane(),
+    agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', proseRouting: 'disabled' }],
+    modules: [],
+    gate: { configPath },
+  });
+  t.after(async () => {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  membrane.pushResponse(createMockResponse(
+    [{ type: 'tool_use', id: 'add', name: 'wake_add_rule', input: { name: 'watch', match: { tagsAny: ['chat:watch'] }, behavior: 'always' } }],
+    'tool_use',
+  ));
+  membrane.pushResponse(createMockResponse([]));
+  assert.equal(framework.nudgeAgent('scout').ok, true);
+  await framework.runUntilIdle();
+  const [round] = membrane.lastStream!.receivedToolResults as Array<Array<{ content: string; isError: boolean }>>;
+  assert.equal(round![0]!.isError, false, round![0]!.content);
+  assert.deepEqual(onDisk(configPath).policies.map((p) => p.name), ['mentions', 'by-hand', 'watch']);
+  assert.deepEqual(readdirSync(dir).filter((f) => f.startsWith('gate.json.unreadable-')), []);
+});
+
 test('wake_add_rule refuses a behavior, or a placement, of the wrong kind in its own terms, names fields it left out, and keeps the rules it didn\'t change', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'gate-strict-'));
   const configPath = join(dir, 'gate.json');
