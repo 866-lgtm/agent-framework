@@ -469,6 +469,21 @@ export class McplServerConnection extends EventEmitter {
       past++;
       return false;
     });
+    // So does the notifications' cap, where a flush that crossed a boundary
+    // joins what it held with the rest of its snapshot: the oldest go, as at
+    // hold.
+    const notifications = this.bufferedEvents.filter((item) => !McplServerConnection.hasResponder(item)).length;
+    if (notifications > McplServerConnection.MAX_HELD_NOTIFICATIONS) {
+      const excess = notifications - McplServerConnection.MAX_HELD_NOTIFICATIONS;
+      let skipped = 0;
+      this.bufferedEvents = this.bufferedEvents.filter((item) =>
+        McplServerConnection.hasResponder(item) || ++skipped > excess);
+      this.droppedBufferedEvents += excess;
+      console.error(
+        `[mcpl] ${this.id}: buffered-event cap (${McplServerConnection.MAX_HELD_NOTIFICATIONS}) — ` +
+        `dropped ${excess} responder-less event(s) where a flush crossed a transport boundary`,
+      );
+    }
     this.heldRequests = this.bufferedEvents.filter((item) => !item.kept && McplServerConnection.hasResponder(item)).length;
     this.keptRequests = kept;
     if (past > 0) {
@@ -544,7 +559,10 @@ export class McplServerConnection extends EventEmitter {
    *  notification is dropped. */
   private static readonly MAX_HELD_NOTIFICATIONS = 1000;
   /** Budget of held requests during a plane pause (#387), counted apart from
-   *  notifications: past it, a request is refused at once, never dropped. It
+   *  notifications: past it, a request is refused at once, never dropped.
+   *  Requests a transport boundary kept are counted apart from it
+   *  (keptRequests), with a bound of the same size past which they're
+   *  dropped, since no server waits on them. It
    *  bounds a server that pipelines requests without waiting for answers. A
    *  server that doesn't send a refused request again loses it (discord-mcpl
    *  doesn't), so the budget sits far above the notifications' cap, to leave
@@ -648,6 +666,12 @@ export class McplServerConnection extends EventEmitter {
     const dropped = this.droppedBufferedEvents;
     this.droppedBufferedEvents = 0;
     this.refusedHeldRequests = 0;
+    if (this.droppedKeptRequests > 0) {
+      console.error(
+        `[mcpl] ${this.id}: ${this.droppedKeptRequests} request(s) a closed transport left were dropped ` +
+        `at the kept-request bound (${McplServerConnection.MAX_HELD_REQUESTS}) during this pause`,
+      );
+    }
     this.droppedKeptRequests = 0;
     if (pending.length > 200) {
       console.error(
@@ -813,7 +837,7 @@ export class McplServerConnection extends EventEmitter {
     const own = (item: { event: string }) => item.event === 'connect-failed' || item.event === 'reconnect-failed';
     const reports = this.bufferedEvents.filter(own);
     if (reports.length === 0) return;
-    this.bufferedEvents = this.bufferedEvents.filter((item) => !own(item));
+    this.replaceHeld(this.bufferedEvents.filter((item) => !own(item)));
     for (const { event, args } of reports) super.emit(event, ...args);
   }
 
@@ -2146,6 +2170,14 @@ export class McplServerConnection extends EventEmitter {
 
   /** Contain synchronous dispatch failures; async RPC handlers own their promises. */
   private dispatchMessage(msg: JsonRpcRequest | JsonRpcResponse, epoch: number): void {
+    // Read after its transport's boundary, it is the dead process's,
+    // whatever it is, a response included: the boundary's rule applies
+    // (afterBoundary).
+    if (epoch !== this.transportEpoch) {
+      this.afterBoundary(msg, epoch);
+      return;
+    }
+
     // Is this a response to one of our outbound requests?
     if ('id' in msg && msg.id != null && !('method' in msg)) {
       this.handleResponse(msg as JsonRpcResponse);
@@ -2154,15 +2186,6 @@ export class McplServerConnection extends EventEmitter {
 
     // It is an inbound request or notification from the server
     const request = msg as JsonRpcRequest;
-    const eventName = typeof request.method === 'string' && Object.hasOwn(McplServerConnection.METHOD_TO_EVENT, request.method)
-      ? McplServerConnection.METHOD_TO_EVENT[request.method] : undefined;
-
-    // Read after its transport's boundary, it is the dead process's,
-    // whatever it is: the boundary's rule applies (afterBoundary).
-    if (epoch !== this.transportEpoch) {
-      this.afterBoundary(request, eventName, epoch);
-      return;
-    }
 
     // MCP's ping, which either side may send: its receiver answers promptly
     // with an empty result. It's answered as it arrives, before admission and
@@ -2174,6 +2197,8 @@ export class McplServerConnection extends EventEmitter {
       return;
     }
 
+    const eventName = typeof request.method === 'string' && Object.hasOwn(McplServerConnection.METHOD_TO_EVENT, request.method)
+      ? McplServerConnection.METHOD_TO_EVENT[request.method] : undefined;
 
     // §7 is removed in 0.5.0: scope/elevate is no longer a method. Answer
     // rather than hang (§6.6 — a method that will never be answered MUST
@@ -2245,18 +2270,28 @@ export class McplServerConnection extends EventEmitter {
    * A message read from a transport after its boundary has passed: the
    * boundary's rule (resetPolicyForTransportBoundary). An incoming message or
    * push is held as kept, for the next transport's grant, and anything else
-   * the process sent is dropped and logged. A stdio server's transport closes
-   * on the child's 'exit', when its stdout may still be open, as it is while
-   * a process the server started holds it, and it is read until the next
-   * reconnect attempt closes its reader. No transport serves meanwhile, so
-   * what is held waits for the next grant (flushHeld). A connection that
-   * won't reconnect reads it while its writer lives, and admits none of it,
-   * since a connection closed for good readies nothing; hold's bounds cap
-   * what it keeps.
+   * the process sent, a response included, is dropped and logged. A stdio
+   * server's transport closes on the child's 'exit', when its stdout may
+   * still be open, as it is while a process the server started holds it, and
+   * it is read until the next reconnect attempt closes its reader. No
+   * transport serves meanwhile, so what is held waits for the next grant
+   * (flushHeld). A connection closed for good, which won't reconnect, reads
+   * it while its writer lives, with no grant to come, so it drops and logs
+   * all of it; hold's bounds cap what any other keeps.
    */
-  private afterBoundary(request: JsonRpcRequest, event: string | undefined, epoch: number): void {
-    if (event === undefined || !McplServerConnection.WORLD_EVENTS.has(event)) {
-      console.error(`[mcpl] ${this.id}: dropped a message read after its transport closed: ${describeMethod(request.method)}`);
+  private afterBoundary(msg: JsonRpcRequest | JsonRpcResponse, epoch: number): void {
+    if ('id' in msg && msg.id != null && !('method' in msg)) {
+      console.error(`[mcpl] ${this.id}: dropped a response read after its transport closed`);
+      return;
+    }
+    const request = msg as JsonRpcRequest;
+    const event = typeof request.method === 'string' && Object.hasOwn(McplServerConnection.METHOD_TO_EVENT, request.method)
+      ? McplServerConnection.METHOD_TO_EVENT[request.method] : undefined;
+    if (this.closedForGood || event === undefined || !McplServerConnection.WORLD_EVENTS.has(event)) {
+      console.error(
+        `[mcpl] ${this.id}: dropped a message read after its transport closed` +
+        `${this.closedForGood ? ', with no transport to come' : ''}: ${describeMethod(request.method)}`,
+      );
       return;
     }
     this.hold(event, request.id != null ? [request.params, this.responderFor(request.id, epoch)] : [request.params], true);

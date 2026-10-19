@@ -747,7 +747,7 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
   // answer bound to a transport that's gone, so it's counted apart, with a
   // bound of its own; one the boundary drops leaves the count.
   const incoming = (id: number) => ({ messages: [{ channelId: 'room', messageId: `m${id}`, content: [] }] });
-  async function heldAcrossBoundary(method: string, params: (id: number) => unknown) {
+  async function heldAcrossBoundary(method: string, params: (id: number) => unknown, count = 10_000) {
     writeFileSync(FLAG_FILE, '');
     connection = await McplServerConnection.connect(makeConfig(), HOST_CAPS);
     let reconnected = 0;
@@ -761,7 +761,7 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
     try {
       // Held while both planes are closed, as after connect.
-      for (let id = 1; id <= 10_000; id++) serverSends({ id, method, params: params(id) });
+      for (let id = 1; id <= count; id++) serverSends({ id, method, params: params(id) });
       connection.sendToolsList().catch(() => {});
       await waitFor(() => reconnected === 1, 5000, 'reconnect after crash');
     } finally {
@@ -838,6 +838,91 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     assert.equal(held[0]!.args[0]!.messages![0]!.messageId, 'm100001', 'the earliest are kept');
     assert.equal(held[9_999]!.args[0]!.messages![0]!.messageId, 'm110000');
     assert.equal(logged.filter((line) => line.includes('kept-request bound (10000) — dropped 10000 request(s) a closed transport left')).length, 2, logged.join('\n'));
+  });
+
+  it('counts the requests read from the closed transport toward the kept bound as it holds them, and says at the flush how many it dropped', async () => {
+    const { lateSends, held } = await heldAcrossBoundary('channels/incoming', incoming, 9_999);
+    const logged: string[] = [];
+    const consoleError = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      lateSends({ id: 20_001, method: 'channels/incoming', params: incoming(20_001) }); // the 10,000th kept
+      lateSends({ id: 20_002, method: 'channels/incoming', params: incoming(20_002) }); // past the bound
+      assert.equal(held().length, 10_000);
+      assert.ok(logged.some((line) => line.includes('kept-request bound (10000) — dropped 1 request(s) a closed transport left')), logged.join('\n'));
+      connection!.establishGrant(new CapabilityGrant(new Set(['channels.incoming']), []));
+      connection!.ready();
+    } finally {
+      console.error = consoleError;
+    }
+    assert.ok(logged.some((line) => line.includes('1 request(s) a closed transport left were dropped at the kept-request bound (10000) during this pause')), logged.join('\n'));
+  });
+
+  it("starts the next pause's counts afresh after a flush", async () => {
+    const { serverSends, held } = await heldAcrossBoundary('channels/incoming', incoming);
+    const consoleError = console.error;
+    console.error = () => {};
+    try {
+      connection!.establishGrant(new CapabilityGrant(new Set(['channels.incoming']), []));
+      connection!.ready();
+      connection!.pauseDataPlane();
+      // A notification cap's worth and one more: the oldest goes.
+      for (let n = 1; n <= 1_001; n++) serverSends({ method: 'channels/incoming', params: incoming(30_000 + n) });
+    } finally {
+      console.error = consoleError;
+    }
+    assert.equal(held().length, 1_000);
+  });
+
+  it('keeps notifications out of the kept bound where boundaries join', async () => {
+    writeFileSync(FLAG_FILE, '');
+    connection = await McplServerConnection.connect(makeConfig(), HOST_CAPS);
+    let reconnected = 0;
+    connection.on('reconnect', () => { reconnected++; });
+    const serverSends = (message: Record<string, unknown>) =>
+      (connection as unknown as { transport: { emit(event: string, line: string): void } }).transport
+        .emit('line', JSON.stringify({ jsonrpc: '2.0', ...message }));
+    const consoleError = console.error;
+    console.error = () => {};
+    try {
+      // 10,000 requests and then five notifications, kept; then 10,000 more
+      // requests, kept at a second boundary with no flush between.
+      for (let n = 1; n <= 10_000; n++) serverSends({ id: n, method: 'channels/incoming', params: incoming(n) });
+      for (let n = 1; n <= 5; n++) serverSends({ method: 'channels/incoming', params: incoming(50_000 + n) });
+      connection.sendToolsList().catch(() => {});
+      await waitFor(() => reconnected === 1, 10_000, 'reconnect 1');
+      for (let n = 1; n <= 10_000; n++) serverSends({ id: 100_000 + n, method: 'channels/incoming', params: incoming(100_000 + n) });
+      connection.sendToolsList().catch(() => {});
+      await waitFor(() => reconnected === 2, 10_000, 'reconnect 2');
+    } finally {
+      console.error = consoleError;
+    }
+    const held = (connection as unknown as { bufferedEvents: Array<{ args: unknown[] }> }).bufferedEvents;
+    assert.equal(held.filter((item) => item.args[1] === undefined).length, 5, 'the five notifications stay');
+    assert.equal(held.length, 10_005);
+  });
+
+  it('holds a notification read from the closed transport as kept, outside both request counts', async () => {
+    const { lateSends, held } = await heldAcrossBoundary('channels/incoming', incoming);
+    lateSends({ method: 'channels/incoming', params: incoming(40_001) });
+    assert.equal(held().length, 10_001);
+    const c = connection as unknown as { bufferedEvents: Array<{ kept?: true; args: unknown[] }>; keptRequests: number; heldRequests: number };
+    const last = c.bufferedEvents.at(-1)!;
+    assert.equal(last.kept, true);
+    assert.equal(last.args[1], undefined, 'no responder');
+    assert.deepEqual([c.keptRequests, c.heldRequests], [10_000, 0]);
+  });
+
+  it('caps notifications where a flush that crossed a boundary joins what it held, the oldest going', (t) => {
+    const logged: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+    const between = Reflect.construct(McplServerConnection, ['between', null, null]) as McplServerConnection;
+    const items = Array.from({ length: 1_200 }, (_, n) => ({ event: 'channels-incoming', args: [incoming(n)], kept: true as const }));
+    (between as unknown as { replaceHeld(items: unknown[]): void }).replaceHeld(items);
+    const held = (between as unknown as { bufferedEvents: Array<{ args: Array<{ messages: Array<{ messageId: string }> }> }> }).bufferedEvents;
+    assert.equal(held.length, 1_000);
+    assert.equal(held[0]!.args[0]!.messages[0]!.messageId, 'm200', 'the oldest 200 went');
+    assert.ok(logged.some((line) => line.includes('buffered-event cap (1000) — dropped 200 responder-less event(s) where a flush crossed a transport boundary')), logged.join('\n'));
   });
 
   it("a control-plane flush keeps what a boundary kept out of the next transport's budget", async () => {
@@ -1012,13 +1097,37 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     await waitFor(() => closed === 1, 5000, 'the transport closed');
     const logged: string[] = [];
     t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+    const written: string[] = [];
+    (dead as unknown as { writeLine(line: string): void }).writeLine = (line: string) => { written.push(line); };
+    const heldBefore = (connection as unknown as { bufferedEvents: unknown[] }).bufferedEvents.length;
     for (const [id, method] of [[7, 'ping'], [8, 'featureSets/changed'], [9, 'scope/elevate'], [10, 'no/such-method']] as const) {
       dead.emit('line', JSON.stringify({ jsonrpc: '2.0', id, method }));
     }
+    dead.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 1, result: {} })); // a response, too
     for (const method of ['ping', 'featureSets/changed', 'scope/elevate', 'no/such-method']) {
       assert.ok(logged.some((line) => line.includes(`dropped a message read after its transport closed: method ${method}`)), `${method}:\n${logged.join('\n')}`);
     }
+    assert.ok(logged.some((line) => line.includes('dropped a response read after its transport closed')), logged.join('\n'));
     assert.equal(logged.some((line) => line.includes('answered -32601')), false, 'nothing is said to have been answered');
+    assert.equal((connection as unknown as { bufferedEvents: unknown[] }).bufferedEvents.length, heldBefore, 'nothing is held');
+    assert.deepEqual(written, [], 'nothing is written');
+  });
+
+  it('drops and logs a world message a connection closed for good reads after its close, since no grant will come', async (t) => {
+    writeFileSync(FLAG_FILE, '');
+    connection = await McplServerConnection.connect({ ...makeConfig(), reconnect: false }, HOST_CAPS);
+    let closed = 0;
+    connection.on('close', () => { closed++; });
+    type Wire = { emit(event: string, line: string): void };
+    const dead = (connection as unknown as { transport: Wire }).transport;
+    connection.sendToolsList().catch(() => {});
+    await waitFor(() => closed === 1, 5000, 'the transport closed');
+    const logged: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+    const heldBefore = (connection as unknown as { bufferedEvents: unknown[] }).bufferedEvents.length;
+    dead.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'channels/incoming', params: incoming(3) }));
+    assert.equal((connection as unknown as { bufferedEvents: unknown[] }).bufferedEvents.length, heldBefore, 'not held');
+    assert.ok(logged.some((line) => line.includes('dropped a message read after its transport closed, with no transport to come: method channels/incoming')), logged.join('\n'));
   });
 
   it("logs a request id it can't answer as the server's field, escaped", (t) => {

@@ -116,6 +116,7 @@ async function makeHarness() {
   fw.inferenceRouter = null;
   fw.eventGate = null;
   fw.mcplPolicyExchanges = new WeakMap();
+  fw.manifestRefreshState = new Map();
 
   fw.featureSetManager = new FeatureSetManager();
   fw.scopeManager = new ScopeManager();

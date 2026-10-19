@@ -187,6 +187,19 @@ test("a connect under a new prefix drops the prefix its id's failed connect left
   }
 });
 
+test("a disconnect discards the server's manifest-refresh state, so a replacement starts its own", async () => {
+  const h = await create([fixture('flaky', 'flaky')]);
+  try {
+    await waitFor(() => offered(h.fw).length === 1, 'the listing');
+    const internals = h.fw as unknown as { manifestRefreshState: Map<string, unknown> };
+    internals.manifestRefreshState.set('flaky', { inFlight: false, queued: true, lastCompletedAt: Date.now() });
+    await h.fw.disconnectMcplServer('flaky');
+    assert.equal(internals.manifestRefreshState.has('flaky'), false);
+  } finally {
+    await h.cleanup();
+  }
+});
+
 test("a restart that changes the server's id isn't refused by the prefix it replaces", async () => {
   // `mcpl--plain--x` meets `mcpl--plain`, but the restart disconnects `plain` first.
   const h = await create([fixture('plain')]);

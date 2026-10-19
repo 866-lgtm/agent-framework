@@ -17,24 +17,29 @@
 - A policy answer that arrives after its transport closed grants nothing,
   whether to the initial policy Request or to one after a manifest change,
   and a manifest fetched from a transport that has closed isn't installed,
-  nor a refresh queued on it run on the next one. A reconnect is still
-  announced (`mcpl:server-reconnected`, `module:added`) once its attempt has
-  settled, granted or not, and now also when another gate replaced its own
-  before the awareness drain ended, where it used to go unannounced. A
-  connect or reconnect whose transport drops before it's announced isn't
-  announced: the close has reported the server gone (`module:removed`), and
-  the next reconnect, if one comes, announces it. For a host that lists
-  modules from the trace: a server whose first connect failed is added
-  (`module:added`) once, by the first reconnect that's still connected once
-  its attempt settles, granted or not, where it used to be added also when
-  startup or a runtime connect registered it, and one that never connects
-  isn't added. What a server sent about its own process that is still held
-  when its transport closes, such as a request, a `tools/observe` filter or
-  a channel registration, is dropped rather than admitted under the next
-  transport's grant: the next process announces its own. So is such a
-  message read from the transport after it closed, as can happen when a
-  process a stdio server started still holds its stdout, until a reconnect
-  attempt, if one comes, closes the transport's reader. Incoming channel
+  nor a refresh queued on it run on the next one. A queued refresh's receipt
+  reports the domains of the announcements it coalesced on its transport,
+  and a server's removal discards its refresh state, so a timer of the
+  removed connection no longer drops its replacement's queued refresh. A
+  reconnect is still announced (`mcpl:server-reconnected`, `module:added`)
+  once its attempt has settled, granted or not, and now also when another
+  gate replaced its own before the awareness drain ended, where it used to
+  go unannounced. A connect or reconnect whose transport drops before it's
+  announced isn't announced: the close has reported the server gone
+  (`module:removed`), and the next reconnect, if one comes, announces it.
+  For a host that lists modules from the trace: a server whose first connect
+  failed is added (`module:added`) once, by the first reconnect that's still
+  connected once its attempt settles, granted or not, where it used to be
+  added also when startup or a runtime connect registered it, and one that
+  never connects isn't added. What a server sent about its own process that
+  is still held when its transport closes, such as a request, a
+  `tools/observe` filter or a channel registration, is dropped rather than
+  admitted under the next transport's grant: the next process announces its
+  own. So is such a message read from the transport after it closed, as can
+  happen when a process a stdio server started still holds its stdout, until
+  a reconnect attempt, if one comes, closes the transport's reader, and so
+  is a response read then. A connection closed for good drops and logs
+  everything it reads late, since no grant will come. Incoming channel
   messages and pushes still held, or read from the transport after it
   closed, are kept and admitted under the next grant, since a bridge that
   recorded them as forwarded won't send them again, and they stay held while
