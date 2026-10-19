@@ -1109,6 +1109,37 @@ test("a mount configured in a moved direct root's new directory, through a link 
   assert.deepEqual(await answers(moved), fromStart);
 });
 
+test("a mount configured at a link into a moved direct root's new directory is nested where the link leads, as a start there nests it", async (t) => {
+  const env = new Env(t);
+  // `work` is configured at `w`, a link to `b/deep/work`, so a start with
+  // `ref` at `b` nests it by its real root alone: no directory above `w`
+  // is `b`.
+  const a = join(env.root, 'a');
+  const b = join(env.root, 'b');
+  mkdirSync(a, { recursive: true });
+  mkdirSync(join(b, 'deep', 'work'), { recursive: true });
+  writeFileSync(join(b, 'deep', 'work', 'file.txt'), 'work file\n');
+  writeFileSync(join(b, 'own.txt'), 'b own file\n');
+  symlinkSync(join(b, 'deep', 'work'), join(env.root, 'w'));
+  const link = join(env.root, 'link');
+  symlinkSync(a, link);
+  const mounts: [Partial<MountConfig>, MountConfig[]] = [{ path: link }, [{ name: 'work', path: join(env.root, 'w'), mode: 'read-only', backend: 'direct' }]];
+  const moved = await env.open(...mounts);
+  rmSync(link);
+  symlinkSync(b, link);
+  const started = await new Env(t).open(...mounts);
+  const answers = async (m: WorkspaceModule) => ({
+    read: await call(m, 'read', { path: 'ref/deep/work/file.txt' }),
+    disk: await m.readFileFromDisk('ref/deep/work/file.txt').then(() => 'read', (err: unknown) => (err instanceof WorkspaceReadError ? err.code : String(err))),
+    found: (await data<{ results: Array<{ file: string }> }>(m, 'grep', { pattern: 'file', path: 'ref' })).results.map((r) => r.file),
+  });
+  const fromStart = await answers(started);
+  assert.match(fromStart.read.error ?? '', /lies in mount "work", nested in mount "ref"/);
+  assert.equal(fromStart.disk, 'other_mount');
+  assert.deepEqual(fromStart.found, ['ref/own.txt']);
+  assert.deepEqual(await answers(moved), fromStart);
+});
+
 test("a direct mount whose root moves between a read's parse and its open names the mount a link on the way leads into, by the root it opens under", async (t) => {
   const env = new Env(t);
   const a = join(env.root, 'a');
