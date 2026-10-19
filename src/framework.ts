@@ -18293,9 +18293,9 @@ export class AgentFramework {
       return this.draftsToolResult(origin.agentName, call.input);
     }
 
-    // The utils meta-tool — programmatic callers (code_execution scripts,
-    // ephemerals, ModuleContext.callTool) reach utilities the same way the
-    // model does.
+    // The utils meta-tool: callers that await a tool's result (the puppet and
+    // a host through executeToolCall, and a module through callTool) reach
+    // utilities the same way the model does.
     if (call.name === 'utils') {
       return this.handleUtilsToolCall(call.callerAgentName ?? '__ephemeral__', call, { inProcess: true, trustedModule: origin.kind === 'module' });
     }
@@ -25751,9 +25751,10 @@ export class AgentFramework {
   }
 
   /** The `utils` meta-tool: list/describe/run over module utilities
-   *  (Module.getUtilities). Shared by the model-facing dispatcher and the
-   *  programmatic path (executeToolCall), so code_execution scripts and
-   *  ephemerals reach utilities too. */
+   *  (Module.getUtilities). Shared by the model-facing dispatcher, which a
+   *  running code_execution script's calls take too, and executeToolCallFrom,
+   *  which the puppet and a host reach through executeToolCall and a module
+   *  through callTool. */
   private async handleUtilsToolCall(agentName: string, call: ToolCall, options: { inProcess?: boolean; trustedModule?: boolean } = {}): Promise<ToolResult> {
     const input = (call.input ?? {}) as { action?: unknown; name?: unknown; args?: unknown };
     const allUtilities = this.moduleRegistry.getAllUtilities();
