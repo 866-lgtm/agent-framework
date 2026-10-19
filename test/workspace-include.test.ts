@@ -1156,6 +1156,54 @@ describe('mount include', () => {
     assert.equal(readFileSync(join(env.dir, 'gate.json.bak'), 'utf8'), 'backup 2, edited after the include\n');
   });
 
+  test('with the watcher running, a change outside the include takes no pass of the mount and wakes no one', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('gate.json', '{"v":1}\n');
+    const events: Array<{ type: string; paths?: string[] }> = [];
+    const m = new WorkspaceModule({ mounts: [
+      { name: 'work', path: env.dir, mode: 'read-write', watch: 'always', watchDebounceMs: 50, include: ['gate.json'] },
+    ] });
+    m.initStore(env.store);
+    await m.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: (e: unknown) => events.push(e as { type: string; paths?: string[] }) } as unknown as ModuleContext);
+    try {
+      const internals = m as unknown as {
+        mounts: Map<string, { watcherReadyAt?: number }>;
+        handleFsChanges(mount: string, changes: Array<{ path: string; op: string }>): Promise<void>;
+        passUnlocked(mount: unknown, scope: { kind: string; paths?: string[] }): Promise<unknown>;
+      };
+      const until = async (done: () => boolean, what: string): Promise<void> => {
+        for (const started = Date.now(); !done(); await new Promise((r) => setTimeout(r, 20))) {
+          if (Date.now() - started > 10_000) assert.fail(`timed out: ${what}`);
+        }
+      };
+      await until(() => !!internals.mounts.get('work')!.watcherReadyAt && env.store.treeGet(TREE, 'gate.json') !== null,
+        'the watcher is ready and the catch-up scan took gate.json');
+      // Each batch the watcher hands over, and each pass of the mount from here on.
+      const batches: string[][] = [];
+      const passes: string[][] = [];
+      const handle = internals.handleFsChanges.bind(m);
+      internals.handleFsChanges = (mount, changes) => { batches.push(changes.map((c) => c.path)); return handle(mount, changes); };
+      // A watcher's batch takes a pass of the paths it names; the catch-up scan after ready is the mount's.
+      const pass = internals.passUnlocked.bind(m);
+      internals.passUnlocked = (mount, scope) => { if (scope.kind === 'paths') passes.push(scope.paths ?? []); return pass(mount, scope); };
+      const named = (path: string): boolean => events.some((e) => e.paths?.includes(path));
+      events.length = 0;
+      env.writeDisk('notes.txt', 'outside the include\n');
+      await until(() => batches.flat().includes('notes.txt'), 'the watcher reports the uncovered file');
+      // Time for its batch's handling to finish, had it taken a pass.
+      await new Promise((r) => setTimeout(r, 300));
+      assert.equal(passes.length, 0, `no pass of the mount: ${JSON.stringify(passes)}`);
+      assert.ok(!named('work/notes.txt'), `and no event: ${JSON.stringify(events)}`);
+      // A covered change, as a control: the watcher reports it, a pass takes it in, and its event goes out.
+      env.writeDisk('gate.json', '{"v":2}\n');
+      await until(() => named('work/gate.json'), 'the covered change is taken in');
+      assert.ok(passes.length > 0 && passes.every((paths) => !paths.includes('notes.txt')), JSON.stringify(passes));
+      assert.equal(env.store.treeGet(TREE, 'notes.txt'), null);
+    } finally {
+      await m.stop();
+    }
+  });
+
   test("a path in a nested mount's directory is that mount's, whether or not the outer include covers it: every tool names the mount that holds it", async (t) => {
     const env = new Env(t);
     env.writeDisk('gate.json', '{}\n');

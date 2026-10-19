@@ -4238,11 +4238,14 @@ export class WorkspaceModule implements Module {
    * The watcher's ops only choose which paths to look at: each path is
    * observed again and decided under the three-way rule, so an event that
    * arrives late or out of order can't delete or revert anything by itself.
+   * A path outside the mount (insideMount), such as one its include doesn't
+   * cover, is no pass's to decide (gather), so a batch of nothing else takes
+   * no turn of the mount.
    */
   private async handleFsChanges(mountName: string, changes: FsChange[]): Promise<void> {
     const mount = this.mounts.get(mountName);
     if (!this.store || !this.running() || !mount) return;
-    const paths = [...new Set(changes.map((c) => c.path))];
+    const paths = [...new Set(changes.map((c) => c.path))].filter((p) => insideMount(p, mount.config.include));
     if (paths.length === 0) return;
     await this.withMount(mount, () => this.passUnlocked(mount, { kind: 'paths', paths }));
   }
