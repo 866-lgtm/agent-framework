@@ -146,7 +146,7 @@ test('the mandatory awareness deadline still bounds a hung reaction with request
     framework = await AgentFramework.create(config({ requestTimeoutMs: 0, awarenessDeadlineMs: 150 }));
     await waitFor('the hung add to be recorded unanswered', () => entry('m1')?.confirmed === 'unknown');
     assert.deepEqual(entry('m1')!.mayLand, ['add']);
-    assert.match(entry('m1')!.lastError ?? '', /did not respond/);
+    assert.match(entry('m1')!.lastError ?? '', /didn't answer within/);
   } finally {
     writeFileSync(paths.hold, '1');
     await framework?.stop();
@@ -354,7 +354,7 @@ test('an inbound event is handled in the turn it arrives: delivery holds no MCPL
   framework.handleHostCommand = async () => { handled.push('host-command'); return { ok: true }; };
   const connection = new EventEmitter() as any;
   connection.id = 'discord';
-  framework.wireMcplEvents(connection);
+  framework.wireMcplEvents(connection, { id: 'discord' });
   const responder = { id: 1, respond: () => {}, respondError: () => {} };
   for (const event of ['push-event', 'inference-request', 'channels-incoming', 'host-command']) {
     connection.emit(event, {}, responder);

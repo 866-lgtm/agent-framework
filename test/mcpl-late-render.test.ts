@@ -38,7 +38,7 @@ async function timedOutRender(t: TestContext, params: PushRenderParams = RENDER)
   const framework = Object.create(AgentFramework.prototype) as any;
   framework.traceListeners = [];
   framework.onTrace((event: never) => traces.push(event));
-  framework.wireMcplEvents(connection);
+  framework.wireMcplEvents(connection, { id: 'srv' });
   const orphans: unknown[] = [];
   connection.on('orphaned-response', (info: unknown) => orphans.push(info));
   connection.ready();
@@ -47,7 +47,7 @@ async function timedOutRender(t: TestContext, params: PushRenderParams = RENDER)
   const render = connection.sendPushRender(params);
   const { id } = JSON.parse(transport.lines[0]!) as { id: number };
   t.mock.timers.tick(5_000);
-  await assert.rejects(render, /did not respond to push\/render/);
+  await assert.rejects(render, /didn't answer within/);
   const answerLate = (answer: object = { result: { content: [{ type: 'text', text: 'late' }] } }) =>
     transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id, ...answer }));
   const recorded = () => traces
@@ -99,7 +99,7 @@ test('a late answer to a tool call whose deadline passed is still recorded as mc
     const call = connection.sendToolsCallWithDeadline('stuck', {}, 75);
     const { id } = JSON.parse(transport.lines.at(-1)!) as { id: number };
     t.mock.timers.tick(75);
-    await assert.rejects(call, /outcome is unknown/);
+    await assert.rejects(call, /whether the request took effect is unknown/);
     return id;
   };
   const answered = await lateCall();
@@ -119,7 +119,7 @@ test('a late answer carrying both a result and an error, which JSON-RPC forbids,
   const call = connection.sendToolsCallWithDeadline('stuck', {}, 75);
   const { id } = JSON.parse(transport.lines.at(-1)!) as { id: number };
   t.mock.timers.tick(75);
-  await assert.rejects(call, /outcome is unknown/);
+  await assert.rejects(call, /whether the request took effect is unknown/);
   transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id, ...both }));
   assert.deepEqual(recorded(), [
     { ...lateRender, error: '[-32603] tool failed' },

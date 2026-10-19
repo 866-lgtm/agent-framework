@@ -133,7 +133,7 @@ async function makeHarness() {
     getAllServers: () => [connection],
     getServer: (id: string) => id === connection.id ? connection : null,
   };
-  fw.wireMcplEvents(connection);
+  fw.wireMcplEvents(connection, config);
   await fw.registerMcplServerFeatures(config, connection);
 
   // During reconnect the §5.3 policy round-trip spans a microtask before

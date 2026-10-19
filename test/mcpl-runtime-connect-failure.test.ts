@@ -62,6 +62,11 @@ describe('MCPL runtime connect: a policy registration that throws', () => {
       maintenanceIntervalMs: 0,
       mcplServers: [serverConfig('running')],
     });
+    // Which servers' tools the framework asks to relist.
+    const lists = framework as unknown as { handleToolsListChanged(id: string): void };
+    const relist = lists.handleToolsListChanged.bind(framework);
+    const refreshed: string[] = [];
+    lists.handleToolsListChanged = (id: string) => { refreshed.push(id); relist(id); };
     const features = FeatureSetManager.prototype as any;
     const initializeServer = features.initializeServer;
     features.initializeServer = function (this: unknown, serverId: string, ...rest: unknown[]) {
@@ -98,7 +103,7 @@ describe('MCPL runtime connect: a policy registration that throws', () => {
     const running = registry.getServer('running') as { isConnected: boolean; dataPlaneReady: boolean };
     assert.equal(running.isConnected, true, 'the running server stays connected');
     assert.equal(running.dataPlaneReady, true, 'the running server\'s data flows');
-    return { chat, registry };
+    return { chat, registry, refreshed };
   }
 
   it('closes its connection for good, so a later connect of its id reaches the server', async () => {
@@ -111,13 +116,14 @@ describe('MCPL runtime connect: a policy registration that throws', () => {
   it('keeps a connection whose close then fails registered and paused through a resume, and logs the close', async (t) => {
     const logged: string[] = [];
     t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
-    const { chat, registry } = await failPolicyRegistration(true);
+    const { chat, registry, refreshed } = await failPolicyRegistration(true);
     // A close that fails keeps the entry, so a later disconnect, restart or
     // shutdown can close it again.
     const refused = registry.getServer(chat.id) as { dataPlaneReady: boolean; willReconnect: boolean } | null;
     assert.ok(refused, 'the connection whose close failed is still registered');
     assert.equal(refused.willReconnect, false, 'its close had disarmed it before the transport close failed');
     assert.equal(refused.dataPlaneReady, false, 'the failed connect left it paused');
+    assert.ok(refreshed.includes(chat.id), 'a refresh of the tool list was asked for though its close failed');
     // A resume opens every registered server's planes.
     await framework!.quiesce({ reason: 'test' });
     await framework!.resume();

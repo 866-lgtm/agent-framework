@@ -56,6 +56,7 @@ process.stdin.on('data', (chunk) => {
         jsonrpc: '2.0',
         id: message.id,
         result: {
+          protocolVersion: '2024-11-05',
           capabilities: {
             experimental: {
               mcpl: {

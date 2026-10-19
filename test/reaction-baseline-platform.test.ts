@@ -29,6 +29,7 @@ async function connectionEnv(
     discordAwarenessOutbox: { batches: () => [] },
     discordAwarenessEmoji: '🔕',
     mcplServerRegistry: {
+      getServer: () => undefined,
       async addServer(config: McplServerConfig) {
         captured = config;
         throw stopBeforeSpawn;

@@ -82,13 +82,18 @@ test('a create() whose module fails to start stops every module it started, that
   await retried.stop();
 });
 
-test('a create() that fails after its MCPL server connected closes the server and frees its store', async t => {
+test('a create() that fails after its MCP servers connected closes them, in both engines, and frees its store', async t => {
   const dir = tempDir(t);
   const eventsPath = join(dir, 'events.jsonl');
   const config = {
     ...baseConfig(join(dir, 'store')),
     agents: [{ name: 'assistant', model: 'test', systemPrompt: 'test' }],
+    // The modern server connects first, so both engines hold a server when
+    // the failure comes.
     mcplServers: [{
+      id: 'modern', command: process.execPath, protocol: 'modern' as const,
+      args: [fileURLToPath(new URL('./fixtures/modern-raw-server.mjs', import.meta.url)), '', join(dir, 'modern.jsonl')],
+    }, {
       id: 'chat', command: process.execPath,
       args: [fileURLToPath(new URL('./fixtures/reregistering-mcpl-server.mjs', import.meta.url))],
       requestTimeoutMs: 1_000, enabledFeatureSets: ['chat'],
@@ -107,14 +112,21 @@ test('a create() that fails after its MCPL server connected closes the server an
     .map(line => JSON.parse(line) as { event: string; pid?: number })
     .find(record => record.event === 'register-sent');
   assert.ok(initialized?.pid, 'the MCPL server had finished its handshake before the failure');
-  // Wait on that child itself, with room for a loaded machine: only a child
-  // still running after 10 s fails this.
+  const modern = readFileSync(join(dir, 'modern.jsonl'), 'utf8').split('\n').filter(Boolean)
+    .map(line => JSON.parse(line) as { event: string; method?: string; pid?: number });
+  const modernPid = modern.find(record => record.event === 'start')?.pid;
+  assert.ok(modernPid, 'the modern server was launched');
   const running = (pid: number) => {
     try { process.kill(pid, 0); return true; }
     catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM'; }
   };
-  for (let waits = 0; running(initialized.pid); waits++) {
-    assert.ok(waits < 1000, 'the MCPL server is still running after create() rejected');
+  // Whatever the assertions find, no child outlives the test.
+  t.after(() => { if (running(modernPid)) process.kill(modernPid, 'SIGKILL'); });
+  assert.ok(modern.some(record => record.method === 'server/discover'), 'the modern server had its handshake before the failure');
+  // Wait on those children themselves, with room for a loaded machine: only
+  // a child still running after 10 s fails this.
+  for (let waits = 0; running(initialized.pid) || running(modernPid); waits++) {
+    assert.ok(waits < 1000, `still running after create() rejected: ${running(initialized.pid) ? 'the MCPL server' : 'the modern server'}`);
     await new Promise(done => setTimeout(done, 10));
   }
   const retried = await AgentFramework.create(config);
