@@ -142,10 +142,10 @@ function problemText(problem: EditProblem, tool: EditTool): string {
           : typeof expected === 'number' && found > expected
             ? `Include more of the text around it to single out the ${expected === 1 ? 'one' : 'ones'} you mean, or set occurrences to ${found} if every one should change.`
             : `Set occurrences to ${found} if those are all.`;
-      // Why a count is a floor goes on a line of its own, so a cut first line
-      // (cutLine) keeps the hint.
+      // Why a count is a floor goes on a line of its own, so it doesn't push
+      // the hint past the first line's cut (cutLine).
       const floor = problem.spent && !overlapping
-        ? `This call counted as many occurrences as one call may, so ${found} is a floor: sent in a call of its own, the edit has every one counted.\n`
+        ? `This call counted as many occurrences as one call may, so ${found} is a floor: sent in a call of its own, the edit has every one counted, unless they overlap.\n`
         : '';
       return `${occurs}${quotes}${differs ? `, not ${expected}` : ''}${overlap}. ${hint}\n${floor}${problem.shown}`;
     }
@@ -165,7 +165,8 @@ function problemText(problem: EditProblem, tool: EditTool): string {
       const ways = problem.readings.map((reading) => `${READS[reading.leaves]} (${countLines(reading)})`);
       const list = ways.length < 3 ? ways.join(' and ') : `${ways.slice(0, -1).join(', ')} and ${ways.at(-1)}`;
       // The lines of each reading follow on a line of their own, so however
-      // long they run, a cut first line (cutLine) keeps the hint.
+      // long they run, they don't push the hint past the first line's cut
+      // (cutLine).
       return `oldString ${carries}, and occurs in ${problem.path} read more than one way, so which you mean can't be told. `
         + `Include more of the text around it, such as the line before or after it, to say which.\nIt occurs ${list}.`;
     }

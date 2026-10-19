@@ -188,10 +188,54 @@ test("an edit's count in a call of its own is exact, in a text longer than the c
   assert.deepEqual(planned.problems.map((p) => p.kind === 'count' && [p.found, p.atLeast, p.spent]), [[1_500, false, false]]);
 });
 
-test("crowded edits among which one replaces every occurrence ask for as many as it finds", () => {
+test("crowded edits among which one replaces every occurrence ask for as many as it finds, however little of the budget is left", () => {
   const bytes = Buffer.from(`${'x'.repeat(100)}\n`);
   assert.deepEqual(planFile(decodeForEdit(bytes)!, bytes, [spec(0, 'x', 'a', 'all'), spec(1, 'x', 'b', 100), spec(2, 'x', 'c', 100)]),
     { problems: [{ kind: 'crowded', edits: [0, 1, 2], asked: 300, length: 101 }] });
+  // The first edit spends all but 21 of a budget of 1,001; the second stops
+  // at 42, short of its ask; the third, replacing every occurrence, counts
+  // all 1,000 regardless.
+  const long = Buffer.from(`${'x'.repeat(1_000)}\n`);
+  const planned = planFile(decodeForEdit(long)!, long, [spec(0, 'x', 'a', 990), spec(1, 'x', 'b', 990), spec(2, 'x', 'c', 'all')], hintBudget(), Infinity, countBudget(1_000));
+  assert.ok('problems' in planned);
+  assert.deepEqual(planned.problems.map((p) => (p.kind === 'count' ? [p.kind, p.edit, p.found] : p)), [['count', 0, 1_000], { kind: 'crowded', edits: [1, 2], asked: 1_990, length: 1_001 }]);
+});
+
+test("one count budget raised for a text longer than it is raised once for each length, however many such texts it plans", () => {
+  // Raised to 1,500 by the first text, whose one edit counts all but 21 of
+  // it, the budget leaves the second text's edit its free 21, those 21, and
+  // one more.
+  const counts = countBudget(1_000);
+  const bytes = Buffer.from('a'.repeat(1_500));
+  const counted = (newText: string) => {
+    const planned = planFile(decodeForEdit(bytes)!, bytes, [spec(0, 'a', newText)], hintBudget(), Infinity, counts);
+    assert.ok('problems' in planned);
+    return planned.problems.map((p) => p.kind === 'count' && [p.found, p.atLeast, p.spent]);
+  };
+  assert.deepEqual(counted('b'), [[1_500, false, false]]);
+  assert.deepEqual(counted('c'), [[43, true, true]]);
+});
+
+test("crowded edits whose counts stopped short, where the crowded check names none, are each named, by a loop, and their problems made only then", () => {
+  // The first edit asks for more than there are and counts them all; the
+  // second runs the budget out; the next 199,999, each asking 21, stop at 21
+  // and between them ask for no more than the text holds. Each is named.
+  const text = `${'a'.repeat(4_199)}\n`.repeat(1_000);
+  const bytes = Buffer.from(text);
+  const specs = [spec(0, 'a', 'x', 10_000_000), ...Array.from({ length: 200_000 }, (_, k) => spec(k + 1, 'a', 'y', 21))];
+  const planned = planFile(decodeForEdit(bytes)!, bytes, specs);
+  assert.ok('problems' in planned);
+  assert.equal(planned.problems.length, 200_001);
+  assert.ok(planned.problems.every((p) => p.kind === 'count'));
+  // Where the crowded check names them, their problems aren't made: 200,000
+  // edits of one line of 2,000,000 that a crowded refusal names take no
+  // longer than their counts.
+  const line = Buffer.from('a'.repeat(2_000_000));
+  const before = process.cpuUsage();
+  const crowded = planFile(decodeForEdit(line)!, line, Array.from({ length: 200_000 }, (_, k) => spec(k, 'a', 'y', 3_000)));
+  const used = process.cpuUsage(before);
+  assert.ok('problems' in crowded && crowded.problems.some((p) => p.kind === 'crowded'));
+  assert.ok((used.user + used.system) / 1000 < 4_000, `${(used.user + used.system) / 1000} ms of CPU`);
 });
 
 test("a miss's closest region is the line most like the first 2,000 code units of the old text's first line, its bigrams each counted as often as that line has them", () => {
@@ -211,10 +255,11 @@ test("a miss's closest region is the line most like the first 2,000 code units o
   assert.equal(region('ababababab\nabcx\n', 'abcd'), 2);
 });
 
-test("a miss's closest region over 100,000 lines that share a bigram with the old text takes no longer than a pass over them", () => {
+test("a miss's closest region over 100,000 lines that share a bigram with the old text takes under 2 s of CPU", () => {
   const text = 'abc\n'.repeat(100_000);
   const before = process.cpuUsage();
-  assert.equal(problems(text, [spec(0, 'abd', 'z')])[0]?.kind, 'miss');
+  const [miss] = problems(text, [spec(0, 'abd', 'z')]);
+  assert.ok(miss?.kind === 'miss' && miss.hint.startsWith('Closest region (line 1, similarity 0.50)'), JSON.stringify(miss));
   const used = process.cpuUsage(before);
   assert.ok((used.user + used.system) / 1000 < 2_000, `${(used.user + used.system) / 1000} ms of CPU`);
 });

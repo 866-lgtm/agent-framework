@@ -367,6 +367,41 @@ test("an oldString that is a CR or a BOM alone, found as given, is refused where
   assert.match(errorOf(await call('edit', { path: 'work/b.txt', oldString: '\uFEFF', newString: 'Q' })),
     /\nIt occurs as given \(on line 2\) and with its BOM read as the file's own \(on line 1\)\.$/);
   assert.equal(await stored('b.txt'), '\uFEFF\nx\uFEFFy\n');
+  // Not found as given, it's never read as the line end's CR or the file's
+  // BOM alone, which would put its new text where they are: it misses.
+  await file('m.txt', '\r\nx');
+  assert.match(errorOf(await call('edit', { path: 'work/m.txt', oldString: '\r', newString: 'Y' })), /^The edit did nothing: oldString isn't in work\/m\.txt\./);
+  await file('o.txt', '\uFEFFx\n');
+  assert.match(errorOf(await call('edit', { path: 'work/o.txt', oldString: '\uFEFF', newString: 'Q' })), /^The edit did nothing: oldString isn't in work\/o\.txt\./);
+  // Deleting it, read as a line end's CR, would change nothing, so a lone CR
+  // as given is the only one the edit can mean.
+  await file('d.txt', 'a\rb\r\n');
+  dataOf(await call('edit', { path: 'work/d.txt', oldString: '\r', newString: '' }));
+  assert.equal(await stored('d.txt'), 'ab\r\n');
+});
+
+test("an oldString with the file's BOM at its start and a CR at its end is read as the BOM and an empty first line's CRLF end beside another reading", async (t) => {
+  const { call, stored, file } = setup(t);
+  // Line 2's BOM before its CRLF end is one reading; the file's BOM and the
+  // empty line 1's CRLF end, as a character page shows them, is the other.
+  await file('e.txt', '\uFEFF\r\nx\uFEFF\r\n');
+  assert.match(errorOf(await call('edit', { path: 'work/e.txt', oldString: '\uFEFF\r', newString: 'Y' })),
+    /\nIt occurs with its last CR read as its CRLF line end's \(on line 2\) and with its BOM read as the file's own and its last CR as a CRLF line end's \(on line 1\)\.$/);
+  assert.equal(await stored('e.txt'), '\uFEFF\r\nx\uFEFF\r\n');
+  // Where line 1 isn't empty, only line 2 holds it.
+  await file('f.txt', '\uFEFFa\r\nx\uFEFF\r\n');
+  dataOf(await call('edit', { path: 'work/f.txt', oldString: '\uFEFF\r', newString: 'Y' }));
+  assert.equal(await stored('f.txt'), '\uFEFFa\r\nxY\r\n');
+});
+
+test("a replaceAll of a CR or a BOM alone replaces those in the text, keeping CRLF line ends and the file's BOM", async (t) => {
+  const { call, stored, file } = setup(t);
+  await file('c.txt', 'a\rb\r\nc\r\n');
+  dataOf(await call('edit', { path: 'work/c.txt', oldString: '\r', newString: '|', replaceAll: true }));
+  assert.equal(await stored('c.txt'), 'a|b\r\nc\r\n');
+  await file('b.txt', '\uFEFFa\uFEFFb\n');
+  dataOf(await call('edit', { path: 'work/b.txt', oldString: '\uFEFF', newString: '-', replaceAll: true }));
+  assert.equal(await stored('b.txt'), '\uFEFFa-b\n');
 });
 
 test("an oldString found in two readings other than as given is refused, and one found in three names all three", async (t) => {
@@ -1024,7 +1059,7 @@ test("a call counts occurrences its edits don't need, across its files, only as 
   await file('b.txt', 'a'.repeat(1_000));
   const error = errorOf(await call('edit_many', { edits: [{ path: 'work/a.txt', oldString: 'a', newString: 'b' }, { path: 'work/b.txt', oldString: 'a', newString: 'c' }] }));
   assert.match(error, /edit 1: oldString occurs 1000 times in work\/a\.txt \(the first 20 on line 1\), not 1\. Include more of the text around it to single out the one you mean, or set occurrences to 1000 if every one should change\.\n/);
-  assert.match(error, /edit 2: oldString occurs at least 43 times in work\/b\.txt \(the first 20 on line 1\), not 1\. Include more of the text around it to single out the one you mean\.\nThis call counted as many occurrences as one call may, so 43 is a floor: sent in a call of its own, the edit has every one counted\.\n/);
+  assert.match(error, /edit 2: oldString occurs at least 43 times in work\/b\.txt \(the first 20 on line 1\), not 1\. Include more of the text around it to single out the one you mean\.\nThis call counted as many occurrences as one call may, so 43 is a floor: sent in a call of its own, the edit has every one counted, unless they overlap\.\n/);
   // Sent alone, it has every one counted.
   assert.match(errorOf(await call('edit_many', { edits: [{ path: 'work/b.txt', oldString: 'a', newString: 'c' }] })), /edit 1: oldString occurs 1000 times in work\/b\.txt/);
 });
@@ -1067,6 +1102,7 @@ test("edits of an oldString read more than one way, each found many times, each 
   const error = errorOf(await call('edit_many', { edits: Array.from({ length: 200 }, (_, k) => ({ path: 'work/m.txt', oldString: 'x\r', newString: `${k}` })) }));
   const used = process.cpuUsage(before);
   assert.match(error, /^The edit_many call stored none of its edits: 200 problems\./);
+  assert.match(error, /\n\nedit 1: oldString ends in a CR, and occurs in work\/m\.txt read more than one way, so which you mean can't be told\./);
   assert.ok((used.user + used.system) / 1000 < 4_000, `${(used.user + used.system) / 1000} ms of CPU`);
 });
 
@@ -1079,7 +1115,14 @@ test("a crowded edit whose count stopped short of its ask, which no crowded prob
     { path: 'work/ab.txt', oldString: 'ab', newString: 'z', occurrences: 900 },
   ] }));
   assert.match(error, /^The edit_many call stored none of its edits: 3 problems\./);
-  assert.match(error, /\nedit 3: oldString occurs at least 561 times in work\/ab\.txt \(the first 20 on line 1\)\. Whether it occurs the 900 times it asks for can't be told from this call\.\nThis call counted as many occurrences as one call may, so 561 is a floor: sent in a call of its own, the edit has every one counted\.\n/);
+  assert.match(error, /\nedit 3: oldString occurs at least 561 times in work\/ab\.txt \(the first 20 on line 1\)\. Whether it occurs the 900 times it asks for can't be told from this call\.\nThis call counted as many occurrences as one call may, so 561 is a floor: sent in a call of its own, the edit has every one counted, unless they overlap\.\n/);
+  // Stopped at just what it asks for, it's a floor all the same.
+  const atAsk = errorOf(await call('edit_many', { edits: [
+    { path: 'work/ab.txt', oldString: 'a', newString: 'x', occurrences: 1_500 },
+    { path: 'work/ab.txt', oldString: 'b', newString: 'y', occurrences: 1_500 },
+    { path: 'work/ab.txt', oldString: 'ab', newString: 'z', occurrences: 561 },
+  ] }));
+  assert.match(atAsk, /\nedit 3: oldString occurs at least 561 times in work\/ab\.txt \(the first 20 on line 1\)\. Whether it occurs the 561 times it asks for can't be told from this call\.\n/);
 });
 
 test('every path is checked before any entry is set: a check that fails at the second file stores neither', async (t) => {

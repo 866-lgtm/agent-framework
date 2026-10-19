@@ -3290,7 +3290,11 @@ export class WorkspaceModule implements Module {
         // Nothing below awaits until the commit's push.
         const maxSize = mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
         const hints = hintBudget();
-        const counts = countBudget(maxSize);
+        // As much as the largest file the call names holds, at least, so the
+        // budget is the same whatever order its files are planned in.
+        let largest = maxSize;
+        for (const target of targets.values()) largest = Math.max(largest, store.treeGet(mount.treeStateId, target.relativePath)?.size ?? 0);
+        const counts = countBudget(largest);
         const notes: string[] = [];
         const pushes = this.pushesOnCommit(mount);
         const plans: Array<{ target: EditTarget; plan: FilePlan; mode: number; backOnDisk: string | null; conflictNote: string | null }> = [];

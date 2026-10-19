@@ -140,13 +140,14 @@ interface Found {
 /**
  * What one call may count of occurrences no answer needs, all of its edits
  * together: those past what an edit asks for and the one more that shows it
- * finds more, which only make a refusal's count exact. As many as the larger
- * of the call's size limit in bytes and the longest text it plans in code
- * units (planFile raises it to each file's). A file's occurrences of a
- * nonempty text pass neither, since a file within its limit has no more code
- * units than bytes, so an edit's count in a call of its own is exact, even
- * in a file stored before its mount's limit was lowered; past it, a count is
- * a floor. Without it, each of many edits of a text with millions of
+ * finds more, which only make a refusal's count exact. applyEdits sizes it
+ * before it plans, to the larger of the mount's limit and the largest file
+ * the call names, in bytes, which no file's occurrences of a nonempty text
+ * pass, as a file has no more code units than bytes; so it's the same
+ * whatever order the files are planned in, and an edit's count in a call of
+ * its own is exact, even in a file stored before its mount's limit was
+ * lowered. planFile raises it to any text longer than it, for a caller that
+ * sizes it smaller. Past it, a count is a floor. Without it, each of many edits of a text with millions of
  * occurrences counted them all, at a cost of the edits times the
  * occurrences. COUNT_MAX, the default limit's, serves a caller with none.
  */
@@ -414,7 +415,11 @@ function matchedLines(value: string, starts: number[], lines: number[]): string 
 export type MatchProblem =
   /** The old text doesn't occur, even with straight and curly quotes treated as equal. */
   | { kind: 'miss'; edit: number; hint: string; crlf: boolean }
-  /** It occurs a number of times other than the one asked for, or its occurrences overlap one another. */
+  /**
+   * It occurs a number of times other than the one asked for, or its
+   * occurrences overlap one another, or the call's count budget stopped its
+   * count, which is then a floor, even at the number asked for.
+   */
   | {
     kind: 'count';
     edit: number;
@@ -620,8 +625,9 @@ export function planFile(
     // that shows it finds more than it asks for. Past that, a count only makes
     // a refusal exact, and takes from the call's budget (CountBudget). Crowded
     // edits are refused whatever they find (below), so they count freely no
-    // more than a refusal shows.
-    const free = crowded ? SHOWN_MATCHES : spec.expected === 'all' ? Infinity : Math.max(spec.expected, SHOWN_MATCHES) + 1;
+    // more than a refusal shows, but for one that replaces every occurrence,
+    // which asks for as many as there are, and so counts them all.
+    const free = spec.expected === 'all' ? Infinity : crowded ? SHOWN_MATCHES : Math.max(spec.expected, SHOWN_MATCHES) + 1;
     const budget = counts;
     let matched = spec;
     let { starts, count, overlapping, atLeast, spent } = scan(value, spec.oldText, keep, undefined, free, budget);
@@ -630,17 +636,21 @@ export function planFile(
     // more ways than as given: without either, or both, as a character page
     // or a line shown with its CRLF end's CR gives it (readingsOf). A line
     // whose own text ends in one CR, shown with its end's, reads as given as a
-    // line ending in two. Where more than one reading finds it, which the edit
-    // means can't be told, so it's refused; where one does, it's taken, before
-    // quotes are read as equal. Beside a match as given, a reading need only
-    // be found, and shown as a refusal shows it. A reading that leaves
-    // nothing, of an old text that is the BOM or a CR alone, is found where
-    // what it leaves out is the file's, the BOM at the text's start and a CR
-    // before each CRLF line end; it counts only beside a match as given, as
-    // an empty text can't be replaced.
+    // line ending in two. Where more than one reading that changes something
+    // finds it, which the edit means can't be told, so it's refused; where one
+    // does, it's taken, before quotes are read as equal. One that changes
+    // nothing, its new text read the same way as its old, can't be what the
+    // edit means beside another, and alone has nothing to change. Beside a
+    // match as given, a reading need only be found, and shown as a refusal
+    // shows it. A reading that leaves nothing, of an old text that is the BOM
+    // or a CR alone, is found where what it leaves out is the file's, the BOM
+    // at the text's start and a CR before each CRLF line end; it counts only
+    // beside another match, as an empty text can't be replaced, and not for
+    // an edit that replaces every occurrence: edits keep line ends and the
+    // BOM, so that can only mean the CRs or BOMs in the text.
     const emptyAt = (leaves: Leaves): number[] => (leaves === 'cr' ? crs : file.bom && (leaves === 'bom' || crAt(0)) ? [0] : []);
-    const reads = readingsOf(spec, file, crAt)
-      .filter((read) => read.spec.oldText || count > 0)
+    const allReads = readingsOf(spec, file, crAt)
+      .filter((read) => read.spec.oldText || spec.expected !== 'all')
       .map((read) => {
         if (read.spec.oldText) {
           return { read, found: count > 0 ? scan(value, read.spec.oldText, SHOWN_MATCHES, read.accept, SHOWN_MATCHES) : scan(value, read.spec.oldText, keep, read.accept, free, budget) };
@@ -649,6 +659,9 @@ export function planFile(
         return { read, found: { starts: at.slice(0, SHOWN_MATCHES), count: at.length, overlapping: false, atLeast: false, spent: false } };
       })
       .filter(({ found }) => found.count > 0);
+    const changing = allReads.filter(({ read }) => read.spec.oldText !== read.spec.newText);
+    const others = (count > 0 ? 1 : 0) + changing.filter(({ read }) => read.spec.oldText).length;
+    const reads = changing.filter(({ read }) => read.spec.oldText || others > 0);
     if (reads.length + (count > 0 ? 1 : 0) > 1) {
       const where = (found: Found) => ({ found: found.count, atLeast: found.atLeast, lines: lineNumbersAt(value, found.starts.slice(0, SHOWN_MATCHES)) });
       problems.push({
@@ -664,15 +677,14 @@ export function planFile(
       continue;
     }
     if (count === 0 && reads.length === 1) {
-      const { read, found } = reads[0]!;
-      // Read as the file's own, the BOM or CR was all the edit changed.
-      if (read.spec.oldText === read.spec.newText) {
-        problems.push({ kind: 'same', edit: spec.index });
-        continue;
-      }
-      ({ starts, count, overlapping, atLeast, spent } = found);
+      const { read, found: where } = reads[0]!;
+      ({ starts, count, overlapping, atLeast, spent } = where);
       matched = read.spec;
       readForms.push(spec.index);
+    } else if (count === 0 && !reads.length && allReads.some(({ read }) => read.spec.oldText && read.spec.oldText === read.spec.newText)) {
+      // Read as the file's own, the BOM or CR was all the edit changed.
+      problems.push({ kind: 'same', edit: spec.index });
+      continue;
     }
     if (count === 0) {
       ({ starts, count, overlapping, atLeast, spent } = scan((quoted ??= normalizeQuotes(value)), normalizeQuotes(spec.oldText), keep, undefined, free, budget));

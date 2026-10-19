@@ -253,7 +253,11 @@ export interface ToolCall {
    * agent's inline cap, past which the framework spills the result to a
    * workspace file and sends a preview. For a call from a running
    * code_execution script it is the script's limit, past which a success's
-   * result is cut; an error reaches the script whole, after "Error: ". A tool
+   * result is cut; an error reaches the script whole, after "Error: ". A
+   * result that carries `structured` reaches a script instead as one JSON
+   * object of its content, structured content and error, measured whole; one
+   * past the limit is saved to a workspace file in its place, or, where it
+   * can't be, isn't delivered. A tool
    * that pages or budgets its answer can stay under it. The framework sets it
    * on a model's, a script's and the operator's puppet's call to a module, a
    * utility run through `utils` included. A call made in process with
