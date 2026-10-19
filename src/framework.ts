@@ -22790,9 +22790,9 @@ export class AgentFramework {
     // transport, if one comes, runs that one's. A runtime connect or restart
     // whose policy registration throws has its new connection closed for
     // good by the exchange (closeOnFailure), through the registry, before its
-    // marker lifts, as on main: left live, it would be half registered. A
-    // staged startup connect's failure goes to initializeMcpl's loop, which
-    // logs it and goes on with the other servers.
+    // marker lifts: left live, it would be half registered. A staged startup
+    // connect's failure goes to initializeMcpl's loop, which logs it and goes
+    // on with the other servers.
     await this.settlePolicyExchange(config, connection, staged ? {} : { closeOnFailure: true, epoch: registeredEpoch });
     if (staged) {
       // Announced while the transport it registered still serves, checked

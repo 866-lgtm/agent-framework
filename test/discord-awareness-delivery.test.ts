@@ -373,8 +373,7 @@ test('marks queued while a configured route is down go out when it reconnects, w
 
 test('an inbound event is handled in the turn it arrives: delivery holds no MCPL traffic', () => {
   // The push coalescer orders a push against its retraction by arrival, so
-  // an inbound handler must not yield before it hands the event on. Ported
-  // from main's 0fb707e, without the barrier field this branch removed.
+  // an inbound handler must not yield before it hands the event on.
   const framework = Object.create(AgentFramework.prototype) as any;
   const handled: string[] = [];
   framework.pushHandler = { handlePushEvent: async () => { handled.push('push-event'); } };

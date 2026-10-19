@@ -1,11 +1,10 @@
 /**
  * A runtime connect or restart whose §5.3 policy registration throws closes
- * its new connection for good, through the registry, as main does since
- * #459: left live, it would be half registered. A close that then fails
- * keeps the entry, so a later disconnect, restart or shutdown can close it
- * again, and a connection closed for good readies nothing, so what it held
- * stays held through any later open of every plane. Main's tests of this sit
- * with the awareness gate, which this branch removes.
+ * its new connection for good, through the registry, while its exchange's
+ * marker still holds its planes: left live, it would be half registered. A
+ * close that then fails keeps the entry, so a later disconnect, restart or
+ * shutdown can close it again, and a connection closed for good readies
+ * nothing, so what it held stays held through any later open of every plane.
  */
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
