@@ -2096,12 +2096,11 @@ export class McplServerConnection extends EventEmitter {
       // server's text, so the message is redacted there, whatever JSON value
       // it is, as every other line this connection writes is.
       const said = typeof response.error.message === 'string' ? boundedForLog(response.error.message.trim()) : '';
-      // The call is settled before its log line, since that line redacts with
-      // this connection's configuration, and a stdio server's env is a getter
-      // that throws when the reaction baseline's ledger can't be read. Its
-      // entry is gone and its timer cleared, so nothing else would settle it.
-      // A throw there prints none of the server's text, and the dispatch's
-      // containment reports it.
+      // The call is settled before its log line: its entry is gone and its
+      // timer cleared, so nothing else would settle it, and a host's logger
+      // can throw. The dispatch's containment reports such a throw. (A
+      // configuration that can't be read withholds the message rather than
+      // throw: redactServerText.)
       pending.reject(new McplRequestError(
         said
           ? `The "${this.id}" server answered with an error: ${said}`
