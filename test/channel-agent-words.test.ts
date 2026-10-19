@@ -556,12 +556,12 @@ test('channel_decline says the decline is recorded, and what became of its ackno
   server.sendChannelsClose = async () => ({});
   await f.call('channel_open', { channelId: 'x' });
   assert.equal((await f.call('channel_decline', { channelId: 'x', messageId: 'm3' })).error,
-    'Channel "x" is open, or set to open, so there\'s nothing to decline. channel_close closes it.');
+    'Channel "x" is open, or set to open, so there\'s nothing to decline. If you need it closed, call channel_close.');
   // A server that isn't up has an empty grant until its next exchange, and
   // channel_close closes the channel once it's back, so it's still named.
   f.servers.set('a', down(true));
   assert.equal((await f.call('channel_decline', { channelId: 'x', messageId: 'm4' })).error,
-    'Channel "x" is open, or set to open, so there\'s nothing to decline. channel_close closes it.');
+    'Channel "x" is open, or set to open, so there\'s nothing to decline. If you need it closed, call channel_close.');
 });
 
 test('a decline whose close a later open overtook says that decision stands', async () => {
@@ -699,15 +699,28 @@ test('a decline whose channel stops being registered while its close is out offe
   const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
   const notSent = 'The "a" server isn\'t connected, so the request wasn\'t sent.';
   const later = 'when the "a" server next registers this channel, if this host may open and close its channels then';
-  // The server de-lists it, or this host removes the server; either way the
-  // server answered the close first, so the text doesn't say it didn't complete.
-  const cases: Array<[string, (f: Awaited<ReturnType<typeof fixture>>) => Promise<void>, string]> = [
+  // The server de-lists it, or this host removes the server, and then its
+  // registration may come back; either way the server answered the close
+  // first, so the text doesn't say it didn't complete.
+  // Another decline, and so the acknowledgment's retry, is offered only where
+  // the channel is registered again.
+  const retry = ' To try again, call channel_decline again with the same arguments.';
+  const cases: Array<[string, (f: Awaited<ReturnType<typeof fixture>>) => Promise<void>, string, string]> = [
     ['the server de-lists it', async (f) => { await f.registry.handleChanged('a', { removed: ['y'] }); },
-      'the "a" server no longer lists the channel'],
+      'it isn\'t registered here any more: the "a" server no longer lists the channel', ''],
     ['this host removes the server', async (f) => { f.registry.removeServer('a'); },
-      'this host disconnected the "a" server while the change was being made'],
+      'it isn\'t registered here any more: this host disconnected the "a" server while the change was being made', ''],
+    ['this host removes the server, and it registers the channel again', async (f) => {
+      f.registry.removeServer('a');
+      // The registration's own reconcile waits behind the decline's close, so
+      // it's left running and awaited once that close is answered.
+      registering = f.registry.handleRegister('a', { channels: [descriptor('y')] });
+      for (let i = 0; i < 5; i++) await tick();
+      assert.equal(f.registry.getChannelServerId('y'), 'a', 'y is registered again while the close is out');
+    }, 'its registration went and came back while the close was out', retry],
   ];
-  for (const [what, go, why] of cases) {
+  let registering: Promise<unknown> | undefined;
+  for (const [what, go, why, ackRetry] of cases) {
     const f = await fixture({ a: ['x'] });
     const server = f.servers.get('a')!;
     // A close that didn't complete, the registration's own here, leaves y's
@@ -725,9 +738,16 @@ test('a decline whose channel stops being registered while its close is out offe
     answers.shift()!();
     const declined = await declining;
     assert.equal(declined.success, true, what);
-    assert.equal(declined.data?.acknowledgmentError, `The decline is recorded, but the acknowledgment wasn't posted: ${notSent}`, what);
-    assert.equal(declined.data?.closeError,
-      `The decline is recorded, and this host closes the channel ${later}; it isn't registered here any more: ${why}.`, what);
+    assert.equal(declined.data?.acknowledgmentError, `The decline is recorded, but the acknowledgment wasn't posted: ${notSent}${ackRetry}`, what);
+    assert.equal(declined.data?.closeError, `The decline is recorded, and this host closes the channel ${later}; ${why}.`, what);
+    // The registration that came back reconciles the decline's close; it's
+    // answered here so nothing is left waiting.
+    // Read through a function: the assertion above narrows the length.
+    const held = () => answers.length;
+    for (let i = 0; i < 50 && registering !== undefined && held() === 0; i++) await tick();
+    while (held() > 0) answers.shift()!();
+    await registering;
+    registering = undefined;
   }
 });
 

@@ -658,6 +658,13 @@ function unrecordedDecision(err: unknown): ChannelLifecycleError {
   return new ChannelLifecycleError(`this host couldn't record the decision: ${requestErrorText(err)}`, 'unrecorded');
 }
 
+/** A failure's clause, then more said of the same failure. A server's own
+ *  words keep their final stop (requestErrorText), so after them the rest
+ *  is a sentence of its own. */
+function afterClause(clause: string, more: string): string {
+  return /[.!?]$/.test(clause) ? `${clause} ${more.charAt(0).toUpperCase()}${more.slice(1)}` : `${clause}; ${more}`;
+}
+
 /** A lifecycle failure as a clause: its own words, or its request's. */
 function lifecycleClause(err: unknown): string {
   return err instanceof ChannelLifecycleError ? err.message : requestErrorText(err);
@@ -3452,9 +3459,17 @@ export class ChannelRegistry {
       return { result: applied.result!, opened };
     } catch (err) {
       if (wrote && this.desiredStates.get(key) !== wrote) {
-        // That decision stands, so no step is offered: another try would
-        // meet it.
-        throw new ChannelLifecycleError(lifecycleClause(err), 'overtaken', undefined, { cause: err });
+        // That decision stands, and the failure says so where its own clause
+        // doesn't, as a superseded open's does. What helps turns on that
+        // decision, so no step is offered.
+        const own = lifecycleClause(err);
+        throw new ChannelLifecycleError(
+          err instanceof ChannelLifecycleError && err.kind === 'superseded'
+            ? own : afterClause(own, 'a decision about the channel made while the open was out stands'),
+          'overtaken',
+          undefined,
+          { cause: err },
+        );
       }
       if (wrote) {
         try {
@@ -3463,8 +3478,8 @@ export class ChannelRegistry {
           // The caller reports both: the channel isn't open, but it stays
           // selected for opening, so reconciliation may open it later.
           throw new ChannelLifecycleError(
-            `${lifecycleClause(err)}${refusalRemedy(err)}; the channel stays selected for opening, ` +
-              `as this host couldn't record undoing that: ${requestErrorText(putBackErr)}`,
+            afterClause(lifecycleClause(err), 'the channel stays selected for opening, as this host couldn\'t record ' +
+              `undoing that: ${requestErrorText(putBackErr)}`),
             'put-back-unrecorded',
             undefined,
             { cause: err },
@@ -3509,8 +3524,8 @@ export class ChannelRegistry {
         }
         if (selectedAgain) {
           throw new ChannelLifecycleError(
-            `${lifecycleClause(err)}${refusalRemedy(err)}; the channel is selected for opening again, as ` +
-              (selectedAgain === 'server-bootstrap' ? 'its server announces it open' : 'the subscription policy admits it'),
+            afterClause(lifecycleClause(err), 'the channel is selected for opening again, as ' +
+              (selectedAgain === 'server-bootstrap' ? 'its server announces it open' : 'the subscription policy admits it')),
             'selected-again',
             undefined,
             { by: selectedAgain, cause: err },
@@ -4043,16 +4058,17 @@ export class ChannelRegistry {
       return { success: false, error: resolved.error, isError: true };
     }
     if (entry.open || this.getDesiredState(entry.serverId, input.channelId) === 'open') {
-      // channel_close closes it where this host directs the server's
-      // lifecycle, or will once the server is back. A server that's up
-      // without that grant keeps its channels as it chooses, so the text
-      // says so, and whom to ask.
+      // channel_close is the call that closes it: its own answer says when,
+      // as for a server that isn't up. A server that's up without that grant
+      // keeps its channels as it chooses, so the text says so, and whom to
+      // ask.
       const refusal = this.serverReach(entry.serverId) === 'up' && !this.directsLifecycle(entry.serverId)
         ? this.lifecycleRefusal(entry.serverId) : undefined;
       return {
         success: false,
         error: `Channel "${input.channelId}" is open, or set to open, so there's nothing to decline` +
-          (refusal ? `, and ${refusal.message}; if you need it closed, ask whoever runs this host.` : '. channel_close closes it.'),
+          (refusal ? `, and ${refusal.message}; if you need it closed, ask whoever runs this host.`
+            : '. If you need it closed, call channel_close.'),
         isError: true,
       };
     }
@@ -4145,13 +4161,15 @@ export class ChannelRegistry {
       } catch (error) {
         // Reconciling closes it when the server next registers the channel,
         // if this host directs their lifecycle then (§14.1). A registration
-        // that went while the close was out says so: the server may have
-        // closed it first.
-        const gone = error instanceof ChannelLifecycleError && (error.kind === 'cancelled' || error.kind === 'unlisted');
+        // that went while the close was out says so, since the server may
+        // have closed it first, and one that came back since says that.
+        const went = error instanceof ChannelLifecycleError && (error.kind === 'cancelled' || error.kind === 'unlisted');
         closeError = withStop(
           `The decline is recorded, and this host closes the channel ${laterClause(entry.serverId)}; ` +
-          (gone ? `it isn't registered here any more: ${(error as ChannelLifecycleError).message}`
-            : `closing it now didn't complete: ${lifecycleClause(error)}`),
+          (!went ? `closing it now didn't complete: ${lifecycleClause(error)}`
+            : this.channels.has(`${entry.serverId}:${input.channelId}`)
+              ? 'its registration went and came back while the close was out'
+              : `it isn't registered here any more: ${(error as ChannelLifecycleError).message}`),
         );
       }
     }

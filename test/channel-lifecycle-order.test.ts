@@ -8,6 +8,7 @@ import { MockMembrane } from './helpers/mock-membrane.js';
 import assert from 'node:assert/strict';
 import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
+import { McplRequestError } from '../src/mcpl/server-connection.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 import type { ChannelDescriptor, ChannelIncomingMessage, ChannelsOpenResult } from '../src/mcpl/types.js';
@@ -36,7 +37,7 @@ function message(channelId = 'x', messageId = 'm1'): ChannelIncomingMessage {
 function fixture(onNotice?: NoticeHandler, store?: JsStore, coalesce?: RegistryOptions['handleCoalescedIncoming']) {
   const actual = new Map<string, boolean>();
   const calls: Array<{ kind: 'open' | 'close'; id: string; address?: unknown }> = [];
-  const pending: Array<{ finish: () => void; fail: () => void }> = [];
+  const pending: Array<{ finish: () => void; fail: (err?: Error) => void }> = [];
   const held = new Set<string>();
   const publishedWhileOpen: boolean[] = [];
   const notices: Array<{ source: string; channels: Array<{ channelId: string; label?: string }> }> = [];
@@ -58,7 +59,7 @@ function fixture(onNotice?: NoticeHandler, store?: JsStore, coalesce?: RegistryO
           ? { channel: { ...descriptor(target), ...(declared ? { direction: declared } : {}) } }
           : { closed: true });
       };
-      if (held.has(id)) pending.push({ finish, fail: () => reject(new Error('fixture lifecycle failure')) });
+      if (held.has(id)) pending.push({ finish, fail: (err?: Error) => reject(err ?? new Error('fixture lifecycle failure')) });
       else finish();
     });
   };
@@ -1641,13 +1642,13 @@ function failAppend(registry: ChannelRegistry, skip = 0) {
 }
 
 /** Starts speech into `x` while the server holds its open, and fails that open. */
-async function speechWhoseOpenFails(f: ReturnType<typeof fixture>, others: () => Promise<unknown>[] = () => []) {
+async function speechWhoseOpenFails(f: ReturnType<typeof fixture>, others: () => Promise<unknown>[] = () => [], failure?: Error) {
   f.held.add('x');
   const speech = f.registry.publish('agent', 'words', { serverId: 'test', channelId: 'x' });
   await tick();
   const meanwhile = others();
   await tick();
-  f.pending.shift()!.fail();
+  f.pending.shift()!.fail(failure);
   f.held.delete('x');
   await f.drain(speech, ...meanwhile);
   return { outcome: await speech, meanwhile };
@@ -1701,7 +1702,28 @@ test("the agent's close made while speech's open is out stands when that open fa
   await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
   const { outcome } = await speechWhoseOpenFails(f, () => [f.tool('close')]);
   assert.equal(outcome.status, 'failed');
-  assert.equal(outcome.reason, "opening the channel for these words didn't complete: fixture lifecycle failure", "the open's own failure, carried as overtaken");
+  assert.equal(outcome.reason, "opening the channel for these words didn't complete: fixture lifecycle failure; a decision about the " +
+    'channel made while the open was out stands', "the open's own failure, carried as overtaken, and the decision that stands");
+  assert.deepEqual(decision(f.registry), { state: 'closed', source: 'agent-tool' });
+});
+
+test("speech whose open was answered after the agent closed the channel meanwhile names that close once", async () => {
+  // The open's own failure is the later close, so its clause names it, and
+  // the overtaken failure adds nothing to it.
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+  f.held.add('x');
+  const speech = f.registry.publish('agent', 'words', { serverId: 'test', channelId: 'x' });
+  await tick();
+  assert.equal(f.pending.length, 1, "speech's open is out");
+  const closing = f.tool('close');
+  await tick();
+  f.held.delete('x');
+  f.pending.shift()!.finish();
+  await f.drain(speech, closing);
+  const outcome = await speech;
+  assert.equal(outcome.status, 'failed');
+  assert.equal(outcome.reason, "opening the channel for these words didn't complete: a later decision to close it came first");
   assert.deepEqual(decision(f.registry), { state: 'closed', source: 'agent-tool' });
 });
 
@@ -1759,8 +1781,9 @@ test("a reply's failed open after the agent's channel_open during its round-trip
   await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
   const { answer, meanwhile } = await replyWhoseOpenFails(f, () => [f.tool('open')]);
   assert.deepEqual(answer, { status: 'open-failed', channelId: 'x', label: 'x', opening: false }, "the agent's own open answers for itself");
-  assert.deepEqual(f.traces.filter((t) => t.type === 'mcpl:channel-open-failed').map((t) => t.error), ['fixture lifecycle failure'],
-    "the open's own failure, carried as overtaken");
+  assert.deepEqual(f.traces.filter((t) => t.type === 'mcpl:channel-open-failed').map((t) => t.error),
+    ['fixture lifecycle failure; a decision about the channel made while the open was out stands'],
+    "the open's own failure, carried as overtaken, and the decision that stands");
   assert.equal(((await meanwhile[0]) as { success: boolean }).success, true, "the agent's open goes through");
   assert.deepEqual(decision(f.registry), { state: 'open', source: 'agent-tool' });
   assert.equal(f.isOpen(), true);
@@ -1832,6 +1855,13 @@ test("when an open by speech or a reply fails while the server announces the cha
       assert.equal(outcome.status, 'failed');
       assert.equal(outcome.reason,
         "opening the channel for these words didn't complete: fixture lifecycle failure; the channel is selected for opening again, as its server announces it open");
+      // A server's own words keep their stop, so what follows is a sentence.
+      const g = fixture();
+      await g.registry.handleChanged('test', { added: [descriptor('x', false)] });
+      const answered = await speechWhoseOpenFails(g, () => [g.registry.handleChanged('test', { added: [descriptor('x', true)] })],
+        new McplRequestError('Opening x is not allowed here.', 'error-response'));
+      assert.equal(answered.outcome.reason, "opening the channel for these words didn't complete: Opening x is not allowed here. " +
+        'The channel is selected for opening again, as its server announces it open');
     } else {
       const { answer } = await replyWhoseOpenFails(f, reannounce);
       assert.deepEqual(answer, { status: 'open-failed', channelId: 'x', label: 'x', opening: true, selectedForOpening: 'server-bootstrap' });
@@ -1851,6 +1881,8 @@ test("when a reply's open fails after the subscription policy came to admit the 
   await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
   const { answer } = await replyWhoseOpenFails(f, () => { f.registry.setSubscriptionPolicy('test', 'auto'); return []; });
   assert.deepEqual(answer, { status: 'open-failed', channelId: 'x', label: 'x', opening: true, selectedForOpening: 'subscription-policy' });
+  assert.deepEqual(f.traces.filter((t) => t.type === 'mcpl:channel-open-failed').map((t) => t.error),
+    ['fixture lifecycle failure; the channel is selected for opening again, as the subscription policy admits it']);
   await tick(); await tick();
   assert.deepEqual(decision(f.registry), { state: 'open', source: 'subscription-policy' });
   assert.equal(f.isOpen(), true);
