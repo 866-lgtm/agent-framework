@@ -1682,13 +1682,13 @@ export class ChannelRegistry {
     // (heartbeats). Without this, a fork
     // was advertised the global locus but published somewhere else; and a trunk
     // agent was told the wrong channel under concurrency.
-    const home = agentName ? this.homeChannelResolver?.(agentName) : undefined;
-    const active = agentName ? this.activeChannelResolver?.(agentName) : undefined;
+    // Each lookup is keyed on whether a name was given, not its truthiness:
+    // '' is a name an ephemeral run can have, and resolveLocus reads it too.
+    const home = agentName !== undefined ? this.homeChannelResolver?.(agentName) : undefined;
+    const active = agentName !== undefined ? this.activeChannelResolver?.(agentName) : undefined;
     // An ephemeral run takes no global fallback (takesGlobalFallback): neither
     // the latest inbound message's channel as its outgoing one, nor that
     // message as the one it is replying to.
-    // Keyed on whether a name was given, not its truthiness: '' is a name an
-    // ephemeral run can have.
     const fallback = agentName !== undefined ? this.globalFallbackFor(agentName) : this.defaultPublishChannel;
     const outgoing = home ?? active ?? fallback;
 

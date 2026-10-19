@@ -172,6 +172,20 @@ describe('an ephemeral run takes no global fallback (#551)', () => {
     } finally { await f.close(); }
   });
 
+  it('a subagent named \'\' that opened a channel is told that channel, where its speech goes', async () => {
+    const f = await fixture();
+    try {
+      await busyFallback(f);
+      await f.framework.createEphemeralAgent({ name: '', model: 'test', systemPrompt: 'Do the task.', proseRouting: 'locus' });
+      // The run's turn opened side: its routing state names it, as
+      // channel_open's result leaves it.
+      (f.framework as unknown as { turnRouting: Map<string, { locus?: string }> }).turnRouting.set('', { locus: SIDE });
+
+      assert.equal(registry(f).resolveLocus(''), SIDE, 'control: its speech goes to side');
+      assert.equal(registry(f).buildChannelContext('')?.defaultOutgoing?.channelId, SIDE, 'and its channel context says so');
+    } finally { await f.close(); }
+  });
+
   it('a subagent\'s refusal is marked on no one\'s message; a resident\'s still is', async () => {
     const calls: Array<Record<string, unknown>> = [];
     const f = await fixture({ toolsCall: (params) => { calls.push(params); return { content: [] }; } });
