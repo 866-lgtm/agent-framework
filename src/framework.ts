@@ -3348,6 +3348,11 @@ export class AgentFramework {
             .filter((m) => (m.forAgent ?? framework.primaryAgentName) === framework.primaryAgentName)
             .sort(bySeq)
             .map((m) => ({ participant: m.participant, content: m.content, metadata: m.metadata as Record<string, unknown> | undefined })),
+          residentMessageChars: () => {
+            const primary = framework.primaryAgentName
+              ? framework.agents.get(framework.primaryAgentName) : undefined;
+            return primary ? framework.strategyDerivedToolResultChars(primary) : undefined;
+          },
           currentSequence: () => framework.store.currentSequence(),
           setSubconsciousAnchor: (sequence) =>
             framework.subconsciousStrategy?.setAnchor(sequence),

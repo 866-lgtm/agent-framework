@@ -334,7 +334,7 @@ describe("a message a tune-out holds stays out of what the residents are shown, 
       await waitFor("the subconscious's report notice", () => noticeOf() !== undefined);
       assert.ok(!noticeOf()!.includes('Still held'), 'the notice carries no held message, as the dump shows them all');
       assert.deepEqual(reportOf(internals)!.held, [], 'and no held row follows it');
-      assert.ok(noticeOf()!.includes('1 of 4 diverted messages were above the cap and not delivered raw to the resident'), 'it gives the count above the cap');
+      assert.ok(noticeOf()!.includes("1 of 4 diverted messages, the oldest, weren't delivered raw to the resident"), 'it gives the count the dump left out');
 
       // The boundary then stores the held messages without injecting them, so
       // the dump is the one row that shows them to the resident.

@@ -37,6 +37,17 @@ const WAKE_COALESCE_MS = 2_000;
 /** How long after an end time whose cancel threw the cancel is tried again. */
 const EXPIRY_RETRY_MS = 60_000;
 
+/** Ends a backlog line cut to fit in one of the resident's messages. */
+const CUT_MARK = ' [cut to fit; fetch_history has it whole]';
+
+/** The first `length` code units of `text`, one fewer where the last would be
+ *  the first half of a surrogate pair. */
+function prefixOf(text: string, length: number): string {
+  const cut = text.slice(0, Math.max(0, length));
+  const last = cut.charCodeAt(cut.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
+}
+
 /** What a thrown value says, without throwing: an Error's message, or the
  *  value as text, which String() can't give for an object with no prototype. */
 function thrownReason(error: unknown): string {
@@ -69,6 +80,13 @@ export interface TuneOutFrameworkHooks {
    * message held mid-turn is in the backlog it belongs to (#232 gap 7).
    */
   getDeferredMessages?: () => Array<Pick<StoredMessage, 'participant' | 'content' | 'metadata'>>;
+  /**
+   * The most characters of text the primary resident is shown whole in one
+   * message: its strategy's per-message cap (`maxMessageTokens`) at four
+   * characters a token, or undefined when its strategy has no such cap. A
+   * cancel's dump is one message, so it holds as many backlog lines as fit.
+   */
+  residentMessageChars?: () => number | undefined;
   /** Current chronicle head sequence (window anchor for new epochs). */
   currentSequence: () => number;
   /** Move the subconscious window anchor (never forward past active epochs). */
@@ -323,39 +341,77 @@ export class TuneOutCoordinator {
       ...held,
     ];
     const cap = ended.params.backlogCap;
-    const shown = cap > 0 ? backlog.slice(-cap) : [];
-    const truncated = backlog.length - shown.length;
-    // The held messages the cap leaves out of the dump, the oldest of them.
-    // The subconscious's report covers what the dump leaves out, but its view
-    // holds stored rows only, so these go to it with its notice below. So does
-    // a held message the dump shows whose image or audio its text lines drop.
-    const heldLeftOut = held.slice(0, Math.max(0, held.length - shown.length));
-    const heldForReport = [
-      ...heldLeftOut,
-      ...held.slice(heldLeftOut.length).filter((m) => m.content.some((b) => b.type !== 'text')),
-    ];
-
     const authorOf = (m: Pick<StoredMessage, 'participant' | 'metadata'>): string =>
       (m.metadata as { author?: { name?: string } } | undefined)?.author?.name ?? m.participant;
-    const lines = shown.map((m) => {
+    const lineOf = (m: Pick<StoredMessage, 'participant' | 'content' | 'metadata'>): string => {
       const text = m.content
         .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
         .map((b) => b.text)
         .join('\n');
       return `${authorOf(m)}: ${text}`;
-    });
-    const attrs = [
-      `channel="${channelId}"`,
-      `messages=${backlog.length}`,
-      ...(truncated > 0 ? [`truncated=${truncated} (oldest; fetch_history covers the rest)`] : []),
+    };
+    const lifecycle = `[Tune-out: ${channelId} cancelled — ${reason}, ${ended.wakeCount} wake${ended.wakeCount === 1 ? '' : 's'}]`;
+    const render = (lines: string[], truncated: number): string => {
+      const attrs = [
+        `channel="${channelId}"`,
+        `messages=${backlog.length}`,
+        ...(truncated > 0 ? [`truncated=${truncated} (oldest; fetch_history covers the rest)`] : []),
+      ];
+      return `${lifecycle}\n\n<tuned-out-backlog ${attrs.join(' ')}>\n${lines.join('\n')}\n</tuned-out-backlog>`;
+    };
+
+    // The dump is one message in the resident's window, so the resident's
+    // strategy cuts it as it cuts any message past its per-message cap:
+    // context-manager's strategies count a text block at a token per four
+    // characters, rounded up, and keep a message's first cap × 4 characters.
+    // Cut there, the dump would lose its newest lines, which would still
+    // count as shown. So it holds the newest lines that fit whole, and those
+    // it leaves out, the oldest, count as truncated along with those above
+    // backlogCap, so the report is told of them. A newest message too long to
+    // fit alone is shown cut to the room left and marked, so the resident
+    // still gets its head, as it would from a row of its own.
+    let shown = cap > 0 ? backlog.slice(-cap) : [];
+    let lines = shown.map(lineOf);
+    let newestCut = false;
+    const room = this.hooks.residentMessageChars?.();
+    if (room !== undefined && render(lines, backlog.length - shown.length).length > room) {
+      // The lines' room, measured with the widest count `truncated=` can
+      // take, so the dump rendered with its own count fits too.
+      const left = room - render([], backlog.length).length;
+      let used = 0;
+      let kept = 0;
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const cost = lines[i]!.length + (kept > 0 ? 1 : 0); // and its newline
+        if (used + cost > left) break;
+        used += cost;
+        kept++;
+      }
+      if (kept === 0 && lines.length > 0 && left > CUT_MARK.length) {
+        lines = [prefixOf(lines[lines.length - 1]!, left - CUT_MARK.length) + CUT_MARK];
+        shown = shown.slice(-1);
+        newestCut = true;
+      } else {
+        lines = lines.slice(lines.length - kept);
+        shown = shown.slice(shown.length - kept);
+      }
+    }
+    const truncated = backlog.length - shown.length;
+    // The held messages the dump leaves out, the oldest of them. The
+    // subconscious's report covers what the dump leaves out, but its view
+    // holds stored rows only, so these go to it with its notice below. So does
+    // a held message the dump shows but can't give whole: one whose image or
+    // audio its text lines drop, or the newest, cut to fit.
+    const heldLeftOut = held.slice(0, Math.max(0, held.length - shown.length));
+    const heldForReport = [
+      ...heldLeftOut,
+      ...held.slice(heldLeftOut.length).filter((m) =>
+        m.content.some((b) => b.type !== 'text') || (newestCut && m === shown[0])),
     ];
-    const dump =
-      `<tuned-out-backlog ${attrs.join(' ')}>\n${lines.join('\n')}\n</tuned-out-backlog>`;
 
     // Host-framed system artifacts — never voiced as anyone.
     this.hooks.addMessage(
       'user',
-      [{ type: 'text', text: `[Tune-out: ${channelId} cancelled — ${reason}, ${ended.wakeCount} wake${ended.wakeCount === 1 ? '' : 's'}]\n\n${dump}` }],
+      [{ type: 'text', text: render(lines, truncated) }],
       { system: true, kind: 'tune-out-cancel', channelId, epochId },
     );
     // The subconscious's own words, under its own name, verbatim.
@@ -372,19 +428,18 @@ export class TuneOutCoordinator {
       this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out');
     }
     // The subconscious gets one cancel turn of its own: the issue's cancel
-    // shape is dump + a report from the subconscious, and when the cap
-    // truncated the raw dump, its summary is what covers the tail. The held
-    // messages the dump can't give the resident whole follow the notice,
-    // each a row of its own with its own content, as its view can't have
-    // them until they're stored. A cancel the subconscious makes itself gets
-    // the notice and the turn when some do, since it wrote its note before
-    // it could see them, and when it wrote no note and the cap cut anything,
-    // since nothing else then covers what the dump leaves out. Otherwise its
-    // note speaks for what it saw.
+    // shape is dump + a report from the subconscious, and when the dump left
+    // messages out, its summary is what covers them. The held messages the
+    // dump can't give the resident whole follow the notice, each a row of its
+    // own with its own content, as its view can't have them until they're
+    // stored. A cancel the subconscious makes itself gets the notice and the
+    // turn when some do, since it wrote its note before it could see them,
+    // and when it wrote no note and the dump left any message out, since
+    // nothing else then covers it. Otherwise its note speaks for what it saw.
     const selfCancel = source === 'subconscious';
     if (subName && (!selfCancel || heldForReport.length > 0 || (!subconsciousNote && truncated > 0))) {
       const truncNote = truncated > 0
-        ? ` ${truncated} of ${backlog.length} diverted messages were above the cap and not delivered raw to the resident.`
+        ? ` ${truncated} of ${backlog.length} diverted messages, the oldest, weren't delivered raw to the resident.`
         : '';
       const heldNote = heldForReport.length > 0
         ? ` Still held at the cancel, so your view may not have them yet: the ${heldForReport.length} message${heldForReport.length === 1 ? '' : 's'} after this one.`
