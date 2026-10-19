@@ -321,10 +321,13 @@ export function withinIncludes(view: Pick<MountView, 'include' | 'nested'>, path
 /**
  * The path a mount's include judges for `given`, one of the mount's paths,
  * which landed at `real`, its canonical path, inside the mount and in no
- * nested mount's directory. The include is the operator's statement of which
- * files' content the workspace holds, and a link is a path, not a grant of
- * content, so where a followed path lands is judged as where it's named, as
- * a nested mount's place is (namesNestedPlace). A path that meets no link
+ * nested mount's directory. Where realpath couldn't resolve it, as for a
+ * loop or a directory this process can't search, `real` is the path as
+ * path.resolve reads it, so it's judged as named. The include is the
+ * operator's statement of which files' content the workspace holds, and a
+ * link is a path, not a grant of content, so where a followed path lands is
+ * judged as where it's named, as a nested mount's place is
+ * (namesNestedPlace). A path that meets no link
  * lands where it's named, and is judged as named. realpath can spell such a
  * path otherwise only as a disk that folds names does, with disk's stored
  * names on macOS and Windows where a path keeps a workspace entry's
@@ -334,7 +337,7 @@ export function withinIncludes(view: Pick<MountView, 'include' | 'nested'>, path
  * the spelling a link's target gives, which on a disk that folds names need
  * not be disk's (diskSpelling).
  */
-export async function judgedAt(root: string, rootReal: string, real: string, given: string): Promise<string> {
+export async function judgedAt(rootReal: string, real: string, given: string): Promise<string> {
   const landed = relative(rootReal, real).split(sep).join('/');
   if (landed === given) return given;
   if (foldedLoosely(landed) === foldedLoosely(given) && await sameLevels(rootReal, given, landed)) return given;
@@ -348,15 +351,17 @@ export async function judgedAt(root: string, rootReal: string, real: string, giv
  * named passes through no link of its own that the landing doesn't. Beneath
  * the last level both sides have, where neither has the next, a file a write
  * would create there lands where it's named. A level only one side has, or
- * one this can't ask, is no such path. On a disk that folds names a level
- * both spellings share is one entry, so a link disk puts there after the
- * realpath meets both alike: that's the open's check to catch, as where the
- * spellings match.
+ * one this can't ask, is no such path. It asks disk once: on a disk that
+ * folds names a level both spellings share is one entry, so a link disk
+ * puts there after the realpath meets both alike, and a name removed while
+ * this asks and put back after reads as a file a write would create. Where
+ * a read follows, its check of the opened file catches a link to another
+ * file, but not one back to the opened file itself; that race, like one
+ * where the spellings match, isn't closed here.
  */
 async function sameLevels(rootReal: string, given: string, landed: string): Promise<boolean> {
   const named = given.split('/');
   const landing = landed.split('/');
-  if (named.length !== landing.length) return false;
   const level = (segments: string[], i: number) => lstat(join(rootReal, ...segments.slice(0, i)), { bigint: true })
     .then((st) => st, (err: unknown) => (errno(err) === 'ENOENT' || errno(err) === 'ENOTDIR' ? null : undefined));
   for (let i = 1; i <= named.length; i++) {
@@ -375,8 +380,8 @@ async function sameLevels(rootReal: string, given: string, landed: string): Prom
  * that leaves the mount, in the words each such refusal already has
  * (nestedAtReal's callers). A mount without an include covers every file.
  */
-export async function coversLanding(view: Pick<MountView, 'root' | 'include'>, rootReal: string, real: string, given: string): Promise<boolean> {
-  return view.include === undefined || insideMount(await judgedAt(view.root, rootReal, real, given), view.include);
+export async function coversLanding(view: Pick<MountView, 'include'>, rootReal: string, real: string, given: string): Promise<boolean> {
+  return view.include === undefined || insideMount(await judgedAt(rootReal, real, given), view.include);
 }
 
 /**
@@ -1957,7 +1962,7 @@ export async function walkScope(
     // a file in it is judged where it lies as well as by its path, as
     // coversLanding judges where a path lands (judgedAt, once for the
     // listing).
-    const judgedDir = view.include === undefined ? rel : await judgedAt(view.root, rootReal, dir.real, rel);
+    const judgedDir = view.include === undefined ? rel : await judgedAt(rootReal, dir.real, rel);
     const leaves: Array<[string, boolean]> = [];
     const subdirs: string[] = [];
     const others: Array<[string, string]> = [];

@@ -1034,6 +1034,28 @@ describe('mount include', () => {
     }
   });
 
+  test("on a mount that follows links, a covered path whose landing realpath can't resolve is refused for a read and a write alike, so no copy history took in before the include through it is served and nothing is written through it", async (t) => {
+    const env = new Env(t);
+    env.writeDisk('secret.dat', "needle: not the mount's\n");
+    symlinkSync('secret.dat', join(env.dir, 'c.json'));
+    let m = await env.open({ followSymlinks: true });
+    await call(m, 'sync', {});
+    assert.ok(env.tree().includes('c.json'), `without an include, it's taken in: ${env.tree()}`);
+    await env.stop(m);
+    // Disk turns the link into a loop, so where it lands can't be told.
+    rmSync(join(env.dir, 'c.json'));
+    symlinkSync('loop.json', join(env.dir, 'c.json'));
+    symlinkSync('c.json', join(env.dir, 'loop.json'));
+    m = await env.open({ followSymlinks: true, include: ['*.json'] });
+    const read = await refused(m, 'read', { path: 'work/c.json' });
+    assert.ok(read.includes('Unable to resolve file: work/c.json') && !read.includes('needle'), read);
+    await assert.rejects(m.readFileFromDisk('work/c.json'), (err: unknown) => err instanceof WorkspaceReadError && err.code === 'not_found');
+    const written = await refused(m, 'write', { path: 'work/c.json', content: 'written through a loop\n' });
+    assert.ok(written.includes('Unable to resolve file: work/c.json'), written);
+    assert.ok(lstatSync(join(env.dir, 'c.json')).isSymbolicLink() && lstatSync(join(env.dir, 'loop.json')).isSymbolicLink(), 'both links stay');
+    assert.equal(readFileSync(join(env.dir, 'secret.dat'), 'utf8'), "needle: not the mount's\n");
+  });
+
   test("a path that meets no link is judged where it's named, whatever spelling realpath gives where it lands, and one through a link where it lands, as disk spells it", async (t) => {
     const root = mkdtempSync(join(tmpdir(), 'af-ws-include-landing-'));
     t.after(() => rmSync(root, { recursive: true, force: true }));
@@ -1042,7 +1064,7 @@ describe('mount include', () => {
     mkdirSync(join(root, 'site'));
     writeFileSync(join(root, 'site', 'b.txt'), "not the mount's\n");
     symlinkSync('site', join(root, 'via'));
-    const view = { root, include: ['Docs/**', 'via/**'] };
+    const view = { include: ['Docs/**', 'via/**'] };
     const rootReal = realpathSync(root);
     // On macOS and Windows realpath gives disk's stored names, which can differ from a workspace entry's
     // spelling the parse kept: here it lands spelled otherwise, with no link on the way, which only a disk that
@@ -1055,15 +1077,18 @@ describe('mount include', () => {
     // A landing spelled otherwise than folding makes it, with no link left on the way, as after a link was
     // swapped for a directory between the realpath and the walk, is judged where it lands too.
     assert.equal(await coversLanding(view, rootReal, join(rootReal, 'site', 'b.txt'), 'Docs/a.txt'), false);
+    // So is one where neither spelling is there at any level, which only the folding comparison tells apart:
+    // a file a write would create at `bb/new.txt` isn't one named `aa/new.txt`.
+    assert.equal(await coversLanding({ include: ['aa/**'] }, rootReal, join(rootReal, 'bb', 'new.txt'), 'aa/new.txt'), false);
     // Without an include, every file is covered.
-    assert.equal(await coversLanding({ root }, rootReal, join(rootReal, 'site', 'b.txt'), 'via/b.txt'), true);
+    assert.equal(await coversLanding({}, rootReal, join(rootReal, 'site', 'b.txt'), 'via/b.txt'), true);
     // Spelled otherwise only as folding makes it, through a link, where disk tells case apart: a link `vx` to a
     // directory `VX` the include leaves out is judged where it lands.
     mkdirSync(join(root, 'VX'));
     writeFileSync(join(root, 'VX', 'c.txt'), "not the mount's either\n");
     if (!existsSync(join(root, 'vx'))) {
       symlinkSync('VX', join(root, 'vx'));
-      assert.equal(await coversLanding({ root, include: ['vx/**'] }, rootReal, join(rootReal, 'VX', 'c.txt'), 'vx/c.txt'), false);
+      assert.equal(await coversLanding({ include: ['vx/**'] }, rootReal, join(rootReal, 'VX', 'c.txt'), 'vx/c.txt'), false);
     }
     // Where disk tells case apart, a link `qz` to `QZ` swapped for a directory `qz` between the realpath and the
     // walk leaves no link on the way, but the path as named is another file than the one the link led to, so the
@@ -1073,26 +1098,26 @@ describe('mount include', () => {
     if (!existsSync(join(root, 'qz'))) {
       mkdirSync(join(root, 'qz'));
       writeFileSync(join(root, 'qz', 'c.txt'), 'what the directory put in its place holds\n');
-      assert.equal(await coversLanding({ root, include: ['qz/**'] }, rootReal, join(rootReal, 'QZ', 'c.txt'), 'qz/c.txt'), false);
+      assert.equal(await coversLanding({ include: ['qz/**'] }, rootReal, join(rootReal, 'QZ', 'c.txt'), 'qz/c.txt'), false);
     }
     // Where disk tells case apart, a link at the path itself, however disk got it there, is no level of the
     // landing's own: `gt.json` leads to `GT.JSON`, which the include leaves out.
     writeFileSync(join(root, 'GT.JSON'), "not the mount's\n");
     if (!existsSync(join(root, 'gt.json'))) {
       symlinkSync('GT.JSON', join(root, 'gt.json'));
-      assert.equal(await coversLanding({ root, include: ['gt.json'] }, rootReal, join(rootReal, 'GT.JSON'), 'gt.json'), false);
+      assert.equal(await coversLanding({ include: ['gt.json'] }, rootReal, join(rootReal, 'GT.JSON'), 'gt.json'), false);
     }
     // On a disk that folds names, a file a write would create beneath a directory the path names in another
     // spelling than disk's lands where it's named: neither side has the file, and the directory is one. Judged
     // where it lands instead, as disk spells it, `notes/new.txt` is one `Notes/**` doesn't cover.
     mkdirSync(join(root, 'notes'));
     writeFileSync(join(root, 'notes', 'a.txt'), 'covered as named\n');
-    if (existsSync(join(root, 'NOTES'))) {
-      const notes = { root, include: ['Notes/**'] };
-      assert.equal(await coversLanding(notes, rootReal, join(rootReal, 'notes', 'a.txt'), 'Notes/a.txt'), true);
-      assert.equal(await coversLanding(notes, rootReal, join(rootReal, 'notes', 'new.txt'), 'Notes/new.txt'), true);
-      assert.equal(await coversLanding(notes, rootReal, join(rootReal, 'notes', 'deep', 'new.txt'), 'Notes/deep/new.txt'), true);
-    }
+    const notes = { include: ['Notes/**'] };
+    // Where disk tells case apart, `Notes` is a level only the path as named has, so each lands at `notes/`.
+    const folds = existsSync(join(root, 'NOTES'));
+    assert.equal(await coversLanding(notes, rootReal, join(rootReal, 'notes', 'a.txt'), 'Notes/a.txt'), folds);
+    assert.equal(await coversLanding(notes, rootReal, join(rootReal, 'notes', 'new.txt'), 'Notes/new.txt'), folds);
+    assert.equal(await coversLanding(notes, rootReal, join(rootReal, 'notes', 'deep', 'new.txt'), 'Notes/deep/new.txt'), folds);
   });
 
   test("history the outer mount took in where a nested mount now holds the directory is no mount's where that mount's include leaves it out: no listing, sync or grep names it", async (t) => {

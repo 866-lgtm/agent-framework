@@ -64,8 +64,9 @@ export interface MountConfig {
    * symlink, not walked", where the link leads to a directory, and wherever
    * it leads on a mount that doesn't follow links. No pass decides a change
    * the watcher reports there, and a materialize doesn't write it back even
-   * when the workspace's history holds it. A materialize that names a directory
-   * inside the mount counts each such entry beneath it under `passedOver`,
+   * when the workspace's history holds it. A materialize that names a
+   * directory inside the mount counts each such entry beneath it under
+   * `passedOver`,
    * with the reason and without its path, a deletion or conflict held there
    * included; one of the whole mount takes none of them up. The file
    * operations (read, write, edit, delete, and the module's binary and disk
@@ -78,22 +79,26 @@ export interface MountConfig {
    * reaches a file the include doesn't cover, through a link at the path or
    * on its way, is refused as one that leaves the mount (the file operations
    * refuse it before anything is stored), and a listing from where a link
-   * leads passes over such a file.
+   * leads passes over such a file. A covered path whose landing realpath
+   * can't resolve, as for a loop or a directory this process can't search,
+   * is refused too, for a read and a write alike, since where it lands
+   * can't be judged.
    *
    * A sync, materialize, grep, glob or ls that names a path the include
    * doesn't cover takes it as a directory, its scope, exactly where a listing
    * names one: where disk has a directory reached from the mount's root
    * through directories, with no link among them, or the workspace's history
-   * holds an entry beneath it that the include covers, and where `ignore`
-   * covers a directory, which is still a scope when it's named. Each refuses
-   * any other path the include doesn't cover. A covered path is a file to a
-   * sync, materialize or grep when disk or history has a file there, and
-   * otherwise a directory; a glob takes its path as a directory. Beneath a
-   * directory, each passes over what the include doesn't cover, and a
-   * listing that isn't recursive names each directory directly beneath its
-   * path that disk has, and each that a covered entry in history implies,
-   * with only the files the include covers. `ignore` still applies to what
-   * `include` covers.
+   * holds an entry beneath it that the include covers, and that a nested
+   * mount's include covers too where it lies in that mount's directory. A
+   * directory `ignore` covers is a scope too when it's named, though a
+   * listing passes over it. Each refuses any other path the include doesn't
+   * cover. A covered path is a file to a sync, materialize or grep when disk
+   * or history has a file there, and otherwise a directory; a glob takes its
+   * path as a directory. Beneath a directory, each passes over what the
+   * include doesn't cover, and a listing that isn't recursive names each
+   * directory directly beneath its path that disk has, and each that a
+   * covered entry in history implies, with only the files the include
+   * covers. `ignore` still applies to what `include` covers.
    *
    * On a disk that folds names, the parse reads a path in disk's spelling,
    * as the walk names what it lists, so a covered name whose file disk

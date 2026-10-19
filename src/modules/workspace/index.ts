@@ -384,9 +384,10 @@ const LINKS_FOLLOWED = 40;
  * taken lexically. A link's target is read from the link's directory as it
  * is on disk, so a `..` is taken from where the links before it lead, as the
  * kernel takes it. Where realpath fails for any other reason, such as a
- * loop or a lack of permission, the whole path as path.resolve reads it.
+ * loop or a lack of permission, the whole path as path.resolve reads it, and
+ * `unresolved`, where given, takes the first such code.
  */
-async function realBeneath(given: string, links = 0): Promise<string> {
+async function realBeneath(given: string, links = 0, unresolved?: { code?: string }): Promise<string> {
   // A trailing separator, as a link to a directory is often written, names
   // the same place, but readlink would then follow the link it names.
   const { root } = parse(given);
@@ -397,10 +398,13 @@ async function realBeneath(given: string, links = 0): Promise<string> {
   } catch (err) {
     const code = errnoOf(err);
     const parent = dirname(absolute);
-    if ((code !== 'ENOENT' && code !== 'ENOTDIR') || links >= LINKS_FOLLOWED || parent === absolute) return resolve(absolute);
-    const place = await realBeneath(parent, links);
+    if ((code !== 'ENOENT' && code !== 'ENOTDIR') || links >= LINKS_FOLLOWED || parent === absolute) {
+      if (unresolved) unresolved.code ??= links >= LINKS_FOLLOWED ? 'ELOOP' : code ?? 'EIO';
+      return resolve(absolute);
+    }
+    const place = await realBeneath(parent, links, unresolved);
     const target = await readlink(absolute).catch(() => null);
-    if (target !== null) return realBeneath(isAbsolute(target) ? target : `${place}${sep}${target}`, links + 1);
+    if (target !== null) return realBeneath(isAbsolute(target) ? target : `${place}${sep}${target}`, links + 1, unresolved);
     return join(place, basename(absolute));
   }
 }
@@ -2271,26 +2275,34 @@ export class WorkspaceModule implements Module {
   /**
    * The refusal for a path of `mount` that reaches a nested mount's directory
    * through a symlink on its way (nestedAtReal), or a file this mount's own
-   * include leaves out (coversLanding), or null where it doesn't. On a mount
-   * that doesn't follow the link, the refusal is the link's own (linkWords),
-   * as the readers and pushes give it. On one that does, it names the nested
-   * mount only where the place is that mount's (namesNestedPlace); anywhere
-   * else the place is no mount's, so the path leaves this one, in the disk
-   * readers' words, as it does where it lands on a file this mount's include
-   * leaves out. A mount with nothing nested, and without both an include and
-   * links followed, has nothing to find, so it pays nothing.
+   * include leaves out (coversLanding), or, on a mount that follows links
+   * with an include, one realpath can't resolve, or null where it doesn't.
+   * On a mount that doesn't follow the link, the refusal is the link's own
+   * (linkWords), as the readers and pushes give it. On one that does, it
+   * names the nested mount only where the place is that mount's
+   * (namesNestedPlace); anywhere else the place is no mount's, so the path
+   * leaves this one, in the disk readers' words, as it does where it lands
+   * on a file this mount's include leaves out. A mount with nothing nested,
+   * and without both an include and links followed, has nothing to find, so
+   * it pays nothing.
    */
   private async landingRefusal(mount: MountState, relativePath: string, path: string): Promise<Error | null> {
     const nested = this.nestedOf(mount.config.name);
     const judged = mount.config.followSymlinks === true && mount.config.include !== undefined;
     if (nested.length === 0 && !judged) return null;
-    const real = await realBeneath(resolve(mount.config.path, relativePath));
+    const unresolved: { code?: string } = {};
+    const real = await realBeneath(resolve(mount.config.path, relativePath), 0, unresolved);
     const holder = nestedAtReal(real, nested);
     if (!holder) {
       if (!judged) return null;
+      // Where realpath can't resolve the path, as for a loop or a directory
+      // this process can't search, where it lands can't be judged, and a
+      // promise about content fails closed: the path is refused, in the
+      // words a disk read gives a path it can't resolve.
+      if (unresolved.code !== undefined) return new WorkspaceReadError('not_found', `Unable to resolve file: ${path}`, 'realpath', unresolved.code);
       const rootReal = await realBeneath(resolve(mount.config.path));
       if (!isContainedPath(rootReal, real) || await stat(real).then((info) => info.isDirectory(), () => false)) return null;
-      return await coversLanding({ root: mount.config.path, include: mount.config.include }, rootReal, real, relativePath) ? null : new WorkspaceReadError('escape', `Symlink escape detected: ${path}`, 'realpath');
+      return await coversLanding({ include: mount.config.include }, rootReal, real, relativePath) ? null : new WorkspaceReadError('escape', `Symlink escape detected: ${path}`, 'realpath');
     }
     if (mount.config.followSymlinks !== true) {
       const found = await linkOnTheWay({ root: mount.config.path, followSymlinks: false }, relativePath);
@@ -2451,14 +2463,17 @@ export class WorkspaceModule implements Module {
   private entriesOf(mount: MountState): WorkspaceEntries {
     const store = this.getStore();
     const intents = this.intents.get(mount.config.name)!;
+    const own = { include: mount.config.include, nested: this.nestedOf(mount.config.name) };
     return {
       // An intent recorded at a path, such as a deletion disk hasn't been
       // given yet or a conflict, is the workspace's own name for the file
       // there, as an entry is, so the calls that settle it reach it.
       has: (path) => store.treeGet(mount.treeStateId, path) !== null || store.treeGet(intents.treeStateId, path) !== null,
-      // A key no spelling names, such as `c/` or `a//b.txt` from an earlier
-      // version, is outside the mount (parsedSpelling), so it spells nothing.
-      under: (prefix) => store.treeList(mount.treeStateId, prefix).map((entry) => entry.path).filter((path) => parsedSpelling(path)),
+      // Only an entry the mount will write spells a draft's path: not a key no
+      // spelling names, such as `c/` or `a//b.txt` from an earlier version,
+      // nor one outside the include or in a nested mount's directory that
+      // mount's include leaves out, which no listing names (withinIncludes).
+      under: (prefix) => store.treeList(mount.treeStateId, prefix).map((entry) => entry.path).filter((path) => withinIncludes(own, path)),
       holder: (path) => this.holderOf(mount.config.name, path)?.name,
       rootFoldsCase: this.rootFoldsCase.get(mount.config.name) ?? false,
     };
@@ -2788,7 +2803,10 @@ export class WorkspaceModule implements Module {
       }
 
       // A directory swapped for a link since the walk above is caught here, by
-      // what the path resolved to after the open.
+      // what the path resolved to after the open, and the check below holds
+      // the opened file to that path. A link put back after this realpath,
+      // leading to the opened file itself, passes both: a race this doesn't
+      // close.
       const resolvedThrough = await linkRefusal(linkView, realMountRoot, relativePath, realFilePath);
       if (resolvedThrough !== null) throw await linkReadError(mount, resolvedThrough, mountPrefixedPath, relativePath, this.nestedOf(mount.config.name));
 
@@ -2798,7 +2816,7 @@ export class WorkspaceModule implements Module {
       // no mount's, so the path leaves this one (namesNestedPlace), and so
       // does one reaching a file this mount's own include leaves out
       // (coversLanding).
-      const own = holder === undefined && inside && !(await coversLanding({ root: mount.config.path, include: mount.config.include }, realMountRoot, realFilePath, relativePath));
+      const own = holder === undefined && inside && !(await coversLanding({ include: mount.config.include }, realMountRoot, realFilePath, relativePath));
       if (!inside || own || (holder !== undefined && !namesNestedPlace(holder.rest, holder.include, false))) {
         throw new WorkspaceReadError('escape', `Symlink escape detected: ${mountPrefixedPath}`, 'realpath');
       }

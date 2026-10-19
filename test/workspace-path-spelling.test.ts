@@ -402,7 +402,10 @@ test("a segment on a path's way that isn't a directory and that the include does
     // What a sync of the path says it skipped names it the same way.
     const synced = JSON.stringify(await workspace.handleToolCall({ id: 'sync', name: 'sync', input: { path } } as Parameters<WorkspaceModule['handleToolCall']>[0]));
     assert.ok(!synced.includes(given), `${path}: ${synced}`);
+    // Beneath a link the mount doesn't follow, the sync names what it skipped in disk's spelling; beneath a
+    // file, there's nothing to take in or skip.
     if (segment === 'link') assert.ok(synced.includes('link/a.json'), `the sync names what it skipped in disk's spelling: ${synced}`);
+    else assert.ok(synced.includes('"totalSynced":0') && !synced.includes('skipped'), `nothing beneath a file: ${synced}`);
   }
   // The include's own refusal answers the path asked about, as given.
   const outside = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path: 'work/SECRET.TXT' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
@@ -1145,4 +1148,31 @@ test('on a disk that tells case apart, two drafts that differ only in case stay 
   await call('materialize', { mount: 'work' });
   assert.deepEqual(readdirSync(join(dir, 'src')).sort(), ['NEW.txt', 'New.txt', 'a.ts']);
   assert.deepEqual(readdirSync(dir).sort(), ['DOCS', 'docs', 'src']);
+});
+
+test("only history the mount will write spells a draft's path: an entry the include leaves out, from before it, doesn't respell a covered one", { skip: FOLDING_ONLY }, async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-'));
+  const dir = join(root, 'mount');
+  mkdirSync(join(dir, 'NOTES'), { recursive: true });
+  writeFileSync(join(dir, 'NOTES', 'old.bin'), 'taken in before the include\n');
+  const store = JsStore.openOrCreate({ path: join(root, 'store') });
+  let workspace: WorkspaceModule | undefined;
+  t.after(async () => { await workspace?.stop(); if (!store.isClosed()) store.close(); rmSync(root, { recursive: true, force: true }); });
+  const ctx = { isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext;
+  const before = new WorkspaceModule({ mounts: [{ name: 'work', path: dir, mode: 'read-write', watch: 'never' }] });
+  before.initStore(store);
+  await before.start(ctx);
+  assert.equal((await before.handleToolCall({ id: 's', name: 'sync', input: {} } as Parameters<WorkspaceModule['handleToolCall']>[0])).success, true);
+  await before.stop();
+  // Disk no longer has the directory, so only history could spell it.
+  rmSync(join(dir, 'NOTES'), { recursive: true, force: true });
+  workspace = new WorkspaceModule({ mounts: [{ name: 'work', path: dir, mode: 'read-write', watch: 'never', include: ['notes/**'] }] });
+  workspace.initStore(store);
+  await workspace.start(ctx);
+  const write = await workspace.handleToolCall({ id: 'w', name: 'write', input: { path: 'work/notes/new.md', content: 'covered\n' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+  assert.equal(write.success, true, String(write.error));
+  const read = await workspace.handleToolCall({ id: 'r', name: 'read', input: { path: 'work/notes/new.md' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+  assert.equal(read.success, true, String(read.error));
+  const listed = JSON.stringify(await workspace.handleToolCall({ id: 'l', name: 'ls', input: { path: 'work', recursive: true } } as Parameters<WorkspaceModule['handleToolCall']>[0]));
+  assert.ok(listed.includes('notes/new.md') && !listed.includes('NOTES'), listed);
 });
