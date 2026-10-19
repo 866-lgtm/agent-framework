@@ -538,6 +538,12 @@ test('non-conversational markers do not retarget the default publish locus (#157
   const { registry, lookup } = makeRegistry(undefined);
   seedRegistered(registry, 'discord', 'chanA');
   seedRegistered(registry, 'discord', 'chanB');
+  // The host directs this server's lifecycle (the mock's grant includes
+  // channels.lifecycle), so traffic repairs a channel's open state only
+  // while the channel is decided open (#210). chanB is.
+  (registry as unknown as {
+    setDesiredState(s: string, c: string, d: 'open' | 'closed', src: string): void;
+  }).setDesiredState('discord', 'chanB', 'open', 'agent-tool');
   registry.handleIncoming('discord', incoming('chanA', 'hi from A', undefined, undefined, 'thread-A'));
 
   for (const tag of ['chat:reaction', 'chat:reaction-remove', 'chat:edited', 'chat:deleted']) {
@@ -548,8 +554,9 @@ test('non-conversational markers do not retarget the default publish locus (#157
     const anchor = registry.buildChannelContext()?.incoming;
     assert.equal(anchor?.messageId, 'm1', `a ${tag} marker leaves the reply anchor's message`);
     assert.equal(anchor?.threadId, 'thread-A', `a ${tag} marker leaves the reply anchor's thread`);
-    // The liveness repair still runs for a marker: a server sending
-    // channels/incoming is evidence that its transport is open.
+    // The liveness repair still runs for a marker, as for any message: a
+    // server sending channels/incoming for a channel decided open is
+    // evidence that its transport is open.
     assert.equal(lookup('chanB')?.open, true, `a ${tag} marker still repairs chanB's open state`);
     // On the anchor's own channel, a marker leaves the anchor too.
     registry.handleIncoming('discord', incoming('chanA', `[${tag}] marker on A`, undefined, [tag]));
