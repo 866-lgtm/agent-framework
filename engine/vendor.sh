@@ -32,24 +32,35 @@ FILES=(
 # Physical paths, as git gives the repository's, so the one can be taken from the other.
 here=$(cd "$(dirname "$0")" && pwd -P)
 dest=$here/quickjs-ng
-# The command that puts back the committed copy's files, from the commit, from any directory.
+# The command that puts back the committed copy's files from the commit, from any directory: with
+# --no-overlay (git 2.22 and later), a file the index holds and the commit doesn't goes too.
 top=$(git -C "$here" rev-parse --show-toplevel)
-restore="git -C $(printf '%q' "$top") checkout HEAD -- $(printf '%q' "${dest#"$top"/}")"
+restore="git -C $(printf '%q' "$top") checkout --no-overlay HEAD -- $(printf '%q' "${dest#"$top"/}")"
+# A stage or a committed copy moved aside, left by a run that was killed outright.
+shopt -s nullglob dotglob
+left=("$here"/.quickjs-ng.*)
+shopt -u nullglob dotglob
+if [ ${#left[@]} -gt 0 ]; then
+  echo "vendor.sh: engine/ holds ${left[*]##*/}, left by a run that was killed outright; remove them (what's committed is in git, and $restore puts it back). engine/quickjs-ng is unchanged." >&2
+  exit 1
+fi
 changes=$(git -C "$here" status --porcelain --untracked-files=all --ignored -- quickjs-ng)
 if [ -n "$changes" ]; then
-  echo "vendor.sh: engine/quickjs-ng holds changes or files not committed, which replacing it would erase; commit what you mean to keep, or run $restore to put back what's committed and remove any file listed below as untracked (??) or ignored (!!):" >&2
+  echo "vendor.sh: engine/quickjs-ng holds changes or files not committed, which replacing it would erase; commit what you mean to keep, or run $restore to put back what's committed, then this again, which lists any file left that git doesn't track (??) or ignores (!!), for you to remove:" >&2
   echo "$changes" >&2
   exit 1
 fi
 # Whenever the script exits, a committed copy left moved aside goes back, unless the new one is in
-# its place, and what was staged goes. bash runs this on a signal that ends the shell too: INT,
+# its place, and what was staged goes. bash 5.2 runs this on a signal that ends the shell too: INT,
 # TERM and HUP are trapped below, so they wait for the command in progress, and PIPE, ALRM, USR1,
-# USR2 and XCPU were checked to run it as well. Signals are ignored while it runs. SIGKILL, which
-# no trap sees, skips it. A signal ignored when the script started, as SIGINT is for a background
-# job of a non-interactive shell, stays ignored, and the script carries on.
+# USR2 and XCPU were checked to run it as well (bash ignores QUIT). The signals named in its first
+# line, and in the traps below, are ignored from then on. SIGKILL, which no trap sees, skips it, and
+# leaves what the next run refuses over. A signal ignored when the script started, as SIGINT is for
+# a background job of a non-interactive shell, stays ignored, and the script carries on.
 tmp= stage= old=
+ignore_signals='trap "" HUP INT PIPE ALRM TERM USR1 USR2 XCPU XFSZ'
 finish() {
-  trap '' HUP INT PIPE ALRM TERM USR1 USR2 XCPU
+  eval "$ignore_signals"
   set +e
   if [ -n "$old" ] && [ -e "$old" ]; then
     if [ -e "$dest" ]; then
@@ -64,9 +75,9 @@ finish() {
   [ -n "$stage" ] && rm -rf "$stage"
 }
 trap finish EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
+trap "$ignore_signals; exit 129" HUP
+trap "$ignore_signals; exit 130" INT
+trap "$ignore_signals; exit 143" TERM
 tmp=$(mktemp -d)
 # The new copy is staged beside the old one, on the same filesystem: once it's whole, the old one
 # is moved aside, the stage renamed into its place, and only then is the old one removed. Killed
@@ -147,6 +158,7 @@ if ! mv "$stage" "$dest"; then
 fi
 if [ -e "$old" ] && ! rm -rf "$old"; then
   echo "vendor.sh: the new copy is in place, but the committed copy moved aside to $old couldn't be removed; remove it." >&2
+  old=
   exit 1
 fi
 echo "copied ${#FILES[@]} files from quickjs-ng $TAG ($COMMIT), with $patched patches"
