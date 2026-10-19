@@ -66,12 +66,19 @@ async function messagesApi(): Promise<{ baseURL: string; seen: Array<{ body: Rec
 
 describe('thinkingBinding.dropBlock', () => {
   it('adds the binding control to the thinking config the agent sends, and to no request without the setting', async () => {
-    const thinking = { enabled: true, budgetTokens: 2048 };
-    assert.deepEqual(await sentThinking({ thinking, thinkingBinding: { dropBlock: true } }), { ...thinking, blockBinding: BINDING });
-    assert.deepEqual(await sentThinking({ thinkingBinding: { dropBlock: true } }), { enabled: false, blockBinding: BINDING },
-      'an agent with no thinking config of its own still carries the control, for a model whose thinking is always on');
-    assert.deepEqual(await sentThinking({ thinking }), thinking);
-    assert.deepEqual(await sentThinking({ thinking, thinkingBinding: { dropBlock: false } }), thinking);
+    // Each agent is given a config of its own, and the expectations are
+    // literals, so a control written into the agent's config would show.
+    const thinking = () => ({ enabled: true, budgetTokens: 2048 });
+    const given = thinking();
+    assert.deepEqual(await sentThinking({ thinking: given, thinkingBinding: { dropBlock: true } }),
+      { enabled: true, budgetTokens: 2048, blockBinding: BINDING });
+    assert.deepEqual(given, { enabled: true, budgetTokens: 2048 }, 'the agent\'s own config is left as it was');
+    for (const none of [undefined, null, false]) {
+      assert.deepEqual(await sentThinking({ thinking: none, thinkingBinding: { dropBlock: true } }), { enabled: false, blockBinding: BINDING },
+        `an agent whose thinking is ${String(none)} still carries the control, for a model whose thinking is always on`);
+    }
+    assert.deepEqual(await sentThinking({ thinking: thinking() }), { enabled: true, budgetTokens: 2048 });
+    assert.deepEqual(await sentThinking({ thinking: thinking(), thinkingBinding: { dropBlock: false } }), { enabled: true, budgetTokens: 2048 });
     assert.equal(await sentThinking({ thinkingBinding: { dropBlock: false } }), undefined);
   });
 
@@ -108,7 +115,7 @@ describe('thinkingBinding.dropBlock', () => {
     }
   });
 
-  it('puts a call\'s report in its inference:usage trace, and leaves a call that dropped blocks out of calibration', async () => {
+  it('puts a call\'s report in its inference:usage trace, and gives no calibration sample from a call that dropped blocks or any later call of its stream', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-thinking-binding-'));
     const membrane = new MockMembrane();
     const framework = await AgentFramework.create({
@@ -121,12 +128,16 @@ describe('thinkingBinding.dropBlock', () => {
     try {
       const dropped = { reason: 'prefix_binding_mismatch', path: 'messages.1.content.0', message: 1 };
       const shown = { reason: 'prefix_binding_mismatch', path: 'messages.3.content.0', message: 3 };
+      // Four calls of one stream: no report, a block shown though it failed
+      // the check, a block dropped, and a report that names nothing.
       membrane.pushResponse(withRound(createMockResponse([{ type: 'tool_use', id: 'c1', name: 'test--echo', input: {} }], 'tool_use'),
-        { inputTokens: 100, outputTokens: 10, cacheCreationTokens: 0, cacheReadTokens: 400 }, { dropped: [dropped], mismatchAllowed: [] }));
+        { inputTokens: 100, outputTokens: 10, cacheCreationTokens: 0, cacheReadTokens: 400 }));
       membrane.pushResponse(withRound(createMockResponse([{ type: 'tool_use', id: 'c2', name: 'test--echo', input: {} }], 'tool_use'),
         { inputTokens: 130, outputTokens: 15, cacheCreationTokens: 0, cacheReadTokens: 900 }, { dropped: [], mismatchAllowed: [shown] }));
+      membrane.pushResponse(withRound(createMockResponse([{ type: 'tool_use', id: 'c3', name: 'test--echo', input: {} }], 'tool_use'),
+        { inputTokens: 150, outputTokens: 20, cacheCreationTokens: 60, cacheReadTokens: 900 }, { dropped: [dropped], mismatchAllowed: [] }));
       membrane.pushResponse(withRound(createMockResponse([{ type: 'text', text: 'Done.' }]),
-        { inputTokens: 150, outputTokens: 20, cacheCreationTokens: 60, cacheReadTokens: 900 }, { dropped: [], mismatchAllowed: [] }));
+        { inputTokens: 170, outputTokens: 25, cacheCreationTokens: 60, cacheReadTokens: 1400 }, { dropped: [], mismatchAllowed: [] }));
 
       const { agent, contextManager } = await framework.createEphemeralAgent({
         name: 'worker', model: 'claude-opus-5-5', systemPrompt: 'Do the task.', allowedTools: 'all',
@@ -139,13 +150,15 @@ describe('thinkingBinding.dropBlock', () => {
       await framework.runEphemeralToCompletion(agent, contextManager);
 
       const usage = traces.filter((event): event is Extract<TraceEvent, { type: 'inference:usage' }> => event.type === 'inference:usage');
-      assert.equal(usage.length, 3);
-      assert.deepEqual(usage[0]!.thinking, { dropped: [dropped], mismatchAllowed: [] });
+      assert.equal(usage.length, 4);
+      assert.equal('thinking' in usage[0]!, false, 'a call with no report carries no thinking field');
       assert.deepEqual(usage[1]!.thinking, { dropped: [], mismatchAllowed: [shown] },
         'a block shown to the model though it failed the check is reported too');
-      assert.equal('thinking' in usage[2]!, false, 'a call whose report names nothing carries no thinking field');
-      assert.deepEqual(calibrated, [30 + 0 + 500, 20 + 60 + 0],
-        'each call that dropped nothing is a sample, as its own share of the stream\'s usage; one that showed a block was billed for it');
+      assert.deepEqual(usage[2]!.thinking, { dropped: [dropped], mismatchAllowed: [] });
+      assert.equal('thinking' in usage[3]!, false, 'a call whose report names nothing carries no thinking field');
+      assert.deepEqual(calibrated, [100 + 0 + 400, 30 + 0 + 500],
+        'each call before the drop is given, as its own share of the stream\'s usage, a shown block being billed; ' +
+        'the call that dropped one and the call after it are not, since the strategy would take the first call given after its compile');
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
@@ -198,12 +211,12 @@ class EchoTools implements Module {
 type Entry = { reason: string; path: string; message?: number };
 
 /** A response whose usage event carries membrane's round report with the
- *  given thinking entries. Usage is cumulative across a stream's rounds, as
- *  membrane reports it. */
+ *  given thinking entries, or no report when none are given. Usage is
+ *  cumulative across a stream's rounds, as membrane reports it. */
 function withRound(
   response: NormalizedResponse,
   usage: DetailedUsage,
-  thinking: { dropped: Entry[]; mismatchAllowed: Entry[] },
+  thinking?: { dropped: Entry[]; mismatchAllowed: Entry[] },
 ): NormalizedResponse {
-  return Object.assign(response, { usage, round: { thinking } });
+  return Object.assign(response, thinking ? { usage, round: { thinking } } : { usage });
 }

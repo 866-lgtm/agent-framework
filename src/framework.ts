@@ -18826,6 +18826,9 @@ export class AgentFramework {
       cacheCreationTokens: 0,
       cacheReadTokens: 0,
     };
+    // Whether a call of this stream reported signed thinking the provider
+    // dropped: from then on none of its calls is a calibration sample.
+    let thinkingDroppedInStream = false;
     // Output tokens billed since this turn's assistant blocks were last
     // persisted. The residual over the round's visible blocks is the price of
     // its hidden thinking, stamped on the signed blocks at persist time
@@ -20495,13 +20498,21 @@ export class AgentFramework {
             // the second argument.
             // A call whose report names thinking the provider dropped billed
             // less than the request held: the strategy still counts those
-            // blocks, so the call's ratio would pull its calibration low. It
-            // keeps its last value until drops stop, since what it tracks is
-            // the tokenizer's drift, which a dropped block doesn't move.
+            // blocks, so the call's ratio would pull its calibration low. The
+            // strategy takes the first call it's given after a compile as
+            // that compile's one sample, and each later call of the stream
+            // carries what the stream appended, so once a call has dropped
+            // blocks, none of the stream's later calls is given either. A
+            // compile whose first call dropped blocks gives no sample, and the
+            // calibration keeps its value. If the provider drops an earlier
+            // model's blocks after a model switch (`model_binding_mismatch`),
+            // they drop on every call until they leave the context, and the
+            // calibration takes up the new model's tokenizer only after that.
             const thinkingReport = event.round?.thinking;
             const thinkingDropped = (thinkingReport?.dropped.length ?? 0) > 0;
+            if (thinkingDropped) thinkingDroppedInStream = true;
             try {
-              if (!thinkingDropped) {
+              if (!thinkingDroppedInStream) {
                 strat?.reportRealInputTokens?.(
                   realTotal,
                   compiledRequest ? { system: compiledRequest.system, tools: compiledRequest.tools } : undefined,

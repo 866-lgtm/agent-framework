@@ -195,13 +195,14 @@ export type TraceEvent =
       agentName: string;
       tokenUsage: { input: number; output: number; cacheCreation?: number; cacheRead?: number };
       /**
-       * The signed thinking this call sent that failed the provider's binding
-       * check, as the provider reported it (membrane's `RoundReport.thinking`):
-       * blocks it dropped before the model saw them, and blocks it showed the
-       * model anyway because the check isn't enforced. The provider reports
-       * them for a request that carried the binding control, as
-       * `thinkingBinding.dropBlock` sends it. Present only when the report
-       * names any block.
+       * The provider's report on the signed thinking of the call this event
+       * closes (membrane's `RoundReport.thinking`): blocks it dropped before
+       * the model saw them, and blocks it showed the model anyway because the
+       * check isn't enforced. `tokenUsage` beside it is the stream's running
+       * total, not this call's. The provider reports them for a request that
+       * carried the binding control, whoever asked for it:
+       * `thinkingBinding.dropBlock`, or a thinking config the host sends
+       * itself. Present only when the report names any block.
        */
       thinking?: {
         dropped: ThinkingBindingEntry[];
