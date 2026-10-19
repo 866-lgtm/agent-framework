@@ -2678,10 +2678,13 @@ test('a close of a channel only a push has registered, decided closed before a r
   }
 });
 
-test('a decline in a channel only a push has registered sends its close through the lifecycle queue', async () => {
+test('a decline in a channel only a push has registered, after its traffic, sends its close through the lifecycle queue', async () => {
   const f = fixture();
   f.actual.set('x', true);
   f.registry.ensureChannelRegistered('test', 'x', 'x');
+  // With nothing decided, its traffic doesn't show it open.
+  await f.registry.handleIncoming('test', { messages: [message()] });
+  assert.equal(f.isOpen(), false);
   const result = await f.registry.handleChannelToolCall('channel_decline', { serverId: 'test', channelId: 'x', messageId: 'm1' });
   assert.equal(result.success, true);
   assert.equal(dataOf(result).status, 'remained closed');
@@ -2727,5 +2730,46 @@ test('traffic in a tuned-out channel only a push has registered shows it open, w
     assert.equal(declined.success, false, `directs: ${directs}`);
     assert.equal(f.registry.getDesiredState('test', 'x'), 'tuned-out', `directs: ${directs}`);
     assert.deepEqual(f.calls, [], `directs: ${directs}`);
+  }
+});
+
+test("a registration whose descriptor carries the push's placeholder metadata still waits for a receipt before its traffic shows it open", async () => {
+  const f = fixture();
+  f.actual.set('x', true);
+  f.held.add('x');
+  f.registry.enterTuneOut('test', 'x', {
+    epochId: 'e1', cadenceSeconds: 60, backlogCap: 20, maxWakes: 3, startedAtSequence: 1,
+  }, 'agent-tool');
+  const registering = f.registry.handleChanged('test', {
+    added: [{ ...descriptor('x', true), metadata: { lazyRegistered: true } }],
+  });
+  await tick();
+  await f.registry.handleIncoming('test', { messages: [message()] });
+  assert.equal(f.isOpen(), false, 'its traffic is no receipt');
+  f.held.delete('x');
+  await f.drain(registering);
+  assert.equal(f.isOpen(), true, "the reconcile's receipt confirms it");
+});
+
+test('an update that keeps the target of a channel only a push has registered leaves its traffic showing it open; one that gives it a target waits for a receipt', async () => {
+  for (const retarget of [false, true]) {
+    const f = fixture();
+    f.actual.set('x', true);
+    f.held.add('x');
+    f.registry.ensureChannelRegistered('test', 'x', 'x');
+    f.registry.enterTuneOut('test', 'x', {
+      epochId: 'e1', cadenceSeconds: 60, backlogCap: 20, maxWakes: 3, startedAtSequence: 1,
+    }, 'agent-tool');
+    // The push's entry has the server id as its type and no address.
+    const update: ChannelDescriptor = retarget
+      ? descriptor('x', false, 'B')
+      : { id: 'x', type: 'test', label: 'x, renamed', direction: 'bidirectional' };
+    const updating = f.registry.handleChanged('test', { updated: [update] });
+    await tick();
+    await f.registry.handleIncoming('test', { messages: [message()] });
+    assert.equal(f.isOpen(), !retarget, `retarget: ${retarget}`);
+    f.held.delete('x');
+    await f.drain(updating);
+    assert.equal(f.isOpen(), true, `retarget: ${retarget}`);
   }
 });
