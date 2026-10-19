@@ -56,6 +56,7 @@ import {
   checkRoot,
   leadsInto,
   nameOf,
+  namesNestedPlace,
   nestedAtReal,
   parentOf,
 } from './observe.js';
@@ -395,9 +396,10 @@ async function checkOpened(
   if (expect.kind === 'content' && (await hashAt(target, info, noFollow)) !== expect.hash) throw new EffectFailed(CHANGED, touched);
   const real = await realpath(target).catch(() => null);
   if (real === null) throw new EffectFailed(CHANGED, touched);
-  if (!contained(rootReal, real)) throw new EffectFailed(view.followSymlinks ? 'a symlink that leaves the mount' : OUTSIDE_PARENT, touched);
+  const leaves = view.followSymlinks ? 'a symlink that leaves the mount' : OUTSIDE_PARENT;
+  if (!contained(rootReal, real)) throw new EffectFailed(leaves, touched);
   const holder = nestedAtReal(real, view.nested);
-  if (holder) throw new EffectFailed(leadsInto(view.name, rel, holder), touched);
+  if (holder) throw new EffectFailed(namesNestedPlace(holder.rest, holder.include, false) ? leadsInto(view.name, rel, holder) : leaves, touched);
   const named = await stat(real, { bigint: true }).catch(() => null);
   if (named === null || named.dev !== info.dev || named.ino !== info.ino) throw new EffectFailed(CHANGED, touched);
   if (!view.followSymlinks) {
@@ -535,7 +537,10 @@ export async function unlinkContained(view: MountView, rootReal: string, rel: st
     // One leading into a nested mount's directory is that mount's: the link
     // and the file it leads to are left as they are.
     const holder = nestedAtReal(real, view.nested);
-    if (holder) throw new EffectFailed(leadsInto(view.name, rel, holder), false);
+    if (holder) {
+      const directory = await stat(real).then((s) => s.isDirectory(), () => false);
+      throw new EffectFailed(namesNestedPlace(holder.rest, holder.include, directory) ? leadsInto(view.name, rel, holder) : 'a symlink that leaves the mount', false);
+    }
     const through = await stat(real, { bigint: true }).catch(() => null);
     if (through === null) throw new EffectFailed(CHANGED, false);
     // A followed link stands for the file it leads to, so it's removed only

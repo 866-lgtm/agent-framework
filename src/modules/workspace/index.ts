@@ -40,7 +40,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
-import { IGNORED, NONBLOCK, OTHER_MOUNT, OUTSIDE_INCLUDE, beginsWithDir, type LevelFolds, checkDir, diskSpelling, filesystemTrustsCtime, foldsAtEach, includePatternReadable, inOtherMount, insideMount, leadsInto, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, namesHolder, nestedAtReal, nestedHolder, type NestedMount, parsedSpelling, passedOverAt, pathSegments, readPrefix, type LinkFound } from './observe.js';
+import { IGNORED, NONBLOCK, OTHER_MOUNT, OUTSIDE_INCLUDE, beginsWithDir, type LevelFolds, checkDir, diskSpelling, filesystemTrustsCtime, foldsAtEach, includePatternReadable, inOtherMount, insideMount, leadsInto, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, namesHolder, namesNestedPlace, nestedAtReal, nestedHolder, type NestedMount, parsedSpelling, passedOverAt, pathSegments, readPrefix, type LinkFound } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
 import {
   type MountRuntime,
@@ -2174,12 +2174,17 @@ export class WorkspaceModule implements Module {
   private async leadsIntoNested(mount: MountState, relativePath: string, path: string): Promise<Error | null> {
     const nested = this.nestedOf(mount.config.name);
     if (nested.length === 0) return null;
-    const holder = nestedAtReal(await realBeneath(resolve(mount.config.path, relativePath)), nested);
+    const real = await realBeneath(resolve(mount.config.path, relativePath));
+    const holder = nestedAtReal(real, nested);
     if (!holder) return null;
     if (mount.config.followSymlinks !== true) {
       const found = await linkOnTheWay({ root: mount.config.path, followSymlinks: false }, relativePath);
       if (found !== null) return await linkReadError(mount, found, path, nested);
     }
+    // A place the nested mount's include leaves out is no mount's, so the
+    // path leaves this one, in the disk readers' words (namesNestedPlace).
+    const directory = await stat(real).then((s) => s.isDirectory(), () => false);
+    if (!namesNestedPlace(holder.rest, holder.include, directory)) return new WorkspaceReadError('escape', `Symlink escape detected: ${path}`, 'realpath');
     return new NestedMountError(path, mount.config.name, holder.name, holder.use, 'leads into');
   }
 
@@ -2556,10 +2561,13 @@ export class WorkspaceModule implements Module {
       const resolvedThrough = await linkRefusal(linkView, realMountRoot, relativePath, realFilePath);
       if (resolvedThrough !== null) throw await linkReadError(mount, resolvedThrough, mountPrefixedPath, this.nestedOf(mount.config.name));
 
-      if (!isContainedPath(realMountRoot, realFilePath)) {
+      const inside = isContainedPath(realMountRoot, realFilePath);
+      const holder = inside ? nestedAtReal(realFilePath, this.nestedOf(mount.config.name)) : undefined;
+      // A place in a nested mount's directory that its include leaves out is
+      // no mount's, so the path leaves this one (namesNestedPlace).
+      if (!inside || (holder !== undefined && !namesNestedPlace(holder.rest, holder.include, false))) {
         throw new WorkspaceReadError('escape', `Symlink escape detected: ${mountPrefixedPath}`, 'realpath');
       }
-      const holder = nestedAtReal(realFilePath, this.nestedOf(mount.config.name));
       if (holder) throw new WorkspaceReadError('other_mount', leadsInto(mount.config.name, relativePath, holder), 'realpath');
 
       let pathStat: Stats;

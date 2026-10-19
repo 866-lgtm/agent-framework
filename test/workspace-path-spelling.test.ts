@@ -386,6 +386,23 @@ test('resolveAbsolutePath takes a nested mount\'s directory in any spelling disk
   assert.notEqual(workspace.resolveAbsolutePath('outer/src/a.ts'), null, "the outer mount's own file");
 });
 
+test('resolveAbsolutePath takes a nested mount\'s directory where the real roots place it as that mount\'s in any spelling disk folds to it, as it does the configured one', { skip: FOLDING_ONLY }, async (t) => {
+  const { workspace } = await setup(t, (d) => {
+    mkdirSync(join(d, 'real', 'inner'), { recursive: true });
+    writeFileSync(join(d, 'real', 'inner', 'x.txt'), 'inner\n');
+    symlinkSync(join(d, 'real'), join(d, 'link'));
+    return [
+      { name: 'outer', path: d, mode: 'read-write', watch: 'never' },
+      // Configured through a link: its directory is link/inner as configured, and real/inner where disk has it.
+      { name: 'inner', path: join(d, 'link', 'inner'), mode: 'read-write', watch: 'never' },
+    ];
+  });
+  for (const path of ['outer/real/inner/x.txt', 'outer/REAL/inner/x.txt', 'outer/real/INNER/x.txt', 'outer/link/INNER/x.txt']) {
+    assert.equal(workspace.resolveAbsolutePath(path), null, path);
+  }
+  assert.notEqual(workspace.resolveAbsolutePath('outer/src/a.ts'), null, "the outer mount's own file");
+});
+
 test('resolveAbsolutePath takes a nested mount\'s directory in the other normalization form as that mount\'s', { skip: NORMALIZATION_FOLDING_ONLY }, async (t) => {
   const { workspace } = await setup(t, (d) => {
     mkdirSync(join(d, 'caf\u00e9'), { recursive: true });

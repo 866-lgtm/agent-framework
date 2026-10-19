@@ -280,7 +280,23 @@ export function nestedHolder<N extends { dir: string; name: string }>(target: st
  * `other_mount`), so the code says no more than the message.
  */
 export function namesHolder(leads: { target: string; directory: boolean }, holder: { dir: string; include?: readonly string[] }): boolean {
-  return leads.directory || insideMount(leads.target.slice(holder.dir.length + 1), holder.include);
+  return namesNestedPlace(leads.target.slice(holder.dir.length + 1), holder.include, leads.directory);
+}
+
+/**
+ * Whether a refusal names a place in a nested mount's directory, `rest`
+ * beneath that mount's root, as a place of that mount's: a directory, or a
+ * file its include covers. The place is one of that mount's own paths, so
+ * its include decides, and a refusal's code follows the same test, so the
+ * code says no more than the message. Anywhere else the place is no mount's:
+ * the outer mount passes over the nested directory, and the nested mount's
+ * include leaves it out. So a link the outer mount doesn't follow is refused
+ * as one it doesn't follow (namesHolder), and a path that reaches the place
+ * through one it follows is refused as one that leaves the mount, in the
+ * words each such refusal already has (nestedAtReal's callers).
+ */
+export function namesNestedPlace(rest: string, include: readonly string[] | undefined, directory: boolean): boolean {
+  return directory || insideMount(rest, include);
 }
 
 /**
@@ -326,18 +342,20 @@ export async function linkReason(view: Pick<MountView, 'root' | 'name' | 'nested
 
 /**
  * The nested mount whose root holds `real`, a canonical path, the innermost,
- * with the path to use there; undefined when none does. A path the lexical
- * checks pass (inOtherMount, the tools' holderOf) reaches another mount's
- * directory this way through a symlink the mount follows, so each check that
- * resolves a path canonically asks this too.
+ * with the path to use there, the path beneath its root (`rest`) and its
+ * include; undefined when none does. A path the lexical checks pass
+ * (inOtherMount, the tools' holderOf) reaches another mount's directory this
+ * way through a symlink the mount follows, so each check that resolves a
+ * path canonically asks this too, and names the mount only where
+ * namesNestedPlace says the place is that mount's.
  */
-export function nestedAtReal(real: string, nested: readonly NestedMount[] = []): { name: string; use: string } | undefined {
+export function nestedAtReal(real: string, nested: readonly NestedMount[] = []): { name: string; use: string; rest: string; include?: readonly string[] } | undefined {
   const holder = nested
-    .flatMap((n) => (n.real !== undefined && contained(n.real, real) ? [{ name: n.name, real: n.real }] : []))
+    .flatMap((n) => (n.real !== undefined && contained(n.real, real) ? [{ name: n.name, real: n.real, include: n.include }] : []))
     .sort((a, b) => b.real.length - a.real.length)[0];
   if (!holder) return undefined;
   const rest = relative(holder.real, real).split(sep).join('/');
-  return { name: holder.name, use: rest ? `${holder.name}/${rest}` : holder.name };
+  return { name: holder.name, use: rest ? `${holder.name}/${rest}` : holder.name, rest, include: holder.include };
 }
 
 /**
@@ -921,7 +939,9 @@ export async function observePath(view: MountView, rootReal: string, relativePat
     }
     if (!contained(rootReal, real)) return { kind: 'unobserved', reason: 'a symlink that leaves the mount' };
     const holder = nestedAtReal(real, view.nested);
-    if (holder) return { kind: 'unobserved', reason: leadsInto(view.name, relativePath, holder) };
+    if (holder) {
+      return { kind: 'unobserved', reason: namesNestedPlace(holder.rest, holder.include, target.isDirectory()) ? leadsInto(view.name, relativePath, holder) : 'a symlink that leaves the mount' };
+    }
     if (!target.isFile()) {
       return { kind: 'unobserved', reason: target.isDirectory() ? 'a symlink to a directory, not walked' : 'not a regular file' };
     }
@@ -982,11 +1002,10 @@ async function openContained(
     const found = await linkRefusal(view, rootReal, relativePath, real);
     if (found !== null) return { kind: 'unobserved', reason: await linkReason(view, rootReal, found) };
     if (!info.isFile()) return { kind: 'unobserved', reason: info.isDirectory() ? 'a directory' : 'not a regular file' };
-    if (!contained(rootReal, real)) {
-      return { kind: 'unobserved', reason: view.followSymlinks ? 'a symlink that leaves the mount' : OUTSIDE_PARENT };
-    }
+    const leaves = view.followSymlinks ? 'a symlink that leaves the mount' : OUTSIDE_PARENT;
+    if (!contained(rootReal, real)) return { kind: 'unobserved', reason: leaves };
     const holder = nestedAtReal(real, view.nested);
-    if (holder) return { kind: 'unobserved', reason: leadsInto(view.name, relativePath, holder) };
+    if (holder) return { kind: 'unobserved', reason: namesNestedPlace(holder.rest, holder.include, false) ? leadsInto(view.name, relativePath, holder) : leaves };
     const named = await stat(real, { bigint: true }).catch(() => null);
     if (named === null || named.dev !== info.dev || named.ino !== info.ino) {
       return { kind: 'unobserved', reason: 'the file changed while it was read' };
