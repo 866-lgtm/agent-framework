@@ -1643,9 +1643,17 @@ export const IGNORED = 'ignored by the mount';
 /** The walk's reason for an entry `EDITOR_FILE` names. */
 const EDITOR_FILE_REASON = "an editor's swap or backup file";
 
+/**
+ * The walk's reason for a link it doesn't enter. On a mount with an include,
+ * a link the include's names don't cover that leads to a directory is passed
+ * over with it, by design, since the walk takes no name the include leaves
+ * out as a file.
+ */
+const LINK_NOT_WALKED = 'a symlink, not walked';
+
 /** Whether a reason the walk gave an entry is one it passes over by design. */
 export function passedOverByDesign(why: string | undefined): boolean {
-  return why === IGNORED || why === EDITOR_FILE_REASON || why === OTHER_MOUNT || why === OUTSIDE_INCLUDE;
+  return why === IGNORED || why === EDITOR_FILE_REASON || why === OTHER_MOUNT || why === OUTSIDE_INCLUDE || why === LINK_NOT_WALKED;
 }
 
 /** Why a pass passes over a directory that another mount nested in this one holds, and what lies beneath it. */
@@ -1933,6 +1941,17 @@ export async function walkScope(
       // (a regular file, a FIFO, a socket or a device) is noted as a file,
       // since nothing can lie beneath it.
       if (!entry.isDirectory() && (!insideMount(childRel, view.include) || (judgedDir !== rel && !insideMount(judgedDir === '' ? entry.name : `${judgedDir}/${entry.name}`, view.include)))) {
+        // A link that leads to a directory gets the reason a mount without an
+        // include gives it, a symlink the walk doesn't enter, since the same
+        // holds beneath it as beneath a directory: what's read through it is
+        // judged by its path and where it lands, so its own name doesn't put
+        // what lies there outside. That name is no covered file's, so the
+        // walk passes it over as it does one, rather than taking it.
+        if (entry.isSymbolicLink() && await stat(dir.at(entry.name)).then((info) => info.isDirectory(), () => false)) {
+          others.push([childRel, LINK_NOT_WALKED]);
+          regions.push({ path: childRel, reason: LINK_NOT_WALKED, kind: 'ignored' });
+          continue;
+        }
         others.push([childRel, OUTSIDE_INCLUDE]);
         if (!entry.isSymbolicLink()) otherFiles.push(childRel);
         regions.push({ path: childRel, reason: OUTSIDE_INCLUDE, kind: 'ignored' });
@@ -1946,7 +1965,7 @@ export async function walkScope(
         const symlink = entry.isSymbolicLink();
         leaves.push([childRel, false]);
         others.push([childRel, symlink ? 'a symlink' : 'not a regular file']);
-        if (symlink) regions.push({ path: childRel, reason: 'a symlink, not walked', kind: 'symlink' });
+        if (symlink) regions.push({ path: childRel, reason: LINK_NOT_WALKED, kind: 'symlink' });
       }
     }
     // A listing of a directory that was moved or replaced meanwhile says

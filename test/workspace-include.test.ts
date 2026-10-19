@@ -501,6 +501,47 @@ describe('mount include', () => {
     }
   });
 
+  test("a link the include's names don't cover that leads to a directory is reported as on a mount without an include, as a symlink not walked, while a link to a file or to nothing is outside the include", async (t) => {
+    const OUTSIDE_INCLUDE = "outside the mount's include";
+    type Sync = { incomplete?: Array<{ path: string; reason: string }>; skipped?: Array<{ path: string; reason: string }>; passedOver?: Array<{ reason: string; count: number }> };
+    type Entries = { entries: Array<{ path?: string; name?: string; type: string; state?: string; note?: string }> };
+    const open = async (followSymlinks: boolean, include?: string[]): Promise<WorkspaceModule> => {
+      const env = new Env(t);
+      env.writeDisk('real/a.json', '{}\n');
+      symlinkSync('real', join(env.dir, 'link'));
+      symlinkSync(join('real', 'a.json'), join(env.dir, 'x.txt'));
+      symlinkSync('nowhere', join(env.dir, 'gone'));
+      const m = await env.open({ followSymlinks, ...(include ? { include } : {}) });
+      // What's read through the link is judged by its path and where it lands, both of which `*.json` covers.
+      if (followSymlinks) assert.equal(((await call(m, 'read', { path: 'work/link/a.json' })).content as string).trim(), '1\t{}');
+      return m;
+    };
+    const byPath = (list: Array<{ path: string; reason: string }> | undefined): Record<string, string> => Object.fromEntries((list ?? []).map((r) => [r.path, r.reason]));
+    for (const follow of [true, false]) {
+      const m = await open(follow, ['*.json']);
+      const synced = await call(m, 'sync', {}) as Sync;
+      const label = `${follow ? 'following' : 'not following'} links: ${JSON.stringify(synced)}`;
+      if (follow) {
+        // Beneath it, history the read took in: the link's region, and what that history is skipped for, read as on
+        // a mount without an include.
+        const plain = await call(await open(follow), 'sync', {}) as Sync;
+        assert.equal(byPath(plain.incomplete)['link'], 'a symlink, not walked', JSON.stringify(plain));
+        assert.equal(byPath(synced.incomplete)['link'], 'a symlink, not walked', label);
+        assert.equal(byPath(synced.skipped)['link/a.json'], byPath(plain.skipped)['link/a.json'], `${label}; ${JSON.stringify(plain)}`);
+      } else {
+        // With nothing tracked beneath it, the link is counted with that reason, and the walk took everything else.
+        assert.equal(synced.passedOver?.find((p) => p.reason === 'a symlink, not walked')?.count, 1, label);
+        assert.deepEqual(synced.incomplete ?? [], [], label);
+      }
+      // A link to a file, and one that leads nowhere, are judged by their names, which the include leaves out.
+      assert.equal(synced.passedOver?.find((p) => p.reason === OUTSIDE_INCLUDE)?.count, 2, label);
+      // No listing takes the link's own name as a file, nor calls what lies beneath it outside the include.
+      const listed = await call(m, 'ls', { path: 'work', recursive: true }) as Entries;
+      assert.ok(!listed.entries.some((e) => (e.path ?? e.name) === 'link' && e.type === 'file'), JSON.stringify(listed));
+      assert.ok(listed.entries.every((e) => e.note !== OUTSIDE_INCLUDE), JSON.stringify(listed));
+    }
+  });
+
   test("a link into a nested mount's directory names its target only where that mount's own include covers it, and the outer include covers the link", async (t) => {
     const env = new Env(t);
     env.writeDisk('inner/kept.json', '{}\n');
