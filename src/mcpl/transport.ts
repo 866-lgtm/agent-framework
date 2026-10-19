@@ -413,7 +413,7 @@ export class StdioTransport extends McplTransport {
     // Node's error for a launch that failed reaches the host, and its words
     // and its other properties (`spawnargs`, `path`) can repeat a credential
     // the configuration holds. So it's handed on as its name and redacted
-    // words (maskedError), with its errno code, which says what failed. What
+    // words (maskedError), with its code, which says what failed. What
     // spawn() refuses at once is one of the configuration's own arguments or
     // options, which Node quotes after " Received", cut to 128 characters: a
     // credential across that cut couldn't be matched, so the words stop
@@ -428,7 +428,8 @@ export class StdioTransport extends McplTransport {
     };
     // The child's environment is read first, outside that: a configuration
     // whose `env` can't be read throws the framework's own error, such as
-    // its awareness ledger's, which its startup acts on.
+    // its awareness ledger's, which the framework acts on: its startup ends
+    // on it, and a reconnect reports it.
     const env = buildChildEnv(config);
     let child: ChildProcess;
     try {

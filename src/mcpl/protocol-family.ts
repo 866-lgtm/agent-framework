@@ -132,10 +132,11 @@ export function redactUrl(url: string | undefined): string {
  * whoever wrote the words: a server's words are redacted, then bounded,
  * where an error is built from them, the strings in an error answer's data
  * are redacted ({@link redactedData}), and an error a library raised is
- * handed on as its name and its redacted words alone ({@link maskedError}).
- * A failed handshake's stderr tail is redacted from a longer window of the
- * stream, so a credential of up to 14,336 characters that reaches into it
- * is replaced whole (McplTransport.stderrTailRedacted). A close's or a
+ * handed on as its name and its redacted words alone ({@link maskedError}),
+ * with a stdio launch failure's code. A failed handshake's stderr tail
+ * is redacted from a longer window of the stream, so a credential of up to
+ * 14,336 characters that reaches into it is replaced whole
+ * (McplTransport.stderrTailRedacted). A close's or a
  * cleanup's failure carries the transports' own words, a child's pid, its
  * server's id and the wait it was given, and passes as built. A
  * connection's events are the framework's records' inputs, and the records

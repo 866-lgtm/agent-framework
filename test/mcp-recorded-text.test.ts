@@ -815,7 +815,7 @@ test("a launch that wrote nothing to stderr has no stderr tail, even while its c
   });
 });
 
-test("a stdio server that can't be started is refused without its command line, which can repeat a credential, and with its errno code", async () => {
+test("a stdio server that can't be started is refused without its command line, which can repeat a credential, and with its code", async () => {
   const token = 'envSecret0123456789';
   // The command's path and an argument both repeat the credential.
   const missing = (at: string) => `/nonexistent/${at}/mcpl-server-that-is-not-here`;
@@ -826,6 +826,14 @@ test("a stdio server that can't be started is refused without its command line, 
     assert.equal(cause.code, 'ENOENT');
     for (const kept of ['spawnargs', 'path', 'syscall', 'errno']) assert.equal((cause as unknown as Record<string, unknown>)[kept], undefined, kept);
     assert.ok(!inspect(error, { depth: 5, showHidden: true }).includes(token), inspect(error, { depth: 5 }));
+    return true;
+  });
+  // A failure Node reports on a tick after keeps its words whole, redacted,
+  // even where they hold " Received": they quote the command, not a value
+  // Node refused.
+  const received = '/nonexistent/x Received y/mcpl-server-that-is-not-here';
+  await assert.rejects(McplServerConnection.connect({ id: 'received', command: received, env: { API_TOKEN: token } }, { version: '0.5' }), (error: Error) => {
+    assert.equal(error.message, `MCPL server "received" could not be started: spawn ${received} ENOENT`);
     return true;
   });
   // An argument or an env value Node refuses at spawn() itself, before any
@@ -840,6 +848,7 @@ test("a stdio server that can't be started is refused without its command line, 
       assert.equal(error.message, `MCPL server "${id}" could not be started: ${said}`);
       const cause = error.cause as NodeJS.ErrnoException;
       assert.equal(cause.message, said);
+      assert.equal(cause.name, 'TypeError');
       assert.equal(cause.code, 'ERR_INVALID_ARG_VALUE');
       assert.ok(!inspect(error, { depth: 5, showHidden: true }).includes(token.slice(0, 8)), inspect(error, { depth: 5 }));
       return true;

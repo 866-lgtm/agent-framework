@@ -30,14 +30,14 @@
   ones before that. A redacted key that comes out the same as another key is
   numbered (`redacted (2)`), and data nested past 64 levels reads
   `[withheld: nested too deep to redact]`. A failed handshake's `stderrTail`
-  is the same end of the server's stderr, with every credential that reaches
-  into it, up to 14,336 characters long, replaced whole. A library's error
-  is handed on as its name and its redacted words alone. A legacy stdio
-  server that couldn't be started is refused with its words redacted and a
-  `cause` that keeps Node's error's name, its redacted words and its errno
-  `code`, and nothing else of it; when Node refuses an argument or an env
-  value at once, the words leave the value out.
-  `McplUnreapedLaunchError.connection` isn't enumerable. With a
+  is the same end of the server's stderr, with every credential of up to
+  14,336 characters that reaches into it replaced whole. A library's error
+  is handed on as its name and its redacted words alone, with a launch
+  failure's `code`: a legacy stdio server that couldn't be started is
+  refused with its words redacted and a `cause` that keeps Node's error's
+  name, those words and its `code`, and nothing else of it; when Node
+  refuses an argument or an env value at once, the words leave the value
+  out. `McplUnreapedLaunchError.connection` isn't enumerable. With a
   configuration that can't be read, the server's words are withheld, as the
   records already withhold them, and an error answer's data is withheld
   whole.
