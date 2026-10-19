@@ -10,6 +10,11 @@ export interface AgentUsage {
   agentName: string;
   usage: SessionUsage;
   inferenceCount: number;
+  /** Set on the one entry that holds every ephemeral agent's usage together
+   *  (agentName EPHEMERAL_USAGE_NAME), apart from any agent of that name. Each
+   *  ephemeral agent runs under a new name, so an entry per name would grow
+   *  the record by one for every run, for good. */
+  ephemeral?: true;
 }
 
 export interface SessionUsageSnapshot {

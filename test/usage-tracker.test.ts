@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { UsageTracker } from '../src/usage/usage-tracker.js';
+import { EPHEMERAL_USAGE_NAME, UsageTracker } from '../src/usage/usage-tracker.js';
 import type { UsageUpdatedEvent } from '../src/usage/types.js';
 
 describe('UsageTracker', () => {
@@ -153,6 +153,55 @@ describe('UsageTracker', () => {
     assert.equal(snap.inferenceCount, 2);
     assert.ok(snap.totals.estimatedCost);
     assert.ok(Math.abs(snap.totals.estimatedCost.total - 0.03) < 1e-10);
+  });
+
+  it('counts every ephemeral agent in one shared entry, apart from an agent of its name, and the trace still names each', () => {
+    const { tracker, traces } = createTracker();
+    tracker.onInferenceCompleted('spawn-a-1', { inputTokens: 100, outputTokens: 50 }, { total: 0.01, currency: 'USD' }, true);
+    tracker.onInferenceCompleted('spawn-b-2', { inputTokens: 200, outputTokens: 75 }, { total: 0.02, currency: 'USD' }, true);
+    tracker.onInferenceCompleted(EPHEMERAL_USAGE_NAME, { inputTokens: 7, outputTokens: 3 });
+
+    const snap = tracker.getSnapshot();
+    assert.deepEqual(snap.byAgent.map((a) => [a.agentName, a.ephemeral, a.inferenceCount, a.usage.inputTokens]), [
+      [EPHEMERAL_USAGE_NAME, undefined, 1, 7],
+      [EPHEMERAL_USAGE_NAME, true, 2, 300],
+    ]);
+    const shared = snap.byAgent.find((a) => a.ephemeral)!;
+    assert.ok(Math.abs(shared.usage.estimatedCost!.total - 0.03) < 1e-10);
+    // The snapshot holds a copy: changing it changes nothing kept.
+    shared.usage.inputTokens = 0;
+    shared.usage.estimatedCost!.total = 0;
+    const kept = tracker.getSnapshot().byAgent.find((a) => a.ephemeral)!;
+    assert.equal(kept.usage.inputTokens, 300);
+    assert.ok(Math.abs(kept.usage.estimatedCost!.total - 0.03) < 1e-10);
+    assert.equal(snap.totals.inputTokens, 307);
+    assert.equal(snap.inferenceCount, 3);
+    assert.deepEqual(traces.map((e) => e.agentName), ['spawn-a-1', 'spawn-b-2', EPHEMERAL_USAGE_NAME]);
+  });
+
+  it('restores the shared entry, and folds into it each stored entry wasEphemeral names', () => {
+    const { tracker } = createTracker();
+    tracker.onInferenceCompleted('resident', { inputTokens: 1000, outputTokens: 500 });
+    tracker.onInferenceCompleted('spawn-new', { inputTokens: 40, outputTokens: 4 }, undefined, true);
+    const stored = JSON.parse(JSON.stringify(tracker.toJSON()));
+    // Entries an earlier release stored for each ephemeral agent by its own name.
+    stored.byAgent.push(
+      { agentName: 'spawn-old-1', usage: { inputTokens: 100, outputTokens: 10, cacheCreationTokens: 0, cacheReadTokens: 0 }, inferenceCount: 1 },
+      { agentName: 'spawn-old-2', usage: { inputTokens: 200, outputTokens: 20, cacheCreationTokens: 0, cacheReadTokens: 0 }, inferenceCount: 2 },
+    );
+    const restored = new UsageTracker({
+      emitTrace: () => {},
+      restored: stored,
+      wasEphemeral: (name) => name.startsWith('spawn-old-'),
+    });
+    restored.onInferenceCompleted('spawn-later', { inputTokens: 1, outputTokens: 1 }, undefined, true);
+
+    const snap = restored.getSnapshot();
+    assert.deepEqual(snap.byAgent.map((a) => [a.agentName, a.ephemeral, a.inferenceCount, a.usage.inputTokens, a.usage.outputTokens]), [
+      ['resident', undefined, 1, 1000, 500],
+      [EPHEMERAL_USAGE_NAME, true, 5, 341, 35],
+    ]);
+    assert.deepEqual(JSON.parse(JSON.stringify(restored.toJSON())).byAgent.map((a: { agentName: string }) => a.agentName), ['resident', EPHEMERAL_USAGE_NAME]);
   });
 
   it("a usage without a count adds nothing for it, so the totals stay numbers and are stored as numbers", () => {
