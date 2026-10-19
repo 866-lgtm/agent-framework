@@ -1,12 +1,14 @@
 /**
  * Content context-manager won't store is refused where the framework writes
  * it, whether the write would be stored at once or deferred while a turn
- * runs, as the store's own write and edit refuse it: a module's write, an
- * edit of a write still held for the turn's end, and a process response's
- * messages throw context-manager's MalformedContentError. Before, a deferred
- * write was refused only at a later flush, where the writer never heard of
- * it, and a held write's edit could replace valid content with content the
- * drain then dropped.
+ * runs, as the store's own write and edit refuse it: a module's write, and
+ * its edit of a write still held for the turn's end, throw
+ * context-manager's MalformedContentError. A process response with such
+ * content is refused whole before any response applies, with a line and a
+ * trace, and throws nothing; the API's message.send refuses content that
+ * isn't text at its call. Before, a deferred write was refused only at a
+ * later flush, where the writer never heard of it, and a held write's edit
+ * could replace valid content with content the drain then dropped.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -16,7 +18,7 @@ import { join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
 import { MalformedContentError } from '@animalabs/context-manager';
 import type { Module, ModuleContext, ProcessEvent, ProcessState, EventResponse, ToolDefinition, ToolCall, ToolResult } from '../src/index.js';
-import { AgentFramework } from '../src/index.js';
+import { AgentFramework, ApiServer } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 const text = (t: string): ContentBlock[] => [{ type: 'text', text: t } as ContentBlock];
@@ -58,6 +60,7 @@ async function harness(modules: Writer[]) {
     storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
     agents: [{ name: 'assistant', model: 'test', systemPrompt: 'test' }],
     modules,
+    processLogging: { persist: true },
   });
   const errors: string[] = [];
   const error = console.error;
@@ -157,6 +160,30 @@ test("a process response with a malformed message or edit is refused whole, queu
   const completed = x.traces.filter((e) => e.type === 'process:completed' && (e.processEvent as { type: string }).type === 'ping');
   assert.deepEqual(completed.map((e) => (e.responses as Array<{ moduleName: string }>).map((r) => r.moduleName)), [['good']],
     'the trace lists only the response that applied');
+  const logged = x.framework.queryProcessLogs({ eventType: 'ping' }).entries
+    .map(({ entry }) => (entry.responses as Array<{ moduleName: string }>).map((r) => r.moduleName));
+  assert.deepEqual(logged, [['good']], 'and so does the process log');
+  assert.deepEqual(
+    x.traces.filter((e) => e.type === 'process:response-refused').map((e) => [e.moduleName, e.eventType, e.where, (e.places as string[]).length > 0]),
+    [['bad', 'ping', 'addMessages[1]', true], ['bad-edit', 'ping', 'editMessages[0]', true]],
+    'a trace names each refused response',
+  );
+});
+
+test("the API's message.send refuses content that isn't text, before any module sees it", async (t) => {
+  const writer = new Writer();
+  const x = await harness([writer]); t.after(x.close);
+  const server = new ApiServer(x.framework, { port: 0 });
+  const send = (content: unknown) =>
+    (server as unknown as { cmdMessageSend(p: unknown): Promise<unknown> }).cmdMessageSend({ participant: 'user', content });
+  await assert.rejects(send(5), /content must be text/);
+  await assert.rejects(send([{ type: 'text', text: 'blocks' }]), /content must be text/);
+  await x.framework.runUntilIdle();
+  const apiEvents = () => x.traces.filter((e) => e.type === 'process:received' && (e.processEvent as { type: string }).type === 'api:message').length;
+  assert.equal(apiEvents(), 0, 'no event was queued');
+  assert.deepEqual(await send('hello'), { messageId: 'pending' }, 'text is accepted as before');
+  await x.framework.runUntilIdle();
+  assert.equal(apiEvents(), 1, 'and its event queued');
 });
 
 test("console input whose only message is refused isn't counted as accepted", async (t) => {

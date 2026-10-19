@@ -33,8 +33,22 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'process:completed';
       processEvent: ProcessEvent;
+      /** The modules' responses that applied: one refused for malformed
+       *  content is left out, and named by process:response-refused. */
       responses: ModuleProcessResponse[];
       durationMs: number;
+    })
+  /** A module's process response held content context-manager won't store,
+   *  in a message it adds or an edit it makes, and was refused whole before
+   *  any response to the event applied. `where` names the first such message
+   *  or edit in the response, such as `addMessages[1]`, and `places` is
+   *  malformedContentPlaces' answer for it. */
+  | (TraceEventBase & {
+      type: 'process:response-refused';
+      moduleName: string;
+      eventType: string;
+      where: string;
+      places: string[];
     })
 
   // Inference lifecycle

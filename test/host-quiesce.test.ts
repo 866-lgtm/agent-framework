@@ -1417,7 +1417,12 @@ test('a recovered deferred write context-manager refuses as malformed is dropped
     const file = join(storePath, 'recovery', 'deferred-writes.json');
     const doc = JSON.parse(readFileSync(file, 'utf8')) as { pending: Array<Record<string, unknown>> };
     assert.equal(doc.pending.length, 2);
-    doc.pending.push({ id: 'number-text', seq: 100, participant: 'user', content: [{ type: 'text', text: 5 }] });
+    // Between the two writes, so the second is queued behind it: the second
+    // moves up one seq, and the malformed entry takes its place.
+    const second = doc.pending[1]!;
+    const seq = second.seq as number;
+    second.seq = seq + 1;
+    doc.pending.splice(1, 0, { id: 'number-text', seq, participant: 'user', content: [{ type: 'text', text: 5 }] });
     writeFileSync(file, JSON.stringify(doc));
 
     framework = await AgentFramework.create(config());

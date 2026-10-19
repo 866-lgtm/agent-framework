@@ -298,18 +298,19 @@ const isConversationalInjection = (metadata?: MessageMetadata): boolean => {
 };
 
 /**
- * Where a module's process response holds content context-manager won't
- * store, in a message it adds or an edit it makes, in the words of the
- * store's own refusal; null when it holds none.
+ * The first message a module's process response adds, or edit it makes,
+ * whose content context-manager won't store: `where` names it in the
+ * response, such as `addMessages[1]`, and `places` is malformedContentPlaces'
+ * answer for it. Null when the response holds none.
  */
-function malformedResponseContent(response: EventResponse): string | null {
+function malformedResponseContent(response: EventResponse): { where: string; places: string[] } | null {
   const writes = [
     ...(response.addMessages ?? []).map((msg, i) => [`addMessages[${i}]`, msg.content] as const),
     ...(response.editMessages ?? []).map((edit, i) => [`editMessages[${i}]`, edit.content] as const),
   ];
   for (const [where, content] of writes) {
     const places = malformedContentPlaces(content);
-    if (places.length > 0) return new MalformedContentError(`${where} refused`, places).message;
+    if (places.length > 0) return { where, places };
   }
   return null;
 }
@@ -1943,8 +1944,8 @@ function boundFailureFields(record: Record<string, unknown>): Record<string, unk
  *   adapter files every status it doesn't list (404, 405, 409, 410, 413,
  *   415, 422 …) as invalid_request, so it alone produces an invalid_request
  *   at 413 or 422, and no 0.5.86 adapter produces a context_length at 413.
- * - From membrane 0.5.87 (membrane #56 and #107), this package's floor, every
- *   adapter sends an HTTP failure through one status table
+ * - From membrane 0.5.87 (membrane #56 and #107), below this package's
+ *   floor, every adapter sends an HTTP failure through one status table
  *   (errorFromProviderStatus). On a 400 or 422, auth codes and reasons and
  *   the two account refusals it recognizes by their text (a balance too low,
  *   usage limits reached) are auth, and a context overflow, by its code or
@@ -6771,11 +6772,13 @@ export class AgentFramework {
     // its reads leave one out; an older store kept it as given, and since the
     // context manager's token estimate keys a WeakMap on each block, every
     // compile for that agent then threw, and a restart didn't clear it. What a
-    // block holds, such as a tool result's content, isn't checked here, as it
-    // isn't for a fresh write. The framework writes `forAgent` only as a
-    // non-empty name, so another value comes from damage or a hand edit, and
-    // the agent it meant can't be known: sent to the primary, as a falsy one
-    // would be, it could put another agent's message in the primary's window.
+    // block holds, such as a tool result's content, isn't checked here: a
+    // recovered write whose content context-manager refuses is dropped at the
+    // flush that meets it (writeDrainedInOrder). The framework writes
+    // `forAgent` only as a non-empty name, so another value comes from damage
+    // or a hand edit, and the agent it meant can't be known: sent to the
+    // primary, as a falsy one would be, it could put another agent's message
+    // in the primary's window.
     const wellFormed = (m: unknown): m is Omit<DeferredWrite, 'id' | 'seq' | 'heldAt'> & { id?: unknown; seq?: unknown; heldAt?: unknown } => {
       if (!m || typeof m !== 'object') return false;
       const { participant, content, forAgent } = m as { participant?: unknown; content?: unknown; forAgent?: unknown };
@@ -11245,16 +11248,23 @@ export class AgentFramework {
     // it adds or an edit it makes, is refused whole before any response is
     // applied: none of it is applied, its module state update and inference
     // request included, so no turn runs for content that was never stored,
-    // and it doesn't count as accepting a surface's input. A line names the
-    // module, and the other modules' responses apply. The trace and the
-    // process log list the responses that applied, so a view built on them
-    // doesn't show a refused response's messages as the event's.
+    // and it doesn't count as accepting a surface's input. A line and a
+    // trace name the module and where, and the other modules' responses
+    // apply. process:completed and the process log list the responses that
+    // applied, so a view built on them doesn't show a refused response's
+    // messages as the event's. A store error while a response applies, such
+    // as a shard the store refuses when a strategy's chunking makes one,
+    // propagates as any store error does.
     const applying = responses.filter(({ moduleName, response }) => {
       const refusal = malformedResponseContent(response);
-      if (refusal !== null) {
-        console.error(`[process-response-refused] module=${moduleName} event=${event.type} reason=malformed-content: ${logDetail(refusal)}`);
-      }
-      return refusal === null;
+      if (refusal === null) return true;
+      const { where, places } = refusal;
+      console.error(
+        `[process-response-refused] module=${moduleName} event=${event.type} reason=malformed-content: ` +
+        logDetail(new MalformedContentError(`${where} refused`, places).message),
+      );
+      this.emitTrace({ type: 'process:response-refused', moduleName, eventType: event.type, where, places });
+      return false;
     });
 
     // Apply responses. Console/API input is conversation from a non-channel

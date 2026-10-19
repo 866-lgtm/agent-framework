@@ -125,33 +125,48 @@ test('push: a tool_use whose input is not an object is mended by the store, so i
   assert.deepEqual(stored?.input, {}, 'with its input mended to an object');
 });
 
-test("channel: with conversation routing on, a malformed message that would bind a fork spawns none and stores nothing", async (t) => {
+test("channel: with conversation routing on, a malformed message that would bind a fork spawns none and stores nothing, where the same message well-formed binds one", async (t) => {
   const x = await harness({ conversations: { templateAgent: 'assistant', bind: { channel: 'mention' } } } as never);
   t.after(x.close);
   const agents = () => x.framework.getAllAgents().length;
   const before = agents();
-  const placement = await (x.framework as any).handleMcplChannelIncoming({
-    type: 'mcpl:channel-incoming', serverId: 'srv', channelId: 'slack:C1', messageId: 'm2',
-    author: { id: 'U1', name: 'alice' }, content: ['bot, help'], timestamp: TS, triggerInference: true,
+  const message = (messageId: string, content: unknown[]) => (x.framework as any).handleMcplChannelIncoming({
+    type: 'mcpl:channel-incoming', serverId: 'srv', channelId: 'slack:C1', messageId,
+    author: { id: 'U1', name: 'alice' }, content, timestamp: TS, triggerInference: false,
     metadata: { mentioned: true },
   });
+  // Visible text beside a malformed block, so the empty-content check would
+  // let it through and only the malformed-content check stops it.
+  const placement = await message('m2', [{ type: 'text', text: 'bot, help' }, { type: 'image', source: 'not-an-object' }]);
   await x.framework.runUntilIdle();
   assert.equal(placement, undefined, 'nothing was placed');
   assert.equal(agents(), before, 'no fork was spawned');
   assert.deepEqual(x.traces.filter((e) => String(e.type).startsWith('mcpl:conversation-')), [], 'nor bound');
   assert.deepEqual(x.added, [], 'no row traced');
   assert.equal(x.refused.length, 1, 'refused instead');
+  await message('m3', [{ type: 'text', text: 'bot, help' }]);
+  await x.framework.runUntilIdle();
+  assert.equal(agents(), before + 1, 'the same message well-formed spawns a fork');
 });
 
-test('push: absent content is the empty-content check\'s, not refused as malformed', async (t) => {
-  const x = await harness(); t.after(x.close);
-  const placement = (x.framework as any).handleMcplPushEvent({
-    type: 'mcpl:push-event', serverId: 'module', featureSet: 'fs', eventId: 'e3',
-    content: undefined, timestamp: TS, inferenceId: 'i', triggerInference: true,
+for (const lane of ['push', 'channel'] as const) {
+  test(`${lane}: absent content, undefined or null, is the empty-content check's, not refused as malformed`, async (t) => {
+    const x = await harness(); t.after(x.close);
+    for (const [id, content] of [['e3', undefined], ['e4', null]] as const) {
+      const placement = lane === 'push'
+        ? (x.framework as any).handleMcplPushEvent({
+            type: 'mcpl:push-event', serverId: 'module', featureSet: 'fs', eventId: id,
+            content, timestamp: TS, inferenceId: 'i', triggerInference: true,
+          })
+        : await (x.framework as any).handleMcplChannelIncoming({
+            type: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:c', messageId: `m-${id}`, eventId: id,
+            author: { id: 'u', name: 'User' }, content, timestamp: TS, triggerInference: true,
+          });
+      await x.framework.runUntilIdle();
+      assert.equal(placement, undefined, `${String(content)}: nothing was placed`);
+    }
+    assert.deepEqual(x.refused, [], 'no malformed-content refusal');
+    assert.deepEqual(x.traces.filter((e) => e.type === 'mcpl:empty-content-dropped').map((e) => e.lane), [lane, lane]);
+    assert.deepEqual(x.added, []);
   });
-  await x.framework.runUntilIdle();
-  assert.equal(placement, undefined, 'nothing was placed');
-  assert.deepEqual(x.refused, [], 'no malformed-content refusal');
-  assert.deepEqual(x.traces.filter((e) => e.type === 'mcpl:empty-content-dropped').map((e) => [e.lane, e.eventId]), [['push', 'e3']]);
-  assert.deepEqual(x.added, []);
-});
+}

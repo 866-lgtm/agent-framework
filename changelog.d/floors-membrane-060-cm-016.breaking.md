@@ -26,8 +26,9 @@
     can change there, so a provider's prompt cache misses from that point,
     once (context-manager 0.16.0).
   - **Tools given `null` arguments:** an OpenAI-family tool call whose
-    arguments are the text `null` reaches the tool as `{}`, with the text in
-    `unparseableInput`, where it reached it as `null` (membrane 0.6.0).
+    arguments are the text `null` reaches the tool as `{}`, where it reached
+    it as `null`. membrane keeps the arguments' text on the `tool_use` block
+    as `unparseableInput` (membrane 0.6.0).
   - **Anthropic streams:** after a stream's first event, SSE `ping`
     keepalives now count as activity for its idle deadline, so a stream that
     keeps sending only pings no longer ends at it (membrane 0.6.0).
