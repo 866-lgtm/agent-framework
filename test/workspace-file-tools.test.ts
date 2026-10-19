@@ -4,7 +4,7 @@
 import { spawnSync } from 'node:child_process';
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
@@ -647,6 +647,21 @@ test("a read whose disk copy can't be checked says it shows the workspace's copy
   assert.deepEqual((await call('read', { path: 'work/u.txt' })).data, {
     path: 'work/u.txt', totalLines: 1, fromLine: 1, toLine: 1,
     note: "The path couldn't be checked against disk (a directory), so this read shows the workspace's copy.",
+    content: '     1\theld',
+  });
+});
+
+test("a read of a held file whose mount's root is gone says disk couldn't be checked, and not to read again", async (t) => {
+  // The pass reports the path as unverified and leaves the root's region
+  // incomplete. It didn't give up on a branch that kept changing, so reading
+  // again won't check it.
+  const { dir, call } = setup(t);
+  writeFileSync(join(dir, 'u.txt'), 'held\n');
+  assert.equal((await call('read', { path: 'work/u.txt' })).success, true);
+  renameSync(dir, join(dir, '..', 'gone'));
+  assert.deepEqual((await call('read', { path: 'work/u.txt' })).data, {
+    path: 'work/u.txt', totalLines: 1, fromLine: 1, toLine: 1,
+    note: "The path couldn't be checked against disk (the mount root is unavailable), so this read shows the workspace's copy.",
     content: '     1\theld',
   });
 });

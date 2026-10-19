@@ -52,6 +52,11 @@ test('a CRLF file reads as its lines without the CR, and says so', async t => {
   const page = (await readMixed()).data as LinePage;
   assert.equal(page.content, '     1\ta\n     2\tb\n     3\tc\n     4\td');
   assert.equal(page.note, 'Line ends are mixed, 2 CRLF and 1 LF, and a CRLF end is shown without its CR. An edit matches text as read shows it, and keeps each line\'s end.');
+  // One line whose own text ends in a CR, in a file of mixed ends: the note counts it, in the singular.
+  const { read: readKept } = await setup(t, 'x\r\r\ny\nz\r\n');
+  const kept = (await readKept()).data as LinePage;
+  assert.equal(kept.content, '     1\tx\r\r\n     2\ty\n     3\tz');
+  assert.equal(kept.note, 'Line ends are mixed, 2 CRLF and 1 LF, and a CRLF end is shown without its CR, except on 1 line whose own text ends in a CR, which shows both CRs. An edit matches text as read shows it, and keeps each line\'s end.');
   // A CR that doesn't end a line is the line's own.
   const { read: readCr } = await setup(t, 'a\rb\n');
   assert.deepEqual((await readCr()).data, { path: 'work/text.txt', totalLines: 1, fromLine: 1, toLine: 1, content: '     1\ta\rb' });
@@ -237,6 +242,26 @@ test('a first line that alone would pass the limit is cut where it fits', async 
   assert.equal(tiny.toLine, 1);
   assert.equal(tiny.content, '     1\t [… 1500 more chars; read them with offsetChars=0]');
   assert.match(tiny.note!, /Line 1 is cut: read its rest with offsetChars=0 and limitChars=1500, then continue with offset=2\.$/);
+});
+
+test("a first line cut to fit stays within 2,000 characters, though a longer cut would fit once its rest loses a digit", async t => {
+  const { read } = await setup(t, 'a'.repeat(3_000));
+  const withCut = (page: LinePage, cut: number) => JSON.stringify({
+    ...page,
+    note: `Line 1 is cut: read its rest with offsetChars=${cut} and limitChars=${3_000 - cut}.`,
+    content: `     1\t${'a'.repeat(cut)} [… ${3_000 - cut} more chars; read them with offsetChars=${cut}]`,
+  }).length;
+  const shape = (await read({}, 24_000)).data as LinePage;
+  // At this limit the cut at 2,000 is a character too long, and the cut at
+  // 2,001 would fit, since its rest's length, 999, has a digit fewer than
+  // 1,000, in the marker and in the note.
+  const limit = withCut(shape, 2_000) - 1;
+  assert.equal(withCut(shape, 2_001), limit);
+  const result = await read({}, limit);
+  assert.ok(stored(result) <= limit, `${stored(result)} > ${limit}`);
+  const page = result.data as LinePage;
+  assert.equal(/^ {5}1\t(a*) \[/.exec(page.content)![1].length, 1_999);
+  assert.equal(stored(result), withCut(page, 1_999));
 });
 
 test("a first line cut to fit is the longest cut that fits, where the rest's length loses a digit too", async t => {

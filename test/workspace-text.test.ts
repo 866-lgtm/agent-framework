@@ -22,6 +22,10 @@ test('fileText gives the lines read shows, where each starts, and what the text 
   assert.deepEqual([crKept.crlfEnds, crKept.lfEnds, crKept.crKept], [3, 0, 2]);
   assert.equal(fileText(Buffer.from('\r\r\n')).crKept, 1);
   assert.equal(fileText(Buffer.from('a\r\n\r\n')).crKept, 0, 'an empty line after a CRLF end is no CR of its own');
+  // A line ended by a bare LF keeps nothing, though a CR sits before its last character.
+  const lfLine = fileText(Buffer.from('a\rb\nc\r\n'));
+  assert.deepEqual(lfLine.lines, ['a\rb', 'c']);
+  assert.deepEqual([lfLine.crlfEnds, lfLine.lfEnds, lfLine.crKept], [1, 1, 0]);
 
   const crlf = fileText(Buffer.from('one\r\ntwo\nthree'));
   assert.deepEqual(crlf.starts, [0, 5, 9]);
