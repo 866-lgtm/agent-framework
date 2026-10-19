@@ -444,7 +444,7 @@ test('an ending the module can\'t read out is answered as out of memory, and tha
   for (const [script, kind, message] of [
     ['tool("a"); tool("b"); ({ ok: true })', 'rejected', 'out of memory while serializing the script\'s return value; return less, or let go of data the script no longer needs'],
     ['tool("a"); tool("b"); throw new Error("x")', 'rejected', 'out of memory while reading what the script threw; throw something smaller, such as an Error with a shorter message, or let go of data the script no longer needs'],
-    ['tool("a"); tool("b"); queueMicrotask(() => { throw new TypeError("x") }); 1', 'failed', 'out of memory while reading the exception that ended the run; throw something smaller, catch it in the callback that threw it, or let go of data the script no longer needs'],
+    ['tool("a"); tool("b"); queueMicrotask(() => { throw new TypeError("x") }); 1', 'failed', 'out of memory while reading the exception that ended the run; let go of data the script no longer needs, and if a callback given to queueMicrotask or a FinalizationRegistry threw it, throw something smaller or catch it there'],
   ] as const) {
     let reads = 0;
     const { e } = await engineAround((ex) => ({ engine_result: () => (++reads === 1 ? 0 : ex.engine_result()) }));
@@ -464,7 +464,7 @@ test('an ending longer than the binding can decode is answered with its length, 
   for (const [script, length, kind, message] of [
     ['({ ok: true })', 600_000_000, 'rejected', 'the script\'s return value comes to 600000000 bytes as text, more than the 536870888 the engine reads back; return less'],
     ['throw new Error("x")', 600_000_000, 'rejected', 'what the script threw comes to 600000000 bytes as text, more than the 536870888 the engine reads back; throw something smaller'],
-    ['queueMicrotask(() => { throw new TypeError("x") }); 1', 600_000_000, 'failed', 'the exception that ended the run comes to 600000000 bytes as text, more than the 536870888 the engine reads back; throw something smaller, or catch it in the callback that threw it'],
+    ['queueMicrotask(() => { throw new TypeError("x") }); 1', 600_000_000, 'failed', 'the exception that ended the run comes to 600000000 bytes as text, more than the 536870888 the engine reads back; if a callback given to queueMicrotask or a FinalizationRegistry threw it, throw something smaller or catch it there'],
     // One byte past the bound is refused too.
     ['({ ok: true })', 536_870_889, 'rejected', 'the script\'s return value comes to 536870889 bytes as text, more than the 536870888 the engine reads back; return less'],
   ] as const) {
@@ -553,6 +553,67 @@ test('a stop while the exception that ended the run is read leaves the run faile
   const t = b.e.start(PRELUDE, `${thrower}; 1`, 's.js');
   assert.deepEqual([t.kind, (t as { name?: string }).name], ['failed', 'InternalError']);
   b.e.dispose();
+});
+
+test('a stop asked for once stays a stop, and what it cuts off a failure\'s read is left out, not made up', async () => {
+  // The interrupt slot says stop once only. The thrown object's name getter spins until then; its
+  // message getter would spin on for a while, and then give "late". Neither runs on after the stop,
+  // and the message isn't replaced by the object's JSON or string form.
+  let checks = 0;
+  const { e } = await engine({ interrupt: () => ++checks === 101 });
+  const s = e.start(PRELUDE, 'queueMicrotask(() => { throw { get name() { for (;;) {} }, get message() { for (let i = 0; i < 3e7; i++) {} return "late" } } }); 1', 's.js');
+  assert.deepEqual(s, { kind: 'failed', name: '', message: '' });
+  assert.equal(checks, 101);
+  e.dispose();
+});
+
+test('a stop while a throw at the start is read stays a stop, which later calls answer without reading it again', async () => {
+  // The prelude makes a call, then throws an object whose message getter spins until the stop:
+  // the script's own ending, cut off by a stop, as a rejection's would be.
+  let checks = 0, reads = 0;
+  const { e } = await engineAround((ex) => ({ engine_result: () => { reads++; return ex.engine_result(); } }), { interrupt: () => ++checks > 100 });
+  const prelude = '__host("a", "{}"); throw { get message() { for (;;) {} } };';
+  assert.deepEqual(e.start(prelude, '1', 's.js'), { kind: 'interrupted' });
+  assert.deepEqual(e.settle(1, true, '1', UNFIT), { kind: 'interrupted', dropped: true });
+  assert.equal(reads, 1, 'the ending was read again');
+  e.dispose();
+});
+
+test('a settle whose resolve call is stopped on its way in is dropped, and the stop isn\'t taken for a failure', async () => {
+  // QuickJS asks the interrupt slot at its first check and then once in 10,000, and makes a check
+  // on the way into each call. A script making k calls to an empty function before it awaits call
+  // 2 puts the next asking at a place set by k: the largest k whose start asks no more than with
+  // none puts it on the first check the settle makes, the one on the way into the promise's
+  // resolve function.
+  const script = (k: number) => `const f = () => {}; tool("a"); ${'f();'.repeat(k)} const v = await tool("b"); print("ran"); v`;
+  async function askedInStart(k: number) {
+    let asked = 0;
+    const { e } = await engine({ interrupt: () => { asked++; return false; } });
+    e.start(PRELUDE, script(k), 's.js');
+    e.dispose();
+    return asked;
+  }
+  const none = await askedInStart(0);
+  let lo = 0, hi = 20_000;
+  assert.ok((await askedInStart(hi)) > none);
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if ((await askedInStart(mid)) > none) hi = mid;
+    else lo = mid;
+  }
+  async function settledStopped(k: number) {
+    let stop = false;
+    const { e, rec } = await engine({ interrupt: () => stop });
+    e.start(PRELUDE, script(k), 's.js');
+    stop = true;
+    const s = e.settle(2, true, '2', UNFIT);
+    e.dispose();
+    return { s, ran: rec.output.length > 0 };
+  }
+  assert.deepEqual(await settledStopped(lo), { s: { kind: 'interrupted', dropped: true }, ran: false });
+  // One call fewer, the asking falls just after the resolve function ran: the result is handed over.
+  const after = await settledStopped(lo - 1);
+  assert.equal(after.s.dropped, undefined, JSON.stringify(after));
 });
 
 test('a result that reaches a stopped run is dropped', async () => {

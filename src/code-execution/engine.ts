@@ -38,9 +38,11 @@ export interface EngineSlots {
   hostCall(callId: number, name: string, argsJson: string): void;
   /**
    * Called while the guest runs, every few thousand of its operations. Return true to stop it for
-   * good: the call in progress answers `interrupted`, and so does every call after. The one
-   * exception is a stop in the jobs that reading the script's ending queued, after the ending was
-   * read whole: that call answers the ending, and the calls after it answer `interrupted`.
+   * good: the engine doesn't ask again, the call in progress answers `interrupted`, and so does
+   * every call after, with two exceptions. A stop in the jobs that reading the script's ending
+   * queued, after the ending was read whole, lets that call answer the ending, and the calls after
+   * it answer `interrupted`. And a run that has failed stays `failed`, a stop while its exception
+   * is read included.
    */
   interrupt(): boolean;
   /** The guest called `__output(stream, text)`: stream 1 is out, 2 is err. */
@@ -67,8 +69,10 @@ export type RunState =
    * Once the script was running, an exception escaped its promises and ended the run, even after
    * its own ending: a callback it gave `queueMicrotask` or a `FinalizationRegistry` threw, or a job
    * failed in the engine itself; or the engine couldn't settle a call. The fields are the
-   * exception's, as for `rejected`, less any part a stop cut off while it was read. Every later
-   * call answers the same, a stop after it included, and no later result reaches the script.
+   * exception's, read as the engine reads a `rejected` one (an Error's name, message and stack; a
+   * value with no message of its own, its JSON or string form), less any part a stop cut off while
+   * it was read. Every later call answers the same, a stop after it included, and no later result
+   * reaches the script.
    */
   | { kind: 'failed'; name: string; message: string; stack?: string }
   /** `interrupt()` returned true while it ran. */
@@ -77,12 +81,13 @@ export type RunState =
 /**
  * What `settle` answers: the run's state; `unfit` when the guest couldn't take the result, for
  * want of memory to copy it in or of memory or stack to parse it, and the call took the child's
- * own error instead; and `dropped` when the call never took either, because the run had been
- * stopped or had failed before this settle (`interrupted` or `failed`), or the step that hands it
- * over was stopped or failed before it ran. Without `dropped`, the call's promise took the result
- * or the child's error, and the script's own code runs with it, a `then` getter it put on
- * Object.prototype included: a stop or failure in that code, or in the jobs after, leaves it
- * taken. The two are never both set.
+ * own error instead; and `dropped` when neither was handed over, because the run had been stopped
+ * or had failed before this settle (`interrupted` or `failed`), or the call of the promise's
+ * resolve or reject function was stopped or failed before it ran. Without `dropped`, that function
+ * ran with the result or the child's error, and the script's own code runs with it: a `then`
+ * getter it put on Object.prototype, which can reject the promise instead, and its continuations.
+ * A stop or failure in that code, or in the jobs after, leaves it handed over. The two are never
+ * both set.
  */
 export type SettleState = RunState & { unfit?: true; dropped?: true };
 
@@ -164,9 +169,9 @@ const DIAGNOSTICS_CHARS = 4096;
  * The longest ending text the binding decodes, in UTF-8 bytes: V8's longest string, 2^29 - 24
  * characters (Node's `buffer.constants.MAX_STRING_LENGTH`), which a text of this many bytes can't
  * exceed. Node can't decode a longer one. Bun's longest string is 2^31 - 1, and the same bound
- * holds there, so a script ends the same way on either. A longer text is answered, as the state it
- * belongs to (`rejected` for the script's own ending, `failed` for an exception that ended the
- * run), with a RangeError that gives its length.
+ * holds there, so a script ends the same way on either. A longer text is answered with a
+ * RangeError that gives its length: `rejected` for the script's own ending, its value's or what it
+ * threw, and `failed` for an exception that ended the run.
  */
 const MAX_ENDING_BYTES = 2 ** 29 - 24;
 
@@ -428,8 +433,8 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
       long: (n: number) => `what the script threw comes to ${n} bytes as text, more than the ${MAX_ENDING_BYTES} the engine reads back; throw something smaller`,
     },
     [FAILED]: {
-      memory: 'out of memory while reading the exception that ended the run; throw something smaller, catch it in the callback that threw it, or let go of data the script no longer needs',
-      long: (n: number) => `the exception that ended the run comes to ${n} bytes as text, more than the ${MAX_ENDING_BYTES} the engine reads back; throw something smaller, or catch it in the callback that threw it`,
+      memory: 'out of memory while reading the exception that ended the run; let go of data the script no longer needs, and if a callback given to queueMicrotask or a FinalizationRegistry threw it, throw something smaller or catch it there',
+      long: (n: number) => `the exception that ended the run comes to ${n} bytes as text, more than the ${MAX_ENDING_BYTES} the engine reads back; if a callback given to queueMicrotask or a FinalizationRegistry threw it, throw something smaller or catch it there`,
     },
   } as const;
   /**
