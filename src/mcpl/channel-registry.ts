@@ -3604,8 +3604,8 @@ export class ChannelRegistry {
     // never-guess rule that governs delivery.
     const matches = [...this.channels.values()].filter((e) => e.descriptor.id === channelId);
     if (matches.length !== 1) return null;
-    // A stream is a copy of speech the host would publish, and nothing is
-    // published into an inbound-only channel.
+    // Nothing is published into an inbound-only channel, so nothing is
+    // streamed there either.
     if (isInboundOnly(matches[0]!)) return null;
     const server = this.serverRegistry.getServer(matches[0]!.serverId);
     // §5.4: the GRANT gates streaming, not the raw advertisement. The old
@@ -3705,9 +3705,12 @@ export class ChannelRegistry {
    * or inbound-only. A removal during a wait already fails it there
    * (waitForOpenChannel); the check also catches one made after the last
    * wait, as the opening's notice can. Words refused after an open for a
-   * declaration leave the channel open: the agent gets the notice that it's
-   * open, which says how to close it, and the failure for the words. When
-   * the registration is gone, the failure says the channel was removed.
+   * declaration leave the channel open, and the agent gets the failure for
+   * the words. An open that turned a closed channel open also gives the
+   * notice that it's open, which says how to close it. One that only
+   * reconfirmed the transport of a channel already decided open or tuned out
+   * changes no decision, and gives none. When the registration is gone, the
+   * failure says the channel was removed.
    *
    * Only the connector's `delivered: true` confirms a post. `failed` means
    * nothing was posted: the attempt stopped before the request was written,

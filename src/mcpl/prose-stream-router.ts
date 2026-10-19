@@ -16,11 +16,13 @@
  *
  * Suppression is fail-closed: text whose destination is unknown (explicit
  * mode before the first `>>`, unresolvable/ambiguous targets, `>>skip_reply`)
- * emits NOTHING — the delivery path will bounce/retain it; a stream consumer
- * must never see text that delivery would refuse to send. Text for a channel
- * the `speakable` option refuses emits nothing either. `speakable` is asked
- * as the text is routed, so a channel declared inbound-only after its text
- * was emitted is refused at delivery, though a consumer has seen the text.
+ * emits NOTHING — the delivery path will bounce/retain it. Text for a channel
+ * the `speakable` option refuses emits nothing either, and which servers see
+ * what is emitted is the registry's (sendOutgoingChunk). The stream can't
+ * know what delivery decides later: `speakable` is asked as the text is
+ * routed, so a channel declared inbound-only after its text was emitted, or
+ * one whose open then fails, is refused at delivery, though a consumer has
+ * seen the text.
  *
  * Three modes, mirroring proseRouting:
  *  - explicit: parse `>>` prefixes. A fresh turn's stream starts suppressed;
