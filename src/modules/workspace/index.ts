@@ -1392,7 +1392,8 @@ export class WorkspaceModule implements Module {
           + 'or isn\'t valid UTF-8. '
           + 'For long lines or spill files, use offsetChars/limitChars instead: returns the stored text as it is, '
           + 'BOM and CRs included, without line numbers, with nextOffsetChars (null at EOF), stopped at the result limit too. '
-          + 'Keep limitChars when continuing. '
+          + 'When a page stops at the result limit, its note gives the offsetChars and limitChars that read the rest of what you asked for. '
+          + 'Otherwise, continue from nextOffsetChars with the same limitChars. '
           + 'Character offsets count UTF-16 code units; do not mix character and line parameters.',
         inputSchema: {
           type: 'object' as const,

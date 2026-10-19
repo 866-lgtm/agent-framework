@@ -172,7 +172,7 @@ test('a page with notes holds to the result limit with its notes', async t => {
     const result = await readBad({ offsetChars: 0, limitChars: 100_000 }, limit);
     assert.ok(stored(result) <= limit, `${stored(result)} > ${limit}`);
     const page = result.data as CharPage;
-    assert.equal(page.note, `Stopped at character ${page.nextOffsetChars} to stay within the ${limit}-character result limit; continue with offsetChars=${page.nextOffsetChars}. The file isn't valid UTF-8: each invalid byte sequence shows as U+FFFD. Edit refuses this file, and write replaces it whole.`);
+    assert.equal(page.note, `Stopped at character ${page.nextOffsetChars} to stay within the ${limit}-character result limit; continue with offsetChars=${page.nextOffsetChars} and limitChars=${page.totalChars - page.nextOffsetChars!}. The file isn't valid UTF-8: each invalid byte sequence shows as U+FFFD. Edit refuses this file, and write replaces it whole.`);
   }
 });
 
@@ -252,6 +252,42 @@ test('a first line cut to fit, read from a later offset, is numbered and placed 
   assert.equal(more.nextOffsetChars, 4 + 1500);
 });
 
+test("a cut line's rest read through several character pages, following only the notes, ends where the line does", async t => {
+  // A rest longer than a page at a limit of 1,000, with more lines after it:
+  // each character page that stops gives what's left of the rest, so reading
+  // on as the notes say reaches the line's end and no further.
+  const long = 'z'.repeat(5_000);
+  const { read } = await setup(t, `head\n${long}\n${Array.from({ length: 50 }, (_, i) => `after ${i}`).join('\n')}\n`);
+  // From line 2, the line is cut to fit the page.
+  const linePage = (await read({ offset: 2 }, 1_000)).data as LinePage;
+  const [, at, left] = /Line 2 is cut: read its rest with offsetChars=(\d+) and limitChars=(\d+), then continue with offset=3\.$/.exec(linePage.note!)!;
+  const lineEnd = 'head\n'.length + long.length;
+  assert.equal(Number(at) + Number(left), lineEnd);
+  let offsetChars = Number(at);
+  let limitChars = Number(left);
+  let rest = '';
+  let pages = 0;
+  for (;;) {
+    assert.ok(++pages < 100, 'every page moves on');
+    const result = await read({ offsetChars, limitChars }, 1_000);
+    assert.ok(stored(result) <= 1_000, `${stored(result)}`);
+    const page = result.data as CharPage;
+    rest += page.content;
+    const next = page.note === undefined ? null : /continue with offsetChars=(\d+) and limitChars=(\d+)/.exec(page.note);
+    if (next === null) {
+      // The last page holds all it was asked for, and ends at the line's end.
+      assert.equal(page.note, undefined);
+      assert.equal(page.nextOffsetChars, lineEnd);
+      break;
+    }
+    offsetChars = Number(next[1]);
+    limitChars = Number(next[2]);
+    assert.equal(offsetChars + limitChars, lineEnd);
+  }
+  assert.ok(pages > 2, `${pages} pages`);
+  assert.equal(rest, long.slice(Number(at) - 'head\n'.length));
+});
+
 test('a page whose last line is cut names where its rest starts before the next line', async t => {
   const long = 'z'.repeat(3000);
   const { read } = await setup(t, `short\n${long}\n${long}\n${long}\n`);
@@ -305,17 +341,21 @@ test('a character page stops at the result limit too, with nextOffsetChars', asy
   const text = 'abc\u0001'.repeat(20_000);
   const { read } = await setup(t, text);
   for (const limit of [24_000, 1_000]) {
+    // Following each page's note, from a first page asked for more than the file holds.
     let offsetChars = 0;
+    let limitChars = 100_000;
     let recovered = '';
     for (let pages = 0; ; pages++) {
       assert.ok(pages < 1_000, 'every page moves on');
-      const result = await read({ offsetChars, limitChars: 100_000 }, limit);
+      const result = await read({ offsetChars, limitChars }, limit);
       assert.ok(stored(result) <= limit, `${stored(result)} > ${limit}`);
       const page = result.data as CharPage;
       recovered += page.content;
       if (page.nextOffsetChars === null) break;
-      assert.equal(page.note, `Stopped at character ${page.nextOffsetChars} to stay within the ${limit}-character result limit; continue with offsetChars=${page.nextOffsetChars}.`);
+      // What's left of what was asked for is the rest of the text.
+      assert.equal(page.note, `Stopped at character ${page.nextOffsetChars} to stay within the ${limit}-character result limit; continue with offsetChars=${page.nextOffsetChars} and limitChars=${text.length - page.nextOffsetChars}.`);
       offsetChars = page.nextOffsetChars;
+      limitChars = text.length - page.nextOffsetChars;
     }
     assert.equal(recovered, text);
   }
@@ -341,7 +381,7 @@ test('a character page moved on by a whole character keeps a surrogate pair whol
   const { read } = await setup(t, '😀abc');
   assert.deepEqual((await read({ offsetChars: 0, limitChars: 100 }, 50)).data, {
     path: 'work/text.txt', totalChars: 5, offsetChars: 0, nextOffsetChars: 2,
-    note: 'Stopped at character 2 to stay within the 50-character result limit; continue with offsetChars=2.',
+    note: 'Stopped at character 2 to stay within the 50-character result limit; continue with offsetChars=2 and limitChars=3.',
     content: '😀',
   });
   // Where that step reaches what the page was asked for, the page holds all of it.

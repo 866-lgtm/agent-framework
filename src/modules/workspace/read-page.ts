@@ -156,8 +156,11 @@ export function characterPage(path: string, file: FileText, offsetChars: number,
   let end = start + Math.min(limitChars, text.length - start);
   if (splitsPair(text, end)) end++;
   const notes = [...(file.utf8 ? [] : [NOT_UTF8]), ...extraNotes];
-  const stoppedNote = (to: number) =>
-    `Stopped at character ${to} to stay within the ${maxChars}-character result limit; continue with offsetChars=${to}.`;
+  // A page that stops short of what it was asked for gives what's left of
+  // that as limitChars, so a reader that follows its notes ends where it
+  // asked to: at a cut line's end, for the rest a line page's note names.
+  const stoppedNote = (to: number, left: number) =>
+    `Stopped at character ${to} to stay within the ${maxChars}-character result limit; continue with offsetChars=${to} and limitChars=${left}.`;
   const page = (to: number, note: string | undefined) => ({
     path,
     totalChars: text.length,
@@ -169,8 +172,8 @@ export function characterPage(path: string, file: FileText, offsetChars: number,
   const whole = page(end, joined(notes));
   if (maxChars === undefined || JSON.stringify(whole).length <= maxChars) return { success: true, data: whole };
   // As many characters as fit beside the rest of the page, which takes the
-  // most with the largest offset it could stop at.
-  const overhead = JSON.stringify({ ...page(end, joined([stoppedNote(end), ...notes])), nextOffsetChars: end, content: '' }).length;
+  // most with the largest offset it could stop at and the most left.
+  const overhead = JSON.stringify({ ...page(end, joined([stoppedNote(end, end - start), ...notes])), nextOffsetChars: end, content: '' }).length;
   // A page moves by whole characters, a surrogate pair at once, so it never
   // stops inside one.
   const step = (at: number) => (splitsPair(text, at + 1) ? 2 : 1);
@@ -185,5 +188,5 @@ export function characterPage(path: string, file: FileText, offsetChars: number,
   // small for the page's own fields then passes it. Where that reaches the
   // page's own end, it holds all it was asked for, so it names no stop.
   if (to === start) to = Math.min(end, start + step(start));
-  return { success: true, data: page(to, joined([to < end ? stoppedNote(to) : null, ...notes])) };
+  return { success: true, data: page(to, joined([to < end ? stoppedNote(to, end - to) : null, ...notes])) };
 }
