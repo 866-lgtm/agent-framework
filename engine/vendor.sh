@@ -36,12 +36,13 @@ dest=$here/quickjs-ng
 # --no-overlay (git 2.22 and later), a file the index holds and the commit doesn't goes too.
 top=$(git -C "$here" rev-parse --show-toplevel)
 restore="git -C $(printf '%q' "$top") checkout --no-overlay HEAD -- $(printf '%q' "${dest#"$top"/}")"
-# A stage or a committed copy moved aside, left by a run that was killed outright.
+# A stage or a committed copy moved aside, which only this script makes: left by a run that
+# didn't finish, or one running now.
 shopt -s nullglob dotglob
 left=("$here"/.quickjs-ng.*)
 shopt -u nullglob dotglob
 if [ ${#left[@]} -gt 0 ]; then
-  echo "vendor.sh: engine/ holds ${left[*]##*/}, left by a run that was killed outright; remove them (what's committed is in git, and $restore puts it back). engine/quickjs-ng is unchanged." >&2
+  echo "vendor.sh: engine/ holds ${left[*]##*/}, which a run of this script makes while it replaces the copy: one that didn't finish, or one running now. If none is running, run $restore to put back what's committed, then remove them." >&2
   exit 1
 fi
 changes=$(git -C "$here" status --porcelain --untracked-files=all --ignored -- quickjs-ng)
@@ -51,14 +52,16 @@ if [ -n "$changes" ]; then
   exit 1
 fi
 # Whenever the script exits, a committed copy left moved aside goes back, unless the new one is in
-# its place, and what was staged goes. bash 5.2 runs this on a signal that ends the shell too: INT,
-# TERM and HUP are trapped below, so they wait for the command in progress, and PIPE, ALRM, USR1,
-# USR2 and XCPU were checked to run it as well (bash ignores QUIT). The signals named in its first
-# line, and in the traps below, are ignored from then on. SIGKILL, which no trap sees, skips it, and
-# leaves what the next run refuses over. A signal ignored when the script started, as SIGINT is for
-# a background job of a non-interactive shell, stays ignored, and the script carries on.
+# its place, and what was staged goes. INT, TERM and HUP are trapped below, so they wait for the
+# command in progress and end the script through this; bash 5.2 was checked to run it on PIPE,
+# ALRM, USR1, USR2, XCPU, XFSZ and VTALRM too, and not on PROF or PWR, and it ignores QUIT. Once
+# one of those traps runs, or this cleanup starts, the signals in ignore_signals are ignored.
+# SIGKILL, which no trap sees, skips it: it leaves the clone in TMPDIR, and in engine/ a
+# stage or the committed copy moved aside, which the next run refuses over. A signal ignored when
+# the script started, as SIGINT is for a background job of a non-interactive shell, stays ignored,
+# and the script carries on.
 tmp= stage= old=
-ignore_signals='trap "" HUP INT PIPE ALRM TERM USR1 USR2 XCPU XFSZ'
+ignore_signals='trap "" HUP INT PIPE ALRM TERM USR1 USR2 XCPU XFSZ VTALRM'
 finish() {
   eval "$ignore_signals"
   set +e
@@ -152,13 +155,17 @@ if ! mv "$stage" "$dest"; then
   if [ -e "$old" ] && mv "$old" "$dest"; then
     echo "vendor.sh: couldn't move the new copy into $dest; the committed copy is back in place." >&2
   else
-    echo "vendor.sh: couldn't move the new copy into $dest, nor the committed copy back from $old; $restore restores it." >&2
+    # Told here, so the cleanup doesn't try again or tell it twice.
+    moved=$old
+    old=
+    echo "vendor.sh: couldn't move the new copy into $dest, nor the committed copy back from $moved; $restore restores it." >&2
   fi
   exit 1
 fi
 if [ -e "$old" ] && ! rm -rf "$old"; then
-  echo "vendor.sh: the new copy is in place, but the committed copy moved aside to $old couldn't be removed; remove it." >&2
+  moved=$old
   old=
+  echo "vendor.sh: the new copy is in place, but the committed copy moved aside to $moved couldn't be removed; remove it." >&2
   exit 1
 fi
 echo "copied ${#FILES[@]} files from quickjs-ng $TAG ($COMMIT), with $patched patches"
