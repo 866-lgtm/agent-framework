@@ -1330,6 +1330,16 @@ describe('present while acting', () => {
       [ambient('discord:guild:portables')], 'discord:guild:portables'],
     ['leaves it for a reaction in a channel the turn engaged',
       [{ channelId: 'discord:guild:portables', tags: ['chat:reaction'] }], 'chan-turn'],
+    ['leaves it for a reaction removal in a channel the turn engaged',
+      [{ channelId: 'discord:guild:portables', tags: ['chat:reaction-remove'] }], 'chan-turn'],
+    ['leaves it for an edit in a channel the turn engaged',
+      [{ channelId: 'discord:guild:portables', tags: ['chat:edited'] }], 'chan-turn'],
+    ['leaves it for a deletion in a channel the turn engaged',
+      [{ channelId: 'discord:guild:portables', tags: ['chat:deleted'] }], 'chan-turn'],
+    // An edit of a message addressed to the agent can arrive tagged
+    // chat:addressed too; it still moves nothing.
+    ['leaves it for an edit that carries the addressed tag',
+      [{ channelId: 'discord:dm:q', tags: ['chat:edited', 'chat:addressed'] }], 'chan-turn'],
   ] as const) {
     it(`a re-inference on unstreamed tool results ${label}`, async () => {
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Carrying on.' }] as ContentBlock[]));
@@ -1344,7 +1354,7 @@ describe('present while acting', () => {
       // fallback's re-inference. Messages arrive before that starts.
       const open: Routing = {
         locus: 'chan-turn', triggerChannel: 'chan-turn', engaged: new Set(['discord:guild:portables']),
-        destination: null, continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
+        continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
       };
       internals.turnRouting.set('assistant', open);
       internals.openLogical.set('assistant', open);
@@ -1368,12 +1378,13 @@ describe('present while acting', () => {
     const internals = framework as unknown as {
       turnRouting: Map<string, Routing>; openLogical: Map<string, Routing>; pendingRequests: InferenceRequest[];
       activeTurnTokens: Map<string, number>;
+      assembling: Set<string>;
       deferredMessages: Array<Record<string, unknown>>;
       addMessage(participant: string, content: ContentBlock[], metadata: Record<string, unknown>, opts?: { bypassDeferralFor?: string }): string;
     };
     const open: Routing = {
       locus: 'chan-turn', triggerChannel: 'chan-turn', engaged: new Set(),
-      destination: null, continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
+      continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
     };
     internals.turnRouting.set('assistant', open);
     internals.openLogical.set('assistant', open);
@@ -1381,7 +1392,9 @@ describe('present while acting', () => {
       // A delivery assembled while a start of the turn holds it (the
       // coalescing assembly writes past the deferral) is an arrival too.
       internals.activeTurnTokens.set('assistant', -1);
+      internals.assembling.add('assistant');
       internals.addMessage('Antra', [{ type: 'text', text: 'batched' }] as ContentBlock[], addressed('discord:dm:q'), { bypassDeferralFor: 'assistant' });
+      internals.assembling.delete('assistant');
       internals.activeTurnTokens.delete('assistant');
       assert.deepEqual(open.arrivals.map((a) => a.channelId), ['discord:dm:q']);
       // A message still deferred when the turn's next start begins lands in
@@ -1524,7 +1537,7 @@ describe('present while acting', () => {
       recordTurnCheckpoint(agentName: string): void;
     };
     const open: Routing = {
-      locus: 'chan-turn', engaged: new Set(), destination: null,
+      locus: 'chan-turn', engaged: new Set(),
       continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
     };
     internals.openLogical.set('assistant', open);
@@ -1553,7 +1566,7 @@ describe('present while acting', () => {
     // live, and stop() ended every open turn. Its budget restart now runs,
     // and its stream fails and is retried.
     const turn: Routing = {
-      locus: 'chan-turn', triggerChannel: 'chan-turn', engaged: new Set(), destination: null,
+      locus: 'chan-turn', triggerChannel: 'chan-turn', engaged: new Set(),
       continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
     };
     internals.turnRouting.set('assistant', turn);
@@ -1600,7 +1613,7 @@ describe('present while acting', () => {
     // Built by hand, as #312's silent-start test does: production runs no
     // silent turn while a prose turn is open.
     const open: Routing = {
-      locus: 'chan-turn', engaged: new Set(), destination: null,
+      locus: 'chan-turn', engaged: new Set(),
       continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
     };
     internals.openLogical.set('assistant', open);
@@ -2288,9 +2301,47 @@ describe('present while acting', () => {
     await framework.runUntilIdle();
 
     assert.deepEqual(routed, [], 'post-send prose stayed suppressed after a reaction');
+    // That verdict counts only if the reaction was in the round: one that
+    // missed it would leave the suppression set as well.
+    const injected = JSON.stringify(membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? []);
+    assert.ok(injected.includes('[reaction] @someone reacted'), 'the reaction was injected at the send\'s tool boundary');
 
     await framework.stop();
   });
+
+  for (const tag of ['chat:reaction-remove', 'chat:edited', 'chat:deleted']) {
+    it(`a ${tag} marker injected mid-turn does not clear send suppression (#157)`, async () => {
+      // Edits, deletions and reaction removals (RFC-001 core tags, delivered
+      // as synthetic incoming messages by e.g. zulip_mcp#23) are markers
+      // ABOUT an existing message — the same category as a reaction.
+      // Before #157 only `chat:reaction` was exempt, so an
+      // "[edited] Ann: typo fix" arriving right after an explicit send
+      // re-opened auto-routing and double-posted the same-round prose.
+      membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'c1', name: 'robot--send_message', input: { text: 'reply to room4' } },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'Sent it.' },
+      ] as ContentBlock[]));
+
+      const framework = await createFramework();
+      const routed = stubChannelRegistry(framework);
+      module.interjection = `[${tag}] marker about an earlier message`;
+      module.interjectionChannelId = null;
+      module.interjectionMetadata = { channelId: '999888777', tags: [tag] };
+
+      trigger(framework);
+      await framework.runUntilIdle();
+
+      assert.deepEqual(routed, [], `post-send prose stayed suppressed after a ${tag} marker`);
+      // That verdict counts only if the marker was in the round: a marker that
+      // missed it would leave the suppression set as well.
+      const injected = JSON.stringify(membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? []);
+      assert.ok(injected.includes(`[${tag}] marker about an earlier message`), `the ${tag} marker was injected at the send's tool boundary`);
+
+      await framework.stop();
+    });
+  }
 
   it('text-only turns route to the turn-frozen locus, not a live re-resolution', async () => {
     // The text-only dispatch runs after the agent is idle; a live resolution
