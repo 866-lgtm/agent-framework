@@ -1127,10 +1127,11 @@ describe("another mount's directory, to the outer mount's file tools and pushes"
     assert.deepEqual(whole.results, []);
     assert.deepEqual(regions(whole), []);
     // Named, it's the answer to what was asked: its region names the holder.
-    for (const [path, use] of [['work/a/b', 'deep'], ['work/a/b/inner.txt', 'deep/inner.txt'], ['work/a//b/inner.txt', 'deep/inner.txt']]) {
+    // A doubled separator is the same path, named in its one spelling.
+    for (const [path, named, use] of [['work/a/b', 'work/a/b', 'deep'], ['work/a/b/inner.txt', 'work/a/b/inner.txt', 'deep/inner.txt'], ['work/a//b/inner.txt', 'work/a/b/inner.txt', 'deep/inner.txt']]) {
       const found = await call(m, 'grep', { path, pattern: 'stale' });
       assert.deepEqual(found.results, [], path);
-      assert.deepEqual(regions(found), [[path, `it lies in mount "deep", nested in this one: use "${use}"`]], path);
+      assert.deepEqual(regions(found), [[named, `it lies in mount "deep", nested in this one: use "${use}"`]], path);
     }
     // A file there the outer store doesn't hold is named too.
     env.writeDisk('a/b/other.txt', 'stale words');
@@ -1144,6 +1145,30 @@ describe("another mount's directory, to the outer mount's file tools and pushes"
       ['a/b', true], ['a/b/x', true], ['a//b/x', true], ['a/b/', true], ['./a/b/x', true], ['a/c/../b/x', true],
       ['a/b/../x', false], ['a/bc/x', false], ['a', false], ['', false],
     ] as const) assert.equal(inOtherMount(path, ['a/b']), inside, path);
+  });
+
+  test("a path into the nested directory is read in the outer mount's one spelling: a climb above the root and a separator after the mount's name are refused, and a `..` or a trailing separator names what it reaches", async (t) => {
+    const env = new Env(t);
+    env.writeDisk('a/x.txt', 'x');
+    env.writeDisk('a/b/inner.txt', 'inner');
+    const m = await env.open({}, nested(env));
+    // A `..` with nothing before it to take back climbs above the root, even
+    // where it comes back in by the mount directory's own name.
+    assert.match(await refused(m, 'ls', { path: 'work/../work/a/b' }), /climbs above the root of mount "work"/);
+    // A separator right after the mount's name would make the rest an absolute path.
+    assert.match(await refused(m, 'ls', { path: 'work//a/b' }), /has a separator right after mount "work"/);
+    // A `..` that takes back the nested directory's name names its parent.
+    const listed = async (path: string) => (await call(m, 'ls', { path })).entries;
+    assert.deepEqual(await listed('work/a/b/..'), await listed('work/a'));
+    // A trailing separator names the directory itself.
+    await call(m, 'write', { path: 'work/a/y.txt', content: 'y' });
+    const withSlash = await call(m, 'materialize', { path: 'work/a/' });
+    assert.deepEqual(withSlash.materialized, [{ mount: 'work', path: 'a/y.txt' }]);
+    await call(m, 'write', { path: 'work/a/y.txt', content: 'y, again' });
+    const plain = await call(m, 'materialize', { path: 'work/a' });
+    assert.deepEqual(plain.materialized, withSlash.materialized);
+    assert.deepEqual(Object.keys(plain).sort(), Object.keys(withSlash).sort());
+    assert.equal(env.readDisk('a/b/inner.txt'), 'inner', "the nested mount's file is as it was");
   });
 
   test('a doubled or trailing separator is the nested directory too: a sync or a listing of it takes nothing in, and no push of the outer mount writes there', async (t) => {
