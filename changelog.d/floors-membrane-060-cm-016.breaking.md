@@ -15,9 +15,19 @@
     `hysteresisCertificate` takes the certified exit, and
     `hysteresisCertificate: false` restores the full solver on every compile
     (context-manager 0.15.0).
-  - **Content context-manager won't store** is refused at agent-framework's
-    MCPL lanes and dropped at its deferred-write drains, as the entry on
-    malformed content says.
+  - **Content context-manager won't store** is refused where agent-framework
+    writes it, as the entry on malformed content says.
+  - **Stored history:** content an older context-manager stored that doesn't
+    match `ContentBlock` is now read mended, or left out, with one line per
+    message naming each place, where some such content made every compile
+    throw. A `tool_use` stored with `input: null`, as membrane 0.5.87's
+    OpenAI-family adapters gave it for the arguments `null`, reads as `{}`
+    with `null` in `unparseableInput`. A request compiled from such a message
+    can change there, so a provider's prompt cache misses from that point,
+    once (context-manager 0.16.0).
+  - **Tools given `null` arguments:** an OpenAI-family tool call whose
+    arguments are the text `null` reaches the tool as `{}`, with the text in
+    `unparseableInput`, where it reached it as `null` (membrane 0.6.0).
   - **Anthropic streams:** after a stream's first event, SSE `ping`
     keepalives now count as activity for its idle deadline, so a stream that
     keeps sending only pings no longer ends at it (membrane 0.6.0).
