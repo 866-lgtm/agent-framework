@@ -4,8 +4,11 @@
  * input over as a plain object, so `"null"` arrives as `{}`, with the text
  * kept in `unparseableInput`. On membrane 0.5.87 the OpenAI-family adapters'
  * `safeParseJson` gave `null`, and a tool that read a field of its input
- * answered the model with a TypeError, `skip_reply` among them ("Cannot read
- * properties of null (reading 'wake_in_seconds')").
+ * answered the model with a TypeError ("Cannot read properties of null").
+ * `skip_reply` reads a null input as no wake since agent-framework#501, so
+ * the framework half below, `skip_reply` running as a call with no
+ * arguments, is a control: it passes with either input. The input
+ * assertions are what need membrane 0.6.0.
  */
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
