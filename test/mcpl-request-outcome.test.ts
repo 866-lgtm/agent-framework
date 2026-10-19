@@ -2,7 +2,8 @@
  * McplRequestError: a request that produced no result says which of three
  * things happened, as a fact rather than a message to parse.
  *   not-sent        refused before anything was written (connection closed)
- *   error-response  the server answered with a JSON-RPC error (code, data kept)
+ *   error-response  the server answered with a JSON-RPC error (its words and
+ *                   data kept; the code goes to the log)
  *   no-response     the request was handed to the transport and no answer
  *                   came back (timeout, or the connection closed while
  *                   awaiting): it may or may not have reached the server

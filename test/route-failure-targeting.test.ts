@@ -171,7 +171,7 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(metadata?.system, true);
       assert.equal(metadata?.kind, 'discord-send-failed');
       assert.equal(metadata?.channelId, 'missing-channel');
-      assert.match(String(metadata?.reason), /no registered channel/);
+      assert.equal(metadata?.reason, 'no channel "missing-channel" is registered here');
       assert.equal(metadata?.textLen, 5);
       t.mock.restoreAll();
       const { messages } = await framework.getAgent('secondary')!.getContextManager().compile();
@@ -264,7 +264,7 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(primary.mock.callCount(), 1);
       const [, content, metadata] = primary.mock.calls[0]!.arguments;
       assert.match(JSON.stringify(content),
-        /\[discord-send-failed\] A reply by released-conversation \(5 chars\) could not be delivered to missing-channel \(no registered channel[^)]*\)\. Nothing was posted\. released-conversation has ended\./);
+        /\[discord-send-failed\] A reply by released-conversation \(5 chars\) could not be delivered to missing-channel \(no channel \\"missing-channel\\" is registered here\)\. Nothing was posted\. released-conversation has ended\./);
       assert.equal(metadata?.speaker, 'released-conversation');
       assert.equal(metadata?.textLen, 5);
       assert.equal(internals(framework).pendingRequests.length, 0, 'context only: the primary is not woken');
@@ -533,7 +533,7 @@ describe('notices about an agent\'s own action', () => {
       const told = messages.filter((m) => JSON.stringify(m.content).includes(SEND_FAILED));
       assert.equal(told.length, 1);
       assert.match(JSON.stringify(told[0]!.content),
-        new RegExp(`A reply by ${fork.name} \\(${reply.length} chars\\) could not be delivered to missing-channel \\(no registered channel[^)]*\\)\\. Nothing was posted\\. ${fork.name} has ended\\.`));
+        new RegExp(`A reply by ${fork.name} \\(${reply.length} chars\\) could not be delivered to missing-channel \\(no channel \\\\"missing-channel\\\\" is registered here\\)\\. Nothing was posted\\. ${fork.name} has ended\\.`));
     });
 
     it('passes on only what a fork never read: a notice its later turn compiled stays its own', async () => {
@@ -938,7 +938,7 @@ describe('notices about an agent\'s own action', () => {
           const noticeIndex = messages.findIndex((m) => JSON.stringify(m.content).includes(SEND_FAILED));
           assert.ok(noticeIndex > replyIndex, 'the archived failure notice follows the closure reply');
           assert.equal(count(messages, SEND_FAILED), 1);
-          assert.match(JSON.stringify(messages[noticeIndex]!.content), /Your previous reply.*delivered:false/);
+          assert.match(JSON.stringify(messages[noticeIndex]!.content), /Your previous reply.*server said it didn't post the message/);
           // Every write of a drained entry carries its durable id (drainDeferredFor).
           const stored = archive.getAllMessages().find((m) => JSON.stringify(m.content).includes(SEND_FAILED));
           const id = (stored?.metadata as { deferredWriteId?: unknown } | undefined)?.deferredWriteId;
@@ -958,7 +958,7 @@ describe('notices about an agent\'s own action', () => {
         const told = primary.messages.filter((m) => JSON.stringify(m.content).includes(SEND_FAILED));
         assert.equal(told.length, 1);
         assert.match(JSON.stringify(told[0]!.content),
-          new RegExp(`A reply by ${fork.name} \\(${finalReply.length} chars\\) could not be delivered to #closure test \\(closure-channel\\) \\(.*delivered:false.*\\)\\. Nothing was posted\\. ${fork.name} has ended\\.`));
+          new RegExp(`A reply by ${fork.name} \\(${finalReply.length} chars\\) could not be delivered to #closure test \\(closure-channel\\) \\(.*server said it didn't post the message\\)\\. Nothing was posted\\. ${fork.name} has ended\\.`));
         assert.equal(membrane.calls.length, 2, 'only the initial and closure turns ran');
         assert.equal(state.pendingRequests.length, 0, 'a failed closure reply does not wake another turn');
       });
