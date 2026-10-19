@@ -134,6 +134,7 @@ import {
 import { randomUUID, createHash } from 'node:crypto';
 import { PyRunner, buildInjectedTools, formatLimit, type ScriptToolResult } from './code-execution/py-runner.js';
 import { scriptToolNames } from './code-execution/script-tool-names.js';
+import { scriptEndText, scriptEndTextWithin, type ScriptEnd } from './code-execution/result-text.js';
 import {
   buildCodeExecutionToolDefinition,
   CODE_EXECUTION_TOOL_NAME,
@@ -19444,9 +19445,21 @@ export class AgentFramework {
       this.scriptRoutingInterpreters.set(agentName, { interpreter, names: new Set([...earlier, ...reachable]) });
     }
 
+    // The model reads how the script ended as text, its ending first, within
+    // the bound its caller reads whole: the one the call carries, as an
+    // in-process caller may set it, or else the one the framework gives the
+    // calls it dispatches (resultMaxCharsFor), the agent's inline cap. Hosts
+    // read the fields in `structured`.
+    const cap = call.resultMaxChars ?? this.resultMaxCharsFor(agentName, call.id);
+    const text = await this.scriptEndResultText(
+      { stdout: exec.stdout, stderr: exec.stderr, returnCode: exec.returnCode, ...(capNote ? { timeLimitNote: capNote } : {}) },
+      cap,
+      call.id,
+    );
     return {
       success: true,
-      data: {
+      data: [{ type: 'text', text }],
+      structured: {
         stdout: exec.stdout,
         stderr: exec.stderr,
         return_code: exec.returnCode,
@@ -19455,6 +19468,39 @@ export class AgentFramework {
       isError: false,
       ...(endTurn ? { endTurn: true } : {}),
     };
+  }
+
+  /**
+   * A foreground script's ending as the model reads it: whole when it fits
+   * `cap`, or else cut to fit beside a notice, with the whole text written
+   * to a file of its own in the tool results folder. Its name differs from
+   * the one the inline cap's spill gives the result before the call id,
+   * which a long id can cut short, so a later spill of the cut text, as at a
+   * cap lowered before the result is stored, can't write over it. The cut
+   * leaves room for the longest notice it could end with, so it's decided
+   * before anything is written. When the cap can't hold a cut of each stream
+   * beside that notice, the whole text comes back, unwritten. On a model's
+   * call, the inline cap's spill then keeps its head as the result is stored;
+   * an in-process caller that set so small a bound gets the whole text.
+   */
+  private async scriptEndResultText(end: ScriptEnd, cap: number, callId: string): Promise<string> {
+    const whole = scriptEndText(end);
+    if (whole.length <= cap) return whole;
+    const label = `${new Date().toISOString().slice(0, 10)}-output-${callId}`;
+    const keptIn = (path: string) =>
+      `[cut to fit; the whole output (${whole.length} chars): workspace file ${path}. ${this.spillPageAdvice(path, cap)}]`;
+    const writeFailed = (path: string, error: string) =>
+      `[cut to fit; writing the whole output (${whole.length} chars) to workspace file ${path} FAILED (${error.slice(0, 200)}); what was cut was not retained]`;
+    const noWorkspace = `[cut to fit; the whole output was ${whole.length} chars, and with no writable workspace mount without an include, what was cut was not retained]`;
+    const place = this.toolResultFilePlace(label);
+    const reserve = place
+      ? Math.max(keptIn(place.path).length, writeFailed(place.path, 'x'.repeat(200)).length, noWorkspace.length)
+      : noWorkspace.length;
+    const within = scriptEndTextWithin(end, cap - reserve);
+    if (within === null) return whole;
+    const written = place ? await this.writeToolResultFile(label, whole) : null;
+    if (!written) return within + noWorkspace;
+    return within + (written.error === undefined ? keptIn(written.path) : writeFailed(written.path, written.error));
   }
 
   // ---------------------------------------------------------------------------
@@ -19946,6 +19992,19 @@ export class AgentFramework {
     return { path, error: failure };
   }
 
+  /** How to read a tool result's file back a page at a time, with each page
+   *  sized to come back within `cap`. */
+  private spillPageAdvice(path: string, cap: number): string {
+    // JSON serialization can expand each read-back code unit to six
+    // chars (\\u0000). Leave room for the page's metadata and a possible
+    // extra code unit at a surrogate-pair boundary.
+    const pageOverhead = JSON.stringify(path).length + 256;
+    const readLimit = Math.max(1, Math.min(2000, Math.floor((cap - pageOverhead) / 6) - 1));
+    return `Page with workspace--read ${JSON.stringify({ path, offsetChars: 0, limitChars: readLimit })}; `
+      + 'use nextOffsetChars as offsetChars until null, keeping limitChars. Or raise the inline cap via '
+      + 'agent_settings update tool_result_inline_max_chars.';
+  }
+
   private async spillOrTruncate(
     content: string,
     cap: number | undefined,
@@ -19969,17 +20028,10 @@ export class AgentFramework {
     const written = await this.writeToolResultFile(label, content);
     if (written && written.error === undefined) {
       const path = written.path;
-      // JSON serialization can expand each read-back code unit to six
-      // chars (\\u0000). Leave room for the page's metadata and a possible
-      // extra code unit at a surrogate-pair boundary.
-      const pageOverhead = JSON.stringify(path).length + 256;
-      const readLimit = Math.max(1, Math.min(2000, Math.floor((cap - pageOverhead) / 6) - 1));
       return {
         text: head
           + `\n\n[truncated — showing ${head.length} of ${content.length} chars; full content: workspace file ${path}`
-          + `. Page with workspace--read ${JSON.stringify({ path, offsetChars: 0, limitChars: readLimit })}; `
-          + 'use nextOffsetChars as offsetChars until null, keeping limitChars. Or raise the inline cap via '
-          + 'agent_settings update tool_result_inline_max_chars.]'
+          + `. ${this.spillPageAdvice(path, cap)}]`
           + kept,
         filePath: path,
       };
