@@ -262,6 +262,62 @@ test("a line whose own text ends in a CR shows its CRLF end's CR too, so lines c
   // A count refusal shows the lines it names the same way.
   await file('c.txt', text);
   assert.ok(errorOf(await call('edit', { path: 'work/c.txt', oldString: 'yy', newString: 'z' })).includes('     3\tyy\r\r\n     6\tyy'));
+  // A last line with no line end shows its own CR alone, in each.
+  const last = 'aa\r\nxx\r\r\nxx\r';
+  await file('l.txt', last);
+  assert.ok(errorOf(await call('edit', { path: 'work/l.txt', oldString: 'xx\nqq', newString: 'z' })).includes('     2\txx\r\r\n     3\txx\r\nMatch'));
+  assert.ok(errorOf(await call('edit', { path: 'work/l.txt', oldString: 'xx', newString: 'z' })).endsWith('     2\txx\r\r\n     3\txx\r'));
+  assert.equal(dataOf(await call('edit', { path: 'work/l.txt', oldString: 'aa', newString: 'AA' })).changed, '     1\tAA\n     2\txx\r\r\n     3\txx\r');
+  // A long matched line shows the CR where its excerpt reaches its end, and
+  // not where the excerpt is cut after a CR inside the line.
+  const long = `aa\r\n${'q'.repeat(300)}mm\r\r\nmm${'q'.repeat(237)}\r${'q'.repeat(100)}\r\nmm\r\n`;
+  await file('x.txt', long);
+  assert.ok(errorOf(await call('edit', { path: 'work/x.txt', oldString: 'mm', newString: 'z' }))
+    .endsWith(`     2\t\u2026${'q'.repeat(237)}mm\r\r\n     3\tmm${'q'.repeat(237)}\r\u2026\n     4\tmm`));
+});
+
+test("a receipt shows each line as read shows the stored bytes, where the edit puts a CR before a line feed", async (t) => {
+  const { call, stored, file } = setup(t);
+  // A CR the edit puts before a bare LF makes the two a CRLF end on disk,
+  // shown without the CR, so lines copied from the receipt edit lines 1 and
+  // 2, not lines 3 and 4, whose first line's own text ends in a CR.
+  await file('b.txt', 'p\nq\nx\r\r\nq\n');
+  assert.equal(dataOf(await call('edit', { path: 'work/b.txt', oldString: 'p', newString: 'x\r' })).changed, '     1\tx\n     2\tq\n     3\tx\r\r');
+  assert.equal(await stored('b.txt'), 'x\r\nq\nx\r\r\nq\n');
+  dataOf(await call('edit', { path: 'work/b.txt', oldString: 'x\nq', newString: 'M\nN' }));
+  assert.equal(await stored('b.txt'), 'M\r\nN\nx\r\r\nq\n');
+  // One before a CRLF end is the line's own, and shows that end's CR too; two
+  // before a bare LF are the line's own and the end's, and show as stored.
+  await file('c.txt', 'a\r\nb\r\n');
+  assert.equal(dataOf(await call('edit', { path: 'work/c.txt', oldString: 'a', newString: 'a\r' })).changed, '     1\ta\r\r\n     2\tb');
+  await file('l.txt', 'a\nb\n');
+  assert.equal(dataOf(await call('edit', { path: 'work/l.txt', oldString: 'a', newString: 'a\r\r' })).changed, '     1\ta\r\r\n     2\tb');
+  // A long line's stretch that reaches its end shows the CR too.
+  await file('x.txt', `aa\r\n${'q'.repeat(2500)}mm\r\r\n`);
+  assert.ok((dataOf(await call('edit', { path: 'work/x.txt', oldString: 'mm', newString: 'MM' })).changed as string).endsWith(`${'q'.repeat(80)}MM\r\r`));
+});
+
+test("an oldString with the file's BOM at its start or a CR at its end, found both as given and read without it, is refused, naming both", async (t) => {
+  const { call, stored, file } = setup(t);
+  // Line 2's own text ends in one CR and line 3's in two, before CRLF ends,
+  // so line 2 as read shows it, with its end's CR, is line 3's text as given.
+  const text = 'aa\r\nxx\r\r\nxx\r\r\r\n';
+  await file('r.txt', text);
+  assert.equal(errorOf(await call('edit', { path: 'work/r.txt', oldString: 'xx\r\r', newString: 'YY' })),
+    "The edit did nothing: oldString ends in a CR, and occurs in work/r.txt both as given (on line 3) and with that CR read as its CRLF line end's (on line 2), "
+    + "so which you mean can't be told. Include the line end after it to say which.");
+  assert.equal(await stored('r.txt'), text);
+  // With its line end it's line 2's alone, and line 3 as read shows it is line 3's.
+  dataOf(await call('edit', { path: 'work/r.txt', oldString: 'xx\r\r\n', newString: 'YY\n' }));
+  assert.equal(await stored('r.txt'), 'aa\r\nYY\r\nxx\r\r\r\n');
+  dataOf(await call('edit', { path: 'work/r.txt', oldString: 'xx\r\r\r', newString: 'ZZ' }));
+  assert.equal(await stored('r.txt'), 'aa\r\nYY\r\nZZ\r\n');
+  // A BOM the same, in edit_many's words.
+  await file('m.txt', '\uFEFFab\n\uFEFFab\n');
+  assert.ok(errorOf(await call('edit_many', { edits: [{ path: 'work/m.txt', oldString: '\uFEFFab', newString: 'c' }] })).includes(
+    "edit 1: oldString starts with a BOM, and occurs in work/m.txt both as given (on line 2) and with that BOM read as the file's own (on line 1), "
+    + "so which you mean can't be told. Include more of the text after it to say which."));
+  assert.equal(await stored('m.txt'), '\uFEFFab\n\uFEFFab\n');
 });
 
 test('replacing a whole file with nothing stores no bytes, and its receipt shows and names no line', async (t) => {

@@ -89,13 +89,14 @@ function normalizeQuotes(value: string): string {
  * An edit as matching reads it when its old text carries what matching leaves
  * out of a file's text: the BOM, which decodeForEdit takes off before the
  * first line, at its start, or a line's CR, which matching reads as part of
- * the line end, at its end. A character page shows both. The edit without
+ * the line end, at its end. A character page shows both, and a line whose own
+ * text ends in a CR shows its end's CR too (shownLine). The edit without
  * them, its new text read the same way, so a replacement keeps the file's one
- * BOM and its CRLF line end; and where it may match: at the text's start, and
- * before a CRLF line end. Null when the old text carries neither where the
- * file has them, or is nothing without them.
+ * BOM and its CRLF line end; where it may match: at the text's start, and
+ * before a CRLF line end; and which it leaves out. Null when the old text
+ * carries neither where the file has them, or is nothing without them.
  */
-function readForm(spec: EditSpec, file: FileText, crAt: (lf: number) => boolean): { spec: EditSpec; accept: (at: number) => boolean } | null {
+function readForm(spec: EditSpec, file: FileText, crAt: (lf: number) => boolean): { spec: EditSpec; accept: (at: number) => boolean; leading: boolean; trailing: boolean } | null {
   const leading = file.bom && spec.oldText.startsWith('\uFEFF');
   const trailing = file.crs.length > 0 && spec.oldText.endsWith('\r');
   if (!leading && !trailing) return null;
@@ -108,6 +109,8 @@ function readForm(spec: EditSpec, file: FileText, crAt: (lf: number) => boolean)
     spec: { ...spec, oldText, newText },
     // crs holds only LFs that followed a CR, so one there is a CRLF line end.
     accept: (at) => (!leading || at === 0) && (!trailing || crAt(at + oldText.length)),
+    leading,
+    trailing,
   };
 }
 
@@ -378,7 +381,21 @@ export type MatchProblem =
    * It matches only without the BOM or the line end's CR its old text
    * carries (readForm), and without them it is the same as its new text.
    */
-  | { kind: 'same'; edit: number };
+  | { kind: 'same'; edit: number }
+  /**
+   * Its old text, which carries the file's BOM at its start (`bom`) or a CR
+   * at its end (`cr`), occurs both as given and without them (readForm), so
+   * which the edit means can't be told. Each reading's occurrences as a
+   * count's are: how many, and the lines of the first SHOWN_MATCHES.
+   */
+  | {
+    kind: 'readings';
+    edit: number;
+    bom: boolean;
+    cr: boolean;
+    asGiven: { found: number; atLeast: boolean; lines: number[] };
+    readAs: { found: number; atLeast: boolean; lines: number[] };
+  };
 
 /** One replacement made, in the updated text. */
 export interface Change {
@@ -472,7 +489,9 @@ function lineFeeds(value: string): number {
  * curly quotes treated as equal, and then, if it carries the file's BOM at its
  * start or a line's CR at its end, without them (readForm); an edit that
  * matches only without them, and without them is the same as its new text,
- * has nothing to change. Two edits' matches may touch but not overlap. Only
+ * has nothing to change, and one found both as given and without them is
+ * refused, since which it means can't be told. Two edits' matches may touch
+ * but not overlap. Only
  * the replaced text changes: every other byte stays as it was, and each new
  * text's line ends take, by position, those of the text it replaces. For
  * each occurrence an edit replaces it holds numbers, not objects: the
@@ -522,12 +541,31 @@ export function planFile(
     let matched = spec;
     let { starts, count, overlapping, atLeast } = scan(value, spec.oldText, keep);
     let normalized = false;
+    const read = readForm(spec, file, crAt);
+    // An old text with the file's BOM at its start or a CR at its end reads
+    // two ways: as given, and without it, as a character page or a line shown
+    // with its CRLF end's CR gives it. A line whose own text ends in one CR,
+    // shown with its end's, reads as given as a line ending in two. Where both
+    // readings find it, which the edit means can't be told, so it's refused.
+    if (count > 0 && read) {
+      const other = scan(value, read.spec.oldText, SHOWN_MATCHES, read.accept);
+      if (other.count > 0) {
+        problems.push({
+          kind: 'readings',
+          edit: spec.index,
+          bom: read.leading,
+          cr: read.trailing,
+          asGiven: { found: count, atLeast, lines: lineNumbersAt(value, starts.slice(0, SHOWN_MATCHES)) },
+          readAs: { found: other.count, atLeast: other.atLeast, lines: lineNumbersAt(value, other.starts.slice(0, SHOWN_MATCHES)) },
+        });
+        continue;
+      }
+    }
     if (count === 0) {
       ({ starts, count, overlapping, atLeast } = scan((quoted ??= normalizeQuotes(value)), normalizeQuotes(spec.oldText), keep));
       normalized = count > 0;
     }
     if (count === 0) {
-      const read = readForm(spec, file, crAt);
       if (read) {
         ({ starts, count, overlapping, atLeast } = scan(value, read.spec.oldText, keep, read.accept));
         // Read as the file's own, the BOM or CR was all the edit changed.

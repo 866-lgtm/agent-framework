@@ -4,13 +4,14 @@
  * first changed region. What can grow with a call, problems, notes, files and
  * regions, is held to the length the call's result may have
  * (ToolCall.resultMaxChars). Past it, a problem keeps its first line, a region
- * is named by its lines, and the answer's last line counts what it left out.
+ * is named by its lines, and the answer's last line counts what it left out;
+ * edit's receipt keeps its path and notes whatever their length.
  *
  * Ported from anima-research/hands-mcp's src/edit.ts, where it words the Edit
  * and EditMany tools' answers.
  */
 
-import { type Change, type FilePlan, type MatchProblem, SHOWN_MATCHES, shownLine } from './edit-plan.js';
+import { type Change, type FilePlan, type MatchProblem, SHOWN_MATCHES } from './edit-plan.js';
 import { MAX_LINE_CHARS, jsonLength, numberedLine, safeCut } from './text.js';
 
 /** The tool a call came through, which words its refusals and receipt. */
@@ -142,6 +143,14 @@ function problemText(problem: EditProblem, tool: EditTool): string {
         + 'so some of their matches overlap; give each its own stretch of text.';
     case 'same':
       return `oldString and newString are the same once the BOM or the line end's CR that oldString carries is read as ${problem.path}'s own, which the file keeps, so there's nothing to change.`;
+    case 'readings': {
+      const carries = problem.bom && problem.cr ? 'starts with a BOM and ends in a CR' : problem.bom ? 'starts with a BOM' : 'ends in a CR';
+      const readAs = problem.bom && problem.cr
+        ? "with them read as the file's BOM and a CRLF line end's CR"
+        : problem.bom ? "with that BOM read as the file's own" : "with that CR read as its CRLF line end's";
+      const hint = problem.cr ? 'Include the line end after it to say which.' : 'Include more of the text after it to say which.';
+      return `oldString ${carries}, and occurs in ${problem.path} both as given (${countLines(problem.asGiven)}) and ${readAs} (${countLines(problem.readAs)}), so which you mean can't be told. ${hint}`;
+    }
   }
 }
 
@@ -332,6 +341,29 @@ export function shownRegions(plan: FilePlan, budget: { left: number }, maxChars:
       last.end = Math.max(last.end, region.end);
     } else regions.push(region);
   }
+  // A line shows as read shows the stored bytes. A CR before a line feed in
+  // the updated text is the line's own, so the line shows its CRLF end's CR
+  // too, as a line of the old text does (shownLine), unless the edit put that
+  // CR before a bare LF: on disk the two are then a CRLF end, which read shows
+  // without the CR. The new bytes tell these apart by the CRs before the line
+  // feed, read only for a line whose own text ends in a CR, at a place that
+  // moves forward with the regions' lines. A file's line n is line n of its
+  // bytes, after a BOM's three, since both hold the same line feeds.
+  let byteAt = plan.bom ? 3 : 0;
+  let byteLine = 1;
+  const asStored = (text: string, n: number, beforeLf: boolean): string => {
+    if (!beforeLf || !text.endsWith('\r')) return text;
+    for (; byteLine < n; byteLine++) byteAt = plan.bytes.indexOf(10, byteAt) + 1;
+    const lf = plan.bytes.indexOf(10, byteAt);
+    let own = 0;
+    while (own < text.length && text.charCodeAt(text.length - 1 - own) === 13) own++;
+    let stored = 0;
+    while (stored <= own && lf - 1 - stored >= byteAt && plan.bytes[lf - 1 - stored] === 13) stored++;
+    // A CRLF end after the line's own CRs; or a bare LF, whose last CR read
+    // takes as the end's unless another comes before it.
+    if (stored > own) return `${text}\r`;
+    return own > 1 ? text : text.slice(0, -1);
+  };
   const out: string[] = [];
   const omitted: string[] = [];
   for (const region of regions) {
@@ -345,11 +377,7 @@ export function shownRegions(plan: FilePlan, budget: { left: number }, maxChars:
     for (let lineStart = region.start, n = region.from; fits && lineStart < region.end; n++) {
       const newline = plan.updated.indexOf('\n', lineStart);
       const lineEnd = newline === -1 || newline >= region.end ? region.end : newline;
-      // A line whose own text ends in a CR shows its CRLF end's CR too
-      // (shownLine). Where the edit itself puts a CR before a bare LF, disk
-      // then holds the two as a CRLF end, and this shows the line with two
-      // CRs.
-      const text = shownLine(plan.updated.slice(lineStart, lineEnd), lineEnd === newline);
+      const text = asStored(plan.updated.slice(lineStart, lineEnd), n, lineEnd === newline);
       // A line too long to show whole shows its start, or, where edits' first
       // changes start on it, a stretch from shortly before each.
       const columns = text.length > MAX_LINE_CHARS ? firsts.filter((first) => first.line === n).map((first) => first.at - lineStart) : [];
