@@ -1100,11 +1100,13 @@ export class ChannelRegistry {
           this.invalidateTransportConfirmation(existing);
           // An operation queued or running for this channel reads its target
           // again before it confirms anything, and after a failed RPC, so it
-          // opens the new one. With none, a channel decided open (or tuned
-          // out) is reconciled here.
+          // opens the new one, unless it was queued before its server's
+          // registrations were last removed: that one cancels when it would
+          // run. So a channel decided open (or tuned out) is reconciled here
+          // unless work queued since then is outstanding.
           const desired = this.getDesiredState(serverId, channel.id);
           if ((desired === 'open' || desired === 'tuned-out') &&
-              !this.lifecycleOutstanding.has(this.lifecycleKey(serverId, channel.id))) {
+              !this.outstandingWorkCarriesOut(serverId, this.lifecycleKey(serverId, channel.id))) {
             retargeted.push(channel);
           }
         }
@@ -2736,8 +2738,10 @@ export class ChannelRegistry {
    *  server's registrations were last removed, so it won't cancel when it
    *  would run. Each operation reads the decision when it runs. It answers for
    *  now: a removal after it cancels that work too, and takes the channel's
-   *  entry with it, so its next registration carries the decision out, where
-   *  this host directs the lifecycle then. */
+   *  entry with it, so the channel's next registration by channels/register,
+   *  or as added by channels/changed, carries the decision out, where this
+   *  host directs the lifecycle then. A push's registration
+   *  (ensureChannelRegistered) queues no lifecycle work. */
   private outstandingWorkCarriesOut(serverId: string, key: string): boolean {
     return this.lifecycleOutstanding.has(key) &&
       this.lifecycleQueuedRemovals.get(key) === (this.serverRemovals.get(serverId) ?? 0);
@@ -3132,8 +3136,9 @@ export class ChannelRegistry {
         // where the host directed the lifecycle when it opened: see the grant
         // check above. Where the grant has lost channels.lifecycle since, as a
         // transport drop clears it, the queued work fails for it, and the
-        // server's next registration carries the decision out, where this host
-        // directs the lifecycle then.)
+        // channel's next registration by channels/register, or as added by
+        // channels/changed, carries the decision out, where this host directs
+        // the lifecycle then.)
         if (current && !this.outstandingWorkCarriesOut(entry.serverId, key)) {
           this.applyThroughQueue(entry.serverId, entry.descriptor.id);
         }

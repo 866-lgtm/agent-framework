@@ -1395,6 +1395,75 @@ test("removing a server cancels its queued lifecycle work, even across a re-regi
   assert.equal(f.traces.filter((e) => e.type === 'mcpl:channel-reconcile-failed').length, 0);
 });
 
+// Work queued before a server's removal cancels when it would run, so it
+// carries out no decision for the channel's later entry. A retarget then
+// opens the new target itself, as it does with nothing queued.
+for (const decision of ['open', 'tuned-out'] as const) {
+  test(`a retarget after its server's removal opens the new target, though work queued before the removal is still outstanding, for a channel decided ${decision}`, async () => {
+    const f = fixture();
+    f.held.add('x');
+    const opening = f.registry.handleChanged('test', { added: [descriptor('x', true, 'A')] });
+    await tick();
+    if (decision === 'tuned-out') {
+      f.registry.enterTuneOut('test', 'x', {
+        epochId: 'e1', cadenceSeconds: 60, backlogCap: 20, maxWakes: 3, startedAtSequence: 1,
+      }, 'agent-tool');
+    }
+    f.registry.removeServer('test');
+    // A push names the channel before its server registers it again.
+    f.registry.ensureChannelRegistered('test', 'x', 'x');
+    const retarget = f.registry.handleChanged('test', { updated: [descriptor('x', true, 'B')] });
+    f.held.delete('x');
+    await f.drain(opening, retarget);
+    assert.equal(f.registry.getDesiredState('test', 'x'), decision);
+    assert.deepEqual(f.calls.map((c) => [c.kind, c.address]), [['open', { value: 'A' }], ['open', { value: 'B' }]]);
+    assert.equal(f.isOpen(), true);
+    assert.deepEqual(f.traces.filter((t) => t.type === 'mcpl:channel-reconcile-failed'), []);
+  });
+}
+
+test("a retarget once the lifecycle grant is back opens the new target, though work queued before the server's removal is still outstanding", async () => {
+  const f = fixture();
+  f.held.add('x');
+  const opening = f.registry.handleChanged('test', { added: [descriptor('x', true, 'A')] });
+  await tick();
+  f.registry.removeServer('test');
+  // Registered again where the host doesn't direct the lifecycle, which
+  // reconciles nothing, then retargeted once it does.
+  f.setGrant(ALL_CAPABILITY_PATHS.filter((p) => p !== 'channels.lifecycle'));
+  await f.registry.handleChanged('test', { added: [descriptor('x', true, 'A')] });
+  f.setGrant(ALL_CAPABILITY_PATHS);
+  const retarget = f.registry.handleChanged('test', { updated: [descriptor('x', true, 'B')] });
+  f.held.delete('x');
+  await f.drain(opening, retarget);
+  assert.equal(f.registry.getDesiredState('test', 'x'), 'open');
+  assert.deepEqual(f.calls.map((c) => [c.kind, c.address]), [['open', { value: 'A' }], ['open', { value: 'B' }]]);
+  assert.equal(f.isOpen(), true);
+  assert.deepEqual(f.traces.filter((t) => t.type === 'mcpl:channel-reconcile-failed'), []);
+});
+
+test("a retarget while work queued since its server's removal is outstanding queues nothing more: that work opens the new target", async () => {
+  const f = fixture();
+  f.held.add('x');
+  const opening = f.registry.handleChanged('test', { added: [descriptor('x', true, 'A')] });
+  await tick();
+  f.registry.removeServer('test');
+  f.registry.ensureChannelRegistered('test', 'x', 'x');
+  // Queues an open under the new removal count, behind the held open to A.
+  const toB = f.registry.handleChanged('test', { updated: [descriptor('x', true, 'B')] });
+  f.pending.shift()!.finish();
+  for (let i = 0; i < 100 && f.calls.length < 2; i++) await tick();
+  assert.deepEqual(f.calls.map((c) => [c.kind, c.address]), [['open', { value: 'A' }], ['open', { value: 'B' }]]);
+  // The open to B is outstanding and counted since the removal, so it
+  // carries out the retarget to C: no second open is queued for C.
+  const toC = f.registry.handleChanged('test', { updated: [descriptor('x', true, 'C')] });
+  f.held.delete('x');
+  await f.drain(opening, toB, toC);
+  assert.deepEqual(f.calls.map((c) => [c.kind, c.address]), [['open', { value: 'A' }], ['open', { value: 'B' }], ['open', { value: 'C' }]]);
+  assert.equal(f.isOpen(), true);
+  assert.deepEqual(f.traces.filter((t) => t.type === 'mcpl:channel-reconcile-failed'), []);
+});
+
 test('a substitute removed while its corrective close is queued is cancelled, not traced as failed', async () => {
   const f = fixture();
   f.held.add('y');
