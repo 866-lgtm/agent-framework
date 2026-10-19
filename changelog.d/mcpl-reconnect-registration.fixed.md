@@ -40,11 +40,15 @@
   recorded them as forwarded won't send them again, and they stay held while
   no transport serves, even when a gate readies every connection meanwhile;
   the host's own reports about the transport, such as a `connect-failed`, go
-  on. A channel registration the next process sends while they are still
-  held is admitted ahead of them, so a kept message isn't refused as an
-  unknown channel, unless it names a channel that an earlier removal, or an
-  earlier registration kept in place, names: then it's kept in place too, so
-  the writes to one channel stay in order. A removal stays where it was
+  on. Requests kept this way don't count against the 10,000 held requests a
+  server may have waiting, since no server waits on their answers any more:
+  they have a bound of their own, the same 10,000, past which one is dropped
+  and logged, so a dead process's backlog doesn't refuse the next process's
+  requests. A channel registration the next process sends while they are
+  still held is admitted ahead of them, so a kept message isn't refused as
+  an unknown channel, unless it names a channel that an earlier removal, or
+  an earlier registration kept in place, names: then it's kept in place too,
+  so the writes to one channel stay in order. A removal stays where it was
   held, with whatever else it adds or updates, so when both planes open
   together, what the next process sent before one is admitted before it.
   While the host is quiesced its control plane opens first, so a removal is

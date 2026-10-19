@@ -453,12 +453,31 @@ export class McplServerConnection extends EventEmitter {
     return kept.map((item) => ({ ...item, kept: true as const }));
   }
 
-  /** Hold these items in place of what is held, with heldRequests counting
-   *  the requests among them: a boundary keeps some of what was held, and a
-   *  flush that crosses one holds the rest of its snapshot again. */
+  /** Hold these items in place of what is held, with heldRequests and
+   *  keptRequests counting the requests among them: a boundary keeps some of
+   *  what was held, a flush that crosses one holds the rest of its snapshot
+   *  again, and a flush starts from nothing held. */
   private replaceHeld(items: HeldItem[]): void {
-    this.bufferedEvents = items;
-    this.heldRequests = items.filter((item) => McplServerConnection.hasResponder(item)).length;
+    // The kept bound holds here too: boundaries that come with no flush
+    // between them each keep what the next transport held, so it's checked
+    // where they're joined. The earliest kept are kept, as at hold.
+    let kept = 0;
+    let past = 0;
+    this.bufferedEvents = items.filter((item) => {
+      if (item.kept !== true || !McplServerConnection.hasResponder(item)) return true;
+      if (kept < McplServerConnection.MAX_HELD_REQUESTS) { kept++; return true; }
+      past++;
+      return false;
+    });
+    this.heldRequests = this.bufferedEvents.filter((item) => !item.kept && McplServerConnection.hasResponder(item)).length;
+    this.keptRequests = kept;
+    if (past > 0) {
+      this.droppedKeptRequests += past;
+      console.error(
+        `[mcpl] ${this.id}: kept-request bound (${McplServerConnection.MAX_HELD_REQUESTS}) — ` +
+        `dropped ${past} request(s) a closed transport left`,
+      );
+    }
   }
 
   /** The active transport (stdio child or WebSocket). Null for a disconnected
@@ -510,6 +529,16 @@ export class McplServerConnection extends EventEmitter {
   /** How many of bufferedEvents are server→host requests, each holding a
    *  responder its server waits on. Every change to bufferedEvents keeps it. */
   private heldRequests = 0;
+  /** How many of bufferedEvents are requests a transport boundary kept:
+   *  incoming messages and pushes whose transport has closed. No server waits
+   *  on them, since their answers can't reach it (sameTransport), so they
+   *  stay out of the held-request budget, which bounds what a live server
+   *  waits on: a dead process's backlog must not refuse the next process's
+   *  registration. They have their own bound at the same size, past which a
+   *  kept request is dropped and logged, there being no one to refuse. */
+  private keptRequests = 0;
+  /** Kept requests dropped at their bound, so the first of a run is logged. */
+  private droppedKeptRequests = 0;
   /** Cap on held notifications (responder-less events) during a plane pause
    *  (issue #122), counted apart from requests: past it, the oldest held
    *  notification is dropped. */
@@ -613,13 +642,13 @@ export class McplServerConnection extends EventEmitter {
     this.controlPlaneReady = true;
     this.dataPlaneReady = true;
     const pending = this.bufferedEvents;
-    this.bufferedEvents = [];
+    this.replaceHeld([]);
     // The cap's drops are counted per pause: this flush ends one, so its line
     // reports that pause's drops, and the next pause counts (and logs) its own.
     const dropped = this.droppedBufferedEvents;
     this.droppedBufferedEvents = 0;
-    this.heldRequests = 0;
     this.refusedHeldRequests = 0;
+    this.droppedKeptRequests = 0;
     if (pending.length > 200) {
       console.error(
         `[mcpl] ${this.id}: flushing ${pending.length} buffered event(s) synchronously ` +
@@ -661,9 +690,19 @@ export class McplServerConnection extends EventEmitter {
         this.replaceHeld([...this.bufferedEvents, ...this.keepAcrossBoundary(ordered.slice(index))]);
         return;
       }
-      const { event, args } = ordered[index]!;
-      this.dispatchInboundEvent(event, ...args);
+      const { event, args, kept } = ordered[index]!;
+      // What it can't admit yet is held again, as the admission gate would
+      // hold it, with what a boundary kept still marked as kept.
+      if (kept && !this.planeReadyFor(event)) this.hold(event, args, kept);
+      else this.dispatchInboundEvent(event, ...args);
     }
+  }
+
+  /** Whether the plane an event belongs to is open (lifecycle events always
+   *  pass), as the admission gate (emit) decides it. */
+  private planeReadyFor(event: string): boolean {
+    return McplServerConnection.isLifecycleEvent(event)
+      || (McplServerConnection.isControlPlaneEvent(event) ? this.controlPlaneReady : this.dataPlaneReady);
   }
 
   /**
@@ -753,8 +792,7 @@ export class McplServerConnection extends EventEmitter {
     }
     this.controlPlaneReady = true;
     const pending = this.bufferedEvents;
-    this.bufferedEvents = [];
-    this.heldRequests = 0;
+    this.replaceHeld([]);
     // Re-enter the ADMISSION gate (this.emit), never super.emit: control
     // events include channels-register/changed, which are grant-gated —
     // the old direct flush bypassed positive-grant enforcement entirely
@@ -796,12 +834,7 @@ export class McplServerConnection extends EventEmitter {
    */
   override emit(event: string | symbol, ...args: unknown[]): boolean {
     const name = typeof event === 'string' ? event : '';
-    if (
-      McplServerConnection.isLifecycleEvent(name)
-      || (McplServerConnection.isControlPlaneEvent(name)
-        ? this.controlPlaneReady
-        : this.dataPlaneReady)
-    ) {
+    if (this.planeReadyFor(name)) {
       // Positive-grant admission (§5.4/§14.1), at the single choke-point
       // every path shares: live routing AND buffer flushes re-enter here, so
       // an event buffered while the connection was staged is authorized
@@ -876,11 +909,30 @@ export class McplServerConnection extends EventEmitter {
     // the code of the host's other transient refusals, and its server can send
     // it again. A notification has no one to tell, so past
     // MAX_HELD_NOTIFICATIONS (issue #122) the oldest held notification is
-    // dropped to make room. A flush takes the whole buffer and zeroes its
-    // count, so what it holds again was admitted within these bounds and
-    // stays within them.
+    // dropped to make room. A request a closed transport left (`kept`) has
+    // no server waiting on it, so it's counted apart, as keptRequests, and
+    // dropped past its own bound. A flush takes the whole buffer and zeroes
+    // its counts, so what it holds again was admitted within these bounds
+    // and stays within them.
     const responder = args[1] as { respond?: unknown; respondError?: (code: number, message: string) => void } | undefined;
     const isRequest = McplServerConnection.hasResponder({ args });
+    if (isRequest && kept) {
+      // A request a closed transport left (keptRequests): no server waits on
+      // it, so past its own bound it's dropped, with nobody to refuse.
+      if (this.keptRequests >= McplServerConnection.MAX_HELD_REQUESTS) {
+        this.droppedKeptRequests++;
+        if (this.droppedKeptRequests % 100 === 1) {
+          console.error(
+            `[mcpl] ${this.id}: kept-request bound (${McplServerConnection.MAX_HELD_REQUESTS}) — ` +
+            `dropped ${this.droppedKeptRequests} request(s) a closed transport left`,
+          );
+        }
+        return true;
+      }
+      this.bufferedEvents.push({ event: name, args, kept });
+      this.keptRequests++;
+      return true;
+    }
     if (isRequest && this.heldRequests >= McplServerConnection.MAX_HELD_REQUESTS) {
       this.refusedHeldRequests++;
       if (this.refusedHeldRequests % 100 === 1) {
@@ -895,7 +947,7 @@ export class McplServerConnection extends EventEmitter {
       );
       return true;
     }
-    if (!isRequest && this.bufferedEvents.length - this.heldRequests >= McplServerConnection.MAX_HELD_NOTIFICATIONS) {
+    if (!isRequest && this.bufferedEvents.length - this.heldRequests - this.keptRequests >= McplServerConnection.MAX_HELD_NOTIFICATIONS) {
       this.droppedBufferedEvents++;
       if (this.droppedBufferedEvents % 100 === 1) {
         console.error(

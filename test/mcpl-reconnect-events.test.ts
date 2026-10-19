@@ -742,9 +742,10 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     assert.deepStrictEqual(admitted.map((event) => event.messageId), ['kept-1']);
   });
 
-  // #387's budget of 10,000 held requests counts what a transport boundary
-  // leaves held: a request it keeps still holds its responder, and one it
-  // drops leaves the count.
+  // #387's budget of 10,000 held requests is for requests a live server
+  // waits on. A request a transport boundary keeps has no server waiting, its
+  // answer bound to a transport that's gone, so it's counted apart, with a
+  // bound of its own; one the boundary drops leaves the count.
   const incoming = (id: number) => ({ messages: [{ channelId: 'room', messageId: `m${id}`, content: [] }] });
   async function heldAcrossBoundary(method: string, params: (id: number) => unknown) {
     writeFileSync(FLAG_FILE, '');
@@ -754,6 +755,7 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     const serverSends = (message: Record<string, unknown>) =>
       (connection as unknown as { transport: { emit(event: string, line: string): void } }).transport
         .emit('line', JSON.stringify({ jsonrpc: '2.0', ...message }));
+    const dead = (connection as unknown as { transport: { emit(event: string, line: string): void } }).transport;
     const logged: string[] = [];
     const consoleError = console.error;
     console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
@@ -770,25 +772,97 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     const writeLine = transport.writeLine.bind(transport);
     transport.writeLine = (line: string) => { written.push(line); writeLine(line); };
     const held = () => (connection as unknown as { bufferedEvents: Array<{ event: string }> }).bufferedEvents.map((item) => item.event);
-    return { serverSends, logged, written, held };
+    const lateSends = (message: Record<string, unknown>) => dead.emit('line', JSON.stringify({ jsonrpc: '2.0', ...message }));
+    return { serverSends, lateSends, logged, written, held };
   }
 
-  it('counts the incoming messages a transport boundary keeps against the next transport\'s budget: past 10,000 held, its request is refused at once', async () => {
+  it('keeps the incoming messages a transport boundary keeps out of the next transport\'s budget: after 10,000 kept, its request is held', async () => {
     const { serverSends, written, held } = await heldAcrossBoundary('channels/incoming', incoming);
     assert.equal(held().length, 10_000, 'every incoming message is kept');
+    serverSends({ id: 10_001, method: 'channels/incoming', params: incoming(10_001) });
+    assert.deepStrictEqual(written, [], 'nothing refused');
+    assert.equal(held().length, 10_001);
+  });
+
+  it("admits the next process's channel registration ahead of 10,000 kept messages", async () => {
+    const { serverSends, written } = await heldAcrossBoundary('channels/incoming', incoming);
+    serverSends({ id: 10_001, method: 'channels/register', params: { channels: [{ id: 'room', type: 'text', direction: 'bidirectional' }] } });
+    assert.deepStrictEqual(written, [], 'the registration is held, not refused');
+    const order: string[] = [];
+    connection!.on('channels-register', () => { order.push('register'); });
+    connection!.on('channels-incoming', () => { order.push('incoming'); });
+    connection!.establishGrant(new CapabilityGrant(new Set(['channels.register', 'channels.incoming']), []));
+    connection!.ready();
+    assert.equal(order.length, 10_001);
+    assert.equal(order[0], 'register', 'admitted before what was kept');
+  });
+
+  it('drops and logs a request read from the closed transport past the kept bound of 10,000', async () => {
+    const { lateSends, held } = await heldAcrossBoundary('channels/incoming', incoming);
+    const logged: string[] = [];
     const consoleError = console.error;
-    console.error = () => {};
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
     try {
-      serverSends({ id: 10_001, method: 'channels/incoming', params: incoming(10_001) });
+      lateSends({ id: 10_001, method: 'channels/incoming', params: incoming(10_001) });
     } finally {
       console.error = consoleError;
     }
-    assert.deepStrictEqual(written.map((line) => JSON.parse(line)), [{
-      jsonrpc: '2.0',
-      id: 10_001,
-      error: { code: -32000, message: 'the host is busy: 10000 of this server\'s requests are already waiting; send this one again later' },
-    }]);
-    assert.equal(held().length, 10_000);
+    assert.equal(held().length, 10_000, 'not held');
+    assert.ok(logged.some((line) => line.includes('kept-request bound (10000) — dropped 1 request(s) a closed transport left')), logged.join('\n'));
+  });
+
+  it('keeps the kept bound where boundaries join with no flush between, keeping the earliest', async () => {
+    writeFileSync(FLAG_FILE, '');
+    connection = await McplServerConnection.connect(makeConfig(), HOST_CAPS);
+    let reconnected = 0;
+    connection.on('reconnect', () => { reconnected++; });
+    const serverSends = (message: Record<string, unknown>) =>
+      (connection as unknown as { transport: { emit(event: string, line: string): void } }).transport
+        .emit('line', JSON.stringify({ jsonrpc: '2.0', ...message }));
+    const logged: string[] = [];
+    const consoleError = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      // Three rounds of 10,000 held, each ended by a crash and a reconnect,
+      // with nothing readying the connection between them.
+      for (let round = 1; round <= 3; round++) {
+        for (let n = 1; n <= 10_000; n++) serverSends({ id: round * 100_000 + n, method: 'channels/incoming', params: incoming(round * 100_000 + n) });
+        connection.sendToolsList().catch(() => {});
+        await waitFor(() => reconnected === round, 10_000, `reconnect ${round}`);
+      }
+    } finally {
+      console.error = consoleError;
+    }
+    const held = (connection as unknown as { bufferedEvents: Array<{ args: Array<{ messages?: Array<{ messageId: string }> }> }> }).bufferedEvents;
+    assert.equal(held.length, 10_000);
+    assert.equal(held[0]!.args[0]!.messages![0]!.messageId, 'm100001', 'the earliest are kept');
+    assert.equal(held[9_999]!.args[0]!.messages![0]!.messageId, 'm110000');
+    assert.equal(logged.filter((line) => line.includes('kept-request bound (10000) — dropped 10000 request(s) a closed transport left')).length, 2, logged.join('\n'));
+  });
+
+  it("a control-plane flush keeps what a boundary kept out of the next transport's budget", async () => {
+    const { serverSends, written, held } = await heldAcrossBoundary('channels/incoming', incoming);
+    // A quiesce opens the control plane first; the kept messages are data.
+    connection!.establishGrant(new CapabilityGrant(new Set(['channels.incoming']), []));
+    connection!.readyControlPlane();
+    assert.equal(held().length, 10_000, 'held again');
+    serverSends({ id: 10_001, method: 'channels/incoming', params: incoming(10_001) });
+    assert.deepStrictEqual(written, [], 'nothing refused');
+    assert.equal(held().length, 10_001);
+  });
+
+  it("holds the next transport's notifications beside 10,000 kept requests, dropping none", async () => {
+    const { serverSends, held } = await heldAcrossBoundary('channels/incoming', incoming);
+    const logged: string[] = [];
+    const consoleError = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      for (let n = 1; n <= 5; n++) serverSends({ method: 'channels/incoming', params: incoming(20_000 + n) });
+    } finally {
+      console.error = consoleError;
+    }
+    assert.equal(held().length, 10_005);
+    assert.equal(logged.some((line) => line.includes('buffered-event cap')), false, logged.join('\n'));
   });
 
   it('frees the budget of the requests a transport boundary drops: after 10,000 held inference requests, the next transport\'s request is held', async () => {
