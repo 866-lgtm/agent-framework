@@ -375,8 +375,8 @@ export class TuneOutCoordinator {
     // report is told of them. A newest message too long to fit alone is shown
     // cut to the room left and marked, so the residents still get its head,
     // as they would from a row of its own. When no line fits, whole or cut,
-    // the dump shows none, and a room too small for even that has its frame,
-    // the header and tags, cut.
+    // the dump shows none; if the room is too small for even that, the
+    // residents' strategies cut its frame, the header and tags.
     let shown = cap > 0 ? backlog.slice(-cap) : [];
     let lines = shown.map(lineOf);
     let newestCut = false;

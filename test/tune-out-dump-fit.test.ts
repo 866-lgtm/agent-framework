@@ -109,9 +109,10 @@ test('it keeps the newest lines that fit whole, counts those it leaves out, and 
 });
 
 test('at every room, over six backlogs, the dump shows as many of the newest as fit whole, or the newest cut, fits, and counts the rest', () => {
-  // Twelve takes truncated= across a digit, and so do ten and twelve under a
-  // backlogCap of 9, which leaves some out before the fit; a newest longer
-  // than the mark reaches the cut, alone too, where showing it drops truncated=.
+  // Twelve takes truncated= across a digit as the fit keeps lines, and so does
+  // twelve under a backlogCap of 9, which leaves some out before the fit; ten
+  // under that cap crosses it between no line and one; a newest longer than
+  // the mark reaches the cut, alone too, where showing it drops truncated=.
   const long = row('Bo', `NEWEST ${'y'.repeat(300)}`);
   const backlogs: Array<{ msgs: Row[]; cap?: number }> = [
     { msgs: FIVE }, { msgs: stored(12) }, { msgs: stored(10), cap: 9 }, { msgs: stored(12), cap: 9 },
@@ -130,6 +131,7 @@ test('at every room, over six backlogs, the dump shows as many of the newest as 
       const at = `over ${n}${cap !== undefined ? ` capped at ${cap}` : ''} at room ${room}`;
       const { dump, notice } = cancelWith({ room, stored: msgs, ...(cap !== undefined ? { backlogCap: cap } : {}) });
       const lines = linesOf(dump);
+      assert.ok(lines.length <= most, `${at} no more lines than the cap allows`);
       if (lines.length > 0 && lines[0]!.endsWith(CUT_MARK)) {
         const head = lines[0]!.slice(0, -CUT_MARK.length);
         assert.equal(lines.length, 1, `${at} a cut line is the only one`);
