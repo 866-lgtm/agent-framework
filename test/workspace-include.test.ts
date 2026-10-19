@@ -1064,12 +1064,40 @@ describe('mount include', () => {
     const m = await env.open({ followSymlinks: true, include: ['*.json'] });
     chmodSync(join(env.dir, 'locked'), 0o000);
     try {
-      for (const [name, input] of [['read', { path: 'work/locked/x.json' }], ['write', { path: 'work/locked/x.json', content: '[]\n' }]] as const) {
+      for (const [name, input] of [['read', { path: 'work/locked/x.json' }], ['write', { path: 'work/locked/x.json', content: '[]\n' }], ['delete', { path: 'work/locked/x.json' }]] as const) {
         const why = await refused(m, name, input);
         assert.ok(why.includes('Unable to resolve file: work/locked/x.json'), `${name}: ${why}`);
       }
+      await assert.rejects(m.readFileFromDisk('work/locked/x.json'), (err: unknown) => err instanceof WorkspaceReadError && err.code === 'not_found');
     } finally {
       chmodSync(join(env.dir, 'locked'), 0o755);
+    }
+  });
+
+  // Linux's kernel follows 40 links in one resolution and refuses a 41st.
+  // realBeneath follows as many links as the kernel does, so a chain of 40 is
+  // taken, and one of 41 is refused where realpath refuses it. This pins
+  // Linux's limit, so it runs on Linux.
+  test("on a mount that follows links, a covered path through 40 links to a file not made yet is taken, and one through 41 is refused, as the kernel resolves them", { skip: process.platform !== 'linux' ? "pins Linux's limit of 40 links in one resolution" : false }, async (t) => {
+    for (const links of [40, 41]) {
+      const env = new Env(t);
+      // c0.json -> c1.json -> ... -> new.json, which isn't there yet.
+      for (let i = 0; i < links; i++) symlinkSync(i === links - 1 ? 'new.json' : `c${i + 1}.json`, join(env.dir, `c${i}.json`));
+      const m = await env.open({ followSymlinks: true, include: ['*.json'] });
+      if (links === 40) {
+        await call(m, 'write', { path: 'work/c0.json', content: '{}\n' });
+        const done = await call(m, 'materialize', { mount: 'work' });
+        assert.ok(JSON.stringify(done.skipped).includes('c0.json: cannot verify disk copy'), JSON.stringify(done));
+        assert.equal(existsSync(join(env.dir, 'new.json')), false, 'nothing is written through the chain');
+        assert.ok(lstatSync(join(env.dir, 'c0.json')).isSymbolicLink(), 'and the link stays');
+      } else {
+        for (const [name, input] of [['read', { path: 'work/c0.json' }], ['write', { path: 'work/c0.json', content: '{}\n' }], ['delete', { path: 'work/c0.json' }]] as const) {
+          const why = await refused(m, name, input);
+          assert.ok(why.includes('Unable to resolve file: work/c0.json'), `${name}: ${why}`);
+        }
+        await assert.rejects(m.readFileFromDisk('work/c0.json'), (err: unknown) => err instanceof WorkspaceReadError && err.code === 'not_found');
+      }
+      await env.stop(m);
     }
   });
 
