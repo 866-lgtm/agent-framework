@@ -374,8 +374,9 @@ export class TuneOutCoordinator {
     // oldest, count as truncated along with those above backlogCap, so the
     // report is told of them. A newest message too long to fit alone is shown
     // cut to the room left and marked, so the residents still get its head,
-    // as they would from a row of its own. A room too small for the dump's
-    // frame, its header and tags, leaves it no line, and the frame is cut.
+    // as they would from a row of its own. When no line fits, whole or cut,
+    // the dump shows none, and a room too small for even that has its frame,
+    // the header and tags, cut.
     let shown = cap > 0 ? backlog.slice(-cap) : [];
     let lines = shown.map(lineOf);
     let newestCut = false;
@@ -396,11 +397,12 @@ export class TuneOutCoordinator {
         used = next;
         kept++;
       }
-      // What of the newest line's text fits beside the frame and the mark.
-      const cutRoom = room - frameShowing(1) - CUT_MARK.length;
-      const newest = lines.at(-1);
-      if (kept === 0 && newest !== undefined && cutRoom > 0) {
-        lines = [prefixOf(newest, cutRoom) + CUT_MARK];
+      // What of the newest line's text fits beside the frame and the mark. A
+      // cut shows some of it or none: a room under one character, or one
+      // that would split a surrogate pair, leaves the head empty.
+      const head = prefixOf(lines.at(-1) ?? '', room - frameShowing(1) - CUT_MARK.length);
+      if (kept === 0 && head !== '') {
+        lines = [head + CUT_MARK];
         shown = shown.slice(-1);
         newestCut = true;
       } else {

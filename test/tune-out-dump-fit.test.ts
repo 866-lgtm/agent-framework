@@ -108,17 +108,27 @@ test('it keeps the newest lines that fit whole, counts those it leaves out, and 
   assert.ok(one.dump.includes('messages=5 truncated=4 '), 'with the other four counted');
 });
 
-test('at every room, over five messages and over twelve, the dump shows as many of the newest as fit whole, fits, and counts the rest', () => {
-  for (const msgs of [FIVE, stored(12)]) {
+test('at every room, over six backlogs, the dump shows as many of the newest as fit whole, or the newest cut, fits, and counts the rest', () => {
+  // Twelve takes truncated= across a digit, and so do ten and twelve under a
+  // backlogCap of 9, which leaves some out before the fit; a newest longer
+  // than the mark reaches the cut, alone too, where showing it drops truncated=.
+  const long = row('Bo', `NEWEST ${'y'.repeat(300)}`);
+  const backlogs: Array<{ msgs: Row[]; cap?: number }> = [
+    { msgs: FIVE }, { msgs: stored(12) }, { msgs: stored(10), cap: 9 }, { msgs: stored(12), cap: 9 },
+    { msgs: [...FIVE, long] }, { msgs: [long] },
+  ];
+  for (const { msgs, cap } of backlogs) {
     const n = msgs.length;
-    const all = msgs.map((r) => `Ann: ${textOf(r.content)}`);
+    const most = Math.min(n, cap ?? n);
+    const all = msgs.map((r) => `${(r.metadata!.author as { name: string }).name}: ${textOf(r.content)}`);
+    let cuts = 0;
     // The dump with no line and all n counted: backlogCap 0 gives it.
     const frame = cancelWith({ backlogCap: 0, stored: msgs }).dump.length;
     // What of the newest line fits beside the frame for one shown and the mark.
     const roomForCut = (room: number): number => room - (lengthShowing(1, msgs) - all[n - 1]!.length) - CUT_MARK.length;
-    for (let room = 0; room <= lengthShowing(n, msgs) + 2; room++) {
-      const at = `over ${n} at room ${room}`;
-      const { dump, notice } = cancelWith({ room, stored: msgs });
+    for (let room = 0; room <= lengthShowing(most, msgs) + 2; room++) {
+      const at = `over ${n}${cap !== undefined ? ` capped at ${cap}` : ''} at room ${room}`;
+      const { dump, notice } = cancelWith({ room, stored: msgs, ...(cap !== undefined ? { backlogCap: cap } : {}) });
       const lines = linesOf(dump);
       if (lines.length > 0 && lines[0]!.endsWith(CUT_MARK)) {
         const head = lines[0]!.slice(0, -CUT_MARK.length);
@@ -126,10 +136,11 @@ test('at every room, over five messages and over twelve, the dump shows as many 
         assert.ok(head.length > 0 && all[n - 1]!.startsWith(head), `${at} it's a head of the newest's line, not empty`);
         assert.ok(lengthShowing(1, msgs) > room, `${at} as the newest doesn't fit whole`);
         assert.equal(dump.length, room, `${at} and it fills the room`);
+        cuts++;
       } else {
         assert.deepEqual(lines, all.slice(n - lines.length), `${at} the lines are the newest, whole`);
         if (lines.length > 0) assert.equal(dump.length, lengthShowing(lines.length, msgs), `${at} rendered as backlogCap ${lines.length} renders it`);
-        if (lines.length < n) assert.ok(lengthShowing(lines.length + 1, msgs) > room, `${at} the next older line wouldn't fit`);
+        if (lines.length < most) assert.ok(lengthShowing(lines.length + 1, msgs) > room, `${at} the next older line wouldn't fit`);
         if (lines.length === 0) assert.ok(roomForCut(room) <= 0, `${at} there's no room to show the newest cut`);
       }
       if (lines.length > 0 || room >= frame) assert.ok(dump.length <= room, `${at} the dump fits (it's ${dump.length})`);
@@ -140,7 +151,28 @@ test('at every room, over five messages and over twelve, the dump shows as many 
         assert.ok(notice!.includes(`${counted} of ${n} diverted messages, the oldest,`), `${at} and the report is told of them`);
       }
     }
+    assert.equal(cuts > 0, msgs.includes(long), `over ${n}, the newest is shown cut at some room exactly when it's longer than the mark`);
   }
+});
+
+test('a cut shows some of the newest or none: not under one character of room, nor half of a surrogate pair', () => {
+  /** The room that leaves `head` characters for the newest's head, beside
+   *  the dump's frame for one shown message and the mark. */
+  const roomFor = (msgs: Row[], head: number): number => {
+    const newest = msgs.at(-1)!;
+    const line = `${(newest.metadata!.author as { name: string }).name}: ${textOf(newest.content)}`;
+    return lengthShowing(1, msgs) - line.length + CUT_MARK.length + head;
+  };
+  const long = [...FIVE, row('Bo', `NEWEST ${'y'.repeat(300)}`)];
+  // A fractional room, as a fractional maxMessageTokens gives.
+  const half = cancelWith({ room: roomFor(long, 0.5), stored: long });
+  assert.deepEqual(linesOf(half.dump), [], 'half a character shows nothing, not the mark alone');
+  assert.ok(half.dump.includes('messages=6 truncated=6 '), 'and the newest is counted as left out');
+  assert.deepEqual(linesOf(cancelWith({ room: roomFor(long, 1), stored: long }).dump), [`B${CUT_MARK}`], 'one character shows that character, marked');
+  // An author whose name opens with an emoji: one code unit would split it.
+  const emoji = [...FIVE, row('😀', `NEWEST ${'y'.repeat(300)}`)];
+  assert.deepEqual(linesOf(cancelWith({ room: roomFor(emoji, 1), stored: emoji }).dump), [], 'room for half the pair shows nothing');
+  assert.deepEqual(linesOf(cancelWith({ room: roomFor(emoji, 2), stored: emoji }).dump), [`😀${CUT_MARK}`], 'room for the pair shows it, marked');
 });
 
 test('a newest message too long to fit alone is shown cut to the room left and marked, with nothing older', () => {

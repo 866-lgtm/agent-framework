@@ -3,7 +3,8 @@
  * The dump and the subconscious's report notice take the ended epoch's
  * messages only. After the notice come, each a row of its own with its own
  * content, the held ones the dump leaves out and the held ones
- * the dump shows whose media its text lines drop, since the subconscious's
+ * the dump shows whose media its text lines drop (and, in
+ * test/tune-out-dump-fit, a held newest it shows cut), since the subconscious's
  * view holds stored messages only. A cancel the subconscious makes itself gets that notice and
  * a report turn when some held message goes to it, or when it wrote no note
  * and the dump left anything out. Here the cap does it; test/tune-out-dump-fit

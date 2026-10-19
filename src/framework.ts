@@ -3353,7 +3353,6 @@ export class AgentFramework {
           residentMessageChars: () => {
             let chars: number | undefined;
             for (const reader of framework.sharedSlotAgents) {
-              if (framework.agents.get(reader.name) !== reader) continue;
               const bound = framework.strategyDerivedToolResultChars(reader);
               if (bound !== undefined && (chars === undefined || bound < chars)) chars = bound;
             }
