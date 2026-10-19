@@ -29,35 +29,48 @@ FILES=(
   libregexp.h libregexp-opcode.h libunicode.h libunicode-table.h
   builtin-array-fromasync.h builtin-iterator-zip.h builtin-iterator-zip-keyed.h
 )
-here=$(cd "$(dirname "$0")" && pwd)
+# Physical paths, as git gives the repository's, so the one can be taken from the other.
+here=$(cd "$(dirname "$0")" && pwd -P)
 dest=$here/quickjs-ng
 # The command that restores the committed copy, from any directory.
 top=$(git -C "$here" rev-parse --show-toplevel)
 restore="git -C $(printf '%q' "$top") checkout -- $(printf '%q' "${dest#"$top"/}")"
 changes=$(git -C "$here" status --porcelain --untracked-files=all --ignored -- quickjs-ng)
 if [ -n "$changes" ]; then
-  echo "vendor.sh: engine/quickjs-ng holds changes or files not committed, which replacing it would erase; commit or remove them first:" >&2
+  echo "vendor.sh: engine/quickjs-ng holds changes or files not committed, which replacing it would erase; commit or remove what you made, or run $restore to put back what's committed:" >&2
   echo "$changes" >&2
   exit 1
 fi
-tmp=$(mktemp -d)
-# The new copy is staged beside the old one, on the same filesystem: once it's whole, the old one
-# is moved aside, the stage renamed into its place, and only then is the old one removed.
-stage=$(mktemp -d "$here/.quickjs-ng.XXXXXX")
-old=$stage.old
-# However the script ends, a committed copy left moved aside goes back, unless the new one is in
-# its place, and what was staged goes.
+# Whenever the script exits, short of being killed outright (SIGKILL), a committed copy left moved
+# aside goes back, unless the new one is in its place, and what was staged goes. A signal waits
+# for the command in progress, and one during this cleanup is ignored.
+tmp= stage= old=
 finish() {
-  if [ -e "$old" ]; then
-    if [ ! -e "$dest" ] && mv "$old" "$dest"; then
-      echo "vendor.sh: stopped while replacing the copy; the committed copy is back in place." >&2
-    elif [ -e "$dest" ]; then
+  set +e
+  trap '' INT TERM HUP
+  if [ -n "$old" ] && [ -e "$old" ]; then
+    if [ -e "$dest" ]; then
       rm -rf "$old"
+    elif mv "$old" "$dest"; then
+      echo "vendor.sh: stopped while replacing the copy; the committed copy is back in place." >&2
+    else
+      echo "vendor.sh: stopped while replacing the copy, and couldn't move the committed copy back from $old; $restore restores it." >&2
     fi
   fi
-  rm -rf "$tmp" "$stage"
+  [ -n "$tmp" ] && rm -rf "$tmp"
+  [ -n "$stage" ] && rm -rf "$stage"
 }
 trap finish EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+tmp=$(mktemp -d)
+# The new copy is staged beside the old one, on the same filesystem: once it's whole, the old one
+# is moved aside, the stage renamed into its place, and only then is the old one removed. Killed
+# outright between the two renames, the script leaves the committed copy at $old, and $restore
+# puts back what's committed.
+stage=$(mktemp -d "$here/.quickjs-ng.XXXXXX")
+old=$stage.old
 git -c advice.detachedHead=false clone --quiet --depth 1 --branch "$TAG" https://github.com/quickjs-ng/quickjs.git "$tmp/quickjs-ng"
 got=$(git -C "$tmp/quickjs-ng" rev-parse HEAD)
 if [ "$got" != "$COMMIT" ]; then
@@ -70,13 +83,13 @@ patched=0
 # Every entry, a dot-named one or a link included, is a regular .patch file or refused, and so is
 # an engine/patches that isn't a directory.
 if { [ -e "$here/patches" ] || [ -L "$here/patches" ]; } && { [ ! -d "$here/patches" ] || [ -L "$here/patches" ]; }; then
-  echo "vendor.sh: engine/patches isn't a directory; remove it, or make it one. engine/quickjs-ng is unchanged." >&2
+  echo "vendor.sh: engine/patches isn't a directory (a symbolic link, even to one, isn't taken); make it one, or remove it. engine/quickjs-ng is unchanged." >&2
   exit 1
 fi
 shopt -s nullglob dotglob
 for patch in "$here"/patches/*; do
   if [ "${patch%.patch}" = "$patch" ] || [ -L "$patch" ] || [ ! -f "$patch" ]; then
-    echo "vendor.sh: engine/patches/$(basename "$patch") isn't a regular .patch file; rename or remove it. engine/quickjs-ng is unchanged." >&2
+    echo "vendor.sh: engine/patches/$(basename "$patch") isn't a regular file named *.patch (a symbolic link, even to one, isn't taken); make it one, or remove it. engine/quickjs-ng is unchanged." >&2
     exit 1
   fi
   if ! git -C "$tmp/quickjs-ng" apply --cached "$patch"; then
