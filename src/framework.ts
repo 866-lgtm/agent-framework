@@ -2209,7 +2209,10 @@ function channelNoticePassOn(metadata: unknown): ChannelNoticePassOn | null {
     notice?: unknown; cause?: unknown; channels?: unknown; channel?: unknown; selectedForOpening?: unknown;
   } | null | undefined;
   if (passOn?.notice === 'channel-opened') {
-    const causes: readonly unknown[] = ['subscription-policy', 'opened-by-delivery', 'opened-by-reply'];
+    // A policy admission's notice is addressed to no agent of its own and
+    // carries no inputs (channelOpenedNotices), so only an agent's send reads
+    // back.
+    const causes: readonly unknown[] = ['opened-by-delivery', 'opened-by-reply'];
     if (!causes.includes(passOn.cause) || !Array.isArray(passOn.channels) || passOn.channels.length === 0) return null;
     const channels = passOn.channels.map(noticeChannel);
     if (channels.some((c) => c === null)) return null;
@@ -8330,9 +8333,10 @@ export class AgentFramework {
         // turn's end, is left to its window's release below
         // (releaseWindowNowOrAfterResume), as for a disposed fork: it lands
         // there in the run's store, which keeps the run's namespace for
-        // investigation, now or, while quiesced, at resume. A failed reply
-        // among it goes on to the primary as the same queue entry, so no ack
-        // comes between the entry and the primary's notice.
+        // investigation, now or, while quiesced, at resume. A failed reply, or
+        // a channel notice the run could act on, among it goes on to the
+        // primary as the same queue entry, so no ack comes between the entry
+        // and the primary's notice.
         // Exact-generation disposal owns these name-keyed entries. Remove them
         // before deregistration; the late driveStream finally will see the
         // generation mismatch and leave any future owner untouched.
@@ -15127,7 +15131,7 @@ export class AgentFramework {
         return [];
       }
       return [{
-        text: `[channels] Now open: ${shown}: opened by ${agentName}'s reply; ${agentName} has ended.` +
+        text: `[channels] Now open: ${shown}: ${agentName}'s own message into the closed channel opened it; ${agentName} has ended.` +
           optOut(this.canCloseChannels(primary, ids)),
         metadata: { system: true, kind: 'channel-notice', speaker: agentName } as MessageMetadata,
         told: `the primary, by name (${agentName} has ended)`,
@@ -15160,7 +15164,7 @@ export class AgentFramework {
     if (agentName && !canClose && primary !== undefined && this.agents.has(primary) &&
         this.canCloseChannels(primary, ids)) {
       notices.push({
-        text: `[channels] Now open: ${shown}: opened by ${agentName}'s reply; ${agentName} can't close ${plural ? 'them' : 'it'}.` +
+        text: `[channels] Now open: ${shown}: ${agentName}'s own message into the closed channel opened it, and ${agentName} can't close ${plural ? 'them' : 'it'}.` +
           optOut(true),
         metadata: { system: true, kind: 'channel-notice', speaker: agentName } as MessageMetadata,
         told: `the primary, by name (${agentName} can't close ${plural ? 'them' : 'it'})`,
@@ -21607,8 +21611,17 @@ export class AgentFramework {
       const floor = watermark
         ? Math.min(watermark.sequence, this.branchesPartAt(watermark.branch, cm.currentBranch().name))
         : Number.NEGATIVE_INFINITY;
+      // A body the store took as more than one message (a sharded body)
+      // carries the same metadata on each of its copies, and is one notice.
+      const bodies = new Set<string>();
       return cm.getAllMessages()
-        .filter((m) => m.sequence > floor && passesToPrimary(m.metadata))
+        .filter((m) => {
+          if (m.sequence <= floor || !passesToPrimary(m.metadata)) return false;
+          if (m.bodyGroupId === undefined) return true;
+          if (bodies.has(m.bodyGroupId)) return false;
+          bodies.add(m.bodyGroupId);
+          return true;
+        })
         .map((m) => m.metadata as MessageMetadata);
     } catch (err) {
       // A release must complete whatever its window's read meets.
@@ -22783,8 +22796,9 @@ export class AgentFramework {
         },
         // A channel opened without the agent asking (policy admission or an
         // open forced by delivery) must be announced in the window, with the
-        // opt-out named. Routed here so registry-driven opens and framework-
-        // driven opens produce the same durable notice.
+        // opt-out named to a reader that can use it. Routed here so
+        // registry-driven opens and framework-driven opens produce the same
+        // durable notice.
         onChannelAutoOpened: ({ conversationId, source, channels }) => {
           this.recordChannelAutoOpenNotice(conversationId, channels, source);
         },

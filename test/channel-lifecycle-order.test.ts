@@ -2343,6 +2343,10 @@ test("where a reply's reader can't close a channel selected for opening, the pri
       // Its inputs, so a release that finds it unread tells the primary.
       told: [{ text: facts + again + ', and channel_close withdraws that.', forAgent: 'helper', metadata: { system: true, kind: 'channel-notice',
         passOn: { notice: 'reply-open-failed', channel: { channelId: 'x', label: '#x' }, selectedForOpening: 'server-bootstrap' } } }] },
+    { why: 'a reader who can close it, the put-back unrecorded', name: 'helper', agents: [['helper', []], ['primary', []]],
+      primary: 'primary', selectedForOpening: 'unrecorded',
+      told: [{ text: facts + stays + ', and channel_close withdraws that. channel_open tries again.', forAgent: 'helper', metadata: { system: true, kind: 'channel-notice',
+        passOn: { notice: 'reply-open-failed', channel: { channelId: 'x', label: '#x' }, selectedForOpening: 'unrecorded' } } }] },
     { why: "a primary that can close it but not open it, the put-back unrecorded", name: 'fork', agents: [['fork', []], ['primary', ['channel_open']]],
       homes: [['fork', 'y']], primary: 'primary', selectedForOpening: 'unrecorded',
       told: [
@@ -2408,7 +2412,7 @@ test('the opened notice names channel_close only to a reader that can call it, a
     { why: 'a fork away from its home', name: 'fork', agents: [['fork', []], ['primary', []]], homes: [['fork', 'y']], primary: 'primary',
       told: [
         { text: own + optOut, metadata: { system: true, kind: 'channel-notice' }, forAgent: 'fork' },
-        { text: "[channels] Now open: #x (x): opened by fork's reply; fork can't close it." + optOut + close,
+        { text: "[channels] Now open: #x (x): fork's own message into the closed channel opened it, and fork can't close it." + optOut + close,
           metadata: { system: true, kind: 'channel-notice', speaker: 'fork' } },
       ] },
     { why: 'a fork at its home', name: 'fork', agents: [['fork', []], ['primary', []]], homes: [['fork', 'x']], primary: 'primary',
@@ -2416,7 +2420,7 @@ test('the opened notice names channel_close only to a reader that can call it, a
     { why: 'an agent whose allowedTools leave channel_close out', name: 'helper', agents: [['helper', ['channel_close']], ['primary', []]], primary: 'primary',
       told: [
         { text: own + optOut, metadata: { system: true, kind: 'channel-notice' }, forAgent: 'helper' },
-        { text: "[channels] Now open: #x (x): opened by helper's reply; helper can't close it." + optOut + close,
+        { text: "[channels] Now open: #x (x): helper's own message into the closed channel opened it, and helper can't close it." + optOut + close,
           metadata: { system: true, kind: 'channel-notice', speaker: 'helper' } },
       ] },
     { why: "a primary that can't close it either", name: 'fork', agents: [['fork', []], ['primary', ['channel_close']]], homes: [['fork', 'y']], primary: 'primary',
@@ -2430,7 +2434,7 @@ test('the opened notice names channel_close only to a reader that can call it, a
       told: [
         { text: '[channels] Now open: #y (y), #x (x): your own message into the closed channel opened it.' + optOut,
           metadata: { system: true, kind: 'channel-notice' }, forAgent: 'fork' },
-        { text: "[channels] Now open: #y (y), #x (x): opened by fork's reply; fork can't close them." + optOut + closeMany,
+        { text: "[channels] Now open: #y (y), #x (x): fork's own message into the closed channel opened it, and fork can't close them." + optOut + closeMany,
           metadata: { system: true, kind: 'channel-notice', speaker: 'fork' } },
       ] },
     { why: 'a policy admission, to the primary that can close it', cause: 'subscription-policy', agents: [['primary', []]], primary: 'primary',
@@ -2440,8 +2444,11 @@ test('the opened notice names channel_close only to a reader that can call it, a
     { why: "a policy admission, to a primary that can't close it", cause: 'subscription-policy', agents: [['primary', ['channel_close']]], primary: 'primary',
       told: [{ text: '[channels] Selected for opening by subscription policy: #x (x). This records the admission decision; channel_list shows current transport state.' + optOut,
         metadata: { system: true, kind: 'channel-notice' } }] },
+    { why: "a policy admission with no primary, to the first agent, which can't close it", cause: 'subscription-policy', agents: [['worker', ['channel_close']]], primary: null,
+      told: [{ text: '[channels] Selected for opening by subscription policy: #x (x). This records the admission decision; channel_list shows current transport state.' + optOut,
+        metadata: { system: true, kind: 'channel-notice' } }] },
     { why: "an agent that has ended, with a primary that can't close it", name: 'gone', agents: [['primary', ['channel_close']]], primary: 'primary',
-      told: [{ text: "[channels] Now open: #x (x): opened by gone's reply; gone has ended." + optOut,
+      told: [{ text: "[channels] Now open: #x (x): gone's own message into the closed channel opened it; gone has ended." + optOut,
         metadata: { system: true, kind: 'channel-notice', speaker: 'gone' } }] },
   ];
   for (const c of cases) {
@@ -2470,10 +2477,63 @@ test('the opened notice names channel_close only to a reader that can call it, a
   }
 });
 
+// A body the store took as more than one message (a sharded body) carries
+// the same metadata on each of its copies, and is one notice to pass on.
+test("a sharded notice is passed on once: the release's scan takes one copy of each body", () => {
+  const framework = Object.create(AgentFramework.prototype) as any;
+  const passOn = { notice: 'channel-opened', cause: 'opened-by-reply', channels: [{ channelId: 'x', label: '#x' }] };
+  const stored = [
+    { sequence: 1, metadata: { system: true, kind: 'channel-notice', passOn }, bodyGroupId: 'g-1' },
+    { sequence: 2, metadata: { system: true, kind: 'channel-notice', passOn }, bodyGroupId: 'g-1' },
+    { sequence: 3, metadata: { system: true, kind: 'channel-notice', passOn } },
+    { sequence: 4, metadata: { system: true, kind: 'discord-send-failed', channelId: 'x' }, bodyGroupId: 'g-2' },
+    { sequence: 5, metadata: { system: true, kind: 'discord-send-failed', channelId: 'x' }, bodyGroupId: 'g-2' },
+  ];
+  const agent = {
+    name: 'fork',
+    getConsumedWatermark: () => undefined,
+    getContextManager: () => ({ getAllMessages: () => stored }),
+  };
+  const unread = framework.unreadNoticesForPrimary(agent) as Array<{ kind?: string }>;
+  assert.deepEqual(unread.map((m) => m.kind), ['channel-notice', 'channel-notice', 'discord-send-failed'],
+    'one per body: the two shards of g-1 once, the unsharded notice, and g-2 once');
+});
+
+// Each notice is written on its own: a reader's notice that can't be
+// written leaves the primary's to be written still.
+test("a reader's notice that can't be written still leaves the primary's by-name notice written, for both notices", () => {
+  for (const write of ['opened', 'reply'] as const) {
+    const told: Array<{ text: string; forAgent?: string }> = [];
+    const logged: string[] = [];
+    const framework = Object.create(AgentFramework.prototype) as any;
+    framework.agents = new Map([['fork', { name: 'fork', canUseTool: () => true }], ['primary', { name: 'primary', canUseTool: () => true }]]);
+    framework.primaryAgentName = 'primary';
+    framework.usedEphemeralAgentNames = new Set();
+    framework.conversationAgentHomes = new Map([['fork', 'y']]);
+    framework.addMessage = (_participant: string, content: Array<{ text: string }>, _metadata: unknown, routed?: { forAgent?: string }) => {
+      if (routed?.forAgent) throw new Error('store refused the write');
+      told.push({ text: content[0]!.text });
+      return 'm';
+    };
+    const error = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      if (write === 'opened') framework.recordChannelAutoOpenNotice('fork', [{ channelId: 'x', label: '#x' }], 'opened-by-reply');
+      else framework.recordReplyOpenFailedNotice('fork', { channelId: 'x', label: '#x' }, 'server-bootstrap');
+    } finally {
+      console.error = error;
+    }
+    assert.equal(told.length, 1, `${write}: the primary's notice is written`);
+    assert.match(told[0]!.text, /fork can't close it/, write);
+    assert.ok(logged.some((l) => l.startsWith(write === 'opened' ? 'recordChannelAutoOpenNotice failed:' : 'recordReplyOpenFailedNotice failed:')),
+      `${write}: the reader's failure is logged`);
+  }
+});
+
 // A release finds a channel notice its reader could act on unread: the
 // primary is told in its place, in the words the notice's builder gives an
-// agent that has ended, judged for the primary. A notice whose inputs a store
-// kept from another build, or that carries none, isn't passed on.
+// agent that has ended, judged for the primary. A notice whose inputs don't
+// read back as this build writes them, or that carries none, isn't passed on.
 test("a channel notice's inputs give the primary's by-name notice once its reader has ended, and malformed ones give none", () => {
   const framework = Object.create(AgentFramework.prototype) as any;
   framework.agents = new Map([['primary', { name: 'primary', canUseTool: (tool: string) => tool !== 'channel_open' }]]);
@@ -2497,12 +2557,20 @@ test("a channel notice's inputs give the primary's by-name notice once its reade
       { notice: 'channel-opened', cause: 'opened-by-reply', channels: [{ channelId: '' }] },
       { notice: 'reply-open-failed', channel: { channelId: 'x' } },
       { notice: 'reply-open-failed', channel: { channelId: 'x' }, selectedForOpening: 'maybe' },
+      { notice: 'channel-opened', cause: 'opened-by-reply', channels: [{ channelId: 7 }] },
+      { notice: 'channel-opened', cause: 'opened-by-reply', channels: 'x' },
+      { notice: 'channel-opened', cause: 'subscription-policy', channels: [{ channelId: 'x' }] },
+      { notice: 'reply-open-failed', channel: null, selectedForOpening: 'unrecorded' },
       { notice: 'something-else' },
     ]) {
       assert.equal(framework.noticeForPrimary('gone', { system: true, kind: 'channel-notice', ...(passOn ? { passOn } : {}) }), null, JSON.stringify(passOn));
     }
     assert.equal(framework.noticeForPrimary('gone', { system: true, kind: 'routing-notice', passOn: { notice: 'channel-opened', cause: 'opened-by-reply', channels: [{ channelId: 'x' }] } }), null,
       'only a channel notice');
+    // A channel with no label, or one whose label isn't text, is named by its id.
+    const unlabeled = framework.noticeForPrimary('gone', { system: true, kind: 'channel-notice',
+      passOn: { notice: 'channel-opened', cause: 'opened-by-delivery', channels: [{ channelId: 'x', label: 9 }] } });
+    assert.match(unlabeled?.content[0]?.text ?? '', /^\[channels\] Now open: x: gone's own message into the closed channel opened it; gone has ended\./);
   } finally {
     console.error = error;
   }
