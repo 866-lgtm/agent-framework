@@ -95,7 +95,7 @@ test('a long line is cut at 2000 characters, with the offsetChars that reads the
   assert.equal(lines[2], '     3\tlast');
   // Where the cut line ends the page, its note names the offset its marker does.
   const two = (await read({ limit: 2 }, 24_000)).data as LinePage;
-  assert.ok(two.note!.startsWith(`Truncated at 2 lines (file has 3). Line 2 is cut: read its rest with offsetChars=${at}. Use offset/limit to read more.`), two.note);
+  assert.ok(two.note!.startsWith(`Truncated at 2 lines (file has 3). Line 2 is cut: read its rest with offsetChars=${at} and limitChars=${rest}. Use offset/limit to read more.`), two.note);
 });
 
 test('a line page stops before its result would pass the limit, and says where to continue', async t => {
@@ -203,14 +203,14 @@ test('a first line that alone would pass the limit is cut where it fits', async 
   assert.equal(Number(at), shown.length);
   assert.equal(shown.length + Number(rest), 1500);
   // Reading on in order means the rest of line 1 first, so the note names it.
-  assert.equal(page.note, `Stopped at line 1 to stay within the 1000-character result limit (file has 2). Line 1 is cut: read its rest with offsetChars=${at}, then continue with offset=2.`);
+  assert.equal(page.note, `Stopped at line 1 to stay within the 1000-character result limit (file has 2). Line 1 is cut: read its rest with offsetChars=${at} and limitChars=${rest}, then continue with offset=2.`);
   // The cut is the most the page has room for: one character more passes the
   // limit, on a page that goes on and on one that ends the file.
   const oneMore = (cutPage: LinePage, chars: number) => {
     const more = chars + 1;
     return JSON.stringify({
       ...cutPage,
-      ...(cutPage.note !== undefined ? { note: cutPage.note.replace(/offsetChars=\d+/, `offsetChars=${more}`) } : {}),
+      ...(cutPage.note !== undefined ? { note: cutPage.note.replace(/offsetChars=\d+ and limitChars=\d+/, `offsetChars=${more} and limitChars=${1500 - more}`) } : {}),
       content: `     1\t${'"'.repeat(more)} [… ${1500 - more} more chars; read them with offsetChars=${more}]`,
     }).length;
   };
@@ -222,7 +222,7 @@ test('a first line that alone would pass the limit is cut where it fits', async 
   const lastShown = /^ {5}1\t("*) \[/.exec(lastPage.content)![1].length;
   // The page ends the file, and its last line is cut, so its note names the rest.
   assert.equal(lastPage.toLine, lastPage.totalLines);
-  assert.equal(lastPage.note, `Line 1 is cut: read its rest with offsetChars=${lastShown}.`);
+  assert.equal(lastPage.note, `Line 1 is cut: read its rest with offsetChars=${lastShown} and limitChars=${1500 - lastShown}.`);
   assert.ok(oneMore(lastPage, lastShown) > 1_000, `${oneMore(lastPage, lastShown)}`);
   // Shown whole, a line carries no marker and its note no cut, so its page can
   // fit where a cut one character shorter doesn't: it is shown whole.
@@ -234,7 +234,7 @@ test('a first line that alone would pass the limit is cut where it fits', async 
   const tiny = (await read({}, 50)).data as LinePage;
   assert.equal(tiny.toLine, 1);
   assert.equal(tiny.content, '     1\t [… 1500 more chars; read them with offsetChars=0]');
-  assert.match(tiny.note!, /Line 1 is cut: read its rest with offsetChars=0, then continue with offset=2\.$/);
+  assert.match(tiny.note!, /Line 1 is cut: read its rest with offsetChars=0 and limitChars=1500, then continue with offset=2\.$/);
 });
 
 test('a page whose last line is cut names where its rest starts before the next line', async t => {
@@ -244,17 +244,17 @@ test('a page whose last line is cut names where its rest starts before the next 
   // The limit stops the page at the cut line.
   const byLimit = (await read({ limit: 2 }, 24_000)).data as LinePage;
   assert.equal(byLimit.toLine, 2);
-  assert.equal(byLimit.note, `Truncated at 2 lines (file has 4). Line 2 is cut: read its rest with offsetChars=${at(2)}. Use offset/limit to read more.`);
+  assert.equal(byLimit.note, `Truncated at 2 lines (file has 4). Line 2 is cut: read its rest with offsetChars=${at(2)} and limitChars=1000. Use offset/limit to read more.`);
   // The result limit stops it there: line 4 would pass 5,000 characters.
   const byBudget = (await read({}, 5_000)).data as LinePage;
   assert.equal(byBudget.toLine, 3);
-  assert.equal(byBudget.note, `Stopped at line 3 to stay within the 5000-character result limit (file has 4). Line 3 is cut: read its rest with offsetChars=${at(3)}, then continue with offset=4.`);
+  assert.equal(byBudget.note, `Stopped at line 3 to stay within the 5000-character result limit (file has 4). Line 3 is cut: read its rest with offsetChars=${at(3)} and limitChars=1000, then continue with offset=4.`);
   // A cut line inside a page has its rest named by its own marker alone. The
   // page that ends the file names its cut last line too: toLine is the last
   // line, but the file isn't read whole until that line's rest is.
   const whole = (await read({}, 24_000)).data as LinePage;
   assert.equal(whole.toLine, 4);
-  assert.equal(whole.note, `Line 4 is cut: read its rest with offsetChars=${at(4)}.`);
+  assert.equal(whole.note, `Line 4 is cut: read its rest with offsetChars=${at(4)} and limitChars=1000.`);
   // A page that ends the file on a line shown whole has nothing to say.
   const { read: readShort } = await setup(t, `${long}\nshort\n`);
   assert.equal(((await readShort({}, 24_000)).data as LinePage).note, undefined);

@@ -41,11 +41,12 @@ const joined = (notes: Array<string | null>): string | undefined => {
  * longest that fits within `maxChars` as JSON; where none fits with its first
  * line as a page shows it, that line is cut shorter, at the most the page has
  * room for. Where the page's last line is cut, its note names where that
- * line's rest starts, since reading on in order starts there: before the next
- * line, or, on the page that ends the file, before the file is read whole. A
- * page whose own fields and least content pass `maxChars` still moves on, and
- * passes it. With no `maxChars`, for a call made in process, which takes the
- * data itself, the page holds to `limit` alone and shows every line whole.
+ * line's rest starts and how long it is, since reading on in order starts
+ * there: before the next line, or, on the page that ends the file, before the
+ * file is read whole. A page whose own fields and least content pass
+ * `maxChars` still moves on, and passes it. With no `maxChars`, for a call
+ * made in process, which takes the data itself, the page holds to `limit`
+ * alone and shows every line whole.
  */
 export function linePage(path: string, file: FileText, offset: number, limit: number, maxChars: number | undefined, extraNotes: string[] = []): ToolResult {
   const { lines, starts } = file;
@@ -69,7 +70,10 @@ export function linePage(path: string, file: FileText, offset: number, limit: nu
   // maxLineChars long, as its marker says; null for a line shown whole.
   const restOf = (i: number, maxLineChars: number): number | null =>
     lines[i].length > maxLineChars ? starts[i] + safeCut(lines[i], maxLineChars) : null;
-  const cutLine = (to: number, rest: number) => `Line ${to} is cut: read its rest with offsetChars=${rest}`;
+  // The rest's length is what's left of the line as a page shows it, so a
+  // character read of it ends where the line does.
+  const cutLine = (to: number, rest: number) =>
+    `Line ${to} is cut: read its rest with offsetChars=${rest} and limitChars=${starts[to - 1]! + lines[to - 1]!.length - rest}`;
   const limitNote = (to: number, rest: number | null) =>
     `Truncated at ${limit} lines (file has ${total}).${rest === null ? '' : ` ${cutLine(to, rest)}.`} Use offset/limit to read more.`;
   const budgetNote = (to: number, rest: number | null) =>
