@@ -234,6 +234,14 @@ describe('mount include', () => {
     ] as const) {
       assert.match(await refused(m, name, input as Record<string, unknown>), /outside the mount's include: mount "work" holds only gate\.json/, name);
     }
+    // edit_many refuses an uncovered path beside a covered one in the
+    // include's words, and stores none of its edits.
+    const many = await refused(m, 'edit_many', { edits: [
+      { path: 'work/gate.json', oldString: '{}', newString: '[]' },
+      { path: 'work/.gate.json.swp', oldString: 'swap', newString: 'swapped' },
+    ] });
+    assert.match(many, /^The edit_many call stored none of its edits: 1 problem\.\n\nedit 2: "work\/\.gate\.json\.swp" is outside the mount's include: mount "work" holds only gate\.json/, many);
+    assert.match((await call(m, 'read', { path: 'work/gate.json' })).content, /\t\{\}$/m);
     // A `..` takes back the segment before it, as on any mount, before
     // anything looks the path up, so the include judges the path every tool
     // acts on: one that reaches a file the include doesn't cover is refused
@@ -575,6 +583,11 @@ describe('mount include', () => {
       const left = await refusal('work/h.md/y.md');
       assert.match(left, /^parent_symlink: .*"work\/h\.md" is a symlink, which this mount does not follow/);
       assert.ok(!left.includes('hidden') && !left.includes('inner'), left);
+      // At the path itself, the link keeps `symlink`, where one whose refusal names the mount gets `other_mount`.
+      const atPath = await refusal('work/h.md');
+      assert.match(atPath, /^symlink: /);
+      assert.ok(!atPath.includes('hidden') && !atPath.includes('inner'), atPath);
+      assert.match(await refusal('work/k.md'), /^other_mount: .*use "inner\/kept\.json"/);
       assert.match(await refusal('work/k.md/y.md'), /^other_mount: .*use "inner\/kept\.json"/);
       assert.match(await refusal('work/d.md/a.json'), /^other_mount: .*use "inner\/sub"/);
       // A link the outer include doesn't cover tells nothing of where it leads, the nested mount included.

@@ -124,9 +124,15 @@ export type TraceEvent =
       blockType: 'text' | 'thinking' | 'tool_call' | 'tool_result';
       /** 0-indexed block position in the current assistant turn. */
       blockIndex: number;
-      /** The channel this stream shows typing in: the turn's locus as the
-       *  stream started (see inference:started), or in explicit mode the
-       *  channel the start's wake came from. */
+      /** The channel this stream shows typing in, the conversation the turn
+       *  is attending. Locus and hybrid mode: the turn's locus, which an
+       *  addressed re-pin or the agent's own `channel_open` can move between
+       *  rounds, so it can change within one stream; the indicator and these
+       *  traces follow it from the next round on, at the model's first
+       *  content in it or its retry after a refusal, and a tool result the
+       *  boundary reports carries the channel of the round it answers. In
+       *  hybrid mode a `>>>` envelope can send the text itself elsewhere.
+       *  Explicit mode: the channel the start's wake came from. */
       channelId?: string;
     })
   | (TraceEventBase & {
@@ -141,9 +147,15 @@ export type TraceEvent =
       phase: 'block_start' | 'block_complete';
       blockType: 'text' | 'thinking' | 'tool_call' | 'tool_result';
       blockIndex: number;
-      /** The channel this stream shows typing in: the turn's locus as the
-       *  stream started (see inference:started), or in explicit mode the
-       *  channel the start's wake came from. */
+      /** The channel this stream shows typing in, the conversation the turn
+       *  is attending. Locus and hybrid mode: the turn's locus, which an
+       *  addressed re-pin or the agent's own `channel_open` can move between
+       *  rounds, so it can change within one stream; the indicator and these
+       *  traces follow it from the next round on, at the model's first
+       *  content in it or its retry after a refusal, and a tool result the
+       *  boundary reports carries the channel of the round it answers. In
+       *  hybrid mode a `>>>` envelope can send the text itself elsewhere.
+       *  Explicit mode: the channel the start's wake came from. */
       channelId?: string;
     })
   | (TraceEventBase & {
@@ -443,13 +455,16 @@ export type TraceEvent =
     })
 
   // Host-owned speech routing (ChannelRegistry.routeSpeech). One trace per
-  // delivered prose segment. `text` is the segment verbatim — the same content
+  // delivered prose segment, and one per publish the subconscious's
+  // speak_in_channel delivers (ChannelRegistry.publishForAgent): that one's
+  // conversationId is the speaking agent's name, and it carries no
+  // messageId. `text` is the segment verbatim — the same content
   // already on the bus chunk-by-chunk via inference:tokens, and mcpl:* traces
   // are 'ops'-scoped on the webui wire — and `messageId` is the surface's id
-  // for the posted message (when the MCPL server reports one). Together they
-  // give external taps the (channelId, messageId, text) tuple needed to edit
-  // a just-posted message, e.g. a TTS interruption truncating a reply to the
-  // words actually voiced.
+  // for the posted message (on routeSpeech's traces, when the MCPL server
+  // reports one). Together they give external taps the (channelId,
+  // messageId, text) tuple needed to edit a just-posted message, e.g. a TTS
+  // interruption truncating a reply to the words actually voiced.
   | (TraceEventBase & {
       type: 'mcpl:speech-routed';
       /** Agent / conversation whose speech was routed. */
@@ -460,7 +475,8 @@ export type TraceEvent =
       textLen: number;
       /** The routed prose segment, verbatim. */
       text: string;
-      /** Surface message id (e.g. Discord message id), when reported. */
+      /** Surface message id (e.g. Discord message id), when reported, on
+       *  routeSpeech's traces. speak_in_channel's carry none. */
       messageId?: string;
     })
   | (TraceEventBase & {
@@ -474,6 +490,9 @@ export type TraceEvent =
       /** `failed`: nothing was posted; `unknown`: the request was dispatched
        *  and no valid receipt came back, so it may have been. */
       outcome?: 'failed' | 'unknown';
+      /** The connector error's structured data, bounded (connectorText),
+       *  when it sent some: it may say what a multi-part send posted. */
+      detail?: string;
     })
 
   // Admin puppet: an operator executed a tool AS an agent and stored the
@@ -633,7 +652,7 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'mcpl:orphaned-response';
       serverId: string;
-      /** The JSON-RPC id of the late response whose pending request already timed out. */
+      /** The JSON-RPC id of the late response, whose request had already timed out or been ended by its transport's close. */
       responseId: string | number;
       /** Original request method when retained for mandatory-deadline visibility. */
       method?: string;
