@@ -515,6 +515,28 @@ test("a credential with parentheses, quotes or brackets, or an IPv6 host, is mas
   }
 });
 
+test("a client's error is withheld, not thrown, when the configuration can't be read", async () => {
+  const wss = startMockMcplWsServer();
+  await waitListening(wss);
+  try {
+    const url = wsUrl(wss);
+    let readable = true;
+    const config = { id: 'editor', get url() { if (!readable) throw new Error('unreadable'); return url; } } as unknown as { id: string; url: string };
+    const conn = await McplServerConnection.connect(config, HOST_CAPS);
+    conn.ready();
+    const reported = new Promise<Error>((resolve) => conn.once('error', resolve));
+    readable = false;
+    const raw = (conn as unknown as { transport: { ws: WebSocket } }).transport.ws;
+    raw.emit('error', new Error(`Invalid frame from '${url}'`));
+    const error = await withDeadline(reported, 5_000, "the connection's 'error'");
+    assert.match(error.message, /transport error: \[withheld:/);
+    readable = true;
+    await conn.close();
+  } finally {
+    wss.close();
+  }
+});
+
 test("a WebSocket client's error after the socket opened reaches the connection's listeners masked", async () => {
   const wss = startMockMcplWsServer();
   await waitListening(wss);

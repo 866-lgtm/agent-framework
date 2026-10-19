@@ -23,7 +23,7 @@ import { StringDecoder } from 'node:string_decoder';
 import WebSocket from 'ws';
 
 import type { McplServerConfig } from './types.js';
-import { describeCredentialError, noteDialSent, redactServerText, redactUrl, resolveServerBinding, urlAsDialed } from './protocol-family.js';
+import { WITHHELD_TEXT, describeCredentialError, noteDialSent, redactServerText, redactUrl, resolveServerBinding, urlAsDialed } from './protocol-family.js';
 import { assertBooleanSetting } from '../config-checks.js';
 import { logDetail } from './log-value.js';
 
@@ -661,17 +661,25 @@ const WS_URL_IN_TEXT = /\bwss?:\/\/[^\s"'<>`]+/gi;
  * ({@link redactServerText}); then any other ws(s) url left is shown as
  * {@link redactUrl} shows it. The caller makes a new error of it with no
  * `cause`, so the client's own error, message and stack, isn't reachable.
+ * A configuration that can't be read withholds the text
+ * ({@link WITHHELD_TEXT}) rather than throw: this runs in a socket's
+ * 'error' listener, where a throw has nowhere to go.
  */
 export function clientErrorText(err: unknown, config: McplServerConfig, dialed: string): string {
   // Bun's ws emits an ErrorEvent, not an Error, its text in `message` too.
-  const said = (err as { message?: unknown } | null)?.message;
-  let text = typeof said === 'string' ? said : String(err);
-  const shown = redactUrl(config.url);
-  for (const url of [dialed, config.url]) {
-    if (url) text = text.split(url).join(shown);
+  try {
+    const said = (err as { message?: unknown } | null)?.message;
+    let text = typeof said === 'string' ? said : String(err);
+    const configured = config.url;
+    const shown = redactUrl(configured);
+    for (const url of [dialed, configured]) {
+      if (url) text = text.split(url).join(shown);
+    }
+    text = redactServerText(text, config);
+    return text.replace(WS_URL_IN_TEXT, (found) => redactUrl(found));
+  } catch {
+    return WITHHELD_TEXT;
   }
-  text = redactServerText(text, config);
-  return text.replace(WS_URL_IN_TEXT, (found) => redactUrl(found));
 }
 
 /**
