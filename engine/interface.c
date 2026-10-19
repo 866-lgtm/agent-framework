@@ -391,7 +391,9 @@ int engine_start(const char *prelude, uint32_t prelude_len, const char *script, 
    instead, the host's own error, and the state answered has ENGINE_UNFIT set: a null json, which
    the host couldn't copy in, or a parse that fails, for want of memory or stack (or because it
    isn't JSON, which a host's result never is). Any of these took effect without reaching the
-   script, which an error at the call's await would hide. A parse that fails frees what it built,
+   script, which an error at the call's await would hide. A result nested deeper than the
+   binding's MAX_RESULT_DEPTH never gets here: under Node, its parse would overflow the host's
+   stack before QuickJS's own check saw the recursion. A parse that fails frees what it built,
    so the small unfit error has room, unless the result's copy took the last of the memory; if
    even it can't be copied in (a null unfit) or parsed, the call rejects with what that failure
    gives. json and unfit, when not null, must end in a NUL at [len], as JS_ParseJSON requires. */
@@ -463,7 +465,8 @@ int engine_settle(uint32_t id, int ok, const char *json, uint32_t json_len, cons
 /* The text of a value or an error, for engine_result. Takes v. Returns a JS string, undefined,
    or an exception. */
 static JSValue error_json(JSValue v) {
-    JSValue o = JS_NewObject(ctx);
+    /* No prototype, so a toJSON the script put on Object.prototype doesn't serialize it. */
+    JSValue o = JS_NewObjectProto(ctx, JS_NULL);
     if (JS_IsException(o)) {
         JS_FreeValue(ctx, v);
         return o;
@@ -579,9 +582,11 @@ static uint8_t *read_ending(int st) {
    [u32 kind][u32 length][UTF-8]. Kind 0: fulfilled with undefined (or a value JSON.stringify
    leaves out), no text. Kind 1: fulfilled, the value's JSON. Kind 2: an error, as JSON
    {name?, message?, stack?}: what the script threw, or why its value couldn't be stringified.
-   Returns 0 in any other state, or when it can't allocate. The ending is fixed before it's read,
-   so the script's code that serializing runs can't reach the host, and a stop leaves out the
-   part it interrupts. */
+   Returns 0 in any other state, or when it can't allocate. The ending is fixed before it's read.
+   The script's own code that serializing runs (a toJSON, a getter), and the jobs it queues, which
+   run before this returns, can't reach the host. A stop while it runs leaves the guest stopped,
+   and the binding answers that. Data nested deeper than the host's stack allows can overflow it
+   in JS_JSONStringify, which throws out of the module: the binding reports that as a crash. */
 EXPORT("engine_result")
 uint8_t *engine_result(void) {
     int st = state();
@@ -589,6 +594,7 @@ uint8_t *engine_result(void) {
         return NULL;
     reading = true;
     uint8_t *buf = read_ending(st);
+    run_jobs();
     reading = false;
     return buf;
 }

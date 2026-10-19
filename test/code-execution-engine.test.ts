@@ -51,6 +51,31 @@ function fulfilled(s: RunState): unknown {
   return json === undefined ? undefined : JSON.parse(json);
 }
 
+interface Imports { env: { memory: { buffer: ArrayBuffer } }; wasi_snapshot_preview1: { fd_write(fd: number, iovs: number, iovsLen: number, written: number): number } }
+type Exports = Record<string, (...args: number[]) => number>;
+interface WasmApi {
+  instantiate(module: object, imports: Imports): Promise<{ exports: Exports }>;
+  RuntimeError: new (message: string) => Error;
+}
+const wasm = (globalThis as unknown as { WebAssembly: WasmApi }).WebAssembly;
+
+/**
+ * An engine on the real module with some of its exports replaced, for what the module can't be
+ * made to do on cue: `wrap` gets the real exports and the imports, and returns the replacements.
+ */
+async function engineAround(wrap: (ex: Exports, imports: Imports) => Exports, over: Partial<EngineSlots> = {}, limits: Partial<EngineLimits> = {}) {
+  const instantiate = wasm.instantiate;
+  wasm.instantiate = async (module, imports) => {
+    const { exports } = await instantiate.call(wasm, module, imports);
+    return { exports: { ...exports, ...wrap(exports, imports) } };
+  };
+  try {
+    return await engine(over, limits);
+  } finally {
+    wasm.instantiate = instantiate;
+  }
+}
+
 test('a script\'s value is its last expression statement\'s, as JSON', async () => {
   const { e } = await engine();
   assert.deepEqual(fulfilled(e.start(PRELUDE, '1 + 2; ({ a: [1, "two"], b: null })', 's.js')), { a: [1, 'two'], b: null });
@@ -100,14 +125,19 @@ test('a failed call rejects with its fields, and the prelude makes an Error of t
 
 test('a result the guest can\'t parse, nested too deeply or not JSON, rejects the call with the child\'s own error', async () => {
   // The call took effect either way, and a RangeError or SyntaxError at its await, or a crash,
-  // would read as a failed call. Nested 10,000 deep, the parse overflows the host's stack under
-  // Node before QuickJS's own check sees it.
+  // would read as a failed call. The binding refuses a result nested past MAX_RESULT_DEPTH before
+  // the guest parses it, since under Node a parse nested about 10,000 deep overflows the host's
+  // stack before QuickJS's own check sees it. One that isn't JSON fails the guest's parse.
   const nested = (depth: number) => `${'['.repeat(depth)}"x"${']'.repeat(depth)}`;
+  const objects = (depth: number) => `${'{"a":'.repeat(depth)}1${'}'.repeat(depth)}`;
   for (const [shape, json, unfit] of [
     ['nested to the limit', nested(MAX_RESULT_DEPTH), false],
     ['nested past the limit', nested(MAX_RESULT_DEPTH + 1), true],
+    ['objects nested past the limit', objects(MAX_RESULT_DEPTH + 1), true],
     ['nested past the host\'s stack', nested(200_000), true],
-    ['brackets inside strings', `["${'['.repeat(MAX_RESULT_DEPTH + 1)}\\""]`, false],
+    ['many containers, none deep', `[${'[],'.repeat(MAX_RESULT_DEPTH * 2)}{}]`, false],
+    // The escaped quote comes first, so a scan that ended the string there would count the rest.
+    ['brackets inside a string, after an escaped quote', `["\\"${'['.repeat(MAX_RESULT_DEPTH + 1)}"]`, false],
     ['not JSON', '{"unterminated": ', true],
   ] as const) {
     const { e } = await engine();
@@ -170,6 +200,8 @@ test('a script\'s value is serialized once, however many calls settle after it r
   const { e } = await engine();
   const s = e.start(PRELUDE, 'let n = 0; tool("a"); tool("b"); ({ toJSON() { n++; return { n }; } })', 's.js');
   assert.deepEqual(fulfilled(s), { n: 1 });
+  // What a call answers is the caller's own: changing it doesn't change the next answer.
+  (s as { json?: string }).json = 'changed by the caller';
   assert.deepEqual(fulfilled(e.settle(1, true, '1', UNFIT)), { n: 1 });
   assert.deepEqual(fulfilled(e.settle(2, true, '2', UNFIT)), { n: 1 });
   e.dispose();
@@ -261,7 +293,9 @@ test('a slot failure is an EngineError, not a stop, when the interrupt is what e
       err instanceof EngineError && /the stop file is unreadable/.test(err.message), script);
     e.dispose();
   }
-  const b = await engine({ output: () => { throw new Error('the output pipe is gone'); } });
+  // If the failure didn't stop the guest, this interrupt would, so the test fails rather than spins.
+  let checks = 0;
+  const b = await engine({ output: () => { throw new Error('the output pipe is gone'); }, interrupt: () => ++checks > 1000 });
   assert.throws(() => b.e.start(PRELUDE, 'try { print("x") } catch {}\nfor (;;) {}', 's.js'), (err: unknown) =>
     err instanceof EngineError && /the output pipe is gone/.test(err.message));
   b.e.dispose();
@@ -287,24 +321,143 @@ test('a slot that calls back into the engine ends the run with an EngineError', 
   e.dispose();
 });
 
-test('the script\'s code that runs while its ending is read can\'t reach the host', async () => {
-  // A getter on what the script threw runs after its ending is fixed: neither the call it makes
-  // nor its output is taken, and a message that throws is told by the object's JSON.
+test('the script\'s code that runs while its ending is read, and the jobs it queues, can\'t reach the host', async () => {
+  // A getter on what the script threw runs after its ending is fixed: the call it tries and its
+  // output are refused, and so are a job's it queues, which runs before the read returns rather
+  // than at a later settle.
   const { e, rec } = await engine();
-  const s = e.start(PRELUDE, 'throw Object.defineProperty({ why: 1 }, "message", { get() { __output(1, "late"); __host("late", "{}"); return "m"; } })', 's.js');
-  assert.deepEqual(s, { kind: 'rejected', name: '', message: '{"why":1}' });
-  assert.deepEqual([rec.calls, rec.output], [[], []]);
+  const s = e.start(PRELUDE, `tool("in flight");
+    const tried = [];
+    const attempt = (what, fn) => { try { fn(); tried.push(what + " went"); } catch { tried.push(what + " refused"); } };
+    throw Object.defineProperty({}, "message", { get() {
+      attempt("call", () => __host("late", "{}"));
+      attempt("output", () => __output(1, "late"));
+      Promise.resolve().then(() => { __host("queued", "{}"); __output(1, "queued"); });
+      return tried.join(", ");
+    } })`, 's.js');
+  assert.deepEqual(s, { kind: 'rejected', name: '', message: 'call refused, output refused' });
+  e.settle(1, true, '1', UNFIT);
+  assert.deepEqual([rec.calls.map((c) => c.name), rec.output], [['in flight'], []]);
   e.dispose();
 });
 
 test('what a thrown object holds is read as text, and a part that can\'t be read is left out', async () => {
-  const a = await engine();
-  assert.deepEqual(a.e.start(PRELUDE, 'throw { name: 7, message: 42 }', 's.js'), { kind: 'rejected', name: '7', message: '42' });
-  a.e.dispose();
-  const b = await engine();
-  assert.deepEqual(b.e.start(PRELUDE, 'throw Object.defineProperty(new TypeError("readable"), "stack", { get() { throw 1 } })', 's.js'),
-    { kind: 'rejected', name: 'TypeError', message: 'readable' });
-  b.e.dispose();
+  for (const [script, name, message, stack] of [
+    ['throw { name: 7, message: 42 }', '7', '42', false],
+    ['throw Object.defineProperty(new TypeError("readable"), "stack", { get() { throw 1 } })', 'TypeError', 'readable', false],
+    // A message that can't be read is told by the object's JSON, and with no JSON, its string form.
+    ['throw Object.defineProperty({ why: 1 }, "message", { get() { throw 1 } })', '', '{"why":1}', false],
+    ['throw { big: 1n, toString() { return "told by its string form" } }', '', 'told by its string form', false],
+    // A toJSON the script puts on Object.prototype doesn't reach the engine's own record of it.
+    ['Object.prototype.toJSON = () => { throw new Error("not this") }; throw new RangeError("this")', 'RangeError', 'this', true],
+  ] as const) {
+    const { e } = await engine();
+    const s = e.start(PRELUDE, script, 's.js') as Extract<RunState, { kind: 'rejected' }>;
+    assert.deepEqual([s.kind, s.name, s.message, typeof s.stack === 'string'], ['rejected', name, message, stack], script);
+    e.dispose();
+  }
+});
+
+test('a slot that throws a value with no string form still ends the run with an EngineError', async () => {
+  const thrown = { toString() { throw new Error('no string form'); } };
+  const { e } = await engine({ hostCall: () => { throw thrown; } });
+  assert.throws(() => e.start(PRELUDE, '__host("a", "{}")', 's.js'), (err: unknown) =>
+    err instanceof EngineError && err.cause === thrown && /a value with no string form/.test(err.message));
+  e.dispose();
+});
+
+test('after a slot\'s failure, every later call throws that failure, and a dispose() refused from a slot can be made again', async () => {
+  let self: Engine | undefined;
+  const { e } = await engine({ hostCall: () => { self!.dispose(); } });
+  self = e;
+  let failure: unknown;
+  assert.throws(() => e.start(PRELUDE, 'await tool("t")', 's.js'), (err: unknown) => {
+    failure = err;
+    return err instanceof EngineError && /dispose\(\) was called from inside one of the engine's slots/.test(err.message);
+  });
+  // Not "after dispose()", and not a bad id's own error, but the slot's failure.
+  assert.throws(() => e.settle(1, true, '1', UNFIT), (err: unknown) => err === failure);
+  assert.throws(() => e.settle(1.5, true, '1', UNFIT), (err: unknown) => err === failure);
+  e.dispose();
+  assert.throws(() => e.settle(1, true, '1', UNFIT), /after dispose/);
+});
+
+test('a module trap after a slot\'s failure the script caught reports the slot\'s failure', async () => {
+  // The toJSON's output fails and is caught, and then the next element, nested past the host's
+  // stack, makes JSON.stringify trap.
+  const { e } = await engine({ output: () => { throw new Error('the output pipe is gone'); } });
+  const script = 'let deep = []; for (let i = 0; i < 100000; i++) deep = [deep];\nJSON.stringify([{ toJSON() { try { print("x") } catch {} return 1 } }, deep])';
+  assert.throws(() => e.start(PRELUDE, script, 's.js'), (err: unknown) =>
+    err instanceof EngineError && /^a slot threw during start\(\): the output pipe is gone$/.test(err.message));
+  e.dispose();
+});
+
+test('an ending the module can\'t read out is answered as out of memory, and that answer is kept', async () => {
+  // The module can't allocate the ending's text the first time it's read, which can't be made to
+  // happen on cue; the binding mustn't read it again, which would run the script's serializing
+  // code again and could answer differently.
+  for (const [script, message] of [
+    ['tool("a"); tool("b"); ({ ok: true })', 'out of memory while serializing the script\'s return value; return less'],
+    ['tool("a"); tool("b"); throw new Error("x")', 'out of memory while reading what the script threw; throw something smaller, such as an Error with a shorter message'],
+  ]) {
+    let reads = 0;
+    const { e } = await engineAround((ex) => ({ engine_result: () => (++reads === 1 ? 0 : ex.engine_result()) }));
+    const expected = { kind: 'rejected', name: 'InternalError', message };
+    assert.deepEqual(e.start(PRELUDE, script, 's.js'), expected, script);
+    assert.deepEqual(e.settle(1, true, '1', UNFIT), expected, script);
+    assert.deepEqual(e.settle(2, true, '2', UNFIT), expected, script);
+    assert.equal(reads, 1, script);
+    e.dispose();
+  }
+});
+
+test('an ending longer than the binding can decode is answered with its length, not a crash', async () => {
+  // The module's buffer here claims a text past V8's longest string; a real one needs a budget
+  // of gigabytes.
+  for (const [script, message] of [
+    ['({ ok: true })', 'the script\'s return value is 600000000 bytes as JSON, more than can be read back; return less'],
+    ['throw new Error("x")', 'what the script threw is 600000000 bytes as JSON, more than can be read back; throw something smaller'],
+  ]) {
+    const { e } = await engineAround((ex, imports) => ({
+      engine_result: () => {
+        const ptr = ex.engine_alloc(8);
+        const view = new DataView(imports.env.memory.buffer);
+        view.setUint32(ptr, 1, true);
+        view.setUint32(ptr + 4, 600_000_000, true);
+        return ptr;
+      },
+    }));
+    assert.deepEqual(e.start(PRELUDE, script, 's.js'), { kind: 'rejected', name: 'RangeError', message }, script);
+    e.dispose();
+  }
+});
+
+test('a stop while an ending is read answers interrupted, as every later call does', async () => {
+  // The read runs the script's own toJSON, which spins until the stop.
+  let checks = 0;
+  const { e } = await engine({ interrupt: () => ++checks > 100 });
+  assert.deepEqual(e.start(PRELUDE, 'tool("a"); ({ toJSON() { for (;;) {} } })', 's.js'), { kind: 'interrupted' });
+  assert.deepEqual(e.settle(1, true, '1', UNFIT), { kind: 'interrupted' });
+  e.dispose();
+});
+
+test('a result too large to copy in still gets the child\'s own error when the error\'s first copy is refused', async () => {
+  // The refusal opens the allocator's headroom, which a second copy of the small error fits in, and
+  // without it the call would reject with an out of memory at its await.
+  let refuseNext = false;
+  const { e } = await engineAround((ex) => ({
+    engine_alloc: (n) => {
+      if (!refuseNext) return ex.engine_alloc(n);
+      refuseNext = false;
+      return 0;
+    },
+  }), {}, { memoryMaxBytes: 8 * MiB });
+  e.start(PRELUDE, 'try { await tool("big"); "fit" } catch (err) { err.name }', 's.js');
+  refuseNext = true;
+  const s = e.settle(1, true, JSON.stringify({ data: 'x'.repeat(12 * MiB) }), UNFIT);
+  assert.equal(s.unfit, true);
+  assert.equal(fulfilled(s), 'ResultTooLarge');
+  e.dispose();
 });
 
 test('a script too large to copy into the guest\'s memory is rejected, not an engine failure', async () => {
@@ -314,40 +467,26 @@ test('a script too large to copy into the guest\'s memory is rejected, not an en
   e.dispose();
 });
 
-test('a trap in the module throws an EngineError with what the engine wrote, up to 4,096 characters, and the engine stays broken', async () => {
+test('a trap in the module throws an EngineError with the first 4,096 characters the engine wrote, and the engine stays broken', async () => {
   // An assertion in QuickJS writes its message to stderr, then traps. This stands in for one,
-  // around the real module: its engine_start writes 20,000 bytes to stderr, then traps.
-  interface Imports { env: { memory: { buffer: ArrayBuffer } }; wasi_snapshot_preview1: { fd_write(fd: number, iovs: number, iovsLen: number, written: number): number } }
-  interface WasmApi {
-    instantiate(module: object, imports: Imports): Promise<{ exports: Record<string, (...args: number[]) => number> }>;
-    RuntimeError: new (message: string) => Error;
-  }
-  const wasm = (globalThis as unknown as { WebAssembly: WasmApi }).WebAssembly;
-  const instantiate = wasm.instantiate;
-  wasm.instantiate = async (module, imports) => {
-    const { exports: ex } = await instantiate.call(wasm, module, imports);
-    const engine_start = (): number => {
-      const text = ex.engine_alloc(20_000), iov = ex.engine_alloc(8), written = ex.engine_alloc(4);
-      new Uint8Array(imports.env.memory.buffer, text, 20_000).fill(0x44); // 'D'
-      const view = new DataView(imports.env.memory.buffer);
-      view.setUint32(iov, text, true);
-      view.setUint32(iov + 4, 20_000, true);
-      imports.wasi_snapshot_preview1.fd_write(2, iov, 1, written);
+  // around the real module: its engine_start writes 3,000 As and then 3,000 Bs, then traps.
+  const { e } = await engineAround((ex, imports) => ({
+    engine_start: () => {
+      for (const [byte, n] of [[0x41, 3000], [0x42, 3000]]) {
+        const text = ex.engine_alloc(n), iov = ex.engine_alloc(8), written = ex.engine_alloc(4);
+        new Uint8Array(imports.env.memory.buffer, text, n).fill(byte);
+        const view = new DataView(imports.env.memory.buffer);
+        view.setUint32(iov, text, true);
+        view.setUint32(iov + 4, n, true);
+        imports.wasi_snapshot_preview1.fd_write(2, iov, 1, written);
+      }
       throw new wasm.RuntimeError('unreachable');
-    };
-    return { exports: { ...ex, engine_start } };
-  };
-  let loaded: Awaited<ReturnType<typeof engine>>;
-  try {
-    loaded = await engine();
-  } finally {
-    wasm.instantiate = instantiate;
-  }
-  const { e } = loaded;
+    },
+  }));
   let crash: unknown;
   assert.throws(() => e.start(PRELUDE, '1', 's.js'), (err: unknown) => {
     crash = err;
-    return err instanceof EngineError && /^the engine crashed in start\(\): unreachable \(D{4096}\)$/.test(err.message);
+    return err instanceof EngineError && /^the engine crashed in start\(\): unreachable \(A{3000}B{1096}\)$/.test(err.message);
   });
   assert.throws(() => e.settle(1, true, '1', UNFIT), (err: unknown) => err === crash);
   e.dispose();

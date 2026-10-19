@@ -120,6 +120,12 @@ export const DEFAULT_STACK_BYTES = 512 * 1024;
 export const MAX_RESULT_DEPTH = 2000;
 /** The most of the engine's own stdio a crash's message keeps. */
 const DIAGNOSTICS_CHARS = 4096;
+/**
+ * The longest ending text the binding decodes: V8's longest string, in characters, which a text
+ * of this many UTF-8 bytes can't exceed. A longer one couldn't be decoded, so it's answered as a
+ * rejection that says so.
+ */
+const MAX_ENDING_BYTES = 2 ** 29 - 24;
 /** Leaves a quarter of the link-time stack for C frames between QuickJS's checks. */
 export const MAX_STACK_BYTES = LINK_STACK_BYTES - 256 * 1024;
 
@@ -207,6 +213,8 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
   let diagnostics = '';
   /** A call into the module is in progress, so a slot is the only thing that can call again. */
   let busy = false;
+  /** interrupt() has returned true: the guest is stopped for good. */
+  let stopped = false;
 
   /**
    * A view of the module's memory. A corrupted guest could pass any pointer, and the view's own
@@ -237,7 +245,9 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
     host_interrupt: () => {
       if (slotFailed) return 1;
       try {
-        return slots.interrupt() ? 1 : 0;
+        if (!slots.interrupt()) return 0;
+        stopped = true;
+        return 1;
       } catch (err) {
         slotFailed = true;
         slotError = err;
@@ -307,13 +317,23 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
       out = fn();
     } catch (err) {
       if (err instanceof EngineError) throw err;
+      // A slot that failed first is why: the guest ran on, refused, until the module trapped.
+      if (slotFailed) return slotFailure(what);
       const why = diagnostics.trim();
-      broken = new EngineError(`the engine crashed in ${what}: ${err instanceof Error ? err.message : String(err)}${why ? ` (${why})` : ''}`, { cause: err });
+      broken = new EngineError(`the engine crashed in ${what}: ${describe(err)}${why ? ` (${why})` : ''}`, { cause: err });
       throw broken;
     } finally {
       busy = false;
     }
     return out;
+  };
+  /** A thrown value as text, for a message: it may have no string form, or one that throws. */
+  const describe = (err: unknown): string => {
+    try {
+      return err instanceof Error ? err.message : String(err);
+    } catch {
+      return 'a value with no string form';
+    }
   };
   /** Copies text, or UTF-8 bytes, into the module with the NUL its C expects. Caller frees. */
   const put = (value: string | Uint8Array): { ptr: number; len: number } => {
@@ -326,12 +346,17 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
     dst[len] = 0;
     return { ptr, len };
   };
-  const result = (): { kind: number; text: string } | undefined => {
+  /** The ending's text, or its length alone when it's too long to decode, or nothing when the module couldn't make it. */
+  const result = (): { kind: number; text: string } | { kind: number; tooLong: number } | undefined => {
     const ptr = ex.engine_result();
     if (ptr === 0) return undefined;
     const view = new DataView(memory.buffer);
     const kind = view.getUint32(ptr, true);
     const len = view.getUint32(ptr + 4, true);
+    if (len > MAX_ENDING_BYTES) {
+      ex.engine_free(ptr);
+      return { kind, tooLong: len };
+    }
     const out = decoder.decode(new Uint8Array(memory.buffer, ptr + 8, len));
     ex.engine_free(ptr);
     return { kind, text: out };
@@ -350,7 +375,7 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
   const endings = new Map<number, RunState>();
   /** The run ended because a slot threw. */
   const slotFailure = (what: string): never => {
-    broken = new EngineError(`a slot threw during ${what}: ${slotError instanceof Error ? slotError.message : String(slotError)}`, { cause: slotError });
+    broken = new EngineError(`a slot threw during ${what}: ${describe(slotError)}`, { cause: slotError });
     throw broken;
   };
   /** Reads a state code into a RunState, or throws for the engine's own failures. */
@@ -367,14 +392,19 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
         const known = endings.get(code);
         if (known) return { ...known };
         const r = result();
-        // Reading runs the interrupt slot, which can throw.
+        // Reading runs the interrupt slot, which can throw, or stop the guest: then this call
+        // answers as any call does in which that happens.
         if (slotFailed) return slotFailure(what);
-        if (!r) {
-          return { kind: 'rejected', name: 'InternalError', message: code === FULFILLED
+        if (stopped) return { kind: 'interrupted' };
+        const state: RunState = !r
+          ? { kind: 'rejected', name: 'InternalError', message: code === FULFILLED
             ? 'out of memory while serializing the script\'s return value; return less'
-            : 'out of memory while reading what the script threw' };
-        }
-        const state: RunState = r.kind === 0 ? { kind: 'fulfilled', json: undefined }
+            : 'out of memory while reading what the script threw; throw something smaller, such as an Error with a shorter message' }
+          : 'tooLong' in r
+          ? { kind: 'rejected', name: 'RangeError', message: code === FULFILLED
+            ? `the script's return value is ${r.tooLong} bytes as JSON, more than can be read back; return less`
+            : `what the script threw is ${r.tooLong} bytes as JSON, more than can be read back; throw something smaller` }
+          : r.kind === 0 ? { kind: 'fulfilled', json: undefined }
           : r.kind === 1 ? { kind: 'fulfilled', json: r.text }
           : errorState(r.text);
         endings.set(code, state);
@@ -406,6 +436,7 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
   return {
     start(prelude, script, filename) {
       live('start()');
+      if (broken) throw broken;
       if (started) throw new EngineError('start() was already called');
       started = true;
       return call('start()', () => {
@@ -420,13 +451,16 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
     },
     settle(callId, ok, json, unfitJson) {
       live('settle()');
+      if (broken) throw broken;
       if (!started) throw new EngineError('settle() before start()');
       if (callId >>> 0 !== callId) throw new EngineError(`settle(): ${callId} isn't a call id`);
       return call('settle()', () => {
-        // The small error first, so a result that takes the last of the memory leaves it room.
+        // The small error first, so a result that takes the last of the memory leaves it room,
+        // and once more if refused: the refusal opens the allocator's headroom, which it fits in.
         // A copy the module can't make room for goes as a null pointer, and so does a result
         // nested too deeply to parse.
-        const u = put(unfitJson);
+        let u = put(unfitJson);
+        if (!u.ptr) u = put(unfitJson);
         const j = nestsDeeper(json, MAX_RESULT_DEPTH) ? { ptr: 0, len: 0 } : put(json);
         try {
           const code = ex.engine_settle(callId, ok ? 1 : 0, j.ptr, j.len, u.ptr, u.len);
@@ -440,8 +474,10 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
     },
     dispose() {
       if (disposed) return;
-      disposed = true;
+      // Marked only once it's done, so a dispose() the engine refuses (from inside a slot) can be
+      // made again.
       if (!broken) call('dispose()', () => ex.engine_dispose());
+      disposed = true;
     },
   };
 }
