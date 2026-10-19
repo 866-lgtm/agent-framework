@@ -2161,8 +2161,10 @@ export class AgentFramework {
   private ephemeralRuns: Map<string, EphemeralRun> = new Map();
   /** Ephemeral namespaces/names are single-generation for this framework
    * lifetime. Reusing one while an old stream drains would let name-keyed
-   * liveness/settlement state cross generations. */
-  private usedEphemeralAgentNames: Set<string> = new Set();
+   * liveness/settlement state cross generations. Each name records what
+   * reserved it: an ephemeral run (createEphemeralAgent), which takes no
+   * global fallback even after its release, or a conversation fork. */
+  private usedEphemeralAgentNames: Map<string, 'run' | 'conversation'> = new Map();
   /** One-shot generation tickets minted by createEphemeralAgent. */
   private ephemeralCandidates: WeakMap<Agent, ContextManager> = new WeakMap();
   /** Warn only once per Agent instance after utilities are registered. */
@@ -7685,7 +7687,7 @@ export class AgentFramework {
     if (this.usedEphemeralAgentNames.has(config.name) || this.agents.has(config.name)) {
       throw new Error(`Ephemeral agent name \"${config.name}\" is already registered or has been used in this framework`);
     }
-    this.usedEphemeralAgentNames.add(config.name);
+    this.usedEphemeralAgentNames.set(config.name, 'run');
     try {
       const namespace = `subagent/${config.name}`;
 
@@ -8460,13 +8462,17 @@ export class AgentFramework {
 
   /**
    * Mark an inference refusal visibly: react on the message that holds the
-   * conversational locus (the most recent incoming channel message) with a
-   * category-specific emoji. Best-effort — failures are logged, never thrown,
-   * and non-Discord loci are silently skipped.
+   * refused agent's conversational locus (the most recent incoming channel
+   * message; an ephemeral run has none, so a subagent's refusal marks no
+   * message) with a category-specific emoji. Best-effort — failures are
+   * logged, never thrown, and non-Discord loci are silently skipped.
    */
   private async reactToRefusal(agentName: string, category: string): Promise<void> {
     try {
-      const incoming = this.channelRegistry?.buildChannelContext()?.incoming;
+      // The refused agent's own view of the latest inbound message: an
+      // ephemeral run has none (takesGlobalFallback), so a subagent's refusal
+      // marks no one else's channel.
+      const incoming = this.channelRegistry?.buildChannelContext(agentName)?.incoming;
       if (!incoming) return;
       // incoming.channelId is the MCPL composite id ("discord:<guild>:<channel>");
       // the reaction tool wants the raw Discord channel (or thread) id — the
@@ -11602,7 +11608,7 @@ export class AgentFramework {
     if (this.usedEphemeralAgentNames.has(name) || this.agents.has(name)) {
       throw new Error(`Conversation agent name "${name}" is already registered or reserved`);
     }
-    this.usedEphemeralAgentNames.add(name);
+    this.usedEphemeralAgentNames.set(name, 'conversation');
     try {
 
       const contextManager = await ContextManager.open({
@@ -13185,7 +13191,8 @@ export class AgentFramework {
       // Ambient chatter must not outrank an addressed message just by being
       // newest (2026-07-21 Cairn lounge misroute, turn-start variant).
       // Non-channel wakes (heartbeats, module events, reactions — which never
-      // carry channelId) leave both undefined → global fallback.
+      // carry channelId) leave both undefined → global fallback, which an
+      // ephemeral run never takes (takesGlobalFallback).
       // Track the winning REQUEST, not just its channel: channel, addressed
       // and counterparty must come from the same message, or a batch of
       // "ambient from A, then addressed from B" would report B's channel
@@ -15605,7 +15612,8 @@ export class AgentFramework {
       // a previous turn's channel.
       routing.triggerChannel = trigger?.channelId;
       // FREEZE the turn's outbound locus now (turn-frozen routing): the home
-      // channel for forks, else the trigger channel, else the global default.
+      // channel for forks, else the trigger channel, else the global default,
+      // which an ephemeral run never takes (takesGlobalFallback).
       // Mid-turn injections must not redirect the agent's plain prose
       // (ambient chatter and reactions hijacked it before, 2026-07-21), and
       // the eager snapshot protects heartbeat turns from a moving
@@ -17321,7 +17329,7 @@ export class AgentFramework {
                 // one channel must not land its postscript in another.
                 const locus = resolveTurnLocus();
                 console.error(
-                  `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> routing ${segments.length} ${liveProseRouting ? 'trailing ' : ''}prose segment(s) -> ${locus ?? '(default)'}`,
+                  `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> routing ${segments.length} ${liveProseRouting ? 'trailing ' : ''}prose segment(s) -> ${locus ?? '(none)'}`,
                 );
                 // Deliver sequentially (await each) so the segments land in order.
                 for (const seg of segments) {
@@ -21032,7 +21040,8 @@ export class AgentFramework {
       kind: 'refusal',
       category,
       streak,
-      locus: this.channelRegistry?.buildChannelContext()?.incoming?.channelId ?? null,
+      // The refused agent's own view: a subagent's refusal names no channel.
+      locus: this.channelRegistry?.buildChannelContext(agentName)?.incoming?.channelId ?? null,
       tokens: tokens ?? null,
     });
     if (streak >= 2) {
@@ -21489,11 +21498,17 @@ export class AgentFramework {
         // a later start of the turn is told where its unprefixed speech lands
         // unless a hybrid `>>>` destination takes it. Empty for a heartbeat /
         // no-trigger turn until its locus is resolved, so that resolution
-        // takes the global fallback; the turn then keeps that channel.
+        // takes the global fallback (none for an ephemeral run); the turn then
+        // keeps that channel.
         activeChannelResolver: (agentName) => {
           const routing = this.turnRouting.get(agentName);
           return routing?.locus ?? routing?.triggerChannel;
         },
+        // An ephemeral run (a subagent) never takes the process-global
+        // fallback: its prose is its caller's result, and the latest inbound
+        // message's channel is nobody's choice for it (#551). By name, so a
+        // speech dispatch that comes after the run's release still counts.
+        takesGlobalFallback: (conversationId) => this.usedEphemeralAgentNames.get(conversationId) !== 'run',
         eventGatePresent: this.eventGate !== null,
         // A text-only turn whose speech couldn't be delivered must not vanish
         // silently: record a `[discord-send-failed]` marker in chronicle so the
