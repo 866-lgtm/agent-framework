@@ -18247,7 +18247,8 @@ export class AgentFramework {
     let ownedToEnd = false;
     try {
       const started = Date.now();
-      const call = { id: toolUseId, name: toolName, input, callerAgentName: agentName };
+      // The pair is stored under the agent's inline cap, as a model's call is.
+      const call = { id: toolUseId, name: toolName, input, callerAgentName: agentName, resultMaxChars: this.resolveToolResultInlineCap(agent).cap };
       const returned = await this.executeToolCall(call);
       const durationMs = Date.now() - started;
       // The pair is stored as a model's call would be, so the result stored,
@@ -19539,6 +19540,19 @@ export class AgentFramework {
     };
   }
 
+  /**
+   * A tool call's resultMaxChars: how long its result may be and still reach
+   * its caller whole. A call from a running script resolves to the script,
+   * which takes up to SCRIPT_RESULT_MAX_CHARS. Any other call's result
+   * is stored in its agent's context under the agent's inline cap, and a call
+   * for an agent the framework doesn't hold gets the house default.
+   */
+  private resultMaxCharsFor(agentName: string, callId: string): number {
+    if (this.scriptToolWaiters.has(callId)) return AgentFramework.SCRIPT_RESULT_MAX_CHARS;
+    const agent = this.agents.get(agentName);
+    return agent ? this.resolveToolResultInlineCap(agent).cap : DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS;
+  }
+
   private approximateDecodedBase64Bytes(base64: string): number {
     const padding = base64.endsWith('==') ? 2 : base64.endsWith('=') ? 1 : 0;
     return Math.max(0, Math.floor(base64.length * 3 / 4) - padding);
@@ -20014,7 +20028,7 @@ export class AgentFramework {
     const startTime = Date.now();
 
     this.moduleRegistry
-      .storableToolCall({ ...call, callerAgentName: agentName })
+      .storableToolCall({ ...call, callerAgentName: agentName, resultMaxChars: this.resultMaxCharsFor(agentName, call.id) })
       .then((result) => {
         const durationMs = Date.now() - startTime;
         this.emitTrace({
@@ -26011,8 +26025,10 @@ export class AgentFramework {
           try {
             result = await workspace.writeBinary(destination, bytes, image.mediaType);
           } catch (error) {
-            // Thrown before its tree entry was set; the images before it
-            // are saved, and the failure says so, as a returned one does.
+            // A throw leaves the file's tree entry as it was, unless its
+            // error says that whether the entry changed isn't known
+            // (writeBinary); the images before it are saved, and the
+            // failure says so, as a returned one does.
             failed(error);
             return;
           }
@@ -26111,9 +26127,18 @@ export class AgentFramework {
         // against the utility resolved here, even where one of the module's
         // tools shares its name. An in-process caller gets the module's own
         // result; the model's path takes the result's stored form.
+        //
+        // The result goes where the utils call's does. On the model's path it
+        // is stored or handed to a script as that call's result, so it may be
+        // as long as that call's may (resultMaxCharsFor). An in-process caller
+        // gets it back, and the utils call carries what that caller may take,
+        // if anything does: the puppet's carries the agent's cap, since the
+        // puppet stores the pair under it.
+        const resultMaxChars = options.inProcess ? call.resultMaxChars : this.resultMaxCharsFor(agentName, call.id);
         const utilityCall: ToolCall = {
           id: call.id, name: def.name, input: args, callerAgentName: agentName,
           ...(call.callerTurnId !== undefined ? { callerTurnId: call.callerTurnId } : {}),
+          ...(resultMaxChars !== undefined ? { resultMaxChars } : {}),
         };
         return options.inProcess
           ? this.moduleRegistry.handleToolCall(utilityCall, { definition: def })
