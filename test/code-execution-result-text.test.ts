@@ -343,6 +343,16 @@ describe('code_execution result text, through the framework (real python3)', () 
     });
   });
 
+  it('a bound the call carries, as an in-process caller may set it, bounds the text', async () => {
+    await withFramework({ workspace: true }, async (framework) => {
+      const r = await framework.executeToolCall({ id: 'ce-call-bound', name: 'code_execution', input: { code: outputTail }, resultMaxChars: 5000 });
+      const text = textOf(r);
+      assert.ok(text.length <= 5000 && text.length > 4500, String(text.length));
+      assert.ok(text.startsWith('exit code: 1\n--- stderr ---\nan error line\n'), text.slice(0, 80));
+      assert.match(text, /\n\[cut to fit; the whole output \(\d+ chars\): workspace file files\/tool-results\/\S+-ce-call-bound\.txt\. /);
+    });
+  });
+
   it('a cap too small for a cut of each stream returns the whole text, written nowhere, for the inline cap\'s spill', async () => {
     // 50 tokens bound the cap at 200 characters, less than the notice alone.
     await withFramework({ workspace: true, agents: [agentWithTokenBound(50)] }, async (framework, _readSpill, _failWrites, wroteFor) => {

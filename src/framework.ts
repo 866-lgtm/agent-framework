@@ -19446,8 +19446,10 @@ export class AgentFramework {
     }
 
     // The model reads how the script ended as text, its ending first, within
-    // the agent's inline cap; hosts read the fields in `structured`.
-    const cap = agent ? this.resolveToolResultInlineCap(agent).cap : DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS;
+    // the bound its caller reads whole: the one the call carries, as an
+    // in-process caller may set it, or else the agent's inline cap, as for
+    // any call (resultMaxCharsFor). Hosts read the fields in `structured`.
+    const cap = call.resultMaxChars ?? this.resultMaxCharsFor(agentName, call.id);
     const text = await this.scriptEndResultText(
       { stdout: exec.stdout, stderr: exec.stderr, returnCode: exec.returnCode, ...(capNote ? { timeLimitNote: capNote } : {}) },
       cap,
