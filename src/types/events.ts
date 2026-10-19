@@ -193,6 +193,20 @@ export interface ToolResult {
   /** Whether this was an error (for LLM) */
   isError?: boolean;
   /**
+   * The dispatcher refused the call before it opened, RFC-007's refusal, so
+   * nothing ran and the call certainly had no effect. Only the dispatcher's
+   * path, the model's calls and a script's, sets it: the caller may not use
+   * the tool (allowedTools), a `skip_reply` wake was refused, the call's MCPL
+   * server is absent or still connecting, the host's policy for that server
+   * denies the tool, or a fork reached outside its channel. RFC-007's
+   * lifecycle refuses the call from the same place, so observers see no
+   * events for it. A check made after the call opened, such as a module's
+   * answer for a name it has no tool for or arguments that don't fit a
+   * schema, is a failure whose text says nothing was done, as is an MCPL
+   * request that couldn't be written.
+   */
+  refused?: boolean;
+  /**
    * The result's machine-readable form, beside `data`. Programs read it: a
    * script gets it in its result object, and a host in the tool result
    * event. The model never reads this field: it sees the value only where an

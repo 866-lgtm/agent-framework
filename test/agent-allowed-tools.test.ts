@@ -486,12 +486,14 @@ for (const route of ['model', 'public', 'script'] as const) {
       } else if (route === 'public') {
         const result = await h.framework.executeToolCall({ id: 'utility-denied', name: 'utils', input, callerAgentName: 'assistant' });
         assert.equal(result.isError, true); assert.match(result.error!, /not permitted.*allowedTools/);
+        assert.equal(result.refused, undefined, 'its utils call has opened, so the utility\'s refusal is a failure');
       } else {
         const pending = h.internal.dispatchScriptToolCall('assistant', 'utils', input);
         const processing = setInterval(() => { void h.framework.runUntilIdle(); }, 5);
         try {
           const result = await pending;
           assert.equal(result.isError, true); assert.match(result.error!, /not permitted.*allowedTools/);
+          assert.equal(result.refused, undefined, 'its utils call has opened, so the utility\'s refusal is a failure');
         } finally { clearInterval(processing); }
       }
       assert.deepEqual(h.effects, []);

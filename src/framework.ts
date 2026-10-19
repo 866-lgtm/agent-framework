@@ -19117,8 +19117,13 @@ export class AgentFramework {
 
   private async executeToolCallFrom(call: ToolCall, origin: ChannelToolOrigin): Promise<ToolResult> {
     if (origin.kind === 'agent') {
-      const refusal = this.agentToolPermissionFailure(origin.agentName, call);
-      if (refusal) return refusal;
+      // A programmatic call, off the dispatcher: no RFC-007 call opened, so a
+      // denial here is a failure. It's this call's end, so it's traced here.
+      const failure = this.agentToolPermissionFailure(origin.agentName, call, false);
+      if (failure) {
+        this.emitTrace({ type: 'tool:failed', module: 'framework', tool: call.name, callId: call.id, error: failure.error ?? '' });
+        return failure;
+      }
     }
 
     if (isPresentationTool(call.name)) return this.editToolPresentation(call.callerAgentName ?? '__ephemeral__', call);
@@ -19166,14 +19171,15 @@ export class AgentFramework {
     }
 
     // Module tools. The caller uses the result in process, so it gets the
-    // module's own result, as the module returned it.
+    // module's own result, as the module returned it, less a refusal it
+    // claims, which is the dispatcher's to say.
     return this.moduleRegistry.handleToolCall(call);
   }
 
   /** A programmatic call of an MCPL tool: `serverId` and `prefix` as resolveMcplTool matched them. */
   private async executeMcplToolCall(call: ToolCall, serverId: string, prefix: string): Promise<ToolResult> {
     if (!this.mcplServerRegistry) {
-      return { success: false, error: 'MCPL not initialized', isError: true };
+      return { success: false, error: 'MCPL not initialized, so the call didn\'t run', isError: true };
     }
     const modern = this.modernServers().get(serverId) ?? null;
     const server = modern ? null : this.mcplServerRegistry.getServer(serverId);
@@ -20685,16 +20691,29 @@ export class AgentFramework {
 
   private agentToolPermissionFailure(agentName: string, call: ToolCall, reportRefusal = true): ToolResult | undefined {
     if (this.canAgentUseTool(agentName, call.name)) return undefined;
-    const error = !this.agents.has(agentName) && this.usedEphemeralAgentNames.has(agentName)
-      ? `Caller '${agentName}' is not a running agent; framework-created agents have tool authority only while registered.`
-      : `Tool '${call.name}' is not permitted by this agent's allowedTools.`;
-    if (reportRefusal) {
-      this.toolLifecycleEmitter?.refuse(agentName, call.id);
-      this.emitTrace({
-        type: 'tool:failed', module: 'framework', tool: call.name, callId: call.id, error,
-      });
-    }
-    return { success: false, error, isError: true };
+    const why = !this.agents.has(agentName) && this.usedEphemeralAgentNames.has(agentName)
+      ? `Caller '${agentName}' is not a running agent; framework-created agents have tool authority only while registered`
+      : `Tool '${call.name}' is not permitted by this agent's allowedTools`;
+    // Off the dispatcher, nothing opened the call to refuse it in RFC-007's
+    // lifecycle, so it's a failure, not a refusal (ToolResult.refused), whose
+    // text says the call didn't run.
+    if (!reportRefusal) return { success: false, error: `${why}, so the call didn't run.`, isError: true };
+    const error = `${why}.`;
+    const refusal = this.refusedResult(agentName, call.id, error);
+    this.emitTrace({
+      type: 'tool:failed', module: 'framework', tool: call.name, callId: call.id, error,
+    });
+    return refusal;
+  }
+
+  /**
+   * A dispatched call answered without running its tool. RFC-007's lifecycle
+   * forgets it, and its result says it was refused (`ToolResult.refused`), both
+   * from here, so the two can't disagree.
+   */
+  private refusedResult(agentName: string, callId: string, error: string): ToolResult {
+    this.toolLifecycleEmitter?.refuse(agentName, callId);
+    return { success: false, error, isError: true, refused: true };
   }
 
   /**
@@ -20873,9 +20892,9 @@ export class AgentFramework {
         if (error !== undefined) {
           const wakeValue = (enrichedCall.input as { wake_in_seconds?: unknown } | null | undefined)?.wake_in_seconds;
           console.error(`[self-wake] agent=${agentName} wake_in_seconds=${logValue(wakeValue)} skip_reply refused: ${logDetail(this.eventGate ? "wake_in_seconds isn't a number of seconds" : 'No EventGate configured (FrameworkConfig.gate is unset)')}`);
-          this.toolLifecycleEmitter?.refuse(agentName, enrichedCall.id);
+          const result = this.refusedResult(agentName, enrichedCall.id, error);
           this.emitTrace({ type: 'tool:failed', module: 'channels', tool: enrichedCall.name, callId: enrichedCall.id, error });
-          this.pushEvent({ type: 'tool-result', callId: enrichedCall.id, toolName: enrichedCall.name, agentName, moduleName: 'channels', result: { success: false, error, isError: true } });
+          this.pushEvent({ type: 'tool-result', callId: enrichedCall.id, toolName: enrichedCall.name, agentName, moduleName: 'channels', result });
           return;
         }
         const wake = readSkipReplyWake(enrichedCall.input);
@@ -25724,21 +25743,20 @@ export class AgentFramework {
 
     if ((!modern && !server) || this.modernStillConnecting(modern)) {
       // RFC-007: refused before executing — no lifecycle events.
-      this.toolLifecycleEmitter?.refuse(agentName, call.id);
       this.pushEvent({
         type: 'tool-result',
         callId: call.id,
         toolName: call.name,
         agentName,
         moduleName: `mcpl:${serverId}`,
-        result: { success: false, error: this.mcplServerAbsentText(serverId, call.name), isError: true },
+        result: this.refusedResult(agentName, call.id, this.mcplServerAbsentText(serverId, call.name)),
       });
       return;
     }
 
     const config = this.mcplServerConfigs.get(serverId);
     if (!isToolAllowed(toolName, config)) {
-      this.toolLifecycleEmitter?.refuse(agentName, call.id);
+      const result = this.refusedResult(agentName, call.id, mcplToolDeniedText(serverId, call.name));
       this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, error: 'denied by tool policy' });
       this.pushEvent({
         type: 'tool-result',
@@ -25746,7 +25764,7 @@ export class AgentFramework {
         toolName: call.name,
         agentName,
         moduleName: `mcpl:${serverId}`,
-        result: { success: false, error: mcplToolDeniedText(serverId, call.name), isError: true },
+        result,
       });
       return;
     }
@@ -25768,6 +25786,8 @@ export class AgentFramework {
       this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, error: err.message, stack: err.stack });
       // RFC-007: transport error, closed connection or timeout — no result.
       this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
+      // A request that couldn't be written is a failure, not a refusal: the
+      // call had opened (RFC-007), and its error says it wasn't sent.
       this.pushEvent({
         type: 'tool-result',
         callId: call.id,
@@ -26085,7 +26105,7 @@ export class AgentFramework {
     if (home) {
       const reject = (error: string): void => {
         // RFC-007: the guard refuses before the tool runs — no lifecycle events.
-        this.toolLifecycleEmitter?.refuse(agentName, call.id);
+        const result = this.refusedResult(agentName, call.id, error);
         this.emitTrace({
           type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id,
           error: `conversation agent ${agentName}: ${error}`,
@@ -26096,7 +26116,7 @@ export class AgentFramework {
           toolName: call.name,
           agentName,
           moduleName: 'channels',
-          result: { success: false, error, isError: true },
+          result,
         });
       };
 
@@ -27072,7 +27092,7 @@ export class AgentFramework {
       case 'run': {
         const def = allUtilities.find((u) => u.name === input.name);
         if (!def) {
-          return { success: false, isError: true, error: `No utility "${String(input.name)}". ${available()}` };
+          return { success: false, isError: true, error: `No utility "${String(input.name)}", so nothing was done. ${available()}` };
         }
         if (!options.trustedModule) {
           // The allowed outer utils call owns its lifecycle and terminal trace;
