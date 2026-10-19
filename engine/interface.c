@@ -49,6 +49,10 @@ enum {
     ENGINE_HOST_FAILED = 4,  /* an import reported failure: the run is over, and the host refuses
                                 the guest's later calls and output and stops it at its next
                                 interrupt check */
+    ENGINE_FAILED = 5,       /* once the script was running, an exception escaped its promises: a
+                                job failed, or a callback it gave queueMicrotask or a
+                                FinalizationRegistry threw. The run is over, and engine_result has
+                                the exception */
     ENGINE_MISUSE = -1,      /* called out of order, or with a malformed buffer */
     ENGINE_NO_MEMORY = -2,   /* the engine couldn't allocate its own state */
     ENGINE_UNKNOWN_CALL = -3 /* engine_settle named no pending call */
@@ -56,6 +60,9 @@ enum {
 /* Or'd into engine_settle's state when the result didn't fit and the call took the host's
    rejection instead. */
 #define ENGINE_UNFIT 16
+/* Or'd into engine_settle's state when the result never reached the script: the run had ended
+   before this settle, or the engine failed before it could deliver it. */
+#define ENGINE_DROPPED 32
 
 static JSRuntime *rt;
 static JSContext *ctx;
@@ -64,8 +71,10 @@ static JSValue pending;
 /* The script's completion promise from JS_EVAL_FLAG_ASYNC, which settles to { value }. */
 static JSValue completion;
 /* What ended the run when it wasn't the completion promise: the prelude's or the script's
-   synchronous throw, or an exception that escaped a job. */
+   synchronous throw, or an exception that escaped a job or settling a call; and the state it
+   gives, ENGINE_REJECTED or ENGINE_FAILED. */
 static JSValue failure;
+static int failure_state;
 static bool started;
 static bool failed;
 static bool interrupted;
@@ -278,13 +287,16 @@ static JSValue js_output(JSContext *c, JSValueConst this_val, int argc, JSValueC
     return JS_UNDEFINED;
 }
 
-/* Keeps `exc` as what ended the run, unless something already did. Takes `exc`. */
-static void fail_with(JSValue exc) {
+/* Keeps `exc` as what ended the run, unless something already did, with the state it gives:
+   ENGINE_REJECTED for the prelude's or the script's own throw as it starts, ENGINE_FAILED for an
+   exception that escapes once it runs. Takes `exc`. */
+static void fail_with(JSValue exc, int st) {
     if (failed) {
         JS_FreeValue(ctx, exc);
         return;
     }
     failure = exc;
+    failure_state = st;
     failed = true;
 }
 
@@ -298,13 +310,14 @@ static void run_jobs(void) {
         if (r == 0)
             return;
         if (r < 0) {
-            /* A promise job catches what its handler throws, so only an uncatchable error or a
-               failure in the job machinery itself gets here. */
+            /* A promise job catches what its handler throws, but the job of a queueMicrotask or
+               FinalizationRegistry callback passes its throw on, and so does a failure of the
+               job machinery itself, or an uncatchable error. */
             JSValue exc = JS_GetException(job_ctx);
             if (interrupted)
                 JS_FreeValue(ctx, exc);
             else
-                fail_with(exc);
+                fail_with(exc, ENGINE_FAILED);
             return;
         }
     }
@@ -316,7 +329,7 @@ static int state(void) {
     if (host_failed)
         return ENGINE_HOST_FAILED;
     if (failed)
-        return ENGINE_REJECTED;
+        return failure_state;
     switch (JS_PromiseState(ctx, completion)) {
     case JS_PROMISE_FULFILLED:
         return ENGINE_FULFILLED;
@@ -376,7 +389,7 @@ int engine_start(const char *prelude, uint32_t prelude_len, const char *script, 
         if (interrupted || host_failed)
             JS_FreeValue(ctx, exc);
         else
-            fail_with(exc);
+            fail_with(exc, ENGINE_REJECTED);
         return state();
     }
     JS_FreeValue(ctx, r);
@@ -387,7 +400,7 @@ int engine_start(const char *prelude, uint32_t prelude_len, const char *script, 
         if (interrupted || host_failed)
             JS_FreeValue(ctx, exc);
         else
-            fail_with(exc);
+            fail_with(exc, ENGINE_REJECTED);
         return state();
     }
     completion = r;
@@ -401,7 +414,7 @@ static void release(char **buf) {
     *buf = NULL;
 }
 
-/* engine_settle's work, which frees each buffer as soon as it's parsed. */
+/* engine_settle's work, which frees each buffer as soon as it's done with it. */
 static int settle(uint32_t id, int ok, char **json, uint32_t json_len, char **unfit,
                   uint32_t unfit_len) {
     if (!started || (*json && (*json)[json_len] != '\0') || (*unfit && (*unfit)[unfit_len] != '\0'))
@@ -423,7 +436,7 @@ static int settle(uint32_t id, int ok, char **json, uint32_t json_len, char **un
     JS_FreeAtom(ctx, atom);
     if (interrupted || host_failed || failed) {
         JS_FreeValue(ctx, entry);
-        return state();
+        return state() | ENGINE_DROPPED;
     }
 
     JSValue value = JS_UNDEFINED;
@@ -453,14 +466,14 @@ static int settle(uint32_t id, int ok, char **json, uint32_t json_len, char **un
     JS_FreeValue(ctx, entry);
     if (JS_IsException(fn)) {
         JS_FreeValue(ctx, value);
-        fail_with(JS_GetException(ctx));
-        return state();
+        fail_with(JS_GetException(ctx), ENGINE_FAILED);
+        return state() | ENGINE_DROPPED | (too_large ? ENGINE_UNFIT : 0);
     }
     JSValue r = JS_Call(ctx, fn, JS_UNDEFINED, 1, (JSValueConst *)&value);
     JS_FreeValue(ctx, fn);
     JS_FreeValue(ctx, value);
     if (JS_IsException(r))
-        fail_with(JS_GetException(ctx));
+        fail_with(JS_GetException(ctx), ENGINE_FAILED);
     else
         JS_FreeValue(ctx, r);
     run_jobs();
@@ -474,15 +487,18 @@ static int settle(uint32_t id, int ok, char **json, uint32_t json_len, char **un
    the host couldn't copy in, or a parse that fails, for want of memory or stack (or because it
    isn't JSON, which a host's result never is). Any of these took effect without reaching the
    script, which an error at the call's await would hide. A result nested deeper than the
-   binding's MAX_RESULT_DEPTH never gets here: under Node, a parse nested 5,000 to 10,000 deep
-   overflows the host's stack before QuickJS's own check sees the recursion, and the binding
-   refuses results well short of that.
+   binding's MAX_RESULT_DEPTH never gets here: under Node, a parse nested about 10,000 deep (5,000
+   with V8's optimizing tier alone) overflows the host's stack before QuickJS's own check sees the
+   recursion, and the binding refuses results well short of that. When the run had already ended,
+   or the engine fails before it can deliver the result, the state answered has ENGINE_DROPPED
+   set: the result never reached the script.
 
    json and unfit are the host's buffers from engine_alloc, each null or ending in a NUL at [len]
-   as JS_ParseJSON requires, and this frees both, whatever it returns: each as soon as it's
-   parsed, so the result's copy is gone before the unfit error is parsed and before the script's
-   code runs. A parse that fails frees what it built too. If even the unfit error can't be copied
-   in (a null unfit) or parsed, the call rejects with what that failure gives. */
+   as JS_ParseJSON requires, and this frees both, whatever it returns: the result's copy as soon
+   as it's parsed, so it's gone before the unfit error is parsed, and the unfit error's once it's
+   parsed or isn't needed, before the script's code runs. A parse that fails frees what it built
+   too. If even the unfit error can't be copied in (a null unfit) or parsed, the call rejects with
+   what that failure gives. */
 EXPORT("engine_settle")
 int engine_settle(uint32_t id, int ok, char *json, uint32_t json_len, char *unfit,
                   uint32_t unfit_len) {
@@ -584,7 +600,7 @@ static uint8_t *pack(uint32_t kind, JSValue text) {
 static uint8_t *read_ending(int st) {
     JSValue text;
     uint32_t kind = 2;
-    if (st == ENGINE_REJECTED) {
+    if (st != ENGINE_FULFILLED) {
         text = error_json(failed ? JS_DupValue(ctx, failure) : JS_PromiseResult(ctx, completion));
     } else {
         JSValue settled = JS_PromiseResult(ctx, completion);
@@ -608,10 +624,11 @@ static uint8_t *read_ending(int st) {
     return pack(kind, text);
 }
 
-/* After ENGINE_FULFILLED or ENGINE_REJECTED: a buffer the host frees with engine_free,
-   [u32 kind][u32 length][UTF-8]. Kind 0: fulfilled with undefined (or a value JSON.stringify
-   leaves out), no text. Kind 1: fulfilled, the value's JSON. Kind 2: an error, as JSON
-   {name?, message?, stack?}: what the script threw, or why its value couldn't be stringified.
+/* After ENGINE_FULFILLED, ENGINE_REJECTED or ENGINE_FAILED: a buffer the host frees with
+   engine_free, [u32 kind][u32 length][UTF-8]. Kind 0: fulfilled with undefined (or a value
+   JSON.stringify leaves out), no text. Kind 1: fulfilled, the value's JSON. Kind 2: an error, as
+   JSON {name?, message?, stack?}: what the script threw, why its value couldn't be stringified,
+   or the exception that ended the run.
    Returns 0 in any other state, when it can't allocate, or when a stop lands while the ending is
    read, which leaves none to give. The ending is fixed before it's read. The script's own code
    that serializing runs (a toJSON, a getter), and the jobs it queues, which run before this
@@ -623,7 +640,7 @@ static uint8_t *read_ending(int st) {
 EXPORT("engine_result")
 uint8_t *engine_result(void) {
     int st = state();
-    if (st != ENGINE_FULFILLED && st != ENGINE_REJECTED)
+    if (st != ENGINE_FULFILLED && st != ENGINE_REJECTED && st != ENGINE_FAILED)
         return NULL;
     reading = true;
     uint8_t *buf = read_ending(st);

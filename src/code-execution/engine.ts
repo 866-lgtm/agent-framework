@@ -38,7 +38,9 @@ export interface EngineSlots {
   hostCall(callId: number, name: string, argsJson: string): void;
   /**
    * Called while the guest runs, every few thousand of its operations. Return true to stop it for
-   * good: the call in progress answers `interrupted`, and so does every call after.
+   * good: the call in progress answers `interrupted`, and so does every call after. The one
+   * exception is a stop in the jobs that reading the script's ending queued, after the ending was
+   * read whole: that call answers the ending, and the calls after it answer `interrupted`.
    */
   interrupt(): boolean;
   /** The guest called `__output(stream, text)`: stream 1 is out, 2 is err. */
@@ -61,15 +63,25 @@ export type RunState =
    * `String(value)`.
    */
   | { kind: 'rejected'; name: string; message: string; stack?: string }
+  /**
+   * Once the script was running, an exception escaped its promises and ended the run: a callback
+   * it gave `queueMicrotask` or a `FinalizationRegistry` threw, or one of QuickJS's own jobs
+   * failed, such as for want of memory to settle a promise. The fields are the exception's, as for
+   * `rejected`. Every later call answers the same, and no later result reaches the script.
+   */
+  | { kind: 'failed'; name: string; message: string; stack?: string }
   /** `interrupt()` returned true while it ran. */
   | { kind: 'interrupted' };
 
 /**
- * What `settle` answers: the run's state, and `unfit` when the guest couldn't take the result, for
+ * What `settle` answers: the run's state; `unfit` when the guest couldn't take the result, for
  * want of memory to copy it in or of memory or stack to parse it, and the call took the child's
- * own error instead.
+ * own error instead; and `dropped` when the result never reached the script, because the run had
+ * already ended (`interrupted` or `failed`) or the engine failed before it could deliver it.
+ * Without `dropped`, the script got the result or the child's error, even if the run ended in the
+ * jobs that followed.
  */
-export type SettleState = RunState & { unfit?: true };
+export type SettleState = RunState & { unfit?: true; dropped?: true };
 
 export interface Engine {
   /**
@@ -88,8 +100,8 @@ export interface Engine {
    * for calls still in flight when a script returned. Throws for an id that isn't pending.
    *
    * Once a call has answered the script's ending, later calls answer it again, unless something
-   * came after it: a stop answers `interrupted`, a slot's failure throws, and a failure of
-   * QuickJS's own job machinery answers `rejected` with that failure.
+   * came after it: a stop answers `interrupted`, a slot's failure throws, and an exception that
+   * escapes the script's promises answers `failed`.
    */
   settle(callId: number, ok: boolean, json: string | Uint8Array, unfitJson: string): SettleState;
   /** Frees the engine's runtime, unless the module trapped, which leaves it as it is. Nothing may be called after it. */
@@ -115,15 +127,18 @@ export const MIN_MEMORY_BYTES = 4 * 1024 * 1024;
 export const MAX_MEMORY_BYTES = 2048 * 1024 * 1024;
 /**
  * The most QuickJS's stack limit may be, and its default. QuickJS measures its stack in the
- * module's linear memory, but each level of a script's recursion also takes the host's own stack,
- * about two to three times as much, and under Node that stack is about 984 KiB. Recursing through
- * a getter, a proxy trap or a built-in that calls back (map, toString, for...of), the host's stack
- * ran out first, crashing the engine, once QuickJS's limit passed about 320 KiB. At this limit,
- * QuickJS's catchable RangeError comes first, with about two fifths of the host's stack to spare.
- * Bun's stack is larger, and the same limit holds there, so a script ends the same way on either.
+ * module's linear memory, but each level of a script's recursion through calls also takes the
+ * host's own stack, two to three times as much in the 31 ways to recurse that were measured, and
+ * under Node that stack is about 984 KiB. Recursing through a getter, a proxy trap or a built-in
+ * that calls back (map, toString, for...of), the host's stack ran out first, crashing the engine,
+ * once QuickJS's limit passed about 320 KiB. At this limit, QuickJS's catchable RangeError comes
+ * first in each of the 31, with about two fifths of the host's stack to spare. Bun's stack is
+ * larger, and the same limit holds there, so recursion through calls ends the same way on either.
  *
- * The parser isn't held to it: it recurses in C, which the check barely sees, so under Node a
- * script whose text nests function expressions 300 deep, or brackets 700 deep, crashes its run.
+ * Recursion in C that the check barely sees isn't held to it, and under Node crashes the run: a
+ * script's text nesting function expressions 300 deep or brackets 700 deep (the parser), a chain
+ * of 3,000 iterator helpers (each one's next calls the one before), and the script's own JSON
+ * nested 5,000 to 10,000 deep (see MAX_RESULT_DEPTH).
  */
 export const MAX_STACK_BYTES = 192 * 1024;
 export const DEFAULT_STACK_BYTES = MAX_STACK_BYTES;
@@ -147,7 +162,8 @@ const DIAGNOSTICS_CHARS = 4096;
 const MAX_ENDING_BYTES = 2 ** 29 - 24;
 
 // interface.c's states and failures.
-const PENDING = 0, FULFILLED = 1, REJECTED = 2, INTERRUPTED = 3, HOST_FAILED = 4, UNFIT = 16;
+const PENDING = 0, FULFILLED = 1, REJECTED = 2, INTERRUPTED = 3, HOST_FAILED = 4, FAILED = 5;
+const UNFIT = 16, DROPPED = 32;
 const MISUSE = -1, NO_MEMORY = -2, UNKNOWN_CALL = -3;
 
 interface Exports {
@@ -336,6 +352,8 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
       out = fn();
     } catch (err) {
       if (err instanceof EngineError) throw err;
+      // A trap, or an exception in reading what the module returned: either way the module may
+      // have stopped partway, so dispose() leaves it as it is.
       crashed = true;
       // A slot that failed first is why: the guest ran on, refused, until the module trapped.
       if (slotFailed) return slotFailure(what);
@@ -381,12 +399,28 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
     ex.engine_free(ptr);
     return { kind, text: out };
   };
-  const errorState = (json: string): RunState => {
+  const errorState = (json: string, kind: 'rejected' | 'failed'): RunState => {
     const e = JSON.parse(json) as { name?: string; message?: string; stack?: string };
-    const state: RunState = { kind: 'rejected', name: e.name ?? '', message: e.message ?? '' };
+    const state: { kind: 'rejected' | 'failed'; name: string; message: string; stack?: string } =
+      { kind, name: e.name ?? '', message: e.message ?? '' };
     if (typeof e.stack === 'string') state.stack = e.stack;
     return state;
   };
+  /** What an ending that can't be read out is answered with, by what it is. */
+  const unread = {
+    [FULFILLED]: {
+      memory: 'out of memory while serializing the script\'s return value; return less, or let go of data the script no longer needs',
+      long: (n: number) => `the script's return value comes to ${n} bytes as text, more than the ${MAX_ENDING_BYTES} the engine reads back; return less`,
+    },
+    [REJECTED]: {
+      memory: 'out of memory while reading what the script threw; throw something smaller, such as an Error with a shorter message, or let go of data the script no longer needs',
+      long: (n: number) => `what the script threw comes to ${n} bytes as text, more than the ${MAX_ENDING_BYTES} the engine reads back; throw something smaller`,
+    },
+    [FAILED]: {
+      memory: 'out of memory while reading the exception that ended the run',
+      long: (n: number) => `the exception that ended the run comes to ${n} bytes as text, more than the ${MAX_ENDING_BYTES} the engine reads back`,
+    },
+  } as const;
   /**
    * Each ending as it was first read. Reading one serializes the script's value or error in the
    * guest, which can run the script's own code (a toJSON, a getter), and every settle after the
@@ -408,7 +442,9 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
         if (slotFailed) return slotFailure(what);
         return { kind: 'interrupted' };
       case FULFILLED:
-      case REJECTED: {
+      case REJECTED:
+      case FAILED: {
+        // Each kept under its own code, so a failure after the script's own ending is read anew.
         const known = endings.get(code);
         if (known) return { ...known };
         const r = result();
@@ -418,17 +454,12 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
         // the read queued comes after a whole ending, which this call answers.
         if (slotFailed) return slotFailure(what);
         if (!r && stopped) return { kind: 'interrupted' };
-        const state: RunState = !r
-          ? { kind: 'rejected', name: 'InternalError', message: code === FULFILLED
-            ? 'out of memory while serializing the script\'s return value; return less, or let go of data the script no longer needs'
-            : 'out of memory while reading what the script threw; throw something smaller, such as an Error with a shorter message, or let go of data the script no longer needs' }
-          : 'tooLong' in r
-          ? { kind: 'rejected', name: 'RangeError', message: code === FULFILLED
-            ? `the script's return value comes to ${r.tooLong} bytes as text, more than the ${MAX_ENDING_BYTES} the engine reads back; return less`
-            : `what the script threw comes to ${r.tooLong} bytes as text, more than the ${MAX_ENDING_BYTES} the engine reads back; throw something smaller` }
+        const kind = code === FAILED ? 'failed' : 'rejected';
+        const state: RunState = !r ? { kind, name: 'InternalError', message: unread[code].memory }
+          : 'tooLong' in r ? { kind, name: 'RangeError', message: unread[code].long(r.tooLong) }
           : r.kind === 0 ? { kind: 'fulfilled', json: undefined }
           : r.kind === 1 ? { kind: 'fulfilled', json: r.text }
-          : errorState(r.text);
+          : errorState(r.text, kind);
         endings.set(code, state);
         return { ...state };
       }
@@ -485,17 +516,20 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
         if (!u.ptr) u = put(unfitJson);
         const j = nestsDeeper(json, MAX_RESULT_DEPTH) ? { ptr: 0, len: 0 } : put(json);
         const code = ex.engine_settle(callId, ok ? 1 : 0, j.ptr, j.len, u.ptr, u.len);
-        if (code >= 0 && (code & UNFIT) !== 0) return { ...toState(code & ~UNFIT, 'settle()'), unfit: true };
-        return toState(code, 'settle()');
+        if (code < 0) return toState(code, 'settle()');
+        const state: SettleState = toState(code & ~(UNFIT | DROPPED), 'settle()');
+        if (code & UNFIT) state.unfit = true;
+        if (code & DROPPED) state.dropped = true;
+        return state;
       });
     },
     dispose() {
       if (disposed) return;
       // Refused from inside a slot, it isn't marked done, so it can be made again.
       if (busy) throw new EngineError('dispose() was called from inside one of the engine\'s slots, which may not call back into it');
-      // A module that trapped may have stopped anywhere, so it's left as it is. One that ended
-      // for a slot's failure, or for want of memory for its own state, is whole, and frees its
-      // runtime.
+      // A module whose call ended in an exception, a trap or otherwise, may have stopped anywhere,
+      // so it's left as it is. One that ended for a slot's failure, or for want of memory for its
+      // own state, is whole, and frees its runtime.
       if (!crashed) {
         busy = true;
         try {
