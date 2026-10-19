@@ -978,10 +978,26 @@ test("a lazily registered channel whose open answers inbound-only is refused bef
   assert.equal(failures.length, 2);
 });
 
-test("an open's answer that names another channel, declares no direction or declares one that isn't inbound leaves speech published (R1-3)", async () => {
+test("an open's answer whose channel names no id is this channel's, so its inbound-only declaration applies (R1-3)", async () => {
+  // The lifecycle work takes an answer whose channel has no id as the
+  // requested channel's, not a substitution, so the declaration it carries
+  // applies as well, and the speech is refused rather than posted.
+  const { registry, publishCalls, openCalls, failures, setOpenResult } = makeRegistry({ delivered: true });
+  registry.ensureChannelRegistered('body', 'body:ears', 'Body · ears');
+  setOpenResult({ channel: { direction: 'inbound' } });
+
+  assert.equal(await registry.routeSpeech('linn', 'hello', 'body:ears'), null);
+  assert.deepEqual(openCalls.map((c) => c.channelId), ['body:ears'], 'speech opened the channel');
+  assert.equal(publishCalls.length, 0, 'nothing was published');
+  assert.match(failures[0]!.reason, /^inbound-only: server "body" declared this channel's direction "inbound"/);
+  assert.equal(registry.isChannelOpen('body:ears'), true, 'the open stands');
+});
+
+test("an open's answer that declares no direction, or one that isn't inbound, leaves speech published (R1-3)", async () => {
+  // An answer for another channel is a substitution, which fails the open
+  // whatever it declares (channel-open-substitution.test.ts).
   for (const answer of [
     { channel: { id: 'body:ears', type: 'chat', label: 'Body · ears', direction: 'bidirectional' } },
-    { channel: { id: 'body:other', type: 'chat', label: 'Body · other', direction: 'inbound' } },
     {},
   ]) {
     const { registry, publishCalls, failures, setOpenResult } = makeRegistry({ delivered: true });
@@ -1009,7 +1025,7 @@ test('a channel removed while the host opens it for speech is refused, and nothi
     assert.equal(await registry.routeSpeech('linn', 'hello', 'body:home'), null);
     assert.deepEqual(openCalls.map((c) => c.channelId), ['body:home']);
     assert.equal(publishCalls.length, 0, 'nothing was published to the removed channel');
-    assert.deepEqual(failures.map((f) => f.reason), ['the channel was removed before the words were published'],
+    assert.deepEqual(failures.map((f) => f.reason), ['channel is closed and open failed: Channel is no longer registered: body:home'],
       `refused as removed, after the answer ${JSON.stringify(answer)}`);
   }
 });
@@ -1024,7 +1040,7 @@ test("a server's refusal of an open or a tool's publish reaches the agent in its
   assert.equal(await registry.routeSpeech('linn', 'hello', 'body:home'), null);
   assert.deepEqual(failures.map((f) => f.reason), ['channel is closed and open failed: The "body" server answered with an error: Channel unavailable']);
   const opened = await registry.handleChannelToolCall('channel_open', { channelId: 'body:home' }, { kind: 'agent', agentName: 'linn' });
-  assert.equal(opened.error, 'Failed to open channel: The "body" server answered with an error: Channel unavailable');
+  assert.equal(opened.error, 'Failed to open channel: The "body" server answered with an error: Channel unavailable (it stays selected for opening: a later delivery or reconnect tries again, and channel_close withdraws that)');
 
   setOnOpen(undefined);
   setOnPublish(async () => { throw new McplRequestError('The "body" server answered with an error: Channel not permitted', 'error-response'); });
@@ -1108,106 +1124,24 @@ test("an open by reconcile applies its answer too: a channel the answer declares
   assert.match(failures[0]!.reason, /^inbound-only: server "body" declared/);
 });
 
-test('a channel announced again while the host opens it is recorded open once the open answers, and the publish goes there (R1-3)', async () => {
-  const { registry, publishCalls, setOnOpen } = makeRegistry({ delivered: true });
-  const home = { id: 'body:home', type: 'chat', label: 'Body · home', direction: 'bidirectional' };
-  await registry.handleRegister('body', { channels: [home] } as never);
-  // The announcement replaces the entry at once, closed, and its reconcile's
-  // own open waits until the speech is done.
-  let release!: () => void;
-  const held = new Promise<void>((resolve) => { release = resolve; });
-  let announced: Promise<void> | undefined;
-  let opens = 0;
-  setOnOpen(async () => {
-    opens++;
-    if (opens === 1) announced = registry.handleChanged('body', { added: [home] } as never);
-    else await held;
-  });
-
-  assert.deepEqual(await registry.routeSpeech('linn', 'hello', 'body:home'), { delivered: true, channelId: 'body:home' });
-  assert.equal(publishCalls.length, 1);
-  assert.equal(registry.isChannelOpen('body:home'), true, "the channel's current entry is recorded open before its reconcile's open answers");
-  assert.equal(opens, 2, "the announcement's reconcile opened it too, and waits");
-  release();
-  await announced;
-});
-
-// An open answered after a close the host asked for during it: the close is
-// the newer decision, so the channel stays closed, whichever way the host
-// opened it and whether or not an announcement replaced its entry meanwhile.
-async function closedWhileOpening(holdOpen: number) {
+// A registry with body:home registered, counting the server's opens. An open
+// raced by a close or by a re-registration is the lifecycle queue's
+// (channel-lifecycle-order.test.ts).
+async function withHome() {
   const made = makeRegistry({ delivered: true });
   const home = { id: 'body:home', type: 'chat', label: 'Body · home', direction: 'bidirectional' };
   await made.registry.handleRegister('body', { channels: [home] } as never);
-  let answer!: () => void;
-  const answered = new Promise<void>((resolve) => { answer = resolve; });
-  let sent!: () => void;
-  const held = new Promise<void>((resolve) => { sent = resolve; });
   let opens = 0;
-  made.setOnOpen(async () => {
-    opens++;
-    if (opens === holdOpen) { sent(); await answered; }
-  });
-  const agent = { kind: 'agent' as const, agentName: 'linn' };
-  return { ...made, home, agent, answer, held, opens: () => opens };
+  made.setOnOpen(async () => { opens++; });
+  return { ...made, home, opens: () => opens };
 }
 
-test("an open answered after the agent closed the channel during it leaves the channel closed", async () => {
-  const { registry, closeCalls, agent, answer, held, setOpenResult } = await closedWhileOpening(1);
-  // The answer declares the channel inbound-only, which lands either way: it
-  // shows the late answer reached the host.
-  setOpenResult({ channel: { id: 'body:home', type: 'chat', label: 'Body · home', direction: 'inbound' } });
-  const opening = registry.handleChannelToolCall('channel_open', { channelId: 'body:home' }, agent);
-  await held;
-  // Registering the channel already sent one close, its reconcile's.
-  const closesBefore = closeCalls.length;
-  const closed = await registry.handleChannelToolCall('channel_close', { channelId: 'body:home' }, agent);
-  assert.equal((closed as { success?: boolean }).success, true);
-  assert.equal(closeCalls.length, closesBefore + 1, "the agent's close was sent");
-  answer();
-  await opening;
-  assert.equal(registry.getDesiredState('body', 'body:home'), 'closed');
-  assert.equal(registry.inboundOnlyServer('body:home'), 'body', "the late answer's declaration was applied");
-  assert.equal(registry.isChannelOpen('body:home'), false, 'the open answered after the close must not record the channel open');
-});
-
 test("a reconcile's open answered while the channel is tuned out is recorded: a tune-out keeps the transport open", async () => {
-  const { registry, home, opens } = await closedWhileOpening(0);
+  const { registry, home, opens } = await withHome();
   assert.equal(registry.isChannelOpen('body:home'), false);
   (registry as unknown as { setDesiredState(s: string, c: string, state: string, source: string): void })
     .setDesiredState('body', 'body:home', 'tuned-out', 'agent-tool');
   await registry.handleChanged('body', { added: [home] } as never);
   assert.equal(opens(), 1, "the announcement's reconcile opened it");
   assert.equal(registry.isChannelOpen('body:home'), true);
-});
-
-test("an open answered after the agent closed the channel leaves it closed, though an announcement replaced its entry during the open", async () => {
-  const { registry, home, agent, answer, held, opens } = await closedWhileOpening(1);
-  const opening = registry.handleChannelToolCall('channel_open', { channelId: 'body:home' }, agent);
-  await held;
-  // The server announces the channel again: its entry is replaced, and the
-  // announcement's reconcile opens it, answered at once.
-  await registry.handleChanged('body', { added: [home] } as never);
-  assert.equal(opens(), 2);
-  assert.equal(registry.isChannelOpen('body:home'), true, "the reconcile's answered open is recorded");
-  await registry.handleChannelToolCall('channel_close', { channelId: 'body:home' }, agent);
-  assert.equal(registry.isChannelOpen('body:home'), false);
-  answer();
-  await opening;
-  assert.equal(registry.isChannelOpen('body:home'), false, "the first open's late answer must not reopen the replacement");
-});
-
-test("a reconcile's open answered after the agent closed the channel leaves it closed", async () => {
-  const { registry, home, agent, answer, held, opens } = await closedWhileOpening(2);
-  assert.equal((await registry.handleChannelToolCall('channel_open', { channelId: 'body:home' }, agent) as { success?: boolean }).success, true);
-  assert.equal(registry.isChannelOpen('body:home'), true);
-  // The server announces it again; the reconcile's open is the one held.
-  const announced = registry.handleChanged('body', { added: [home] } as never);
-  await held;
-  assert.equal(opens(), 2);
-  await registry.handleChannelToolCall('channel_close', { channelId: 'body:home' }, agent);
-  answer();
-  await announced;
-  assert.equal(registry.getDesiredState('body', 'body:home'), 'closed');
-  assert.equal(registry.isChannelOpen('body:home'), false, "the reconcile's late answer must not record the channel open");
 });

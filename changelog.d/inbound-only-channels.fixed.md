@@ -7,8 +7,8 @@
     channel is opened or published to, a drafts resend and `{{unsent}}`
     included, with a reason that names the declaration and says to use that
     server's own tools. A channel declared inbound-only while the publish
-    waits, on its open or anything else, or removed meanwhile, is refused
-    too, and nothing is published to it.
+    waits, on the channel's lifecycle work, its open or anything else, or
+    removed meanwhile, is refused too, and nothing is published to it.
   - A `>>` or `>>>` target naming the channel bounces with the same reason,
     and the closed-channel invitation offers no reply into it. In explicit
     mode the refused target also clears the turn's destination, so the turn's

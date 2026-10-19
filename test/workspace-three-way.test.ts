@@ -13,7 +13,7 @@ import { describe, test, type TestContext } from 'node:test';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS } from '../src/module-registry.js';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { appendFileSync, chmodSync, constants as fsConstants, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, closeSync, constants as fsConstants, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { open, statfs } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
@@ -1424,7 +1424,8 @@ describe('the catch-up pass at start', () => {
    * re-attach the watcher reports, since a re-attached watcher's ready runs its own pass (here always long before its
    * own bound). A watcher can re-attach just after its first ready. On macOS, by libuv's src/unix/fsevents.c, an
    * FSEvents event for the watched directory itself, when it carries no modification flags, reaches fs.watch as a
-   * rename under the directory's own name, and the watcher's raw handler re-attaches on any rename named like its root.
+   * rename under the directory's own name, and there, holding no root, the watcher re-attaches at any rename named
+   * like its root.
    */
   const assertPassesOnceReady = (env: Env, passes: number, expected: number) => {
     const reattaches = env.events.filter((e) => e.type === 'workspace:watcher-reattached').length;
@@ -1452,17 +1453,19 @@ describe('the catch-up pass at start', () => {
   test('a re-attached watcher runs its pass at its own ready, so a change after that pass reaches the store', { skip: process.platform !== 'linux' }, async (t) => {
     const env = new Env(t);
     env.writeDisk('gate.json', 'v1');
-    // The root poll is past the test's deadline, so only the root's rename event re-attaches the watcher.
+    // The root poll is past the test's deadline, so only the re-attach below happens.
     const m = await env.open({ watch: 'always', watchDebounceMs: 50, watchRootPollMs: 60_000 });
     const mount = (m as any).mounts.get('work');
     await until(() => !!mount.watcherReadyAt && storedText(env, 'gate.json') === 'v1', 'the first pass took gate.json in');
-    // The root is moved away, its file changed, and moved back, so the watcher re-attaches to the same directory,
-    // which the module still agrees with. chokidar's directory reads each wait a second meanwhile, so the
-    // re-attached watcher's scan reaches gate.json long after a pass started at the re-attach would have run.
+    // The watcher re-attaches to the same directory, which the module still agrees with, as it does at a rename
+    // named like a root it can't hold open. gate.json changes once the old chokidar instance has begun to close, which
+    // takes its listeners first, so no watcher reports the change. chokidar's directory reads each wait a second
+    // meanwhile, so the re-attached watcher's scan reaches gate.json long after a pass started at the re-attach would
+    // have run.
     await withChokidarReaddir(() => new Promise((r) => setTimeout(r, 1000)), async (reads) => {
-      renameSync(env.dir, `${env.dir}.away`);
-      writeFileSync(join(`${env.dir}.away`, 'gate.json'), 'v2');
-      renameSync(`${env.dir}.away`, env.dir);
+      const reattaching: Promise<void> = (m as any).watchers.get('work').reattach();
+      env.writeDisk('gate.json', 'v2');
+      await reattaching;
       await until(() => reattached(env), 'the watcher re-attached');
       await until(() => storedText(env, 'gate.json') === 'v2', 'gate.json\'s v2 was taken in', 15_000);
       env.writeDisk('gate.json', 'v3');
@@ -1529,8 +1532,9 @@ describe('the catch-up pass at start', () => {
     const m = await env.open({ watch: 'always', watchDebounceMs: 50 }, {}, (m) => { counted = countPasses(m); });
     const mount = (m as any).mounts.get('work');
     await until(() => !!mount.watcherReadyAt && storedText(env, 'gate.json') === 'v1', 'the pass ran at ready');
-    // The rename macOS reports for an FSEvents event on the root itself, sent to the watcher's chokidar instance.
-    (m as any).watchers.get('work').watcher.emit('raw', 'rename', 'work', {});
+    // The watcher re-attaches, as it does on macOS, where it holds no root, at the rename an FSEvents event on the root
+    // itself arrives as.
+    await (m as any).watchers.get('work').reattach();
     await until(() => counted.passes >= 2, "the re-attached watcher's ready ran its pass");
     await elapse(200);
     assert.ok(reattached(env), 'the watcher re-attached');
@@ -3891,6 +3895,32 @@ describe('restarts and faults', () => {
     assert.equal(agreement.needsBarrier, true);
   });
 
+  test('a rebuild whose append fails partway leaves memory as it was, whole, with the identity a disk read checks', (t) => {
+    // Nothing reaches this today: after the open, a rebuild finds every
+    // mount's record and appends none. A later open with a moved mount does.
+    const env = new Env(t);
+    const agreement = new DiskAgreement(env.store);
+    agreement.open([{ name: 'work', root: '/srv/work' }, { name: 'other', root: '/srv/other' }]);
+    const identity = { dev: '1', ino: '2' };
+    agreement.recordRootIdentity('other', identity);
+    const store = env.store as unknown as { appendJson: (type: string, payload: unknown) => unknown };
+    const append = store.appendJson;
+    store.appendJson = function (this: unknown, type: string, payload: unknown) {
+      if (type === DISK_AGREEMENT_RECORD_TYPE) throw new Error('injected: the store refused the append');
+      return append.call(this, type, payload);
+    };
+    try {
+      // 'work' has moved, so the rebuild appends its record before it reaches 'other'.
+      assert.throws(() => agreement.open([{ name: 'work', root: '/srv/moved' }, { name: 'other', root: '/srv/other' }]), /injected/);
+    } finally {
+      store.appendJson = append;
+    }
+    // Through a structural type, so this builds against a DiskAgreement
+    // without the accessor too, and fails there rather than not building.
+    const read = agreement as unknown as { rootIdentityForRead(mount: string): unknown };
+    assert.deepEqual(read.rootIdentityForRead('other'), identity, 'the mount after the failed append keeps its identity');
+  });
+
   test('an append that fails inside the store leaves no decision to stale evidence: passes refuse until a reopen, which finds the evidence', async (t) => {
     const env = new Env(t);
     let m = await env.open();
@@ -4743,6 +4773,40 @@ describe('trust and identity at the point of use', () => {
     assert.equal(read.size, grown.length);
     assert.equal(read.fp.size, grown.length, 'the fingerprint gives the size of the bytes hashed');
     assert.equal(read.hash, createHash('sha256').update(grown).digest('hex'));
+  });
+
+  test("a FIFO swapped in at a checked directory's path doesn't hold up its sync", { skip: process.platform === 'win32' ? 'no FIFOs or directory syncs' : false }, async (t) => {
+    const env = new Env(t);
+    mkdirSync(env.disk('sub'), { recursive: true });
+    const rootReal = realpathSync(env.dir);
+    const dir = join(rootReal, 'sub');
+    let swapped = false;
+    const synced = withFsPromises('open', (original) => async (...args: any[]) => {
+      if (!swapped && args[0] === dir) {
+        swapped = true; // checked as a directory, then a FIFO put at its path before the sync opens it
+        rmSync(dir, { recursive: true });
+        assert.equal(spawnSync('mkfifo', [dir]).status, 0, 'mkfifo');
+      }
+      return original(...args);
+    }, () => syncDirectories(viewOf(env.dir), rootReal, ['sub']));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const failed = await Promise.race([synced, new Promise<never>((_, reject) => {
+        // Only a sync held by the FIFO comes near this: without one, it settles at once.
+        timer = setTimeout(() => reject(new Error('the sync waited on the FIFO')), 10_000);
+      })]);
+      assert.equal(swapped, true, 'the swap ran');
+      assert.match(failed.get('sub') ?? '', /changed while it was observed/);
+    } finally {
+      clearTimeout(timer);
+      // An open still waiting on the FIFO is let go before the mount is removed.
+      try {
+        closeSync(openSync(dir, fsConstants.O_WRONLY | fsConstants.O_NONBLOCK));
+      } catch {
+        // ENXIO: nothing is waiting.
+      }
+      await synced.catch(() => {});
+    }
   });
 
   /** A root identified as it is now, and a way to replace it: renamed away, with an empty `sub` in its place. */
@@ -7450,4 +7514,21 @@ describe('the mount root', () => {
     const m = await env.open();
     assert.match(await refused(m, 'sync', { path: 'work/a.txt', acceptRoot: true }), /whole mount/);
   });
+});
+
+// anima-research/agent-framework#530 (slimepriestess): an outer mount's forced
+// materialize through a file link wrote into a nested mount's file. Her probe,
+// as the issue gives it.
+for (const autoMaterialize of [false, true]) test(`a forced materialize through a file link into a nested mount leaves the inner mount's file alone (autoMaterialize ${autoMaterialize})`, async (t) => {
+  const env = new Env(t);
+  env.writeDisk('a/b/x.txt', "the inner mount's");
+  const m = await env.open({}, { mounts: [
+    { name: 'work', path: env.dir, mode: 'read-write', watch: 'never', followSymlinks: true, autoMaterialize },
+    { name: 'deep', path: env.disk('a/b'), mode: 'read-write', watch: 'never' },
+  ] });
+  await m.handleToolCall({ id: 't', name: 'write', input: { path: 'work/flink.txt', content: 'outer wrote' } });
+  if (existsSync(env.disk('flink.txt'))) rmSync(env.disk('flink.txt'));
+  symlinkSync(env.disk('a/b/x.txt'), env.disk('flink.txt'));
+  await m.handleToolCall({ id: 't', name: 'materialize', input: { path: 'work/flink.txt', force: true } });
+  assert.equal(readFileSync(env.disk('a/b/x.txt'), 'utf8'), "the inner mount's");
 });
