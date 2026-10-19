@@ -71,7 +71,7 @@ import type {
   SameRoundThinkTextPolicy,
   ModuleMessage,
 } from './types/index.js';
-import { heldHandle, heldWriteId, matchesMessageQuery } from './held-writes.js';
+import { asModuleRow, heldHandle, heldWriteId, matchesMessageQuery } from './held-writes.js';
 import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
@@ -3343,6 +3343,10 @@ export class AgentFramework {
               ? framework.agents.get(framework.primaryAgentName) : undefined;
             return primary ? primary.getContextManager().getAllMessages() : [];
           },
+          getDeferredMessages: () => framework.deferredMessages
+            .filter((m) => (m.forAgent ?? framework.primaryAgentName) === framework.primaryAgentName)
+            .sort(bySeq)
+            .map((m) => ({ participant: m.participant, content: m.content, metadata: m.metadata as Record<string, unknown> | undefined })),
           currentSequence: () => framework.store.currentSequence(),
           setSubconsciousAnchor: (sequence) =>
             framework.subconsciousStrategy?.setAnchor(sequence),
@@ -11420,6 +11424,12 @@ export class AgentFramework {
           // with everything queued behind it — the queue keeps its order —
           // for the turn-end flush, where no reply follows it in this stream.
           //
+          // A message a tune-out holds from the residents is drained and
+          // stored like any other, but not injected: every resident's
+          // viewFilter leaves it out of the next compile as well, so the
+          // window's compiled prefix and the live request still match without
+          // it (#232 gap 5).
+          //
           // A stream that declares it can't carry injected messages
           // (supportsInjectedMessages false: membrane's XML prefill path)
           // gets none, so nothing is drained here. Everything queued for
@@ -11445,6 +11455,11 @@ export class AgentFramework {
               // Every other resident reads what this boundary stores; for its
               // own agent, the boundary weighs what it injects below.
               this.noteForOtherResidents(agent, msg.metadata, id);
+              // A message a tune-out holds from the residents is stored (the
+              // subconscious reads it) and left out of every resident's
+              // compiled view; injecting it here would put in the live turn
+              // what the next compile hides (#232 gap 5).
+              if ((msg.metadata as { tuneOut?: unknown } | undefined)?.tuneOut) continue;
               const injection = {
                 participant: msg.participant,
                 content,
@@ -20872,8 +20887,9 @@ export class AgentFramework {
     // (activeStreams is kept as a belt-and-suspenders backstop.) Deferred
     // messages flush at the next turn's START (before its compile — riding
     // their own wake), at the agent's next tool boundary (where they are
-    // ALSO injected into the live stream — hear-while-acting), or in
-    // driveStream's finally when the turn ends.
+    // ALSO injected into the live stream — hear-while-acting — all but a
+    // message a tune-out holds from the residents), or in driveStream's
+    // finally when the turn ends.
     // Quiesce (issue #122): the window exists to run compression/refold
     // against a FROZEN context — module events and api message.send must not
     // append mid-surgery. Deferred here, flushed by resume(). tool_result
@@ -21528,11 +21544,12 @@ export class AgentFramework {
 
   /**
    * The writes held for `reader`'s store (heldWritesFor) as the rows a
-   * module's context reads: each under its handle, marked `held`, with the
-   * participant, content and metadata it was written with, the time it was
-   * first held as its timestamp, and a sequence after every row the store
-   * holds, in queue order. The sequence and timestamp are provisional: the
-   * stored row has the store's own.
+   * module's context reads: each under its handle, marked `held`, and
+   * `heldFromResidents` too when its metadata carries a tune-out's stamp
+   * (asModuleRow), with the participant, content and metadata it was
+   * written with, the time it was first held as its timestamp, and a
+   * sequence after every row the store holds, in queue order. The sequence
+   * and timestamp are provisional: the stored row has the store's own.
    */
   private heldRows(reader: Agent): ModuleMessage[] {
     const writes = this.heldWritesFor(reader);
@@ -21540,14 +21557,14 @@ export class AgentFramework {
     const cm = reader.getContextManager();
     const count = cm.getMessageCount();
     const last = count > 0 ? cm.getMessageWindow(count - 1, 1, { resolveBlobs: false }).messages[0]?.sequence ?? 0 : 0;
-    return writes.map((m, i) => ({
+    return writes.map((m, i) => asModuleRow({
       id: heldHandle(m.id),
       sequence: last + 1 + i,
       participant: m.participant,
       content: m.content,
       metadata: m.metadata,
       timestamp: new Date(m.heldAt),
-      held: true,
+      held: true as const,
     }));
   }
 
@@ -21632,8 +21649,10 @@ export class AgentFramework {
       return null;
     }
     const writeId = heldWriteId(id);
-    if (writeId === undefined) return agent.getContextManager().getMessage(id);
-    return this.heldRows(agent).find((row) => row.id === id) ?? this.landedRow(agent.getContextManager(), writeId);
+    const row = writeId === undefined
+      ? agent.getContextManager().getMessage(id)
+      : this.heldRows(agent).find((held) => held.id === id) ?? this.landedRow(agent.getContextManager(), writeId);
+    return row ? asModuleRow(row) : null;
   }
 
   private queryMessages(filter: MessageQuery): { messages: ModuleMessage[]; totalCount: number } {
@@ -21643,12 +21662,15 @@ export class AgentFramework {
     }
     const cm = agent.getContextManager();
     const held = this.heldRows(agent).filter((row) => matchesMessageQuery(row, filter));
-    if (held.length === 0) return cm.queryMessages(filter);
+    if (held.length === 0) {
+      const stored = cm.queryMessages(filter);
+      return { ...stored, messages: stored.messages.map(asModuleRow) };
+    }
     // The stored rows, then the held ones, reversed and cut to the limit as
     // the store's own query does it: it matches every row, then reverses,
     // then cuts.
     const { limit, reverse, ...match } = filter;
-    let messages: ModuleMessage[] = [...cm.queryMessages(match).messages, ...held];
+    let messages: ModuleMessage[] = [...cm.queryMessages(match).messages.map(asModuleRow), ...held];
     const totalCount = messages.length;
     if (reverse) messages = messages.reverse();
     if (limit !== undefined && limit < messages.length) messages = messages.slice(0, limit);
