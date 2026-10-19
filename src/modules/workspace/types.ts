@@ -69,7 +69,12 @@ export interface MountConfig {
    * include, a directory's included, and `resolveAbsolutePath` returns null
    * for one; the mount's root is inside. Whether a name is taken isn't
    * withheld: a refusal may show that something occupies a path the caller
-   * named.
+   * named. On a mount that follows links, a path is judged where it lands as
+   * well as where it's named, as disk spells it there: a covered path that
+   * reaches a file the include doesn't cover, through a link at the path or
+   * on its way, is refused as one that leaves the mount (the file operations
+   * refuse it before anything is stored), and a listing from where a link
+   * leads passes over such a file.
    *
    * A sync, materialize, grep, glob or ls that names a path the include
    * doesn't cover takes it as a directory, its scope, exactly where a listing
@@ -105,10 +110,11 @@ export interface MountConfig {
    * directory is matched by spelling, so three cases fall outside this, as
    * for any nested mount: on a disk that folds names, a mount configured
    * through a link that spells a directory otherwise than disk does isn't
-   * found nested, and its files read as this mount's; on such a disk, a path
-   * through a link that spells a nested mount's directory otherwise than
-   * disk does isn't found to lead there, and this mount reads the file it
-   * reaches as its own, though a walk passes over the directory; and a
+   * found nested, and this mount holds its files as its own; on such a disk,
+   * a path through a link that spells a nested mount's directory otherwise
+   * than disk does isn't found to lead there, and this mount reads, lists,
+   * searches and writes there as its own, creating files too, though a walk
+   * from its root passes over the directory; and a
    * nested mount whose root moves while running, as
    * `acceptRoot` takes, stays placed where it was until the next start.
    *
@@ -143,7 +149,9 @@ export interface MountConfig {
    * doesn't cover is outside the mount itself, and its refusal tells nothing
    * of where it leads. A mount root that is itself a symlink is still the
    * root. With it, a symlink on a path is followed while what it reaches
-   * stays inside the mount. Either way, a listing or a sync's walk descends
+   * stays inside the mount, which on a mount with an include means a
+   * directory or a file the include covers. Either way, a listing or a
+   * sync's walk descends
    * into no symlinked directory beneath its scope; with it, a scope named
    * through a link is listed from where the link leads.
    */

@@ -40,7 +40,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
-import { IGNORED, NONBLOCK, OTHER_MOUNT, OUTSIDE_INCLUDE, ROOT_REPLACED, ROOT_UNAVAILABLE, beginsWithDir, checkDir, checkRoot, diskSpelling, filesystemTrustsCtime, includePatternReadable, inOtherMount, insideMount, leadsInto, linkOnTheWay, linkRefusal, linkWords, locateRoot, namesHolder, namesNestedPlace, nestedAtReal, nestedHolder, type CheckedDir, type MountView, type NestedMount, parsedSpelling, passedOverAt, pathSegments, readPrefix, shownLeads, type LinkFound } from './observe.js';
+import { IGNORED, NONBLOCK, OTHER_MOUNT, OUTSIDE_INCLUDE, ROOT_REPLACED, ROOT_UNAVAILABLE, beginsWithDir, checkDir, checkRoot, coversLanding, diskSpelling, filesystemTrustsCtime, includePatternReadable, inOtherMount, insideMount, leadsInto, linkOnTheWay, linkRefusal, linkWords, locateRoot, namesHolder, namesNestedPlace, nestedAtReal, nestedHolder, type CheckedDir, type MountView, type NestedMount, parsedSpelling, passedOverAt, pathSegments, readPrefix, shownLeads, type LinkFound } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
 import {
   type MountRuntime,
@@ -2174,31 +2174,40 @@ export class WorkspaceModule implements Module {
    */
   private async parseFilePath(path: string): Promise<{ mount: MountState; relativePath: string; path: string }> {
     const parsed = this.refuseNotHeld(await this.parsePath(path), path);
-    // A path can also reach a nested mount's directory through a symlink on
-    // its way. No push of this mount writes it there and no read reads it,
-    // so it's refused here, before anything is stored, and the checks where
-    // disk is acted on refuse it again.
-    const refusal = await this.leadsIntoNested(parsed.mount, parsed.relativePath, parsed.path);
+    // A path can also reach a nested mount's directory, or a file this
+    // mount's own include leaves out, through a symlink on its way. No push
+    // of this mount writes it there and no read reads it, so it's refused
+    // here, before anything is stored, and the checks where disk is acted on
+    // refuse it again.
+    const refusal = await this.landingRefusal(parsed.mount, parsed.relativePath, parsed.path);
     if (refusal) throw refusal;
     return parsed;
   }
 
   /**
    * The refusal for a path of `mount` that reaches a nested mount's directory
-   * through a symlink on its way (nestedAtReal), or null where it doesn't. On
-   * a mount that doesn't follow the link, the refusal is the link's own
-   * (linkWords), as the readers and pushes give it. On one that does, it
-   * names the nested mount only where the place is that mount's
-   * (namesNestedPlace); anywhere else the place is no mount's, so the path
-   * leaves this one, in the disk readers' words. A mount with nothing nested
-   * has nothing to find, so it pays nothing.
+   * through a symlink on its way (nestedAtReal), or a file this mount's own
+   * include leaves out (coversLanding), or null where it doesn't. On a mount
+   * that doesn't follow the link, the refusal is the link's own (linkWords),
+   * as the readers and pushes give it. On one that does, it names the nested
+   * mount only where the place is that mount's (namesNestedPlace); anywhere
+   * else the place is no mount's, so the path leaves this one, in the disk
+   * readers' words, as it does where it lands on a file this mount's include
+   * leaves out. A mount with nothing nested, and without both an include and
+   * links followed, has nothing to find, so it pays nothing.
    */
-  private async leadsIntoNested(mount: MountState, relativePath: string, path: string): Promise<Error | null> {
+  private async landingRefusal(mount: MountState, relativePath: string, path: string): Promise<Error | null> {
     const nested = this.nestedOf(mount.config.name);
-    if (nested.length === 0) return null;
+    const judged = mount.config.followSymlinks === true && mount.config.include !== undefined;
+    if (nested.length === 0 && !judged) return null;
     const real = await realBeneath(resolve(mount.config.path, relativePath));
     const holder = nestedAtReal(real, nested);
-    if (!holder) return null;
+    if (!holder) {
+      if (!judged) return null;
+      const rootReal = await realBeneath(resolve(mount.config.path));
+      if (!isContainedPath(rootReal, real) || await stat(real).then((info) => info.isDirectory(), () => false)) return null;
+      return await coversLanding(mount.config.include, rootReal, real, relativePath) ? null : new WorkspaceReadError('escape', `Symlink escape detected: ${path}`, 'realpath');
+    }
     if (mount.config.followSymlinks !== true) {
       const found = await linkOnTheWay({ root: mount.config.path, followSymlinks: false }, relativePath);
       if (found !== null) return await linkReadError(mount, found, path, relativePath, nested);
@@ -2665,8 +2674,11 @@ export class WorkspaceModule implements Module {
       const inside = isContainedPath(realMountRoot, realFilePath);
       const holder = inside ? nestedAtReal(realFilePath, this.nestedOf(mount.config.name)) : undefined;
       // A place in a nested mount's directory that its include leaves out is
-      // no mount's, so the path leaves this one (namesNestedPlace).
-      if (!inside || (holder !== undefined && !namesNestedPlace(holder.rest, holder.include, false))) {
+      // no mount's, so the path leaves this one (namesNestedPlace), and so
+      // does one reaching a file this mount's own include leaves out
+      // (coversLanding).
+      const own = holder === undefined && inside && !(await coversLanding(mount.config.include, realMountRoot, realFilePath, relativePath));
+      if (!inside || own || (holder !== undefined && !namesNestedPlace(holder.rest, holder.include, false))) {
         throw new WorkspaceReadError('escape', `Symlink escape detected: ${mountPrefixedPath}`, 'realpath');
       }
       if (holder) throw new WorkspaceReadError('other_mount', leadsInto(mount.config.name, relativePath, holder), 'realpath');
@@ -3638,8 +3650,10 @@ export class WorkspaceModule implements Module {
         // again, and a branch that keeps changing leaves the scope unsearched.
         //
         // A copy held at a path that now leads into a nested mount's directory
-        // through a link is that mount's file too: read refuses it
-        // (parseFilePath), so grep searches none of it and says why. The pass
+        // through a link is that mount's file too, and one that now lands on a
+        // file this mount's include leaves out is no file of this mount's:
+        // read refuses either (parseFilePath), so grep searches none of it and
+        // says why. The pass
         // can't check such a path's disk, so only an unverified one can be
         // one. Asking awaits disk, so it's done before the branch is
         // compared, and a branch selected meanwhile runs the pass again.
@@ -3652,7 +3666,7 @@ export class WorkspaceModule implements Module {
           const asked = new Map<string, string>();
           for (const report of next.reports.values()) {
             if (report.state !== 'unverified') continue;
-            const refusal = await this.leadsIntoNested(mount, report.path, `${mount.config.name}/${report.path}`);
+            const refusal = await this.landingRefusal(mount, report.path, `${mount.config.name}/${report.path}`);
             if (refusal) asked.set(report.path, refusal.message);
           }
           if (next.branchId === undefined || next.branchId === store.currentBranch().id) {

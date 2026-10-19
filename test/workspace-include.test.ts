@@ -886,13 +886,85 @@ describe('mount include', () => {
     }
   });
 
-  test('a link the include covers is read through its own name, on a mount that follows links, wherever in the mount it leads', async (t) => {
+  test("on a mount that follows links, the include is judged where a path lands as well as where it's named: a covered link to a covered file reads through, and a covered path that reaches a file the include leaves out leaves the mount", async (t) => {
     const env = new Env(t);
-    env.writeDisk('secret.txt', 'the link reads me\n');
+    env.writeDisk('data.json', '{"through": 1}\n');
+    env.writeDisk('later.json', '{"later": 1}\n');
+    env.writeDisk('secret.txt', "not the mount's\n");
+    env.writeDisk('elsewhere/x.txt', "not the mount's either\n");
+    env.writeDisk('elsewhere/sub/y.txt', "not the mount's either\n");
+    mkdirSync(join(env.dir, 'box'));
+    symlinkSync('data.json', join(env.dir, 'alias.json'));
     symlinkSync('secret.txt', join(env.dir, 'notes.json'));
-    const m = await env.open({ include: ['*.json'], followSymlinks: true });
-    assert.match((await call(m, 'read', { path: 'work/notes.json' })).content, /the link reads me/);
-    assert.match(await refused(m, 'read', { path: 'work/secret.txt' }), /outside the mount's include/);
+    symlinkSync('elsewhere', join(env.dir, 'via'));
+    const m = await env.open({ include: ['*.json', 'via/**', 'box/**'], followSymlinks: true });
+    assert.match((await call(m, 'read', { path: 'work/alias.json' })).content, /"through": 1/, 'a covered link to a covered file reads through');
+    // A link at the path itself, and one on its way: the file tools refuse it before anything is stored, in
+    // the words a nested mount's place its include leaves out gets, and so does the disk read.
+    for (const path of ['work/notes.json', 'work/via/x.txt']) {
+      for (const [tool, input] of [['read', { path }], ['write', { path, content: 'x' }], ['edit', { path, oldString: 'not', newString: 'now' }], ['delete', { path }]] as const) {
+        const said = await refused(m, tool, input);
+        assert.ok(said.endsWith(`Symlink escape detected: ${path}`), `${tool} ${path}: ${said}`);
+      }
+      assert.equal(await diskRefusal(m, path), `escape: Symlink escape detected: ${path}`, path);
+    }
+    const created = await refused(m, 'write', { path: 'work/via/new.txt', content: 'x' });
+    assert.ok(created.endsWith('Symlink escape detected: work/via/new.txt'), `a file it would create where the link leads: ${created}`);
+    // A sync, named or not, stores none of it, grep matches none of it, and a listing from where a link leads
+    // (`via/sub` is covered, so it's a directory) names none of it.
+    await call(m, 'sync', {});
+    for (const path of ['work/notes.json', 'work/via/x.txt', 'work/via/sub']) await m.handleToolCall({ id: 't', name: 'sync', input: { path } });
+    assert.deepEqual(env.tree(), ['alias.json', 'data.json', 'later.json'], 'nothing a link leads to that the include leaves out is stored');
+    for (const path of ['work', 'work/via/sub', 'work/notes.json']) {
+      assert.equal((await call(m, 'grep', { path, pattern: "not the mount's" })).totalMatches, 0, `grep ${path}`);
+    }
+    const listing = JSON.stringify(await call(m, 'ls', { path: 'work/via/sub' }));
+    assert.ok(!listing.includes('y.txt'), `a listing from where a link leads names no file the include leaves out there: ${listing}`);
+
+    // Where disk puts the link after the change was taken, no materialize, forced or not, writes through it,
+    // creates a file where it leads, or removes it.
+    await call(m, 'write', { path: 'work/later.json', content: '{"over": 1}\n' });
+    await call(m, 'write', { path: 'work/box/new.txt', content: 'made\n' });
+    await call(m, 'delete', { path: 'work/alias.json' });
+    rmSync(join(env.dir, 'later.json'));
+    symlinkSync('secret.txt', join(env.dir, 'later.json'));
+    rmSync(join(env.dir, 'box'), { recursive: true });
+    symlinkSync('elsewhere', join(env.dir, 'box'));
+    rmSync(join(env.dir, 'alias.json'));
+    symlinkSync('secret.txt', join(env.dir, 'alias.json'));
+    for (const force of [false, true]) {
+      const pushed = await call(m, 'materialize', { path: 'work', force, applyDeletions: true });
+      const reasons = JSON.stringify(pushed.skipped ?? []);
+      for (const path of ['later.json', 'box/new.txt', 'alias.json']) assert.ok(reasons.includes(path), `force ${force}, ${path}: ${reasons}`);
+      assert.equal(readFileSync(join(env.dir, 'secret.txt'), 'utf8'), "not the mount's\n", `force ${force}: the file a link leads to keeps its bytes`);
+      assert.ok(lstatSync(join(env.dir, 'later.json')).isSymbolicLink() && lstatSync(join(env.dir, 'alias.json')).isSymbolicLink(), `force ${force}: both links stay`);
+      assert.equal(existsSync(join(env.dir, 'elsewhere/new.txt')), false, `force ${force}: nothing is made where a link leads`);
+    }
+  });
+
+  test("a copy history took in before the include, at a covered path whose landing the include leaves out, is neither vouched for nor searched", async (t) => {
+    const env = new Env(t);
+    env.writeDisk('secret.dat', "needle: not the mount's\n");
+    env.writeDisk('site/docs/x.txt', "needle: not the mount's either\n");
+    symlinkSync('secret.dat', join(env.dir, 'x.json'));
+    symlinkSync('site/docs', join(env.dir, 'docs'));
+    // Past the racy window, so the first sync records fingerprints old enough to vouch, as history a mount
+    // holds from before its include would.
+    await new Promise((resolve) => setTimeout(resolve, 2100));
+    let m = await env.open({ followSymlinks: true });
+    await call(m, 'sync', {});
+    // A walk goes through no link, so the file beneath one is taken in by name.
+    await call(m, 'sync', { path: 'work/docs/x.txt' });
+    assert.ok(env.tree().includes('x.json') && env.tree().includes('docs/x.txt'), `without an include, both are taken in: ${env.tree()}`);
+    await env.stop(m);
+    // The stat of each is unchanged, so a pass would vouch for its copy without opening it: a link at the
+    // path, and one on its way.
+    m = await env.open({ followSymlinks: true, include: ['*.json', 'docs/**'] });
+    await call(m, 'sync', {});
+    await m.handleToolCall({ id: 't', name: 'sync', input: { path: 'work/docs/x.txt' } });
+    for (const path of ['work', 'work/x.json', 'work/docs', 'work/docs/x.txt']) {
+      assert.equal((await call(m, 'grep', { path, pattern: 'needle' })).totalMatches, 0, `grep ${path}`);
+    }
   });
 
   test("on a mount that doesn't follow links, a link at the path itself is `symlink` however the path is spelled", async (t) => {
@@ -1408,5 +1480,41 @@ describe("the checks where disk is acted on, called directly as a push and a rea
     } finally {
       await m.stop();
     }
+  });
+
+  test("each judges the mount's own include where a covered path lands, as it judges a nested mount's place", async (t) => {
+    const { at, view, rootReal } = rig(t);
+    writeFileSync(at('secret.txt'), 'outside the outer include');
+    symlinkSync(at('secret.txt'), at('cover.json'));
+    mkdirSync(at('elsewhere'));
+    symlinkSync(at('elsewhere'), at('box'));
+    const own = { ...view, include: ['*.json', 'box/**'] } as MountView;
+    assert.deepEqual(await readPath(own, rootReal, 'cover.json', 1 << 20), { kind: 'unobserved', reason: leaves });
+    // In place through the link, and a file the write would create where a covered directory's link leads.
+    for (const path of ['cover.json', 'box/new.txt']) {
+      const err = await writeContained(own, rootReal, path, Buffer.from('outer wrote'), { kind: 'any' }).then(() => null, (e: unknown) => e);
+      assert.ok(err instanceof EffectFailed, String(err));
+      assert.equal(err.message, leaves, path);
+    }
+    const removed = await unlinkContained(own, rootReal, 'cover.json', { kind: 'any' }).then(() => null, (e: unknown) => e);
+    assert.ok(removed instanceof EffectFailed, String(removed));
+    assert.equal(removed.message, leaves);
+    assert.equal(readFileSync(at('secret.txt'), 'utf8'), 'outside the outer include');
+    assert.ok(lstatSync(at('cover.json')).isSymbolicLink(), 'the link stays');
+    assert.equal(existsSync(at('elsewhere/new.txt')), false, 'nothing is made where the link leads');
+  });
+
+  test("the module's disk read judges the mount's own include where a covered path lands, past the parse that refuses first", async (t) => {
+    const env = new Env(t);
+    env.writeDisk('secret.txt', "not the mount's\n");
+    symlinkSync('secret.txt', join(env.dir, 'cover.json'));
+    const m = await env.open({ include: ['*.json'], followSymlinks: true });
+    const internals = m as unknown as {
+      mounts: Map<string, unknown>;
+      openContainedFile(mount: unknown, relativePath: string, mountPrefixedPath: string): Promise<unknown>;
+    };
+    const err = await internals.openContainedFile(internals.mounts.get('work'), 'cover.json', 'work/cover.json').then(() => null, (e: unknown) => e);
+    assert.ok(err instanceof WorkspaceReadError, String(err));
+    assert.equal(`${err.code}: ${err.message}`, 'escape: Symlink escape detected: work/cover.json');
   });
 });

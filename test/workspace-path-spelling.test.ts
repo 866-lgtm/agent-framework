@@ -318,6 +318,31 @@ test('a name a mount\'s include doesn\'t cover is refused as given, whether disk
   assert.equal(readFileSync(join(dir, 'secret.txt'), 'utf8'), 'secret\n');
 });
 
+test("through a link a mount follows, the include judges where the path lands as disk spells it, whatever spelling the link's target gives", { skip: FOLDING_ONLY }, async (t) => {
+  const { workspace, dir, call } = await setup(t, (d) => [
+    { name: 'work', path: d, mode: 'read-write', watch: 'never', followSymlinks: true, include: ['*.json', 'via/**', 'ELSE/**'] },
+  ]);
+  // Disk spells the first file outside the include, and the link's target spells it inside it.
+  writeFileSync(join(dir, 'Y.JSON'), 'outside the include as disk spells it\n');
+  symlinkSync('y.json', join(dir, 'x.json'));
+  // And the other way round: a covered file the link's target spells otherwise reads through.
+  writeFileSync(join(dir, 'k.json'), '{"covered": 1}\n');
+  symlinkSync('K.JSON', join(dir, 'w.json'));
+  // A listing from where a link leads judges each file there as disk spells its directory, too.
+  mkdirSync(join(dir, 'else', 'sub'), { recursive: true });
+  writeFileSync(join(dir, 'else', 'sub', 'y.txt'), 'outside the include as disk spells it\n');
+  symlinkSync('ELSE', join(dir, 'via'));
+  const read = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path: 'work/x.json' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+  assert.equal(read.success, false);
+  assert.ok(String(read.error).endsWith('Symlink escape detected: work/x.json'), String(read.error));
+  await assert.rejects(workspace.readFileFromDisk('work/x.json'), (err: unknown) => err instanceof WorkspaceReadError && err.code === 'escape');
+  await call('sync', {});
+  assert.equal((((await call('grep', { path: 'work', pattern: 'outside the include' })).data) as { totalMatches: number }).totalMatches, 0);
+  assert.match(JSON.stringify((await call('read', { path: 'work/w.json' })).data), /covered/);
+  const listing = JSON.stringify((await call('ls', { path: 'work/via/sub' })).data);
+  assert.ok(!listing.includes('y.txt'), listing);
+});
+
 // Past a nested mount's directory a path is that mount's, and its own include
 // decides what a tool may name there, so the outer mount's answers show the
 // rest of the path as given. The directory itself takes disk's spelling, as a
