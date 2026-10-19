@@ -1,6 +1,6 @@
 - When an open that speech or a reply made fails, the channel's decision goes
-  back to what it was. So an agent told the channel is closed and the open
-  failed isn't later put into it by that open's decision. Before, the
+  back to what it was. So an agent told the open failed isn't later put
+  into the channel by that open's decision. Before, the
   decision to open stayed: the agent's next speech there, or reconciliation
   when the server announced the channel again, opened it without the notice
   that says it's open and how to close it. A decision made while the open
@@ -25,8 +25,8 @@
   Where the channel is selected for opening after the failure, the notice
   says so and why, as speech's failure does, and that `channel_close`
   withdraws that, where the agent can call it: where the host couldn't
-  record putting the channel's decision back, in `channel_open`'s own
-  failure's words, a later delivery or reconnect tries again; where the
+  record putting the channel's decision back, a later delivery or
+  reconnect tries again; where the
   server's latest announcement or the policy selected it again, the host
   tries again itself. Where the channel is selected for opening and the
   replying agent has ended, the primary is told by name instead, if one is
