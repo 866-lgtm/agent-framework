@@ -1,7 +1,8 @@
 - A channel the host knows only from a push event no longer counts as
   confirmed closed before anything has shown its state: after a restart, the
   server may still hold a channel an earlier process opened. Its traffic shows
-  it open, as before.
+  it open as before: where this host directs the lifecycle, once it's decided
+  open or tuned out.
   - Where this host directs the channel's lifecycle, `channel_decline` in such
     a channel that isn't open sends its close through the lifecycle queue.
     Until now it sent nothing. Its answer is still `remained closed`.

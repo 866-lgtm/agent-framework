@@ -2651,8 +2651,8 @@ test("the agent's channel_open over a channel speech opened is the agent's decis
 // A channel only a push has registered (ensureChannelRegistered) starts with
 // its transport unknown, as a registration's does: after a restart the server
 // may still hold a channel an earlier process opened. Its traffic shows it
-// open, since it has no target a retarget could have left behind. In each
-// test below the server holds it open.
+// open when it's decided open or tuned out, since it has no target a retarget
+// could have left behind. In each test below the server holds it open.
 
 test('a close of a channel only a push has registered, decided closed before a restart, is sent to the server, not answered as already closed', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'push-registered-close-'));
@@ -2733,22 +2733,27 @@ test('traffic in a tuned-out channel only a push has registered shows it open, w
   }
 });
 
-test("a registration whose descriptor carries the push's placeholder metadata still waits for a receipt before its traffic shows it open", async () => {
-  const f = fixture();
-  f.actual.set('x', true);
-  f.held.add('x');
-  f.registry.enterTuneOut('test', 'x', {
-    epochId: 'e1', cadenceSeconds: 60, backlogCap: 20, maxWakes: 3, startedAtSequence: 1,
-  }, 'agent-tool');
-  const registering = f.registry.handleChanged('test', {
-    added: [{ ...descriptor('x', true), metadata: { lazyRegistered: true } }],
-  });
-  await tick();
-  await f.registry.handleIncoming('test', { messages: [message()] });
-  assert.equal(f.isOpen(), false, 'its traffic is no receipt');
-  f.held.delete('x');
-  await f.drain(registering);
-  assert.equal(f.isOpen(), true, "the reconcile's receipt confirms it");
+test("a registration, over a push's entry or carrying the push's placeholder metadata, still waits for a receipt before its traffic shows it open", async () => {
+  for (const registration of ['over a push', 'with the placeholder key'] as const) {
+    const f = fixture();
+    f.actual.set('x', true);
+    f.held.add('x');
+    if (registration === 'over a push') f.registry.ensureChannelRegistered('test', 'x', 'x');
+    f.registry.enterTuneOut('test', 'x', {
+      epochId: 'e1', cadenceSeconds: 60, backlogCap: 20, maxWakes: 3, startedAtSequence: 1,
+    }, 'agent-tool');
+    // channels/register over the push's entry; channels/changed's added for
+    // the descriptor with the key.
+    const registering = registration === 'over a push'
+      ? f.registry.handleRegister('test', { channels: [descriptor('x', true)] })
+      : f.registry.handleChanged('test', { added: [{ ...descriptor('x', true), metadata: { lazyRegistered: true } }] });
+    await tick();
+    await f.registry.handleIncoming('test', { messages: [message()] });
+    assert.equal(f.isOpen(), false, `${registration}: its traffic is no receipt`);
+    f.held.delete('x');
+    await f.drain(registering);
+    assert.equal(f.isOpen(), true, `${registration}: the reconcile's receipt confirms it`);
+  }
 });
 
 test('an update that keeps the target of a channel only a push has registered leaves its traffic showing it open; one that gives it a target waits for a receipt', async () => {

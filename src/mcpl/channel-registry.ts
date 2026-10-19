@@ -648,10 +648,12 @@ function unreachableRemedy(reach: Exclude<ServerReach, 'up'>): string {
   }
 }
 
-/** Whether an entry's descriptor is still the placeholder a push minted
- *  (ensureChannelRegistered's lazyRegistered metadata), which no server
- *  declaration has replaced: a registration or a channels/changed update
- *  brings the server's own descriptor. */
+/** Whether an entry's descriptor carries the key a push's placeholder has
+ *  (ensureChannelRegistered's lazyRegistered metadata), as main reads it for
+ *  whether the server has declared the channel: a registration or a
+ *  channels/changed update brings the server's own descriptor, which
+ *  doesn't normally carry it. The traffic rule doesn't read it, since a
+ *  server's descriptor can (untargetedPushEntries). */
 function pushPlaceholder(entry: ChannelEntry): boolean {
   return (entry.descriptor.metadata as { lazyRegistered?: boolean } | undefined)?.lazyRegistered === true;
 }
