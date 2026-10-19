@@ -1431,13 +1431,16 @@ export class WorkspaceModule implements Module {
       ? `Mount "${mounts[0]![0]}" holds ${counted(mounts[0]![1])}`
       : `Mounts ${each.slice(0, -1).join(', ')} and ${each[each.length - 1]} hold`;
     const held = mounts.flatMap(([name, paths]) => paths.map((h) => `"${name}/${h.path}" (${h.what})`));
+    // Materialize doesn't settle an intent the workspace can't read, so the
+    // ways out say so wherever one is held, past the ten paths named too.
+    const intents = mounts.some(([, paths]) => paths.some((h) => h.what === UNREADABLE_INTENT))
+      ? "Only a sync settles an intent it can't read. "
+      : '';
     const message = (one
-      ? "A mount configured direct runs as 'chronicle' this session, keeping what the workspace holds there in view. " +
-        'To start it direct, settle each held change: '
-      : "Mounts configured direct run as 'chronicle' this session, keeping what the workspace holds there in view. " +
-        'To start a mount direct, settle each change held at it: ') +
+      ? "A mount configured direct runs as 'chronicle' this session. To start it direct, settle each held change, then start it again: "
+      : "Mounts configured direct run as 'chronicle' this session. To start a mount direct, settle each change held at it, then start it again: ") +
       "sync its path to take disk's copy, or configure the mount 'chronicle' and read-write, materialize it, " +
-      `and follow materialize's answer. Its next start then runs it direct. ${which}: ${held.slice(0, 10).join(', ')}` +
+      `follow the answer, and restore its direct config. ${intents}${which}: ${held.slice(0, 10).join(', ')}` +
       `${held.length > 10 ? `, and ${held.length - 10} more` : ''}.`;
     console.warn(`[workspace] ${message}`);
     this.ctx?.notifyOps?.('workspace-mount-not-direct', 'framework', message, { held: Object.fromEntries(mounts.map(([name, paths]) => [name, paths.length])) });
@@ -2260,7 +2263,7 @@ export class WorkspaceModule implements Module {
     // After a trailing slash a store-backed mount's read finds no file. A
     // direct mount's would read the file and answer with the slash.
     if (spelled.mount.direct && spelled.relativePath.endsWith('/')) {
-      throw new Error(`Path not taken: ${JSON.stringify(path)} ends with "/", which a direct mount's file operations don't read: name the file without it`);
+      throw new Error(`Path not taken: ${JSON.stringify(path)} ends with "/", which a direct mount's file operations don't take: give the file's path without it`);
     }
     const parsed = this.refuseNested(spelled);
     // A path can also reach a nested mount's directory through a symlink on
@@ -2319,11 +2322,11 @@ export class WorkspaceModule implements Module {
    */
   private async parsePath(path: string): Promise<{ mount: MountState; relativePath: string; path: string }> {
     const given = this.parsePathAsGiven(path);
-    // A store-backed mount's store refuses a `.` or `..` segment as an
-    // invalid tree path. A direct mount reads disk, which would take it and
-    // answer with the path so spelled, giving one file several names.
+    // A direct mount refuses what a store-backed mount's store refuses as an
+    // invalid tree path, a `.` or `..` segment, which disk would otherwise
+    // take, so neither kind takes a path the other refuses.
     if (given.mount.direct && given.relativePath.split('/').some((segment) => segment === '.' || segment === '..')) {
-      throw new Error(`Path not taken: ${JSON.stringify(path)} has a "." or ".." segment, which a direct mount doesn't read: name the file from the mount's root without it`);
+      throw new Error(`Path not taken: ${JSON.stringify(path)} has a "." or ".." segment, which a direct mount doesn't take: give the path from the mount's root without it`);
     }
     const relativePath = await diskSpelling(resolve(given.mount.config.path), given.relativePath, given.mount.direct ? undefined : this.entriesOf(given.mount));
     return {
@@ -4640,9 +4643,10 @@ const DIRECT_ROOT_REPLACED = 'the mount root was replaced as the file was opened
 /**
  * How the alert that a mount configured direct runs as 'chronicle' names an
  * intent the workspace can't read: materialize doesn't select one with no
- * workspace entry, and a sync of its path replaces it.
+ * workspace entry, or settle one with an entry, and a sync of its path
+ * replaces it where it can read disk's copy.
  */
-const UNREADABLE_INTENT = "its workspace intent can't be read; a sync of the path settles it";
+const UNREADABLE_INTENT = "its workspace intent can't be read, and only a sync of the path settles it";
 
 /**
  * A mount's watch mode as it runs. A mount configured direct watches
