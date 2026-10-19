@@ -316,6 +316,7 @@ describe("a message a tune-out holds stays out of what the residents are shown, 
         sub.getAllMessages().map(textOf).find((t) => t.includes('[Tune-out cancelled:'));
       await waitFor("the subconscious's report notice", () => noticeOf() !== undefined);
       assert.ok(!noticeOf()!.includes('Still held'), 'the notice carries no held message, as the dump shows them all');
+      assert.ok(noticeOf()!.includes('1 of 4 diverted messages were above the cap and not delivered raw to the resident'), 'it gives the count above the cap');
 
       // The boundary then stores the held messages without injecting them, so
       // the dump is the one row that shows them to the resident.
@@ -394,7 +395,7 @@ describe("a message a tune-out holds stays out of what the residents are shown, 
     }
   });
 
-  it("with backlogCap 0, hands the subconscious's cancel report every held message, oldest first, and the dump none", async () => {
+  it("with backlogCap 0, a cancel the subconscious makes itself hands its report every held message, oldest first, and the dump none", async () => {
     const { framework, ctx, module, membrane, internals, emit, close } = await open(0);
     let release: () => void = () => {};
     try {
@@ -414,7 +415,9 @@ describe("a message a tune-out holds stays out of what the residents are shown, 
       emit('t5b', 'T5-HELD-2 more chatter while the turn is alive');
       await waitFor('the second held write', () => rowWith(ctx.queryMessages({}).messages, 'T5-HELD-2')?.held === true);
 
-      assert.ok(internals.tuneOutCoordinator!.cancel('disc', CHANNEL, 'agent-tool', 'test').ok);
+      // The subconscious cancels, with a note it wrote before it could see
+      // the held messages; the notice and a report turn bring it them.
+      assert.ok(internals.tuneOutCoordinator!.cancel('disc', CHANNEL, 'subconscious', 'subconscious judgment', 'Someone needs you here.').ok);
       await waitFor('the dump', () => !!rowWith(ctx.queryMessages({}).messages, '<tuned-out-backlog'));
       const dumpText = textOf(rowWith(ctx.queryMessages({}).messages, '<tuned-out-backlog')!);
       assert.ok(dumpText.includes('messages=2 truncated=2'), 'the dump counts both and shows none');

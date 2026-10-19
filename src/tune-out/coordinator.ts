@@ -327,8 +327,13 @@ export class TuneOutCoordinator {
     const truncated = backlog.length - shown.length;
     // The held messages the cap leaves out of the dump, the oldest of them.
     // The subconscious's report covers what the dump leaves out, but its view
-    // holds stored rows only, so these go to it with its notice below.
+    // holds stored rows only, so these go to it with its notice below. So does
+    // a held message the dump shows whose image or audio its text lines drop.
     const heldLeftOut = held.slice(0, Math.max(0, held.length - shown.length));
+    const heldForReport = [
+      ...heldLeftOut,
+      ...held.slice(heldLeftOut.length).filter((m) => m.content.some((b) => b.type !== 'text')),
+    ];
 
     const authorOf = (m: Pick<StoredMessage, 'participant' | 'metadata'>): string =>
       (m.metadata as { author?: { name?: string } } | undefined)?.author?.name ?? m.participant;
@@ -366,24 +371,23 @@ export class TuneOutCoordinator {
     if (primary) {
       this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out');
     }
-    // The subconscious gets one cancel turn of its own (unless it initiated
-    // the cancel — its note already carries its words): the issue's cancel
+    // The subconscious gets one cancel turn of its own: the issue's cancel
     // shape is dump + a report from the subconscious, and when the cap
     // truncated the raw dump, its summary is what covers the tail. The held
-    // messages in that tail come with the notice, each with its own content,
-    // as its view can't have them until they're stored. A cancel the
-    // subconscious makes itself gets the notice and the turn too when it
-    // leaves held messages out, for those alone: it wrote its note before it
-    // could see them.
+    // messages the dump can't give the resident whole come with the notice,
+    // each with its own content, as its view can't have them until they're
+    // stored. A cancel the subconscious makes itself gets the notice and the
+    // turn only when some do: its note, if it wrote one, speaks for what it
+    // saw, and it wrote that before it could see them.
     const selfCancel = source === 'subconscious';
-    if (subName && (!selfCancel || heldLeftOut.length > 0)) {
-      const truncNote = truncated > 0 && !selfCancel
+    if (subName && (!selfCancel || heldForReport.length > 0)) {
+      const truncNote = truncated > 0
         ? ` ${truncated} of ${backlog.length} diverted messages were above the cap and not delivered raw to the resident.`
         : '';
-      const heldBlocks: ContentBlock[] = heldLeftOut.length > 0
+      const heldBlocks: ContentBlock[] = heldForReport.length > 0
         ? [
             { type: 'text', text: 'Still held at the cancel, so your view may not have them yet:' },
-            ...heldLeftOut.flatMap((m): ContentBlock[] => [{ type: 'text', text: `${authorOf(m)}:` }, ...m.content]),
+            ...heldForReport.flatMap((m): ContentBlock[] => [{ type: 'text', text: `${authorOf(m)}:` }, ...m.content]),
           ]
         : [];
       this.hooks.addMessage(
