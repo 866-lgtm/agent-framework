@@ -111,6 +111,9 @@ function firstLaunch(): { transport: () => StdioTransport | undefined; sameCallb
     return transport;
   };
   cleanups.push(() => { (StdioTransport as unknown as { spawn: typeof StdioTransport.spawn }).spawn = realSpawn; });
+  // The launch is ended once its test is over too, so a test that fails
+  // before its handshake ends doesn't leave the child running.
+  cleanups.push(() => first?.close().catch(() => {}));
   return { transport: () => first, sameCallback };
 }
 
