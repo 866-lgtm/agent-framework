@@ -195,10 +195,10 @@ static const JSMallocFunctions limited_malloc_funcs = {
 };
 
 /* Once the host has stopped the guest, every later check stops it too, without asking again, so
-   a stop holds for good even if the host would say otherwise later. A failure's read runs the
-   script's code after a stop (getters of what it threw), and a check ends that code. QuickJS
-   checks at its first poll and once in 10,000 after, so code runs on until the next check, not
-   less. */
+   a stop holds for good even if the host would say otherwise later. Nothing the engine does runs
+   the script's code after a stop today: every entry point checks the flag first, and error_json
+   ends its read at one. This keeps the stop if that ever changes. QuickJS checks at its first
+   poll and once in 10,000 after, so a check ends the code running then, not at once. */
 static int interrupt_handler(JSRuntime *r, void *opaque) {
     (void)r;
     (void)opaque;
@@ -534,10 +534,10 @@ int engine_settle(uint32_t id, int ok, char *json, uint32_t json_len, char *unfi
 }
 
 /* The text of a value or an error, for engine_result. Takes v. Returns a JS string, undefined,
-   or an exception. Reading an object's parts can run the script's own code (a getter, a toString),
-   and after a stop they're still read: code that spins is ended at the next check, which leaves
-   that part out. But once a stop has come, no stand-in is made for a missing message, since its
-   JSON or string form would run more of the script's code and wouldn't be the message. */
+   or an exception. Reading an object's parts can run the script's own code (a getter, a toJSON, a
+   toString), and a stop ends the read: what was read before it stays, and nothing more is read,
+   neither a part nor a stand-in for a missing message. The message is read first, as the part
+   most worth keeping. */
 static JSValue error_json(JSValue v) {
     /* No prototype, so a toJSON the script put on Object.prototype doesn't serialize it. */
     JSValue o = JS_NewObjectProto(ctx, JS_NULL);
@@ -547,9 +547,12 @@ static JSValue error_json(JSValue v) {
     }
     JSValue name = JS_UNDEFINED, message = JS_UNDEFINED, stack = JS_UNDEFINED;
     if (JS_IsObject(v)) {
-        name = JS_GetPropertyStr(ctx, v, "name");
-        message = JS_GetPropertyStr(ctx, v, "message");
-        stack = JS_GetPropertyStr(ctx, v, "stack");
+        if (!interrupted)
+            message = JS_GetPropertyStr(ctx, v, "message");
+        if (!interrupted)
+            name = JS_GetPropertyStr(ctx, v, "name");
+        if (!interrupted)
+            stack = JS_GetPropertyStr(ctx, v, "stack");
         /* An object with no message of its own, such as a plain object thrown, or one whose
            message can't be read, is told by its JSON, or by its string form when it has none,
            rather than left blank. */
@@ -570,7 +573,8 @@ static JSValue error_json(JSValue v) {
         /* A primitive's string form runs no script code (a Symbol has none, and is left out). */
         message = JS_ToString(ctx, v);
     }
-    /* A getter that throws, or a value with no string form, leaves that part out. */
+    /* A getter that throws, a name or message with no string form, or a stack that isn't a string
+       leaves that part out. */
     JSValue parts[3] = {name, message, stack};
     const char *keys[3] = {"name", "message", "stack"};
     for (int i = 0; i < 3; i++) {
@@ -580,6 +584,10 @@ static JSValue error_json(JSValue v) {
             continue;
         }
         if (i < 2 && !JS_IsUndefined(p) && !JS_IsString(p)) {
+            if (interrupted) {
+                JS_FreeValue(ctx, p);
+                continue;
+            }
             JSValue s = JS_ToString(ctx, p);
             JS_FreeValue(ctx, p);
             if (JS_IsException(s)) {

@@ -62,8 +62,8 @@ export type RunState =
   /**
    * The prelude or the script threw, or its value couldn't be stringified (a BigInt, a cycle).
    * The fields are what was thrown: an Error's name, message and stack. A thrown value with no
-   * message of its own has name `''`, and as its message an object's JSON, or else
-   * `String(value)`.
+   * message of its own has name `''`, and as its message an object's JSON, or else its string
+   * form; a Symbol, which has none here, leaves the message `''`.
    */
   | { kind: 'rejected'; name: string; message: string; stack?: string }
   /**
@@ -72,7 +72,7 @@ export type RunState =
    * failed in the engine itself; or the engine couldn't settle a call. The fields are the
    * exception's, read as the engine reads a `rejected` one (an Error's name, message and stack; a
    * value with no message of its own, its JSON or string form), less any part a stop cut off while
-   * it was read; after a stop, no stand-in is made for a missing message. Every later call answers
+   * it was read: a stop ends the read, and nothing after it is read. Every later call answers
    * the same, a stop after it included, and no later result reaches the script.
    */
   | { kind: 'failed'; name: string; message: string; stack?: string }
@@ -95,8 +95,8 @@ export type SettleState = RunState & { unfit?: true; dropped?: true };
 export interface Engine {
   /**
    * Evaluates the prelude as a global script, then the script as global code with top-level
-   * await, then runs pending jobs until none is left or the guest is interrupted. The script's
-   * value is that of its last expression statement. Called once.
+   * await, then runs pending jobs until none is left, the guest is interrupted or the run fails.
+   * The script's value is that of its last expression statement. Called once.
    */
   start(prelude: string, script: string, filename: string): RunState;
   /**

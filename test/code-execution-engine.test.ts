@@ -555,16 +555,23 @@ test('a stop while the exception that ended the run is read leaves the run faile
   b.e.dispose();
 });
 
-test('a stop asked for once stays a stop, and what it cuts off a failure\'s read is left out, not made up', async () => {
-  // The interrupt slot says stop once only. The thrown object's name getter spins until then; its
-  // message getter would spin on for a while, and then give "late". Neither runs on after the stop,
-  // and the message isn't replaced by the object's JSON or string form.
+test('a stop ends a failure\'s read: nothing after it is read, a part or a part\'s string form', async () => {
+  // The interrupt slot says stop once only. The thrown object's message, read first, spins until
+  // then; its name getter would give "made up" at once, and isn't run. In the second, the message
+  // is read, the name is an object whose toString would give "made up", and the stack getter
+  // spins until the stop, after which the name's string form isn't made.
   let checks = 0;
-  const { e } = await engine({ interrupt: () => ++checks === 101 });
-  const s = e.start(PRELUDE, 'queueMicrotask(() => { throw { get name() { for (;;) {} }, get message() { for (let i = 0; i < 3e7; i++) {} return "late" } } }); 1', 's.js');
+  const a = await engine({ interrupt: () => ++checks === 101 });
+  const s = a.e.start(PRELUDE, 'queueMicrotask(() => { throw { get message() { for (;;) {} }, get name() { return "made up" } } }); 1', 's.js');
   assert.deepEqual(s, { kind: 'failed', name: '', message: '' });
   assert.equal(checks, 101);
-  e.dispose();
+  a.e.dispose();
+  checks = 0;
+  const b = await engine({ interrupt: () => ++checks > 100 });
+  const t = b.e.start(PRELUDE, 'queueMicrotask(() => { throw { message: "m", name: { toString() { return "made up" } }, get stack() { for (;;) {} } } }); 1', 's.js');
+  assert.deepEqual(t, { kind: 'failed', name: '', message: 'm' });
+  assert.ok(checks > 100, 'the stop came while the stack was read');
+  b.e.dispose();
 });
 
 test('once a stop has come, a failure with no message gets no stand-in for one', async () => {
@@ -579,6 +586,7 @@ test('once a stop has come, a failure with no message gets no stand-in for one',
     const { e } = await engine({ interrupt: () => ++checks > 100 });
     const s = e.start(PRELUDE, `queueMicrotask(() => { throw ${thrown} }); 1`, 's.js');
     assert.deepEqual(s, { kind: 'failed', name: '', message: '' }, thrown);
+    assert.ok(checks > 100, `${thrown}: the stop came while it was read`);
     e.dispose();
   }
 });
@@ -601,7 +609,10 @@ test('a settle whose resolve call is stopped on its way in is dropped, and the s
   // 2 puts the next asking at a place set by k: the largest k whose start asks no more than with
   // none puts it on the first check the settle makes, the one on the way into the promise's
   // resolve function.
-  const script = (k: number) => `const f = () => {}; tool("a"); ${'f();'.repeat(k)} const v = await tool("b"); print("ran"); v`;
+  // If the asking falls on the settle with no calls at all, one more check before them moves it
+  // 10,000 checks on, so that there's a k - 1 to try.
+  let before = '';
+  const script = (k: number) => `const f = () => {}; tool("a"); ${before}${'f();'.repeat(k)} const v = await tool("b"); print("ran"); v`;
   async function askedInStart(k: number) {
     let asked = 0;
     const { e } = await engine({ interrupt: () => { asked++; return false; } });
@@ -609,14 +620,23 @@ test('a settle whose resolve call is stopped on its way in is dropped, and the s
     e.dispose();
     return asked;
   }
-  const none = await askedInStart(0);
-  let lo = 0, hi = 20_000;
-  assert.ok((await askedInStart(hi)) > none);
-  while (hi - lo > 1) {
-    const mid = (lo + hi) >> 1;
-    if ((await askedInStart(mid)) > none) hi = mid;
-    else lo = mid;
+  async function largestQuiet() {
+    const none = await askedInStart(0);
+    let lo = 0, hi = 20_000;
+    assert.ok((await askedInStart(hi)) > none);
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if ((await askedInStart(mid)) > none) hi = mid;
+      else lo = mid;
+    }
+    return lo;
   }
+  let lo = await largestQuiet();
+  if (lo === 0) {
+    before = 'f();';
+    lo = await largestQuiet();
+  }
+  assert.ok(lo > 0, `k = ${lo}`);
   async function settledStopped(k: number) {
     let stop = false;
     const { e, rec } = await engine({ interrupt: () => stop });
@@ -628,10 +648,8 @@ test('a settle whose resolve call is stopped on its way in is dropped, and the s
   }
   assert.deepEqual(await settledStopped(lo), { s: { kind: 'interrupted', dropped: true }, ran: false });
   // One call fewer, the asking falls just after the resolve function ran: the result is handed over.
-  if (lo > 0) {
-    const after = await settledStopped(lo - 1);
-    assert.equal(after.s.dropped, undefined, JSON.stringify(after));
-  }
+  const after = await settledStopped(lo - 1);
+  assert.equal(after.s.dropped, undefined, JSON.stringify(after));
 });
 
 test('a result that reaches a stopped run is dropped', async () => {
