@@ -471,7 +471,8 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
 // ============================================================================
 
 /** Bound connector values for notices, logs and an outcome's reason. A
- *  PublishOutcome keeps the connector's structured data (`detail`) whole. */
+ *  PublishOutcome keeps the connector's structured data (`detail`) as the
+ *  connection gives it, its strings redacted (redactedData). */
 export function connectorText(value: unknown): string {
   let text: string;
   try {
@@ -515,7 +516,8 @@ export interface PublishOutcome {
   /** Why it failed, or why its outcome is unknown — for a connector error,
    *  its message, bounded (which may say what was already posted). */
   reason?: string;
-  /** The connector error's structured `data`, verbatim, when it sent one. */
+  /** The connector error's structured `data`, with the strings in it
+   *  redacted (redactedData), when it sent one. */
   detail?: unknown;
   /** When the outcome was established (epoch ms). */
   at: number;
