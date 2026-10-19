@@ -442,13 +442,16 @@ export type TraceEvent =
     })
 
   // Host-owned speech routing (ChannelRegistry.routeSpeech). One trace per
-  // delivered prose segment. `text` is the segment verbatim — the same content
+  // delivered prose segment, and one per publish the subconscious's
+  // speak_in_channel delivers (ChannelRegistry.publishForAgent): that one's
+  // conversationId is the speaking agent's name, and it carries no
+  // messageId. `text` is the segment verbatim — the same content
   // already on the bus chunk-by-chunk via inference:tokens, and mcpl:* traces
   // are 'ops'-scoped on the webui wire — and `messageId` is the surface's id
-  // for the posted message (when the MCPL server reports one). Together they
-  // give external taps the (channelId, messageId, text) tuple needed to edit
-  // a just-posted message, e.g. a TTS interruption truncating a reply to the
-  // words actually voiced.
+  // for the posted message (on routeSpeech's traces, when the MCPL server
+  // reports one). Together they give external taps the (channelId,
+  // messageId, text) tuple needed to edit a just-posted message, e.g. a TTS
+  // interruption truncating a reply to the words actually voiced.
   | (TraceEventBase & {
       type: 'mcpl:speech-routed';
       /** Agent / conversation whose speech was routed. */
@@ -459,7 +462,8 @@ export type TraceEvent =
       textLen: number;
       /** The routed prose segment, verbatim. */
       text: string;
-      /** Surface message id (e.g. Discord message id), when reported. */
+      /** Surface message id (e.g. Discord message id), when reported, on
+       *  routeSpeech's traces. speak_in_channel's carry none. */
       messageId?: string;
     })
   | (TraceEventBase & {
@@ -473,6 +477,9 @@ export type TraceEvent =
       /** `failed`: nothing was posted; `unknown`: the request was dispatched
        *  and no valid receipt came back, so it may have been. */
       outcome?: 'failed' | 'unknown';
+      /** The connector error's structured data, bounded (connectorText),
+       *  when it sent some: it may say what a multi-part send posted. */
+      detail?: string;
     })
 
   // Admin puppet: an operator executed a tool AS an agent and stored the
