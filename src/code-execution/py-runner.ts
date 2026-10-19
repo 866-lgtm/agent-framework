@@ -644,6 +644,9 @@ interface PendingExec {
   stopped?: true;
 }
 
+/** Interpreters started in this process, by every runner: each one's number. */
+let interpretersStarted = 0;
+
 /**
  * The interpreter to spawn. A bare name is looked up on PATH. A path with a
  * separator is resolved against the host's working directory, where it
@@ -681,6 +684,8 @@ export class PyRunner {
   private pending: PendingExec | null = null;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private execCounter = 0;
+  /** The number of this runner's latest interpreter (interpretersStarted). */
+  private interpreterNumber = 0;
   private disposed = false;
 
   constructor(options: PyRunnerOptions) {
@@ -701,6 +706,16 @@ export class PyRunner {
 
   get busy(): boolean {
     return this.pending !== null;
+  }
+
+  /**
+   * The live interpreter, whose state (variables, imports, functions) the
+   * scripts run in it share: a number no other interpreter in this process
+   * has had, from any runner, or null while none is running, before the
+   * first script or once it was reclaimed, killed or has exited.
+   */
+  get interpreter(): number | null {
+    return this.child && this.child.exitCode === null && !this.child.killed ? this.interpreterNumber : null;
   }
 
   /**
@@ -890,6 +905,7 @@ export class PyRunner {
       env: { ...buildChildEnv(this.envOptions), PYTHONUNBUFFERED: '1', PYTHONIOENCODING: 'utf-8' },
     });
     this.child = child;
+    this.interpreterNumber = ++interpretersStarted;
     const protoIn = child.stdio[3] as Writable;
     const protoOut = child.stdio[4] as Readable;
     this.protoIn = protoIn;

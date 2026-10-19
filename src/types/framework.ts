@@ -133,9 +133,10 @@ export interface FrameworkConfig {
   storePath?: string;
 
   /**
-   * Branch-independent Discord awareness-marker outbox. Defaults to
+   * Branch-independent Discord awareness ledger. Defaults to
    * `<storePath>/recovery/discord-awareness-outbox.json`. Set explicitly when
-   * providing an app-owned `store` without `storePath`; omit to disable.
+   * providing an app-owned `store` without `storePath`; with neither, the
+   * framework has no ledger and refuses a marks choice.
    */
   discordAwarenessOutboxPath?: string;
 
@@ -245,8 +246,8 @@ export interface FrameworkConfig {
    * workspace file under `tool-results/` (deterministic `<date>-<callId>.txt`
    * name, overwritten on collision, retained until the workspace owner
    * deletes it — never auto-GC'd) and replaced inline by a bounded preview
-   * plus the file reference; with no writable workspace the fallback is
-   * explicit plain truncation. Default 24000 (house-safe; issue #89). Must be
+   * plus the file reference; with no writable mount without an include, the
+   * fallback is explicit plain truncation. Default 24000 (house-safe; issue #89). Must be
    * >= 1000. A resident's own agent_settings value
    * `tool_result_inline_max_chars` (durable, persisted in framework state)
    * takes precedence over this for that agent; the EFFECTIVE cap for every
