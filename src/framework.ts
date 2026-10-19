@@ -19518,9 +19518,9 @@ export class AgentFramework {
 
     // Journal: a file under the agent's first read-write workspace mount
     // without an include (firstWritableMountName), so their existing
-    // read/grep/shell tools work on it. Python appends
-    // directly to the materialized path; watch-mode mounts sync it back to
-    // the chronicle tree on their usual cadence.
+    // read/grep/shell tools work on it. The runner appends the script's output
+    // to the materialized path as it reads it; watch-mode mounts sync it back
+    // to the chronicle tree on their usual cadence.
     let logPath: string | null = null;
     let logAbsPath: string | null = null;
     const workspace = this.getWorkspaceModule();
@@ -19581,7 +19581,7 @@ export class AgentFramework {
       data: {
         status: 'background script started',
         script_id: scriptId,
-        log: logPath ?? 'not kept: background script logs go to a writable workspace mount without an include, and this setup has none. Its output is not retrievable; only wake_agent() reaches you',
+        log: logPath ?? 'not kept in a file: background script logs go to a writable workspace mount without an include, and this setup has none. wake_agent() reaches you, and if the script dies, the last of its output reaches you too',
         lifetime_hours: Math.round(lifetimeMs / 3_600_000 * 10) / 10,
         lifetime: formatLimit(lifetimeMs), // exact for short limits, which lifetime_hours rounds to 0
         note: 'The script dies if the host process restarts. Manage with code_execution {"action": "list"|"cancel"}.',
