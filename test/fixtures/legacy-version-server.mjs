@@ -77,13 +77,14 @@ process.stdin.on('data', (chunk) => {
         process.stdin.once('close', () => {
           try { closeSync(0); } catch { /* already closed */ }
           openSync('/dev/null', 'r');
+          // SIGUSR2's handler is in place before the stderr line, which a test
+          // may take as its cue to send it: until then the signal's default
+          // action would end the process.
+          process.once('SIGUSR2', mode === 'deaf-ping-answered'
+            ? () => process.stdout.write(`${JSON.stringify(ping)}\n${JSON.stringify(ok)}\n`)
+            : () => send(ok));
           process.stderr.write('deaf-ping: stdin closed\n');
-          if (mode === 'deaf-ping-answered') {
-            process.once('SIGUSR2', () => process.stdout.write(`${JSON.stringify(ping)}\n${JSON.stringify(ok)}\n`));
-            return;
-          }
-          process.once('SIGUSR2', () => send(ok));
-          send(ping);
+          if (mode === 'deaf-ping') send(ping);
         });
         process.stdin.destroy();
         setInterval(() => {}, 1 << 30);
