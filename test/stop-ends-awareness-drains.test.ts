@@ -1,8 +1,8 @@
 /**
  * stop() ends Discord awareness drains: a drain sends nothing once stop() has
- * begun, what it hasn't sent stays queued in the journal, unrecorded, for the
+ * begun, what it hasn't sent stays queued in the ledger, unrecorded, for the
  * next start, and stop() waits for a drain still recording the call its close
- * ended, so no drain writes the journal after stop() has returned or a failed
+ * ended, so no drain writes the ledger after stop() has returned or a failed
  * create() has rejected (F74).
  */
 import { describe, it } from 'node:test';
@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework, ShutdownTimeoutError } from '../src/index.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
-import { DiscordAwarenessOutbox, type DiscordAwarenessOp } from '../src/recovery/discord-awareness-outbox.js';
+import { DiscordAwarenessOutbox, defaultDiscordAwarenessOutboxPath } from '../src/recovery/discord-awareness-outbox.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
 const FIXTURE = fileURLToPath(new URL('./fixtures/surgery-marks-mcpl-server.mjs', import.meta.url));
@@ -52,45 +52,44 @@ function frameworkConfig(dir: string, servers: McplServerConfig[]) {
   };
 }
 
+const ledgerPath = (dir: string) => defaultDiscordAwarenessOutboxPath(join(dir, 'store'));
+
 /** One active batch of marks to add, `refs` as [serverId, messageId], queued
- *  in the store's journal while no framework has the store open. */
-function pendingMarks(dir: string, refs: Array<[string, string]>): void {
+ *  in the store's ledger while no framework has the store open. */
+async function pendingMarks(dir: string, refs: Array<[string, string]>): Promise<void> {
   const store = JsStore.openOrCreate({ path: join(dir, 'store') });
   try {
-    const outbox = new DiscordAwarenessOutbox(store);
-    const batch = outbox.prepare({
-      agentName: 'assistant', sourceBranch: 'source', targetBranch: 'main', scope: 'all', activationPolicy: 'explicit',
+    const outbox = new DiscordAwarenessOutbox(ledgerPath(dir), { store });
+    const batch = await outbox.prepare({
+      agentName: 'assistant', sourceBranch: 'source', targetBranch: 'main', scope: 'all',
       refs: refs.map(([serverId, messageId]) => ({ serverId, channelId: `discord:guild:${serverId}`, messageId })),
     });
     assert.ok(batch);
-    outbox.activate(batch.id);
+    await outbox.activate(batch.id);
   } finally {
     store.close();
   }
 }
 
-/** Once no framework has the store open: each operation by its message id,
- *  and the message ids still due. */
-function journal(dir: string): { ops: Record<string, DiscordAwarenessOp>; due: string[] } {
-  const store = JsStore.open({ path: join(dir, 'store') });
-  try {
-    const outbox = new DiscordAwarenessOutbox(store);
-    const ops: Record<string, DiscordAwarenessOp> = {};
-    for (const op of outbox.operations()) ops[op.key.messageId] = op;
-    return { ops, due: outbox.pendingDispatches().map((dispatch) => dispatch.key.messageId).sort() };
-  } finally {
-    store.close();
-  }
+/** Once no framework has the ledger open: each reaction's entry by its
+ *  message id, and the message ids still owed. */
+function ledger(dir: string): { entries: Record<string, Record<string, any>>; due: string[] } {
+  const entries: Record<string, Record<string, any>> = {};
+  for (const entry of JSON.parse(readFileSync(ledgerPath(dir), 'utf8')).entries) entries[entry.messageId] = entry;
+  return { entries, due: new DiscordAwarenessOutbox(ledgerPath(dir)).due().map((request) => request.messageId).sort() };
 }
 
-/** When each journal write a drain makes lands: its write-ahead and its outcome. */
-function recordJournalWrites(t: import('node:test').TestContext): number[] {
+/** When each ledger write a drain makes is done: its write-ahead and its outcome. */
+function recordLedgerWrites(t: import('node:test').TestContext): number[] {
   const writes: number[] = [];
-  for (const method of ['recordDispatching', 'recordOutcome'] as const) {
-    const original = DiscordAwarenessOutbox.prototype[method] as (...args: unknown[]) => unknown;
-    t.mock.method(DiscordAwarenessOutbox.prototype, method, function (this: DiscordAwarenessOutbox, ...args: unknown[]) {
-      writes.push(performance.now());
-      return original.apply(this, args);
+  for (const method of ['claim', 'recordOutcome'] as const) {
+    const original = DiscordAwarenessOutbox.prototype[method] as (...args: unknown[]) => Promise<unknown>;
+    t.mock.method(DiscordAwarenessOutbox.prototype, method, async function (this: DiscordAwarenessOutbox, ...args: unknown[]) {
+      try {
+        return await original.apply(this, args);
+      } finally {
+        writes.push(performance.now());
+      }
     });
   }
   return writes;
@@ -140,8 +139,8 @@ function settlesWithin(settling: Promise<unknown>, ms: number): Promise<unknown>
 describe('stop() and Discord awareness drains', () => {
   it('a drain sending when stop() begins sends nothing more, and stop() waits for it to record the call its close ended', async (t) => {
     const dir = tempDir(t);
-    pendingMarks(dir, [['discord', 'm1'], ['discord', 'm2'], ['discord', 'm3']]);
-    const writes = recordJournalWrites(t);
+    await pendingMarks(dir, [['discord', 'm1'], ['discord', 'm2'], ['discord', 'm3']]);
+    const writes = recordLedgerWrites(t);
     // The start's delivery sends the first add, which the server holds.
     const framework = await AgentFramework.create(frameworkConfig(dir, [server(dir, 'discord')]));
     const [first] = await untilCalls(dir, 'discord', 1);
@@ -150,14 +149,15 @@ describe('stop() and Discord awareness drains', () => {
     const stopped = performance.now();
     assert.equal(internals(framework).discordAwarenessDrains.size, 0, 'no drain is running once stop() has returned');
     await new Promise((resolve) => setTimeout(resolve, 100));
-    assert.ok(writes.every((at) => at < stopped), 'no journal write after stop() returned');
+    assert.ok(writes.every((at) => at < stopped), 'no ledger write after stop() returned');
     assert.deepEqual(await untilCalls(dir, 'discord', 1), [first], 'nothing more was sent');
-    const { ops, due } = journal(dir);
+    const { entries, due } = ledger(dir);
     const rest = ['m1', 'm2', 'm3'].filter((id) => id !== first);
-    assert.equal(ops[first].attempts.length, 1, 'the call in flight is recorded');
-    assert.equal(ops[first].attempts[0].outcome, 'unknown');
-    assert.match(ops[first].attempts[0].error ?? '', /closed while awaiting response/);
-    assert.deepEqual(rest.map((id) => ops[id].attempts), [[], []], 'what the drain had not sent is unrecorded');
+    assert.deepEqual([entries[first].attempts, entries[first].confirmed, entries[first].mayLand], [1, 'unknown', ['add']],
+      'the call in flight is recorded unanswered');
+    assert.match(entries[first].lastError ?? '', /closed while awaiting response/);
+    assert.deepEqual(rest.map((id) => [entries[id].attempts, entries[id].sending]), [[0, undefined], [0, undefined]],
+      'what the drain had not sent is unrecorded');
     assert.deepEqual(due, ['m1', 'm2', 'm3'], 'and stays queued for the next start, with the unanswered add');
     assert.ok(log.some((line) => line.startsWith(
       '[discord-awareness] discord: 2 mark(s) not sent: the framework is stopping; the next start delivers them')), log.join('\n'));
@@ -177,7 +177,7 @@ describe('stop() and Discord awareness drains', () => {
     const dir = tempDir(t);
     const framework = await AgentFramework.create(frameworkConfig(dir, []));
     registerDrain(framework, 'discord', new Promise<void>((_resolve, reject) => {
-      setTimeout(() => reject(new Error('zz the journal refused the write')), 50);
+      setTimeout(() => reject(new Error('zz the ledger refused the write')), 50);
     }));
     await framework.stop();
     assert.equal(internals(framework).discordAwarenessDrains.size, 0);
@@ -205,8 +205,8 @@ describe('stop() and Discord awareness drains', () => {
 
   it("a create() that fails while its start's delivery has a call in flight leaves no drain writing after it rejects", async (t) => {
     const dir = tempDir(t);
-    pendingMarks(dir, [['discord', 'm1'], ['discord', 'm2'], ['discord', 'm3']]);
-    const writes = recordJournalWrites(t);
+    await pendingMarks(dir, [['discord', 'm1'], ['discord', 'm2'], ['discord', 'm3']]);
+    const writes = recordLedgerWrites(t);
     // The start fails once its delivery's first add is on the wire: a tools
     // refresh that fails then, which comes after the delivery has started.
     let first: string | undefined;
@@ -217,13 +217,13 @@ describe('stop() and Discord awareness drains', () => {
     await assert.rejects(AgentFramework.create(frameworkConfig(dir, [server(dir, 'discord')])), /zz the tools refresh failed/);
     const rejected = performance.now();
     await new Promise((resolve) => setTimeout(resolve, 100));
-    assert.ok(writes.every((at) => at < rejected), 'no journal write after create() rejected');
+    assert.ok(writes.every((at) => at < rejected), 'no ledger write after create() rejected');
     assert.ok(first);
-    const { ops, due } = journal(dir);
-    assert.equal(ops[first].attempts.length, 1, 'the call in flight is recorded');
-    assert.equal(ops[first].attempts[0].outcome, 'unknown');
+    const { entries, due } = ledger(dir);
+    assert.deepEqual([entries[first].attempts, entries[first].confirmed], [1, 'unknown'], 'the call in flight is recorded unanswered');
     const rest = ['m1', 'm2', 'm3'].filter((id) => id !== first);
-    assert.deepEqual(rest.map((id) => ops[id].attempts), [[], []], 'what the drain had not sent is unrecorded');
+    assert.deepEqual(rest.map((id) => [entries[id].attempts, entries[id].sending]), [[0, undefined], [0, undefined]],
+      'what the drain had not sent is unrecorded');
     assert.deepEqual(due, ['m1', 'm2', 'm3'], 'and stays queued for the next start');
   });
 });

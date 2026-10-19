@@ -3,5 +3,5 @@
   joinable for one more microtask, so a request made then (an operator's
   retract, say) joined a pass that would never look again, and its work
   waited for the next surgery, operator act, reconnect, `tools/list_changed`
-  or restart. A pass now stops being joinable in the same step as its last
-  claim.
+  or restart. A pass now stops being joinable as soon as its last claim
+  finds nothing more to send, before a later act can make more work owed.

@@ -189,8 +189,9 @@ messages that mentioned or replied to the bot, and DMs) or `--marks all`
 (every removed Discord message). The output counts what will be marked and
 what stays unmarked, and `--dry-run` shows exactly which addresses each choice
 covers. Only `{serverId, channelId, messageId}` metadata is written, to the
-awareness journal kept in the store itself, and the marks are delivered when
-the host and that agent's `discord-mcpl` bot next connect (see
+awareness ledger, `<store>/recovery/discord-awareness-outbox.json`, and the
+marks are delivered when the host and that agent's `discord-mcpl` bot next
+connect (see
 [Live surgery and Discord awareness marks](#live-surgery-and-discord-awareness-marks)).
 If the branch is made but the marks can't be recorded, the output's `markers`
 says so and the branch stands. The live controls described below list, cancel
@@ -428,7 +429,7 @@ const result = await framework.rollbackToMessage('cairn', {
   with a count and batch id), not chosen or not in scope (`none`), not to be
   delivered because recording the batch failed after the body change and it
   was retired or never recorded (`not-scheduled`), or `unresolved` (neither
-  activation nor retirement could be recorded, or the journal could not be
+  activation nor retirement could be recorded, or the ledger could not be
   read back to say whether the batch was; it names a batch the next start
   may still deliver). Every receipt also counts the removed messages left
   unmarked. Marker bookkeeping never fails or undoes an applied rollback or
@@ -439,35 +440,36 @@ const result = await framework.rollbackToMessage('cairn', {
   Each reaction call has a mandatory deadline independent of
   `requestTimeoutMs` (including `0`): `discordAwarenessDeadlineMs` (default
   10000ms, clamped to 50..60000ms). The emoji is `discordAwarenessEmoji`
-  (offline: `--emoji`). An operation is not sent again after three
-  unconfirmed attempts (Discord refused it, or no answer came and so it may
-  have landed, one left on the wire when the host stopped included; an
-  attempt refused before it left the host doesn't count), or after a refusal
-  no retry can change (the message, channel or emoji is gone, access is
-  missing, or the message takes no more reactions); a pass that gives up on
-  operations raises one `discord-awareness-delivery` ops alert, and so does
-  a start whose reconciliation gives up on any. A JSON-RPC error answer,
-  which may come after the server acted, counts as unanswered.
+  (offline: `--emoji`). Nothing more is sent for a mark after three
+  unconfirmed attempts at it (Discord refused it, or no answer came and so
+  it may have landed, one left on the wire when the host stopped included;
+  an attempt refused before it left the host doesn't count), or after a
+  refusal no retry can change (the message, channel or emoji is gone, access
+  is missing, or the message takes no more reactions); a pass that gives up
+  on marks raises one `discord-awareness-delivery` ops alert, and so does a
+  start whose reconciliation gives up on any. A JSON-RPC error answer, which
+  may come after the server acted, counts as unanswered.
 - **Marks are one-shot.** Switching branches, a turn undo, a redo and
   restarts never request a mark or a removal of their own: what goes out is what a surgery
-  (the marks chosen for it) or a retract recorded, and a start's delivery sends what of that hasn't gone out. The
-  journal is an append-only history of requests and their attempts, kept as
-  typed records in the Chronicle store: it survives rollbacks, branch
-  deletion and a killed process, and lives with its store. Each request is
-  written ahead of its dispatch, and a dispatch is admitted from the journal
-  as it is at that moment, so a cancel takes effect even while an earlier
-  request is on the wire. A request written and never answered stays
-  `unknown` in its operation's history and in every receipt's unresolved
-  count, even after a later attempt is confirmed; an operation's status is
-  its latest answer. Between opposite requests for one reaction, the later
-  *authorization* wins, whenever each request was created: a surgery's adds
-  carry the moment of its marks choice, even when activation comes later, so
-  a retract made in between prevails. A record that
-  certifies a body change (an activation, a completed suppression or a
-  retirement) is written only after that change is synced. A journal write the store took
-  but this process can't read back (Chronicle's periodic sync failing inside
-  an append) leaves the journal refusing every read and write until the
-  store is reopened; the next start reads that record with the rest.
+  (the marks chosen for it) or a retract recorded, and a start's delivery
+  sends what of that hasn't gone out. The ledger is a table with one entry
+  per reaction (route, channel, message and emoji): what the acts that still
+  stand want of it, whether Discord is owed a request for that, and what
+  Discord last answered. It is a JSON file outside Chronicle,
+  `<store>/recovery/discord-awareness-outbox.json` (or
+  `discordAwarenessOutboxPath`), so it survives rollbacks, branch deletion
+  and a killed process. Each request is written ahead before it leaves, and
+  the next one is chosen from the ledger as it is then, so a cancel takes
+  effect even while an earlier request is on the wire. A request written and
+  never answered is kept as one that may land, whatever Discord answers
+  later. Between opposite wishes for one reaction, the later act wins: a
+  surgery's marks carry the moment of its choice, even when activation comes
+  later, so a retract made in between prevails, and cancelling it revives
+  nothing. A write that activates, completes or retires a batch syncs the
+  store first, so it never outlives the change it certifies. A ledger that
+  can't be read, or holds a version this build doesn't read, stops a start;
+  in a running host, nothing is sent while it can't be read, the delivery
+  alert says so, and the controls refuse.
 - **A start never activates a surgery's marks.** A batch an interrupted
   surgery left prepared is retired at the next start, none of its marks
   sent. One that had marks to apply raises a `discord-awareness-not-scheduled` ops alert that names the
@@ -480,30 +482,35 @@ const result = await framework.rollbackToMessage('cairn', {
   only logged. An interrupted suppression's removals are still finished, at
   the first start on its branch, and its batch is retired then. Until then
   a start on any branch with that name would apply those removals there.
-- **Operator controls,** each that changes the journal recorded in the
+- **Operator controls,** each that changes the ledger recorded in the
   operator log (a list or a preview records nothing); once `stop()`
   has begun, cancel and retract refuse, like every operator entry
   point:
-  - `listDiscordAwareness()` lists batches and retract requests;
-  - `cancelDiscordAwareness(batch | retractRequest)` stops all further sends
-    and retries of a batch's marks or a retract's removals, and never removes
-    or undoes anything. Its receipt's `unresolvedAttempts` counts requests
-    on the wire or unknown, including earlier attempts later answered, any
-    of which may still land;
+  - `listDiscordAwareness()` lists batches and retract requests, each with
+    its reactions counted by state (`queued`, `sending`, `present`,
+    `absent`, `unknown`, `failed` or `untouched`) and how many may still land;
+  - `cancelDiscordAwareness(batch | retractRequest)` stops a batch's marks or
+    a retract's removals from being sent or sent again, and never removes or
+    undoes anything. Its receipt counts what it stopped before any request
+    went out (`cancelled`), what Discord last confirmed as the act wanted
+    (`confirmed`), and the act's reactions with a request on the wire or one
+    never answered, any of which may still land (`mayStillLand`);
   - `retractDiscordAwareness(batch | 'all')` queues removal of this bot's
     reaction, through each address's configured MCPL route, for every message
     of the batch (or of every batch that isn't retired, whether prepared or
-    active), whatever history says: removing an absent reaction does
-    nothing. As the latest
-    authorization for those messages, it stops adds that haven't ended and
-    any an earlier choice would request later (a prepared batch's
-    activation); cancelling it never revives them. Its receipt discloses earlier
-    add requests whose outcome is unresolved, on the wire or unknown (an
-    unknown removal can't bring a mark back).
+    active, and every reaction the ledger holds), whatever was answered
+    before: removing an absent reaction does nothing. As the latest act on
+    those reactions, it replaces the adds owed there and any an earlier
+    choice would owe later (a prepared batch's activation); cancelling it
+    never revives them. Its receipt counts the reactions on which an add may
+    still land, on the wire or never answered (an unanswered removal can't
+    bring a mark back).
 
-  A request the journal won't carry out (an unknown batch, or one in the
-  wrong state) is refused as `invalid`; a failure to read or write the
-  journal is `failed`.
+  Both are async. A request the ledger won't carry out (an unknown batch or
+  retract request) is refused as `invalid`; a failure to read or write the
+  ledger is `failed`. A framework with neither `storePath` nor
+  `discordAwarenessOutboxPath` has no ledger: it refuses a marks choice as
+  `invalid`, and so do its controls.
 - **Over `host/command`** (servers granted `allowHostCommands`): an `undo` by
   messages takes `marks: 'none' | 'addressed' | 'all'` (default `none`; any
   other value is refused) and returns `markers`. It holds the store like
@@ -513,25 +520,24 @@ const result = await framework.rollbackToMessage('cairn', {
   | 'cancel' | 'retract'` with a `target` (a batch id; for cancel also a
   retract request id; for retract also `all`).
 
-A pre-journal awareness ledger (`discord-awareness-outbox.json` under the
-store, or `discordAwarenessOutboxPath`) is imported once on first use and the
-file renamed `.migrated-v2`; a copy put back at that path later imports only
-batches the journal doesn't already hold, and is renamed beside the first
-(`.migrated-v2.<hash>`) rather than over it. Each imported batch keeps how many
-of its messages 0.22.x's last attempt saw a mark added to (`legacyAdded` in
-the list), never as a claim about what is on Discord,
-and an imported `active` suppression is not taken as proof that its body
-completed: startup verifies and resumes its intervals on its branch. The
-work agent-framework 0.22.x had still to do is never sent, since nobody
-chose it: a batch it never activated is retired (a suppression whose body
-may be pending, once a start on its branch finishes the body), and pending
-adds and removals are dropped. The import names each batch that had such
-work, with how many adds and removals, on stderr wherever it runs, and in a
-`discord-awareness-import-unsent` ops alert at the host's start that
-imported it. A batch 0.22.x never activated placed no marks; a retract of a
-batch takes off the mark of its emoji from each of its messages, whichever
-batch placed it. A version 1 ledger, which only an unreleased commit wrote,
-is refused until it is moved away, and its error says what that gives up.
+The ledger is version 3. A version 2 ledger, agent-framework 0.22.x's at the
+same path, is rewritten as version 3 in place by its first write: at a start,
+or an offline recovery. Each of its batches keeps how many of its messages
+0.22.x's last attempt saw a mark added to (`legacyAdded` in the list), never
+as a claim about what is on Discord. The work 0.22.x had still to do is never
+sent, since nobody chose it: a batch it never activated is retired (a
+suppression whose body may be pending, once a start on its branch finishes
+the body), and pending adds and removals are dropped. A batch it activated
+stays active, its body taken as finished, as 0.22.x took it. The rewrite names
+each batch that had such work, with how many adds and removals, on stderr
+wherever it runs, and in a `discord-awareness-import-unsent` ops alert at the
+host's start that made it. A batch 0.22.x never activated placed no marks; a
+retract of a batch takes off the mark of its emoji from each of its messages,
+whichever batch placed it. 0.22.x reads only versions 1 and 2, and its start
+stops on a version 3 file: to go back to 0.22.x, move the file aside first,
+and 0.22.x then starts with no marks history. A version 1 ledger, which only
+an unreleased commit wrote, is refused until it is moved away, and its error
+says what that gives up.
 
 ## Observability
 

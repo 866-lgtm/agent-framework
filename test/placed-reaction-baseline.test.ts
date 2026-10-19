@@ -1,10 +1,9 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework } from '../src/framework.js';
 import { REFUSAL_REACTION_BASELINE } from '../src/refusal-reactions.js';
 import { DiscordAwarenessOutbox } from '../src/recovery/discord-awareness-outbox.js';
@@ -23,13 +22,13 @@ function baseline(framework: AgentFramework): readonly string[] {
   return (framework as unknown as { getPlacedReactionBaseline(): readonly string[] }).getPlacedReactionBaseline();
 }
 
-// A refusal for an awareness journal that can't be read, met by the read a
-// connect or restart makes to derive the protective default: the journal's
-// own refusal (as breakJournal leaves it) is the cause. The assertions after
+// A refusal for an awareness ledger that can't be read, met by the read a
+// connect or restart makes to derive the protective default: the ledger's
+// own refusal (as breakLedger leaves it) is the cause. The assertions after
 // each refusal say what it left behind.
 function accountingRefusal(error: unknown): boolean {
   return error instanceof Error && error.name === 'DiscordAwarenessAccountingError'
-    && /The Discord awareness journal can't be read in this process/.test(error.message);
+    && /Invalid Discord awareness ledger .*: it isn't JSON/.test(error.message);
 }
 
 async function childEnv(framework: AgentFramework) {
@@ -69,16 +68,15 @@ describe('placed-reaction baseline', () => {
     return framework;
   }
 
-  /** The running framework's own journal instance (the journal's one writer). */
-  const journal = (fw: AgentFramework) =>
+  /** The running framework's own ledger instance (the ledger's one writer). */
+  const ledger = (fw: AgentFramework) =>
     (fw as unknown as { discordAwarenessOutbox: DiscordAwarenessOutbox }).discordAwarenessOutbox;
 
   /**
-   * Retain a batch with this marker in the store's journal: through the
-   * running framework's own journal, or, before one runs, in the store
-   * directly.
+   * Retain a batch with this marker in the ledger: through the running
+   * framework's own instance, or, before one runs, in the file directly.
    */
-  function retain(emoji: string, opts: { activate?: boolean } = {}) {
+  async function retain(emoji: string, opts: { activate?: boolean } = {}) {
     const input = {
       agentName: 'resident',
       sourceBranch: 'main',
@@ -87,28 +85,20 @@ describe('placed-reaction baseline', () => {
       scope: 'all' as const,
       refs: [{ serverId: 'discord', channelId: 'discord:guild:channel', messageId: emoji }],
     };
-    const prepareIn = (outbox: DiscordAwarenessOutbox) => {
-      const batch = outbox.prepare(input)!;
-      if (opts.activate) outbox.activate(batch.id);
-      return batch;
-    };
-    if (framework) return prepareIn(journal(framework));
-    const store = JsStore.openOrCreate({ path: join(dir, 'test.chronicle') });
-    try {
-      return prepareIn(new DiscordAwarenessOutbox(store));
-    } finally {
-      store.close();
-    }
+    const outbox = framework ? ledger(framework) : new DiscordAwarenessOutbox(outboxPath);
+    const batch = (await outbox.prepare(input))!;
+    if (opts.activate) await outbox.activate(batch.id);
+    return batch;
   }
 
   /**
-   * Leave the running framework's journal unreadable for the rest of this
-   * process, as an append that threw inside the store does (RecordJournal's
-   * needsReopen): every read of it throws from now on.
+   * Leave the running framework's ledger unreadable, as a write that failed
+   * leaves it when the file can't be read back: every read of it throws
+   * until the file reads again.
    */
-  function breakJournal(fw: AgentFramework): void {
-    (journal(fw) as unknown as { journal: { unreadable: unknown } }).journal.unreadable =
-      new Error('an append threw inside the store');
+  function breakLedger(fw: AgentFramework): void {
+    writeFileSync(outboxPath, '{broken');
+    (ledger(fw) as unknown as { state: unknown }).state = null;
   }
 
   it('includes default awareness and refusal markers once, with a fresh snapshot', async () => {
@@ -120,9 +110,9 @@ describe('placed-reaction baseline', () => {
   });
 
   it('keeps the adapter default alongside configured and retained offline awareness markers', async () => {
-    retain('🫥');
+    await retain('🫥');
     // An active batch's marker stays covered: its marks can later be removed.
-    retain('👁️', { activate: true });
+    await retain('👁️', { activate: true });
     const fw = await create('🔕');
     assert.deepEqual(new Set(baseline(fw)), new Set([...REFUSAL_REACTION_BASELINE, '💤', '🔕', '🫥', '👁️']));
     assert.equal(baseline(fw).length, new Set(baseline(fw)).size);
@@ -138,19 +128,19 @@ describe('placed-reaction baseline', () => {
   }
 
   it('canonicalizes retained custom markers before deduplication without changing the ledger', async () => {
-    const first = retain('<:old_name:123456789012345678>');
-    retain('new_name:123456789012345678');
-    retain('<a:another:123456789012345679>');
+    const first = await retain('<:old_name:123456789012345678>');
+    await retain('new_name:123456789012345678');
+    await retain('<a:another:123456789012345679>');
     const fw = await create('123456789012345678');
     assert.deepEqual(baseline(fw), [...REFUSAL_REACTION_BASELINE, '💤', '123456789012345678', '123456789012345679']);
-    const stored = journal(fw).batches();
+    const stored = ledger(fw).batches();
     assert.equal(stored.find((batch) => batch.id === first.id)?.emoji, '<:old_name:123456789012345678>');
   });
 
   it('preserves Unicode and name tokens while accepting padded full custom markers', async () => {
-    retain('👩‍💻');
-    retain(':name_only:');
-    retain('not:a:custom');
+    await retain('👩‍💻');
+    await retain(':name_only:');
+    await retain('not:a:custom');
     const fw = await create('  <:mark:123456789012345678>  ');
     assert.deepEqual(baseline(fw), [...REFUSAL_REACTION_BASELINE, '💤', '123456789012345678', '👩‍💻', ':name_only:', 'not:a:custom']);
   });
@@ -161,7 +151,7 @@ describe('placed-reaction baseline', () => {
   });
 
   it('injects the complete default into a real child at framework startup', async () => {
-    retain('🫥');
+    await retain('🫥');
     const config = server({ env: { BASELINE_TEST_EXTRA: 'preserved' } });
     const fw = await create('🔕', [config]);
     const env = await childEnv(fw);
@@ -180,11 +170,11 @@ describe('placed-reaction baseline', () => {
 
   it('derives the default on runtime connect, including newly retained ledger markers', async () => {
     const fw = await create('🔕');
-    retain('🫥');
+    await retain('🫥');
     await fw.connectMcplServer(server());
     const env = await childEnv(fw);
     assert.deepEqual(new Set(env.baseline?.split(',')), new Set([...REFUSAL_REACTION_BASELINE, '💤', '🔕', '🫥']));
-    retain('👁️');
+    await retain('👁️');
     await fw.restartMcplServer('probe');
     assert.ok((await childEnv(fw)).baseline?.split(',').includes('👁️'), 'restart recomputes a default rather than retaining it as an explicit override');
   });
@@ -292,7 +282,7 @@ describe('placed-reaction baseline', () => {
   it('a reconnect respawns the child with a default derived at that spawn', async () => {
     const fw = await create(undefined, [server({ reconnect: true, reconnectIntervalMs: 20, reconnectMaxIntervalMs: 20 })]);
     assert.equal((await childEnv(fw)).baseline?.split(',').includes('🫥'), false);
-    retain('🫥');
+    await retain('🫥');
     const registry = (fw as unknown as {
       mcplServerRegistry: { getServer(id: string): { sendToolsCall(name: string, args: {}): Promise<unknown> } };
     }).mcplServerRegistry;
@@ -308,20 +298,20 @@ describe('placed-reaction baseline', () => {
     assert.ok(env.baseline?.split(',').includes('🫥'), `the respawned child has the marker retained since: ${env.baseline}`);
   });
 
-  it('a restart refuses on an unreadable journal when it derives the default, and leaves the child up', async () => {
+  it('a restart refuses on an unreadable ledger when it derives the default, and leaves the child up', async () => {
     const fw = await create(undefined, [server()]);
-    breakJournal(fw);
+    breakLedger(fw);
     await assert.rejects(() => fw.restartMcplServer('probe'), accountingRefusal);
     // A restart that stopped the child leaves no server to ask.
     assert.ok(await childEnv(fw).catch(() => undefined), 'the running child still answers');
   });
 
-  it('a server with its own baseline, or a WebSocket one, connects and restarts whatever the journal\'s state', async () => {
-    // Only a connect that derives the protective default reads the journal:
+  it('a server with its own baseline, or a WebSocket one, connects and restarts whatever the ledger\'s state', async () => {
+    // Only a connect that derives the protective default reads the ledger:
     // awareness never gates MCPL.
     const fw = await create(undefined, [server({ env: { [ENV_KEY]: '🟪' } })]);
-    breakJournal(fw);
-    assert.throws(() => baseline(fw), accountingRefusal, 'the journal is unreadable');
+    breakLedger(fw);
+    assert.throws(() => baseline(fw), accountingRefusal, 'the ledger is unreadable');
     await fw.restartMcplServer('probe');
     assert.equal((await childEnv(fw)).baseline, '🟪', 'restarted with its own baseline');
     await fw.disconnectMcplServer('probe');
@@ -335,7 +325,7 @@ describe('placed-reaction baseline', () => {
     );
   });
 
-  it('a server that inherits its baseline from the host connects and restarts whatever the journal\'s state', async (t) => {
+  it('a server that inherits its baseline from the host connects and restarts whatever the ledger\'s state', async (t) => {
     const previous = process.env[ENV_KEY];
     process.env[ENV_KEY] = '🟦';
     t.after(() => {
@@ -343,7 +333,7 @@ describe('placed-reaction baseline', () => {
       else process.env[ENV_KEY] = previous;
     });
     const fw = await create(undefined, [server({ inheritEnv: true })]);
-    breakJournal(fw);
+    breakLedger(fw);
     await fw.restartMcplServer('probe');
     assert.equal((await childEnv(fw)).baseline, '🟦', 'restarted with the inherited baseline');
     await fw.disconnectMcplServer('probe');
@@ -351,13 +341,13 @@ describe('placed-reaction baseline', () => {
     assert.equal((await childEnv(fw)).baseline, '🟦', 'connected with the inherited baseline');
   });
 
-  it('a child that takes the default is not respawned while the journal is unreadable: each reconnect fails and is retried', async () => {
+  it('a child that takes the default is not respawned while the ledger is unreadable: each reconnect fails and is retried', async () => {
     const fw = await create(undefined, [server({ reconnect: true, reconnectIntervalMs: 20, reconnectMaxIntervalMs: 20 })]);
     const failures: string[] = [];
     fw.onTrace((event) => {
       if (event.type === 'mcpl:server-connect-failed') failures.push(String((event as { error?: unknown }).error));
     });
-    breakJournal(fw);
+    breakLedger(fw);
     const registry = (fw as unknown as {
       mcplServerRegistry: {
         getServer(id: string): { sendToolsCall(name: string, args: {}): Promise<unknown>; isConnected: boolean; willReconnect: boolean };
@@ -368,7 +358,7 @@ describe('placed-reaction baseline', () => {
     while (failures.length < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
     assert.ok(failures.length >= 2, `each attempt fails and the next is scheduled: ${failures.join(' | ')}`);
     for (const failure of failures) {
-      assert.match(failure, /Discord awareness accounting failed during .*The Discord awareness journal can't be read in this process/);
+      assert.match(failure, /Discord awareness accounting failed during .*Invalid Discord awareness ledger .*: it isn't JSON/);
     }
     assert.equal(registry.getServer('probe').isConnected, false, 'no child was spawned without the default');
     assert.equal(registry.getServer('probe').willReconnect, true, 'and it keeps retrying');
@@ -405,9 +395,9 @@ describe('placed-reaction baseline', () => {
     });
   }
 
-  it('fails explicitly on an unreadable journal rather than deriving an incomplete default', async () => {
+  it('fails explicitly on an unreadable ledger rather than deriving an incomplete default', async () => {
     const fw = await create(undefined, [server()]);
-    breakJournal(fw);
+    breakLedger(fw);
     assert.throws(() => baseline(fw), accountingRefusal);
     const internals = fw as unknown as {
       mcplServerRegistry: { getServer(id: string): unknown };
@@ -416,7 +406,7 @@ describe('placed-reaction baseline', () => {
     };
     assert.equal(internals.mcplPrefixMap.get('mcpl--probe'), 'probe', 'a connected server has its tool routing');
     await fw.disconnectMcplServer('probe');
-    // A connect that derives the default reads the journal before it
+    // A connect that derives the default reads the ledger before it
     // registers anything: a reconnecting server would otherwise be left
     // registered as a closed stub that blocks a retried connect.
     for (const config of [server(), server({ reconnect: true })]) {

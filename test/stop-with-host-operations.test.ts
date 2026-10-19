@@ -54,7 +54,7 @@ interface Internals {
   activeTurnTokens: Map<string, number>;
   maintenancePass: Promise<unknown> | null;
   mcplServerRegistry: unknown;
-  readDiscordAwarenessDispatches(serverId?: string): unknown[];
+  readDiscordAwarenessDue(serverId?: string): unknown[];
   drainDiscordAwarenessOutbox(serverId: string): Promise<unknown>;
   deliverDiscordAwarenessInBackground(occasion: string, agentName: string): void;
   flushDeferredWrites(label: string): Promise<void>;
@@ -129,7 +129,7 @@ describe('stop() with an operator operation in flight', () => {
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
     const fw = internals(framework);
-    fw.readDiscordAwarenessDispatches = () => [{ key: { serverId: 'srv' } }];
+    fw.readDiscordAwarenessDue = () => [{ serverId: 'srv' }];
     fw.drainDiscordAwarenessOutbox = async () => {
       started++;
       await held;
@@ -798,11 +798,11 @@ describe('stop() with an operator operation in flight', () => {
       const api = new ApiServer(framework) as unknown as { cmdBranchCreate(params: { name: string }): Promise<unknown> };
       await api.cmdBranchCreate({ name: 'side' });
       const drains = holdDrains(framework);
-      const journal = framework.listDiscordAwareness();
+      const marks = framework.listDiscordAwareness();
       await framework.switchBranch('side');
       assert.equal(framework.getStore().currentBranch().name, 'side');
       assert.equal(drains.started(), 0);
-      assert.deepEqual(framework.listDiscordAwareness(), journal, 'the awareness journal is unchanged');
+      assert.deepEqual(framework.listDiscordAwareness(), marks, 'the awareness ledger is unchanged');
     } finally { await framework.stop(); }
   });
 

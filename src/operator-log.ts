@@ -146,20 +146,21 @@ export interface SurgeryMarkerFacts {
  * - `queued` — one add request per mark is recorded, and delivered when its
  *   route is up: a pass starts at once unless the host is stopping, and a
  *   later one (a reconnect, a tools-list change or the next start) takes
- *   what remains. The record is durable, unless `error` says the journal's
- *   sync after it failed (a surgery's activation): then an operating system crash or a power failure before
- *   the store's next sync could lose it. If a delivery pass fails, the requests stay
- *   recorded and the `discord-awareness-delivery` ops alert says so. The
- *   same alert names the requests a pass, or a start, gave up on: refused by
- *   Discord for good, or after three unconfirmed attempts. It is not a
- *   delivery claim: per-request outcomes stay in the awareness journal.
+ *   what remains. The record is durable, unless `error` says writing the
+ *   activation didn't complete: then an operating system crash or a power
+ *   failure before the ledger's next write could lose it. If a delivery pass
+ *   fails, the requests stay recorded and the `discord-awareness-delivery`
+ *   ops alert says so. The same alert names the marks a pass, or a start,
+ *   gave up on: refused by Discord for good, or after three unconfirmed
+ *   attempts. It is not a delivery claim: what Discord answers is kept in
+ *   the awareness ledger.
  * - `not-scheduled` — the body change landed, but the batch was never
- *   recorded, or recording it as active failed and it was retired from the
- *   journal: none of its marks will be delivered.
- * - `unresolved` — the journal could record neither the activation nor the
+ *   recorded, or recording it as active failed and it was retired: none of
+ *   its marks will be delivered.
+ * - `unresolved` — the ledger could record neither the activation nor the
  *   retirement, or could not be read back to say whether the batch was
  *   recorded at all. `batchId` names the batch, whose scheduling outcome is
- *   unresolved: if its activation reached the store where this process
+ *   unresolved: if its activation reached the ledger where this process
  *   couldn't read it back, its marks go out from the next start; otherwise
  *   none of them is sent. Nothing here can say which.
  */

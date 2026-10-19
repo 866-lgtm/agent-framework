@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -10,19 +10,12 @@ import { ContextManager } from '@animalabs/context-manager';
 import { createOfflineRecoveryBranch } from '../src/recovery/offline-branch.js';
 import { OperatorActionError } from '../src/operator-log.js';
 import {
-  DISCORD_AWARENESS_RECORD_TYPE,
   DiscordAwarenessOutbox,
+  defaultDiscordAwarenessOutboxPath,
 } from '../src/recovery/discord-awareness-outbox.js';
 
-/** Read the store's awareness journal with the host (and CLI) stopped. */
-function readJournal<T>(storePath: string, read: (outbox: DiscordAwarenessOutbox, store: JsStore) => T): T {
-  const store = JsStore.openOrCreate({ path: storePath });
-  try {
-    return read(new DiscordAwarenessOutbox(store), store);
-  } finally {
-    store.close();
-  }
-}
+/** The store's awareness ledger, read with the host (and CLI) stopped. */
+const ledger = (storePath: string) => new DiscordAwarenessOutbox(defaultDiscordAwarenessOutboxPath(storePath));
 
 test('offline recovery branches without compiling and queues discarded Discord refs', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-'));
@@ -66,17 +59,16 @@ test('offline recovery branches without compiling and queues discarded Discord r
     recoveredCm.close();
     recoveredStore.close();
 
-    const batches = readJournal(storePath, (outbox) => outbox.pendingDispatches('discord'));
-    assert.equal(batches.length, 2);
-    assert.deepEqual(batches.map((dispatch) => dispatch.key.messageId), ['m-toxic-1', 'm-toxic-2']);
+    assert.equal(result.outboxPath, defaultDiscordAwarenessOutboxPath(storePath));
+    const owed = ledger(storePath).due('discord');
+    assert.equal(owed.length, 2);
+    assert.deepEqual(owed.map((request) => request.messageId), ['m-toxic-1', 'm-toxic-2']);
 
-    // The outbox is metadata-only: quarantined text must never leak to it.
-    const rawJournal = readJournal(storePath, (_outbox, store) => store.getRecordIdsByType(DISCORD_AWARENESS_RECORD_TYPE)
-      .map((id) => Buffer.from(store.getRecord(id)!.payload).toString('utf-8'))
-      .join('\n'));
-    assert.ok(rawJournal.length > 0);
-    assert.ok(!rawJournal.includes('never echo this one'));
-    assert.ok(!rawJournal.includes('or this one'));
+    // The ledger is metadata-only: quarantined text must never leak to it.
+    const rawLedger = readFileSync(result.outboxPath, 'utf8');
+    assert.ok(rawLedger.length > 0);
+    assert.ok(!rawLedger.includes('never echo this one'));
+    assert.ok(!rawLedger.includes('or this one'));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -193,10 +185,10 @@ test('offline recovery suppresses inclusive ranges in context order', async () =
     recoveredCm.close();
     recoveredStore.close();
 
-    const batches = readJournal(storePath, (outbox) => outbox.pendingDispatches('discord'));
+    const batches = ledger(storePath).due('discord');
     assert.equal(batches.length, 3);
     assert.deepEqual(
-      batches.map((dispatch) => dispatch.key.messageId),
+      batches.map((request) => request.messageId),
       ['m-from', 'm-inside', 'm-to'],
     );
   } finally {
@@ -405,10 +397,7 @@ test('offline recovery is local by default; addressed marks only messages that a
     assert.equal(local.discordMarkersQueued, 0);
     assert.equal(local.unmarked, 2);
     assert.deepEqual(local.markers, { scope: 'none', unmarked: 2, notRemoved: 0, status: 'none', queued: 0 });
-    readJournal(storePath, (outbox) => {
-      assert.equal(outbox.pendingDispatches('discord').length, 0, 'nothing is queued for Discord');
-      assert.equal(outbox.batches().length, 0);
-    });
+    assert.equal(existsSync(defaultDiscordAwarenessOutboxPath(storePath)), false, 'nothing is recorded: no batch, and nothing queued for Discord');
 
     // A dry run with addressed shows exactly what would be marked.
     rmSync(storePath, { recursive: true, force: true });
@@ -424,7 +413,7 @@ test('offline recovery is local by default; addressed marks only messages that a
     assert.equal(marked.unmarked, 1);
     assert.equal(marked.markers?.status, 'queued');
     assert.deepEqual(
-      readJournal(storePath, (outbox) => outbox.pendingDispatches('discord').map((dispatch) => dispatch.key.messageId)),
+      ledger(storePath).due('discord').map((request) => request.messageId),
       ['m-addressed'],
     );
   } finally {
@@ -442,15 +431,17 @@ test('offline recovery reports a marker bookkeeping failure apart from the body,
     cm.addMessage('user', [{ type: 'text', text: 'hey' }], { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-gone', tags: ['chat:addressed'] });
     cm.close();
     store.close();
-    const original = DiscordAwarenessOutbox.prototype.activate;
-    DiscordAwarenessOutbox.prototype.activate = function () { throw new Error('injected activation failure'); };
+    // settleActivation's own activation, which it falls back from.
+    const proto = DiscordAwarenessOutbox.prototype as unknown as { activateIn: (...args: unknown[]) => Promise<number> };
+    const original = proto.activateIn;
+    proto.activateIn = async function () { throw new Error('injected activation failure'); };
     let result: Awaited<ReturnType<typeof createOfflineRecoveryBranch>>;
     try {
       result = await createOfflineRecoveryBranch({
         storePath, agentName: 'cairn', messageId: 'm-safe', marks: { scope: 'all' }, branchName: 'recovery/cairn/settle',
       });
     } finally {
-      DiscordAwarenessOutbox.prototype.activate = original;
+      proto.activateIn = original;
     }
     assert.equal(result.markers?.status, 'not-scheduled');
     assert.match(result.markers?.status === 'not-scheduled' ? result.markers.error : '', /injected activation failure/);
@@ -458,12 +449,11 @@ test('offline recovery reports a marker bookkeeping failure apart from the body,
     const reopened = JsStore.openOrCreate({ path: storePath });
     try {
       assert.equal(reopened.currentBranch().name, 'recovery/cairn/settle', 'the recovery branch stands');
-      const outbox = new DiscordAwarenessOutbox(reopened);
-      assert.equal(outbox.batches()[0].status, 'discarded');
-      assert.equal(outbox.pendingDispatches('discord').length, 0);
     } finally {
       reopened.close();
     }
+    assert.equal(ledger(storePath).batches()[0].status, 'retired');
+    assert.deepEqual(ledger(storePath).due('discord'), []);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -485,8 +475,8 @@ test('a failed offline suppression retires its batch once the source is confirme
   const inspect = () => {
     const store = JsStore.openOrCreate({ path: storePath });
     try {
-      const outbox = new DiscordAwarenessOutbox(store);
-      return { branch: store.currentBranch().name, statuses: outbox.batches().map((b) => b.status), due: outbox.pendingDispatches().length };
+      const outbox = ledger(storePath);
+      return { branch: store.currentBranch().name, statuses: outbox.batches().map((b) => b.status), due: outbox.due().length };
     } finally {
       store.close();
     }
@@ -506,14 +496,14 @@ test('a failed offline suppression retires its batch once the source is confirme
       }),
       (error: Error) => /^injected redaction failure; branch recovery\/cairn\/fail is kept for diagnosis: it may be partly suppressed, so don't start on it, and delete it once it has been looked at \(the host API's branch\.delete, once the host runs\); awareness batch \S+ retired, none of its marks sent\. To apply its marks, run the recovery again onto a new --branch, choosing them again$/.test(error.message),
     );
-    assert.deepEqual(inspect(), { branch: 'main', statuses: ['discarded'], due: 0 });
+    assert.deepEqual(inspect(), { branch: 'main', statuses: ['retired'], due: 0 });
 
     // The source comes back but retiring the batch fails: the error says its
     // marks are never sent, and that its removals stay pending for the kept
     // branch, whose name stays claimed.
     await seed();
     const discard = DiscordAwarenessOutbox.prototype.discard;
-    DiscordAwarenessOutbox.prototype.discard = function () { throw new Error('injected retire failure'); };
+    DiscordAwarenessOutbox.prototype.discard = async function () { throw new Error('injected retire failure'); };
     try {
       await assert.rejects(
         createOfflineRecoveryBranch({
@@ -526,31 +516,24 @@ test('a failed offline suppression retires its batch once the source is confirme
       DiscordAwarenessOutbox.prototype.discard = discard;
     }
     assert.deepEqual(inspect(), { branch: 'main', statuses: ['prepared'], due: 0 });
-    {
-      const store = JsStore.open({ path: storePath });
-      try {
-        assert.deepEqual(new DiscordAwarenessOutbox(store).recoverAtStartup().retired, [],
-          'a start on the source leaves it: its removals are pending on its branch, which exists');
-        assert.equal(new DiscordAwarenessOutbox(store).batches()[0].status, 'prepared');
-      } finally {
-        store.close();
-      }
-    }
+    assert.deepEqual((await ledger(storePath).recoverAtStartup()).retired, [],
+      'a start on the source leaves it: its removals are pending on its branch, which exists');
+    assert.equal(ledger(storePath).batches()[0].status, 'prepared');
 
-    // Retiring the batch fails, and the journal can't be read back either:
+    // Retiring the batch fails, and the ledger can't be read back either:
     // the error says it can't tell whether the retirement landed, and what
     // stays if it didn't.
     await seed();
     const batchStatus = DiscordAwarenessOutbox.prototype.batchStatus;
-    DiscordAwarenessOutbox.prototype.discard = function () { throw new Error('injected retire failure'); };
-    DiscordAwarenessOutbox.prototype.batchStatus = function () { throw new Error('injected unreadable journal'); };
+    DiscordAwarenessOutbox.prototype.discard = async function () { throw new Error('injected retire failure'); };
+    DiscordAwarenessOutbox.prototype.batchStatus = function () { throw new Error('injected unreadable ledger'); };
     try {
       await assert.rejects(
         createOfflineRecoveryBranch({
           storePath, agentName: 'cairn', messageId: 'm-current', suppressMessageIds: ['m-a'],
           marks: { scope: 'all' }, branchName: 'recovery/cairn/fail-unread',
         }),
-        /awareness batch \S+ could not be retired \(injected retire failure\), and the journal can't be read back to tell whether its retirement landed; if it didn't, it stays prepared, none of its marks to be sent\. Its removals stay pending for recovery\/cairn\/fail-unread: a start on a branch with that name would finish them there and retire the batch/,
+        /awareness batch \S+ could not be retired \(injected retire failure\), and the ledger can't be read back to tell whether its retirement landed; if it didn't, it stays prepared, none of its marks to be sent\. Its removals stay pending for recovery\/cairn\/fail-unread: a start on a branch with that name would finish them there and retire the batch/,
       );
     } finally {
       DiscordAwarenessOutbox.prototype.discard = discard;
@@ -558,12 +541,12 @@ test('a failed offline suppression retires its batch once the source is confirme
     }
     assert.deepEqual(inspect(), { branch: 'main', statuses: ['prepared'], due: 0 });
 
-    // The retirement lands, and only its sync fails: read back, it's
-    // reported retired, with the risk that the sync left.
+    // The retirement reaches the file, and writing it doesn't complete: read
+    // back, it's reported retired, with the risk that leaves.
     await seed();
-    DiscordAwarenessOutbox.prototype.discard = function (this: DiscordAwarenessOutbox, batchId: string) {
-      discard.call(this, batchId);
-      throw new Error('injected sync failure');
+    DiscordAwarenessOutbox.prototype.discard = async function (this: DiscordAwarenessOutbox, batchId: string) {
+      await discard.call(this, batchId);
+      throw new Error('injected directory sync failure');
     };
     try {
       await assert.rejects(
@@ -571,12 +554,12 @@ test('a failed offline suppression retires its batch once the source is confirme
           storePath, agentName: 'cairn', messageId: 'm-current', suppressMessageIds: ['m-a'],
           marks: { scope: 'all' }, branchName: 'recovery/cairn/fail-synced',
         }),
-        /; awareness batch \S+ is retired, none of its marks sent, but the journal's sync after its retirement failed \(injected sync failure\): an operating system crash or a power failure before the store's next sync could lose that record, and the batch would then be prepared again at the next start, its removals pending for recovery\/cairn\/fail-synced\. To apply its marks, run the recovery again onto a new --branch, choosing them again$/,
+        /; awareness batch \S+ is retired, none of its marks sent, but writing that didn't complete \(injected directory sync failure\): an operating system crash or a power failure before the ledger's next write could lose it, and the batch would then be prepared again at the next start, its removals pending for recovery\/cairn\/fail-synced\. To apply its marks, run the recovery again onto a new --branch, choosing them again$/,
       );
     } finally {
       DiscordAwarenessOutbox.prototype.discard = discard;
     }
-    assert.deepEqual(inspect(), { branch: 'main', statuses: ['discarded'], due: 0 });
+    assert.deepEqual(inspect(), { branch: 'main', statuses: ['retired'], due: 0 });
 
     // The source can't be confirmed: the batch stays as the unfinished body's record.
     await seed();
@@ -616,7 +599,7 @@ test('a failed offline suppression whose branch was never made says its removals
     cm.close();
     store.close();
     ContextManager.prototype.branchAt = function () { throw new Error('injected branch failure'); };
-    DiscordAwarenessOutbox.prototype.discard = function () { throw new Error('injected retire failure'); };
+    DiscordAwarenessOutbox.prototype.discard = async function () { throw new Error('injected retire failure'); };
     await assert.rejects(
       createOfflineRecoveryBranch({
         storePath, agentName: 'cairn', messageId: 'm-current', suppressMessageIds: ['m-a'],
@@ -631,12 +614,12 @@ test('a failed offline suppression whose branch was never made says its removals
   }
 });
 
-test('an offline suppression whose resume journal could not be closed, or whose closing sync failed, says what is left of it', async () => {
+test('an offline suppression whose resume record could not be closed, or whose closing write did not complete, says what is left of it', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-unclosed-'));
   const storePath = join(dir, 'agent.chronicle');
   const settleActivation = DiscordAwarenessOutbox.prototype.settleActivation;
   // Each case on a fresh store, since a recovery leaves its fork current.
-  const recoverWith = async (settled: ReturnType<typeof settleActivation>, marks: 'none' | { scope: 'all' }) => {
+  const recoverWith = async (settled: Awaited<ReturnType<typeof settleActivation>>, marks: 'none' | { scope: 'all' }) => {
     rmSync(storePath, { recursive: true, force: true });
     const store = JsStore.openOrCreate({ path: storePath });
     const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
@@ -645,36 +628,36 @@ test('an offline suppression whose resume journal could not be closed, or whose 
     cm.addMessage('user', [{ type: 'text', text: 'anchor' }], { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-current' });
     cm.close();
     store.close();
-    DiscordAwarenessOutbox.prototype.settleActivation = function () { return settled; };
+    DiscordAwarenessOutbox.prototype.settleActivation = async function () { return settled; };
     return createOfflineRecoveryBranch({
       storePath, agentName: 'cairn', messageId: 'm-current', suppressMessageIds: ['m-a'], branchName: 'recovery/cairn/close', marks,
     });
   };
   try {
-    // No marks: the batch is the suppression's resume journal alone.
+    // No marks: the batch is the suppression's resume record alone.
     const unresolved = await recoverWith({ status: 'unresolved', error: 'injected activation failure' }, 'none');
     assert.equal(unresolved.markers?.status, 'none');
     assert.match(
-      unresolved.suppressionJournal ?? '',
-      /^the resume journal \(awareness batch \S+, no marks\) could not be closed \(injected activation failure\); it stays prepared, unless the journal couldn't be read back and its closing record landed anyway; if it stays prepared, a start on recovery\/cairn\/close finds its removals applied and closes it$/,
+      unresolved.suppressionRecord ?? '',
+      /^the resume record \(awareness batch \S+, no marks\) could not be closed \(injected activation failure\); it stays prepared, unless the ledger couldn't be read back and its closing reached it anyway; if it stays prepared, a start on recovery\/cairn\/close finds its removals applied and closes it$/,
     );
     const retired = await recoverWith({ status: 'not-scheduled', error: 'injected activation failure' }, 'none');
     assert.match(
-      retired.suppressionJournal ?? '',
-      /^the resume journal \(awareness batch \S+, no marks\) could not be closed \(injected activation failure\); it was retired instead, so nothing is left to resume$/,
+      retired.suppressionRecord ?? '',
+      /^the resume record \(awareness batch \S+, no marks\) could not be closed \(injected activation failure\); it was retired instead, so nothing is left to resume$/,
     );
-    const unsynced = await recoverWith({ status: 'queued', queued: 0, error: 'injected sync failure' }, 'none');
+    const unsynced = await recoverWith({ status: 'queued', queued: 0, error: 'injected directory sync failure' }, 'none');
     assert.match(
-      unsynced.suppressionJournal ?? '',
-      /^the resume journal \(awareness batch \S+, no marks\) is closed, but the journal's sync after it failed \(injected sync failure\): an operating system crash or a power failure before the store's next sync could lose that record, and a start on recovery\/cairn\/close then finds its removals applied and closes it$/,
+      unsynced.suppressionRecord ?? '',
+      /^the resume record \(awareness batch \S+, no marks\) is closed, but writing that didn't complete \(injected directory sync failure\): an operating system crash or a power failure before the ledger's next write could lose it, and a start on recovery\/cairn\/close then finds its removals applied and closes it$/,
     );
     const closed = await recoverWith({ status: 'queued', queued: 0 }, 'none');
-    assert.equal(closed.suppressionJournal, undefined, 'a journal closed and synced says nothing');
-    // With marks, the receipt carries a queued settlement's sync error.
-    const marked = await recoverWith({ status: 'queued', queued: 2, error: 'injected sync failure' }, { scope: 'all' });
+    assert.equal(closed.suppressionRecord, undefined, 'a record closed and written says nothing');
+    // With marks, the receipt carries a queued settlement's write error.
+    const marked = await recoverWith({ status: 'queued', queued: 2, error: 'injected directory sync failure' }, { scope: 'all' });
     assert.equal(marked.markers?.status, 'queued');
-    assert.equal((marked.markers as { error?: string }).error, 'injected sync failure');
-    assert.equal(marked.suppressionJournal, undefined);
+    assert.equal((marked.markers as { error?: string }).error, 'injected directory sync failure');
+    assert.equal(marked.suppressionRecord, undefined);
   } finally {
     DiscordAwarenessOutbox.prototype.settleActivation = settleActivation;
     rmSync(dir, { recursive: true, force: true });
@@ -697,7 +680,7 @@ test('an offline recovery onto an existing branch is refused before any intent, 
     const inspect = () => {
       const reopened = JsStore.openOrCreate({ path: storePath });
       try {
-        return { branch: reopened.currentBranch().name, statuses: new DiscordAwarenessOutbox(reopened).batches().map((b) => b.status) };
+        return { branch: reopened.currentBranch().name, statuses: ledger(storePath).batches().map((b) => b.status) };
       } finally {
         reopened.close();
       }
@@ -719,13 +702,13 @@ test('an offline recovery onto an existing branch is refused before any intent, 
     } finally {
       ContextManager.prototype.branchAt = branchAt;
     }
-    assert.deepEqual(inspect(), { branch: 'main', statuses: ['discarded'] });
+    assert.deepEqual(inspect(), { branch: 'main', statuses: ['retired'] });
 
     // The same failure with its retirement failing too: the batch stays
     // prepared until a start retires it, none of its marks sent.
     const discard = DiscordAwarenessOutbox.prototype.discard;
     ContextManager.prototype.branchAt = function () { throw new Error('injected branch failure'); };
-    DiscordAwarenessOutbox.prototype.discard = function () { throw new Error('injected retire failure'); };
+    DiscordAwarenessOutbox.prototype.discard = async function () { throw new Error('injected retire failure'); };
     try {
       await assert.rejects(
         createOfflineRecoveryBranch({ storePath, agentName: 'cairn', messageId: 'm-safe', marks: { scope: 'all' }, branchName: 'fresh2' }),
@@ -735,21 +718,16 @@ test('an offline recovery onto an existing branch is refused before any intent, 
       ContextManager.prototype.branchAt = branchAt;
       DiscordAwarenessOutbox.prototype.discard = discard;
     }
-    assert.deepEqual(inspect(), { branch: 'main', statuses: ['discarded', 'prepared'] });
+    assert.deepEqual(inspect(), { branch: 'main', statuses: ['retired', 'prepared'] });
     // A retry under the same name goes ahead.
     const retried = await createOfflineRecoveryBranch({
       storePath, agentName: 'cairn', messageId: 'm-safe', marks: { scope: 'all' }, branchName: 'fresh2',
     });
     assert.equal(retried.targetBranch, 'fresh2');
     // The next start retires the old batch; the retry's own batch is active.
-    const reopened = JsStore.open({ path: storePath });
-    try {
-      const recovered = new DiscordAwarenessOutbox(reopened).recoverAtStartup();
-      assert.deepEqual(recovered.retired.map((r) => r.targetBranch), ['fresh2']);
-      assert.deepEqual(new DiscordAwarenessOutbox(reopened).batches().map((b) => b.status), ['discarded', 'discarded', 'active']);
-    } finally {
-      reopened.close();
-    }
+    const recovered = await ledger(storePath).recoverAtStartup();
+    assert.deepEqual(recovered.retired.map((r) => r.targetBranch), ['fresh2']);
+    assert.deepEqual(ledger(storePath).batches().map((b) => b.status), ['retired', 'retired', 'active']);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1127,11 +1105,13 @@ test('offline recovery refuses a marks choice the live methods refuse, before an
             && /^marks must be 'none' or \{ scope: 'addressed' \| 'all', refs\? \}/.test(error.message),
           `${JSON.stringify(marks)}${dryRun ? ', dry run' : ''}`,
         );
-        readJournal(storePath, (outbox, store) => {
-          assert.equal(outbox.batches().length, 0, 'no batch was prepared');
-          assert.equal(outbox.pendingDispatches('discord').length, 0, 'nothing is queued for Discord');
+        assert.equal(existsSync(defaultDiscordAwarenessOutboxPath(storePath)), false, 'no batch was prepared, and nothing is queued for Discord');
+        const store = JsStore.openOrCreate({ path: storePath });
+        try {
           assert.equal(store.listBranches().some((branch) => branch.name === 'recovery/cairn/bad'), false, 'no branch was made');
-        });
+        } finally {
+          store.close();
+        }
       }
     }
   } finally {
@@ -1170,7 +1150,7 @@ test('the recover CLI places no marks unless --marks chooses them, and refuses a
     assert.equal(result.marksScope, 'none');
     assert.deepEqual(result.markers, { scope: 'none', unmarked: 2, notRemoved: 0, status: 'none', queued: 0 });
     assert.equal(result.messagesRemoved, 2);
-    readJournal(storePath, (outbox) => assert.equal(outbox.pendingDispatches('discord').length, 0, 'nothing is queued for Discord'));
+    assert.equal(existsSync(defaultDiscordAwarenessOutboxPath(storePath)), false, 'nothing is queued for Discord');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

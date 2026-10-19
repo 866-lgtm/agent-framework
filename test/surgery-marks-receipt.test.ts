@@ -26,7 +26,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework, DiscordAwarenessOutbox, OperatorActionError } from '../src/index.js';
-import { DISCORD_AWARENESS_RECORD_TYPE } from '../src/recovery/discord-awareness-outbox.js';
 import type { OperatorLogEntry } from '../src/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
@@ -71,8 +70,18 @@ describe('surgery and awareness marks', () => {
   let framework: AgentFramework;
 
   const cm = () => framework.getAgent('resident')!.getContextManager();
-  /** The running framework's own journal instance (the journal's one writer). */
+  /** The running framework's own ledger instance (the ledger's one writer). */
   const outbox = () => (framework as unknown as { discordAwarenessOutbox: DiscordAwarenessOutbox }).discordAwarenessOutbox;
+  /** The reactions in the ledger file, as written now. */
+  const entries = (): Array<Record<string, any>> => {
+    const path = join(storePath, 'recovery', 'discord-awareness-outbox.json');
+    return existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')).entries : [];
+  };
+  /** settleActivation's own activation and retirement, which its fallbacks use. */
+  const ledgerInternals = DiscordAwarenessOutbox.prototype as unknown as {
+    activateIn: (...args: unknown[]) => Promise<number>;
+    retireIn: (...args: unknown[]) => Promise<void>;
+  };
   const answered = () => jsonl(eventsPath).filter((e) => e.event === 'reaction-answered').length;
   const calls = () => jsonl<{ name: string; args: { messageId: string; emoji: string } }>(callsPath);
 
@@ -166,7 +175,7 @@ describe('surgery and awareness marks', () => {
         (error: unknown) => error instanceof OperatorActionError && error.code === 'failed'
           && /^Rollback not started, nothing changed: recording awareness batch b1 failed: disk full/.test(error.message),
       );
-      // A suppression records its batch (its resume journal, with or without
+      // A suppression records its batch (its resume record, with or without
       // marks) before it changes anything, the same way.
       await assert.rejects(
         framework.suppressMessages('resident', { messageIds: [removed[0]] }),
@@ -181,10 +190,10 @@ describe('surgery and awareness marks', () => {
     assert.equal(cm().listBranches().length, branchesBefore, 'no fork was made');
   });
 
-  it('an operator control the journal refuses is invalid; one it fails to record is failed', async () => {
+  it('an operator control the ledger refuses is invalid; one it fails to record is failed', async () => {
     await start(false);
-    assert.throws(
-      () => framework.cancelDiscordAwareness('no-such-batch'),
+    await assert.rejects(
+      framework.cancelDiscordAwareness('no-such-batch'),
       (error: unknown) => error instanceof OperatorActionError && error.code === 'invalid',
     );
     const original = DiscordAwarenessOutbox.prototype.retract;
@@ -192,8 +201,8 @@ describe('surgery and awareness marks', () => {
       throw new Error('disk full');
     };
     try {
-      assert.throws(
-        () => framework.retractDiscordAwareness('all'),
+      await assert.rejects(
+        framework.retractDiscordAwareness('all'),
         (error: unknown) => error instanceof OperatorActionError && error.code === 'failed' && /disk full/.test(error.message),
       );
     } finally {
@@ -274,9 +283,9 @@ describe('surgery and awareness marks', () => {
     const unhandled: unknown[] = [];
     const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
     process.on('unhandledRejection', onUnhandled);
-    const pendingDispatches = DiscordAwarenessOutbox.prototype.pendingDispatches;
-    DiscordAwarenessOutbox.prototype.pendingDispatches = function () {
-      throw new Error('injected journal read failure');
+    const due = DiscordAwarenessOutbox.prototype.due;
+    DiscordAwarenessOutbox.prototype.due = function () {
+      throw new Error('injected ledger read failure');
     };
     let result: Awaited<ReturnType<AgentFramework['rollbackToMessage']>>;
     try {
@@ -288,20 +297,20 @@ describe('surgery and awareness marks', () => {
       await waitFor('the delivery alert', () => alerts.some((alert) => alert.kind === 'discord-awareness-delivery'));
       await new Promise((resolve) => setImmediate(resolve));
     } finally {
-      DiscordAwarenessOutbox.prototype.pendingDispatches = pendingDispatches;
+      DiscordAwarenessOutbox.prototype.due = due;
       process.off('unhandledRejection', onUnhandled);
     }
     assert.deepEqual(unhandled, [], 'the background failure is handled');
     assert.match(
       alerts.find((alert) => alert.kind === 'discord-awareness-delivery')!.message,
-      /after rollback failed: .*injected journal read failure/,
+      /after rollback failed: .*injected ledger read failure/,
     );
     // Scheduling succeeded: the batch stays durably active for the next pass.
     assert.equal(result.markers.status, 'queued');
     assert.equal(outbox().batches()[0].status, 'active');
   });
 
-  it('a suppression with nothing addressable reports none, whether or not its journal can be closed', async () => {
+  it('a suppression with nothing addressable reports none, whether or not its resume record can be closed', async () => {
     await start(false);
     const local = String(cm().addMessage('resident', [{ type: 'text', text: 'local only' }], {}));
     const other = String(cm().addMessage('resident', [{ type: 'text', text: 'also local' }], {}));
@@ -310,33 +319,32 @@ describe('surgery and awareness marks', () => {
 
     const closed = await framework.suppressMessages('resident', { messageIds: [local] });
     assert.deepEqual(closed.markers, none);
-    const [journal] = outbox().batches();
-    assert.equal(journal?.status, 'active', 'activated, which closes the resume journal');
-    assert.deepEqual(journal.refs, []);
+    const [record] = outbox().batches();
+    assert.equal(record?.status, 'active', 'activated, which closes the resume record');
+    assert.deepEqual(record.refs, []);
 
-    // When the journal can be neither activated nor retired, it still
+    // When the record can be neither activated nor retired, it still
     // schedules nothing, and the receipt says none, not unresolved; the
-    // operator hears that the journal failed.
+    // operator hears that the ledger failed.
     const alerts: Array<{ kind: string; message: string }> = [];
     framework.onTrace((event) => {
       if (event.type === 'ops:alert') alerts.push(event as unknown as { kind: string; message: string });
     });
-    const activate = DiscordAwarenessOutbox.prototype.activate;
-    const discard = DiscordAwarenessOutbox.prototype.discard;
-    DiscordAwarenessOutbox.prototype.activate = function () { throw new Error('injected ledger failure'); };
-    DiscordAwarenessOutbox.prototype.discard = function () { throw new Error('injected retire failure'); };
+    const { activateIn, retireIn } = ledgerInternals;
+    ledgerInternals.activateIn = async function () { throw new Error('injected ledger failure'); };
+    ledgerInternals.retireIn = async function () { throw new Error('injected retire failure'); };
     let stuck: Awaited<ReturnType<AgentFramework['suppressMessages']>>;
     try {
       stuck = await framework.suppressMessages('resident', { messageIds: [other] });
     } finally {
-      DiscordAwarenessOutbox.prototype.activate = activate;
-      DiscordAwarenessOutbox.prototype.discard = discard;
+      ledgerInternals.activateIn = activateIn;
+      ledgerInternals.retireIn = retireIn;
     }
     assert.deepEqual(stuck.markers, none);
     assert.ok(!cm().getAllMessages().some((m) => String(m.id) === other), 'the redaction stood');
-    assert.equal(outbox().batches().filter((batch) => batch.status === 'prepared').length, 1, 'its journal is left prepared');
+    assert.equal(outbox().batches().filter((batch) => batch.status === 'prepared').length, 1, 'its resume record is left prepared');
     const alert = alerts.find((candidate) => candidate.kind === 'discord-awareness-unresolved');
-    assert.match(alert?.message ?? '', /suppress applied, but its resume journal \(awareness batch \S+, no marks\) could not be closed \(.*\); it stays prepared, unless the journal couldn't be read back and its closing record landed anyway; if it stays prepared, a start on this branch finds its removals applied and closes it$/);
+    assert.match(alert?.message ?? '', /suppress applied, but its resume record \(awareness batch \S+, no marks\) could not be closed \(.*\); it stays prepared, unless the ledger couldn't be read back and its closing reached it anyway; if it stays prepared, a start on this branch finds its removals applied and closes it$/);
   });
 
   it('a choice bound to previewed refs never widens to messages that arrive before it applies', async () => {
@@ -358,8 +366,8 @@ describe('surgery and awareness marks', () => {
     assert.equal(result.markers.queued, 2);
     assert.equal(result.markers.unmarked, 2, 'the late arrival is removed locally, unmarked');
     // What was requested, not what has gone out by now: a request for the
-    // late arrival would be in the journal however the drain is paced.
-    assert.deepEqual(outbox().operations().map((op) => op.key.messageId).sort(), authorized.map((r) => r.messageId).sort());
+    // late arrival would be in the ledger however the drain is paced.
+    assert.deepEqual(entries().map((entry) => entry.messageId).sort(), authorized.map((r) => r.messageId).sort());
     await waitFor('two reactions answered', () => answered() === 2);
     assert.ok(!calls().some((c) => c.args.messageId === 'late-1'));
   });
@@ -401,14 +409,11 @@ describe('surgery and awareness marks', () => {
     assert.equal(answered(), 0, 'the probe was not waiting behind the marks');
 
     writeFileSync(holdPath, '1');
-    await waitFor('all four adds confirmed in the journal', () => {
-      const journal = outbox();
-      return journal.operations().filter((op) => journal.operationStatus(op) === 'confirmed').length === 4;
-    });
+    await waitFor('all four adds confirmed in the ledger', () => entries().filter((entry) => entry.confirmed === 'present').length === 4);
     // Exactly the rolled-back messages, nothing from the later suppression.
     assert.deepEqual(
-      outbox().operations().map((op) => `${op.action}:${op.key.messageId}`).sort(),
-      ['add:amb-0', 'add:amb-1', 'add:amb-2', 'add:amb-3'],
+      entries().map((entry) => `${entry.wanted}:${entry.messageId}`).sort(),
+      ['present:amb-0', 'present:amb-1', 'present:amb-2', 'present:amb-3'],
     );
     assert.equal(removed.length, 4);
 
@@ -421,15 +426,15 @@ describe('surgery and awareness marks', () => {
   it('a rollback whose marker bookkeeping fails after the switch reports the body as applied', async () => {
     await start(true);
     const { tail } = seed(2);
-    const original = DiscordAwarenessOutbox.prototype.activate;
-    DiscordAwarenessOutbox.prototype.activate = function () {
+    const { activateIn } = ledgerInternals;
+    ledgerInternals.activateIn = async function () {
       throw new Error('injected ledger failure');
     };
     let result: Awaited<ReturnType<AgentFramework['rollbackToMessage']>>;
     try {
       result = await framework.rollbackToMessage('resident', { messageId: tail, marks: { scope: 'all' } });
     } finally {
-      DiscordAwarenessOutbox.prototype.activate = original;
+      ledgerInternals.activateIn = activateIn;
     }
 
     assert.equal(cm().currentBranch().name, result.targetBranch, 'the rollback stands');
@@ -444,27 +449,26 @@ describe('surgery and awareness marks', () => {
     await framework.stop();
     await start(true);
     await framework.syncDiscordAwarenessMarkers();
-    assert.equal(outbox().operations().length, 0);
+    assert.deepEqual(entries(), []);
     assert.equal(calls().length, 0, 'no reaction was ever sent');
   });
 
   it('reports unresolved bookkeeping when the batch can be neither activated nor retired', async () => {
     await start(false);
     const { tail } = seed(2);
-    const activate = DiscordAwarenessOutbox.prototype.activate;
-    const discard = DiscordAwarenessOutbox.prototype.discard;
-    DiscordAwarenessOutbox.prototype.activate = function () {
+    const { activateIn, retireIn } = ledgerInternals;
+    ledgerInternals.activateIn = async function () {
       throw new Error('injected ledger failure');
     };
-    DiscordAwarenessOutbox.prototype.discard = function () {
+    ledgerInternals.retireIn = async function () {
       throw new Error('injected retire failure');
     };
     let result: Awaited<ReturnType<AgentFramework['rollbackToMessage']>>;
     try {
       result = await framework.rollbackToMessage('resident', { messageId: tail, marks: { scope: 'all' } });
     } finally {
-      DiscordAwarenessOutbox.prototype.activate = activate;
-      DiscordAwarenessOutbox.prototype.discard = discard;
+      ledgerInternals.activateIn = activateIn;
+      ledgerInternals.retireIn = retireIn;
     }
     assert.equal(cm().currentBranch().name, result.targetBranch, 'the rollback stands');
     assert.equal(result.markers.status, 'unresolved');
@@ -476,20 +480,20 @@ describe('surgery and awareness marks', () => {
   it('a suppression whose marker bookkeeping fails after the last redaction stands', async () => {
     await start(false);
     const { removed } = seed(3);
-    const original = DiscordAwarenessOutbox.prototype.activate;
-    DiscordAwarenessOutbox.prototype.activate = function () {
+    const { activateIn } = ledgerInternals;
+    ledgerInternals.activateIn = async function () {
       throw new Error('injected ledger failure');
     };
     let result: Awaited<ReturnType<AgentFramework['suppressMessages']>>;
     try {
       result = await framework.suppressMessages('resident', { messageIds: [removed[1]], marks: { scope: 'all' } });
     } finally {
-      DiscordAwarenessOutbox.prototype.activate = original;
+      ledgerInternals.activateIn = activateIn;
     }
     assert.equal(cm().currentBranch().name, result.targetBranch, 'the suppression is not undone');
     assert.ok(!cm().getAllMessages().some((m) => String(m.id) === removed[1]));
     assert.equal(result.markers.status, 'not-scheduled');
-    assert.deepEqual(outbox().batches().map((batch) => batch.status), ['discarded'], 'its one batch is retired');
+    assert.deepEqual(outbox().batches().map((batch) => batch.status), ['retired'], 'its one batch is retired');
   });
 
   it('cancel stops unsent marks without removing any; retract removes this bot\'s marks and discloses an unknown add', async () => {
@@ -500,14 +504,12 @@ describe('surgery and awareness marks', () => {
     assert.equal(result.markers.status, 'queued');
     const batchId = result.markers.status === 'queued' ? result.markers.batchId : '';
     // The first add goes out and is never answered within the deadline.
-    await waitFor('the first add to time out as unknown', () =>
-      outbox().operations().some((op) => outbox().operationStatus(op) === 'unknown'));
+    await waitFor('the first add to time out unanswered', () => entries().some((entry) => entry.confirmed === 'unknown'));
 
-    const cancelled = framework.cancelDiscordAwareness(batchId, { requester: { via: 'test', name: 'operator' } });
-    const sentOps = outbox().operations().filter((op) => op.attempts.length > 0).length;
+    const cancelled = await framework.cancelDiscordAwareness(batchId, { requester: { via: 'test', name: 'operator' } });
     assert.equal(cancelled.confirmed, 0);
-    assert.equal(cancelled.cancelled + sentOps, 3, 'every add not yet sent is stopped');
-    assert.ok(cancelled.unresolvedAttempts >= 1, 'the timed-out add may still land');
+    assert.equal(cancelled.cancelled + cancelled.mayStillLand, 3, 'every add not yet sent is stopped');
+    assert.ok(cancelled.mayStillLand >= 1, 'the timed-out add may still land');
 
     // Discord finally answers the withheld request: the late add lands.
     writeFileSync(holdPath, '1');
@@ -515,36 +517,48 @@ describe('surgery and awareness marks', () => {
     const sentBeforeRetract = calls().length;
     assert.ok(calls().every((c) => c.name === 'add_reaction'));
     // The cancel stopped every add that hadn't gone out: what went out is
-    // what it counted as unresolved, one per request sent.
-    assert.equal(sentBeforeRetract, cancelled.unresolvedAttempts);
+    // what it counted as able to land, one request per mark.
+    assert.equal(sentBeforeRetract, cancelled.mayStillLand);
 
-    const retracted = framework.retractDiscordAwareness(batchId, { requester: { via: 'test', name: 'operator' } });
+    const retracted = await framework.retractDiscordAwareness(batchId, { requester: { via: 'test', name: 'operator' } });
     assert.equal(retracted.removalsQueued, 3, 'one removal per selected message, whatever history says');
     assert.ok(retracted.keysWithUnresolvedAdds >= 1, 'the unknown add is disclosed, not assumed absent');
     await waitFor('the removals to be sent', () =>
       calls().slice(sentBeforeRetract).filter((c) => c.name === 'remove_reaction').length === retracted.removalsQueued);
-    await waitFor('nothing left to send', () => outbox().pendingDispatches().length === 0);
+    await waitFor('nothing left to send', () => outbox().due().length === 0);
     assert.ok(calls().slice(sentBeforeRetract).every((c) => c.name === 'remove_reaction'), 'the retract revived no add');
     const kinds = framework.getOperatorLog({ limit: 10 }).map((e) => e.kind);
     assert.ok(kinds.includes('awareness-cancel') && kinds.includes('awareness-retract'));
   });
 
-  it('a caller-supplied store keeps its awareness journal in the store too', async () => {
-    framework = await AgentFramework.create({
-      store: JsStore.openOrCreate({ path: storePath }),
+  it('a caller-supplied store has no ledger unless discordAwarenessOutboxPath names one: without it a marks choice is refused before anything changes', async () => {
+    const store = JsStore.openOrCreate({ path: storePath });
+    const config = (extra: Record<string, unknown> = {}) => ({
+      store,
       membrane: new MockMembrane().asMembrane(),
       agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'You are a resident.' }],
       modules: [],
       maintenanceIntervalMs: 0,
-      operatorLogPath: false,
+      operatorLogPath: false as const,
+      ...extra,
     });
+    framework = await AgentFramework.create(config());
     const { tail } = seed(2, [0]);
+    await assert.rejects(
+      framework.rollbackToMessage('resident', { messageId: tail, marks: { scope: 'addressed' } }),
+      (error: unknown) => error instanceof OperatorActionError && error.code === 'invalid'
+        && error.message === 'marks need the awareness ledger, and this framework has none: it was created with neither storePath nor discordAwarenessOutboxPath',
+    );
+    assert.equal(cm().getAllMessages().length, 4, 'nothing was removed');
+    await framework.stop();
+
+    const ledgerPath = join(dir, 'ledger.json');
+    framework = await AgentFramework.create(config({ discordAwarenessOutboxPath: ledgerPath }));
     const result = await framework.rollbackToMessage('resident', { messageId: tail, marks: { scope: 'addressed' } });
     assert.equal(result.markers.status, 'queued');
     assert.equal(result.markers.queued, 1);
     assert.equal(result.markers.unmarked, 1);
-    // The journal is records in the caller's store, and no ledger file is written.
-    assert.ok(framework.getStore().getRecordIdsByType(DISCORD_AWARENESS_RECORD_TYPE).length > 0);
+    assert.equal(JSON.parse(readFileSync(ledgerPath, 'utf8')).entries.length, 1, 'the ledger is the file it names');
     assert.equal(existsSync(join(storePath, 'recovery', 'discord-awareness-outbox.json')), false);
   });
 
@@ -554,14 +568,13 @@ describe('surgery and awareness marks', () => {
     const result = await framework.rollbackToMessage('resident', { messageId: tail, marks: { scope: 'all' } });
     const batchId = result.markers.status === 'queued' ? result.markers.batchId : '';
     await waitFor('the first add on the wire', () => calls().length === 1);
-    const receipt = framework.cancelDiscordAwareness(batchId);
-    assert.deepEqual({ cancelled: receipt.cancelled, unresolvedAttempts: receipt.unresolvedAttempts }, { cancelled: 2, unresolvedAttempts: 1 });
+    const receipt = await framework.cancelDiscordAwareness(batchId);
+    assert.deepEqual({ cancelled: receipt.cancelled, mayStillLand: receipt.mayStillLand }, { cancelled: 2, mayStillLand: 1 });
     writeFileSync(holdPath, '1');
-    await waitFor('the held add answered and recorded', () =>
-      outbox().operations().some((op) => op.attempts[0]?.outcome === 'confirmed'));
-    // Nothing is due, and once every drain pass has ended nothing can send
+    await waitFor('the held add answered and recorded', () => entries().some((entry) => entry.confirmed === 'present'));
+    // Nothing is owed, and once every drain pass has ended nothing can send
     // without a new trigger.
-    assert.equal(outbox().pendingDispatches('discord').length, 0);
+    assert.deepEqual(outbox().due('discord'), []);
     await framework.syncDiscordAwarenessMarkers();
     await Promise.all([...(framework as unknown as { discordAwarenessDrains: Map<string, Promise<unknown>> }).discordAwarenessDrains.values()]);
     assert.equal(calls().length, 1, 'the cancelled marks were never sent');
@@ -618,12 +631,12 @@ describe('surgery and awareness marks', () => {
     } finally {
       live.fork = realFork;
     }
-    assert.equal(outbox().batches().at(-1)!.status, 'discarded');
+    assert.equal(outbox().batches().at(-1)!.status, 'retired');
     // The first surgery never created its branch either: its body waits, at
     // the next start too, for a start on a branch with its name.
     await framework.stop();
     await start(false);
-    assert.deepEqual(outbox().batches().map((batch) => batch.status), ['prepared', 'discarded']);
+    assert.deepEqual(outbox().batches().map((batch) => batch.status), ['prepared', 'retired']);
     assert.equal(outbox().pendingSuppressionsFor(outbox().batches()[0].targetBranch).length, 1);
   });
 
@@ -651,11 +664,11 @@ describe('surgery and awareness marks', () => {
     // An interrupted suppression: the fork exists, nothing was redacted yet.
     await live.fork('partial');
     const [target] = live.getAllMessages().filter((m) => String(m.id) === removed[1]);
-    const batch = outbox().prepare({
+    const batch = (await outbox().prepare({
       agentName: 'resident', sourceBranch, targetBranch: 'partial',
       refs: [{ serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'amb-1' }], scope: 'all',
-      activationPolicy: 'explicit', suppressionIntervals: [{ fromId: String(target.id), toId: String(target.id) }],
-    })!;
+      suppressionIntervals: [{ fromId: String(target.id), toId: String(target.id) }],
+    }))!;
     await live.switchBranch(sourceBranch);
     await framework.stop();
 
@@ -673,15 +686,14 @@ describe('surgery and awareness marks', () => {
       await start(false); // on the target: the body is finished, the marks retired
       assert.ok(!cm().getAllMessages().some((m) => String(m.id) === removed[1]), 'the saved redaction landed');
       const [after] = outbox().batches();
-      assert.equal(after.suppressionComplete, true);
-      assert.equal(after.status, 'discarded', 'a start never activates a surgery\'s marks');
-      assert.deepEqual(outbox().operations(), []);
+      assert.equal(after.status, 'retired', 'a start never activates a surgery\'s marks');
+      assert.deepEqual(entries(), []);
       assert.deepEqual(alerts.map((alert) => alert.kind), ['discord-awareness-not-scheduled']);
       assert.match(alerts[0]!.message, new RegExp(`^The surgery of resident from ${sourceBranch} onto partial \\(awareness batch ${batch.id}: a suppression, or an offline recovery that suppressed\\) was interrupted; this start finished its removals on partial\\.`));
     });
   });
 
-  it('a start that imports a pre-journal ledger alerts with each batch whose undelivered marks it retires', async () => {
+  it('a start that rewrites a version 2 ledger alerts with each batch whose undelivered marks it drops', async () => {
     // The store exists first, as for a host upgraded from 0.22.x.
     await start(false);
     await framework.stop();
@@ -700,9 +712,10 @@ describe('surgery and awareness marks', () => {
     await withAlerts(async (alerts) => {
       await start(false);
       assert.deepEqual(alerts.map((alert) => alert.kind), ['discord-awareness-import-unsent']);
-      assert.match(alerts[0]!.message, /^This start imports the pre-journal awareness ledger, .*: batch legacy-pending \(resident, main to rollback\/resident\/1\): 1 to add, 0 to remove\./);
+      assert.match(alerts[0]!.message, /^This start rewrites the awareness ledger as version 3, .*: batch legacy-pending \(resident, main to rollback\/resident\/1\): 1 to add, 0 to remove\./);
     });
-    assert.equal(outbox().operations().length, 0, 'nothing is sent');
+    assert.deepEqual([entries(), outbox().due()], [[], []], 'nothing is sent');
+    assert.deepEqual(outbox().batches().map((batch) => [batch.id, batch.status, batch.scope]), [['legacy-pending', 'active', 'legacy']]);
   });
 
   it('a rollback or suppression onto an existing branch is refused before any intent is prepared', async () => {
@@ -725,11 +738,11 @@ describe('surgery and awareness marks', () => {
     const { tail } = seed(3);
     const sourceBranch = cm().currentBranch().name;
     // A rollback's batch with marks, left prepared, whose surgery never made fix-1.
-    const first = outbox().prepare({
+    const first = (await outbox().prepare({
       agentName: 'resident', sourceBranch, targetBranch: 'fix-1',
       refs: [0, 1, 2].map((i) => ({ serverId: 'discord', channelId: 'discord:g1:c1', messageId: `amb-${i}` })),
       scope: 'all',
-    })!;
+    }))!;
     const retry = await framework.rollbackToMessage('resident', { messageId: tail, branchName: 'fix-1' });
     assert.equal(retry.targetBranch, 'fix-1');
     await framework.stop();
@@ -745,10 +758,10 @@ describe('surgery and awareness marks', () => {
         + 'onto a new branch name, with its marks');
     });
     assert.equal(cm().currentBranch().name, 'fix-1');
-    assert.equal(outbox().batches().find((batch) => batch.id === first.id)?.status, 'discarded');
+    assert.equal(outbox().batches().find((batch) => batch.id === first.id)?.status, 'retired');
     await framework.syncDiscordAwarenessMarkers();
     assert.deepEqual(calls().filter((call) => call.name === 'add_reaction'), []);
-    assert.deepEqual(outbox().operations(), []);
+    assert.deepEqual(entries(), []);
   });
 
   it('a surgery that removes nothing addressable schedules no marks even when marks are chosen', async () => {

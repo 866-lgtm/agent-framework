@@ -136,7 +136,7 @@ export { PassthroughStrategy, AutobiographicalStrategy, KnowledgeStrategy } from
 export type { KnowledgeConfig, PhaseType } from '@animalabs/context-manager';
 export type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock } from '@animalabs/membrane';
 
-// Offline outage recovery and the Discord awareness-mark journal
+// Offline outage recovery and the Discord awareness-mark ledger
 export {
   DiscordAwarenessOutbox,
   DiscordAwarenessRefusal,
@@ -148,21 +148,19 @@ export {
 } from './recovery/discord-awareness-outbox.js';
 export type {
   DiscordAwarenessAction,
-  DiscordAwarenessAttempt,
   DiscordAwarenessBatch,
-  DiscordAwarenessBatchRecord,
+  DiscordAwarenessBatchStatus,
   DiscordAwarenessBatchView,
   DiscordAwarenessRetractView,
   DiscordAwarenessView,
   DiscordAwarenessCancelReceipt,
-  DiscordAwarenessDispatch,
   DiscordAwarenessMarks,
-  DiscordAwarenessOp,
-  DiscordAwarenessOpStatus,
   DiscordAwarenessOutcome,
   DiscordAwarenessPrepareInput,
+  DiscordAwarenessReactionState,
   DiscordAwarenessImportedUnsent,
   DiscordAwarenessRef,
+  DiscordAwarenessRequest,
   DiscordAwarenessRetractReceipt,
   DiscordAwarenessRetirement,
   DiscordAwarenessScope,

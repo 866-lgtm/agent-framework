@@ -28,7 +28,8 @@ Creates and activates a Chronicle recovery branch while the normal host is
 down. The recovery is local to the resident: by default no Discord reaction is
 placed. --marks chooses to mark removed Discord messages with an awareness
 reaction (queued here, delivered when the host and its Discord MCPL server
-next connect). Message content is never compiled or written to the journal.
+next connect). Message content is never compiled or written to the awareness
+ledger.
 
 Options:
   --message-id <id|link>      Last Discord message the agent should still see
@@ -43,8 +44,7 @@ Options:
                               Awareness marks on removed Discord messages
                               (default none; addressed = mentions, replies to
                               the bot and DMs; all = every addressable message)
-  --outbox <path>             A pre-journal awareness ledger to import
-                              (default: <store>/recovery/discord-awareness-outbox.json)
+  --outbox <path>             Override the branch-independent outbox path
   --emoji <emoji>             Marker reaction (default: 💤)
   --dry-run                   Inspect counts/addresses without writing
   --help                      Show this help

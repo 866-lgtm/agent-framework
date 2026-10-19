@@ -25,11 +25,8 @@
  * Checkpoints bound the replay at open: `checkpoint(snapshot)` records the
  * caller's reduced state together with the last entry it covers, and `load()`
  * returns the latest checkpoint's snapshot plus only the entries appended
- * after it. A journal that never checkpoints replays everything. One opened
- * with `checkpoints: false` keeps none: `load()` replays every entry,
- * whatever checkpoint records an earlier writer left, and `checkpoint()`
- * refuses. What entries mean, how they reduce, and when to checkpoint stay
- * with the caller.
+ * after it. A journal that never checkpoints replays everything. What entries
+ * mean, how they reduce, and when to checkpoint stay with the caller.
  *
  * One writer per record type: a checkpoint covers every entry up to the last
  * one THIS journal loaded or appended, so entries another instance appended
@@ -110,8 +107,6 @@ export class RecordJournal<Entry, Snapshot = never> {
   readonly type: string;
   /** Record type of the checkpoints. */
   readonly checkpointType: string;
-  /** False for a journal that keeps no checkpoints (`checkpoints: false`). */
-  readonly keepsCheckpoints: boolean;
   /** Highest entry id this journal has loaded or appended (0 when none). */
   private lastEntryId = 0n;
   private sinceCheckpoint = 0;
@@ -121,12 +116,11 @@ export class RecordJournal<Entry, Snapshot = never> {
    *  but not in this process's view of the store. Never cleared. */
   private unreadable: Error | null = null;
 
-  constructor(store: JsStore, opts: { type: string; checkpointType?: string; checkpoints?: boolean }) {
+  constructor(store: JsStore, opts: { type: string; checkpointType?: string }) {
     if (!opts.type) throw new Error('RecordJournal: a record type is required');
     this.store = store;
     this.type = opts.type;
     this.checkpointType = opts.checkpointType ?? `${opts.type}/checkpoint`;
-    this.keepsCheckpoints = opts.checkpoints ?? true;
     if (this.checkpointType === this.type) {
       throw new Error('RecordJournal: entries and checkpoints need distinct record types');
     }
@@ -148,7 +142,7 @@ export class RecordJournal<Entry, Snapshot = never> {
     let through = 0n;
     let latestCheckpoint: bigint | null = null;
     let latestCheckpointId: string | null = null;
-    for (const id of this.keepsCheckpoints ? this.store.getRecordIdsByType(this.checkpointType) : []) {
+    for (const id of this.store.getRecordIdsByType(this.checkpointType)) {
       const value = idValue(id);
       if (latestCheckpoint === null || value > latestCheckpoint) {
         latestCheckpoint = value;
@@ -207,9 +201,6 @@ export class RecordJournal<Entry, Snapshot = never> {
    * loaded or appended. Like an entry, it's durable only with `durable`.
    */
   checkpoint(snapshot: Snapshot, opts: { durable?: boolean } = {}): JournalRecordRef {
-    if (!this.keepsCheckpoints) {
-      throw new Error(`RecordJournal(${this.type}): this journal keeps no checkpoints`);
-    }
     this.assertReconciled();
     const payload: CheckpointPayload<Snapshot> = { through: this.lastEntryId.toString(), snapshot };
     return this.write(this.checkpointType, payload, opts.durable === true, () => {

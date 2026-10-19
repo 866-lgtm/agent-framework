@@ -35,7 +35,7 @@ export interface OfflineRecoveryBranchOptions {
   namespace?: string;
   /** Use for old message records that do not carry metadata.serverId. */
   discordServerId?: string;
-  /** A pre-journal awareness ledger to import (default: under the store). */
+  /** The awareness ledger (default: under the store). */
   outboxPath?: string;
   emoji?: string;
   /**
@@ -68,9 +68,11 @@ export interface OfflineRecoveryBranchResult {
   unmarked: number;
   /** Authorized refs (marks.refs) this recovery does not remove. */
   notRemoved: number;
-  /** Set when a suppression-only batch's resume journal couldn't be closed:
+  /** The awareness ledger the batch is recorded in. */
+  outboxPath: string;
+  /** Set when a suppression-only batch's resume record couldn't be closed:
    *  what of it is left, as the host's surgeries report it. */
-  suppressionJournal?: string;
+  suppressionRecord?: string;
 }
 
 /**
@@ -197,6 +199,8 @@ export async function createOfflineRecoveryBranch(
     if (store.listBranches().some((branch) => branch.name === targetBranch)) {
       throw new Error(`Recovery branch ${targetBranch} already exists; choose another --branch`);
     }
+    const outboxPath = options.outboxPath
+      ?? defaultDiscordAwarenessOutboxPath(options.storePath);
 
     const result: OfflineRecoveryBranchResult = {
       dryRun: options.dryRun === true,
@@ -210,15 +214,13 @@ export async function createOfflineRecoveryBranch(
       refs,
       unmarked: selection.unmarked,
       notRemoved: selection.notRemoved,
+      outboxPath,
     };
     if (options.dryRun) return result;
 
-    // The journal lives in this store; the host is stopped, so this process
-    // is its only writer.
-    const outbox = new DiscordAwarenessOutbox(store, {
-      legacyPath: options.outboxPath ?? defaultDiscordAwarenessOutboxPath(options.storePath),
-    });
-    const batch = outbox.prepare({
+    // The host is stopped, so this process is the ledger's only writer.
+    const outbox = new DiscordAwarenessOutbox(outboxPath, { store });
+    const batch = await outbox.prepare({
       agentName: options.agentName,
       sourceBranch,
       targetBranch,
@@ -228,9 +230,9 @@ export async function createOfflineRecoveryBranch(
       notRemoved: selection.notRemoved,
       emoji: options.emoji ?? DEFAULT_DISCORD_AWARENESS_EMOJI,
       // Merely seeing targetBranch active does not prove branch-local
-      // suppressions finished. Only the recovery operation may activate this
-      // batch after every removal below succeeds.
-      activationPolicy: suppression.intervals.length > 0 ? 'explicit' : 'target-branch',
+      // suppressions finished: a start on it applies them again while the
+      // batch is prepared. Only the recovery may activate it, after every
+      // removal below succeeds.
       suppressionIntervals: suppression.intervals.map((interval) => ({
         fromId: String(interval.fromId),
         toId: String(interval.toId),
@@ -292,28 +294,28 @@ export async function createOfflineRecoveryBranch(
               : 'the next start retires it') + `, none of its marks sent${redoFromSource}`;
         } else {
           try {
-            outbox.discard(batch.id);
+            await outbox.discard(batch.id);
             retire = `; awareness batch ${batch.id} retired, none of its marks sent${redo}`;
           } catch (discardError) {
             // None of its marks is ever sent: a start retires it. A
             // suppression's removals stay pending for its target branch: a
             // start on a branch with that name finishes them. A retirement
-            // can land before its durable barrier fails, so what the journal
+            // can reach the file before its write fails, so what the ledger
             // holds decides, as in the host's retireAfterRestore.
             const detail = boundDiscordAwarenessText(
               discardError instanceof Error ? discardError.message : String(discardError),
             );
             let landed: boolean | undefined;
             try {
-              landed = outbox.batchStatus(batch.id) === 'discarded';
+              landed = outbox.batchStatus(batch.id) === 'retired';
             } catch { /* unknown */ }
             const kept = `; awareness batch ${batch.id} could not be retired (${detail})` + (landed === undefined
-              ? ', and the journal can\'t be read back to tell whether its retirement landed; if it didn\'t, it stays '
+              ? ', and the ledger can\'t be read back to tell whether its retirement landed; if it didn\'t, it stays '
               : '; it stays ') + 'prepared, none of its marks to be sent';
             if (landed) {
-              retire = `; awareness batch ${batch.id} is retired, none of its marks sent, but the journal's sync ` +
-                `after its retirement failed (${detail}): an operating system crash or a power failure before the ` +
-                'store\'s next sync could lose that record, and the batch would then be prepared again at the next ' +
+              retire = `; awareness batch ${batch.id} is retired, none of its marks sent, but writing that didn't ` +
+                `complete (${detail}): an operating system crash or a power failure before the ledger's next write ` +
+                'could lose it, and the batch would then be prepared again at the next ' +
                 `start${suppression.intervals.length > 0 ? `, its removals pending for ${targetBranch}` : ''}${redo}`;
             } else if (suppression.intervals.length === 0) {
               retire = `${kept}, until the next start retires it${redo}`;
@@ -351,12 +353,12 @@ export async function createOfflineRecoveryBranch(
       notRemoved: selection.notRemoved,
     };
     let markers: SurgeryMarkerReceipt = { ...facts, status: 'none', queued: 0 };
-    let suppressionJournal: string | undefined;
+    let suppressionRecord: string | undefined;
     if (batch) {
-      const settled = outbox.settleActivation(batch.id);
+      const settled = await outbox.settleActivation(batch.id);
       if (batch.refs.length > 0) {
-        // A queued settlement's error: recorded, so delivered, but its sync
-        // failed, as the host's receipt says too.
+        // A queued settlement's error: recorded, so delivered, but writing
+        // it didn't complete, as the host's receipt says too.
         markers = settled.status === 'queued'
           ? {
             ...facts, status: 'queued', queued: settled.queued, batchId: batch.id,
@@ -367,23 +369,23 @@ export async function createOfflineRecoveryBranch(
             : { ...facts, status: 'unresolved', queued: 0, batchId: batch.id, error: settled.error };
       } else if (settled.status === 'queued') {
         // A suppression-only batch carries no marks, and its activation
-        // closes the body's resume journal: say if that record's sync failed.
+        // closes the body's resume record: say if writing that didn't complete.
         if (settled.error !== undefined) {
-          suppressionJournal = `the resume journal (awareness batch ${batch.id}, no marks) is closed, but the ` +
-            `journal's sync after it failed (${settled.error}): an operating system crash or a power failure before ` +
-            `the store's next sync could lose that record, and a start on ${targetBranch} then finds its removals ` +
-            'applied and closes it';
+          suppressionRecord = `the resume record (awareness batch ${batch.id}, no marks) is closed, but writing ` +
+            `that didn't complete (${settled.error}): an operating system crash or a power failure before the ` +
+            `ledger's next write could lose it, and a start on ${targetBranch} then finds its removals applied and ` +
+            'closes it';
         }
       } else {
         // If closing it failed, say what's left.
-        suppressionJournal = `the resume journal (awareness batch ${batch.id}, no marks) could not be closed ` +
+        suppressionRecord = `the resume record (awareness batch ${batch.id}, no marks) could not be closed ` +
           `(${settled.error}); ` + (settled.status === 'not-scheduled'
             ? 'it was retired instead, so nothing is left to resume'
-            : 'it stays prepared, unless the journal couldn\'t be read back and its closing record landed anyway; ' +
+            : 'it stays prepared, unless the ledger couldn\'t be read back and its closing reached it anyway; ' +
               `if it stays prepared, a start on ${targetBranch} finds its removals applied and closes it`);
       }
     }
-    return { ...result, discordMarkersQueued: markers.queued, markers, ...(suppressionJournal ? { suppressionJournal } : {}) };
+    return { ...result, discordMarkersQueued: markers.queued, markers, ...(suppressionRecord ? { suppressionRecord } : {}) };
   } finally {
     contextManager?.close();
     store.close();
