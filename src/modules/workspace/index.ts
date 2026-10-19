@@ -40,7 +40,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
-import { IGNORED, NONBLOCK, OTHER_MOUNT, ROOT_REPLACED, ROOT_UNAVAILABLE, checkDir, checkRoot, diskSpelling, filesystemTrustsCtime, inOtherMount, leadsInto, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, nestedAtReal, nestedHolder, passedOverAt, readPrefix, type CheckedDir, type LinkFound, type MountView, type NestedMount } from './observe.js';
+import { IGNORED, NONBLOCK, OTHER_MOUNT, ROOT_REPLACED, ROOT_UNAVAILABLE, checkDir, checkRoot, diskSpelling, filesystemTrustsCtime, inOtherMount, leadsInto, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, looksBinary, nestedAtReal, nestedHolder, observePath, passedOverAt, readBytes, readPrefix, sniffImageMime, walkScope, type CheckedDir, type LinkFound, type MountView, type NestedMount } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
 import {
   type MountRuntime,
@@ -73,6 +73,18 @@ const CATCH_UP_BOUND_MS = 30_000;
 const NOT_RUNNING = 'The workspace has stopped: it takes no more work until it starts again';
 /** The workspace's own deadline must end before the framework's hook bound. */
 const AGENT_ACTION_SCAN_DEADLINE_MAX_MS = TOOL_BATCH_HOOK_TIMEOUT_MS - 1_000;
+/** A direct mount's ignore list when its config names none (MountConfig.ignore). */
+const DIRECT_MOUNT_IGNORE: readonly string[] = ['node_modules', 'dist', '.git', 'build', 'coverage', 'target', '__pycache__', '.venv'];
+/**
+ * How many files a direct mount's grep reads, and its listings look at, at
+ * once. Over a layout of seven checkouts, 5,929 files, a direct grep reading
+ * 16 at a time on Node's default threadpool had a median time below the
+ * store-backed grep's over the same files at every load tried, and one
+ * reading them in turn took 2 to 2.4 times as long.
+ */
+const DIRECT_READS_AT_ONCE = 16;
+/** Why sync passes over a direct mount, as its result's `skipped` says. */
+const DIRECT_SYNC_SKIPPED = "a direct mount: its tools read disk as it is, so there's nothing to take in";
 
 export type {
   WorkspaceConfig,
@@ -835,16 +847,28 @@ export class WorkspaceModule implements Module {
    *  mounts, so restoration must be second-callback-safe like watcher
    *  startup already is (issue #72). Cleared after application. */
   private savedState: WorkspaceModuleState | null = null;
+  /**
+   * The mounts configured direct that run as 'chronicle' this session, with
+   * the changes the store held there that disk lacked (initStore), for
+   * ensureRunning to say once both halves of the lifecycle have run.
+   */
+  private notDirect = new Map<string, Array<{ path: string; what: string }>>();
 
   constructor(config: WorkspaceConfig) {
     for (const mount of config.mounts) {
       const cap: unknown = mount.walkCap;
       if (cap !== undefined && !(Number.isSafeInteger(cap) && (cap as number) > 0)) {
-        // Numbers as JavaScript writes them (JSON would say null for NaN), anything else as JSON.
-        const shown = typeof cap === 'number' ? String(cap) : typeof cap === 'bigint' ? `${cap}n` : JSON.stringify(cap) ?? String(cap);
         throw new Error(
-          `[workspace] Mount "${mount.name}": walkCap must be a positive integer no larger than ${Number.MAX_SAFE_INTEGER}, not ${shown}`,
+          `[workspace] Mount "${mount.name}": walkCap must be a positive integer no larger than ${Number.MAX_SAFE_INTEGER}, not ${shownValue(cap)}`,
         );
+      }
+      const backend: unknown = mount.backend;
+      if (backend !== undefined && backend !== 'chronicle' && backend !== 'direct') {
+        throw new Error(`[workspace] Mount "${mount.name}": backend must be 'chronicle' or 'direct', not ${shownValue(backend)}`);
+      }
+      const refused = backend === 'direct' ? directRefusals(mount) : [];
+      if (refused.length > 0) {
+        throw new Error(`[workspace] Mount "${mount.name}" is direct, which reads disk as it is with no store, watcher or push: ${refused.join('; ')}`);
       }
     }
     // Detect overlapping mount paths: a mount nested inside another is that
@@ -888,23 +912,31 @@ export class WorkspaceModule implements Module {
     // before the call, knowing no mount, and a later initStore starts clean.
     const mounts = new Map<string, MountState>();
     const intents = new Map<string, BranchIntents>();
+    // A direct mount's files never go into the store, so its states aren't
+    // made. One that ran as 'chronicle' before has them, and they're read
+    // below for what the store holds there that disk lacks.
+    const made = this.config.mounts.some((m) => m.backend === 'direct') ? new Set(store.listStates().map((s) => s.id)) : null;
 
     // Register tree states for each mount: the workspace tree, and the
     // branch-local intent that qualifies it.
     for (const mount of this.config.mounts) {
       const treeStateId = `workspace/${mount.name}/tree`;
       const intentTreeStateId = `workspace/${mount.name}/intent`;
-      for (const id of [treeStateId, intentTreeStateId]) {
-        ensureStateRegistered(store, {
-          id,
-          strategy: 'tree',
-          deltaSnapshotEvery: this.config.deltaSnapshotEvery ?? 50,
-          fullSnapshotEvery: this.config.fullSnapshotEvery ?? 10,
-        });
+      const direct = mount.backend === 'direct';
+      if (!direct) {
+        for (const id of [treeStateId, intentTreeStateId]) {
+          ensureStateRegistered(store, {
+            id,
+            strategy: 'tree',
+            deltaSnapshotEvery: this.config.deltaSnapshotEvery ?? 50,
+            fullSnapshotEvery: this.config.fullSnapshotEvery ?? 10,
+          });
+        }
       }
 
       mounts.set(mount.name, {
         config: mount,
+        direct,
         treeStateId,
         intentTreeStateId,
         lastMaterializedSeq: 0,
@@ -914,7 +946,9 @@ export class WorkspaceModule implements Module {
         watcherReadyAt: null,
         watcherError: null,
       });
-      intents.set(mount.name, new BranchIntents(store, intentTreeStateId));
+      if (!direct || (made!.has(treeStateId) && made!.has(intentTreeStateId))) {
+        intents.set(mount.name, new BranchIntents(store, intentTreeStateId));
+      }
     }
 
     this.store = store;
@@ -925,6 +959,24 @@ export class WorkspaceModule implements Module {
     // branch switch never rewinds it.
     this.agreement = new DiskAgreement(store, { modesObserved: () => this.modesObserved });
     this.agreement.open(this.config.mounts.map((m) => ({ name: m.name, root: resolve(m.path) })));
+
+    // A mount configured direct runs as 'chronicle' this session while the
+    // store holds changes there that disk lacks, so they stay in view
+    // (MountConfig.backend); ensureRunning says so. A path held more than
+    // one way is named for the last way set here.
+    this.notDirect = new Map();
+    for (const [name, state] of mounts) {
+      if (!state.direct || !this.intents.has(name)) continue;
+      const held = this.heldChanges(state);
+      const what = new Map<string, string>();
+      for (const path of held.owed) what.set(path, 'changed in the workspace');
+      for (const path of held.unreadable) what.set(path, "its workspace intent can't be read");
+      for (const path of held.deletions) what.set(path, 'deleted in the workspace');
+      for (const path of held.conflicts) what.set(path, 'in conflict');
+      if (what.size === 0) continue;
+      state.direct = false;
+      this.notDirect.set(name, [...what].sort(([a], [b]) => a.localeCompare(b)).map(([path, label]) => ({ path, what: label })));
+    }
 
     this.applySavedState();
     this.ensureRunning();
@@ -958,7 +1010,7 @@ export class WorkspaceModule implements Module {
    * A mount as observation reads it, with the root identity the workspace
    * recorded for it, if any: what a pass reads beneath (runtime), with
    * rootIdentity's, and what a disk read checks its root against (readRoot),
-   * with rootIdentityForRead's.
+   * with rootIdentityForRead's. A direct mount's has none (diskView).
    */
   private viewOf(mount: MountState, rootIdentity: MountView['rootIdentity']): MountView {
     return {
@@ -967,10 +1019,26 @@ export class WorkspaceModule implements Module {
       rootIdentity,
       followSymlinks: mount.config.followSymlinks === true,
       maxFileSize: mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE,
-      ignore: mount.config.ignore ?? [],
+      ignore: this.ignoreOf(mount),
       others: this.othersOf(mount.config.name),
       nested: this.nestedOf(mount.config.name),
     };
+  }
+
+  /** A mount's ignore list as it runs: its config's, or, for a direct mount that names none, the direct kind's default (MountConfig.ignore). */
+  private ignoreOf(mount: MountState): string[] {
+    return mount.config.ignore ?? (mount.direct ? [...DIRECT_MOUNT_IGNORE] : []);
+  }
+
+  /**
+   * A direct mount as its tools read it: its view, with no root identity,
+   * since it promises what's at its root now and keeps no evidence to check
+   * that against (MountConfig.backend), and its root as realpath resolves it,
+   * or as given where that fails, as a pass's runtime takes it.
+   */
+  private async diskView(mount: MountState): Promise<{ view: MountView; rootReal: string }> {
+    const root = resolve(mount.config.path);
+    return { view: this.viewOf(mount, undefined), rootReal: await realpath(root).catch(() => root) };
   }
 
   /** The view reconciliation needs of a mount, refreshed per pass. */
@@ -992,7 +1060,7 @@ export class WorkspaceModule implements Module {
       intents: this.intents.get(mount.config.name)!,
       readOnly: mount.config.mode === 'read-only',
       walkCap: mount.config.walkCap ?? WALK_CAP,
-      catchUpScan: (mount.config.watch ?? 'always') === 'always',
+      catchUpScan: watchOf(mount.config) === 'always',
       modesObserved: this.modesObserved,
     };
   }
@@ -1006,15 +1074,18 @@ export class WorkspaceModule implements Module {
    * spelling beside their own. So the start stops before a segment spelled
    * any other way, not there, or not a directory, and before a link, which
    * a walk of the whole mount doesn't go through either. It lists only
-   * directories it has checked lie inside the mount, and none the mount
-   * passes over by design, which the walk then answers for.
+   * directories it has checked lie inside the mount, and, on a 'chronicle'
+   * mount, none it passes over by design, which the walk then answers for.
+   * A direct mount walks a path its tools name whatever its ignore list or
+   * an editor's file name covers there (MountConfig.ignore), so there it
+   * lists such directories too, and only another mount's it doesn't.
    */
   private async walkStart(mount: MountState, base: string, beneath: string): Promise<string> {
     if (beneath === '') return base;
-    const { view, rootReal } = await this.runtime(mount);
+    const { view, rootReal } = mount.direct ? await this.diskView(mount) : await this.runtime(mount);
     let start = base;
     for (const segment of beneath.split('/')) {
-      if (start !== '' && passedOverAt(start, view.ignore, view.others) !== undefined) break;
+      if (start !== '' && (mount.direct ? inOtherMount(start, view.others) : passedOverAt(start, view.ignore, view.others) !== undefined)) break;
       const here = await checkDir(view, rootReal, start);
       if (here.kind !== 'checked') break;
       const entry = (await readdir(here.dir.real, { withFileTypes: true }).catch(() => [])).find((e) => e.name === segment);
@@ -1205,12 +1276,12 @@ export class WorkspaceModule implements Module {
    */
   private ensureRunning(): void {
     if (!this.ctx || this.mounts.size === 0) return;
+    for (const [name, held] of this.notDirect) this.sayNotDirect(name, held);
 
     for (const [name, mount] of this.mounts) {
       if (this.watchers.has(name)) continue;
 
-      const watchMode = mount.config.watch ?? 'always';
-      if (watchMode === 'always') {
+      if (watchOf(mount.config) === 'always') {
         // Chokidar is started with ignoreInitial:true, so changes made while
         // the session was down would be invisible. A catch-up pass takes them
         // in under the three-way rule: only real differences produce tree
@@ -1294,6 +1365,24 @@ export class WorkspaceModule implements Module {
     }
   }
 
+  /**
+   * Say, for whoever runs the host, that a mount configured direct runs as
+   * 'chronicle' this session (initStore), which changes the store holds there
+   * that disk lacks are why, and the two ways to start it direct: as an ops
+   * alert (the framework's failures log, its `ops:alert` trace and, where
+   * one is set, its webhook), and on stderr.
+   */
+  private sayNotDirect(name: string, held: Array<{ path: string; what: string }>): void {
+    const shown = held.slice(0, 10).map((h) => `"${name}/${h.path}" (${h.what})`).join(', ');
+    const more = held.length > 10 ? `, and ${held.length - 10} more` : '';
+    const message = `Mount "${name}" runs as 'chronicle' this session, though its config makes it direct: ` +
+      `the workspace holds changes there that disk lacks, which a direct mount wouldn't show: ${shown}${more}. ` +
+      'To start it direct, finish them (with the mount configured \'chronicle\' and read-write, materialize them) ' +
+      'or give them up (sync each path, which takes disk\'s copy); the first start that finds none starts it direct.';
+    console.warn(`[workspace] ${message}`);
+    this.ctx?.notifyOps?.('workspace-mount-not-direct', 'framework', message, { mount: name, held: held.length });
+  }
+
   private async initialScan(mountName: string): Promise<void> {
     const store = this.store;
     const mount = this.mounts.get(mountName);
@@ -1375,6 +1464,18 @@ export class WorkspaceModule implements Module {
   // ==========================================================================
 
   getTools(): ToolDefinition[] {
+    // Where a mount runs direct, three descriptions say what that changes.
+    // A host with none keeps them as they were, and its residents' caches.
+    const direct = [...this.mounts.values()].some((m) => m.direct);
+    const lsDirect = direct
+      ? ' A direct mount (ls without a path says which, with its ignore list) lists disk\'s files as they are now: each with '
+        + 'its size and no state, or a note where the mount doesn\'t take it. A path its ignore list covers is listed when you name it.'
+      : '';
+    const grepDirect = direct
+      ? ' On a direct mount, grep searches disk\'s files as they are now (version disk), and lists as skipped, with why, '
+        + 'those it doesn\'t: binary, over the size limit, or not read, such as a link the mount doesn\'t follow.'
+      : '';
+    const syncDirect = direct ? ' A direct mount is listed under `skipped`: its tools read disk as it is, so there\'s nothing to take in.' : '';
     return [
       {
         name: 'read',
@@ -1455,7 +1556,7 @@ export class WorkspaceModule implements Module {
           + 'interrupted) — sync the path to take disk, or materialize that path with force to take the workspace, '
           + 'with applyDeletions too where the workspace deleted it; '
           + 'disk-missing-provenance-unknown; unverified (disk could not be checked). `incomplete` names regions '
-          + 'the listing could not see.',
+          + 'the listing could not see.' + lsDirect,
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -1482,7 +1583,7 @@ export class WorkspaceModule implements Module {
           + 'which version matched: the workspace\'s (with its state); the disk version kept with a conflict '
           + '(conflicting-disk); or, once disk has changed since the conflict was recorded, that recorded version '
           + '(recorded-disk). Disk versions it could not search are listed as skipped: disk-only files (binary or '
-          + 'over the size limit), and a conflict\'s disk version that is binary, oversize, or newer than the one recorded.',
+          + 'over the size limit), and a conflict\'s disk version that is binary, oversize, or newer than the one recorded.' + grepDirect,
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -1548,7 +1649,7 @@ export class WorkspaceModule implements Module {
           + 'in another mount\'s directory isn\'t synced even when you name it: use the mount that holds it. Naming '
           + 'an ignored directory sets aside the patterns that cover it or a directory above it; one that '
           + 'covers only something inside it still applies, and what it covers is passed over, as are editors\' '
-          + 'files inside it.',
+          + 'files inside it.' + syncDirect,
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -1855,8 +1956,10 @@ export class WorkspaceModule implements Module {
 
   /**
    * Read a file's raw bytes from a mount (through the Chronicle tree, synced
-   * first like the `read` tool). Public API for the framework's synthesized
-   * `read_image` tool and other peer callers that need binary content.
+   * first like the `read` tool; on a direct mount, from disk as
+   * readBinaryFromDisk reads it, at most the mount's `maxFileSize`). Public
+   * API for the framework's synthesized `read_image` tool and other peer
+   * callers that need binary content.
    */
   async readBinary(
     mountPrefixedPath: string,
@@ -1875,6 +1978,8 @@ export class WorkspaceModule implements Module {
     } catch (error) {
       return { error: error instanceof Error ? error.message : String(error) };
     }
+    // A direct mount's bytes are disk's, as read takes them, at most its size limit.
+    if (mount.direct) return this.bytesFromDisk(mount, relativePath, mountPrefixedPath, mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE);
     const store = this.getStore();
     return this.withMount(mount, async () => {
       await this.ensureSynced(mount, relativePath);
@@ -1920,8 +2025,17 @@ export class WorkspaceModule implements Module {
     } catch (error) {
       return { error: error instanceof Error ? error.message : String(error) };
     }
-    const absolutePath = resolve(mount.config.path, relativePath);
-    const maxBytes = opts.maxBytes;
+    const read = await this.bytesFromDisk(mount, relativePath, mountPrefixedPath, opts.maxBytes);
+    return 'error' in read ? read : { data: read.data, absolutePath: resolve(mount.config.path, relativePath) };
+  }
+
+  /** A file's bytes as readBinaryFromDisk reads them, once its path is parsed. */
+  private async bytesFromDisk(
+    mount: MountState,
+    relativePath: string,
+    mountPrefixedPath: string,
+    maxBytes: number | undefined,
+  ): Promise<{ data: Buffer } | { error: string }> {
     let tooLarge: string | undefined;
     try {
       const { handle, fileStat } = await this.openContainedFile(mount, relativePath, mountPrefixedPath, (fileStat) => {
@@ -1931,14 +2045,14 @@ export class WorkspaceModule implements Module {
         }
       });
       try {
-        if (maxBytes === undefined) return { data: await handle.readFile(), absolutePath };
+        if (maxBytes === undefined) return { data: await handle.readFile() };
         // No more than maxBytes is loaded: a file grown past it since the
         // fstat above is refused here, as one already over it was there. Its
         // size is an fstat's after the read, and at least one more than the
         // bytes kept, so the refusal's size is always past maxBytes.
         const { bytes, more } = await readPrefix(handle, maxBytes, fileStat.size);
         if (more) return { error: `File too large: ${Math.max((await handle.stat()).size, bytes.length + 1)} > ${maxBytes} bytes` };
-        return { data: bytes, absolutePath };
+        return { data: bytes };
       } finally {
         await handle.close();
       }
@@ -2232,6 +2346,8 @@ export class WorkspaceModule implements Module {
    * which answers while the evidence awaits reopening; where even it can't
    * be read, as when the evidence was never read back whole, the read is
    * refused too, with an errno only where no directory is at the root's path.
+   * A direct mount's root is checked against no identity, and its read reads
+   * no evidence: it promises what's at its root now (diskView).
    */
   private async readRoot(mount: MountState): Promise<{ real: string; dir: CheckedDir }> {
     const name = mount.config.name;
@@ -2243,13 +2359,15 @@ export class WorkspaceModule implements Module {
       throw new WorkspaceReadError('mount_unavailable', `Mount unavailable: ${name}`, 'realpath_root', errnoOf(err));
     }
     let rootIdentity: MountView['rootIdentity'];
-    try {
-      rootIdentity = this.agreementOrThrow().rootIdentityForRead(name);
-    } catch (err) {
-      // The evidence can't be read back, so neither can the check be made.
-      // Where no directory is at the root's path, its errno still says so.
-      throw new WorkspaceReadError('mount_unavailable',
-        `Mount unavailable: ${name}: ${err instanceof Error ? err.message : String(err)}`, 'root', await rootAbsence(root));
+    if (!mount.direct) {
+      try {
+        rootIdentity = this.agreementOrThrow().rootIdentityForRead(name);
+      } catch (err) {
+        // The evidence can't be read back, so neither can the check be made.
+        // Where no directory is at the root's path, its errno still says so.
+        throw new WorkspaceReadError('mount_unavailable',
+          `Mount unavailable: ${name}: ${err instanceof Error ? err.message : String(err)}`, 'root', await rootAbsence(root));
+      }
     }
     const checked = await checkRoot(this.viewOf(mount, rootIdentity), real);
     if ('dir' in checked) return { real, dir: checked.dir };
@@ -2492,7 +2610,9 @@ export class WorkspaceModule implements Module {
    * - Once the workspace has recorded the mount root's identity, with the
    *   first evidence it gathers there, a root that is another directory is
    *   an unavailable mount: a replaced directory, a link swapped in for it,
-   *   or an unmounted drive's mountpoint. In any mount, recorded or not, a
+   *   or an unmounted drive's mountpoint. A direct mount's reads check no
+   *   recorded identity: they read beneath whatever directory is at its
+   *   root (MountConfig.backend). In any mount, recorded or not, a
    *   root that stops being the directory the read checked until the file
    *   has been opened and checked is unavailable too: with ENOENT or
    *   ENOTDIR where no directory is there, as before the read, and with no
@@ -2810,6 +2930,60 @@ export class WorkspaceModule implements Module {
     }
   }
 
+  /**
+   * A file's bytes for read, from where the mount keeps what it reads: the
+   * workspace's copy, taken in from disk first where it holds none
+   * (ensureSynced); or, on a direct mount, disk's file as it is now
+   * (bytesOnDisk). An error says why there are none to read.
+   */
+  private async bytesOf(mount: MountState, relativePath: string, path: string): Promise<{ bytes: Buffer } | { error: string }> {
+    if (mount.direct) return this.bytesOnDisk(mount, relativePath, path);
+    const store = this.getStore();
+    return this.withMount(mount, async () => {
+      const report = await this.ensureSynced(mount, relativePath);
+      const entry = store.treeGet(mount.treeStateId, relativePath);
+      if (!entry) return { error: this.notInWorkspace(path, report) };
+      const blob = store.getBlob(entry.blobHash);
+      if (!blob) return { error: `Blob not found for: ${path}` };
+      return { bytes: blob };
+    });
+  }
+
+  /**
+   * A direct mount's file for read: its bytes on disk as they are now,
+   * through the mount's boundary as readFileFromDisk reaches them
+   * (openContainedFile), whose refusals are the answer. What a 'chronicle'
+   * mount never stores, it doesn't show either: a file over the mount's
+   * size limit, and a binary one, with a NUL in its first 8 KB, which
+   * read_image reads where it's an image.
+   */
+  private async bytesOnDisk(mount: MountState, relativePath: string, path: string): Promise<{ bytes: Buffer } | { error: string }> {
+    const maxSize = mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
+    const over = `${path} is over the size limit (${maxSize} bytes), so read doesn't show it.`;
+    let opened: Awaited<ReturnType<WorkspaceModule['openContainedFile']>>;
+    try {
+      opened = await this.openContainedFile(mount, relativePath, path, (fileStat) => {
+        if (fileStat.size > maxSize) throw new Error(over);
+      });
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : String(err) };
+    }
+    try {
+      // No more than the limit is loaded, as for a file over it at its fstat.
+      const { bytes, more } = await readPrefix(opened.handle, maxSize, opened.fileStat.size);
+      if (more) return { error: over };
+      if (looksBinary(bytes)) {
+        return { error: `${path} is binary, so read doesn't show it as text${sniffImageMime(bytes) ? '; read it with read_image.' : '.'}` };
+      }
+      return { bytes };
+    } catch (err) {
+      const errno = errnoOf(err);
+      return { error: `Unable to read file: ${path}${errno ? ` (${errno})` : ''}` };
+    } finally {
+      await opened.handle.close();
+    }
+  }
+
   // ==========================================================================
   // Tool Handlers
   // ==========================================================================
@@ -2827,17 +3001,9 @@ export class WorkspaceModule implements Module {
     if (content === undefined) {
       const { mount, relativePath, path } = await this.parseFilePath(input.path);
       input = { ...input, path };
-      const store = this.getStore();
-      const found = await this.withMount(mount, async (): Promise<{ text: string } | { error: string }> => {
-        const report = await this.ensureSynced(mount, relativePath);
-        const entry = store.treeGet(mount.treeStateId, relativePath);
-        if (!entry) return { error: this.notInWorkspace(input.path, report) };
-        const blob = store.getBlob(entry.blobHash);
-        if (!blob) return { error: `Blob not found for: ${input.path}` };
-        return { text: blob.toString('utf-8') };
-      });
+      const found = await this.bytesOf(mount, relativePath, path);
       if ('error' in found) return { success: false, error: found.error, isError: true };
-      content = found.text;
+      content = found.bytes.toString('utf-8');
     }
     if (characterPaging) {
       const start = Math.min(offsetChars, content.length);
@@ -2931,48 +3097,23 @@ export class WorkspaceModule implements Module {
     const maxSize = mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
     let treeError: WorkspaceImageReadError | null = null;
 
-    try {
-      const image = this.tryReadImageFromTree(mount, relativePath, input.path, maxSize);
-      if (image) {
-        return {
-          success: true,
-          data: [
-            {
-              type: 'text',
-              text: `Path: ${input.path}\nMIME: ${image.mimeType}\nBytes: ${image.bytes.byteLength}`,
-            },
-            {
-              type: 'image',
-              data: image.bytes.toString('base64'),
-              mimeType: image.mimeType,
-            },
-          ],
-        };
-      }
-    } catch (err) {
-      if (err instanceof WorkspaceImageReadError) {
-        treeError = err;
-      } else {
-        throw err;
+    // The workspace's copy first, where it holds one, then disk's. A direct
+    // mount holds none, so its image is disk's.
+    if (!mount.direct) {
+      try {
+        const image = this.tryReadImageFromTree(mount, relativePath, input.path, maxSize);
+        if (image) return imageResult(input.path, image);
+      } catch (err) {
+        if (err instanceof WorkspaceImageReadError) {
+          treeError = err;
+        } else {
+          throw err;
+        }
       }
     }
 
     try {
-      const image = await this.readImageFromFilesystem(mount, relativePath, input.path, maxSize);
-      return {
-        success: true,
-        data: [
-          {
-            type: 'text',
-            text: `Path: ${input.path}\nMIME: ${image.mimeType}\nBytes: ${image.bytes.byteLength}`,
-          },
-          {
-            type: 'image',
-            data: image.bytes.toString('base64'),
-            mimeType: image.mimeType,
-          },
-        ],
-      };
+      return imageResult(input.path, await this.readImageFromFilesystem(mount, relativePath, input.path, maxSize));
     } catch (err) {
       if (err instanceof WorkspaceImageReadError) {
         if (err.code === 'not_found' && treeError) {
@@ -3215,14 +3356,14 @@ export class WorkspaceModule implements Module {
   }
 
   private async handleLs(input: LsInput): Promise<ToolResult> {
-    const store = this.getStore();
-
     if (!input.path) {
-      // List all mounts
+      // List all mounts, with a direct mount's kind and the ignore list it
+      // walks by, whose default no config shows.
       const mounts = [...this.mounts.entries()].map(([name, m]) => ({
         name,
         path: m.config.path,
         mode: m.config.mode,
+        ...(m.direct ? { backend: 'direct', ignore: this.ignoreOf(m) } : {}),
       }));
       return { success: true, data: { mounts } };
     }
@@ -3232,46 +3373,120 @@ export class WorkspaceModule implements Module {
     const recursive = input.recursive === true;
 
     // Every listing checks the paths it shows against disk first, under the
-    // three-way rule, whatever the mount's watch mode.
-    return this.withMount(mount, async (): Promise<ToolResult> => {
-      const pass = await this.passUnlocked(mount, { kind: 'dir', dir: relativePath, recursive });
-      const reports = [...pass.reports.values()].sort((a, b) => a.path.localeCompare(b.path));
-      const incomplete = pass.incomplete.length > 0 ? { incomplete: pass.incomplete } : {};
-
-      if (recursive) {
-        return {
-          success: true,
-          data: {
-            path: input.path,
-            entries: reports.map((r) => ({ path: r.path, ...stateView(r) })),
-            count: reports.length,
-            ...incomplete,
-          },
-        };
-      }
-
-      // Non-recursive: the scope's files, and the directories beneath it that
-      // disk or the workspace has.
-      const prefix = relativePath ? relativePath + '/' : '';
-      const dirNames = new Set(pass.dirs.map((d) => d.slice(prefix.length)));
-      for (const entry of store.treeList(mount.treeStateId, prefix || undefined)) {
-        const slash = entry.path.indexOf('/', prefix.length);
-        if (slash >= 0) dirNames.add(entry.path.slice(prefix.length, slash));
-      }
-      const children: Array<Record<string, unknown>> = [
-        ...[...dirNames].sort().map((name) => ({ name, type: 'directory' })),
-        ...reports.map((r) => ({ name: r.path.slice(prefix.length), type: 'file', ...stateView(r) })),
-      ];
+    // three-way rule, whatever the mount's watch mode; a direct mount's
+    // shows disk's.
+    const listing = await this.listingOf(mount, relativePath, recursive);
+    const incomplete = listing.incomplete.length > 0 ? { incomplete: listing.incomplete } : {};
+    if (recursive) {
       return {
         success: true,
         data: {
           path: input.path,
-          entries: children,
-          count: children.length,
+          entries: listing.files,
+          count: listing.files.length,
           ...incomplete,
         },
       };
+    }
+
+    // Non-recursive: the scope's files, and the directories beneath it.
+    const prefix = relativePath ? relativePath + '/' : '';
+    const children: Array<Record<string, unknown>> = [
+      ...listing.dirs.map((d) => d.slice(prefix.length)).sort().map((name) => ({ name, type: 'directory' })),
+      ...listing.files.map(({ path: file, ...view }) => ({ name: file.slice(prefix.length), type: 'file', ...view })),
+    ];
+    return {
+      success: true,
+      data: {
+        path: input.path,
+        entries: children,
+        count: children.length,
+        ...incomplete,
+      },
+    };
+  }
+
+  /**
+   * What a listing shows of a directory scope, from where the mount keeps
+   * what it reads: the store-backed kind's pass (listingFromStore), or, on a
+   * direct mount, disk (listingFromDisk). `keep` chooses the files shown.
+   */
+  private listingOf(mount: MountState, dir: string, recursive: boolean, keep?: (path: string) => boolean): Promise<Listing> {
+    return mount.direct ? this.listingFromDisk(mount, dir, recursive, keep) : this.listingFromStore(mount, dir, recursive, keep);
+  }
+
+  /**
+   * A 'chronicle' mount's listing: a pass over the scope under the three-way
+   * rule, each path it decided with its state, and the directories beneath
+   * the scope that disk or the workspace has.
+   */
+  private listingFromStore(mount: MountState, dir: string, recursive: boolean, keep?: (path: string) => boolean): Promise<Listing> {
+    const store = this.getStore();
+    return this.withMount(mount, async (): Promise<Listing> => {
+      const pass = await this.passUnlocked(mount, { kind: 'dir', dir, recursive });
+      const files = [...pass.reports.values()]
+        .sort((a, b) => a.path.localeCompare(b.path))
+        .filter((report) => keep === undefined || keep(report.path))
+        .map((report) => ({ path: report.path, ...stateView(report) }));
+      if (recursive) return { files, dirs: [], incomplete: pass.incomplete };
+      // Read with the pass's reports, on the branch it decided on, before
+      // anything else takes the mount's turn.
+      const dirs = new Set(pass.dirs);
+      const prefix = dir ? dir + '/' : '';
+      for (const entry of store.treeList(mount.treeStateId, prefix || undefined)) {
+        const slash = entry.path.indexOf('/', prefix.length);
+        if (slash >= 0) dirs.add(entry.path.slice(0, slash));
+      }
+      return { files, dirs: [...dirs], incomplete: pass.incomplete };
     });
+  }
+
+  /**
+   * A direct mount's listing: its walk of the scope (diskWalk), with each
+   * entry it took as disk has it now, observed as a pass observes it: a
+   * file's size, or why the mount doesn't take it (a link it doesn't follow,
+   * one that leaves the mount, what isn't a regular file). A file gone since
+   * the walk listed it is no longer there to show.
+   */
+  private async listingFromDisk(mount: MountState, dir: string, recursive: boolean, keep?: (path: string) => boolean): Promise<Listing> {
+    const { view, rootReal, taken, dirs, incomplete } = await this.diskWalk(mount, dir, recursive);
+    const files: Listing['files'] = [];
+    await inOrder(taken.filter((path) => keep === undefined || keep(path)), DIRECT_READS_AT_ONCE, (path) => observePath(view, rootReal, path), (seen, path) => {
+      if (seen.kind === 'file') files.push({ path, size: seen.size });
+      else if (seen.kind === 'unobserved') files.push({ path, note: seen.reason });
+    });
+    return { files, dirs, incomplete };
+  }
+
+  /**
+   * A direct mount's walk of a scope, from its view (diskView): the entries
+   * it took that aren't directories (files, links and the like), in path
+   * order; the directories directly beneath a scope it doesn't descend; and
+   * the regions it couldn't see that a pass reports beside no tracked file:
+   * what it couldn't list, what the cap left, and a scope in another mount's
+   * directory, said as a listing says it. A path the walk names is walked
+   * whatever the mount's ignore list or an editor's file name covers there
+   * (MountConfig.ignore), as a path sync's walk is.
+   */
+  private async diskWalk(mount: MountState, dir: string, recursive: boolean): Promise<{
+    view: MountView; rootReal: string; taken: string[]; dirs: string[]; incomplete: Array<{ path: string; reason: string }>;
+  }> {
+    const { view, rootReal } = await this.diskView(mount);
+    const walk = await walkScope(view, rootReal, dir, recursive, mount.config.walkCap ?? WALK_CAP, { named: true });
+    const incomplete = walk.incomplete
+      .filter((region) => region.kind === 'error' || region.kind === 'cap' || (region.kind === 'ignored' && region.path === dir && dir !== ''))
+      .map((region) => ({
+        path: region.path,
+        reason: region.reason === OTHER_MOUNT ? this.otherMountNote(mount.config.name, region.path, 'list') : region.reason,
+      }));
+    return {
+      view,
+      rootReal,
+      taken: [...walk.files, ...walk.othersTaken].sort((a, b) => a.localeCompare(b)),
+      // A walk that doesn't descend sees the scope's own subdirectories alone.
+      dirs: recursive ? [] : [...walk.dirs],
+      incomplete,
+    };
   }
 
   private async handleGlob(input: GlobInput): Promise<ToolResult> {
@@ -3290,15 +3505,10 @@ export class WorkspaceModule implements Module {
     const patternDir = literalDirOf(input.pattern);
     for (const { mount, relativePath } of mountsToSearch) {
       const start = await this.walkStart(mount, relativePath, patternDir);
-      const pass = await this.withMount(mount, () =>
-        this.passUnlocked(mount, { kind: 'dir', dir: start, recursive: true }));
-      for (const report of [...pass.reports.values()].sort((a, b) => a.path.localeCompare(b.path))) {
-        const testPath = relativePath ? report.path.slice(relativePath.length + 1) : report.path;
-        if (regex.test(testPath)) {
-          matches.push({ path: `${mount.config.name}/${report.path}`, ...stateView(report) });
-        }
-      }
-      for (const region of pass.incomplete) {
+      const matched = (path: string) => regex.test(relativePath ? path.slice(relativePath.length + 1) : path);
+      const listing = await this.listingOf(mount, start, true, matched);
+      for (const { path, ...view } of listing.files) matches.push({ path: `${mount.config.name}/${path}`, ...view });
+      for (const region of listing.incomplete) {
         incomplete.push({ path: `${mount.config.name}/${region.path}`, reason: region.reason });
       }
     }
@@ -3315,7 +3525,6 @@ export class WorkspaceModule implements Module {
   }
 
   private async handleGrep(input: GrepInput): Promise<ToolResult> {
-    const store = this.getStore();
     let regex: RegExp;
     try {
       regex = new RegExp(input.pattern);
@@ -3337,8 +3546,8 @@ export class WorkspaceModule implements Module {
       : [...this.mounts.values()].map(m => ({ mount: m, relativePath: '' }));
 
     type GrepMatch = { line: number; text: string; context?: string[] };
-    const results: Array<{ file: string; state: string; version: 'workspace' | 'conflicting-disk' | 'recorded-disk'; matches: GrepMatch[] }> = [];
-    const skipped: Array<{ file: string; reason: string; size?: number; mimeType?: string }> = [];
+    const results: Array<{ file: string; state?: string; version: GrepText['version']; matches: GrepMatch[] }> = [];
+    const skipped: GrepSkip[] = [];
     const incomplete: Array<{ path: string; reason: string }> = [];
 
     const search = (content: string): GrepMatch[] => {
@@ -3371,110 +3580,16 @@ export class WorkspaceModule implements Module {
       const deeper = deeperOf(relativePath, filterDir);
       if (deeper === null) continue;
       const start = await this.walkStart(mount, relativePath, deeper === relativePath ? '' : deeper.slice(relativePath ? relativePath.length + 1 : 0));
-      await this.withMount(mount, async () => {
-        // A `path` naming a single file greps just that file; otherwise it is a
-        // directory prefix. (A file path once produced the prefix "notes.md/"
-        // and silently matched nothing.)
-        const fileScope = relativePath !== '' && (
-          store.treeGet(mount.treeStateId, relativePath) !== null ||
-          await lstat(join(mount.config.path, relativePath)).then((s) => !s.isDirectory(), () => false)
-        );
-        // What follows reads the tree and branch intent to go with the pass's
-        // reports, synchronously. They must be the branch the pass decided
-        // on: one selected in between would label its content with the other
-        // branch's states. So a pass whose branch is no longer selected runs
-        // again, and a branch that keeps changing leaves the scope unsearched.
-        //
-        // A copy held at a path that now leads into a nested mount's directory
-        // through a link is that mount's file too: read refuses it
-        // (parseFilePath), so grep searches none of it and says why. The pass
-        // can't check such a path's disk, so only an unverified one can be
-        // one. Asking awaits disk, so it's done before the branch is
-        // compared, and a branch selected meanwhile runs the pass again.
-        let pass: PassResult | null = null;
-        let refused = new Map<string, string>();
-        for (let attempt = 0; attempt < 3 && pass === null; attempt++) {
-          const next = await this.passUnlocked(mount, fileScope
-            ? { kind: 'paths', paths: [relativePath] }
-            : { kind: 'dir', dir: start, recursive: true });
-          const asked = new Map<string, string>();
-          for (const report of next.reports.values()) {
-            if (report.state !== 'unverified') continue;
-            const refusal = await this.leadsIntoNested(mount, report.path, `${mount.config.name}/${report.path}`);
-            if (refusal) asked.set(report.path, refusal.message);
-          }
-          if (next.branchId === undefined || next.branchId === store.currentBranch().id) {
-            pass = next;
-            refused = asked;
-          }
-        }
-        if (pass === null) {
-          incomplete.push({
-            path: `${mount.config.name}/${relativePath}`,
-            reason: 'the selected branch kept changing while grep ran; nothing here was searched — grep again',
-          });
-          return;
-        }
-        for (const region of pass.incomplete) {
-          incomplete.push({ path: `${mount.config.name}/${region.path}`, reason: region.reason });
-        }
-
-        const intents = this.intents.get(mount.config.name)!;
-        for (const report of [...pass.reports.values()].sort((a, b) => a.path.localeCompare(b.path))) {
-          if (fileGlob && !fileGlob.test(report.path)) continue;
-          const file = `${mount.config.name}/${report.path}`;
-          if (report.state === 'disk-only') {
-            skipped.push({
-              file,
-              reason: 'disk-only: binary or over the size limit, never stored',
-              ...(report.size !== undefined ? { size: report.size } : {}),
-              ...(report.mimeType ? { mimeType: report.mimeType } : {}),
-            });
-            continue;
-          }
-          // A path in another mount's directory is that mount's: grep gives
-          // none of this mount's copy of it, as read refuses it. Beneath a
-          // scope it's passed over by design, like the directory.
-          if (inOtherMount(report.path, this.othersOf(mount.config.name))) continue;
-          const refusal = refused.get(report.path);
-          if (refusal !== undefined) {
-            skipped.push({ file, reason: refusal });
-            continue;
-          }
-          // The workspace's version, labelled with the path's state.
-          const entry = store.treeGet(mount.treeStateId, report.path);
-          const blob = entry ? store.getBlob(entry.blobHash) : null;
-          if (blob) {
-            const found = search(blob.toString('utf-8'));
-            if (found.length > 0) results.push({ file, state: report.state, version: 'workspace', matches: found });
-          } else if (entry) {
-            skipped.push({ file, reason: 'the workspace copy is missing from the store, so it was not searched' });
-          }
-          if (report.state !== 'conflict') continue;
-          // A conflict's disk side. The version recorded with the conflict is
-          // disk's only while disk still holds it; once disk has changed
-          // since, it is labelled as recorded, and a file disk holds now
-          // (never stored) is listed as not searched. A binary or oversize
-          // disk version was never stored either.
-          const disk = intents.get(report.path)?.conflict?.disk;
-          const changed = report.conflict?.diskChangedSinceRecorded === true;
-          const diskBlob = disk?.stored ? store.getBlob(disk.stored) : null;
-          if (diskBlob) {
-            const found = search(diskBlob.toString('utf-8'));
-            if (found.length > 0) results.push({ file, state: report.state, version: changed ? 'recorded-disk' : 'conflicting-disk', matches: found });
-          }
-          if (disk?.stored && !diskBlob) {
-            skipped.push({ file, reason: 'conflict: the disk version recorded with the conflict is missing from the store, so it was not searched' });
-          }
-          if (changed) {
-            if (report.diskNow === 'file') {
-              skipped.push({ file, reason: 'conflict: disk changed since the conflict was recorded; grep searches stored text, so the file disk holds now was not searched' });
-            }
-          } else if (disk && !disk.stored) {
-            skipped.push({ file, reason: 'conflict: the disk version is binary or over the size limit, never stored', size: disk.size });
-          }
-        }
-      });
+      const searched = (text: GrepText): void => {
+        const matches = search(text.text);
+        if (matches.length > 0) results.push({ file: text.file, ...(text.state !== undefined ? { state: text.state } : {}), version: text.version, matches });
+      };
+      const kept = (path: string): boolean => fileGlob === null || fileGlob.test(path);
+      const found = mount.direct
+        ? await this.textsFromDisk(mount, relativePath, start, kept, searched)
+        : await this.textsFromStore(mount, relativePath, start, kept, searched);
+      skipped.push(...found.skipped);
+      incomplete.push(...found.incomplete);
     }
 
     return {
@@ -3489,6 +3604,168 @@ export class WorkspaceModule implements Module {
     };
   }
 
+  /**
+   * The texts a 'chronicle' mount's grep searches beneath `start`, or in the
+   * single file `relativePath` names, those `keep` lets through, each handed
+   * to `each` in path order: a pass over the scope, then each path's
+   * workspace copy, labelled with its state, and a conflict's disk side.
+   * What it doesn't search is in `skipped`, and what it couldn't see in
+   * `incomplete`, each mount-prefixed.
+   */
+  private async textsFromStore(
+    mount: MountState,
+    relativePath: string,
+    start: string,
+    keep: (path: string) => boolean,
+    each: (text: GrepText) => void,
+  ): Promise<{ skipped: GrepSkip[]; incomplete: Array<{ path: string; reason: string }> }> {
+    const store = this.getStore();
+    const skipped: GrepSkip[] = [];
+    const incomplete: Array<{ path: string; reason: string }> = [];
+    await this.withMount(mount, async () => {
+      // A `path` naming a single file greps just that file; otherwise it is a
+      // directory prefix. (A file path once produced the prefix "notes.md/"
+      // and silently matched nothing.)
+      const fileScope = relativePath !== '' && (
+        store.treeGet(mount.treeStateId, relativePath) !== null ||
+        await lstat(join(mount.config.path, relativePath)).then((s) => !s.isDirectory(), () => false)
+      );
+      // What follows reads the tree and branch intent to go with the pass's
+      // reports, synchronously. They must be the branch the pass decided
+      // on: one selected in between would label its content with the other
+      // branch's states. So a pass whose branch is no longer selected runs
+      // again, and a branch that keeps changing leaves the scope unsearched.
+      //
+      // A copy held at a path that now leads into a nested mount's directory
+      // through a link is that mount's file too: read refuses it
+      // (parseFilePath), so grep searches none of it and says why. The pass
+      // can't check such a path's disk, so only an unverified one can be
+      // one. Asking awaits disk, so it's done before the branch is
+      // compared, and a branch selected meanwhile runs the pass again.
+      let pass: PassResult | null = null;
+      let refused = new Map<string, string>();
+      for (let attempt = 0; attempt < 3 && pass === null; attempt++) {
+        const next = await this.passUnlocked(mount, fileScope
+          ? { kind: 'paths', paths: [relativePath] }
+          : { kind: 'dir', dir: start, recursive: true });
+        const asked = new Map<string, string>();
+        for (const report of next.reports.values()) {
+          if (report.state !== 'unverified') continue;
+          const refusal = await this.leadsIntoNested(mount, report.path, `${mount.config.name}/${report.path}`);
+          if (refusal) asked.set(report.path, refusal.message);
+        }
+        if (next.branchId === undefined || next.branchId === store.currentBranch().id) {
+          pass = next;
+          refused = asked;
+        }
+      }
+      if (pass === null) {
+        incomplete.push({
+          path: `${mount.config.name}/${relativePath}`,
+          reason: 'the selected branch kept changing while grep ran; nothing here was searched — grep again',
+        });
+        return;
+      }
+      for (const region of pass.incomplete) {
+        incomplete.push({ path: `${mount.config.name}/${region.path}`, reason: region.reason });
+      }
+
+      const intents = this.intents.get(mount.config.name)!;
+      for (const report of [...pass.reports.values()].sort((a, b) => a.path.localeCompare(b.path))) {
+        if (!keep(report.path)) continue;
+        const file = `${mount.config.name}/${report.path}`;
+        if (report.state === 'disk-only') {
+          skipped.push({
+            file,
+            reason: 'disk-only: binary or over the size limit, never stored',
+            ...(report.size !== undefined ? { size: report.size } : {}),
+            ...(report.mimeType ? { mimeType: report.mimeType } : {}),
+          });
+          continue;
+        }
+        // A path in another mount's directory is that mount's: grep gives
+        // none of this mount's copy of it, as read refuses it. Beneath a
+        // scope it's passed over by design, like the directory.
+        if (inOtherMount(report.path, this.othersOf(mount.config.name))) continue;
+        const refusal = refused.get(report.path);
+        if (refusal !== undefined) {
+          skipped.push({ file, reason: refusal });
+          continue;
+        }
+        // The workspace's version, labelled with the path's state.
+        const entry = store.treeGet(mount.treeStateId, report.path);
+        const blob = entry ? store.getBlob(entry.blobHash) : null;
+        if (blob) {
+          each({ file, state: report.state, version: 'workspace', text: blob.toString('utf-8') });
+        } else if (entry) {
+          skipped.push({ file, reason: 'the workspace copy is missing from the store, so it was not searched' });
+        }
+        if (report.state !== 'conflict') continue;
+        // A conflict's disk side. The version recorded with the conflict is
+        // disk's only while disk still holds it; once disk has changed
+        // since, it is labelled as recorded, and a file disk holds now
+        // (never stored) is listed as not searched. A binary or oversize
+        // disk version was never stored either.
+        const disk = intents.get(report.path)?.conflict?.disk;
+        const changed = report.conflict?.diskChangedSinceRecorded === true;
+        const diskBlob = disk?.stored ? store.getBlob(disk.stored) : null;
+        if (diskBlob) {
+          each({ file, state: report.state, version: changed ? 'recorded-disk' : 'conflicting-disk', text: diskBlob.toString('utf-8') });
+        }
+        if (disk?.stored && !diskBlob) {
+          skipped.push({ file, reason: 'conflict: the disk version recorded with the conflict is missing from the store, so it was not searched' });
+        }
+        if (changed) {
+          if (report.diskNow === 'file') {
+            skipped.push({ file, reason: 'conflict: disk changed since the conflict was recorded; grep searches stored text, so the file disk holds now was not searched' });
+          }
+        } else if (disk && !disk.stored) {
+          skipped.push({ file, reason: 'conflict: the disk version is binary or over the size limit, never stored', size: disk.size });
+        }
+      }
+    });
+    return { skipped, incomplete };
+  }
+
+  /**
+   * The texts a direct mount's grep searches beneath `start`, or in the
+   * single file `relativePath` names, those `keep` lets through, each handed
+   * to `each` in path order: each file its walk took (diskWalk), read from
+   * disk as it is now, DIRECT_READS_AT_ONCE at a time. A file over the size
+   * limit, a binary one and one the mount doesn't take are in `skipped`,
+   * each with why, as a 'chronicle' mount's grep lists what it never stored;
+   * one gone since the walk listed it isn't there to search.
+   */
+  private async textsFromDisk(
+    mount: MountState,
+    relativePath: string,
+    start: string,
+    keep: (path: string) => boolean,
+    each: (text: GrepText) => void,
+  ): Promise<{ skipped: GrepSkip[]; incomplete: Array<{ path: string; reason: string }> }> {
+    const name = mount.config.name;
+    const fileScope = relativePath !== '' && await lstat(join(mount.config.path, relativePath)).then((s) => !s.isDirectory(), () => false);
+    const { view, rootReal, taken, incomplete } = fileScope
+      ? { ...(await this.diskView(mount)), taken: [relativePath], incomplete: [] }
+      : await this.diskWalk(mount, start, true);
+    const maxSize = mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
+    const skipped: GrepSkip[] = [];
+    await inOrder(taken.filter(keep), DIRECT_READS_AT_ONCE, (path) => readBytes(view, rootReal, path, maxSize), (read, path) => {
+      const file = `${name}/${path}`;
+      if (read.kind === 'absent') return;
+      if (read.kind === 'unobserved') {
+        skipped.push({ file, reason: read.reason });
+        return;
+      }
+      const mimeType = sniffImageMime(read.head);
+      const what = { size: read.size, ...(mimeType ? { mimeType } : {}) };
+      if (read.bytes === null) skipped.push({ file, reason: `over the size limit (${maxSize} bytes)`, ...what });
+      else if (looksBinary(read.head)) skipped.push({ file, reason: 'binary: a NUL in its first 8 KB', ...what });
+      else each({ file, version: 'disk', text: read.bytes.toString('utf-8') });
+    });
+    return { skipped, incomplete: incomplete.map((region) => ({ path: `${name}/${region.path}`, reason: region.reason })) };
+  }
+
   private async handleStatus(input: StatusInput): Promise<ToolResult> {
     const store = this.getStore();
     const status: Record<string, unknown> = {};
@@ -3498,25 +3775,22 @@ export class WorkspaceModule implements Module {
 
     for (const [name, mount] of this.mounts) {
       if (input.mount !== undefined && name !== input.mount) continue;
+      if (mount.direct) {
+        // A direct mount keeps nothing to count: its kind, and the ignore
+        // list its walks go by, whose default no config shows.
+        status[name] = { path: mount.config.path, mode: mount.config.mode, backend: 'direct', ignore: this.ignoreOf(mount) };
+        continue;
+      }
       const entries = store.treeList(mount.treeStateId);
       const currentSeq = store.currentSequence();
-      const own = this.ownPaths(mount);
-      const intents = this.intents.get(name)!.list().filter(([p]) => own(p));
-      const conflictPaths = intents.filter(([, bi]) => bi.conflict).map(([p]) => p);
-      // A workspace deletion is pending until a push confirms it on disk:
-      // left there without applyDeletions, or unlinked but unconfirmed.
-      const deletionPaths = intents.filter(([, bi]) => bi.tombstone).map(([p]) => p);
-      // Pending is what disk owes by the evidence: every entry it doesn't
-      // show on disk (a refused or failed push stays owed), conflicts and
-      // deletions. An entry from before the evidence isn't counted until a
-      // listing or a materialize checks it: unchecked isn't unpushed.
-      const pending = new Set([...conflictPaths, ...deletionPaths, ...this.entriesByEvidence(mount).owed]);
+      const { conflicts: conflictPaths, deletions: deletionPaths, owed } = this.heldChanges(mount);
+      const pending = new Set([...conflictPaths, ...deletionPaths, ...owed]);
 
       const currentBranch = store.currentBranch();
       status[name] = {
         path: mount.config.path,
         mode: mount.config.mode,
-        watch: mount.config.watch ?? 'always',
+        watch: watchOf(mount.config),
         fileCount: entries.length,
         lastMaterializedSeq: mount.lastMaterializedSeq,
         currentSeq,
@@ -3532,6 +3806,29 @@ export class WorkspaceModule implements Module {
     }
 
     return { success: true, data: status };
+  }
+
+  /**
+   * What the store holds of a mount that disk lacks, on the selected branch,
+   * among the mount's own paths. Status counts the first three as pending:
+   * recorded conflicts; workspace deletions, pending until a push confirms
+   * them on disk (left there without applyDeletions, or unlinked but
+   * unconfirmed); and what disk owes by the evidence (entriesByEvidence's
+   * `owed`: every entry it doesn't show on disk, a refused or failed push's
+   * included). An entry from before the evidence isn't among them until a
+   * listing or a materialize checks it: unchecked isn't unpushed. The
+   * fourth, intents that can't be read, may hold a deletion or a conflict,
+   * so a mount configured direct counts them too (initStore).
+   */
+  private heldChanges(mount: MountState): { conflicts: string[]; deletions: string[]; owed: string[]; unreadable: string[] } {
+    const own = this.ownPaths(mount);
+    const intents = this.intents.get(mount.config.name)!.list().filter(([p]) => own(p));
+    return {
+      conflicts: intents.filter(([, bi]) => bi.conflict).map(([p]) => p),
+      deletions: intents.filter(([, bi]) => bi.tombstone).map(([p]) => p),
+      owed: this.entriesByEvidence(mount).owed,
+      unreadable: intents.filter(([, bi]) => bi.unreadable !== undefined).map(([p]) => p),
+    };
   }
 
   /**
@@ -3819,6 +4116,12 @@ export class WorkspaceModule implements Module {
     }
 
     for (const { name, mount, relativePath } of targets) {
+      // A direct mount's tools read disk as it is, so a sync has nothing to
+      // take in there, and says it didn't look rather than that nothing changed.
+      if (mount.direct) {
+        allSkipped.push({ mount: name, path: relativePath, reason: DIRECT_SYNC_SKIPPED });
+        continue;
+      }
       const pass = await this.withMount(mount, async () => {
         if (input.acceptRoot && await this.acceptRootUnlocked(mount)) rootsAccepted.push(name);
         if (!relativePath) {
@@ -3891,7 +4194,7 @@ export class WorkspaceModule implements Module {
       // without a path passes over it, so nothing else keeps it current
       // (agent-framework #276). A path in another mount's directory isn't
       // synced at all, and the note says so.
-      const passedOver = passedOverAt(relativePath, mount.config.ignore ?? [], this.othersOf(name));
+      const passedOver = passedOverAt(relativePath, this.ignoreOf(mount), this.othersOf(name));
       if (passedOver !== undefined) {
         allIgnored.push({
           mount: name,
@@ -3980,7 +4283,7 @@ export class WorkspaceModule implements Module {
   async onToolBatchComplete(_agentName?: string): Promise<void> {
     // Every agent's workspace is the store's current branch, so the agent
     // that ran the batch doesn't choose what is scanned.
-    const mounts = [...this.mounts.values()].filter((m) => m.config.watch === 'on-agent-action');
+    const mounts = [...this.mounts.values()].filter((m) => watchOf(m.config) === 'on-agent-action');
     if (mounts.length === 0 || !this.store || !this.running()) return;
     const deadlineMs = this.agentActionScanDeadlineMs();
     await Promise.all(mounts.map(async (mount) => {
@@ -4129,6 +4432,68 @@ export class WorkspaceModule implements Module {
 
 }
 
+/**
+ * A text grep searches (textsFromStore, textsFromDisk): its mount-prefixed
+ * file, which copy it is, and on a 'chronicle' mount, the path's state.
+ */
+interface GrepText {
+  file: string;
+  state?: string;
+  version: 'workspace' | 'conflicting-disk' | 'recorded-disk' | 'disk';
+  text: string;
+}
+
+/** A file, or a copy of one, grep doesn't search, with why. */
+type GrepSkip = { file: string; reason: string; size?: number; mimeType?: string };
+
+/** What a listing shows of a directory scope (listingOf). */
+interface Listing {
+  /** Each file it shows, by mount-relative path, in order, with what a listing says of it beyond its name. */
+  files: Array<{ path: string } & Record<string, unknown>>;
+  /** For a listing that doesn't descend, the directories directly beneath the scope, mount-relative; none for one that does. */
+  dirs: string[];
+  /** The regions it couldn't see, mount-relative, each with why. */
+  incomplete: Array<{ path: string; reason: string }>;
+}
+
+/**
+ * Run `work` on each item, at most `width` at once, and hand each result to
+ * `each` in the items' order, as soon as it and those before it are done.
+ * A `work` that rejects rejects this when its turn comes; any started after
+ * it finish unheard. Exported for its tests.
+ */
+export async function inOrder<T, R>(items: readonly T[], width: number, work: (item: T) => Promise<R>, each: (result: R, item: T) => void): Promise<void> {
+  const started: Array<Promise<R>> = [];
+  for (let i = 0; i < items.length; i++) {
+    while (started.length < items.length && started.length < i + width) {
+      const running = work(items[started.length]!);
+      // Handled from the start, so a rejection that comes before its turn
+      // isn't an unhandled one; awaiting it below still throws it.
+      running.catch(() => {});
+      started.push(running);
+    }
+    each(await started[i]!, items[i]!);
+  }
+}
+
+/** read_image's answer for an image, wherever it was read from. */
+function imageResult(path: string, image: { bytes: Buffer; mimeType: SupportedImageMimeType }): ToolResult {
+  return {
+    success: true,
+    data: [
+      {
+        type: 'text',
+        text: `Path: ${path}\nMIME: ${image.mimeType}\nBytes: ${image.bytes.byteLength}`,
+      },
+      {
+        type: 'image',
+        data: image.bytes.toString('base64'),
+        mimeType: image.mimeType,
+      },
+    ],
+  };
+}
+
 /** What a listing shows of a path beyond its name. */
 function stateView(report: PathReport): Record<string, unknown> {
   return {
@@ -4146,6 +4511,38 @@ function stateView(report: PathReport): Record<string, unknown> {
 
 /** A lone UTF-16 surrogate, which UTF-8 can't store: in `u` mode, a pair is one code point. */
 const LONE_SURROGATE = /\p{Cs}/u;
+
+/**
+ * A mount's watch mode as it runs. A mount configured direct watches
+ * nothing, whichever kind it runs as this session: its config takes no
+ * other mode (directRefusals), and leaving it out means 'never' there.
+ */
+function watchOf(config: MountConfig): 'always' | 'on-agent-action' | 'never' {
+  return config.watch ?? (config.backend === 'direct' ? 'never' : 'always');
+}
+
+/** A config value for a refusal: a number as JavaScript writes it (JSON would say null for NaN), anything else as JSON. */
+function shownValue(value: unknown): string {
+  return typeof value === 'number' ? String(value) : typeof value === 'bigint' ? `${value}n` : JSON.stringify(value) ?? String(value);
+}
+
+/**
+ * What a direct mount's config sets that would never act there, each with
+ * the way out (MountConfig.backend): a direct mount is read-only, and has no
+ * watcher to tune, no change event to wake on and no push to make.
+ */
+function directRefusals(mount: MountConfig): string[] {
+  const refused: string[] = [];
+  if (mount.mode !== 'read-only') refused.push(`mode must be 'read-only', not ${shownValue(mount.mode)}`);
+  if (mount.watch !== undefined && mount.watch !== 'never') refused.push(`watch ${shownValue(mount.watch)} would watch nothing (leave it out, or set 'never')`);
+  for (const key of ['watchDebounceMs', 'watchRootPollMs'] as const) {
+    if (mount[key] !== undefined) refused.push(`${key} would tune no watcher (leave it out)`);
+  }
+  const wake = mount.wakeOnChange;
+  if (wake === true || (Array.isArray(wake) && wake.length > 0)) refused.push('wakeOnChange would never wake (leave it out)');
+  if (mount.autoMaterialize === true) refused.push('autoMaterialize would never push (leave it out)');
+  return refused;
+}
 
 /**
  * The answer to a write, edit or delete that the workspace stored but

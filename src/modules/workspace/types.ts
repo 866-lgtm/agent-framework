@@ -17,6 +17,33 @@ export interface MountConfig {
   /** Access mode */
   mode: 'read-write' | 'read-only';
   /**
+   * Where the mount's tools get what they read (default: 'chronicle').
+   * - 'chronicle': the workspace keeps the mount's files in its store, where
+   *   writes and edits land first, and takes in disk's changes under the
+   *   three-way rule as its listings, reads and syncs reach them.
+   * - 'direct': for a checkout an agent reads, not one it changes. Every
+   *   read, listing and search is disk's own copy as it is when it runs,
+   *   and none of its files go into the store. No scan or watcher
+   *   runs, so no call waits behind one, and `sync`, `materialize` and the
+   *   watch settings have nothing to act on. Only with `mode: 'read-only'`,
+   *   and not with `watch` other than 'never', `watchDebounceMs`,
+   *   `watchRootPollMs`, `wakeOnChange` or `autoMaterialize`: each of those
+   *   would never act, and the workspace refuses the mount. Its `ignore`
+   *   has a default (see there). Paths, links, other mounts' directories,
+   *   size limits and the walk cap hold as on a 'chronicle' mount. Its
+   *   tools read beneath whatever directory is at its root, with no check
+   *   against the one a 'chronicle' run of it last agreed with.
+   *
+   * A mount configured 'direct' that the store holds changes on that disk
+   * lacks, on the branch selected when the store is given (a draft, a
+   * workspace deletion, a conflict, as `status` counts them pending), runs
+   * as 'chronicle' that session, so they stay in view; the workspace says
+   * so through the framework's ops alerts, naming them and the ways to
+   * start it direct. A mount that ran direct and runs as 'chronicle' again
+   * takes in what disk changed meanwhile, as after any time away.
+   */
+  backend?: 'chronicle' | 'direct';
+  /**
    * Watch mode for filesystem changes:
    * - 'always': chokidar watches continuously; each event re-observes its paths
    * - 'on-agent-action': after each completed agent tool batch, the mount is
@@ -43,6 +70,15 @@ export interface MountConfig {
    * says, a directory with what lies beneath it: `.name.swp` and `.name.swx`
    * (the whole name), and names ending in `~` or in `.subl…tmp`, matched by
    * `^\..+\.sw[px]$`, `~$` and `\.subl.*\.tmp$`.
+   *
+   * A direct mount (`backend`) whose config names no list takes
+   * `node_modules`, `dist`, `.git`, `build`, `coverage`, `target`,
+   * `__pycache__` and `.venv`, each matching that name at any depth. Its
+   * walks of the whole mount, and of any path no pattern covers, pass over
+   * what the list covers. A listing, glob or grep whose path, or whose
+   * pattern's directory, the list covers is walked all the same, the
+   * patterns covering it set aside and the rest applying beneath it, as a
+   * sync that names a path walks it on a 'chronicle' mount.
    */
   ignore?: string[];
   /**
@@ -148,6 +184,12 @@ export interface WorkspaceConfig {
 export interface MountState {
   /** The mount config */
   config: MountConfig;
+  /**
+   * Whether the mount runs direct this session (`MountConfig.backend`), as
+   * initStore decided: a mount configured direct runs as 'chronicle' while
+   * the store holds changes there that disk lacks.
+   */
+  direct: boolean;
   /** Tree state ID in Chronicle */
   treeStateId: string;
   /** Branch-local intent (tombstones, store origin, conflicts) for this mount's paths */

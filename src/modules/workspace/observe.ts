@@ -1035,6 +1035,53 @@ export async function readPath(
   }
 }
 
+/** A file's bytes as readBytes read them, none hashed. */
+export interface BytesResult {
+  kind: 'bytes';
+  /**
+   * Its size in bytes: as read, for a file within the limit; as its fstat
+   * says, for one over it, and at least one past the limit where the reads
+   * found it grown past it.
+   */
+  size: number;
+  /** The whole file, when it is at most the limit both at its fstat and as read; null otherwise. */
+  bytes: Buffer | null;
+  /** Its first bytes (at most HEAD_BYTES), for binary detection and MIME sniffing. */
+  head: Buffer;
+}
+
+/**
+ * A mount-relative file's bytes, through the same located descriptor as
+ * readPath, for a direct mount's tools, which keep nothing: at most `limit`
+ * of them, and none hashed. A file over `limit` at its fstat has only its
+ * head read, and one that grew past it since is read no further than it.
+ */
+export async function readBytes(
+  view: MountView,
+  rootReal: string,
+  relativePath: string,
+  limit: number,
+): Promise<BytesResult | Exclude<Observation, { kind: 'file' }>> {
+  const opened = await openContained(view, rootReal, relativePath);
+  if (!('handle' in opened)) return opened;
+  const { handle, info } = opened;
+  try {
+    const size = Number(info.size);
+    if (size > limit) {
+      const head = Buffer.alloc(Math.min(HEAD_BYTES, size));
+      const { bytesRead } = await handle.read(head, 0, head.length, 0);
+      return { kind: 'bytes', size, bytes: null, head: head.subarray(0, bytesRead) };
+    }
+    const { bytes, more } = await readPrefix(handle, limit, size);
+    if (more) return { kind: 'bytes', size: Math.max(Number((await handle.stat({ bigint: true })).size), bytes.length + 1), bytes: null, head: bytes.subarray(0, HEAD_BYTES) };
+    return { kind: 'bytes', size: bytes.byteLength, bytes, head: bytes.subarray(0, HEAD_BYTES) };
+  } catch (err) {
+    return { kind: 'unobserved', reason: `cannot read (${errno(err) ?? String(err)})` };
+  } finally {
+    await handle.close();
+  }
+}
+
 /**
  * The first bytes of a mount-relative file and its size, through the same
  * located descriptor as readPath — for listing a file nothing tracks, which
