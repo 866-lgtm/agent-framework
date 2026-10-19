@@ -141,8 +141,11 @@ export interface TuneOutParams {
   epochId: string;
   /** Subconscious summary cadence, in seconds. */
   cadenceSeconds: number;
-  /** Maximum messages dumped raw at cancel; above the cap the subconscious
-   *  curates a digest and `fetch_history` covers the rest. */
+  /** Maximum messages dumped raw at cancel, the newest. Where the residents'
+   *  strategies cap a message's size, the dump holds as many as fit whole in
+   *  one message, or, when even the newest doesn't, as much of the newest as
+   *  fits beside the cut's mark, if any does. For those left out the
+   *  subconscious curates a digest, and `fetch_history` covers them. */
   backlogCap: number;
   /** Wake invocations before the tune-out auto-cancels. */
   maxWakes: number;
