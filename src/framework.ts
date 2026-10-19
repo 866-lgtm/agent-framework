@@ -9,7 +9,7 @@ import {
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStream, DetailedUsage, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
-import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks, MalformedContentError, malformedContentPlaces } from '@animalabs/context-manager';
+import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks, MalformedContentError, malformedContentPlaces, CompressionWithdrawn } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SILENT_HEARTBEAT_SEPARATOR, type RequestOnlyPrompt, type RequestOnlyStamps } from './silent-heartbeat.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
@@ -1159,21 +1159,17 @@ function logSeedOmissions(
  * A maintenance provider call withdrawn because a surgery holds the store, or
  * because stop() has closed provider admission: either is the framework's own
  * doing, and no failure. It sent nothing: it was refused at the provider
- * gate, or woken there from its wait. For a call outside context-manager
- * 0.14's compression fallback ladder, a merge's or a chunk's canonical call
- * with its retries after a tool_use stop, context-manager counts no attempt.
- * A merge keeps its queue entry, so the next tick after the hold, or after
- * the next start, does it again. A chunk's compression has already left the
- * queue: it logs "Failed to compress chunk (hierarchical)" with this error
- * and records the call, and the chunk, still uncompressed, is queued again at
- * that manager's next rebuild (its next initialization, message, sent compile
- * or released hold). A call inside the ladder, after a chunk's canonical call
- * was refused or cut short, is caught by the rung that made it and recorded
- * as a provider error, since 0.14 rethrows only its own
- * CompressionBranchDiscard there; once every rung has failed, the chunk's
- * request family is quarantined, with its alert, and the tick returns.
+ * gate, or woken there from its wait. It extends context-manager's
+ * CompressionWithdrawn, whose constructor sets the brand context-manager reads
+ * a withdrawal by, so the call is no outcome of the compression: every rung
+ * of the fallback ladder and the merge path rethrow it unchanged, recording
+ * no outcome, attempt, streak or quarantine event. Its tick puts the chunk
+ * back at the head of the queue, unless a rebuild decided the queue afresh
+ * while the call was out, and a merge stays at the head of its own, for the
+ * next tick once calls are let through again (context-manager's
+ * CompressionWithdrawn doc has the rest).
  */
-class MaintenanceWithdrawnError extends Error {
+class MaintenanceWithdrawnError extends CompressionWithdrawn {
   constructor(reason: string) {
     super(`maintenance call withdrawn: ${reason}`);
     this.name = 'MaintenanceWithdrawnError';
@@ -4253,9 +4249,8 @@ export class AgentFramework {
   /**
    * Refuse an auxiliary call to a model the provider asked this agent to wait
    * on, without calling it. The refusal is a retryable rate limit carrying
-   * the remaining wait, so a caller that paces (context-manager's compression
-   * lane, from its corrective round #138 on) waits it out instead of spending
-   * a call. It is marked
+   * the remaining wait, so a caller that paces waits it out instead of
+   * spending a call. It is marked
    * `providerAdmission: 'deferred'`: no call was made, so a caller can keep
    * the wait without counting a failed call (room-225 #47927).
    */
