@@ -107,19 +107,21 @@ export function redactUrl(url: string | undefined): string {
  *   short password goes with its username and a short username alone goes
  *   too, and the Basic credential a WebSocket client sends for that userinfo;
  * - the static token, and each token an access provider handed a dial for
- *   a header, raw, as JSON encoders write it (JSON.stringify's escapes, and
- *   with its slashes escaped too, as some encoders write them), and percent-
- *   or form-encoded with either case of hex;
+ *   a header, raw, and percent- or form-encoded with either case of hex;
  * - a stdio server's environment values whose names say they're
- *   credentials, raw, as JSON encoders write them, and percent-encoded with
- *   either case of hex.
+ *   credentials, raw, and percent-encoded with either case of hex.
+ * Each of these strings, from every source, the name=value pairs and
+ * userinfo units too, is also replaced as JSON encoders write it:
+ * JSON.stringify's escapes (a quote, a backslash, a control character), and
+ * with its slashes escaped too, as some encoders write them.
  * A string replaced on its own has at least 8 characters, since a shorter
  * one can't be told from ordinary text, and it is replaced wherever it
  * occurs, after an escape or inside a longer token too. A query parameter is
  * also replaced as its whole name=value, only where no letter or digit
- * adjoins the pair, so v=2 leaves dev=2 alone; a short value goes only that
- * way. Every place one of these matches is replaced, overlapping places
- * included, and the replacement is never scanned again; text that may come
+ * adjoins the pair, so v=2 leaves dev=2 alone (a JSON escape before it, such
+ * as \n, isn't one); a short value goes only that way. Every place one of
+ * these matches is replaced, overlapping places included, and the
+ * replacement is never scanned again; text that may come
  * from several servers takes one pass over all their configurations'
  * strings (serverCredentialPatterns), so strings of different servers that
  * overlap are both replaced whole. A credential neither the configuration
@@ -235,27 +237,21 @@ export function serverCredentialPatterns(config: Pick<McplServerConfig, 'url' | 
   // token too), and name=value pairs, replaced only where no letter or digit
   // adjoins them, so a pair such as v=2 leaves dev=2 alone. A pair's value is
   // also replaced on its own when it's a credential, wherever it occurs.
-  const secrets = new Set<string>();
+  const standalones = new Set<string>();
   const pairs = new Set<string>();
   const userinfo = new Set<string>();
-  const standalone = (value: string): void => { if (value.length >= 8) secrets.add(value); };
+  const standalone = (value: string): void => { standalones.add(value); };
   const decode = (value: string, query = false): string => {
     try { return decodeURIComponent(query ? value.replace(/\+/g, ' ') : value); }
     catch { return value; }
   };
   // Percent-escapes in lowercase hex, as some encoders write them.
   const lowerEscapes = (value: string): string => value.replace(/%[0-9A-F]{2}/g, (escape) => escape.toLowerCase());
-  // A string as written; as JSON encoders write it, with JSON.stringify's
-  // escapes (a quote, a backslash, a control character) and with its
-  // slashes escaped too, as some encoders write them; and percent-encoded in
-  // either case of hex (a string encodeURIComponent refuses, such as one
-  // with an unpaired surrogate, has no encoded form).
+  // A string as written, and percent-encoded in either case of hex (a string
+  // encodeURIComponent refuses, such as one with an unpaired surrogate, has
+  // no encoded form). Its JSON forms come with every other string's, below.
   const withEncoded = (value: string): void => {
-    const json = JSON.stringify(value).slice(1, -1);
-    for (const written of [value, json]) {
-      standalone(written);
-      standalone(written.replace(/\//g, '\\/'));
-    }
+    standalone(value);
     let encoded: string;
     try { encoded = encodeURIComponent(value); } catch { return; /* no percent-encoded form */ }
     standalone(encoded);
@@ -341,11 +337,33 @@ export function serverCredentialPatterns(config: Pick<McplServerConfig, 'url' | 
     try { addUrl(new URL(dialed)); } catch { /* a dialed url always parses */ }
   }
   for (const token of sent?.tokens ?? []) addToken(token);
+  // Every string above, from every source, as written and as JSON encoders
+  // write it: with JSON.stringify's escapes (a quote, a backslash, a control
+  // character), and with its slashes escaped too, as some encoders write
+  // them. So a url's credential goes in JSON's forms as a token's does: in a
+  // log line that prints a server's JSON value as its JSON text, or in a
+  // server's JSON that echoes a decoded url secret. A string replaced on its
+  // own has at least 8 characters in each form it's replaced in.
+  const withJsonForms = (values: Iterable<string>, floor: number): Set<string> => {
+    const forms = new Set<string>();
+    for (const value of values) {
+      const json = JSON.stringify(value).slice(1, -1);
+      for (const written of [value, json]) {
+        for (const form of [written, written.replace(/\//g, '\\/')]) if (form.length >= floor) forms.add(form);
+      }
+    }
+    return forms;
+  };
   const escape = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // Where a pair or userinfo unit may start: where no letter or digit
+  // adjoins it, at the text's start or after any other character, or after a
+  // JSON escape that ends in one (\b \f \n \r \t, \uXXXX), as a value's JSON
+  // text writes a control character before it.
+  const start = String.raw`(?<=^|[^A-Za-z0-9]|\\[bfnrt]|\\u[0-9A-Fa-f]{4})`;
   return [
-    ...[...secrets].map(value => ({ value, source: escape(value) })),
-    ...[...pairs].map(value => ({ value, source: `(?<![A-Za-z0-9])${escape(value)}(?![A-Za-z0-9])` })),
-    ...[...userinfo].map(value => ({ value, source: `(?<![A-Za-z0-9])${escape(value)}(?=@)` })),
+    ...[...withJsonForms(standalones, 8)].map(value => ({ value, source: escape(value) })),
+    ...[...withJsonForms(pairs, 0)].map(value => ({ value, source: `${start}${escape(value)}(?![A-Za-z0-9])` })),
+    ...[...withJsonForms(userinfo, 0)].map(value => ({ value, source: `${start}${escape(value)}(?=@)` })),
   ];
 }
 

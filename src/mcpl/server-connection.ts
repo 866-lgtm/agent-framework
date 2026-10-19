@@ -15,7 +15,7 @@ import { openTransport, STDERR_END_WAIT_MS, type McplTransport, type TransportCl
 import { maskNegotiatedCapabilities } from './capability-mask.js';
 import { CapabilityGrant, expandAdvertisementShorthand } from './capability-grant.js';
 import { CAPABILITY_DISABLED, boundedForLog, describeCause } from './errors.js';
-import { logDetail, logValue } from './log-value.js';
+import { logDetail, logValue, logValueRedacted } from './log-value.js';
 import {
   LEGACY_MCP_PROTOCOL_VERSION,
   MODERN_MCP_PROTOCOL_VERSION,
@@ -844,10 +844,11 @@ export class McplServerConnection extends EventEmitter {
     connection.allowHostCommands = config.allowHostCommands === true;
     connection.requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 
-    // Store config for reconnection. Only `true` turns reconnect on, as at
+    // Its configuration, which a reconnect reads and every log line of the
+    // server's text redacts with. Only `true` turns reconnect on, as at
     // every other reader of it.
+    connection.config = config;
     if (config.reconnect === true) {
-      connection.config = config;
       connection.hostCapabilities = hostCapabilities;
       connection.reconnectEnabled = true;
       connection.reconnectIntervalMs = config.reconnectIntervalMs ?? 5000;
@@ -2089,12 +2090,17 @@ export class McplServerConnection extends EventEmitter {
       // errors.ts says, since they're the server's text. Only a string is
       // words: a message of any other JSON value reads as none. The method,
       // id and JSON-RPC code are the operator's, so they go to the log, which
-      // prints any value a server can send without throwing (logValue).
+      // prints any value a server can send without throwing (logValue). The
+      // caller's text keeps the server's words unredacted, as a JSON-RPC
+      // answer passes (redactServerText's scope); the log is a record of the
+      // server's text, so the message is redacted there, whatever JSON value
+      // it is, as every other line this connection writes is.
       const said = typeof response.error.message === 'string' ? boundedForLog(response.error.message.trim()) : '';
-      console.error(
-        `MCPL server "${this.id}" answered ${pending.method} (id=${response.id}) with error ${logValue(response.error.code)}: ` +
-        logValue(response.error.message),
-      );
+      // The call is settled before its log line: its entry is gone and its
+      // timer cleared, so nothing else would settle it, and a host's logger
+      // can throw. The dispatch's containment reports such a throw. (A
+      // configuration that can't be read withholds the message rather than
+      // throw: redactServerText.)
       pending.reject(new McplRequestError(
         said
           ? `The "${this.id}" server answered with an error: ${said}`
@@ -2103,6 +2109,10 @@ export class McplServerConnection extends EventEmitter {
         'error-response',
         (response.error as { data?: unknown }).data,
       ));
+      console.error(
+        `MCPL server "${this.id}" answered ${pending.method} (id=${response.id}) with error ${logValue(response.error.code)}: ` +
+        logValueRedacted(response.error.message, (text) => redactServerText(text, this.config ?? {})),
+      );
     } else {
       pending.resolve(response.result);
     }
