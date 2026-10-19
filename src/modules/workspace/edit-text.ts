@@ -164,11 +164,16 @@ function problemText(problem: EditProblem, tool: EditTool): string {
       const carries = problem.bom && problem.cr ? 'starts with a BOM and ends in a CR' : problem.bom ? 'starts with a BOM' : 'ends in a CR';
       const ways = problem.readings.map((reading) => `${READS[reading.leaves]} (${countLines(reading)})`);
       const list = ways.length < 3 ? ways.join(' and ') : `${ways.slice(0, -1).join(', ')} and ${ways.at(-1)}`;
+      // A reading that changes nothing means the file's own BOM or line end's
+      // CR, which an edit can't change, so the refusal says so.
+      const same = problem.readings.filter((reading) => reading.same);
+      const kept = [same.some((reading) => reading.leaves !== 'cr') && 'BOM', same.some((reading) => reading.leaves !== 'bom') && 'line ends'].filter(Boolean).join(' and ');
       // The lines of each reading follow on a line of their own, so however
       // long they run, they don't push the hint past the first line's cut
       // (cutLine).
       return `oldString ${carries}, and occurs in ${problem.path} read more than one way, so which you mean can't be told. `
-        + `Include more of the text around it, such as the line before or after it, to say which.\nIt occurs ${list}.`;
+        + `Include more of the text around it, such as the line before or after it, to say which.\nIt occurs ${list}.`
+        + (same.length ? `\nWhere it occurs ${same.map((reading) => READS[reading.leaves]).join(' or ')}, the edit changes nothing, since the file keeps its ${kept}.` : '');
     }
   }
 }

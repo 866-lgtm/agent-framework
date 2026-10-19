@@ -201,6 +201,19 @@ test("crowded edits among which one replaces every occurrence ask for as many as
   assert.deepEqual(planned.problems.map((p) => (p.kind === 'count' ? [p.kind, p.edit, p.found] : p)), [['count', 0, 1_000], { kind: 'crowded', edits: [1, 2], asked: 1_990, length: 1_001 }]);
 });
 
+test("a reading in which an edit changes nothing counts toward a refusal for one edit, and not for one that replaces every occurrence", () => {
+  // Line 1's own text ends in a CR; line 2's "x", with its CRLF end's CR, is
+  // "x\r" read that way, where the edit changes nothing.
+  const bytes = Buffer.from('x\r\r\nx\r\n');
+  assert.deepEqual(planFile(decodeForEdit(bytes)!, bytes, [spec(0, 'x\r', 'x')]), { problems: [{
+    kind: 'readings', edit: 0, bom: false, cr: true,
+    readings: [{ leaves: 'nothing', same: false, found: 1, atLeast: false, lines: [1] }, { leaves: 'cr', same: true, found: 1, atLeast: false, lines: [2] }],
+  }] });
+  const all = planFile(decodeForEdit(bytes)!, bytes, [spec(0, 'x\r', 'x', 'all')]);
+  assert.ok('plan' in all, JSON.stringify(all));
+  assert.equal(all.plan.bytes.toString(), 'x\r\nx\r\n');
+});
+
 test("one count budget raised for a text longer than it is raised once for each length, however many such texts it plans", () => {
   // Raised to 1,500 by the first text, whose one edit counts all but 21 of
   // it, the budget leaves the second text's edit its free 21, those 21, and

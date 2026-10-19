@@ -373,11 +373,38 @@ test("an oldString that is a CR or a BOM alone, found as given, is refused where
   assert.match(errorOf(await call('edit', { path: 'work/m.txt', oldString: '\r', newString: 'Y' })), /^The edit did nothing: oldString isn't in work\/m\.txt\./);
   await file('o.txt', '\uFEFFx\n');
   assert.match(errorOf(await call('edit', { path: 'work/o.txt', oldString: '\uFEFF', newString: 'Q' })), /^The edit did nothing: oldString isn't in work\/o\.txt\./);
-  // Deleting it, read as a line end's CR, would change nothing, so a lone CR
-  // as given is the only one the edit can mean.
+  // Deleted, it misses too, though read that way it would change nothing.
+  await file('n.txt', 'x\r\n');
+  assert.match(errorOf(await call('edit', { path: 'work/n.txt', oldString: '\r', newString: '' })), /^The edit did nothing: oldString isn't in work\/n\.txt\./);
+  // Deleted, a copy of the line end's CR still may mean it, which the file
+  // keeps, so the edit is refused, saying so; with the text around it, a
+  // lone CR is deleted.
   await file('d.txt', 'a\rb\r\n');
-  dataOf(await call('edit', { path: 'work/d.txt', oldString: '\r', newString: '' }));
+  assert.match(errorOf(await call('edit', { path: 'work/d.txt', oldString: '\r', newString: '' })),
+    /\nIt occurs as given \(on line 1\) and with its last CR read as its CRLF line end's \(on line 1\)\.\nWhere it occurs with its last CR read as its CRLF line end's, the edit changes nothing, since the file keeps its line ends\.$/);
+  assert.equal(await stored('d.txt'), 'a\rb\r\n');
+  dataOf(await call('edit', { path: 'work/d.txt', oldString: 'a\rb', newString: 'ab' }));
   assert.equal(await stored('d.txt'), 'ab\r\n');
+});
+
+test("a single edit deleting a CR or a BOM, or a text ending or starting with one, is refused where a copy may mean the file's own, which it keeps", async (t) => {
+  const { call, stored, file } = setup(t);
+  // Each file holds the text as given somewhere else than where a character
+  // page shows the line end's CR or the file's BOM; each edit, read that
+  // way, changes nothing (Abigail-2676's cases).
+  const cases: Array<[string, string, string, RegExp]> = [
+    ['\r\nx\r', '\r', '', /as given \(on line 2\) and with its last CR read as its CRLF line end's \(on line 1\)\.\nWhere it occurs with its last CR read as its CRLF line end's, the edit changes nothing, since the file keeps its line ends\.$/],
+    ['x\r\nx\r', 'x\r', 'x', /as given \(on line 2\) and with its last CR read as its CRLF line end's \(on line 1\)\.\nWhere it occurs with its last CR read as its CRLF line end's, the edit changes nothing, since the file keeps its line ends\.$/],
+    ['p\r\nx\r\r\nq\r\n', '\r', '', /as given \(on line 2\) and with its last CR read as its CRLF line end's \(on lines 1, 2 and 3\)\.\nWhere it occurs with its last CR read as its CRLF line end's, the edit changes nothing, since the file keeps its line ends\.$/],
+    ['\uFEFFab\uFEFFc\r\n', '\uFEFF', '', /as given \(on line 1\) and with its BOM read as the file's own \(on line 1\)\.\nWhere it occurs with its BOM read as the file's own, the edit changes nothing, since the file keeps its BOM\.$/],
+    ['\uFEFFx\r\nz\uFEFFx\r\n', '\uFEFFx', 'x', /as given \(on line 2\) and with its BOM read as the file's own \(on line 1\)\.\nWhere it occurs with its BOM read as the file's own, the edit changes nothing, since the file keeps its BOM\.$/],
+    ['\uFEFF\r\nx\uFEFF\r\n', '\uFEFF\r', '', /with its last CR read as its CRLF line end's \(on line 2\) and with its BOM read as the file's own and its last CR as a CRLF line end's \(on line 1\)\.\nWhere it occurs with its BOM read as the file's own and its last CR as a CRLF line end's, the edit changes nothing, since the file keeps its BOM and line ends\.$/],
+  ];
+  for (const [k, [text, oldString, newString, said]] of cases.entries()) {
+    await file(`c${k}.txt`, text);
+    assert.match(errorOf(await call('edit', { path: `work/c${k}.txt`, oldString, newString })), said, `case ${k}`);
+    assert.equal(await stored(`c${k}.txt`), text, `case ${k}`);
+  }
 });
 
 test("an oldString with the file's BOM at its start and a CR at its end is read as the BOM and an empty first line's CRLF end beside another reading", async (t) => {
@@ -387,6 +414,11 @@ test("an oldString with the file's BOM at its start and a CR at its end is read 
   await file('e.txt', '\uFEFF\r\nx\uFEFF\r\n');
   assert.match(errorOf(await call('edit', { path: 'work/e.txt', oldString: '\uFEFF\r', newString: 'Y' })),
     /\nIt occurs with its last CR read as its CRLF line end's \(on line 2\) and with its BOM read as the file's own and its last CR as a CRLF line end's \(on line 1\)\.$/);
+  assert.equal(await stored('e.txt'), '\uFEFF\r\nx\uFEFF\r\n');
+  // Deleted, it's refused too, where the file's BOM and line 1's end are what
+  // a character page's copy shows.
+  assert.match(errorOf(await call('edit', { path: 'work/e.txt', oldString: '\uFEFF\r', newString: '' })),
+    /\nWhere it occurs with its BOM read as the file's own and its last CR as a CRLF line end's, the edit changes nothing, since the file keeps its BOM and line ends\.$/);
   assert.equal(await stored('e.txt'), '\uFEFF\r\nx\uFEFF\r\n');
   // Where line 1 isn't empty, only line 2 holds it.
   await file('f.txt', '\uFEFFa\r\nx\uFEFF\r\n');
@@ -402,6 +434,22 @@ test("a replaceAll of a CR or a BOM alone replaces those in the text, keeping CR
   await file('b.txt', '\uFEFFa\uFEFFb\n');
   dataOf(await call('edit', { path: 'work/b.txt', oldString: '\uFEFF', newString: '-', replaceAll: true }));
   assert.equal(await stored('b.txt'), '\uFEFFa-b\n');
+  // Deleting every lone CR keeps the CRLF line ends.
+  await file('d.txt', 'a\rb\r\nc\rd\r\n');
+  dataOf(await call('edit', { path: 'work/d.txt', oldString: '\r', newString: '', replaceAll: true }));
+  assert.equal(await stored('d.txt'), 'ab\r\ncd\r\n');
+});
+
+test("a replaceAll whose oldString, read as ending in a CRLF end's CR, changes nothing replaces the occurrences that change", async (t) => {
+  const { call, stored, file } = setup(t);
+  // Line 1's own text ends in a CR; line 2's "x" is "x\r" with its line end's
+  // CR, as a character page shows it, which the file keeps. One edit is
+  // refused, as a copy of line 2 may mean it; a replaceAll changes line 1.
+  await file('x.txt', 'x\r\r\nx\r\n');
+  assert.match(errorOf(await call('edit', { path: 'work/x.txt', oldString: 'x\r', newString: 'x' })),
+    /\nWhere it occurs with its last CR read as its CRLF line end's, the edit changes nothing, since the file keeps its line ends\.$/);
+  dataOf(await call('edit', { path: 'work/x.txt', oldString: 'x\r', newString: 'x', replaceAll: true }));
+  assert.equal(await stored('x.txt'), 'x\r\nx\r\n');
 });
 
 test("an oldString found in two readings other than as given is refused, and one found in three names all three", async (t) => {
@@ -1062,6 +1110,25 @@ test("a call counts occurrences its edits don't need, across its files, only as 
   assert.match(error, /edit 2: oldString occurs at least 43 times in work\/b\.txt \(the first 20 on line 1\), not 1\. Include more of the text around it to single out the one you mean\.\nThis call counted as many occurrences as one call may, so 43 is a floor: sent in a call of its own, the edit has every one counted, unless they overlap\.\n/);
   // Sent alone, it has every one counted.
   assert.match(errorOf(await call('edit_many', { edits: [{ path: 'work/b.txt', oldString: 'a', newString: 'c' }] })), /edit 1: oldString occurs 1000 times in work\/b\.txt/);
+});
+
+test("a file stored before its mount's limit was lowered sizes a call's count budget before any of its files is planned", async (t) => {
+  // big.txt, 3,000 bytes, is stored under a limit of 3,000, and a module over
+  // the same store lowers the limit to 1,000. The call's budget is 3,000, so
+  // both edits of small.txt, planned before big.txt, count all 1,000 of
+  // theirs; a budget of the limit would leave the second a floor of 43.
+  const { store, dir, file } = setup(t, { maxFileSize: 3_000 });
+  await file('small.txt', 'a'.repeat(1_000));
+  await file('big.txt', 'a'.repeat(3_000));
+  const lowered = new WorkspaceModule({ mounts: [{ name: 'work', path: dir, mode: 'read-write', watch: 'never', autoMaterialize: false, maxFileSize: 1_000 }] });
+  lowered.initStore(store);
+  const error = errorOf(await lowered.handleToolCall({ id: 'edit_many', name: 'edit_many', input: { edits: [
+    { path: 'work/small.txt', oldString: 'a', newString: 'b' },
+    { path: 'work/small.txt', oldString: 'a', newString: 'c' },
+    { path: 'work/big.txt', oldString: 'a', newString: 'd' },
+  ] } } as Parameters<WorkspaceModule['handleToolCall']>[0]));
+  assert.match(error, /\nedit 1: oldString occurs 1000 times in work\/small\.txt /);
+  assert.match(error, /\nedit 2: oldString occurs 1000 times in work\/small\.txt /);
 });
 
 test("an edit asking for more than 20 counts those it asks for freely, after the call's budget is spent", async (t) => {
