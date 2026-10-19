@@ -2,11 +2,14 @@
  * MCPL content that context-manager won't store is refused where it would
  * be stored or queued. context-manager refuses a write whose content
  * doesn't match ContentBlock (MalformedContentError, its #185), and
- * malformedContentPlaces names where without throwing. The push and channel
- * lanes ask it first, so such a message stores no row, queues no wake and
- * never reaches the deferred queue, and their log line names where it came
- * from. Content the store mends, a tool_use whose input isn't an object, is
- * stored as before.
+ * malformedContentPlaces names where without throwing. Content from an MCPL
+ * server is converted at the boundary into blocks the store accepts, so the
+ * push and channel lanes' check is the backstop for events that never
+ * crossed it, such as a module's, which these tests hand the lanes
+ * directly. The lanes ask it first, so such a message stores no row, spawns
+ * no fork and queues no wake, and their log line names where it came from.
+ * Content the store mends, a tool_use whose input isn't an object, is
+ * stored as before, and absent content is the empty-content check's.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -27,27 +30,32 @@ const MALFORMED: Array<[string, unknown[], string]> = [
   ['an image whose source is a string', [{ type: 'image', source: 'data' }], 'content[0]'],
 ];
 
-async function harness() {
+async function harness(extra: Partial<Parameters<typeof AgentFramework.create>[0]> = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'malformed-content-af-'));
   const membrane = new MockMembrane();
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
     agents: [{ name: 'assistant', model: 'test', systemPrompt: 'test' }],
     modules: [],
+    ...extra,
   });
   const added: string[] = [];
   const refused: Array<Record<string, unknown>> = [];
+  const traces: Array<Record<string, unknown>> = [];
   let starts = 0;
   framework.onTrace((e: any) => {
+    traces.push(e);
     if (e.type === 'message:added') added.push(e.source);
     if (e.type === 'mcpl:malformed-content-refused') refused.push(e);
     if (e.type === 'inference:started') starts++;
   });
+  // What the agent's own store holds, which a refusal mustn't add to.
+  const stored = () => framework.getAgent('assistant')!.getContextManager().getAllMessages().length;
   const errors: string[] = [];
   const error = console.error;
   console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
   return {
-    framework, membrane, added, refused, errors, starts: () => starts,
+    framework, membrane, added, refused, traces, errors, stored, starts: () => starts,
     close: async () => {
       console.error = error;
       await framework.stop();
@@ -60,6 +68,7 @@ for (const [label, content, place] of MALFORMED) {
   test(`push: ${label} is refused, storing no row and queueing no wake, and the line names the server and channel`, async (t) => {
     const x = await harness(); t.after(x.close);
     x.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'invented cause' }] as ContentBlock[]));
+    const before = x.stored();
     const placement = (x.framework as any).handleMcplPushEvent({
       type: 'mcpl:push-event', serverId: 'module', featureSet: 'fs', eventId: 'e1',
       content, timestamp: TS, inferenceId: 'i', triggerInference: true,
@@ -67,11 +76,13 @@ for (const [label, content, place] of MALFORMED) {
     });
     await x.framework.runUntilIdle();
     assert.equal(placement, undefined, 'nothing was placed');
-    assert.deepEqual(x.added, [], 'no row');
+    assert.deepEqual(x.added, [], 'no row traced');
+    assert.equal(x.stored(), before, 'and none in the store');
     assert.equal(x.starts(), 0, 'no wake');
     assert.equal(x.refused.length, 1);
     assert.equal(x.refused[0]!.lane, 'push');
     assert.equal(x.refused[0]!.serverId, 'module');
+    assert.equal(x.refused[0]!.eventId, 'e1');
     assert.equal(x.refused[0]!.channelId, 'discord:g:c');
     assert.ok((x.refused[0]!.places as string[]).some((p) => p.includes(place)), JSON.stringify(x.refused[0]));
     const line = `[push-event-refused] server=module channel=${logValue('discord:g:c')} eventId=${logValue('e1')} reason=malformed-content: `;
@@ -81,15 +92,17 @@ for (const [label, content, place] of MALFORMED) {
   test(`channel: ${label} is refused, storing no row and queueing no wake, and the line names the server and channel`, async (t) => {
     const x = await harness(); t.after(x.close);
     x.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'invented cause' }] as ContentBlock[]));
+    const before = x.stored();
     const placement = await (x.framework as any).handleMcplChannelIncoming({
-      type: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:c', messageId: 'm1',
+      type: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:c', messageId: 'm1', eventId: 'ev1',
       author: { id: 'u', name: 'User' }, content, timestamp: TS, triggerInference: true,
     });
     await x.framework.runUntilIdle();
     assert.equal(placement, undefined, 'nothing was placed');
-    assert.deepEqual(x.added, [], 'no row');
+    assert.deepEqual(x.added, [], 'no row traced');
+    assert.equal(x.stored(), before, 'and none in the store');
     assert.equal(x.starts(), 0, 'no wake');
-    assert.deepEqual(x.refused.map((r) => [r.lane, r.serverId, r.channelId, r.messageId]), [['channel', 'discord', 'discord:g:c', 'm1']]);
+    assert.deepEqual(x.refused.map((r) => [r.lane, r.serverId, r.channelId, r.messageId, r.eventId]), [['channel', 'discord', 'discord:g:c', 'm1', 'ev1']]);
     assert.ok((x.refused[0]!.places as string[]).some((p) => p.includes(place)), JSON.stringify(x.refused[0]));
     const line = `[channel-incoming-refused] server=discord channel=${logValue('discord:g:c')} messageId=${logValue('m1')} reason=malformed-content: `;
     assert.ok(x.errors.some((e) => e.startsWith(line) && e.includes(place)), x.errors.join('\n'));
@@ -110,4 +123,35 @@ test('push: a tool_use whose input is not an object is mended by the store, so i
   const stored = x.framework.getAgent('assistant')!.getContextManager().getAllMessages()
     .flatMap((m) => m.content).find((b) => b.type === 'tool_use') as { input?: unknown } | undefined;
   assert.deepEqual(stored?.input, {}, 'with its input mended to an object');
+});
+
+test("channel: with conversation routing on, a malformed message that would bind a fork spawns none and stores nothing", async (t) => {
+  const x = await harness({ conversations: { templateAgent: 'assistant', bind: { channel: 'mention' } } } as never);
+  t.after(x.close);
+  const agents = () => x.framework.getAllAgents().length;
+  const before = agents();
+  const placement = await (x.framework as any).handleMcplChannelIncoming({
+    type: 'mcpl:channel-incoming', serverId: 'srv', channelId: 'slack:C1', messageId: 'm2',
+    author: { id: 'U1', name: 'alice' }, content: ['bot, help'], timestamp: TS, triggerInference: true,
+    metadata: { mentioned: true },
+  });
+  await x.framework.runUntilIdle();
+  assert.equal(placement, undefined, 'nothing was placed');
+  assert.equal(agents(), before, 'no fork was spawned');
+  assert.deepEqual(x.traces.filter((e) => String(e.type).startsWith('mcpl:conversation-')), [], 'nor bound');
+  assert.deepEqual(x.added, [], 'no row traced');
+  assert.equal(x.refused.length, 1, 'refused instead');
+});
+
+test('push: absent content is the empty-content check\'s, not refused as malformed', async (t) => {
+  const x = await harness(); t.after(x.close);
+  const placement = (x.framework as any).handleMcplPushEvent({
+    type: 'mcpl:push-event', serverId: 'module', featureSet: 'fs', eventId: 'e3',
+    content: undefined, timestamp: TS, inferenceId: 'i', triggerInference: true,
+  });
+  await x.framework.runUntilIdle();
+  assert.equal(placement, undefined, 'nothing was placed');
+  assert.deepEqual(x.refused, [], 'no malformed-content refusal');
+  assert.deepEqual(x.traces.filter((e) => e.type === 'mcpl:empty-content-dropped').map((e) => [e.lane, e.eventId]), [['push', 'e3']]);
+  assert.deepEqual(x.added, []);
 });

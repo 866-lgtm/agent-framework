@@ -644,18 +644,26 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     }
   });
 
-  it('at a tool boundary, a write context-manager refuses as malformed is dropped, and what is queued behind it lands', async () => {
+  it('at a tool boundary, a queued write context-manager refuses as malformed is dropped, and what is queued behind it lands', async () => {
+    // addMessage refuses such content before it's queued, so an entry like
+    // this one reaches a drain only from a queue an earlier process
+    // persisted: it's placed in the queue as boot's restore would place it,
+    // ahead of the interjection by its seq.
+    module.duringTool = () => {
+      (module.framework as unknown as { deferredMessages: unknown[] }).deferredMessages.push({
+        id: 'persisted-before', seq: 0, participant: 'Antra', forAgent: 'assistant', heldAt: Date.now(),
+        // A text block whose text isn't a string, which the store refuses.
+        content: [{ type: 'text', text: 5 } as unknown as ContentBlock],
+      });
+    };
     const errors: string[] = [];
     const error = console.error;
     console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
     let framework: AgentFramework;
     try {
-      framework = await runTurn('move', [
-        // A text block whose text isn't a string, which the store refuses.
-        { participant: 'Antra', content: [{ type: 'text', text: 5 } as unknown as ContentBlock] },
-        { participant: 'Antra', content: text('look right') },
-      ]);
+      framework = await runTurn('move', [{ participant: 'Antra', content: text('look right') }]);
     } finally { console.error = error; }
+    assert.deepEqual(atBoundary(), ['Antra: look right', 'Antra: 5'], 'both were queued when the boundary drained');
     assert.deepEqual(injected(), ['Antra: look right'], 'what was queued behind it is carried');
     assert.deepEqual(windowOf(framework).slice(2), [
       'user: <tool_result>',
