@@ -23,7 +23,7 @@ import { StringDecoder } from 'node:string_decoder';
 import WebSocket from 'ws';
 
 import type { McplServerConfig } from './types.js';
-import { describeCredentialError, noteDialSent, redactUrl, resolveServerBinding, urlAsDialed } from './protocol-family.js';
+import { describeCredentialError, noteDialSent, redactServerText, redactUrl, resolveServerBinding, urlAsDialed } from './protocol-family.js';
 import { assertBooleanSetting } from '../config-checks.js';
 import { logDetail } from './log-value.js';
 
@@ -564,7 +564,12 @@ export class WebSocketTransport extends McplTransport {
     // Error strings travel: traces, logs, tool results the model reads. They
     // get the endpoint, never the credential.
     const redacted = redactUrl(config.url);
-    const ws = new WebSocket(url);
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(url);
+    } catch (err) {
+      throw new Error(`MCPL server "${config.id}" WebSocket connect failed: ${dialErrorText(err, config)} (${redacted})`);
+    }
 
     // A failed dial can emit 'error' MORE THAN ONCE on the raw socket (seen
     // live 2026-08-03: an HTTP 502 upgrade-reject emits the "Expected 101"
@@ -606,7 +611,7 @@ export class WebSocketTransport extends McplTransport {
       });
 
       ws.once('error', (err: Error) => {
-        abandon(new Error(`MCPL server "${config.id}" WebSocket connect failed: ${err.message} (${redacted})`));
+        abandon(new Error(`MCPL server "${config.id}" WebSocket connect failed: ${dialErrorText(err, config)} (${redacted})`));
       });
     });
   }
@@ -633,6 +638,29 @@ export class WebSocketTransport extends McplTransport {
       }
     });
   }
+}
+
+/** A ws:// or wss:// url in a WebSocket client's text, to the next space,
+ *  quote, bracket or parenthesis. */
+const WS_URL_IN_TEXT = /\bwss?:\/\/[^\s"'<>()[\]{}]+/gi;
+
+/**
+ * A WebSocket client's error text for a failed dial (an Error under Node's
+ * ws, an ErrorEvent under Bun's), as the dial's own error carries it. A client can quote the url as dialed: under Bun 1.4.3 a
+ * refused or unreachable dial's message holds it whole, its user, password,
+ * path and query, and the token, a static one or an access provider's. Each
+ * url in it is shown as {@link redactUrl} shows one, and what's left goes
+ * through {@link redactServerText}, which replaces the strings the
+ * configuration and its dials know to be credentials (the dial has noted
+ * what it sent by now) in their encoded and decoded forms. The error is a
+ * new one with no `cause`, so the client's own error, message and stack,
+ * isn't reachable from it.
+ */
+export function dialErrorText(err: unknown, config: McplServerConfig): string {
+  // Bun's ws emits an ErrorEvent, not an Error, its text in `message` too.
+  const said = (err as { message?: unknown } | null)?.message;
+  const message = typeof said === 'string' ? said : String(err);
+  return redactServerText(message.replace(WS_URL_IN_TEXT, (found) => redactUrl(found)), config);
 }
 
 /**
