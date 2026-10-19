@@ -415,7 +415,7 @@ test('grep matches and shows a CRLF file\'s lines without the CR, as read shows 
   // does, and the answer says why.
   const note = "The pattern names a CR, and a file searched has CRLF line ends. Lines are matched as read shows them, "
     + "which leaves out a CRLF end's CR unless the line's own text ends in a CR. read with offsetChars shows every CR.";
-  for (const pattern of ['\\r', '\r', 'o[\\r]?$', '\\\\\\r']) {
+  for (const pattern of ['\\r', '\r', 'o[\\r]?$', '\\\\\\r', '\\x0d', '\\x0D', '\\u000d', '\\cM', '\\cm', '\\015', '[\\x0d]']) {
     const cr = await call('grep', { pattern, path: 'work/crlf.txt' });
     const data = cr.data as { results: Array<{ matches: unknown[] }>; note?: string };
     assert.equal(data.note, note, JSON.stringify(pattern));
@@ -423,7 +423,7 @@ test('grep matches and shows a CRLF file\'s lines without the CR, as read shows 
   }
   // A pattern that names no CR, and a CR pattern over files without a CRLF
   // end, get no note.
-  for (const [pattern, path] of [['foo', 'work/crlf.txt'], ['\\\\r', 'work/crlf.txt'], ['\\r', 'work/lf.txt']]) {
+  for (const [pattern, path] of [['foo', 'work/crlf.txt'], ['\\\\r', 'work/crlf.txt'], ['\\\\x0d', 'work/crlf.txt'], ['\\R', 'work/crlf.txt'], ['\\r', 'work/lf.txt']]) {
     const data = (await call('grep', { pattern, path })).data as object;
     assert.equal('note' in data, false, JSON.stringify([pattern, path]));
   }

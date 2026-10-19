@@ -4770,12 +4770,16 @@ function inputProblem(
 const CRLF_CR_NOTE = 'The pattern names a CR, and a file searched has CRLF line ends. Lines are matched as read shows them, '
   + 'which leaves out a CRLF end\'s CR unless the line\'s own text ends in a CR. read with offsetChars shows every CR.';
 
-/** Whether a grep pattern names a CR: a literal one, or `\r` whose backslash isn't itself escaped. */
+/**
+ * Whether a grep pattern names a CR: a literal one, or an escape that a
+ * pattern compiled without flags reads as one (`\r`, `\x0d`, `\u000d`, `\cM`,
+ * `\015`) whose backslash isn't itself escaped.
+ */
 function namesCr(pattern: string): boolean {
   for (let i = 0; i < pattern.length; i++) {
     if (pattern[i] === '\r') return true;
     if (pattern[i] === '\\') {
-      if (pattern[i + 1] === 'r') return true;
+      if (/^(?:r|x0[dD]|u000[dD]|c[mM]|015)/.test(pattern.slice(i + 1, i + 6))) return true;
       i++;
     }
   }
