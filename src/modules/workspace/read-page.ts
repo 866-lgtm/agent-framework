@@ -37,16 +37,16 @@ const joined = (notes: Array<string | null>): string | undefined => {
 
 /**
  * Lines from `offset` (1-based), at most `limit` of them, each numbered and a
- * long one cut with the offsetChars that reads the rest. The page is the
- * longest that fits within `maxChars` as JSON; where none fits with its first
- * line as a page shows it, that line is cut shorter, at the most the page has
- * room for. Where the page's last line is cut, its note names where that
- * line's rest starts and how long it is, since reading on in order starts
- * there: before the next line, or, on the page that ends the file, before the
- * file is read whole. A page whose own fields and least content pass
- * `maxChars` still moves on, and passes it. With no `maxChars`, for a call
- * made in process, which takes the data itself, the page holds to `limit`
- * alone and shows every line whole.
+ * long one cut with the offsetChars and limitChars that read the rest. The
+ * page is the longest that fits within `maxChars` as JSON; where none fits
+ * with its first line as a page shows it, that line is cut shorter, at the
+ * most the page has room for. Where the page's last line is cut, its note
+ * names where that line's rest starts and how long it is, since reading on in
+ * order starts there: before the next line, or, on the page that ends the
+ * file, before the file is read whole. A page whose own fields and least
+ * content pass `maxChars` still moves on, and passes it. With no `maxChars`,
+ * for a call made in process, which takes the data itself, the page holds to
+ * `limit` alone and shows every line whole.
  */
 export function linePage(path: string, file: FileText, offset: number, limit: number, maxChars: number | undefined, extraNotes: string[] = []): ToolResult {
   const { lines, starts } = file;

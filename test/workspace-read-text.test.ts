@@ -84,7 +84,7 @@ test('a BOM is noted and not shown, and bytes that aren\'t UTF-8 are noted', asy
   assert.equal(((await readLatin1({ offsetChars: 0 })).data as CharPage).note, notUtf8);
 });
 
-test('a long line is cut at 2000 characters, with the offsetChars that reads the rest', async t => {
+test('a long line is cut at 2000 characters, with the offsetChars and limitChars that read the rest', async t => {
   // A BOM and a CRLF before the long line, so its offset counts both.
   const long = 'x'.repeat(1999) + '😀' + 'y'.repeat(1000);
   const { read } = await setup(t, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(`short\r\n${long}\r\nlast\r\n`)]));

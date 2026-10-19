@@ -701,7 +701,7 @@ test("a read whose disk copy can't be checked says it shows the workspace's copy
   });
 });
 
-test("a read of a held file whose mount's root is gone says disk couldn't be checked, and not to read again", async (t) => {
+test("a read of a held file whose mount's root is gone says disk couldn't be checked, and doesn't say to read again", async (t) => {
   // The pass reports the path as unverified and leaves the root's region
   // incomplete. It didn't give up on a branch that kept changing, so reading
   // again won't check it.
