@@ -21420,12 +21420,10 @@ export class AgentFramework {
    * (releaseWindowNowOrAfterResume), since a write could land mid-surgery.
    *
    * The agent never reads its window again, so every failed-reply notice it
-   * may not have read is passed to the primary, by name, once: each one
-   * stored in its window above its consumed watermark (flushed there at its
-   * turn's end, stored while it was idle, or injected at a tool boundary
-   * whose stream didn't say whether it carries injections, which may have
-   * dropped it), and each one still queued for it. One heard at a boundary
-   * whose stream declares it carries them is under the watermark. Writes still
+   * never read is passed to the primary, by name, once: each one stored in
+   * its window above its consumed watermark (flushed there at its turn's end,
+   * or stored while it was idle) and not heard at a tool boundary, and each
+   * one still queued for it. Writes still
    * queued would wait for a boundary it never reaches, and the flush that
    * finds it gone would drop them, so they land in its own window now, which
    * Chronicle keeps for investigation. Its stream is over or cancelled, so it
@@ -21464,16 +21462,15 @@ export class AgentFramework {
   }
 
   /**
-   * The failed-reply notices stored in `agent`'s window that it may not have
-   * read: those above the lower of its consumed watermark and the point where
-   * the watermark's branch and the current one part (branchesPartAt), or
-   * every one, when it has no watermark. The watermark is set at the agent's
-   * creation and moves at a committing compile, and at a tool boundary whose
+   * The failed-reply notices stored in `agent`'s window that it never read:
+   * those above the lower of its consumed watermark and the point where the
+   * watermark's branch and the current one part (branchesPartAt), or every
+   * one, when it never compiled. The watermark moves at a compile, and at a
+   * tool boundary whose
    * stream declares it carries the messages injected there
-   * (markContextConsumed), so a notice such a stream heard is under it. One
-   * a boundary stored without sending (a turn a tool ended, a budget
-   * restart) is above it, and so is one injected into a stream that didn't
-   * say whether it carries injections, which may have dropped it or heard it.
+   * (markContextConsumed), so a notice the live stream heard is under it, and
+   * one a boundary stored without sending (a turn a tool ended, a budget
+   * restart, a stream that may drop injections) is above it.
    */
   private unreadFailedReplies(agent: Agent): MessageMetadata[] {
     try {

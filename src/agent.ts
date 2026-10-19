@@ -925,15 +925,15 @@ export class Agent {
 
   /**
    * RFC-006 consumed watermark, per branch: the newest stored message as of
-   * the latest of the agent's creation, a committing compile, and a tool
-   * boundary that injected messages into a live stream declaring it carries
-   * them (`supportsInjectedMessages` true: membrane's native path, from
-   * membrane 0.6.0). A compile counts from when it takes its value, before
-   * it awaits, so one that began before a boundary's mark doesn't roll the
-   * mark back (applyCompileWatermark), and a dry run, such as
-   * previewActivation's, doesn't move it. Each move takes the store's head,
-   * a scalar, so it also covers stored messages the agent wasn't given, such
-   * as another slot's.
+   * the latest of the agent's creation, a committing compile that returns,
+   * and a tool boundary that injected messages into a live stream declaring
+   * it carries them (`supportsInjectedMessages` true: membrane's native
+   * path, from membrane 0.6.0). A compile counts from when it takes its
+   * value, before it awaits, so one that began before a boundary's mark
+   * doesn't roll the mark back (applyCompileWatermark), and a dry run, such
+   * as previewActivation's, doesn't move it. Each move takes the store's
+   * head, a scalar, so it also covers stored messages the agent wasn't
+   * given, such as another slot's.
    *
    * A message above it may still be replaced or withdrawn in place by its
    * sender, though it may already have been in one of the agent's requests.
@@ -953,10 +953,10 @@ export class Agent {
    * front of the agent, per branch. It moves where the consumed watermark
    * does, and sooner: when a committing compile takes its value, before it
    * awaits, and at every tool boundary that injects, whether or not the
-   * stream says it carries injected messages. So nothing above it can have
-   * been shown, apart from each round's own content and results stored at a
-   * boundary that injected nothing, which its stream carries into its next
-   * request. A compile that throws assembled nothing, and gives its move
+   * stream says it carries injected messages. A message above it may still
+   * have been shown, though: for one, a live stream carries each round's own
+   * content and results, stored at a boundary that injected nothing, into its
+   * next request. A compile that throws assembled nothing, and gives its move
    * back where it can (unshowFailedCompile). A scalar counts a prefix, so a
    * message stored below it without having been shown counts as shown, which
    * errs toward a marker.
