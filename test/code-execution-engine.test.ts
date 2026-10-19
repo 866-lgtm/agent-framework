@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  loadEngine, EngineError, MAX_MEMORY_BYTES, MAX_STACK_BYTES, MIN_MEMORY_BYTES,
+  loadEngine, EngineError, MAX_MEMORY_BYTES, MAX_RESULT_DEPTH, MAX_STACK_BYTES, MIN_MEMORY_BYTES,
 } from '../src/code-execution/engine.js';
 import type { Engine, EngineLimits, EngineSlots, RunState } from '../src/code-execution/engine.js';
 
@@ -98,11 +98,25 @@ test('a failed call rejects with its fields, and the prelude makes an Error of t
   e.dispose();
 });
 
-test('a result that doesn\'t parse rejects the call with the parse error', async () => {
-  const { e } = await engine();
-  e.start(PRELUDE, 'try { await tool("t") } catch (err) { [err.name, String(err.message).length > 0] }', 's.js');
-  assert.deepEqual(fulfilled(e.settle(1, true, '{"unterminated": ', UNFIT)), ['SyntaxError', true]);
-  e.dispose();
+test('a result the guest can\'t parse, nested too deeply or not JSON, rejects the call with the child\'s own error', async () => {
+  // The call took effect either way, and a RangeError or SyntaxError at its await, or a crash,
+  // would read as a failed call. Nested 10,000 deep, the parse overflows the host's stack under
+  // Node before QuickJS's own check sees it.
+  const nested = (depth: number) => `${'['.repeat(depth)}"x"${']'.repeat(depth)}`;
+  for (const [shape, json, unfit] of [
+    ['nested to the limit', nested(MAX_RESULT_DEPTH), false],
+    ['nested past the limit', nested(MAX_RESULT_DEPTH + 1), true],
+    ['nested past the host\'s stack', nested(200_000), true],
+    ['brackets inside strings', `["${'['.repeat(MAX_RESULT_DEPTH + 1)}\\""]`, false],
+    ['not JSON', '{"unterminated": ', true],
+  ] as const) {
+    const { e } = await engine();
+    e.start(PRELUDE, 'try { await tool("t"); "took it" } catch (err) { err.name }', 's.js');
+    const s = e.settle(1, true, json, UNFIT);
+    assert.equal(s.unfit, unfit ? true : undefined, shape);
+    assert.equal(fulfilled(s), unfit ? 'ResultTooLarge' : 'took it', shape);
+    e.dispose();
+  }
 });
 
 test('settling an id that isn\'t pending throws, and leaves the run as it was', async () => {
@@ -151,14 +165,13 @@ test('a thrown object with no message is rejected with its JSON as the message',
 });
 
 test('a script\'s value is serialized once, however many calls settle after it returns', async () => {
-  // Serializing runs the script's own code, here a toJSON that prints, and every settle after the
-  // script returned answers its ending again.
-  const { e, rec } = await engine();
-  const s = e.start(PRELUDE, 'let n = 0; tool("a"); tool("b"); ({ toJSON() { n++; print("serialized", n); return { n }; } })', 's.js');
+  // Serializing runs the script's own code, here a toJSON that counts its runs, and every settle
+  // after the script returned answers its ending again.
+  const { e } = await engine();
+  const s = e.start(PRELUDE, 'let n = 0; tool("a"); tool("b"); ({ toJSON() { n++; return { n }; } })', 's.js');
   assert.deepEqual(fulfilled(s), { n: 1 });
   assert.deepEqual(fulfilled(e.settle(1, true, '1', UNFIT)), { n: 1 });
   assert.deepEqual(fulfilled(e.settle(2, true, '2', UNFIT)), { n: 1 });
-  assert.deepEqual(rec.output, [[1, 'serialized 1\n']]);
   e.dispose();
 });
 
@@ -194,8 +207,8 @@ test('a value JSON can\'t hold is rejected with the stringify error', async () =
 
 test('output reaches the output slot with its stream', async () => {
   const { e, rec } = await engine();
-  e.start(PRELUDE, 'print("out", 1); __output(2, "err ✓"); 0', 's.js');
-  assert.deepEqual(rec.output, [[1, 'out 1\n'], [2, 'err ✓']]);
+  e.start(PRELUDE, 'print("out", 1); __output(2, "err ✓"); __output(1, "\\uFEFFkept"); 0', 's.js');
+  assert.deepEqual(rec.output, [[1, 'out 1\n'], [2, 'err ✓'], [1, '\uFEFFkept']]);
   e.dispose();
 });
 
@@ -236,6 +249,110 @@ test('a slot that throws ends the run with an EngineError, and the engine refuse
   out.e.dispose();
 });
 
+test('a slot failure is an EngineError, not a stop, when the interrupt is what ends the run', async () => {
+  // The interrupt slot itself throwing, while the script runs or while its ending is read, and a
+  // failure the script caught before the interrupt check that stops it: each ends the run with
+  // that failure.
+  for (const script of ['for (;;) {}', 'throw Object.defineProperty({}, "message", { get() { for (;;) {} } })']) {
+    // It throws only well into the spin, so that in the second script, it's the getter's.
+    let checks = 0;
+    const { e } = await engine({ interrupt: () => { if (++checks > 100) throw new Error('the stop file is unreadable'); return false; } });
+    assert.throws(() => e.start(PRELUDE, script, 's.js'), (err: unknown) =>
+      err instanceof EngineError && /the stop file is unreadable/.test(err.message), script);
+    e.dispose();
+  }
+  const b = await engine({ output: () => { throw new Error('the output pipe is gone'); } });
+  assert.throws(() => b.e.start(PRELUDE, 'try { print("x") } catch {}\nfor (;;) {}', 's.js'), (err: unknown) =>
+    err instanceof EngineError && /the output pipe is gone/.test(err.message));
+  b.e.dispose();
+});
+
+test('a slot that throws undefined still ends the run, and no slot is called after it', async () => {
+  let calls = 0, checks = 0, checksAtFailure = -1;
+  const { e } = await engine({
+    hostCall: () => { calls++; checksAtFailure = checks; throw undefined; },
+    interrupt: () => ++checks > 1000,
+  });
+  assert.throws(() => e.start(PRELUDE, 'try { __host("a", "{}") } catch {}\ntry { __host("b", "{}") } catch {}\nfor (;;) {}', 's.js'), EngineError);
+  assert.deepEqual([calls, checks], [1, checksAtFailure]);
+  e.dispose();
+});
+
+test('a slot that calls back into the engine ends the run with an EngineError', async () => {
+  let self: Engine | undefined;
+  const { e } = await engine({ hostCall: (id) => { self!.settle(id, true, '1', UNFIT); } });
+  self = e;
+  assert.throws(() => e.start(PRELUDE, 'await tool("t")', 's.js'), (err: unknown) =>
+    err instanceof EngineError && /settle\(\) was called from inside one of the engine's slots/.test(err.message));
+  e.dispose();
+});
+
+test('the script\'s code that runs while its ending is read can\'t reach the host', async () => {
+  // A getter on what the script threw runs after its ending is fixed: neither the call it makes
+  // nor its output is taken, and a message that throws is told by the object's JSON.
+  const { e, rec } = await engine();
+  const s = e.start(PRELUDE, 'throw Object.defineProperty({ why: 1 }, "message", { get() { __output(1, "late"); __host("late", "{}"); return "m"; } })', 's.js');
+  assert.deepEqual(s, { kind: 'rejected', name: '', message: '{"why":1}' });
+  assert.deepEqual([rec.calls, rec.output], [[], []]);
+  e.dispose();
+});
+
+test('what a thrown object holds is read as text, and a part that can\'t be read is left out', async () => {
+  const a = await engine();
+  assert.deepEqual(a.e.start(PRELUDE, 'throw { name: 7, message: 42 }', 's.js'), { kind: 'rejected', name: '7', message: '42' });
+  a.e.dispose();
+  const b = await engine();
+  assert.deepEqual(b.e.start(PRELUDE, 'throw Object.defineProperty(new TypeError("readable"), "stack", { get() { throw 1 } })', 's.js'),
+    { kind: 'rejected', name: 'TypeError', message: 'readable' });
+  b.e.dispose();
+});
+
+test('a script too large to copy into the guest\'s memory is rejected, not an engine failure', async () => {
+  const { e } = await engine({}, { memoryMaxBytes: MIN_MEMORY_BYTES });
+  assert.deepEqual(e.start(PRELUDE, `/*${'x'.repeat(3 * MiB)}*/ 1`, 's.js'),
+    { kind: 'rejected', name: 'InternalError', message: 'out of memory while loading the script' });
+  e.dispose();
+});
+
+test('a trap in the module throws an EngineError with what the engine wrote, up to 4,096 characters, and the engine stays broken', async () => {
+  // An assertion in QuickJS writes its message to stderr, then traps. This stands in for one,
+  // around the real module: its engine_start writes 20,000 bytes to stderr, then traps.
+  interface Imports { env: { memory: { buffer: ArrayBuffer } }; wasi_snapshot_preview1: { fd_write(fd: number, iovs: number, iovsLen: number, written: number): number } }
+  interface WasmApi {
+    instantiate(module: object, imports: Imports): Promise<{ exports: Record<string, (...args: number[]) => number> }>;
+    RuntimeError: new (message: string) => Error;
+  }
+  const wasm = (globalThis as unknown as { WebAssembly: WasmApi }).WebAssembly;
+  const instantiate = wasm.instantiate;
+  wasm.instantiate = async (module, imports) => {
+    const { exports: ex } = await instantiate.call(wasm, module, imports);
+    const engine_start = (): number => {
+      const text = ex.engine_alloc(20_000), iov = ex.engine_alloc(8), written = ex.engine_alloc(4);
+      new Uint8Array(imports.env.memory.buffer, text, 20_000).fill(0x44); // 'D'
+      const view = new DataView(imports.env.memory.buffer);
+      view.setUint32(iov, text, true);
+      view.setUint32(iov + 4, 20_000, true);
+      imports.wasi_snapshot_preview1.fd_write(2, iov, 1, written);
+      throw new wasm.RuntimeError('unreachable');
+    };
+    return { exports: { ...ex, engine_start } };
+  };
+  let loaded: Awaited<ReturnType<typeof engine>>;
+  try {
+    loaded = await engine();
+  } finally {
+    wasm.instantiate = instantiate;
+  }
+  const { e } = loaded;
+  let crash: unknown;
+  assert.throws(() => e.start(PRELUDE, '1', 's.js'), (err: unknown) => {
+    crash = err;
+    return err instanceof EngineError && /^the engine crashed in start\(\): unreachable \(D{4096}\)$/.test(err.message);
+  });
+  assert.throws(() => e.settle(1, true, '1', UNFIT), (err: unknown) => err === crash);
+  e.dispose();
+});
+
 test('the guest has JavaScript and the three slots, and nothing that reaches the host', async () => {
   const { e } = await engine();
   const s = e.start(PRELUDE, `
@@ -251,12 +368,12 @@ test('the guest has JavaScript and the three slots, and nothing that reaches the
 
 test('the guest reads the host\'s clocks: Date.now, and a performance.now that advances', async () => {
   const { e } = await engine();
-  const before = Date.now();
   const v = fulfilled(e.start(PRELUDE, `
     const t0 = performance.now();
     for (let i = 0; i < 2e6 && performance.now() - t0 < 5; i++);
     [Date.now(), performance.now() - t0 >= 5]`, 's.js')) as [number, boolean];
-  assert.ok(v[0] >= before && v[0] <= Date.now(), `Date.now() in the guest was ${v[0]}`);
+  // Within a minute of the host's wall clock, which may step either way meanwhile.
+  assert.ok(Math.abs(v[0] - Date.now()) < 60_000, `Date.now() in the guest was ${v[0]}, and ${Date.now()} here`);
   assert.equal(v[1], true);
   e.dispose();
 });
@@ -265,7 +382,9 @@ test('a script reaching the memory limit gets a catchable out-of-memory error, a
   for (const [shape, grow] of [
     ['large arrays', 'a.push(new Array(100000).fill(1))'],
     ['small objects', 'a.push({ n: a.length, s: "x" + a.length })'],
-    ['a doubling string', 'a[0] = (a[0] ?? "x") + (a[0] ?? "x")'],
+    // repeat, not +: QuickJS-ng joins strings as ropes, which double to its length limit without
+    // the memory.
+    ['a doubling string', 'a[0] = (a[0] ?? "x").repeat(2)'],
   ]) {
     const { e } = await engine({}, { memoryMaxBytes: 16 * MiB });
     const s = e.start(PRELUDE, `
@@ -276,7 +395,7 @@ test('a script reaching the memory limit gets a catchable out-of-memory error, a
     const v = fulfilled(s) as { caught: unknown; after: string };
     assert.deepEqual(v.after, '2,4,6', shape);
     assert.ok(Array.isArray(v.caught), `${shape}: caught ${JSON.stringify(v.caught)}`);
-    assert.match(String((v.caught as string[])[1]), /out of memory|string too long|invalid array length/, shape);
+    assert.deepEqual(v.caught, ['InternalError', 'out of memory'], shape);
     e.dispose();
   }
 });
@@ -322,13 +441,18 @@ test('a result that fits, beside one that didn\'t, settles as usual', async () =
   e.dispose();
 });
 
-test('deep recursion throws a catchable RangeError at the stack limit', async () => {
+test('deep recursion throws a catchable RangeError at the stack limit, which maxStackBytes sets', async () => {
+  const depths: number[] = [];
   for (const maxStackBytes of [64 * 1024, undefined]) {
     const { e } = await engine({}, { maxStackBytes });
-    const s = e.start(PRELUDE, 'function f(n) { return f(n + 1) + 1 }\ntry { f(0) } catch (err) { [err.name, err.message] }', 's.js');
-    assert.deepEqual(fulfilled(s), ['RangeError', 'Maximum call stack size exceeded'], String(maxStackBytes));
+    const s = e.start(PRELUDE, 'let depth = 0; function f() { depth++; return f() + 1 }\ntry { f() } catch (err) { [err.name, err.message, depth] }', 's.js');
+    const [name, message, depth] = fulfilled(s) as [string, string, number];
+    assert.deepEqual([name, message], ['RangeError', 'Maximum call stack size exceeded'], String(maxStackBytes));
+    depths.push(depth);
     e.dispose();
   }
+  // 64 KiB is an eighth of the default's 512 KiB.
+  assert.ok(depths[0] * 4 < depths[1], `depths ${depths.join(' and ')}`);
 });
 
 test('limits outside their range are refused before anything loads', async () => {
@@ -337,6 +461,8 @@ test('limits outside their range are refused before anything loads', async () =>
   await assert.rejects(loadEngine({ memoryMaxBytes: MIN_MEMORY_BYTES - 65536 }, slots), RangeError);
   await assert.rejects(loadEngine({ memoryMaxBytes: MAX_MEMORY_BYTES + 65536 }, slots), RangeError);
   await assert.rejects(loadEngine({ memoryMaxBytes: 32 * MiB, maxStackBytes: MAX_STACK_BYTES + 1 }, slots), RangeError);
+  await assert.rejects(loadEngine({ memoryMaxBytes: 32 * MiB, maxStackBytes: 8 * 1024 }, slots), RangeError);
+  await assert.rejects(loadEngine({ memoryMaxBytes: 32 * MiB, maxStackBytes: 64 * 1024 + 0.5 }, slots), RangeError);
 });
 
 test('both ends of the memory range load and run', async () => {

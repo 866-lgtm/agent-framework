@@ -4,8 +4,11 @@
  *
  * It is held to what code_execution's bridge needs: limits, evaluating the prelude and a script,
  * one host function whose calls the host settles by id, running jobs, the interrupt, and output.
- * The guest reaches nothing outside JavaScript except through the three imports below, and only
- * JSON text and output text cross them. The host's side is src/code-execution/engine.ts.
+ * The guest reaches nothing outside JavaScript except the three imports below, which only JSON
+ * text and output text cross, and the clocks: Date.now and performance.now read WASI's
+ * clock_time_get. libc's other WASI calls, four random bytes as the module loads and stdio for
+ * the engine's own diagnostics, aren't reachable from guest code. The host's side is
+ * src/code-execution/engine.ts.
  *
  * One runtime and one context per module instance, made by engine_init. A child process holds
  * one instance for one script, so nothing here is reentrant or thread-safe.
@@ -43,7 +46,9 @@ enum {
     ENGINE_FULFILLED = 1,    /* the script settled with a value: engine_result has it */
     ENGINE_REJECTED = 2,     /* the script, or the prelude, threw: engine_result has why */
     ENGINE_INTERRUPTED = 3,  /* host_interrupt returned nonzero while it ran */
-    ENGINE_HOST_FAILED = 4,  /* an import reported failure, so the run ended */
+    ENGINE_HOST_FAILED = 4,  /* an import reported failure: the run is over, and the host refuses
+                                the guest's later calls and output and stops it at its next
+                                interrupt check */
     ENGINE_MISUSE = -1,      /* called out of order, or with a malformed buffer */
     ENGINE_NO_MEMORY = -2,   /* the engine couldn't allocate its own state */
     ENGINE_UNKNOWN_CALL = -3 /* engine_settle named no pending call */
@@ -65,6 +70,9 @@ static bool started;
 static bool failed;
 static bool interrupted;
 static bool host_failed;
+/* engine_result is serializing the script's value or error, which can run the script's own code
+   (a toJSON, a getter) after its ending is fixed. */
+static bool reading;
 static uint32_t next_id = 1;
 
 /*
@@ -77,15 +85,18 @@ static uint32_t next_id = 1;
  * builds is refused too, and the script's catch gets a bare null (the engine test's small-objects
  * case shows it). So QuickJS's own limit stays off, and these functions refuse ordinary
  * allocations at a soft limit OOM_HEADROOM under the limit. After a refusal, allocations may use
- * the headroom up to the limit, so that the error, and the code that handles it, can allocate;
- * the reserve re-arms once usage is back under the soft limit.
+ * the headroom up to the limit, so that QuickJS can build the error and the script's handler can
+ * run, and the next allocation that fits under the soft limit closes it again. So the first
+ * out-of-memory error a script meets is a real one. A script that catches it and keeps allocating
+ * without freeing spends the headroom itself, and an error after that can be a bare null:
+ * keeping the headroom for the error alone would take QuickJS's own in_out_of_memory flag, which
+ * its API doesn't expose.
  */
 #define OOM_HEADROOM (64 * 1024)
 
 static size_t mem_limit; /* 0: no limit */
 static size_t mem_used;  /* the usable size of every live allocation */
 static bool mem_in_oom;  /* a refusal has opened the headroom */
-static uint32_t mem_refusals; /* allocations refused, or failed for want of linear memory */
 
 static size_t soft_limit(void) {
     return mem_limit > 2 * OOM_HEADROOM ? mem_limit - OOM_HEADROOM : mem_limit / 2;
@@ -106,7 +117,6 @@ static bool refuse(size_t size) {
     if (mem_in_oom && !exceeds(size, mem_limit))
         return false;
     mem_in_oom = true;
-    mem_refusals++;
     return true;
 }
 
@@ -118,8 +128,6 @@ static void *limited_calloc(void *opaque, size_t count, size_t size) {
     void *ptr = calloc(count, size);
     if (ptr)
         mem_used += malloc_usable_size(ptr);
-    else
-        mem_refusals++;
     return ptr;
 }
 
@@ -130,8 +138,6 @@ static void *limited_malloc(void *opaque, size_t size) {
     void *ptr = malloc(size);
     if (ptr)
         mem_used += malloc_usable_size(ptr);
-    else
-        mem_refusals++;
     return ptr;
 }
 
@@ -155,8 +161,6 @@ static void *limited_realloc(void *opaque, void *ptr, size_t size) {
     if (new_ptr) {
         mem_used -= old_usable <= mem_used ? old_usable : mem_used;
         mem_used += malloc_usable_size(new_ptr);
-    } else {
-        mem_refusals++;
     }
     return new_ptr;
 }
@@ -183,6 +187,8 @@ static int interrupt_handler(JSRuntime *r, void *opaque) {
    Returns a promise the host settles with engine_settle. */
 static JSValue js_host(JSContext *c, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val;
+    if (reading)
+        return JS_ThrowInternalError(c, "the script has ended, so its calls no longer reach the host");
     if (argc < 2 || !JS_IsString(argv[0]) || !JS_IsString(argv[1]))
         return JS_ThrowTypeError(c, "__host takes a tool name and its arguments as JSON text");
     if (next_id == UINT32_MAX)
@@ -241,6 +247,8 @@ static JSValue js_host(JSContext *c, JSValueConst this_val, int argc, JSValueCon
 /* __output(stream, text): stream 1 is out and 2 is err. */
 static JSValue js_output(JSContext *c, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val;
+    if (reading)
+        return JS_ThrowInternalError(c, "the script has ended, so its output no longer reaches the host");
     int32_t stream;
     if (argc < 2 || !JS_IsNumber(argv[0]) || !JS_IsString(argv[1]))
         return JS_ThrowTypeError(c, "__output takes a stream, 1 or 2, and a string");
@@ -379,13 +387,14 @@ int engine_start(const char *prelude, uint32_t prelude_len, const char *script, 
 }
 
 /* Settles call `id`, then runs jobs. With ok, the call's promise resolves to the parsed JSON;
-   otherwise it rejects with it. JSON that doesn't parse rejects it with the SyntaxError. A result
-   that doesn't fit the guest's memory (a null json, which the host couldn't copy in, or a parse
-   that ran out of memory) rejects it with the parse of unfit instead, the host's own error, and
-   the state answered has ENGINE_UNFIT set. That error is small, and parses in the headroom the
-   refusal opened; if even it can't be copied in (a null unfit) or parsed, the call rejects with
-   what that failure gives. json and unfit, when not null, must end in a NUL at [len], as
-   JS_ParseJSON requires. */
+   otherwise it rejects with it. A result the guest can't take rejects it with the parse of unfit
+   instead, the host's own error, and the state answered has ENGINE_UNFIT set: a null json, which
+   the host couldn't copy in, or a parse that fails, for want of memory or stack (or because it
+   isn't JSON, which a host's result never is). Any of these took effect without reaching the
+   script, which an error at the call's await would hide. A parse that fails frees what it built,
+   so the small unfit error has room, unless the result's copy took the last of the memory; if
+   even it can't be copied in (a null unfit) or parsed, the call rejects with what that failure
+   gives. json and unfit, when not null, must end in a NUL at [len], as JS_ParseJSON requires. */
 EXPORT("engine_settle")
 int engine_settle(uint32_t id, int ok, const char *json, uint32_t json_len, const char *unfit,
                   uint32_t unfit_len) {
@@ -415,16 +424,10 @@ int engine_settle(uint32_t id, int ok, const char *json, uint32_t json_len, cons
     bool resolve = ok != 0;
     bool too_large = !json;
     if (json) {
-        uint32_t refusals = mem_refusals;
         value = JS_ParseJSON(ctx, json, json_len, "<result>");
         if (JS_IsException(value)) {
-            value = JS_GetException(ctx);
-            resolve = false;
-            if (mem_refusals != refusals) {
-                /* The parse ran out of memory, and freed what it had built. */
-                JS_FreeValue(ctx, value);
-                too_large = true;
-            }
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            too_large = true;
         }
     }
     if (too_large) {
@@ -454,7 +457,7 @@ int engine_settle(uint32_t id, int ok, const char *json, uint32_t json_len, cons
         JS_FreeValue(ctx, r);
     run_jobs();
     int st = state();
-    return too_large && st >= 0 ? st | ENGINE_UNFIT : st;
+    return too_large ? st | ENGINE_UNFIT : st;
 }
 
 /* The text of a value or an error, for engine_result. Takes v. Returns a JS string, undefined,
@@ -470,8 +473,13 @@ static JSValue error_json(JSValue v) {
         name = JS_GetPropertyStr(ctx, v, "name");
         message = JS_GetPropertyStr(ctx, v, "message");
         stack = JS_GetPropertyStr(ctx, v, "stack");
-        /* An object with no message of its own, such as a plain object thrown, is told by its
-           JSON, or by its string form when it has none, rather than left blank. */
+        /* An object with no message of its own, such as a plain object thrown, or one whose
+           message can't be read, is told by its JSON, or by its string form when it has none,
+           rather than left blank. */
+        if (JS_IsException(message)) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            message = JS_UNDEFINED;
+        }
         if (JS_IsUndefined(message)) {
             message = JS_JSONStringify(ctx, v, JS_UNDEFINED, JS_UNDEFINED);
             if (JS_IsException(message)) {
@@ -539,45 +547,50 @@ static uint8_t *pack(uint32_t kind, JSValue text) {
     return buf;
 }
 
+/* The ending as engine_result gives it: the value's JSON (kind 0 or 1), or an error's (kind 2). */
+static uint8_t *read_ending(int st) {
+    JSValue text;
+    uint32_t kind = 2;
+    if (st == ENGINE_REJECTED) {
+        text = error_json(failed ? JS_DupValue(ctx, failure) : JS_PromiseResult(ctx, completion));
+    } else {
+        JSValue settled = JS_PromiseResult(ctx, completion);
+        JSValue value = JS_GetPropertyStr(ctx, settled, "value");
+        JS_FreeValue(ctx, settled);
+        if (JS_IsException(value)) {
+            text = error_json(JS_GetException(ctx));
+        } else {
+            text = JS_JSONStringify(ctx, value, JS_UNDEFINED, JS_UNDEFINED);
+            JS_FreeValue(ctx, value);
+            if (JS_IsException(text))
+                text = error_json(JS_GetException(ctx));
+            else
+                kind = JS_IsUndefined(text) ? 0 : 1;
+        }
+    }
+    if (JS_IsException(text)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return NULL;
+    }
+    return pack(kind, text);
+}
+
 /* After ENGINE_FULFILLED or ENGINE_REJECTED: a buffer the host frees with engine_free,
    [u32 kind][u32 length][UTF-8]. Kind 0: fulfilled with undefined (or a value JSON.stringify
    leaves out), no text. Kind 1: fulfilled, the value's JSON. Kind 2: an error, as JSON
    {name?, message?, stack?}: what the script threw, or why its value couldn't be stringified.
-   Returns 0 in any other state, or when it can't allocate. */
+   Returns 0 in any other state, or when it can't allocate. The ending is fixed before it's read,
+   so the script's code that serializing runs can't reach the host, and a stop leaves out the
+   part it interrupts. */
 EXPORT("engine_result")
 uint8_t *engine_result(void) {
     int st = state();
-    if (st == ENGINE_REJECTED) {
-        JSValue why = failed ? JS_DupValue(ctx, failure) : JS_PromiseResult(ctx, completion);
-        JSValue text = error_json(why);
-        if (JS_IsException(text)) {
-            JS_FreeValue(ctx, JS_GetException(ctx));
-            return NULL;
-        }
-        return pack(2, text);
-    }
-    if (st != ENGINE_FULFILLED)
+    if (st != ENGINE_FULFILLED && st != ENGINE_REJECTED)
         return NULL;
-    JSValue settled = JS_PromiseResult(ctx, completion);
-    JSValue value = JS_GetPropertyStr(ctx, settled, "value");
-    JS_FreeValue(ctx, settled);
-    if (JS_IsException(value)) {
-        JSValue text = error_json(JS_GetException(ctx));
-        return JS_IsException(text) ? NULL : pack(2, text);
-    }
-    JSValue text = JS_JSONStringify(ctx, value, JS_UNDEFINED, JS_UNDEFINED);
-    JS_FreeValue(ctx, value);
-    if (JS_IsException(text)) {
-        JSValue etext = error_json(JS_GetException(ctx));
-        if (JS_IsException(etext)) {
-            JS_FreeValue(ctx, JS_GetException(ctx));
-            return NULL;
-        }
-        return pack(2, etext);
-    }
-    if (JS_IsUndefined(text))
-        return pack(0, text);
-    return pack(1, text);
+    reading = true;
+    uint8_t *buf = read_ending(st);
+    reading = false;
+    return buf;
 }
 
 /* Buffers the host fills for engine_start and engine_settle, and frees after engine_result.

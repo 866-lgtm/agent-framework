@@ -26,8 +26,9 @@ export interface EngineLimits {
 
 /**
  * The three imports, as slots the child fills. Each is called synchronously from inside the
- * engine, so none may await, and none may call back into the engine. A slot that throws ends the
- * run: the call in progress throws that error, wrapped as an `EngineError`.
+ * engine, so none may await, and none may call back into the engine: a call into it from a slot
+ * throws an `EngineError`. A slot that throws ends the run: the call in progress throws that
+ * error, wrapped as an `EngineError`, and no slot is called again.
  */
 export interface EngineSlots {
   /**
@@ -64,8 +65,9 @@ export type RunState =
   | { kind: 'interrupted' };
 
 /**
- * What `settle` answers: the run's state, and `unfit` when the result didn't fit the guest's
- * memory, to copy in or as it was parsed, and the call took the child's own error instead.
+ * What `settle` answers: the run's state, and `unfit` when the guest couldn't take the result, for
+ * want of memory to copy it in or of memory or stack to parse it, and the call took the child's
+ * own error instead.
  */
 export type SettleState = RunState & { unfit?: true };
 
@@ -79,10 +81,11 @@ export interface Engine {
   /**
    * Settles call `callId`, then runs pending jobs as `start` does. With `ok`, the call's promise
    * resolves to the parsed JSON; otherwise it rejects with it, and the prelude makes an Error of
-   * it. JSON that doesn't parse rejects the promise with the SyntaxError instead. A result that
-   * doesn't fit the guest's memory rejects it with `unfitJson` parsed, the child's own error
-   * (`ResultTooLarge`), and the answer has `unfit: true`. Allowed after `fulfilled`, for calls
-   * still in flight when a script returned. Throws for an id that isn't pending.
+   * it. A result the guest can't take, for want of memory to copy it in or of memory or stack to
+   * parse it, nested deeper than `MAX_RESULT_DEPTH`, or not JSON, rejects it with `unfitJson`
+   * parsed, the child's own error (`ResultTooLarge`), and the answer has `unfit: true`: the call
+   * took effect, and an error at its await would read as a failed call. Allowed after `fulfilled`,
+   * for calls still in flight when a script returned. Throws for an id that isn't pending.
    */
   settle(callId: number, ok: boolean, json: string | Uint8Array, unfitJson: string): SettleState;
   /** Frees the engine's runtime. Nothing may be called after it. */
@@ -107,6 +110,14 @@ export const MIN_MEMORY_BYTES = 4 * 1024 * 1024;
  */
 export const MAX_MEMORY_BYTES = 2048 * 1024 * 1024;
 export const DEFAULT_STACK_BYTES = 512 * 1024;
+/**
+ * The deepest nesting of arrays and objects a result may have. QuickJS's stack check measures the
+ * module's own stack, which the C recursion of JSON's parse and stringify barely uses, so nesting
+ * about 10,000 deep overflows the host's stack first under Node (about 30,000 under Bun), and the
+ * engine crashes. A deeper result is unfit, since the call took effect. A script's own data isn't
+ * held to this, and nested that deep, it crashes its own run.
+ */
+export const MAX_RESULT_DEPTH = 2000;
 /** The most of the engine's own stdio a crash's message keeps. */
 const DIAGNOSTICS_CHARS = 4096;
 /** Leaves a quarter of the link-time stack for C frames between QuickJS's checks. */
@@ -146,6 +157,27 @@ function engineModule(): Promise<object> {
   return compiled;
 }
 
+/** Whether JSON text nests arrays and objects deeper than `limit`. */
+function nestsDeeper(json: string | Uint8Array, limit: number): boolean {
+  // The characters that count are ASCII, so UTF-8 bytes and UTF-16 code units read alike.
+  const at = typeof json === 'string' ? (i: number) => json.charCodeAt(i) : (i: number) => json[i];
+  let depth = 0, inString = false;
+  for (let i = 0; i < json.length; i++) {
+    const c = at(i);
+    if (inString) {
+      if (c === 0x5c) i++; // a backslash escapes the next character
+      else if (c === 0x22) inString = false;
+    } else if (c === 0x22) {
+      inString = true;
+    } else if (c === 0x5b || c === 0x7b) {
+      if (++depth > limit) return true;
+    } else if (c === 0x5d || c === 0x7d) {
+      depth--;
+    }
+  }
+  return false;
+}
+
 /** QuickJS's allocation limit for a given linear maximum: the stack and data, then a margin. */
 function quickjsMemoryLimit(memoryMaxBytes: number): number {
   return memoryMaxBytes - LINK_STACK_BYTES - 1024 * 1024 - Math.floor(memoryMaxBytes / 32);
@@ -164,12 +196,17 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
   }
 
   const memory = new Wasm.Memory({ initial: Math.ceil((LINK_STACK_BYTES + 2 * PAGE) / PAGE), maximum: memoryMaxBytes / PAGE });
-  const decoder = new TextDecoder();
+  // ignoreBOM, so text that starts with U+FEFF keeps it.
+  const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
   const encoder = new TextEncoder();
-  /** Why the run ended when a slot threw, or what the engine wrote before it crashed. */
+  /** Whether a slot threw, and what: a slot may throw anything, undefined included. */
+  let slotFailed = false;
   let slotError: unknown;
   let broken: EngineError | undefined;
+  /** What the engine wrote before it crashed. */
   let diagnostics = '';
+  /** A call into the module is in progress, so a slot is the only thing that can call again. */
+  let busy = false;
 
   /**
    * A view of the module's memory. A corrupted guest could pass any pointer, and the view's own
@@ -180,11 +217,12 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
   const text = (ptr: number, len: number) => decoder.decode(bytes(ptr, len));
   /** Runs a slot. A throw is kept, and the engine told the slot failed. */
   const guard = (fn: () => void): number => {
-    if (slotError !== undefined) return 1;
+    if (slotFailed) return 1;
     try {
       fn();
       return 0;
     } catch (err) {
+      slotFailed = true;
       slotError = err;
       return 1;
     }
@@ -195,11 +233,13 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
     memory,
     host_call: (id: number, name: number, nameLen: number, args: number, argsLen: number) =>
       guard(() => slots.hostCall(id >>> 0, text(name, nameLen), text(args, argsLen))),
+    // Once a slot has failed, this stops the guest at its next check.
     host_interrupt: () => {
-      if (slotError !== undefined) return 1;
+      if (slotFailed) return 1;
       try {
         return slots.interrupt() ? 1 : 0;
       } catch (err) {
+        slotFailed = true;
         slotError = err;
         return 1;
       }
@@ -253,9 +293,15 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
   const instance = await Wasm.instantiate(await engineModule(), { env, wasi_snapshot_preview1: wasi });
   const ex = instance.exports as unknown as Exports;
 
-  /** Calls into the module. A trap leaves the engine broken, and every later call throws its error. */
+  /**
+   * Calls into the module. A trap leaves the engine broken, and every later call throws its error.
+   * One made from inside a slot, while another is in progress, is refused: the two would share the
+   * module's state.
+   */
   const call = <T>(what: string, fn: () => T): T => {
     if (broken) throw broken;
+    if (busy) throw new EngineError(`${what} was called from inside one of the engine's slots, which may not call back into it`);
+    busy = true;
     let out: T;
     try {
       out = fn();
@@ -264,6 +310,8 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
       const why = diagnostics.trim();
       broken = new EngineError(`the engine crashed in ${what}: ${err instanceof Error ? err.message : String(err)}${why ? ` (${why})` : ''}`, { cause: err });
       throw broken;
+    } finally {
+      busy = false;
     }
     return out;
   };
@@ -300,19 +348,32 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
    * script has ended answers that ending again: read once, that code runs once.
    */
   const endings = new Map<number, RunState>();
+  /** The run ended because a slot threw. */
+  const slotFailure = (what: string): never => {
+    broken = new EngineError(`a slot threw during ${what}: ${slotError instanceof Error ? slotError.message : String(slotError)}`, { cause: slotError });
+    throw broken;
+  };
   /** Reads a state code into a RunState, or throws for the engine's own failures. */
   const toState = (code: number, what: string): RunState => {
     switch (code) {
       case PENDING:
         return { kind: 'pending' };
       case INTERRUPTED:
+        // A slot's failure stops the guest through the interrupt, so this can be that failure.
+        if (slotFailed) return slotFailure(what);
         return { kind: 'interrupted' };
       case FULFILLED:
       case REJECTED: {
         const known = endings.get(code);
         if (known) return { ...known };
         const r = result();
-        if (!r) return { kind: 'rejected', name: 'InternalError', message: 'out of memory while reading the script\'s result' };
+        // Reading runs the interrupt slot, which can throw.
+        if (slotFailed) return slotFailure(what);
+        if (!r) {
+          return { kind: 'rejected', name: 'InternalError', message: code === FULFILLED
+            ? 'out of memory while serializing the script\'s return value; return less'
+            : 'out of memory while reading what the script threw' };
+        }
         const state: RunState = r.kind === 0 ? { kind: 'fulfilled', json: undefined }
           : r.kind === 1 ? { kind: 'fulfilled', json: r.text }
           : errorState(r.text);
@@ -320,8 +381,7 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
         return { ...state };
       }
       case HOST_FAILED:
-        broken = new EngineError(`a slot threw during ${what}: ${slotError instanceof Error ? slotError.message : String(slotError)}`, { cause: slotError });
-        throw broken;
+        return slotFailure(what);
       case UNKNOWN_CALL:
         throw new EngineError(`${what}: no pending call with that id`);
       case NO_MEMORY:
@@ -364,8 +424,10 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
       if (callId >>> 0 !== callId) throw new EngineError(`settle(): ${callId} isn't a call id`);
       return call('settle()', () => {
         // The small error first, so a result that takes the last of the memory leaves it room.
-        // A copy the module can't make room for goes as a null pointer.
-        const u = put(unfitJson), j = put(json);
+        // A copy the module can't make room for goes as a null pointer, and so does a result
+        // nested too deeply to parse.
+        const u = put(unfitJson);
+        const j = nestsDeeper(json, MAX_RESULT_DEPTH) ? { ptr: 0, len: 0 } : put(json);
         try {
           const code = ex.engine_settle(callId, ok ? 1 : 0, j.ptr, j.len, u.ptr, u.len);
           if (code >= 0 && (code & UNFIT) !== 0) return { ...toState(code & ~UNFIT, 'settle()'), unfit: true };
