@@ -40,7 +40,9 @@ export type ModuleMessage = StoredMessage & {
    * and `timestamp` are provisional: the sequence comes after every stored
    * row's, the timestamp is when the framework held the write (for a write
    * an older release held, when its queue was read back), and both change
-   * when it lands. Absent on a stored row.
+   * when it lands. A held write whose earlier write may already be stored
+   * is looked up first, and answered as the stored row it is when the store
+   * holds it. Absent on a stored row.
    */
   held?: true;
   /**
@@ -311,13 +313,17 @@ export interface ModuleContext {
 
   /**
    * Edit a message, by its id or a held write's handle. A held write is
-   * stored with the new content.
+   * stored with the new content. One whose earlier write may already be
+   * stored, where the store can't be searched to tell, throws with nothing
+   * changed.
    */
   editMessage(id: MessageId, content: ContentBlock[]): void;
 
   /**
    * Remove a message, by its id or a held write's handle. A held write is
-   * dropped, so the agent never reads it.
+   * dropped, so the agent never reads it. One whose earlier write may
+   * already be stored, where the store can't be searched to tell, throws
+   * with nothing changed.
    */
   removeMessage(id: MessageId): void;
 

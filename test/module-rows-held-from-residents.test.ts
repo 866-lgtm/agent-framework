@@ -496,4 +496,25 @@ describe("a message a tune-out holds stays out of what the residents are shown, 
       await close();
     }
   });
+
+  it("the cancel's backlog of held writes settles one whose landing was unknown first, so a write that landed is in the stored rows alone", async () => {
+    const { framework, internals, close } = await open();
+    try {
+      // A held write whose first write landed, though its store couldn't be
+      // read to tell (agent-framework's DeferredWrite.landing).
+      framework.getAgent('scout')!.getContextManager().addMessage('Antra', [{ type: 'text', text: 'T7-LANDED' }], { deferredWriteId: 'w-tune' } as never);
+      (internals.deferredMessages as unknown as Array<Record<string, unknown>>).push({
+        id: 'w-tune', seq: 1, participant: 'Antra', content: [{ type: 'text', text: 'T7-LANDED' }], heldAt: Date.now(), landing: 'unknown',
+      });
+      const hooks = (internals.tuneOutCoordinator as unknown as { hooks: { getDeferredMessages(): Array<{ content: ContentBlock[] }> } }).hooks;
+      const error = console.error;
+      console.error = () => {};
+      let held: string[];
+      try { held = hooks.getDeferredMessages().map(textOf); } finally { console.error = error; }
+      assert.ok(!held.includes('T7-LANDED'), 'not among the held writes');
+      assert.ok(!(internals.deferredMessages as unknown as Array<{ id: string }>).some((m) => m.id === 'w-tune'), 'and no longer queued');
+    } finally {
+      await close();
+    }
+  });
 });
