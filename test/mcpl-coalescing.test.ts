@@ -1232,7 +1232,7 @@ test("a render placed in a live turn's deferred queue isn't read by the resident
   assert(f.lastRequest().includes('document_diff'), "the primary's turn read the render once its queue was flushed");
 });
 
-test("a render placed in a live turn's deferred queue leaves the wakes of a newer batch of its subject as they are", async (t) => {
+test("a render placed in a live turn's deferred queue takes a newer batch of its subject, and its wakes, to its agent", async (t) => {
   const f = await fixture({ agents: TWO_RESIDENTS }); t.after(f.close);
   f.alwaysRespond();
   let release!: (value: unknown) => void;
@@ -1248,7 +1248,8 @@ test("a render placed in a live turn's deferred queue leaves the wakes of a newe
   const internals = f.framework as unknown as TurnInternals;
   // As above, the primary's turn is alive and 'other''s assembly renders the
   // batch, here held. A notice during the render opens a newer batch of the
-  // subject, which wakes its audience.
+  // subject, which wakes its audience. Once the render lands in the
+  // primary's queue, the newer batch follows the primary, wakes included.
   internals.activeTurnTokens.set('agent', -1);
   try {
     const pass = internals.processInferenceRequests();
@@ -1258,8 +1259,8 @@ test("a render placed in a live turn's deferred queue leaves the wakes of a newe
     assert.deepEqual(woken, ['agent', 'other']);
     release({ content: [{ type: 'text', text: 'first_render' }] });
     await settles(pass, 'the scheduler pass');
-    assert.deepEqual(internals.pendingRequests.map((r) => r.agentName).sort(), [...woken, 'agent'].sort(),
-      "the newer batch's wakes are as they were, beside the primary's wake for the render");
+    assert.deepEqual(internals.pendingRequests.map((r) => r.agentName), ['agent', 'agent'],
+      "the newer batch's wake is the primary's now, beside the primary's wake for the render");
   } finally {
     endStandInTurn(internals);
   }
@@ -1301,7 +1302,33 @@ test("a render placed in a live turn's deferred queue wakes its agent though a n
   assert(f.lastRequest().includes('first_render'), "the primary's turn read the render");
 });
 
-test("a render placed in a live turn's deferred queue keeps its agent's wake when another agent's assembly freezes a newer batch of its subject that gives nothing", async (t) => {
+test("a notice after a render landed unread in a live turn's deferred queue leaves it there, and the turn reads it before the newer render (#548)", async (t) => {
+  const f = await fixture({ agents: TWO_RESIDENTS }); t.after(f.close);
+  f.alwaysRespond();
+  let renders = 0;
+  f.renderer(() => Promise.resolve({ content: [{ type: 'text', text: ++renders > 1 ? 'second_render' : 'first_render' }] }));
+  await f.send('push/event', f.params('1', 'first_fallback', { deferred: true, initial: true }));
+  const internals = f.framework as unknown as TurnInternals;
+  // The primary's turn is alive, so 'other''s assembly places the render in
+  // the primary's deferred queue, unread. A notice then arrives. The render
+  // is a delta the next one builds on (RFC-006 §5.2), so it stays, and the
+  // notice's batch follows the primary.
+  internals.activeTurnTokens.set('agent', -1);
+  try {
+    await settles(internals.processInferenceRequests(), 'the scheduler pass');
+    assert.equal(renders, 1, "'other''s assembly rendered the first batch");
+    await f.send('push/event', f.params('2', 'second_fallback', { deferred: true }));
+    assert.deepEqual(internals.pendingRequests.map((r) => r.agentName), ['agent', 'agent'], "the render's wake and the newer batch's, both the primary's");
+  } finally {
+    endStandInTurn(internals);
+  }
+  await settles(f.framework.runUntilIdle(), 'the drain');
+  assert.equal(f.membrane.calls.length, 1);
+  const request = f.lastRequest();
+  assert(request.includes('first_render') && request.indexOf('first_render') < request.indexOf('second_render'), 'one call read the first render, then the second');
+});
+
+test("a render placed in a live turn's deferred queue takes a newer batch of its subject to its agent, so another agent's assembly leaves that batch and the render's wake alone", async (t) => {
   const f = await fixture({ agents: TWO_RESIDENTS }); t.after(f.close);
   f.alwaysRespond();
   const withdrawn = withdrawals(f);
@@ -1318,9 +1345,11 @@ test("a render placed in a live turn's deferred queue keeps its agent's wake whe
   const internals = f.framework as unknown as TurnInternals;
   // As above: the primary's turn is alive, 'other''s assembly renders the
   // batch into the primary's queue, and a notice during the render opens a
-  // newer batch, which wakes both. In the next pass the primary is still
-  // busy, and 'other''s assembly freezes the newer batch, whose render is
-  // empty: the freeze withdraws the subject's wakes, and nothing is placed.
+  // newer batch, which wakes both. Once the render lands, the newer batch
+  // follows the primary, whose queue holds the render it builds on (RFC-006
+  // §5.2), wakes included. In the next pass the primary is still busy, and
+  // 'other' has no wake left for the batch: the batch waits, with its wake,
+  // for the primary.
   internals.activeTurnTokens.set('agent', -1);
   try {
     const pass = internals.processInferenceRequests();
@@ -1329,12 +1358,14 @@ test("a render placed in a live turn's deferred queue keeps its agent's wake whe
     release({ content: [{ type: 'text', text: 'first_render' }] });
     await settles(pass, 'the first pass');
     await settles(internals.processInferenceRequests(), 'the second pass');
-    assert.deepEqual(withdrawn, ['other', 'other']);
-    assert.deepEqual(internals.pendingRequests.map((r) => r.agentName), ['agent'], "the primary's wake for the render outlived the newer batch's freeze");
+    assert.deepEqual(withdrawn, ['other'], "only 'other''s turn that rendered the first batch, which gave it nothing");
+    assert.equal(renders, 1, "'other''s assembly didn't render the newer batch");
+    assert.deepEqual(internals.pendingRequests.map((r) => r.agentName), ['agent', 'agent'], "the primary's wakes for the render and for the newer batch both wait for its turn");
   } finally {
     endStandInTurn(internals);
   }
   await settles(f.framework.runUntilIdle(), "the primary's turn");
+  assert.equal(renders, 2, "the primary's assembly rendered the newer batch, which gave nothing");
   assert.equal(f.membrane.calls.length, 1);
   assert(f.lastRequest().includes('first_render'), "the primary's turn read the render");
 });

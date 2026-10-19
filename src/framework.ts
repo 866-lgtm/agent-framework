@@ -147,9 +147,10 @@ import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
  *  closed for good, one removed, or one whose connect failed without
  *  reconnect, which this host doesn't bring back on its own. A server that's
  *  reconnecting stays registered, as does the stub a failed connect with
- *  reconnect leaves, and its closed connection answers the call instead. One
- *  this host is connecting to isn't registered yet, and
- *  mcplServerConnectingText answers for it. */
+ *  reconnect leaves, and its closed connection answers the call instead.
+ *  mcplServerConnectingText answers for one this host is connecting to: a
+ *  legacy server, which isn't registered yet, or a modern connection, which
+ *  is, until its first session is up. */
 function mcplServerGoneText(serverId: string, toolName: string): string {
   return `The "${serverId}" server that provides ${toolName} isn't connected, and this host won't reconnect to it on its own, ` +
     "so the call didn't run. If you need it, ask whoever runs this host.";
@@ -157,7 +158,9 @@ function mcplServerGoneText(serverId: string, toolName: string): string {
 
 /** A tool call refused while this host connects to its server, in a
  *  runtime connect or a restart's: the server's prefix routes calls to it
- *  before the server is registered, which it is once its connect is done. */
+ *  before a legacy server is registered, which it is once its connect is
+ *  done, and to a modern connection, registered before it starts, until its
+ *  first session is up (modernStillConnecting). */
 function mcplServerConnectingText(serverId: string, toolName: string): string {
   return `This host is connecting to the "${serverId}" server that provides ${toolName}, so the call didn't run. ` +
     'Try again in a moment.';
@@ -171,12 +174,11 @@ function mcplToolDeniedText(serverId: string, toolName: string): string {
     "and calling it again won't change that. If you need it, ask whoever runs this host.";
 }
 
-/** A runtime connect or restart refused because a legacy connect of the
- *  server's id is still in its handshake, before its server is registered
- *  (mcpServerIdTaken). A modern connect registers its connection first, so an
- *  id it holds reads as already registered. A disconnect isn't refused: it
- *  ends the connect in flight, in either engine. Whoever asked reads it: an
- *  operator, or an agent through a host's tool that passes it on. */
+/** A runtime connect or restart refused because a connect of the server's id
+ *  is in flight, in either engine, whether or not it has registered its
+ *  server yet (mcpServerIdTaken). A disconnect isn't refused: it ends that
+ *  connect. Whoever asked reads it: an operator, or an agent through a host's
+ *  tool that passes it on. */
 function mcplConnectInFlightText(serverId: string): string {
   return `MCPL server "${serverId}" has a connect in flight; try again once it settles`;
 }
@@ -519,6 +521,7 @@ import type {
   BeforeInferenceParams,
   PushEventParams,
   McplInferenceRequestParams,
+  InferenceChunkParams,
   ChannelsRegisterParams,
   ChannelsChangedParams,
   ChannelsIncomingParams,
@@ -2180,8 +2183,10 @@ export class AgentFramework {
   private ephemeralRuns: Map<string, EphemeralRun> = new Map();
   /** Ephemeral namespaces/names are single-generation for this framework
    * lifetime. Reusing one while an old stream drains would let name-keyed
-   * liveness/settlement state cross generations. */
-  private usedEphemeralAgentNames: Set<string> = new Set();
+   * liveness/settlement state cross generations. Each name records what
+   * reserved it: an ephemeral run (createEphemeralAgent), which takes no
+   * global fallback even after its release, or a conversation fork. */
+  private usedEphemeralAgentNames: Map<string, 'run' | 'conversation'> = new Map();
   /** One-shot generation tickets minted by createEphemeralAgent. */
   private ephemeralCandidates: WeakMap<Agent, ContextManager> = new WeakMap();
   /** Warn only once per Agent instance after utilities are registered. */
@@ -7695,7 +7700,7 @@ export class AgentFramework {
     if (this.usedEphemeralAgentNames.has(config.name) || this.agents.has(config.name)) {
       throw new Error(`Ephemeral agent name \"${config.name}\" is already registered or has been used in this framework`);
     }
-    this.usedEphemeralAgentNames.add(config.name);
+    this.usedEphemeralAgentNames.set(config.name, 'run');
     try {
       const namespace = `subagent/${config.name}`;
 
@@ -8470,13 +8475,17 @@ export class AgentFramework {
 
   /**
    * Mark an inference refusal visibly: react on the message that holds the
-   * conversational locus (the most recent incoming channel message) with a
-   * category-specific emoji. Best-effort — failures are logged, never thrown,
-   * and non-Discord loci are silently skipped.
+   * refused agent's conversational locus (the most recent incoming channel
+   * message; an ephemeral run has none, so a subagent's refusal marks no
+   * message) with a category-specific emoji. Best-effort — failures are
+   * logged, never thrown, and non-Discord loci are silently skipped.
    */
   private async reactToRefusal(agentName: string, category: string): Promise<void> {
     try {
-      const incoming = this.channelRegistry?.buildChannelContext()?.incoming;
+      // The refused agent's own view of the latest inbound message: an
+      // ephemeral run has none (takesGlobalFallback), so a subagent's refusal
+      // marks no one else's channel.
+      const incoming = this.channelRegistry?.buildChannelContext(agentName)?.incoming;
       if (!incoming) return;
       // incoming.channelId is the MCPL composite id ("discord:<guild>:<channel>");
       // the reaction tool wants the raw Discord channel (or thread) id — the
@@ -11877,7 +11886,7 @@ export class AgentFramework {
     if (this.usedEphemeralAgentNames.has(name) || this.agents.has(name)) {
       throw new Error(`Conversation agent name "${name}" is already registered or reserved`);
     }
-    this.usedEphemeralAgentNames.add(name);
+    this.usedEphemeralAgentNames.set(name, 'conversation');
     try {
 
       const contextManager = await ContextManager.open({
@@ -13460,7 +13469,8 @@ export class AgentFramework {
       // Ambient chatter must not outrank an addressed message just by being
       // newest (2026-07-21 Cairn lounge misroute, turn-start variant).
       // Non-channel wakes (heartbeats, module events, reactions — which never
-      // carry channelId) leave both undefined → global fallback.
+      // carry channelId) leave both undefined → global fallback, which an
+      // ephemeral run never takes (takesGlobalFallback).
       // Track the winning REQUEST, not just its channel: channel, addressed
       // and counterparty must come from the same message, or a batch of
       // "ambient from A, then addressed from B" would report B's channel
@@ -15880,7 +15890,8 @@ export class AgentFramework {
       // a previous turn's channel.
       routing.triggerChannel = trigger?.channelId;
       // FREEZE the turn's outbound locus now (turn-frozen routing): the home
-      // channel for forks, else the trigger channel, else the global default.
+      // channel for forks, else the trigger channel, else the global default,
+      // which an ephemeral run never takes (takesGlobalFallback).
       // Mid-turn injections must not redirect the agent's plain prose
       // (ambient chatter and reactions hijacked it before, 2026-07-21), and
       // the eager snapshot protects heartbeat turns from a moving
@@ -17596,7 +17607,7 @@ export class AgentFramework {
                 // one channel must not land its postscript in another.
                 const locus = resolveTurnLocus();
                 console.error(
-                  `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> routing ${segments.length} ${liveProseRouting ? 'trailing ' : ''}prose segment(s) -> ${locus ?? '(default)'}`,
+                  `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> routing ${segments.length} ${liveProseRouting ? 'trailing ' : ''}prose segment(s) -> ${locus ?? '(none)'}`,
                 );
                 // Deliver sequentially (await each) so the segments land in order.
                 for (const seg of segments) {
@@ -18585,7 +18596,7 @@ export class AgentFramework {
     }
     const modern = this.modernServers().get(serverId) ?? null;
     const server = modern ? null : this.mcplServerRegistry.getServer(serverId);
-    if (!modern && !server) {
+    if ((!modern && !server) || this.modernStillConnecting(modern)) {
       return { success: false, error: this.mcplServerAbsentText(serverId, call.name), isError: true };
     }
     const config = this.mcplServerConfigs.get(serverId);
@@ -21313,7 +21324,8 @@ export class AgentFramework {
       kind: 'refusal',
       category,
       streak,
-      locus: this.channelRegistry?.buildChannelContext()?.incoming?.channelId ?? null,
+      // The refused agent's own view: a subagent's refusal names no channel.
+      locus: this.channelRegistry?.buildChannelContext(agentName)?.incoming?.channelId ?? null,
       tokens: tokens ?? null,
     });
     if (streak >= 2) {
@@ -21721,10 +21733,6 @@ export class AgentFramework {
       this.featureSetManager,
       inferenceRouting ?? null,
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
-      (serverId, params) => {
-        const server = this.mcplServerRegistry!.getServer(serverId);
-        server?.sendInferenceChunk(params);
-      },
     );
 
     // Checkpoint manager (Step 8), built and loaded at the top
@@ -21774,11 +21782,17 @@ export class AgentFramework {
         // a later start of the turn is told where its unprefixed speech lands
         // unless a hybrid `>>>` destination takes it. Empty for a heartbeat /
         // no-trigger turn until its locus is resolved, so that resolution
-        // takes the global fallback; the turn then keeps that channel.
+        // takes the global fallback (none for an ephemeral run); the turn then
+        // keeps that channel.
         activeChannelResolver: (agentName) => {
           const routing = this.turnRouting.get(agentName);
           return routing?.locus ?? routing?.triggerChannel;
         },
+        // An ephemeral run (a subagent) never takes the process-global
+        // fallback: its prose is its caller's result, and the latest inbound
+        // message's channel is nobody's choice for it (#551). By name, so a
+        // speech dispatch that comes after the run's release still counts.
+        takesGlobalFallback: (conversationId) => this.usedEphemeralAgentNames.get(conversationId) !== 'run',
         eventGatePresent: this.eventGate !== null,
         // A text-only turn whose speech couldn't be delivered must not vanish
         // silently: record a `[discord-send-failed]` marker in chronicle so the
@@ -22442,15 +22456,77 @@ export class AgentFramework {
 
   /**
    * Open MCPL connections' planes (every connection when none is given). A
-   * quiesced host (issue #122) opens only control planes, so data planes
-   * stay held for the whole maintenance window; resume() calls this again
-   * once the flag is cleared. Otherwise a control plane comes up even while
-   * quiesced, since host/command (and with it resume) rides it.
+   * connection whose policy exchange is in flight stays closed, both planes,
+   * until its grant exists: its exchange's caller opens it once that settles
+   * (mcplPlanesMayOpen). A quiesced host (issue #122) opens only control
+   * planes, so data planes stay held for the whole maintenance window;
+   * resume() calls this again once the flag is cleared. Otherwise a control
+   * plane comes up even while quiesced, since host/command (and with it
+   * resume) rides it.
    */
   private readyMcplPlanes(connections?: McplServerConnection[]): void {
     for (const connection of connections ?? this.mcplServerRegistry?.getAllServers() ?? []) {
+      if (!this.mcplPlanesMayOpen(connection)) continue;
       if (this.quiesced) connection.readyControlPlane();
       else connection.ready();
+    }
+  }
+
+  /**
+   * Per connection, the transport epoch whose §5.3 policy exchange is in
+   * flight: a connect's, from when the registry hands the connection back,
+   * or a reconnect's, from its 'reconnect' event. Until the exchange settles,
+   * that transport's traffic must wait for its grant, so readyMcplPlanes,
+   * which a resume and startup's staged open run over every connection,
+   * passes it by (mcplPlanesMayOpen), and the exchange's own caller opens its
+   * planes once it settles.
+   */
+  private readonly mcplPolicyExchanges = new WeakMap<McplServerConnection, number>();
+
+  /** Whether readyMcplPlanes may open this connection's planes: no policy
+   *  exchange is in flight on its current transport (see mcplPolicyExchanges). */
+  private mcplPlanesMayOpen(connection: McplServerConnection): boolean {
+    const exchange = this.mcplPolicyExchanges.get(connection);
+    return exchange === undefined || exchange !== connection.transportEpoch;
+  }
+
+  /**
+   * Run a connection's §5.3 policy exchange with its planes held: it is
+   * marked in flight for the transport it runs on, so no opener releases
+   * that transport's traffic before its grant exists. With `epoch`, it runs
+   * only on that transport: a runtime connect passes the one it registered,
+   * and if that transport is gone, the exchange isn't run, since a reconnect
+   * that adopts a next transport, if one comes, runs that one's. With
+   * `closeOnFailure`, as for a runtime connect or restart, an exchange that
+   * throws closes the connection for good, through the registry, before it
+   * lifts the marker: left live, the connection would be half registered,
+   * and unmarked before its close, an opener running in between would let
+   * out what it held with no grant. A close that fails keeps the connection
+   * registered, but closed for good, it readies nothing but its own reports.
+   * Without `closeOnFailure`, as for a reconnect or a staged startup connect,
+   * an exchange that throws leaves the connection live with the grant it
+   * reached, empty if the policy step itself threw, and the marker lifts.
+   */
+  private async settlePolicyExchange(
+    config: import('./mcpl/types.js').McplServerConfig,
+    connection: McplServerConnection,
+    opts: { closeOnFailure?: boolean; epoch?: number } = {},
+  ): Promise<void> {
+    const epoch = opts.epoch ?? connection.transportEpoch;
+    if (connection.transportEpoch !== epoch) {
+      // Gone, closed or replaced: a marker left for it no longer matches.
+      console.error(`[mcpl] ${config.id}: its transport closed before its policy exchange; the next transport, if one comes, negotiates its own`);
+      return;
+    }
+    this.mcplPolicyExchanges.set(connection, epoch);
+    try {
+      await this.registerMcplServerFeatures(config, connection);
+    } catch (error) {
+      if (opts.closeOnFailure) await this.closeFailedRuntimeConnect(connection, 'policy registration');
+      throw error;
+    } finally {
+      // A newer transport's exchange may have taken the marker over.
+      if (this.mcplPolicyExchanges.get(connection) === epoch) this.mcplPolicyExchanges.delete(connection);
     }
   }
 
@@ -22643,10 +22719,24 @@ export class AgentFramework {
       });
     }
     let connection: McplServerConnection;
+    // The transport the connect registered, which its own exchange is for.
+    let registeredEpoch = 0;
     const abort = new AbortController();
     this.legacyConnectAborts().set(config.id, abort);
     try {
-      connection = await this.mcplServerRegistry.addServer(connectionConfig, this.mcplHostCapabilities, abort.signal);
+      // Its policy exchange is in flight from its registration until the
+      // exchange settles: an opener that runs meanwhile (a resume, startup's
+      // staged open) passes the connection by, so nothing opens its planes
+      // before its grant exists.
+      connection = await this.mcplServerRegistry.addServer(
+        connectionConfig,
+        this.mcplHostCapabilities,
+        abort.signal,
+        (registering) => {
+          registeredEpoch = registering.transportEpoch;
+          this.mcplPolicyExchanges.set(registering, registeredEpoch);
+        },
+      );
     } catch (error) {
       // Ended by stop() or by a disconnect of its id (its abort): said as a
       // modern connect ended that way says it, with the handshake's own
@@ -22682,6 +22772,9 @@ export class AgentFramework {
       } catch (error) {
         cleanup = `; its cleanup also failed: ${error instanceof Error ? error.message : String(error)}`;
       }
+      // Removed, or closed for good if its removal failed, it readies
+      // nothing but its own reports, so its exchange marker lifts now.
+      this.mcplPolicyExchanges.delete(connection);
       throw new Error(`MCP server "${config.id}" was not connected: ${why}${cleanup}`);
     }
 
@@ -22691,35 +22784,55 @@ export class AgentFramework {
     // §5.3 initial policy handshake with both planes still closed (PR #79
     // review blocker 3: an early control flush released channels-register/
     // changed before any grant existed). The grant is established (or
-    // knowingly left empty) before ANY buffered traffic flows.
-    try {
-      await this.registerMcplServerFeatures(config, connection);
-    } catch (error) {
-      // A runtime connect or restart whose policy registration throws closes
-      // the new connection for good, through the registry, as on main:
-      // left live, it would be half registered. A staged startup connect's
-      // failure goes to initializeMcpl's loop, which logs it and goes on with
-      // the other servers.
-      if (!staged) await this.closeFailedRuntimeConnect(connection, 'policy registration');
-      throw error;
+    // knowingly left empty) before ANY buffered traffic flows. A runtime
+    // connect runs it on the transport it registered: one that closed or was
+    // replaced since has no exchange here, and a reconnect that adopts a next
+    // transport, if one comes, runs that one's. A runtime connect or restart
+    // whose policy registration throws has its new connection closed for
+    // good by the exchange (closeOnFailure), through the registry, before its
+    // marker lifts, as on main: left live, it would be half registered. A
+    // staged startup connect's failure goes to initializeMcpl's loop, which
+    // logs it and goes on with the other servers.
+    await this.settlePolicyExchange(config, connection, staged ? {} : { closeOnFailure: true, epoch: registeredEpoch });
+    if (staged) {
+      // Announced while the transport it registered still serves, checked
+      // now. One whose transport dropped meanwhile, or a stub that has none
+      // yet, is announced by the first reconnect still connected once its
+      // attempt settles, granted or not. Staged startup opens every
+      // connection together (initializeMcpl).
+      if (connection.transportEpoch === registeredEpoch && connection.isConnected) {
+        this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
+      }
+      return connection;
     }
-    this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
-    // Staged startup opens every connection together (initializeMcpl).
-    if (staged) return connection;
 
     this.readyMcplPlanes([connection]);
+    // Announced while the transport it registered still serves, checked
+    // now, after the open's flush. One whose transport dropped meanwhile, or
+    // a stub that has none yet, is announced by the first reconnect still
+    // connected once its attempt settles, granted or not.
+    if (connection.transportEpoch === registeredEpoch && connection.isConnected) {
+      this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
+    }
     // A connection can make queued awareness work deliverable; it never
     // waits on it.
     this.deliverDiscordAwarenessInBackground('connect', 'host');
     return connection;
   }
 
-  /** Per-connection §17.8 fetch limiter: at most one in-flight fetch, at
-   *  most one queued behind it (announcements coalesce), floor between
-   *  completed fetches. Exceeding the floor drops the excess with a
-   *  diagnostic — the host bounds the rate; it never depends on server
-   *  coalescing. */
-  private manifestRefreshState: Map<string, { inFlight: boolean; queued: boolean; lastCompletedAt: number }> = new Map();
+  /** Per-connection §17.8 fetch limiter, keyed by the connection, so one
+   *  that replaces a removed server under its id starts its own: at most one
+   *  fetch in flight; announcements during it coalesce into one refresh run
+   *  after it, and announcements within the floor after a fetch into one run
+   *  once the floor has passed — the host bounds the rate; it never depends
+   *  on server coalescing. A queued refresh runs only on the transport of
+   *  the latest announcement it holds (`queuedEpoch`), and its receipt
+   *  reports the domains of the announcements coalesced into it there
+   *  (`queuedDomains`), since its fetch answers them all. The next
+   *  transport's initialize and policy exchange start afresh, and its own
+   *  announcements queue their own, so an earlier transport's hints are
+   *  dropped. */
+  private manifestRefreshState = new WeakMap<McplServerConnection, { inFlight: boolean; queued: boolean; lastCompletedAt: number; queuedEpoch?: number; queuedDomains?: Set<string> }>();
   private static readonly MANIFEST_FETCH_FLOOR_MS = 5_000;
 
   /**
@@ -22766,14 +22879,29 @@ export class AgentFramework {
     // may leave out: read the one the receipt reports here, before anything
     // is applied, so no later step can throw on them.
     const announcedDomains = announcedDomainsOf(announce);
-    const st = this.manifestRefreshState.get(connection.id)
+    const st = this.manifestRefreshState.get(connection)
       ?? { inFlight: false, queued: false, lastCompletedAt: 0 };
-    this.manifestRefreshState.set(connection.id, st);
+    this.manifestRefreshState.set(connection, st);
+    // A queued announcement's transport, and the domains of every
+    // announcement coalesced on it; one from a newer transport starts afresh.
+    const queueOn = (): void => {
+      if (st.queuedEpoch !== connection.transportEpoch) st.queuedDomains = undefined;
+      st.queuedDomains ??= new Set();
+      for (const domain of announcedDomains) st.queuedDomains.add(domain);
+      st.queuedEpoch = connection.transportEpoch;
+    };
+    // The queued domains, taken by the run that reports them.
+    const takeQueued = (): { domains: string[] } => {
+      const domains = [...(st.queuedDomains ?? [])];
+      st.queuedDomains = undefined;
+      return { domains };
+    };
     if (st.inFlight) {
       // Coalesce: one queued refresh re-runs after the current fetch — the
       // fetch is always of the CURRENT manifest, so N announcements need at
       // most one trailing fetch (§17.8).
       st.queued = true;
+      queueOn();
       return;
     }
     const sinceLast = Date.now() - st.lastCompletedAt;
@@ -22781,18 +22909,23 @@ export class AgentFramework {
       if (!st.queued) {
         st.queued = true;
         setTimeout(() => {
-          const cur = this.manifestRefreshState.get(connection.id);
-          if (cur?.queued && !cur.inFlight) {
-            cur.queued = false;
-            this.rerunManifestRefresh(connection, announce, recorded);
+          if (st.queued && !st.inFlight) {
+            st.queued = false;
+            const queued = takeQueued();
+            if (st.queuedEpoch === connection.transportEpoch) this.rerunManifestRefresh(connection, queued, recorded);
           }
         }, AgentFramework.MANIFEST_FETCH_FLOOR_MS - sinceLast).unref?.();
       }
+      queueOn();
       return;
     }
 
     st.inFlight = true;
     try {
+      // A manifest, and the policy negotiated for it, belong to the transport
+      // they came on: one that closes meanwhile installs nothing, since the
+      // next transport's initialize and policy exchange start afresh.
+      const epoch = connection.transportEpoch;
       // §17.4 fetch. A server that cannot answer keeps its previous
       // manifest in force — an unparseable/failed fetch teaches nothing and
       // narrows nothing (§17.5 step 1).
@@ -22801,6 +22934,10 @@ export class AgentFramework {
         fetched = await connection.sendManifestRequest();
       } catch (err) {
         console.error(`[mcpl] ${connection.id}: mcpl/manifest fetch failed — previous manifest stands (§17.5): ${recorded(err instanceof Error ? err.message : err)}`);
+        return;
+      }
+      if (connection.transportEpoch !== epoch) {
+        console.error(`[mcpl] ${connection.id}: mcpl/manifest answer arrived after its transport closed; not applied`);
         return;
       }
       if (!fetched || typeof fetched !== 'object') {
@@ -22868,6 +23005,10 @@ export class AgentFramework {
       let closeForGood = false;
       try {
         const receipt = await connection.sendFeatureSetsUpdateRequest(updateParams);
+        if (connection.transportEpoch !== epoch) {
+          console.error(`[mcpl] ${connection.id}: post-manifest policy answer arrived after its transport closed; not applied`);
+          return;
+        }
         if (receipt && receipt.accepted === false) {
           const refusal = AgentFramework.policyRefusalFields(receipt, recorded);
           const fallback = refusal.fallback;
@@ -22891,6 +23032,10 @@ export class AgentFramework {
           negotiated = true;
         }
       } catch {
+        if (connection.transportEpoch !== epoch) {
+          console.error(`[mcpl] ${connection.id}: post-manifest policy Request ended by its transport's close; not applied`);
+          return;
+        }
         console.error(`[mcpl] ${connection.id} did not answer post-manifest policy — expansion does not activate (§6.7); interim state stands`);
       }
       if (closeForGood) {
@@ -22934,14 +23079,19 @@ export class AgentFramework {
       st.lastCompletedAt = Date.now();
       if (st.queued) {
         st.queued = false;
-        setTimeout(() => { this.rerunManifestRefresh(connection, announce, recorded); },
-          AgentFramework.MANIFEST_FETCH_FLOOR_MS).unref?.();
+        const { queuedEpoch } = st;
+        const queued = takeQueued();
+        setTimeout(() => {
+          if (connection.transportEpoch === queuedEpoch) this.rerunManifestRefresh(connection, queued, recorded);
+        }, AgentFramework.MANIFEST_FETCH_FLOOR_MS).unref?.();
       }
     }
   }
 
   /** A refresh handleManifestChanged schedules for itself, after the fetch
-   *  floor or behind a fetch in flight. It's contained as the announcement's
+   *  floor or behind a fetch in flight. Its announcement is the domains of
+   *  the announcements it coalesced (`{ domains }`), the one field
+   *  handleManifestChanged reads of one. It's contained as the announcement's
    *  own run is. Its fetch's own failure is logged by the fetch's catch, as
    *  in 0.22.x; any other failure emits mcpl:request-handler-error and a
    *  stderr line through the containment. */
@@ -22978,6 +23128,8 @@ export class AgentFramework {
     // uses one derivation, whatever becomes of the server meanwhile (removed,
     // or replaced by a restart).
     const recorded = serverTextRedactor(config);
+    // A grant belongs to the transport it was negotiated on.
+    const epoch = connection.transportEpoch;
 
     // §5.4: compute the effective grant from the (config-masked)
     // advertisement. Not yet active — expansion activates only after the
@@ -23010,6 +23162,12 @@ export class AgentFramework {
     let closeForGood = false;
     try {
       const receipt = await connection.sendFeatureSetsUpdateRequest(updateParams);
+      if (connection.transportEpoch !== epoch) {
+        // The transport this exchange was for is gone: its answer grants
+        // nothing to any next one, which negotiates its own.
+        console.error(`[mcpl] ${config.id}: policy answer arrived after its transport closed; not applied`);
+        return;
+      }
       if (receipt && receipt.accepted === false) {
         // The fallback the host takes, which is the one logged; the server's
         // reason is its own text.
@@ -23041,6 +23199,10 @@ export class AgentFramework {
         }
       }
     } catch (err) {
+      if (connection.transportEpoch !== epoch) {
+        console.error(`[mcpl] ${config.id}: its transport closed during the initial policy Request; the next one, if one comes, negotiates its own`);
+        return;
+      }
       // A pre-0.5 server treats the Request as a notification and never
       // answers. §6.7: an unanswered expansion simply does not activate —
       // grant stays empty, connection is effectively MCP-only. This WILL
@@ -23210,14 +23372,19 @@ export class AgentFramework {
 
     const collision = this.mcplPrefixCollision(config, undefined, claim);
     if (collision) throw new Error(collision);
+    // The id is refused here too, before the trees are read, so a connect
+    // refused for its id reads nothing and reports only its refusal. The
+    // connect asks again as it takes the id, with nothing awaited between.
+    const taken = this.mcpServerIdTaken(config.id, claim);
+    if (taken) throw new Error(taken);
 
     // The server's restored host-managed trees are read before the server is
     // added, so a read that fails leaves it unconnected; MCPL itself stays
     // up, even when this connect brought it up. A feature set with no
     // restored tree, as after a disconnect removed it, is read when it
-    // registers. A server already connected is refused by addServer below,
-    // so its trees are left as they are.
-    if (!this.mcplServerRegistry?.getServer(config.id)) this.checkpointManager?.loadHostStates(config.id);
+    // registers. A server already registered was refused just above, so the
+    // read never reaches a registered server's trees.
+    this.checkpointManager?.loadHostStates(config.id);
     const oldToolNames = new Set(this.mcplTools.map(t => t.name));
     const connection = await this.connectMcplServerInternal(config, false, claim);
     // A stop() that began during the connect's setup or its tool listing
@@ -23496,11 +23663,14 @@ export class AgentFramework {
     }
     // A disconnect of the id began during the restart, and has finished.
     if (claim?.endedBy) return claim.endedBy;
+    // A connect in flight, in either engine: a legacy one registers its
+    // server once its handshake is done, and a modern one registers its
+    // connection before it starts. Whatever the id has registered meanwhile
+    // is that connect's.
+    if (op) return `${refused}${mcplConnectInFlightText(id)}`;
     const registered = this.modernServers().get(id) ?? this.mcplServerRegistry?.getServer(id);
-    // A connect in flight that hasn't registered its server yet.
-    if (op && !registered) return `${refused}${mcplConnectInFlightText(id)}`;
-    if (op || registered) {
-      const idle = !op && registered && !registered.isConnected && !registered.willReconnect;
+    if (registered) {
+      const idle = !registered.isConnected && !registered.willReconnect;
       return `${refused}MCPL server "${id}" is already registered${idle ? ' (not connected and not reconnecting: disconnect it first)' : ''}`;
     }
     return null;
@@ -23917,7 +24087,12 @@ export class AgentFramework {
     // Handle server-initiated inference requests (Step 6)
     onRequest('inference-request', async (
       params: McplInferenceRequestParams,
-      responder?: { id: string | number; respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
+      responder?: {
+        id: string | number;
+        respond: (result: unknown) => void;
+        respondError: (code: number, message: string) => void;
+        sendChunk?: (chunk: InferenceChunkParams) => void;
+      },
     ) => {
       // RFC-006 §5.3 / SPEC §10.7: no inference from inside a render.
       if (this.pushCoalescer?.isRendering(connection.id)) {
@@ -23939,6 +24114,9 @@ export class AgentFramework {
           respond: responder.respond,
           respondError: responder.respondError,
           requestId: responder.id,
+          // Chunks go out on the transport the request came on, as its
+          // answer does.
+          ...(responder.sendChunk ? { sendChunk: responder.sendChunk } : {}),
         });
       }
     });
@@ -24071,16 +24249,19 @@ export class AgentFramework {
     // preserved across the transient close are resumed by idempotent
     // registration. Then refresh tools (server may have different tools).
     connection.on('reconnect', (info?: { attempts?: number }) => {
-      // The connection paused its data plane before wiring the fresh
-      // transport. Re-establish the grant first: the §5.3 policy Request
-      // (whose response is never buffered) must be answered before the data
-      // plane opens, otherwise the first post-reconnect events land while the
-      // grant is still empty and are rejected fail-closed instead of
-      // delivered.
+      // The connection closed both planes before wiring the fresh transport.
+      // Re-establish the grant first: the §5.3 policy Request must be
+      // answered before either plane opens — otherwise the first
+      // post-reconnect traffic, control included (the server's
+      // channels/register), lands while the grant is still empty and is
+      // rejected fail-closed instead of delivered. The exchange is marked in
+      // flight for this transport synchronously, here (settlePolicyExchange),
+      // so no opener opens the planes meanwhile (readyMcplPlanes).
+      const epoch = connection.transportEpoch;
       void (async () => {
         try {
           const config = this.mcplServerConfigs.get(connection.id);
-          if (config) await this.registerMcplServerFeatures(config, connection);
+          if (config) await this.settlePolicyExchange(config, connection);
         } catch (error) {
           console.error(
             `MCPL server "${connection.id}" re-registration after reconnect failed:`,
@@ -24089,8 +24270,16 @@ export class AgentFramework {
         }
         // Settled, granted or not (an unanswered or refused policy leaves the
         // grant empty and the connection MCP-only, as at initial connect):
-        // open the planes.
+        // open the planes. A connection whose transport dropped meanwhile is
+        // readied as any opener readies one between transports, so its own
+        // reports go on; one whose next transport's exchange is in flight
+        // stays closed, and that reconnect's handler opens it once it settles.
         this.readyMcplPlanes([connection]);
+        // A transport that dropped meanwhile isn't relisted or announced here:
+        // its close reported it gone, and a next reconnect, if one comes,
+        // relists and announces it. Checked after the open's flush, whose
+        // listeners can close it.
+        if (connection.transportEpoch !== epoch || !connection.isConnected) return;
         this.handleToolsListChanged(connection.id);
         this.emitTrace({
           type: 'mcpl:server-reconnected',
@@ -24651,16 +24840,25 @@ export class AgentFramework {
     }
   }
 
-  /** The refusal of a tool call whose server isn't registered, for the
-   *  model's call and a script's alike: "connecting" while a connect of its
-   *  id is in flight (mcpServerOps) or a restart holds the id, and "gone"
-   *  otherwise. A legacy connect registers its server once its handshake is
-   *  done; a modern connect registers its connection first, so a call during
-   *  it reads that connection's own refusal. */
+  /** The refusal of a tool call whose server isn't one to call yet, for the
+   *  model's call, a script's and an in-process one alike: none registered,
+   *  or a modern connection whose connect is still under way
+   *  (modernStillConnecting). It says "connecting" while a connect of its id
+   *  is in flight (mcpServerOps) or a restart holds the id, and "gone"
+   *  otherwise. */
   private mcplServerAbsentText(serverId: string, toolName: string): string {
     return this.mcpServerOps?.get(serverId)?.kind === 'connect' || this.restartClaims().ids.has(serverId)
       ? mcplServerConnectingText(serverId, toolName)
       : mcplServerGoneText(serverId, toolName);
+  }
+
+  /** A modern connection a connect still under way registered: it registers
+   *  before it starts, so until its first session is up it's no server to
+   *  call, and a call reads the "connecting" text, as one during a legacy
+   *  connect's handshake does. Once that session is up, a call goes to it,
+   *  even while the connect lists its tools. */
+  private modernStillConnecting(modern: ModernMcpConnection | null): boolean {
+    return modern !== null && !modern.isConnected && this.mcpServerOps?.get(modern.id)?.kind === 'connect';
   }
 
   /**
@@ -24672,7 +24870,7 @@ export class AgentFramework {
     const modern = this.modernServers().get(serverId) ?? null;
     const server = modern ? null : this.mcplServerRegistry!.getServer(serverId);
 
-    if (!modern && !server) {
+    if ((!modern && !server) || this.modernStillConnecting(modern)) {
       // RFC-007: refused before executing — no lifecycle events.
       this.toolLifecycleEmitter?.refuse(agentName, call.id);
       this.pushEvent({

@@ -34,7 +34,12 @@
   runtime connect or restart failed, and every running server was recycled,
   one without `reconnect: true` closing for good, except while the host was
   stopping. Delivery now runs in the background, and a route that is not
-  connected keeps its work queued until it connects. A ledger that cannot
+  connected keeps its work queued until it connects. Nothing but startup's
+  staged open and `resume()` now opens every MCPL connection's planes, and
+  a connection whose §5.3 policy exchange is in flight still stays closed
+  through both until its grant exists. The marks a drain
+  hadn't sent when `stop()` began stay queued in the awareness ledger, and
+  the next start delivers them in the background. A ledger that cannot
   be read still stops startup, as does one in a version this build doesn't
   read: it can hold a suppression whose removals a start must finish before
   the agent's context is served. A runtime connect or restart is refused

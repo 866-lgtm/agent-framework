@@ -7,7 +7,7 @@
   paths as any MCPL server's, and its tool prefix meets the same rules: it
   can't be a module's name or another server's prefix, or meet another
   server's, whichever family either server is. It has no MCPL surface: no grant, push,
-  channels, inference requests or quiesce plane. MCPL policy
+  channels, inference requests, quiesce plane or awareness gate. MCPL policy
   that asks for that surface on one is a configuration error, such as
   `allowHostCommands: true` or a scope's non-empty `whitelist`. Policy that
   only takes something away or repeats a default, such as
@@ -30,7 +30,12 @@
     `complete` result is a final answer: a call that ends after an
     `input_required` answer, or after a result type this revision doesn't
     define, is `no-response`. A complete result that can't be used is a
-    plain error.
+    plain error. The message an agent reads is the one an MCPL server's
+    failure gives where the two share an outcome, and has its shape where
+    they don't: what happened, whether anything took effect, and what works
+    from there. The method, the tool, the JSON-RPC code and the HTTP status
+    go to the host's log. A tool call made while the server's connect is
+    still under way reads as one made while an MCPL server connects.
   - **Lifetime:** reconnects use the legacy backoff settings. A tool-list
     change subscription is kept open, reopened if refused or lost, and its
     changes go through ordinary admission, so they park under quiesce like
