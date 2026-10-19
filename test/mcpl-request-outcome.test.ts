@@ -94,6 +94,20 @@ test('channels/open keeps a deadline when requestTimeoutMs is 0, as channels/pub
   assert.match(err.message, /^The "outcome" server didn't answer within 0\.2 seconds/);
 });
 
+test('channels/close keeps a deadline when requestTimeoutMs is 0, as channels/open does', { timeout: 10_000 }, async () => {
+  connection = await McplServerConnection.connect(config({ requestTimeoutMs: 0 }), HOST_CAPS);
+  (connection as unknown as { publishDeadlineMs: number }).publishDeadlineMs = 200;
+  const err = await rejectsWith(connection.sendChannelsClose({ channelId: 'nowhere' } as never), 'no-response');
+  assert.match(err.message, /^The "outcome" server didn't answer within 0\.2 seconds/);
+});
+
+test('channels/close keeps a configured requestTimeoutMs rather than the deadline for 0', { timeout: 10_000 }, async () => {
+  connection = await McplServerConnection.connect(config({ requestTimeoutMs: 200 }), HOST_CAPS);
+  (connection as unknown as { publishDeadlineMs: number }).publishDeadlineMs = 60_000;
+  const err = await rejectsWith(connection.sendChannelsClose({ channelId: 'nowhere' } as never), 'no-response');
+  assert.match(err.message, /^The "outcome" server didn't answer within 0\.2 seconds/);
+});
+
 test('a request on a closed connection is not-sent', async () => {
   connection = await McplServerConnection.connect(config(), HOST_CAPS);
   await connection.close();

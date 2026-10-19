@@ -1485,9 +1485,13 @@ export class McplServerConnection extends EventEmitter {
     return this.sendRequest(McplMethod.ChannelsOpen, params as unknown as Record<string, unknown>, { timeoutMs }) as Promise<ChannelsOpenResult>;
   }
 
-  /** Send `channels/close` request and await result. */
+  /** Send `channels/close` request and await result. It keeps a deadline as
+   *  channels/open does: a delivery waits for a channel's queued lifecycle
+   *  work, closes included, so a close that is never answered would hold the
+   *  delivery, and the turn that waits for it, for good. */
   sendChannelsClose(params: ChannelsCloseParams): Promise<ChannelsCloseResult> {
-    return this.sendRequest(McplMethod.ChannelsClose, params as unknown as Record<string, unknown>) as Promise<ChannelsCloseResult>;
+    const timeoutMs = this.requestTimeoutMs > 0 ? this.requestTimeoutMs : this.publishDeadlineMs;
+    return this.sendRequest(McplMethod.ChannelsClose, params as unknown as Record<string, unknown>, { timeoutMs }) as Promise<ChannelsCloseResult>;
   }
 
   /** Send `channels/acknowledge` request and await result. */
