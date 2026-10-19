@@ -2544,18 +2544,77 @@ test("#157: a snapshot keeps a subject's ended first view, so a restored coalesc
   assert.deepEqual(p.delivered.at(-1), { eventId: 'n2' });
 });
 
-for (const shown of [false, true]) test(`#157: the crash-window receipt records keep a subject's ended first view, so a coalescer restored from them alone ${shown ? 'gives the next batch no first view' : 'still gives the next batch its first view when nothing had shown the agent the last'}`, async () => {
+/** n1's render lands in 'other''s deferred queue as the agent's first view;
+ *  `shown` says whether the agent is then shown it, and a plain edit
+ *  displaces it. */
+async function firstViewDisplacedByPlain(p: ReturnType<typeof firstViewProbe>, state: { shown: boolean }, shown: boolean) {
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  await p.coalescer.assemble('agent');
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }], "n1's render is the agent's first view");
+  state.shown = shown;
+  const p1 = await p.coalescer.accept(p.occurrence('p1', { tags: ['chat:edited'] }));
+  assert.equal(p1.coalesce?.outcome, 'replaced', 'p1 displaced the queued render');
+  // Later versions haven't been shown, whatever happened to n1.
+  state.shown = false;
+}
+
+const firstViewEndings = { 'a retraction': firstViewRetracted, 'a plain occurrence that displaces it': firstViewDisplacedByPlain };
+
+for (const [ending, end] of Object.entries(firstViewEndings)) for (const shown of [false, true]) test(`#157: the crash-window receipt records keep a subject's ended first view after ${ending}, so a coalescer restored from them alone ${shown ? 'gives the next batch no first view' : 'still gives the next batch its first view when nothing had shown the agent the last'}`, async () => {
   const state = { shown: false, read: false };
   const p = firstViewProbe(state, { held: [] });
   const records: CoalescingReceiptRecord[] = [];
   p.host.recordReceipt = (record) => { records.push(structuredClone(record)); };
-  await firstViewRetracted(p, state, shown);
+  await end(p, state, shown);
   // A crash before the throttled snapshot: only the records written at each acceptance survive.
   const restored = new PushCoalescer<null>(p.host);
   restored.restoreReceipts(records);
   await restored.accept(p.occurrence('n2', { deferred: true }));
   await restored.assemble('agent');
   assert.deepEqual(p.delivered.at(-1), { eventId: 'n2', ...(shown ? {} : { firstView: true as const }) });
+});
+
+for (const shown of [false, true]) test(`#157: a snapshot taken before a subject's first view ended, with the records written after it, ${shown ? 'gives the next batch no first view' : 'still gives the next batch its first view when nothing had shown the agent the last'}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [] });
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  // The last snapshot holds the subject with its batch pending; the records after it are the crash window's.
+  const snapshot = p.coalescer.snapshot();
+  const records: CoalescingReceiptRecord[] = [];
+  p.host.recordReceipt = (record) => { records.push(structuredClone(record)); };
+  await p.coalescer.assemble('agent');
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }], "n1's render is the agent's first view");
+  state.shown = shown;
+  const r1 = await p.coalescer.accept(p.occurrence('r1', { retract: true, content: [] }));
+  assert.equal(r1.coalesce?.outcome, 'retracted');
+  state.shown = false;
+  assert.equal(records.length, 1, "the retraction's record is the only one after the snapshot");
+  const restored = new PushCoalescer<null>(p.host);
+  restored.restore(snapshot);
+  restored.restoreReceipts(records);
+  await restored.accept(p.occurrence('n2', { deferred: true }));
+  await restored.assemble('agent');
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'n2', ...(shown ? {} : { firstView: true as const }) });
+});
+
+for (const shown of [false, true]) test(`#157: crash-window records restored after their retry window has passed ${shown ? "still end the first view, so the edit of a later initial plain occurrence is no first view" : "leave the edit of a later initial plain occurrence the first view when nothing had shown the agent the last"}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [] });
+  const records: CoalescingReceiptRecord[] = [];
+  p.host.recordReceipt = (record) => { records.push(structuredClone(record)); };
+  await firstViewRetracted(p, state, shown);
+  // The host comes back two hours after the crash: every record is past the default one-hour retry window.
+  const later = Date.now() + 2 * 3_600_000;
+  const restored = new PushCoalescer<null>({ ...p.host, now: () => later });
+  restored.restoreReceipts(records);
+  await restored.accept(p.occurrence('p1', { initial: true }));
+  const e1 = await restored.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
+  assert.equal(e1.coalesce?.outcome, 'replaced', 'e1 replaced the unread p1');
+  // A birth carries no mark of its own (it isn't an edit); its edit carries the first view it hands on.
+  assert.deepEqual(p.delivered.slice(-2), [
+    { eventId: 'p1' },
+    { eventId: 'e1', ...(shown ? {} : { firstView: true as const }) },
+  ]);
 });
 
 test("#157: a receipt keeps an admission's first view in memory only, so a restored receipt has none", async () => {

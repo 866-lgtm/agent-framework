@@ -776,8 +776,8 @@ export class ChannelRegistry {
   private dmClassified = new Map<string, true>();
 
   /** The channel of the most recent incoming message that isn't a reaction,
-   *  reaction removal, edit or deletion marker: used for speech routing and
-   *  the default publish. */
+   *  reaction removal, edit or deletion marker, apart from an edit the agent
+   *  sees first: used for speech routing and the default publish. */
   private defaultPublishChannel: string | null = null;
 
   /** The same message's id and thread, used for buildChannelContext. */
@@ -1550,7 +1550,7 @@ export class ChannelRegistry {
   /**
    * Get the default publish channel ID: the channel of the most recent
    * incoming message that isn't a reaction, reaction removal, edit or
-   * deletion marker.
+   * deletion marker, apart from an edit the agent sees first.
    */
   getDefaultPublishChannel(): string | null {
     return this.defaultPublishChannel;
@@ -1716,8 +1716,8 @@ export class ChannelRegistry {
     const context: ChannelContext = {};
 
     // Incoming: the most recent inbound message that isn't a reaction,
-    // reaction removal, edit or deletion marker (what the agent is replying
-    // to).
+    // reaction removal, edit or deletion marker, apart from an edit the agent
+    // sees first (what the agent is replying to).
     // Left process-global — per-channel inbound tracking (the right messageId for
     // a fork's own channel) is a separate concern from the outbound routing fix.
     if (fallback && this.defaultPublishMessageId) {
@@ -3879,8 +3879,8 @@ export class ChannelRegistry {
 
     // Resolve channelId: default to the channel of the most recent incoming
     // message that isn't a reaction, reaction removal, edit or deletion
-    // marker, which an ephemeral run never takes (takesGlobalFallback), so it
-    // names one.
+    // marker, apart from an edit the agent sees first. An ephemeral run never
+    // takes that default (takesGlobalFallback), so it names one.
     const caller = origin?.kind === 'agent' ? origin.agentName : undefined;
     const channelId = input.channelId ?? (caller !== undefined ? this.globalFallbackFor(caller) : this.defaultPublishChannel);
     if (!channelId) {

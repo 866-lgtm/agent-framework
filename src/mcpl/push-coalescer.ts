@@ -1056,12 +1056,23 @@ export class PushCoalescer<E = unknown> {
   restoreReceipts(records: CoalescingReceiptRecord[]): void {
     const now = this.now();
     for (const r of records) {
-      if (now - r.at > this.retryWindowMs) continue;
-      this.receipts.set(r.key, { result: r.result, at: r.at, committed: true });
-      if (r.born && !this.subjects.has(r.subject)) this.subjects.set(r.subject, { history: r.born, touchedAt: now });
-      // Nothing undoes a first view's end, so any record that carries it ends
-      // the subject's first view.
-      if (r.firstViewEnded) { const ended = this.subjects.get(r.subject); if (ended) ended.firstViewEnded = true; }
+      const fresh = now - r.at <= this.retryWindowMs;
+      if (fresh) {
+        this.receipts.set(r.key, { result: r.result, at: r.at, committed: true });
+        if (r.born && !this.subjects.has(r.subject)) this.subjects.set(r.subject, { history: r.born, touchedAt: now });
+      }
+      // A first view's end is a fact about the subject, which holds while the
+      // coalescer keeps it, not about the receipt, whose retry window says
+      // nothing about it. So a record that carries it ends the subject's
+      // first view whatever its age. A subject this restore doesn't hold yet
+      // existed when the record was written and may have been shown, so it
+      // comes back with that end and an unknown history.
+      if (r.firstViewEnded) {
+        const ended = this.subjects.get(r.subject);
+        if (ended) ended.firstViewEnded = true;
+        else this.subjects.set(r.subject, { history: 'unknown', touchedAt: now, firstViewEnded: true });
+      }
+      if (!fresh) continue;
       // A birth fact is not proof the subject is still unread: the plain
       // occurrence this record acknowledged is in context (durable before the
       // record) and counts as read from recovery on, like a snapshot occupant.

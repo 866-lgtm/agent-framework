@@ -8482,9 +8482,10 @@ export class AgentFramework {
    * Mark an inference refusal visibly: react on the message that holds the
    * refused agent's conversational locus (the most recent incoming channel
    * message that isn't a reaction, reaction removal, edit or deletion
-   * marker; an ephemeral run has none, so a subagent's refusal marks no
-   * message) with a category-specific emoji. Best-effort — failures are
-   * logged, never thrown, and non-Discord loci are silently skipped.
+   * marker, apart from an edit the agent sees first; an ephemeral run has
+   * none, so a subagent's refusal marks no message) with a category-specific
+   * emoji. Best-effort — failures are logged, never thrown, and non-Discord
+   * loci are silently skipped.
    */
   private async reactToRefusal(agentName: string, category: string): Promise<void> {
     try {
