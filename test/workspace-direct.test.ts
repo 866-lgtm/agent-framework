@@ -1173,7 +1173,7 @@ test("a mount configured beneath a moved direct root, through a directory there 
   assert.deepEqual(await answers(moved), fromStart);
 });
 
-test("a mount configured beneath a moved direct root is nested beneath each directory on the way that's the root, the second among them, and no other", async (t) => {
+test("a mount configured beneath a moved direct root is nested beneath a directory on the way that's the root though it's not the first, and beneath none that isn't", async (t) => {
   const env = new Env(t);
   // `work` is configured at `link/x/y/work`. At `b`, `x` is a directory and
   // `x/y` leads to `..`, `b` itself, and `work` to `.`: a start with `ref` at

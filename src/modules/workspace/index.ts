@@ -2486,15 +2486,16 @@ export class WorkspaceModule implements Module {
    * mount's path, and the directories above this mount's path as resolving
    * that path finds them. For any other mount, it's where the last start
    * found them. Each carries its own include, as nestedOf gives it. It
-   * resolves nothing but this mount's own path and directories beneath its
-   * root, so a share elsewhere that doesn't answer holds only its own calls,
-   * unless such a directory is a link into it, where that mount's files lie.
-   * What it leaves to the next start: a mount configured elsewhere whose own
-   * root has moved since, as when a link on its configured path is repointed,
-   * this mount's own reached through another link among them, that mount's
-   * spellings through other links, and the other mounts' own placements, so a
-   * direct root moved into another mount's directory is that mount's too, as
-   * a nested mount's root moved while running stays placed.
+   * resolves nothing but the directories on this mount's own configured path
+   * and those beneath its root, so a share elsewhere that doesn't answer
+   * holds only its own calls, unless such a directory is a link into it,
+   * where that mount's files lie. What it leaves to the next start: a mount
+   * configured elsewhere whose own root has moved since, as when a link on
+   * its configured path is repointed, this mount's own reached through
+   * another link among them, that mount's spellings through other links, and
+   * the other mounts' own placements, so a direct root moved into another
+   * mount's directory is that mount's too, as a nested mount's root moved
+   * while running stays placed.
    */
   private async movedNesting(mount: MountState, rootReal: string): Promise<NestedMount[] | null> {
     // One start's placements, whatever a start in the meantime sets.
@@ -2523,7 +2524,7 @@ export class WorkspaceModule implements Module {
         // where that path now leads: its real root, and each directory above
         // it, resolved now, beneath this root where they lie beneath it.
         const segments = configured?.split('/') ?? [];
-        real = segments.length === 0 ? rootReal : await realBeneath(join(rootReal, ...segments));
+        real = await realBeneath(join(rootReal, ...segments));
         const beneath: Array<{ dir: string; real: string }> = [];
         for (let i = segments.length - 1; i >= 1; i--) {
           beneath.push({ dir: join(outerPath, ...segments.slice(0, i)), real: await realBeneath(join(rootReal, ...segments.slice(0, i))) });

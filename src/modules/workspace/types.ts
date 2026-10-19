@@ -182,7 +182,8 @@ export interface MountConfig {
    * link on a path's way is refused, as on any such mount (followSymlinks).
    * A nested mount's root is placed where disk has it at each start, and its
    * directory is matched by spelling, so four cases fall outside this, as
-   * for any nested mount: on a disk that folds names, a mount configured
+   * for any nested mount, and a fifth on a direct one: on a disk that folds
+   * names, a mount configured
    * through a link that spells a directory otherwise than disk does isn't
    * found nested, and this mount holds its files as its own; on such a disk,
    * a path through a link that spells a nested mount's directory otherwise
@@ -195,7 +196,11 @@ export interface MountConfig {
    * spelling the link's target gives, so a refusal can name a file disk
    * spells outside that include, or leave a covered one unnamed; and a
    * nested mount whose root moves while running, as `acceptRoot` takes,
-   * stays placed where it was until the next start.
+   * stays placed where it was until the next start; and where a direct
+   * mount's root is repointed between a read's parse and its open, a race
+   * left to whoever writes the disk, a mount nested in it by its
+   * directories alone, since its real root holds that root, can have the
+   * read serve a path in its directory.
    *
    * Text the host registers for a path (`registerGeneratedTextFile`) is
    * served there whatever the include says, since it isn't one of the
