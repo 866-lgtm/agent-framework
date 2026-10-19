@@ -924,10 +924,16 @@ export class Agent {
   }
 
   /**
-   * RFC-006 consumed watermark: the newest stored message at the last compile
-   * of a model request, or at the last tool boundary that injected messages
-   * into a live one, per branch. Everything above it has never been in a
-   * request and may still be replaced or withdrawn in place by its sender.
+   * RFC-006 consumed watermark, per branch: the newest stored message at the
+   * agent's creation, at the last compile of a model request, or at the last
+   * tool boundary that injected messages into a live stream declaring it
+   * carries them (`supportsInjectedMessages` true: membrane's native path,
+   * from membrane 0.6.0), whichever came last. A message above it may still
+   * be replaced or withdrawn in place by its sender. Of what's above it, only
+   * what the agent's live stream stored at a tool boundary since then may
+   * have been in one of its requests: each round's own content and results,
+   * and the messages injected at a boundary whose stream didn't say whether
+   * it carries injections, as no membrane 0.5.x stream does.
    */
   private consumedWatermark: { branch: string; sequence: number } | null = null;
   /** Counts marks: a compile writes its watermark back only if no mark was
@@ -955,8 +961,8 @@ export class Agent {
   }
 
   /** Mark everything currently stored as consumed (the agent's creation, at
-   *  boot or later, and a tool boundary that injected messages into the live
-   *  stream). */
+   *  boot or later, and a tool boundary that injected messages into a live
+   *  stream declaring it carries them; see consumedWatermark). */
   markContextConsumed(): void {
     // Tolerates partial context-manager doubles (tests build Agents over
     // stubs): without a watermark nothing is ever treated as unread.

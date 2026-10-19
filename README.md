@@ -416,12 +416,14 @@ later plain occurrence withdraws the unread renders, newest first.
 Plain content stays in context and is delivered on arrival through the ordinary
 channel/push path; the host only remembers where it landed. "Unread" means:
 above the agent's consumed watermark (advanced at every compile of a model
-request), on the current branch, not a sharded message, and not folded into a
-summary by compression. On any doubt — restart, branch switch, eviction — the
-host appends, as it does today. There is no per-subject cap: a busy channel's
-unread backlog is simply its unread backlog. Receipts and subject history are
-kept in the `mcpl/coalescing` state (retry window 1 h); audit lines are
-`mcpl:coalescing` trace events.
+request, and at a tool boundary that injects messages into a stream declaring
+it carries them, as membrane's native path does from 0.6.0), on the current
+branch, not a sharded message, and not folded into a summary by compression.
+On any doubt — restart, branch switch, eviction — the host appends, as it does
+today. There is no per-subject cap: a busy channel's unread backlog is simply
+its unread backlog. Receipts and subject history are kept in the
+`mcpl/coalescing` state (retry window 1 h); audit lines are `mcpl:coalescing`
+trace events.
 
 #### Per-channel conversation routing (deprecated)
 

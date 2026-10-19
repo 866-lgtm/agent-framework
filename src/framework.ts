@@ -11442,11 +11442,11 @@ export class AgentFramework {
           // it (#232 gap 5).
           //
           // A stream that declares it can't carry injected messages
-          // (supportsInjectedMessages false: membrane's XML prefill path)
-          // gets none, so nothing is drained here. Everything queued for
-          // the agent waits for the turn-end flush, as a held message does,
-          // rather than sitting in the window between rounds the stream
-          // never showed it.
+          // (supportsInjectedMessages false: membrane's XML prefill path,
+          // from membrane 0.6.0) gets none, so nothing is drained here.
+          // Everything queued for the agent waits for the turn-end flush, as
+          // a held message does, rather than sitting in the window between
+          // rounds the stream never showed it.
           const midTurnInjections: Array<{ participant: string; content: ContentBlock[]; metadata?: MessageMetadata }> = [];
           // The injected messages' ids, for a boundary that leaves them to the
           // turn's next start as arrivals.
@@ -11697,11 +11697,12 @@ export class AgentFramework {
             // coalesced replacement could remove a message the agent heard
             // and answered (and that its later replies were minted after).
             // Only a stream that declares it carries them is marked read
-            // (supportsInjectedMessages true: membrane's native path). One
-            // that doesn't say may be membrane 0.5.87's XML path, which
-            // drops them with a warning, and a message marked read there
-            // could no longer be replaced though the agent never saw it. So
-            // without the declaration they stay unread, as before this mark.
+            // (supportsInjectedMessages true: membrane's native path, from
+            // membrane 0.6.0). One that doesn't say may be membrane 0.5.87's
+            // XML path, which drops them with a warning, and a message marked
+            // read there could no longer be replaced though the agent never
+            // saw it. So without the declaration they stay unread, as before
+            // this mark.
             // The shown mark moves at every boundary that injects, declared
             // or not, since there a doubt counts as shown.
             // The mark is the store's head, a scalar, as a compile's is: it
@@ -17391,9 +17392,10 @@ export class AgentFramework {
             // So all calls here have valid input — {} is legitimate for parameterless tools.
 
             // Whether this stream can carry messages injected with the round's
-            // results: true on membrane's native path, false on its XML
-            // prefill path, absent before membrane declared it. The tool
-            // boundary reads it from the agent's state.
+            // results: true on membrane's native path and false on its XML
+            // prefill path, from membrane 0.6.0, and absent on 0.5.x, which
+            // doesn't declare it. The tool boundary reads it from the agent's
+            // state.
             agent.enterWaitingForTools(
               event.calls,
               stream,
