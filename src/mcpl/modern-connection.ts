@@ -68,10 +68,10 @@ import {
 
 import { StdioTransport, type McplTransport } from './transport.js';
 import { McplProtocolVersionError, McplRequestError, McplUnreapedLaunchError } from './server-connection.js';
-import { LEGACY_MCP_PROTOCOL_VERSION, MAX_TIMER_MS, MODERN_MCP_PROTOCOL_VERSION, checkServerConfig, describeCredentialError, noteDialSent, redactServerText, serverTextRedactor } from './protocol-family.js';
+import { LEGACY_MCP_PROTOCOL_VERSION, MAX_TIMER_MS, MODERN_MCP_PROTOCOL_VERSION, checkServerConfig, describeCredentialError, maskedError, noteDialSent, redactServerText, redactedData, serverTextRedactor, type ServerTextRedactor } from './protocol-family.js';
 import type { McplServerConfig, McpToolDefinition } from './types.js';
 import { boundedForLog } from './errors.js';
-import { logDetail, logValue, logValueRedacted } from './log-value.js';
+import { logDetail, logValue, logValueRedacted, loggedCode } from './log-value.js';
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 /** Bound on establishing the connection (`server/discover`), like the legacy
@@ -460,6 +460,13 @@ export class ModernMcpConnection extends EventEmitter {
    *  connect() returns), delivered to the first listener. Bounded: the
    *  newest lines are kept. */
   private stderrBacklog: string[] = [];
+  private redactor?: ServerTextRedactor;
+
+  /** The server's text with its configuration's credentials replaced, for
+   *  the errors this connection hands its caller and its records. */
+  private get recorded(): ServerTextRedactor {
+    return (this.redactor ??= serverTextRedactor(this.config));
+  }
 
   private constructor(private readonly config: McplServerConfig) {
     super();
@@ -593,10 +600,16 @@ export class ModernMcpConnection extends EventEmitter {
         this.reconnectEnabled = false;
         throw error;
       }
+      // Any other failure is the SDK's or the transport's: it goes on as its
+      // words alone, redacted, since its message can quote the url and its
+      // other properties, such as Bun's fetch error's `path` or a wrapper's
+      // `cause`, can carry it whole (maskedError). The protocol refusal
+      // above was built from redacted words.
+      const masked = maskedError(error, this.recorded);
       // A launch that couldn't be reaped halts reconnecting, so no retry
       // will come: the first connect fails, as one without reconnect does.
-      if (!this.reconnectEnabled || this.holdsUnreapedChild) throw error;
-      console.error(`MCP server "${this.id}" initial connect failed, will retry:`, redactServerText((error as Error).message, this.config));
+      if (!this.reconnectEnabled || this.holdsUnreapedChild) throw masked;
+      console.error(`MCP server "${this.id}" initial connect failed, will retry:`, masked.message);
       this.reconnectAttempts = 1;
       this.emit('connect-failed', { error: (error as Error).message, attempt: 0 });
       this.scheduleReconnect();
@@ -743,7 +756,11 @@ export class ModernMcpConnection extends EventEmitter {
    */
   private versionVerdict(error: unknown): McplProtocolVersionError | null {
     if (!(error instanceof UnsupportedProtocolVersionError)) return null;
-    const data = (error as { data?: unknown }).data as { supported?: unknown } | undefined;
+    // The server's words and data, redacted before they're bounded or kept:
+    // the error goes to the host. One build for all of them, so a
+    // configuration that can't be read is read once.
+    const redact = this.recorded.now();
+    const data = redactedData((error as { data?: unknown }).data, redact) as { supported?: unknown } | undefined;
     const supported = Array.isArray(data?.supported) && data.supported.every((v) => typeof v === 'string')
       ? (data.supported as string[])
       : null;
@@ -757,13 +774,13 @@ export class ModernMcpConnection extends EventEmitter {
         : ` It speaks only legacy MCP, which this client reaches over stdio or WebSocket (ws://, wss://), not http(s).`;
     return new McplProtocolVersionError(
       `MCP server "${this.id}" does not support MCP ${MODERN_MCP_PROTOCOL_VERSION}` +
-        (supported ? ` (it supports: ${supported.join(', ') || 'none listed'}).` : ` (${error.message}).`) +
+        (supported ? ` (it supports: ${boundedForLog(supported.join(', ')) || 'none listed'}).` : ` (${boundedForLog(redact(error.message))}).`) +
         legacyHint,
       'rejected',
       null,
       supported,
       (error as { code?: unknown }).code === undefined ? undefined : Number((error as { code?: unknown }).code),
-      (error as { data?: unknown }).data,
+      data,
       MODERN_MCP_PROTOCOL_VERSION,
     );
   }
@@ -1133,7 +1150,10 @@ export class ModernMcpConnection extends EventEmitter {
   private requestFailure(what: string, record: WireRecord, error: unknown, timeoutMs?: number, lost = false): Error {
     const server = `the "${this.id}" server`;
     const Server = `The "${this.id}" server`;
-    const message = redactServerText(error instanceof Error ? error.message : String(error), this.config);
+    // One build of the redactor for all of this failure's texts, so a
+    // configuration that can't be read is read once.
+    const redact = this.recorded.now();
+    const message = redact(error instanceof Error ? error.message : String(error));
     const log = (line: string) => console.error(`MCP server "${this.id}" ${line}`);
     const listing = record.method === 'tools/list';
     // What a failure whose effect is in doubt says: for a tool call, that the
@@ -1157,18 +1177,21 @@ export class ModernMcpConnection extends EventEmitter {
     }
     if (record.answer === 'error' && record.error) {
       const { code, message: wireMessage, data } = record.error;
-      // A JSON-RPC answer reaches the caller unredacted (redactServerText's
-      // scope). The log is a record of the server's text, so the message is
-      // redacted there, whatever JSON value it is, as every other line this
-      // connection writes is.
-      log(`answered ${what} with error ${logValue(code)}: ${logValueRedacted(wireMessage, (text) => redactServerText(text, this.config))}`);
-      // The server's own words, bounded as errors.ts says. Only a string is
-      // words: a message of any other JSON value reads as none.
-      const said = typeof wireMessage === 'string' ? boundedForLog(wireMessage.trim()) : '';
+      // The log is a record of the server's text, so the code (loggedCode)
+      // and the message are redacted there, whatever JSON values they are,
+      // as every other line this connection writes is.
+      log(`answered ${what} with error ${loggedCode(code, redact)}: ${logValueRedacted(wireMessage, redact)}`);
+      // The server's own words, redacted and then bounded as errors.ts says,
+      // since they're in an error the caller gets (redactServerText's
+      // scope), and its data's strings redacted too. It's trimmed after it's
+      // redacted, so a credential that ends in a space is whole when it's
+      // matched. Only a string is words: a message of any other JSON value
+      // reads as none.
+      const said = typeof wireMessage === 'string' ? boundedForLog(redact(wireMessage).trim()) : '';
       return new McplRequestError(
         said ? `${Server} answered with an error: ${said}` : unknown(`${Server} answered with an error without saying what went wrong`),
         'error-response',
-        data,
+        redactedData(data, redact),
       );
     }
     if (record.answer === 'complete') {
@@ -1214,10 +1237,14 @@ export class ModernMcpConnection extends EventEmitter {
       // The response body (the SDK's `text`) is the server's text and can
       // echo the request's url, so it's left out of the data; the status stays.
       const { text: _body, ...data } = (error instanceof SdkHttpError && error.data && typeof error.data === 'object' ? error.data : {}) as Record<string, unknown>;
+      const redacted = redactedData(data, redact);
       return new McplRequestError(
         `${Server} refused this host access, so the request didn't run. If you need it, ask whoever runs this host.`,
         'error-response',
-        { ...data, httpStatus: refusedWith },
+        // The status is this host's own, so it's added after the server's
+        // data is redacted, and it stays when a configuration that can't be
+        // read withholds that data.
+        { ...(redacted !== null && typeof redacted === 'object' ? redacted : {}), httpStatus: refusedWith },
       );
     }
     if (deadline) {

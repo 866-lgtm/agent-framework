@@ -1092,10 +1092,10 @@ test('failures are classified in order: nothing sent first, then the answers, th
     'is unknown. Check its effect before trying again.');
   loggedLine(logged, /^MCP server "raw" answered tools\/call op with error -32603: "\\u0020\\u0020"$/);
 
-  // The server's words reach the caller unredacted, and the log redacted,
-  // whatever JSON value they are.
+  // The server's words reach the caller and the log redacted, whatever
+  // JSON value they are.
   const echoed = classify({ answer: 'error', error: { code: -32603, message: `bad token ${token}` } }, new Error('the SDK\'s words'));
-  assert.equal(echoed.message, `The "raw" server answered with an error: bad token ${token}`);
+  assert.equal(echoed.message, 'The "raw" server answered with an error: bad token redacted');
   loggedLine(logged, /^MCP server "raw" answered tools\/call op with error -32603: "bad\\u0020token\\u0020redacted"$/);
   classify({ answer: 'error', error: { code: -32603, message: { said: `bad token ${token}` } } }, new Error('the SDK\'s words'));
   assert.ok(logged.some((line) => line.endsWith('with error -32603: "{\\"said\\":\\"bad\\u0020token\\u0020redacted\\"}"')), logged.join('\n'));
