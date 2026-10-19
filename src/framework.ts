@@ -147,9 +147,10 @@ import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
  *  closed for good, one removed, or one whose connect failed without
  *  reconnect, which this host doesn't bring back on its own. A server that's
  *  reconnecting stays registered, as does the stub a failed connect with
- *  reconnect leaves, and its closed connection answers the call instead. One
- *  this host is connecting to isn't registered yet, and
- *  mcplServerConnectingText answers for it. */
+ *  reconnect leaves, and its closed connection answers the call instead.
+ *  mcplServerConnectingText answers for one this host is connecting to: a
+ *  legacy server, which isn't registered yet, or a modern connection, which
+ *  is, until its first session is up. */
 function mcplServerGoneText(serverId: string, toolName: string): string {
   return `The "${serverId}" server that provides ${toolName} isn't connected, and this host won't reconnect to it on its own, ` +
     "so the call didn't run. If you need it, ask whoever runs this host.";
@@ -157,7 +158,9 @@ function mcplServerGoneText(serverId: string, toolName: string): string {
 
 /** A tool call refused while this host connects to its server, in a
  *  runtime connect or a restart's: the server's prefix routes calls to it
- *  before the server is registered, which it is once its connect is done. */
+ *  before a legacy server is registered, which it is once its connect is
+ *  done, and to a modern connection, registered before it starts, until its
+ *  first session is up (modernStillConnecting). */
 function mcplServerConnectingText(serverId: string, toolName: string): string {
   return `This host is connecting to the "${serverId}" server that provides ${toolName}, so the call didn't run. ` +
     'Try again in a moment.';
@@ -171,12 +174,11 @@ function mcplToolDeniedText(serverId: string, toolName: string): string {
     "and calling it again won't change that. If you need it, ask whoever runs this host.";
 }
 
-/** A runtime connect or restart refused because a legacy connect of the
- *  server's id is still in its handshake, before its server is registered
- *  (mcpServerIdTaken). A modern connect registers its connection first, so an
- *  id it holds reads as already registered. A disconnect isn't refused: it
- *  ends the connect in flight, in either engine. Whoever asked reads it: an
- *  operator, or an agent through a host's tool that passes it on. */
+/** A runtime connect or restart refused because a connect of the server's id
+ *  is in flight, in either engine, whether or not it has registered its
+ *  server yet (mcpServerIdTaken). A disconnect isn't refused: it ends that
+ *  connect. Whoever asked reads it: an operator, or an agent through a host's
+ *  tool that passes it on. */
 function mcplConnectInFlightText(serverId: string): string {
   return `MCPL server "${serverId}" has a connect in flight; try again once it settles`;
 }
@@ -508,7 +510,7 @@ import { UsageTracker, persistedUsageProblem, type PersistedUsageState } from '.
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import { McplProtocolVersionError, McplUnreapedLaunchError, stderrTailOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
 import { ModernMcpConnection } from './mcpl/modern-connection.js';
-import { asText, credentialRedactor, redactUrl, redactServerText, resolveServerBinding, serverConfigProblems, serverCredentialPatterns, serverTextRedactor } from './mcpl/protocol-family.js';
+import { WITHHELD_TEXT, asText, credentialRedactor, redactUrl, redactServerText, resolveServerBinding, serverConfigProblems, serverCredentialPatterns, serverTextRedactor, type CredentialPattern } from './mcpl/protocol-family.js';
 import { MALFORMED_CONTENT_NOTICE, normalizeStandardToolResult } from './mcpl/tool-result-normalize.js';
 import { boundedForLog, describeCause } from './mcpl/errors.js';
 import { assertServerConfigBooleans, buildWebSocketUrl, isWebSocketTransport } from './mcpl/transport.js';
@@ -18307,7 +18309,7 @@ export class AgentFramework {
     }
     const modern = this.modernServers().get(serverId) ?? null;
     const server = modern ? null : this.mcplServerRegistry.getServer(serverId);
-    if (!modern && !server) {
+    if ((!modern && !server) || this.modernStillConnecting(modern)) {
       return { success: false, error: this.mcplServerAbsentText(serverId, call.name), isError: true };
     }
     const config = this.mcplServerConfigs.get(serverId);
@@ -22254,6 +22256,9 @@ export class AgentFramework {
     // under its id or spawned (a reconnecting server would otherwise be left
     // registered as a closed stub). With no outbox configured nothing is read.
     // A modern connection has no awareness barrier and no reaction default.
+    // A ledger that breaks after this read meets the spawn's own read: a
+    // connect with `reconnect` then leaves its stub retrying until the ledger
+    // reads again, as a reconnect does, and one without refuses.
     if (family === 'legacy') this.getPlacedReactionBaseline();
 
     // Register prefix + config for tool dispatch routing (idempotent with
@@ -22953,14 +22958,19 @@ export class AgentFramework {
 
     const collision = this.mcplPrefixCollision(config, undefined, claim);
     if (collision) throw new Error(collision);
+    // The id is refused here too, before the trees are read, so a connect
+    // refused for its id reads nothing and reports only its refusal. The
+    // connect asks again as it takes the id, with nothing awaited between.
+    const taken = this.mcpServerIdTaken(config.id, claim);
+    if (taken) throw new Error(taken);
 
     // The server's restored host-managed trees are read before the server is
     // added, so a read that fails leaves it unconnected; MCPL itself stays
     // up, even when this connect brought it up. A feature set with no
     // restored tree, as after a disconnect removed it, is read when it
-    // registers. A server already connected is refused by addServer below,
-    // so its trees are left as they are.
-    if (!this.mcplServerRegistry?.getServer(config.id)) this.checkpointManager?.loadHostStates(config.id);
+    // registers. A server already registered was refused just above, so the
+    // read never reaches a registered server's trees.
+    this.checkpointManager?.loadHostStates(config.id);
     const oldToolNames = new Set(this.mcplTools.map(t => t.name));
     const connection = await this.connectMcplServerInternal(config, false, claim);
     // A stop() that began during the connect's setup or its tool listing
@@ -23195,7 +23205,8 @@ export class AgentFramework {
    * server's credentials replaced: those of the configurations present when
    * it's made, then those present when it's used. An operation makes it
    * before it waits, so a server removed meanwhile, and one connected
-   * meanwhile, both have their credentials replaced.
+   * meanwhile, both have their credentials replaced. When one of them can't
+   * be read, the text is withheld, as redactServerText withholds it.
    */
   private everyServerRedactor(): (text: unknown) => string {
     const snapshot = [...this.mcplServerConfigs.values()];
@@ -23204,9 +23215,15 @@ export class AgentFramework {
     // covered, each with what its dials have sent by the time the text is
     // recorded. One pass over all their strings, so a secret that begins
     // another server's longer one can't cut that one short.
-    return (text) => credentialRedactor(
-      [...new Set([...snapshot, ...this.mcplServerConfigs.values()])].flatMap(config => serverCredentialPatterns(config)),
-    )(text);
+    return (text) => {
+      let patterns: CredentialPattern[];
+      try {
+        patterns = [...new Set([...snapshot, ...this.mcplServerConfigs.values()])].flatMap(config => serverCredentialPatterns(config));
+      } catch {
+        return WITHHELD_TEXT;
+      }
+      return credentialRedactor(patterns)(text);
+    };
   }
 
   /** Why a connect for this id is refused, or null when the id is free. One
@@ -23233,11 +23250,14 @@ export class AgentFramework {
     }
     // A disconnect of the id began during the restart, and has finished.
     if (claim?.endedBy) return claim.endedBy;
+    // A connect in flight, in either engine: a legacy one registers its
+    // server once its handshake is done, and a modern one registers its
+    // connection before it starts. Whatever the id has registered meanwhile
+    // is that connect's.
+    if (op) return `${refused}${mcplConnectInFlightText(id)}`;
     const registered = this.modernServers().get(id) ?? this.mcplServerRegistry?.getServer(id);
-    // A connect in flight that hasn't registered its server yet.
-    if (op && !registered) return `${refused}${mcplConnectInFlightText(id)}`;
-    if (op || registered) {
-      const idle = !op && registered && !registered.isConnected && !registered.willReconnect;
+    if (registered) {
+      const idle = !registered.isConnected && !registered.willReconnect;
       return `${refused}MCPL server "${id}" is already registered${idle ? ' (not connected and not reconnecting: disconnect it first)' : ''}`;
     }
     return null;
@@ -24425,16 +24445,25 @@ export class AgentFramework {
     }
   }
 
-  /** The refusal of a tool call whose server isn't registered, for the
-   *  model's call and a script's alike: "connecting" while a connect of its
-   *  id is in flight (mcpServerOps) or a restart holds the id, and "gone"
-   *  otherwise. A legacy connect registers its server once its handshake is
-   *  done; a modern connect registers its connection first, so a call during
-   *  it reads that connection's own refusal. */
+  /** The refusal of a tool call whose server isn't one to call yet, for the
+   *  model's call, a script's and an in-process one alike: none registered,
+   *  or a modern connection whose connect is still under way
+   *  (modernStillConnecting). It says "connecting" while a connect of its id
+   *  is in flight (mcpServerOps) or a restart holds the id, and "gone"
+   *  otherwise. */
   private mcplServerAbsentText(serverId: string, toolName: string): string {
     return this.mcpServerOps?.get(serverId)?.kind === 'connect' || this.restartClaims().ids.has(serverId)
       ? mcplServerConnectingText(serverId, toolName)
       : mcplServerGoneText(serverId, toolName);
+  }
+
+  /** A modern connection a connect still under way registered: it registers
+   *  before it starts, so until its first session is up it's no server to
+   *  call, and a call reads the "connecting" text, as one during a legacy
+   *  connect's handshake does. Once that session is up, a call goes to it,
+   *  even while the connect lists its tools. */
+  private modernStillConnecting(modern: ModernMcpConnection | null): boolean {
+    return modern !== null && !modern.isConnected && this.mcpServerOps?.get(modern.id)?.kind === 'connect';
   }
 
   /**
@@ -24446,7 +24475,7 @@ export class AgentFramework {
     const modern = this.modernServers().get(serverId) ?? null;
     const server = modern ? null : this.mcplServerRegistry!.getServer(serverId);
 
-    if (!modern && !server) {
+    if ((!modern && !server) || this.modernStillConnecting(modern)) {
       // RFC-007: refused before executing — no lifecycle events.
       this.toolLifecycleEmitter?.refuse(agentName, call.id);
       this.pushEvent({
