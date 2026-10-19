@@ -280,6 +280,40 @@ test('the interrupt stops a spinning script for good', async () => {
   e.dispose();
 });
 
+test('the script\'s code that QuickJS runs after a stop can\'t reach the host', async () => {
+  // A stop throws an error, and building its backtrace converts Error.stackTraceLimit and calls
+  // Error.prepareStackTrace: here a valueOf and a prepareStackTrace that try a call and output.
+  // The slot says stop once only, as the script spins.
+  let checks = 0;
+  const { e, rec } = await engine({ interrupt: () => ++checks === 3 });
+  const hooks = `const attempt = (fn) => { try { fn() } catch {} };
+    Error.stackTraceLimit = { valueOf() { attempt(() => __host("from the limit", "{}")); return 10; } };
+    Error.prepareStackTrace = () => { attempt(() => __host("from the hook", "{}")); attempt(() => __output(1, "from the hook")); return ""; };
+    for (;;) {}`;
+  assert.deepEqual(e.start(PRELUDE, hooks, 's.js'), { kind: 'interrupted' });
+  assert.deepEqual([rec.calls, rec.output], [[], []]);
+  e.dispose();
+});
+
+test('a stop that lands in the script\'s stack hook holds, though QuickJS puts back the error it was building', async () => {
+  // The slot's one stop lands in the hook, which counts to 3,000,000. QuickJS then throws away the
+  // hook's error and puts back the TypeError whose backtrace it was building, which the script
+  // catches and goes on from: its next check stops it, without asking the slot again, and its call
+  // in between is refused. (The refusal's error runs the hook again, which a stop that didn't hold
+  // would let count to the end.)
+  let checks = 0;
+  const { e, rec } = await engine({ interrupt: () => ++checks === 101 });
+  const s = e.start(PRELUDE, `Error.prepareStackTrace = () => { for (let i = 0; i < 3e6; i++) {} };
+    try { null.x } catch {}
+    try { __host("after the stop", "{}") } catch {}
+    for (let i = 0; i < 1e6; i++) {}
+    "went on"`, 's.js');
+  assert.deepEqual(s, { kind: 'interrupted' });
+  assert.equal(checks, 101, 'the slot was asked again after it said stop');
+  assert.deepEqual(rec.calls, []);
+  e.dispose();
+});
+
 test('the interrupt reaches a script spinning in jobs, and later settles answer interrupted, their results dropped', async () => {
   let stop = false;
   const { e } = await engine({ interrupt: () => stop }, { memoryMaxBytes: 8 * MiB });
@@ -382,6 +416,8 @@ test('what a thrown object holds is read as text, and a part that can\'t be read
     // A message that can't be read is told by the object's JSON, and with no JSON, its string form.
     ['throw Object.defineProperty({ why: 1 }, "message", { get() { throw 1 } })', '', '{"why":1}', false],
     ['throw { big: 1n, toString() { return "told by its string form" } }', '', 'told by its string form', false],
+    // A message that's there but has no string form is left out, with no stand-in for it.
+    ['throw Object.assign(new Error(), { message: Symbol("m") })', 'Error', '', true],
     // A toJSON the script puts on Object.prototype doesn't reach the engine's own record of it.
     ['Object.prototype.toJSON = () => { throw new Error("not this") }; throw new RangeError("this")', 'RangeError', 'this', true],
   ] as const) {
@@ -558,8 +594,8 @@ test('a stop while the exception that ended the run is read leaves the run faile
 test('a stop ends a failure\'s read: nothing after it is read, a part or a part\'s string form', async () => {
   // The interrupt slot says stop once only. The thrown object's message, read first, spins until
   // then; its name getter would give "made up" at once, and isn't run. In the second, the message
-  // is read, the name is an object whose toString would give "made up", and the stack getter
-  // spins until the stop, after which the name's string form isn't made.
+  // is read, and the name is an object whose toString spins until the stop: the name's string form
+  // isn't made, and the stack getter, which would give "late", isn't run.
   let checks = 0;
   const a = await engine({ interrupt: () => ++checks === 101 });
   const s = a.e.start(PRELUDE, 'queueMicrotask(() => { throw { get message() { for (;;) {} }, get name() { return "made up" } } }); 1', 's.js');
@@ -568,10 +604,31 @@ test('a stop ends a failure\'s read: nothing after it is read, a part or a part\
   a.e.dispose();
   checks = 0;
   const b = await engine({ interrupt: () => ++checks > 100 });
-  const t = b.e.start(PRELUDE, 'queueMicrotask(() => { throw { message: "m", name: { toString() { return "made up" } }, get stack() { for (;;) {} } } }); 1', 's.js');
+  const t = b.e.start(PRELUDE, 'queueMicrotask(() => { throw { message: "m", name: { toString() { for (;;) {} } }, get stack() { return "late" } } }); 1', 's.js');
   assert.deepEqual(t, { kind: 'failed', name: '', message: 'm' });
-  assert.ok(checks > 100, 'the stop came while the stack was read');
+  assert.ok(checks > 100, 'the stop came while the name was made a string');
   b.e.dispose();
+});
+
+test('each part read before a stop keeps its string form, a number\'s or an object\'s', async () => {
+  // The slot says stop once only, as the name getter spins. The message, read first, isn't a
+  // string: its string form is made before the name is read.
+  for (const [message, made] of [['42', '42'], ['{ toString() { return "made" } }', 'made']] as const) {
+    let checks = 0;
+    const { e } = await engine({ interrupt: () => ++checks === 101 });
+    const s = e.start(PRELUDE, `queueMicrotask(() => { throw { message: ${message}, get name() { for (;;) {} } } }); 1`, 's.js');
+    assert.deepEqual(s, { kind: 'failed', name: '', message: made }, message);
+    assert.equal(checks, 101);
+    e.dispose();
+  }
+});
+
+test('a stack is left out once a stop has come, though it\'s plain data', async () => {
+  let checks = 0;
+  const { e } = await engine({ interrupt: () => ++checks === 101 });
+  const s = e.start(PRELUDE, 'queueMicrotask(() => { throw { get message() { for (;;) {} }, stack: "late" } }); 1', 's.js');
+  assert.deepEqual(s, { kind: 'failed', name: '', message: '' });
+  e.dispose();
 });
 
 test('once a stop has come, a failure with no message gets no stand-in for one', async () => {

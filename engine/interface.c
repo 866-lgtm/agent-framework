@@ -195,9 +195,13 @@ static const JSMallocFunctions limited_malloc_funcs = {
 };
 
 /* Once the host has stopped the guest, every later check stops it too, without asking again, so
-   a stop holds for good even if the host would say otherwise later. Nothing the engine does runs
-   the script's code after a stop today: every entry point checks the flag first, and error_json
-   ends its read at one. This keeps the stop if that ever changes. QuickJS checks at its first
+   a stop holds for good even if the host would say otherwise later. The engine runs none of the
+   script's code after a stop: every entry point checks the flag first, and error_json ends its
+   read at one. QuickJS does: building an error's backtrace converts Error.stackTraceLimit, which
+   can call a valueOf, and calls Error.prepareStackTrace, for the error a stop throws as for any
+   other. A stop that lands in that code is lost when QuickJS puts back the error it was
+   building, and the script goes on from there. This ends such code at its next check, and
+   __host and __output refuse it, so none of it reaches the host. QuickJS checks at its first
    poll and once in 10,000 after, so a check ends the code running then, not at once. */
 static int interrupt_handler(JSRuntime *r, void *opaque) {
     (void)r;
@@ -210,10 +214,11 @@ static int interrupt_handler(JSRuntime *r, void *opaque) {
 }
 
 /* __host(name, args): name and args are strings (the prelude stringifies the arguments).
-   Returns a promise the host settles with engine_settle. */
+   Returns a promise the host settles with engine_settle. Once the script has ended, while its
+   ending is read, or once it's stopped, the call is refused. */
 static JSValue js_host(JSContext *c, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val;
-    if (reading)
+    if (reading || interrupted)
         return JS_ThrowInternalError(c, "the script has ended, so its calls no longer reach the host");
     if (argc < 2 || !JS_IsString(argv[0]) || !JS_IsString(argv[1]))
         return JS_ThrowTypeError(c, "__host takes a tool name and its arguments as JSON text");
@@ -270,10 +275,10 @@ static JSValue js_host(JSContext *c, JSValueConst this_val, int argc, JSValueCon
     return promise;
 }
 
-/* __output(stream, text): stream 1 is out and 2 is err. */
+/* __output(stream, text): stream 1 is out and 2 is err. Refused as __host is. */
 static JSValue js_output(JSContext *c, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val;
-    if (reading)
+    if (reading || interrupted)
         return JS_ThrowInternalError(c, "the script has ended, so its output no longer reaches the host");
     int32_t stream;
     if (argc < 2 || !JS_IsNumber(argv[0]) || !JS_IsString(argv[1]))
@@ -533,11 +538,39 @@ int engine_settle(uint32_t id, int ok, char *json, uint32_t json_len, char *unfi
     return st;
 }
 
+/* One part of an object, for error_json: read, and made a string at once, so a stop in a later
+   part's read can't take it. Nothing is read once a stop has come. A part that isn't there, or
+   whose read throws, is undefined; one with no string form is null, which error_json leaves out
+   with no stand-in, as it does a stack that isn't a string. */
+static JSValue error_part(JSValue v, const char *key, bool any) {
+    if (interrupted)
+        return JS_UNDEFINED;
+    JSValue p = JS_GetPropertyStr(ctx, v, key);
+    if (any && !JS_IsException(p) && !JS_IsUndefined(p) && !JS_IsString(p)) {
+        JSValue s = JS_ToString(ctx, p);
+        JS_FreeValue(ctx, p);
+        if (JS_IsException(s)) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            return JS_NULL;
+        }
+        p = s;
+    }
+    if (JS_IsException(p)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return JS_UNDEFINED;
+    }
+    if (!JS_IsString(p)) {
+        JS_FreeValue(ctx, p);
+        return JS_UNDEFINED;
+    }
+    return p;
+}
+
 /* The text of a value or an error, for engine_result. Takes v. Returns a JS string, undefined,
    or an exception. Reading an object's parts can run the script's own code (a getter, a toJSON, a
    toString), and a stop ends the read: what was read before it stays, and nothing more is read,
    neither a part nor a stand-in for a missing message. The message is read first, as the part
-   most worth keeping. */
+   most worth keeping, and each part is a string before the next is read. */
 static JSValue error_json(JSValue v) {
     /* No prototype, so a toJSON the script put on Object.prototype doesn't serialize it. */
     JSValue o = JS_NewObjectProto(ctx, JS_NULL);
@@ -547,19 +580,12 @@ static JSValue error_json(JSValue v) {
     }
     JSValue name = JS_UNDEFINED, message = JS_UNDEFINED, stack = JS_UNDEFINED;
     if (JS_IsObject(v)) {
-        if (!interrupted)
-            message = JS_GetPropertyStr(ctx, v, "message");
-        if (!interrupted)
-            name = JS_GetPropertyStr(ctx, v, "name");
-        if (!interrupted)
-            stack = JS_GetPropertyStr(ctx, v, "stack");
+        message = error_part(v, "message", true);
+        name = error_part(v, "name", true);
+        stack = error_part(v, "stack", false);
         /* An object with no message of its own, such as a plain object thrown, or one whose
            message can't be read, is told by its JSON, or by its string form when it has none,
            rather than left blank. */
-        if (JS_IsException(message)) {
-            JS_FreeValue(ctx, JS_GetException(ctx));
-            message = JS_UNDEFINED;
-        }
         if (JS_IsUndefined(message) && !interrupted) {
             message = JS_JSONStringify(ctx, v, JS_UNDEFINED, JS_UNDEFINED);
             if (JS_IsException(message)) {
@@ -573,30 +599,14 @@ static JSValue error_json(JSValue v) {
         /* A primitive's string form runs no script code (a Symbol has none, and is left out). */
         message = JS_ToString(ctx, v);
     }
-    /* A getter that throws, a name or message with no string form, or a stack that isn't a string
-       leaves that part out. */
+    /* A stand-in that throws, or a primitive with no string form, such as a Symbol, is left out. */
     JSValue parts[3] = {name, message, stack};
     const char *keys[3] = {"name", "message", "stack"};
     for (int i = 0; i < 3; i++) {
         JSValue p = parts[i];
-        if (JS_IsException(p)) {
+        if (JS_IsException(p))
             JS_FreeValue(ctx, JS_GetException(ctx));
-            continue;
-        }
-        if (i < 2 && !JS_IsUndefined(p) && !JS_IsString(p)) {
-            if (interrupted) {
-                JS_FreeValue(ctx, p);
-                continue;
-            }
-            JSValue s = JS_ToString(ctx, p);
-            JS_FreeValue(ctx, p);
-            if (JS_IsException(s)) {
-                JS_FreeValue(ctx, JS_GetException(ctx));
-                continue;
-            }
-            p = s;
-        }
-        if (!JS_IsString(p))
+        else if (!JS_IsString(p))
             JS_FreeValue(ctx, p);
         else if (JS_SetPropertyStr(ctx, o, keys[i], p) < 0)
             JS_FreeValue(ctx, JS_GetException(ctx));
