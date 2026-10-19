@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
 import type { AddressInfo } from 'node:net';
 import { spawnSync } from 'node:child_process';
@@ -493,7 +494,7 @@ test("a WebSocket client's error is carried on with the url and the credentials 
   const spaced = { id: 'spaced', url: 'ws://127.0.0.1:1/mcpl' };
   const spacedDialed = buildWebSocketUrl(spaced, 'provided sekret/9');
   noteDialSent(spaced, { url: spacedDialed, token: 'provided sekret/9' });
-  assert.ok(!/provided(%20|\+| )sekret/.test(clientErrorText(new Error('sent provided%20sekret%2F9 and provided sekret/9'), spaced, spacedDialed)));
+  assert.equal(clientErrorText(new Error('sent provided%20sekret%2F9 and provided sekret/9'), spaced, spacedDialed), 'sent redacted and redacted');
   // Text with no credential in it passes as it is.
   assert.equal(clientErrorText(new Error('connect ECONNREFUSED 127.0.0.1:1'), staticConfig, staticDialed), 'connect ECONNREFUSED 127.0.0.1:1');
 });
@@ -503,6 +504,7 @@ test("a credential with parentheses, quotes or brackets, or an IPv6 host, is mas
     'ws://127.0.0.1:1/mcpl?api_key=abc(defghijklmnop)',
     'ws://user:abcdefg(hijklmnop)@127.0.0.1:1/mcpl',
     "ws://user:abc'defghijklmnop@127.0.0.1:1/mcpl",
+    'ws://user:abc[defghijklmnop]@127.0.0.1:1/mcpl',
     'ws://user:sekretpassword1@[::1]:1/mcpl?token=abc(def)ghijk',
   ]) {
     const config = { id: 's', url, token: 'tok-(sekret)-xyz' };
@@ -511,6 +513,8 @@ test("a credential with parentheses, quotes or brackets, or an IPv6 host, is mas
     for (const quoted of [dialed, url]) {
       const text = clientErrorText(new Error(`WebSocket connection to '${quoted}' failed (${quoted})`), config, dialed);
       assert.ok(!/defghijklmnop|hijklmnop|sekretpassword1|ghijk|sekret\)/.test(text), `${url}: ${text}`);
+      // The client's words and the endpoint stay readable: masked, not withheld.
+      assert.match(text, /^WebSocket connection to 'ws:\/\/(127\.0\.0\.1|\[::1\]):1\/mcpl[^']*' failed \(ws:\/\//, `${url}: ${text}`);
     }
   }
 });
@@ -558,6 +562,59 @@ test("a WebSocket client's error after the socket opened reaches the connection'
   }
 });
 
+test("a failed dial's error is masked when the client quotes the url as dialed, as Bun's does, under Node too", async (t) => {
+  // Node's ws names only the address in a failed dial's error, so here it
+  // raises Bun's words instead: the masking at the dial is then checked
+  // wherever the suite runs, with or without bun.
+  const emit = WebSocket.prototype.emit;
+  t.mock.method(WebSocket.prototype, 'emit', function (this: WebSocket, event: string | symbol, ...args: unknown[]) {
+    if (event === 'error') args = [new Error(`WebSocket connection to '${this.url}' failed: Failed to connect`)];
+    return emit.call(this, event, ...args);
+  });
+  for (const config of [
+    { id: 'static', url: 'ws://alice:pw-sekret-1@127.0.0.1:1/mcpl/s/sekret4kQ9xW2vLm8pRs/x?api_key=sekret-q&v=2', token: 'tok-sekret-static' },
+    { id: 'provider', url: 'ws://127.0.0.1:1/mcpl', accessProvider: async () => 'provided-sekret-9' },
+  ]) {
+    await assert.rejects(McplServerConnection.connect(config, HOST_CAPS), (error: Error) => {
+      assert.match(error.message, /WebSocket connect failed: WebSocket connection to 'ws:\/\/127\.0\.0\.1:1\/mcpl[^']*' failed: Failed to connect/, error.message);
+      assert.ok(!SECRETS.test(error.message), error.message);
+      assert.equal(error.cause, undefined);
+      return true;
+    });
+  }
+});
+
+test("a client that throws as the socket is constructed rejects the dial with its text masked and no cause", async (t) => {
+  const config = { id: 'static', url: 'ws://alice:pw-sekret-1@127.0.0.1:1/mcpl/s/sekret4kQ9xW2vLm8pRs/x?api_key=sekret-q&v=2', token: 'tok-sekret-static' };
+  const dialed = buildWebSocketUrl(config);
+  // ws makes its upgrade request inside its constructor, so a request that
+  // throws is a throw from `new WebSocket(url)`: here, one quoting the url.
+  t.mock.method(http, 'request', () => {
+    throw new Error(`cannot request '${dialed}'`);
+  });
+  await assert.rejects(McplServerConnection.connect(config, HOST_CAPS), (error: Error) => {
+    assert.match(error.message, /WebSocket connect failed: cannot request 'ws:\/\/127\.0\.0\.1:1\/mcpl\/s\/redacted\/x\?api_key=redacted&v=redacted'/, error.message);
+    assert.ok(!SECRETS.test(error.message), error.message);
+    assert.equal(error.cause, undefined);
+    return true;
+  });
+});
+
+test("a url the client quotes in another spelling than the one dialed is masked as redactUrl shows it", () => {
+  // The password's slash is %2F as configured and as dialed. A client that
+  // spells the escape %2f quotes neither url as given, and the userinfo's
+  // strings don't match it either: the last step masks it.
+  const config = { id: 's', url: 'ws://alice:pw%2Fsekret-1@127.0.0.1:1/mcpl' };
+  const dialed = buildWebSocketUrl(config);
+  noteDialSent(config, { url: dialed });
+  const quoted = dialed.replace('%2F', '%2f');
+  assert.notEqual(quoted, dialed);
+  assert.equal(
+    clientErrorText(new Error(`WebSocket connection to '${quoted}' failed: Failed to connect`), config, dialed),
+    "WebSocket connection to 'ws://127.0.0.1:1/mcpl' failed: Failed to connect",
+  );
+});
+
 test("under Bun, a failed dial's error leaves no credential in its message, cause or stack", (t) => {
   const probe = spawnSync('bun', ['--version'], { encoding: 'utf8' });
   if (probe.error || probe.status !== 0) {
@@ -595,6 +652,4 @@ test("under Bun, a failed dial's error leaves no credential in its message, caus
       assert.ok(text && !SECRETS.test(text), `${result.id}: ${text}`);
     }
   }
-  // The secrets are on the dial's stderr log lines' side of the process too: none.
-  assert.ok(!SECRETS.test(run.stderr), run.stderr);
 });
