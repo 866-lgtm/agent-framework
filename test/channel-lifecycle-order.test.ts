@@ -1106,10 +1106,13 @@ test('declining an invitation closes an unconfirmed transport for real, and wait
 test("a settled operation releases its channel's queue key", async () => {
   const f = fixture();
   await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
-  const internals = f.registry as unknown as { channelLifecycleTails: Map<string, unknown>; lifecycleOutstanding: Map<string, number> };
+  const internals = f.registry as unknown as {
+    channelLifecycleTails: Map<string, unknown>; lifecycleOutstanding: Map<string, number>; lifecycleQueuedRemovals: Map<string, number>;
+  };
   for (let i = 0; i < 3; i++) await tick();
   assert.equal(internals.channelLifecycleTails.size, 0);
   assert.equal(internals.lifecycleOutstanding.size, 0);
+  assert.equal(internals.lifecycleQueuedRemovals.size, 0, 'the removal count kept for the queue goes with it');
 });
 
 test('the notices say what happened, name the opt-out, and state no rule about later sends', async () => {
@@ -1506,6 +1509,8 @@ test("when a reply's open fails while its server is removed and added again as i
   assert.equal(answer.selectedForOpening, 'server-bootstrap');
   await tick(); await tick();
   assert.deepEqual(decision(f.registry), { state: 'open', source: 'server-bootstrap' });
+  assert.deepEqual(f.calls.slice(f.calls.findIndex((c) => c.kind === 'open') + 1).map((c) => c.kind), ['open'],
+    "the new registration's queued work carries the decision out, so the put-back queues nothing of its own");
   assert.equal(f.isOpen(), true);
 });
 

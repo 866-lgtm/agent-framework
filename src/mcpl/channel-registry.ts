@@ -2620,7 +2620,10 @@ export class ChannelRegistry {
   /** Whether lifecycle work already outstanding for the channel will carry out
    *  its current decision: some is, and the newest was queued since its
    *  server's registrations were last removed, so it won't cancel when it
-   *  would run. Each operation reads the decision when it runs. */
+   *  would run. Each operation reads the decision when it runs. It answers for
+   *  now: a removal after it cancels that work too, and takes the channel's
+   *  entry with it, so its next registration carries the decision out, where
+   *  this host directs the lifecycle then. */
   private outstandingWorkCarriesOut(serverId: string, key: string): boolean {
     return this.lifecycleOutstanding.has(key) &&
       this.lifecycleQueuedRemovals.get(key) === (this.serverRemovals.get(serverId) ?? 0);
@@ -2999,7 +3002,11 @@ export class ChannelRegistry {
         // is, unless other lifecycle work for the channel is queued that will
         // carry it out anyway: work queued before its server's registrations
         // were removed cancels instead. (An incidental open gets here only
-        // where the host directs the lifecycle: see the grant check above.)
+        // where the host directed the lifecycle when it opened: see the grant
+        // check above. Where the grant has lost channels.lifecycle since, as a
+        // transport drop clears it, the queued work fails for it, and the
+        // server's next registration carries the decision out, where this host
+        // directs the lifecycle then.)
         if (current && !this.outstandingWorkCarriesOut(entry.serverId, key)) {
           this.applyThroughQueue(entry.serverId, entry.descriptor.id);
         }
