@@ -191,12 +191,12 @@ export type TraceEvent =
        * break (`\n\n`), so a channel's chunks joined in `index` order are its
        * text, its messages kept apart.
        * `mcpl:speech-routed` also reports speech publishes, with no stream
-       * id, index or end: deliverSpeech's once delivered, the `sleep` tool's
-       * announcement among them, and a subconscious's `speak_in_channel` as
-       * it is sent, before its outcome is known. A relay that voices the
-       * agent's prose takes this trace, with `inference:published_complete`,
-       * and not `mcpl:speech-routed` as well, and takes each message's id
-       * from its `messageId` to edit what it voiced.
+       * id, index or end, each once delivered: deliverSpeech's, the `sleep`
+       * tool's announcement among them, and a subconscious's
+       * `speak_in_channel`'s. A relay that voices the agent's prose takes
+       * this trace, with `inference:published_complete`, and not
+       * `mcpl:speech-routed` as well, and takes each message's id from its
+       * `messageId` to edit what it voiced.
        */
       type: 'inference:published';
       agentName: string;
@@ -495,13 +495,16 @@ export type TraceEvent =
     })
 
   // Host-owned speech routing (ChannelRegistry.routeSpeech). One trace per
-  // delivered prose segment. `text` is the segment verbatim — the same content
+  // delivered prose segment, and one per publish the subconscious's
+  // speak_in_channel delivers (ChannelRegistry.publishForAgent): that one's
+  // conversationId is the speaking agent's name, and it carries no
+  // messageId. `text` is the segment verbatim — the same content
   // already on the bus chunk-by-chunk via inference:tokens, and mcpl:* traces
   // are 'ops'-scoped on the webui wire — and `messageId` is the surface's id
-  // for the posted message (when the MCPL server reports one). Together they
-  // give external taps the (channelId, messageId, text) tuple needed to edit
-  // a just-posted message, e.g. a TTS interruption truncating a reply to the
-  // words actually voiced.
+  // for the posted message (on routeSpeech's traces, when the MCPL server
+  // reports one). Together they give external taps the (channelId,
+  // messageId, text) tuple needed to edit a just-posted message, e.g. a TTS
+  // interruption truncating a reply to the words actually voiced.
   | (TraceEventBase & {
       type: 'mcpl:speech-routed';
       /** Agent / conversation whose speech was routed. */
@@ -512,7 +515,8 @@ export type TraceEvent =
       textLen: number;
       /** The routed prose segment, verbatim. */
       text: string;
-      /** Surface message id (e.g. Discord message id), when reported. */
+      /** Surface message id (e.g. Discord message id), when reported, on
+       *  routeSpeech's traces. speak_in_channel's carry none. */
       messageId?: string;
     })
   | (TraceEventBase & {
@@ -526,6 +530,9 @@ export type TraceEvent =
       /** `failed`: nothing was posted; `unknown`: the request was dispatched
        *  and no valid receipt came back, so it may have been. */
       outcome?: 'failed' | 'unknown';
+      /** The connector error's structured data, bounded (connectorText),
+       *  when it sent some: it may say what a multi-part send posted. */
+      detail?: string;
     })
 
   // Admin puppet: an operator executed a tool AS an agent and stored the
@@ -685,7 +692,7 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'mcpl:orphaned-response';
       serverId: string;
-      /** The JSON-RPC id of the late response whose pending request already timed out. */
+      /** The JSON-RPC id of the late response, whose request had already timed out or been ended by its transport's close. */
       responseId: string | number;
       /** Original request method when retained for mandatory-deadline visibility. */
       method?: string;
@@ -727,7 +734,7 @@ export type TraceEvent =
       parkedAdmissions?: number;
       /** True when undrained turns were force-cancelled (abandon). */
       abandoned?: boolean;
-      /** Agents whose turn abandon could not cancel (token held, no stream). */
+      /** Agents whose turn the abandon had not ended when its grace ran out: a token held with no stream and no check ahead (a puppet tool turn, a store surgery's reservation, a turn finishing its last delivery), or a turn that hadn't reached its next check, the tool-result guard's wait for its speech included. A turn whose stream the abandon cancelled while it was still streaming isn't listed, even one still running when the grace ran out. */
       unabandonable?: string[];
     })
   | (TraceEventBase & {

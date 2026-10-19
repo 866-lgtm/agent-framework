@@ -116,9 +116,9 @@ never do.
   silently stranding an entry.
 - **The fragment lands with the change** — same commit, or at least the same
   PR. This binds direct pushes to `main` just as much as PRs. On PRs, CI
-  enforces it softly: touching `src/` without adding a fragment (or editing
-  `CHANGELOG.md`) fails the `changelog` check unless the `no-changelog`
-  label is applied.
+  enforces it softly: touching `src/` fails the `changelog` check unless the
+  PR adds a fragment, edits a pending one or edits `CHANGELOG.md`, or carries
+  the `no-changelog` label.
 - **What needs an entry:** anything a module developer, host, or downstream
   consumer would notice — behavior, event/trace surfaces, tool namespacing,
   config schema, agent state machine, public exports, defaults. Internal
@@ -148,7 +148,9 @@ never do.
   which refuses a tag with no matching changelog section, checks in a job
   of its own that the packed release installs on its own, publishes
   `@animalabs/agent-framework` to npm once that check has passed, and
-  creates the GitHub release with that section as its notes. The check,
+  creates the GitHub release with that section as its notes, cut at an
+  entry's start, with a link to the whole section, when it's longer than
+  120,000 characters, under GitHub's limit of 125,000. The check,
   `node scripts/pack-installs-alone.mjs`, packs the release and installs
   the tarball alone into an empty directory with its dependencies from
   npm. The install is linked, so each package reaches only the

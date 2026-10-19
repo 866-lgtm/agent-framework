@@ -15,7 +15,13 @@ import { openTransport, STDERR_END_WAIT_MS, type McplTransport, type TransportCl
 import { maskNegotiatedCapabilities } from './capability-mask.js';
 import { CapabilityGrant, expandAdvertisementShorthand } from './capability-grant.js';
 import { CAPABILITY_DISABLED, boundedForLog, describeCause } from './errors.js';
-import { logDetail, logValue } from './log-value.js';
+import { logDetail, logValue, logValueRedacted } from './log-value.js';
+import {
+  LEGACY_MCP_PROTOCOL_VERSION,
+  MODERN_MCP_PROTOCOL_VERSION,
+  checkServerConfig,
+  redactServerText,
+} from './protocol-family.js';
 
 import type {
   McplServerConfig,
@@ -86,24 +92,26 @@ export function stderrTailOf(error: unknown): string | undefined {
 }
 
 /** For the host's own log line about a failed connect: the server's stderr
- *  that the error keeps as `stderrTail`, one marked line per line of it,
- *  each through log-value, since it's the server's text. '' when there's
+ *  that the error keeps as `stderrTail`, with the server's credentials
+ *  taken out by `redact` (its redactServerText), one marked line per line of
+ *  it, each through log-value, since it's the server's text. '' when there's
  *  none. */
-export function withStderr(error: unknown): string {
+export function withStderr(error: unknown, redact: (text: string) => string): string {
   const tail = stderrTailOf(error);
   if (tail === undefined) return '';
-  return '. The last of its stderr:' + tail.split('\n').map((line) => `\n  stderr: ${logDetail(line)}`).join('');
+  return '. The last of its stderr:' + redact(tail).split('\n').map((line) => `\n  stderr: ${logDetail(line)}`).join('');
 }
 
-/** A transport close's reason, as an error message gives it: the transport's
- *  own words. A WebSocket peer's close reason is the server's text
- *  (`reasonFromPeer`), so an error gives the words the transport uses for a
- *  close without one, as `mcpl:server-closed` leaves that text out. A
+/** A transport close's reason, as the host's log and the handshake's error
+ *  give it: the transport's own words. A WebSocket peer's close reason is the
+ *  server's text (`reasonFromPeer`), so they give the words the transport uses
+ *  for a close without one, as `mcpl:server-closed` leaves that text out. A
  *  WebSocket close's code, a number, says what the server meant (4001: a
- *  refused credential), with or without a reason, so each error gives it too:
- *  a pending request's error has `code=`, and the handshake's adds it for any
- *  WebSocket close, since a close before the handshake completes reaches no
- *  'close' event. A stdio child's exit reads as before. */
+ *  refused credential), with or without a reason, so each gives it too: the
+ *  log line for a close with requests pending has `code=`, and the
+ *  handshake's error adds it for any WebSocket close, since a close before the
+ *  handshake completes reaches no 'close' event. A stdio child's exit reads
+ *  as before. */
 function closeReasonText(info: TransportCloseInfo): string {
   if (info.reasonFromPeer) return 'websocket closed';
   return info.reason ?? 'unknown';
@@ -116,8 +124,113 @@ function closeReasonText(info: TransportCloseInfo): string {
  *  tool work while still bounding the hang. */
 const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 
-/** MCP protocol version used in the initialize handshake. */
-const MCP_PROTOCOL_VERSION = '2024-11-05';
+/** MCP protocol version used in the initialize handshake: the only revision
+ *  this legacy engine offers or accepts. */
+const MCP_PROTOCOL_VERSION = LEGACY_MCP_PROTOCOL_VERSION;
+
+/** JSON-RPC code for an unsupported protocol version (MCP 2026-07-28 §basic,
+ *  the code a modern-only server answers our `initialize` with). */
+const UNSUPPORTED_PROTOCOL_VERSION_CODE = -32022;
+
+/** Upper bound on `tools/list` pages, against a server whose cursors never
+ *  end. Generous: real inventories fit in a handful of pages. */
+const MAX_TOOL_LIST_PAGES = 100;
+
+/**
+ * The server and this engine have no protocol revision in common, so the
+ * connection was never established. This is a protocol-negotiation fact, not
+ * a request outcome. Retrying cannot change it: each engine offers one
+ * revision, and only configuration can fix the mismatch. A connection that
+ * gets this error does not schedule reconnects. The legacy engine and the
+ * modern one (ModernMcpConnection, whose pinned revision the server refused)
+ * both throw it, so its readers treat them alike.
+ *
+ * - `rejected`: the server refused the offered revision: the legacy engine's
+ *   `initialize` answered with error -32022, or a modern server's discovery
+ *   or error naming no common revision. `supported` is the server's own list,
+ *   when it gave one.
+ * - `mismatch`: the server answered the legacy engine's `initialize` with a
+ *   revision other than 2024-11-05, or with none.
+ */
+export class McplProtocolVersionError extends Error {
+  constructor(
+    message: string,
+    readonly kind: 'rejected' | 'mismatch',
+    /** Revision the server answered with (`mismatch`; null when it gave none). */
+    readonly returned: string | null,
+    /** Revisions the server says it supports (`rejected`, when stated). */
+    readonly supported: readonly string[] | null,
+    /** The JSON-RPC error's code and data, verbatim (`rejected`). */
+    readonly code?: number,
+    readonly data?: unknown,
+    /** The revision this client offered: the legacy engine's, unless a
+     *  modern connection's. */
+    readonly offered: string = MCP_PROTOCOL_VERSION,
+  ) {
+    super(message);
+    this.name = 'McplProtocolVersionError';
+  }
+}
+
+function protocolVersionRejection(id: string, error: { code: number; message: string; data?: unknown }): McplProtocolVersionError {
+  const data = error.data as { supported?: unknown } | undefined;
+  const supported = Array.isArray(data?.supported) && data.supported.every((v) => typeof v === 'string')
+    ? (data.supported as string[])
+    : null;
+  const modernHint = supported?.includes(MODERN_MCP_PROTOCOL_VERSION)
+    ? ` It speaks modern MCP: configure it with protocol: 'modern' (stdio) or reach it over http(s).`
+    : '';
+  return new McplProtocolVersionError(
+    `MCPL server "${id}" does not support MCP ${MCP_PROTOCOL_VERSION}` +
+      // The server's message can be any JSON value, so it's read without
+      // throwing (describeCause) and bounded, as the initialize error is.
+      (supported ? ` (it supports: ${supported.join(', ') || 'none listed'}).` : ` (${boundedForLog(describeCause(error.message))}).`) +
+      modernHint,
+    'rejected',
+    null,
+    supported,
+    error.code,
+    error.data,
+  );
+}
+
+const errorOf = (value: unknown): Error => (value instanceof Error ? value : new Error(String(value)));
+
+/**
+ * A handshake that failed, and whose cleanup couldn't confirm that the child
+ * exited. The transport goes to whoever owns the launch.
+ */
+class HandshakeCleanupError extends Error {
+  constructor(
+    readonly failure: Error,
+    readonly cleanup: Error,
+    readonly transport: McplTransport,
+  ) {
+    super(`${failure.message}; its cleanup also failed: ${cleanup.message}`, { cause: failure });
+    this.name = 'HandshakeCleanupError';
+  }
+}
+
+/**
+ * A connect that failed, and whose cleanup couldn't confirm that the child
+ * exited: it may still be running. `connection` owns that launch, closed and
+ * not reconnecting. Its close() retries the reap and resolves once the exit
+ * is confirmed, so the caller can still clean up, and should start nothing
+ * else for this server until then. connect() and connectWithReconnect()
+ * throw this, and the modern engine's ModernMcpConnection.connect() too.
+ * `cause` is the connect's own failure.
+ */
+export class McplUnreapedLaunchError<Connection extends { close(): Promise<void> } = McplServerConnection> extends Error {
+  constructor(
+    readonly connection: Connection,
+    failure: Error,
+    /** The cleanup's own failure: the child it couldn't confirm exited. */
+    readonly cleanup: Error,
+  ) {
+    super(`${failure.message}; its cleanup also failed: ${cleanup.message}`, { cause: failure });
+    this.name = 'McplUnreapedLaunchError';
+  }
+}
 
 /**
  * Why a request to an MCPL server produced no result, as far as the host can
@@ -164,6 +277,14 @@ interface RequestOptions {
   surfaceOrphanedResponse?: boolean;
 }
 
+/** A server→host message held while its plane is closed. `kept`: it came on
+ *  a transport that is gone, and the boundary kept it (keepAcrossBoundary). */
+interface HeldItem {
+  event: string;
+  args: unknown[];
+  kept?: true;
+}
+
 /** A request's method for a log line, whatever the server sent there. */
 function describeMethod(method: unknown): string {
   return typeof method === 'string'
@@ -192,7 +313,12 @@ function describeMethod(method: unknown): string {
  *   server's stderr when its handshake failed by its transport closing, a
  *   transport error or its timeout and it had written any; `error` never
  *   carries it.
- * - `'reconnect'`          — Background reconnect succeeded
+ * - `'reconnect'`          — Background reconnect succeeded. The new transport
+ *                            starts with an empty grant and both planes
+ *                            closed, as at initial connect: whoever owns the
+ *                            connection runs the §5.3 policy exchange again,
+ *                            then opens the planes (the framework's listener
+ *                            does).
  */
 export class McplServerConnection extends EventEmitter {
   /** Unique server identifier from config. */
@@ -211,6 +337,10 @@ export class McplServerConnection extends EventEmitter {
   /** OUTER standard MCP capabilities.tools was present at handshake (§5.1 —
    *  the sole source of the `tools` capability path). */
   mcpToolsAdvertised = false;
+
+  /** The MCP revision established by the last successful handshake (always
+   *  2024-11-05 for this engine), or null before the first one. */
+  protocolVersion: string | null = null;
 
   /** Host-owned per-server authority for host/command (config
    *  allowHostCommands, default false). No capability path exists and the
@@ -279,6 +409,22 @@ export class McplServerConnection extends EventEmitter {
     this.grant = CapabilityGrant.empty();
     this.policyEstablished = false;
     this.transportEpoch++;
+    // What the server sent that is still held came on the transport that is
+    // now gone. What it said about its own process is dropped: its requests
+    // wait on answers that can no longer reach whoever asked (an inference
+    // request, a host/command), and its announcements describe a process
+    // that is gone (a tools/observe filter, a channel registration), so the
+    // next one announces its own. What it reported about the world is kept: a
+    // channel's incoming messages and its pushes, which the next process
+    // doesn't send again when its bridge records them as forwarded first, as
+    // discord-mcpl does with its watermark. They are admitted at the flush
+    // against the next transport's grant, like anything held, and an answer
+    // to one is never written to the next transport (sameTransport); a
+    // connection closed for good, with no next transport, drops them. The
+    // host's own reports about the transport stay too: its lifecycle
+    // (connect-failed, reconnect-failed), the server's stderr, and
+    // orphaned-response audits.
+    this.replaceHeld(this.keepAcrossBoundary(this.bufferedEvents));
     // RFC-007 §6.5: a filter is per connection epoch — after a reconnect the
     // server sends it again, and until then receives metadata only.
     this.toolObserveFilter = null;
@@ -287,6 +433,59 @@ export class McplServerConnection extends EventEmitter {
     // transport, and a fresh initialize starts a fresh manifest history
     // (Sol, PR #84 review — they previously survived into the new epoch).
     this.manifestState = { lastValidatedRevision: null, lastFetchedAt: null, lastNegotiatedAt: null };
+  }
+
+  /** What of these held items a transport boundary keeps (see
+   *  resetPolicyForTransportBoundary), in order, each marked `kept`; the
+   *  rest is logged and dropped. A connection closed for good has no next
+   *  transport whose grant could admit what the server reported about the
+   *  world, so that is dropped too. */
+  private keepAcrossBoundary(held: HeldItem[]): HeldItem[] {
+    const forGood = this.closedForGood;
+    const drops = (item: HeldItem) => McplServerConnection.PROCESS_EVENTS.has(item.event)
+      || (forGood && McplServerConnection.WORLD_EVENTS.has(item.event));
+    const kept = held.filter((item) => !drops(item));
+    if (kept.length < held.length) {
+      // Named by event, with a count, so a dropped request a server was
+      // waiting on, which no answer will now reach, can be told apart.
+      const counts = new Map<string, number>();
+      for (const item of held) if (drops(item)) counts.set(item.event, (counts.get(item.event) ?? 0) + 1);
+      const what = [...counts].map(([event, count]) => `${count} ${logValue(event)}`).join(', ');
+      console.error(
+        `[mcpl] ${this.id}: dropped ${held.length - kept.length} held message(s) from a transport that closed` +
+        `${forGood ? ', with no transport to come' : ''}: ${what}`,
+      );
+    }
+    return kept.map((item) => ({ ...item, kept: true as const }));
+  }
+
+  /** Hold these items in place of what is held, with heldRequests and
+   *  keptRequests counting the requests among them: a boundary keeps some of
+   *  what was held, a flush that crosses one holds the rest of its snapshot
+   *  again, and a flush starts from nothing held. Notifications need no cap
+   *  here: hold caps them kept or not, and what this is given never has more
+   *  than was held. */
+  private replaceHeld(items: HeldItem[]): void {
+    // The kept bound holds here too: boundaries that come with no flush
+    // between them each keep what the next transport held, so it's checked
+    // where they're joined. The earliest kept are kept, as at hold.
+    let kept = 0;
+    let past = 0;
+    this.bufferedEvents = items.filter((item) => {
+      if (item.kept !== true || !McplServerConnection.hasResponder(item)) return true;
+      if (kept < McplServerConnection.MAX_HELD_REQUESTS) { kept++; return true; }
+      past++;
+      return false;
+    });
+    this.heldRequests = this.bufferedEvents.filter((item) => !item.kept && McplServerConnection.hasResponder(item)).length;
+    this.keptRequests = kept;
+    if (past > 0) {
+      this.droppedKeptRequests += past;
+      console.error(
+        `[mcpl] ${this.id}: kept-request bound (${McplServerConnection.MAX_HELD_REQUESTS}) — ` +
+        `dropped ${past} request(s) a closed transport left`,
+      );
+    }
   }
 
   /** The active transport (stdio child or WebSocket). Null for a disconnected
@@ -311,9 +510,16 @@ export class McplServerConnection extends EventEmitter {
   /** Set by `reconnectAfterFailure()` before it closes a live transport, so
    *  the transport close handler reports that teardown as `byHost: true`. */
   private hostCloseRequested = false;
+  /** Set by `close()`: this host has stopped the connection, as a removal and
+   *  a restart both do, so a request after it can't say whether the server
+   *  comes back. */
+  private closedByThisHost = false;
+  /** The host's close attempt: in flight, or done. A failed one is cleared,
+   *  so the next close() tries again. */
   private closePromise: Promise<void> | null = null;
+  /** The host closed this connection while it was live, and its teardown
+   *  hasn't completed yet: 'close' is emitted once it has. */
   private closeIncomplete = false;
-  private reconnectPromise: Promise<void> | null = null;
 
   /** Per-request timeout in ms (0 disables). See McplServerConfig.requestTimeoutMs. */
   private requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS;
@@ -327,10 +533,21 @@ export class McplServerConnection extends EventEmitter {
   // reconciliation keeps agent wakes behind a durable barrier.
   private controlPlaneReady = false;
   private dataPlaneReady = false;
-  private bufferedEvents: Array<{ event: string; args: unknown[] }> = [];
+  private bufferedEvents: HeldItem[] = [];
   /** How many of bufferedEvents are server→host requests, each holding a
    *  responder its server waits on. Every change to bufferedEvents keeps it. */
   private heldRequests = 0;
+  /** How many of bufferedEvents are requests a transport boundary kept:
+   *  incoming messages and pushes whose transport has closed. No server waits
+   *  on them, since their answers can't reach it (sameTransport), so they
+   *  stay out of the held-request budget, which bounds what a live server
+   *  waits on: a dead process's backlog must not refuse the next process's
+   *  registration. They have their own bound at the same size, past which a
+   *  kept request is dropped and logged, there being no one to refuse. */
+  private keptRequests = 0;
+  /** Kept requests dropped at their bound since the planes last opened
+   *  (ready()), so the first of each run of drops is logged. */
+  private droppedKeptRequests = 0;
   /** Cap on held notifications (responder-less events) during a plane pause
    *  (issue #122), counted apart from requests: past it, the oldest held
    *  notification is dropped. */
@@ -340,7 +557,9 @@ export class McplServerConnection extends EventEmitter {
    *  bounds a server that pipelines requests without waiting for answers. A
    *  server that doesn't send a refused request again loses it (discord-mcpl
    *  doesn't), so the budget sits far above the notifications' cap, to leave
-   *  a busy server's long pause room. */
+   *  a busy server's long pause room. Requests a transport boundary kept are
+   *  counted apart from it (keptRequests), with a bound of the same size past
+   *  which they're dropped, since no server waits on them. */
   private static readonly MAX_HELD_REQUESTS = 10_000;
   private droppedBufferedEvents = 0;
   /** Requests refused at the budget since the planes last opened (ready()),
@@ -357,11 +576,28 @@ export class McplServerConnection extends EventEmitter {
   /** Consecutive failed connect attempts since the last successful handshake.
    *  Drives the exponential backoff and is reported on reconnect events. */
   private reconnectAttempts = 0;
+  /** The reconnect attempt in flight, so close() can abort it and wait for
+   *  its cleanup. */
+  private reconnecting: { abort: AbortController; done: Promise<void> } | null = null;
+  /**
+   * Launches whose cleanup couldn't confirm that the child exited. While any
+   * is held, reconnecting is halted, since another launch could run beside
+   * one that's still alive. close() retries their reap.
+   */
+  private unreaped: Array<{ transport: McplTransport; failure: Error }> = [];
 
   /** Whether a background reconnect loop will revive this connection after a
-   *  drop. False once close() has been called (explicit close stops retrying). */
+   *  drop. False once close() has been called (explicit close stops retrying),
+   *  after a protocol-version verdict, and while a launch is unreaped. */
   get willReconnect(): boolean {
     return this.reconnectEnabled;
+  }
+
+  /** Whether a child this connection launched couldn't be confirmed exited.
+   *  While it's true the connection owns that child, so whatever registered
+   *  it keeps its id held; close() retries the reap. */
+  get holdsUnreapedChild(): boolean {
+    return this.unreaped.length > 0;
   }
 
   /** Closed with no reconnect to come: after close(), whether or not its
@@ -399,38 +635,157 @@ export class McplServerConnection extends EventEmitter {
    * construction (when setupMessageRouting starts emitting) and now (when
    * the caller has attached listeners via wireMcplEvents).
    *
-   * Does nothing once the connection is closed for good. Its policy was reset
-   * when it closed, so what it held that needs a grant would be refused, and a
-   * closed connection sends no response, so nothing it held could be answered.
-   * Only what needs no grant would pass, to listeners of a server that won't
-   * be served again. A connection between retries isn't closed for good: what
-   * it held, such as a reconnect stub's connect-failed, still reaches its
-   * listeners.
+   * Once the connection is closed for good it readies nothing. Its policy was
+   * reset when it closed, so what the server sent that needs a grant would be
+   * refused, and a closed connection sends no response, so nothing it held
+   * could be answered. It delivers only its own reports of how it ended (see
+   * {@link deliverOwnReports}). A connection between retries isn't closed for
+   * good: what it held, such as a reconnect stub's connect-failed, reaches
+   * its listeners as it does any connection's, except the incoming messages
+   * and pushes a transport boundary kept, which wait for the next
+   * transport's grant (see {@link flushHeld}).
    */
   ready(): void {
-    if (this.closedForGood) return;
+    if (this.closedForGood) {
+      this.deliverOwnReports();
+      return;
+    }
     this.controlPlaneReady = true;
     this.dataPlaneReady = true;
     const pending = this.bufferedEvents;
-    this.bufferedEvents = [];
+    this.replaceHeld([]);
     // The cap's drops are counted per pause: this flush ends one, so its line
     // reports that pause's drops, and the next pause counts (and logs) its own.
     const dropped = this.droppedBufferedEvents;
     this.droppedBufferedEvents = 0;
-    this.heldRequests = 0;
     this.refusedHeldRequests = 0;
+    this.droppedKeptRequests = 0;
     if (pending.length > 200) {
       console.error(
         `[mcpl] ${this.id}: flushing ${pending.length} buffered event(s) synchronously ` +
         `(long pause backlog${dropped > 0 ? `; ${dropped} dropped at cap` : ''})`,
       );
     }
-    for (const { event, args } of pending) {
-      // Re-enter the gate for every buffered item. A control handler (notably
-      // tools/list_changed) may install a newer data-plane barrier while this
-      // snapshot is being flushed; later data items must observe that pause.
-      this.dispatchInboundEvent(event, ...args);
+    // Re-enter the gate for every buffered item. A control handler (notably
+    // tools/list_changed) may install a newer data-plane barrier while this
+    // snapshot is being flushed; later data items must observe that pause.
+    this.flushHeld(pending);
+  }
+
+  /**
+   * Re-emit a held snapshot through the admission gate (this.emit), inside
+   * the containment boundary every inbound event shares
+   * (dispatchInboundEvent), in admission order (admissionOrder). A transport
+   * boundary crossed during the flush (a listener that closes the connection,
+   * say) leaves the rest of the snapshot to the boundary rule, as if it had
+   * still been held: what the server said about its own process is dropped,
+   * and the rest is held again, after whatever this flush held.
+   *
+   * Between transports, the incoming messages and pushes a boundary kept
+   * stay held for the next transport's grant: admitted now, they would meet
+   * the empty grant the boundary left, with no transport to answer on. The
+   * host's own reports about the transport (a stub's connect-failed, say)
+   * need no grant and go on.
+   */
+  private flushHeld(snapshot: HeldItem[]): void {
+    const waits = (item: HeldItem) => item.kept === true && McplServerConnection.WORLD_EVENTS.has(item.event);
+    let pending = snapshot;
+    if (!this.isConnected && snapshot.some(waits)) {
+      this.replaceHeld([...this.bufferedEvents, ...snapshot.filter(waits)]);
+      pending = snapshot.filter((item) => !waits(item));
     }
+    const ordered = McplServerConnection.admissionOrder(pending);
+    const epoch = this.transportEpoch;
+    for (let index = 0; index < ordered.length; index++) {
+      if (this.transportEpoch !== epoch) {
+        this.replaceHeld([...this.bufferedEvents, ...this.keepAcrossBoundary(ordered.slice(index))]);
+        return;
+      }
+      const { event, args, kept } = ordered[index]!;
+      // What it can't admit yet is held again, as the admission gate would
+      // hold it, with what a boundary kept still marked as kept.
+      if (kept && !this.planeReadyFor(event)) this.hold(event, args, kept);
+      else this.dispatchInboundEvent(event, ...args);
+    }
+  }
+
+  /** Whether the plane an event belongs to is open (lifecycle events always
+   *  pass), as the admission gate (emit) decides it. */
+  private planeReadyFor(event: string): boolean {
+    return McplServerConnection.isLifecycleEvent(event)
+      || (McplServerConnection.isControlPlaneEvent(event) ? this.controlPlaneReady : this.dataPlaneReady);
+  }
+
+  /**
+   * The order a flush admits a held snapshot in: as it was held, except that
+   * when it holds items a transport boundary kept, the current transport's
+   * channel registrations (`channels-register`, `channels-changed`) go
+   * first, each unless it names a channel that something the transport sent
+   * before it, and that stays where it was held, also names (below). The
+   * registry refuses a message for a channel it doesn't know
+   * (§14.5). It keeps a server's channels across a reconnect, but a
+   * registration the old process sent that was still held at the boundary
+   * was dropped with it (keepAcrossBoundary), so the next process registers
+   * that channel anew, behind what was kept: a kept message for it admitted
+   * first would be refused, and lost, since a bridge that recorded it as
+   * forwarded doesn't send it again.
+   * Nothing else moves, so a snapshot with nothing kept is flushed as it was
+   * held. A registration also passes whatever its own transport sent before
+   * it, which a server that announces its channels first, as a bridge does,
+   * never has. A removal stays where it was held, with whatever else it adds
+   * or updates, as everything does that isn't a registration. A registration
+   * that names a channel which an earlier removal, or an earlier registration
+   * that stays, names stays where it was held too, so the writes to one
+   * channel keep their order: a channel's removal and its re-registration,
+   * and two registrations or updates of it. In a flush that opens both
+   * planes, what the transport sent before a removal is admitted before it,
+   * its messages for that channel included. A flush that opens only the control
+   * plane, as during a quiesce, admits the control traffic, a removal
+   * included, and holds the data plane's again until that plane opens, as
+   * live traffic is during a quiesce: a message held for a channel a removal
+   * took is then refused as the data plane opens.
+   */
+  private static admissionOrder(pending: HeldItem[]): HeldItem[] {
+    if (!pending.some((item) => item.kept)) return pending;
+    const registrations = new Set<HeldItem>();
+    // The channels named so far by a removal or registration that stays
+    // where it was held.
+    const staying = new Set<string>();
+    for (const item of pending) {
+      if (item.kept) continue;
+      if (item.event !== 'channels-register' && item.event !== 'channels-changed') continue;
+      const removes = McplServerConnection.removedChannelIds(item);
+      const registers = McplServerConnection.registeredChannelIds(item);
+      if (removes.length === 0 && !registers.some((id) => staying.has(id))) {
+        registrations.add(item);
+        continue;
+      }
+      for (const id of [...removes, ...registers]) staying.add(id);
+    }
+    if (registrations.size === 0) return pending;
+    return [...registrations, ...pending.filter((item) => !registrations.has(item))];
+  }
+
+  /** The channels a held `channels-changed` removes. The registry takes any
+   *  entry of `removed` as a channel id, by its string form, so a number
+   *  removes the channel of its digits; an object is left out here, since
+   *  its string form can throw. */
+  private static removedChannelIds(item: HeldItem): string[] {
+    if (item.event !== 'channels-changed') return [];
+    const params = item.args[0] as { removed?: unknown } | null | undefined;
+    return Array.isArray(params?.removed)
+      ? params.removed.filter((id) => typeof id !== 'object' || id === null).map((id) => String(id))
+      : [];
+  }
+
+  /** The channels a held `channels-register` registers, or a held
+   *  `channels-changed` adds or updates. */
+  private static registeredChannelIds(item: HeldItem): string[] {
+    const params = item.args[0] as { channels?: unknown; added?: unknown; updated?: unknown } | null | undefined;
+    const lists = item.event === 'channels-register' ? [params?.channels] : [params?.added, params?.updated];
+    return lists.flatMap((list) => (Array.isArray(list) ? list : []))
+      .map((channel) => (channel as { id?: unknown } | null)?.id)
+      .filter((id): id is string => typeof id === 'string');
   }
 
   /**
@@ -438,28 +793,47 @@ export class McplServerConnection extends EventEmitter {
    * to host requests are never event-buffered, so tools/list and tools/call
    * responses remain live as well. Inference-bearing requests stay queued in
    * their original relative order until {@link ready} is called. Like
-   * {@link ready}, it does nothing once the connection is closed for good.
+   * {@link ready}, once the connection is closed for good it delivers only
+   * its own reports of how it ended.
    */
   readyControlPlane(): void {
-    if (this.closedForGood) return;
+    if (this.closedForGood) {
+      this.deliverOwnReports();
+      return;
+    }
     this.controlPlaneReady = true;
     const pending = this.bufferedEvents;
-    this.bufferedEvents = [];
-    this.heldRequests = 0;
-    for (const item of pending) {
-      // Re-enter the ADMISSION gate (this.emit), never super.emit: control
-      // events include channels-register/changed, which are grant-gated —
-      // the old direct flush bypassed positive-grant enforcement entirely
-      // (PR #79 review blocker 3). Data-plane items re-buffer in order via
-      // the same call, since dataPlaneReady is still false.
-      this.dispatchInboundEvent(item.event, ...item.args);
-    }
+    this.replaceHeld([]);
+    // Re-enter the ADMISSION gate (this.emit), never super.emit: control
+    // events include channels-register/changed, which are grant-gated —
+    // the old direct flush bypassed positive-grant enforcement entirely
+    // (PR #79 review blocker 3). Data-plane items re-buffer in order via
+    // the same call, since dataPlaneReady is still false.
+    this.flushHeld(pending);
+  }
+
+  /**
+   * A connection closed for good still says how it ended. Its own buffered
+   * connect-failed and reconnect-failed, such as the permanent failure of a
+   * launch held as unreaped before the first gate released it, are the
+   * framework's records of it: they need no grant, and its listeners act on
+   * them (a trace, and for a permanent failure an alert and its tools leaving
+   * the list). What the server sent stays held.
+   */
+  private deliverOwnReports(): void {
+    const own = (item: { event: string }) => item.event === 'connect-failed' || item.event === 'reconnect-failed';
+    const reports = this.bufferedEvents.filter(own);
+    if (reports.length === 0) return;
+    // The host's own reports have no responder, so the request counts stand.
+    this.bufferedEvents = this.bufferedEvents.filter((item) => !own(item));
+    for (const { event, args } of reports) super.emit(event, ...args);
   }
 
   /**
    * Close the data plane synchronously while leaving an already-released
-   * control plane live. Used before reconnect adoption and list-change
-   * reconciliation so no new inference event can beat barrier installation.
+   * control plane live. Used before list-change reconciliation so no new
+   * inference event can beat barrier installation. A reconnect closes both
+   * planes instead.
    */
   pauseDataPlane(): void {
     this.dataPlaneReady = false;
@@ -472,12 +846,7 @@ export class McplServerConnection extends EventEmitter {
    */
   override emit(event: string | symbol, ...args: unknown[]): boolean {
     const name = typeof event === 'string' ? event : '';
-    if (
-      McplServerConnection.isLifecycleEvent(name)
-      || (McplServerConnection.isControlPlaneEvent(name)
-        ? this.controlPlaneReady
-        : this.dataPlaneReady)
-    ) {
+    if (this.planeReadyFor(name)) {
       // Positive-grant admission (§5.4/§14.1), at the single choke-point
       // every path shares: live routing AND buffer flushes re-enter here, so
       // an event buffered while the connection was staged is authorized
@@ -536,6 +905,14 @@ export class McplServerConnection extends EventEmitter {
       }
       return super.emit(event, ...args);
     }
+    return this.hold(name, args);
+  }
+
+  /**
+   * Hold an event until its plane opens, `kept` when a transport boundary
+   * keeps it for the next transport's grant (afterBoundary).
+   */
+  private hold(name: string, args: unknown[], kept?: true): true {
     // Held until the plane opens. A long pause (a quiesce, say) on a busy or a
     // runaway server would otherwise grow this array without bound, so
     // requests and notifications each have a bound, counted apart. A request
@@ -544,11 +921,30 @@ export class McplServerConnection extends EventEmitter {
     // the code of the host's other transient refusals, and its server can send
     // it again. A notification has no one to tell, so past
     // MAX_HELD_NOTIFICATIONS (issue #122) the oldest held notification is
-    // dropped to make room. A flush takes the whole buffer and zeroes its
-    // count, so what it holds again was admitted within these bounds and
-    // stays within them.
+    // dropped to make room. A request a closed transport left (`kept`) has
+    // no server waiting on it, so it's counted apart, as keptRequests, and
+    // dropped past its own bound. A flush takes the whole buffer and zeroes
+    // its counts, so what it holds again was admitted within these bounds
+    // and stays within them.
     const responder = args[1] as { respond?: unknown; respondError?: (code: number, message: string) => void } | undefined;
     const isRequest = McplServerConnection.hasResponder({ args });
+    if (isRequest && kept) {
+      // A request a closed transport left (keptRequests): no server waits on
+      // it, so past its own bound it's dropped, with nobody to refuse.
+      if (this.keptRequests >= McplServerConnection.MAX_HELD_REQUESTS) {
+        this.droppedKeptRequests++;
+        if (this.droppedKeptRequests % 100 === 1) {
+          console.error(
+            `[mcpl] ${this.id}: kept-request bound (${McplServerConnection.MAX_HELD_REQUESTS}) — ` +
+            `dropped ${this.droppedKeptRequests} request(s) a closed transport left`,
+          );
+        }
+        return true;
+      }
+      this.bufferedEvents.push({ event: name, args, kept });
+      this.keptRequests++;
+      return true;
+    }
     if (isRequest && this.heldRequests >= McplServerConnection.MAX_HELD_REQUESTS) {
       this.refusedHeldRequests++;
       if (this.refusedHeldRequests % 100 === 1) {
@@ -563,7 +959,7 @@ export class McplServerConnection extends EventEmitter {
       );
       return true;
     }
-    if (!isRequest && this.bufferedEvents.length - this.heldRequests >= McplServerConnection.MAX_HELD_NOTIFICATIONS) {
+    if (!isRequest && this.bufferedEvents.length - this.heldRequests - this.keptRequests >= McplServerConnection.MAX_HELD_NOTIFICATIONS) {
       this.droppedBufferedEvents++;
       if (this.droppedBufferedEvents % 100 === 1) {
         console.error(
@@ -574,7 +970,7 @@ export class McplServerConnection extends EventEmitter {
       const oldest = this.bufferedEvents.findIndex((item) => !McplServerConnection.hasResponder(item));
       if (oldest >= 0) this.bufferedEvents.splice(oldest, 1);
     }
-    this.bufferedEvents.push({ event: name, args });
+    this.bufferedEvents.push(kept ? { event: name, args, kept } : { event: name, args });
     if (isRequest) this.heldRequests++;
     return true;
   }
@@ -583,6 +979,18 @@ export class McplServerConnection extends EventEmitter {
   private static hasResponder(item: { args: unknown[] }): boolean {
     const responder = item.args[1] as { respond?: unknown } | undefined;
     return typeof responder?.respond === 'function';
+  }
+
+  /** Events routed from a server's transport that report the world, which
+   *  the next process doesn't send again when its bridge records them as
+   *  forwarded first: kept at a transport boundary while held. */
+  private static readonly WORLD_EVENTS: ReadonlySet<string> = new Set(['channels-incoming', 'push-event']);
+
+  /** Events routed from a server's transport that speak for its process, not
+   *  the world: dropped at a transport boundary while held. */
+  private static get PROCESS_EVENTS(): ReadonlySet<string> {
+    return new Set(Object.values(McplServerConnection.METHOD_TO_EVENT)
+      .filter((event) => !McplServerConnection.WORLD_EVENTS.has(event)));
   }
 
   /** Event-name form of METHOD_TO_REQUIRED_CAPABILITY, for admission-time
@@ -636,25 +1044,55 @@ export class McplServerConnection extends EventEmitter {
    * capability negotiation, and return a ready-to-use connection.
    *
    * Works over stdio (spawned child) or WebSocket, selected by `config` (see
-   * {@link openTransport}). Throws if the transport can't be opened, the server
-   * closes/errors before the handshake, or the handshake times out.
+   * {@link openTransport}). Throws if the configuration can't be used (before
+   * anything is spawned or dialed), the transport can't be opened, the server
+   * closes/errors before the handshake, or the handshake times out. If the
+   * failed launch's cleanup can't confirm its child exited, it throws
+   * {@link McplUnreapedLaunchError}, whose connection owns that launch.
    */
   static async connect(
     config: McplServerConfig,
     hostCapabilities: McplHostCapabilities,
+    signal?: AbortSignal,
   ): Promise<McplServerConnection> {
-    const { transport, capabilities, droppedCapabilities, mcpToolsAdvertised } = await McplServerConnection.handshake(config, hostCapabilities);
+    McplServerConnection.checkConfig(config);
+    return McplServerConnection.connectChecked(config, hostCapabilities, signal);
+  }
+
+  /** {@link connect}, for a configuration its caller has already checked
+   *  (and warned about) once. `signal` ends the connect at once, its launch
+   *  reaped as for any failed handshake: its caller's stop() or a
+   *  disconnect of its id. */
+  private static async connectChecked(
+    config: McplServerConfig,
+    hostCapabilities: McplHostCapabilities,
+    signal?: AbortSignal,
+  ): Promise<McplServerConnection> {
+    let established: Awaited<ReturnType<typeof McplServerConnection.handshake>>;
+    try {
+      established = await McplServerConnection.handshake(config, hostCapabilities, signal);
+    } catch (error) {
+      if (!(error instanceof HandshakeCleanupError)) throw error;
+      // The launch may still be running. A connection owns it, closed and
+      // halted, so the caller can retry the reap by closing it.
+      const owner = McplServerConnection.createDisconnectedStub(config, hostCapabilities);
+      owner.holdUnreaped(error.transport, error.cleanup);
+      throw new McplUnreapedLaunchError(owner, error.failure, error.cleanup);
+    }
+    const { transport, capabilities, droppedCapabilities, mcpToolsAdvertised, protocolVersion } = established;
 
     const connection = new McplServerConnection(config.id, capabilities, transport);
     connection.droppedCapabilities = droppedCapabilities;
     connection.mcpToolsAdvertised = mcpToolsAdvertised;
+    connection.protocolVersion = protocolVersion;
     connection.allowHostCommands = config.allowHostCommands === true;
     connection.requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 
-    // Store config for reconnection. Only `true` turns reconnect on, as at
+    // Its configuration, which a reconnect reads and every log line of the
+    // server's text redacts with. Only `true` turns reconnect on, as at
     // every other reader of it.
+    connection.config = config;
     if (config.reconnect === true) {
-      connection.config = config;
       connection.hostCapabilities = hostCapabilities;
       connection.reconnectEnabled = true;
       connection.reconnectIntervalMs = config.reconnectIntervalMs ?? 5000;
@@ -665,17 +1103,48 @@ export class McplServerConnection extends EventEmitter {
   }
 
   /**
+   * This engine's configuration check, made before anything is spawned or
+   * dialed: every problem {@link checkServerConfig} finds, the same check the
+   * framework applies, and the modern family, which belongs to
+   * ModernMcpConnection (an http(s) url is never dialed as a WebSocket).
+   * Every configuration that worked before still passes but the one
+   * serverConfigProblems names.
+   */
+  private static checkConfig(config: McplServerConfig): void {
+    const { family } = checkServerConfig(config);
+    if (family === 'modern') {
+      throw new Error(
+        `MCP server "${config.id}" is configured for modern MCP (${MODERN_MCP_PROTOCOL_VERSION}); ` +
+        `McplServerConnection speaks the legacy family (${MCP_PROTOCOL_VERSION} + MCPL) only`,
+      );
+    }
+  }
+
+  /**
    * Open a fresh transport and run the MCP/MCPL initialize handshake over it,
    * returning the connected transport plus the negotiated capabilities. Shared
    * by {@link connect} and {@link attemptReconnect} so both transports handshake
    * identically. On any failure the transport is closed so a spawned child /
-   * open socket never leaks.
+   * open socket never leaks. If that close can't confirm the child exited,
+   * the failure is a {@link HandshakeCleanupError} carrying the transport, so
+   * the caller keeps owning it. `signal` ends a handshake whose connection is
+   * closed meanwhile: it cuts a WebSocket dial short, is checked once the
+   * transport is open, and races the initialize answer.
    */
   private static async handshake(
     config: McplServerConfig,
     hostCapabilities: McplHostCapabilities,
-  ): Promise<{ transport: McplTransport; capabilities: McplCapabilities | null; droppedCapabilities: ReadonlySet<string>; mcpToolsAdvertised: boolean }> {
-    const transport = await openTransport(config);
+    signal?: AbortSignal,
+  ): Promise<{ transport: McplTransport; capabilities: McplCapabilities | null; droppedCapabilities: ReadonlySet<string>; mcpToolsAdvertised: boolean; protocolVersion: string }> {
+    const closedWhileConnecting = () => new Error(`MCPL server "${config.id}" was closed while connecting`);
+    if (signal?.aborted) throw closedWhileConnecting();
+    let transport: McplTransport;
+    try {
+      transport = await openTransport(config, signal);
+    } catch (error) {
+      if (signal?.aborted) throw closedWhileConnecting();
+      throw error;
+    }
     // Once the handshake stops listening for 'error', this logs what the
     // transport reports, until the handshake hands the transport on, or for
     // good if the handshake fails. EventEmitter throws an 'error' that has no
@@ -683,10 +1152,11 @@ export class McplServerConnection extends EventEmitter {
     // WebSocket frame that arrives with the initialize response, or while a
     // failed handshake's close() runs, is such an error.
     const logAfterSettled = (err: Error) => {
-      console.error(`[mcpl] ${config.id}: transport error after the handshake settled: ${err.message}`);
+      console.error(`[mcpl] ${config.id}: transport error after the handshake settled: ${redactServerText(err.message, config)}`);
     };
 
     try {
+      if (signal?.aborted) throw closedWhileConnecting();
       const initId = 0; // use id=0 for the handshake
       const initRequest: JsonRpcRequest = {
         jsonrpc: '2.0',
@@ -699,9 +1169,9 @@ export class McplServerConnection extends EventEmitter {
         },
       };
 
-      // Await the initialize response, racing an early transport close/error and
-      // a timeout. All three paths clean up their listeners.
-      const { mcpl: rawCapabilities, mcpToolsAdvertised } = await new Promise<{ mcpl: McplCapabilities | null; mcpToolsAdvertised: boolean }>((resolve, reject) => {
+      // Await the initialize response, racing an early transport close/error,
+      // a timeout and the owner's close. Every path cleans up its listeners.
+      const { mcpl: rawCapabilities, mcpToolsAdvertised, protocolVersion } = await new Promise<{ mcpl: McplCapabilities | null; mcpToolsAdvertised: boolean; protocolVersion: string }>((resolve, reject) => {
         // When the transport fails, the end of the server's stderr often says
         // why, such as a missing token or a crash at startup. It goes on the
         // error as `stderrTail`, never into the message: an error's message
@@ -715,8 +1185,13 @@ export class McplServerConnection extends EventEmitter {
           transport.off('line', onLine);
           transport.off('close', onClose);
           transport.off('error', onError);
+          signal?.removeEventListener('abort', onAbort);
           transport.on('error', logAfterSettled);
           clearTimeout(timer);
+        };
+        const onAbort = () => {
+          cleanup();
+          reject(closedWhileConnecting());
         };
         const onLine = (line: string) => {
           let msg: JsonRpcResponse;
@@ -748,10 +1223,26 @@ export class McplServerConnection extends EventEmitter {
             // exception, which ends a host that doesn't catch them, and a
             // handshake left to wait forever. It's the server's text in an
             // error's message, so it's bounded as errors.ts says.
-            reject(new Error(`MCPL server "${config.id}" initialize error: ${boundedForLog(describeCause(msg.error.message))}`));
+            reject(msg.error.code === UNSUPPORTED_PROTOCOL_VERSION_CODE
+              ? protocolVersionRejection(config.id, msg.error)
+              : new Error(`MCPL server "${config.id}" initialize error: ${boundedForLog(describeCause(msg.error.message))}`));
             return;
           }
           const result = msg.result as Record<string, unknown> | undefined;
+          // The server's answer is the established revision. This engine
+          // implements exactly one, so any other answer (or none) means the
+          // two sides never agreed on what they're speaking.
+          const returned = typeof result?.protocolVersion === 'string' ? result.protocolVersion : null;
+          if (returned !== MCP_PROTOCOL_VERSION) {
+            reject(new McplProtocolVersionError(
+              `MCPL server "${config.id}" answered initialize with protocolVersion ` +
+                `${returned === null ? '(none)' : JSON.stringify(returned)}; this client's legacy engine speaks only ${MCP_PROTOCOL_VERSION}`,
+              'mismatch',
+              returned,
+              null,
+            ));
+            return;
+          }
           const caps = result?.capabilities as Record<string, unknown> | undefined;
           const experimental = caps?.experimental as Record<string, unknown> | undefined;
           // §5.1: `tools` capability is the OUTER standard MCP member — the
@@ -760,6 +1251,7 @@ export class McplServerConnection extends EventEmitter {
           resolve({
             mcpl: (experimental?.mcpl as McplCapabilities) ?? null,
             mcpToolsAdvertised: caps?.tools !== undefined,
+            protocolVersion: returned,
           });
         };
         const onClose = (info: TransportCloseInfo) => {
@@ -782,6 +1274,7 @@ export class McplServerConnection extends EventEmitter {
           reject(failed(`MCPL server "${config.id}" initialize handshake timed out`));
         }, INITIALIZE_TIMEOUT_MS);
 
+        signal?.addEventListener('abort', onAbort, { once: true });
         transport.on('line', onLine);
         transport.on('close', onClose);
         transport.on('error', onError);
@@ -808,10 +1301,16 @@ export class McplServerConnection extends EventEmitter {
       // listener of its own, in the continuation of this return, before any
       // I/O callback can emit.
       transport.off('error', logAfterSettled);
-      return { transport, capabilities: scoped, droppedCapabilities: new Set(dropped), mcpToolsAdvertised };
+      return { transport, capabilities: scoped, droppedCapabilities: new Set(dropped), mcpToolsAdvertised, protocolVersion };
     } catch (err) {
-      // Never leak the child / socket if the handshake fails.
-      await transport.close().catch(() => { /* best effort */ });
+      // Never leak the child / socket if the handshake fails. A cleanup that
+      // can't confirm the child exited is part of the failure, never
+      // swallowed: the launch may still be running, so the caller keeps it.
+      try {
+        await transport.close();
+      } catch (cleanup) {
+        throw new HandshakeCleanupError(errorOf(err), errorOf(cleanup), transport);
+      }
       throw err;
     }
   }
@@ -820,34 +1319,48 @@ export class McplServerConnection extends EventEmitter {
    * Connect with reconnect support.
    * When `config.reconnect` is true and the initial connection fails,
    * resolves immediately with null capabilities and retries in the background.
+   * A configuration this engine can't use, or a protocol-version verdict,
+   * still throws: retrying can't change either. So does a failed launch that
+   * can't be reaped, as in {@link connect}: no retry starts beside a child
+   * that may still be running, and the {@link McplUnreapedLaunchError}
+   * carries the connection that owns it, whose close() retries the reap.
    * Adapted from Anarchid/agent-framework@mcpl-module-proto.
    */
   static async connectWithReconnect(
     config: McplServerConfig,
     hostCapabilities: McplHostCapabilities,
+    signal?: AbortSignal,
   ): Promise<McplServerConnection> {
+    // Outside the retry path below: a configuration error is never retried.
+    McplServerConnection.checkConfig(config);
     try {
-      return await McplServerConnection.connect(config, hostCapabilities);
+      return await McplServerConnection.connectChecked(config, hostCapabilities, signal);
     } catch (error) {
-      if (config.reconnect !== true) {
+      // No common protocol revision is a configuration fact, not an outage:
+      // a retry stub would restart the server forever for nothing. A connect
+      // its caller ended (stop(), or a disconnect of its id) isn't retried
+      // either, nor is a launch that couldn't be reaped.
+      if (config.reconnect !== true || error instanceof McplProtocolVersionError || error instanceof McplUnreapedLaunchError || signal?.aborted) {
         throw error;
       }
 
-      // Non-blocking start: create a disconnected stub that will reconnect in background
-      console.error(`MCPL server "${config.id}" initial connect failed, will retry: ${(error as Error).message}${withStderr(error)}`);
-      const stub = McplServerConnection.createDisconnectedStub(config, hostCapabilities);
       // Surface the initial failure. The event is buffered by the emit()
       // override until the host wires listeners and calls ready(), so it is
       // not lost in the window before wireMcplEvents runs.
+      // Non-blocking start: create a disconnected stub that will reconnect in background
+      console.error(`MCPL server "${config.id}" initial connect failed, will retry: ${redactServerText((error as Error).message, config)}${withStderr(error, (text) => redactServerText(text, config))}`);
+      const stub = McplServerConnection.createDisconnectedStub(config, hostCapabilities);
       const stderrTail = stderrTailOf(error);
       stub.emit('connect-failed', { error: (error as Error).message, ...(stderrTail ? { stderrTail } : {}), attempt: 0 });
+      stub.scheduleReconnect();
       return stub;
     }
   }
 
   /**
-   * Create a disconnected stub connection that will reconnect in the background.
-   * Used when initial connect fails and reconnect is enabled.
+   * Create a disconnected stub connection, for a failed initial connect: one
+   * that will reconnect in the background (its caller schedules that), or one
+   * that owns a launch that couldn't be reaped.
    * @internal
    */
   private static createDisconnectedStub(
@@ -860,15 +1373,31 @@ export class McplServerConnection extends EventEmitter {
     stub.requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     stub.config = config;
     stub.hostCapabilities = hostCapabilities;
-    stub.reconnectEnabled = true;
+    stub.reconnectEnabled = config.reconnect === true;
     stub.reconnectIntervalMs = config.reconnectIntervalMs ?? 5000;
     stub.reconnectMaxIntervalMs = config.reconnectMaxIntervalMs ?? 300_000;
     stub.reconnectAttempts = 1; // the initial connect already failed
-
-    // Schedule background reconnect
-    stub.scheduleReconnect();
-
     return stub;
+  }
+
+  /**
+   * Keep a launch whose cleanup couldn't confirm its child exited, and halt
+   * reconnecting: another launch could run beside one that's still alive.
+   * close() retries the reap.
+   */
+  private holdUnreaped(transport: McplTransport, failure: Error): void {
+    this.reconnectEnabled = false;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (!this.unreaped.some((held) => held.transport === transport)) this.unreaped.push({ transport, failure });
+  }
+
+  /** The halt, as a reconnect event's failure text. */
+  private unreapedFailure(): string {
+    const held = this.unreaped[0];
+    return `the previous launch could not be reaped (${held?.failure.message ?? 'unknown'}); reconnecting is halted`;
   }
 
   // ==========================================================================
@@ -912,8 +1441,11 @@ export class McplServerConnection extends EventEmitter {
     ) as Promise<FeatureSetsUpdateResult>;
   }
 
-  /** Send `inference/chunk` notification. */
-  sendInferenceChunk(params: InferenceChunkParams): void {
+  /** Send `inference/chunk` notification, on the transport `epoch` names: a
+   *  chunk of a request from a transport that has closed goes nowhere, as
+   *  that request's answer does. */
+  sendInferenceChunk(params: InferenceChunkParams, epoch = this.transportEpoch): void {
+    if (epoch !== this.transportEpoch) return;
     this.sendNotification(McplMethod.InferenceChunk, params as unknown as Record<string, unknown>);
   }
 
@@ -1022,9 +1554,46 @@ export class McplServerConnection extends EventEmitter {
   // Standard MCP methods
   // ==========================================================================
 
-  /** Send `tools/list` and return the server's tool definitions. */
-  sendToolsList(): Promise<{ tools: McpToolDefinition[] }> {
-    return this.sendRequest('tools/list', {}) as Promise<{ tools: McpToolDefinition[] }>;
+  /**
+   * Send `tools/list` and return the server's complete tool inventory,
+   * following `nextCursor` across pages (2024-11-05 pagination). Cursors are
+   * opaque strings, `''` included: only an absent or null `nextCursor` ends
+   * the inventory (a null one is how some servers say "no more", and main
+   * read it as a complete page). A page that isn't well formed (no `tools` array, a cursor
+   * that isn't a string), or cursors that don't terminate (a repeat, or more
+   * than {@link MAX_TOOL_LIST_PAGES} pages), are errors, never a partial or
+   * empty inventory published as complete.
+   */
+  async sendToolsList(): Promise<{ tools: McpToolDefinition[] }> {
+    const tools: McpToolDefinition[] = [];
+    const seen = new Set<string>();
+    let cursor: string | undefined;
+    let first: Record<string, unknown> | undefined;
+    for (let page = 0; page < MAX_TOOL_LIST_PAGES; page++) {
+      const result = await this.sendRequest('tools/list', cursor === undefined ? {} : { cursor }) as Record<string, unknown> | null;
+      const malformed = (why: string) =>
+        new Error(`MCPL server "${this.id}" sent a malformed tools/list page ${page + 1}: ${why}`);
+      if (!result || typeof result !== 'object' || !Array.isArray(result.tools)) {
+        throw malformed('no tools array');
+      }
+      first ??= result;
+      tools.push(...(result.tools as McpToolDefinition[]));
+      if (result.nextCursor === undefined || result.nextCursor === null) {
+        // The first page's other fields are kept as they came, so a
+        // single-page answer is returned exactly as before.
+        const { nextCursor: _done, ...rest } = first as { nextCursor?: unknown };
+        return { ...rest, tools };
+      }
+      if (typeof result.nextCursor !== 'string') {
+        throw malformed(`nextCursor must be a string, got ${JSON.stringify(result.nextCursor)}`);
+      }
+      if (seen.has(result.nextCursor)) {
+        throw new Error(`MCPL server "${this.id}" repeated tools/list cursor ${JSON.stringify(result.nextCursor)}`);
+      }
+      seen.add(result.nextCursor);
+      cursor = result.nextCursor;
+    }
+    throw new Error(`MCPL server "${this.id}" tools/list did not finish within ${MAX_TOOL_LIST_PAGES} pages`);
   }
 
   /** Send `tools/call` and return the result. Optionally includes state/checkpoint for stateful tools. */
@@ -1063,42 +1632,66 @@ export class McplServerConnection extends EventEmitter {
   // Lifecycle
   // ==========================================================================
 
-  /** Close the connection: disable reconnect, kill the child process, and clean up resources. */
-  async close(): Promise<void> {
+  /** The requests still waiting for an answer, for the operator's log line
+   *  when the connection goes: their methods and ids. */
+  private unansweredRequests(): string {
+    const list = [...this.pendingRequests].map(([id, pending]) => `${pending.method} (id=${id})`).join(', ');
+    return `${this.pendingRequests.size} request(s) unanswered: ${list}`;
+  }
+
+  /**
+   * Close the connection for good: disable reconnect, kill the child
+   * process, and clean up resources. At once, as before, reconnecting stops
+   * and pending requests fail; a reconnect handshake in flight is aborted.
+   *
+   * Calls share one attempt: while it is pending, and once it has
+   * succeeded, close() returns it. The attempt waits for the aborted
+   * reconnect's own cleanup, closes the transport (its close is the reaping
+   * verdict) and retries each launch an earlier cleanup couldn't reap. It
+   * rejects while any child can't be confirmed exited, with that failure
+   * itself, or an AggregateError when there are several. A failed attempt is
+   * cleared, so the next close() retries what it couldn't reap. 'close' is
+   * emitted once, when the teardown of a connection the host closed while
+   * live completes.
+   */
+  close(): Promise<void> {
     // Disable reconnect before closing — explicit close means stop retrying
     this.reconnectEnabled = false;
+    this.closedByThisHost = true;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
-
+    this.reconnecting?.abort.abort();
     if (this.closePromise) return this.closePromise;
-    if (this.closed && !this.closeIncomplete && !this.reconnectPromise) return;
-    this.closed = true;
-    this.closeIncomplete = true;
-    this.resetPolicyForTransportBoundary();
 
-    // Reject all pending requests
-    for (const [id, pending] of this.pendingRequests) {
-      if (pending.timer) clearTimeout(pending.timer);
-      pending.reject(new McplRequestError(`Connection to MCPL server "${this.id}" closed while awaiting response for ${pending.method} (id=${id})`, 'no-response'));
+    if (!this.closed) {
+      this.closed = true;
+      this.closeIncomplete = true;
+      this.resetPolicyForTransportBoundary();
+
+      // Reject all pending requests. Each message is the whole of what an
+      // agent reads for a tools/call, and what follows a channel tool's own
+      // words ("Failed to publish to channel: …") for the requests a channel
+      // tool makes, so it names no method; the log line does. It doesn't say
+      // whether this host reconnects: a restart closes the connection and then
+      // connects again.
+      if (this.pendingRequests.size > 0) {
+        console.error(`MCPL server "${this.id}": this host closed its connection with ${this.unansweredRequests()}`);
+      }
+      for (const pending of this.pendingRequests.values()) {
+        if (pending.timer) clearTimeout(pending.timer);
+        pending.reject(new McplRequestError(
+          `The "${this.id}" server didn't answer before this host closed its connection, so whether the request took effect is unknown. ` +
+          'Check its effect before trying again.',
+          'no-response',
+        ));
+      }
+      this.pendingRequests.clear();
+      this.orphanedRequests.clear();
     }
-    this.pendingRequests.clear();
-    this.orphanedRequests.clear();
 
-    // Tear down the transport (kills the child / closes the socket). The
-    // transport's own 'close' event is short-circuited by `this.closed` in
-    // setupLifecycle, so this is the single source of the connection 'close'.
-    const attempt = Promise.resolve().then(async () => {
-      // An already opened handshake owns a transport too. It hands that
-      // transport back without admission once reconnect has been disabled.
-      // Only the registry's closeAll bounds its caller's wait for this; retry
-      // reuses this real close attempt.
-      if (this.reconnectPromise) await this.reconnectPromise;
-      if (this.transport) await this.transport.close();
-      this.closeIncomplete = false;
-      this.emit('close', null, null, this.closeInfoByHost());
-    });
+    const attempt = this.closeStep(this.transport, this.unreaped.map((held) => held.transport));
     this.closePromise = attempt;
     void attempt.catch(() => {
       if (this.closePromise === attempt) this.closePromise = null;
@@ -1106,14 +1699,57 @@ export class McplServerConnection extends EventEmitter {
     return attempt;
   }
 
+  /** One close attempt. `heldBefore` are the launches earlier cleanups
+   *  couldn't reap, which it retries. */
+  private async closeStep(transport: McplTransport | null, heldBefore: McplTransport[]): Promise<void> {
+    // An aborted reconnect cleans up its own launch, holding it if it can't.
+    // That cleanup was this attempt's try at it, so its failure is this
+    // attempt's, not retried here.
+    await this.reconnecting?.done;
+    const heldMeanwhile = this.unreaped.filter((held) => !heldBefore.includes(held.transport));
+    const failures: Error[] = heldMeanwhile.map((held) => held.failure);
+    const targets: McplTransport[] = [];
+    for (const target of [transport, ...heldBefore]) {
+      if (target && !targets.includes(target) && !heldMeanwhile.some((held) => held.transport === target)) targets.push(target);
+    }
+    for (const target of targets) {
+      try {
+        // Kills the child / closes the socket.
+        await target.close();
+        this.unreaped = this.unreaped.filter((held) => held.transport !== target);
+      } catch (error) {
+        const failure = errorOf(error);
+        failures.push(failure);
+        if (!this.unreaped.some((held) => held.transport === target)) this.unreaped.push({ transport: target, failure });
+      }
+    }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) {
+      throw new AggregateError(failures, `MCPL server "${this.id}" did not close cleanly: ${failures.map((f) => f.message).join('; ')}`);
+    }
+    // The transport's own 'close' event is short-circuited by `this.closed`
+    // in setupLifecycle, so this is the single source of the connection
+    // 'close' when the host tears down a live transport.
+    if (this.closeIncomplete) {
+      this.closeIncomplete = false;
+      this.emit('close', null, null, this.closeInfoByHost());
+    }
+  }
+
   /**
    * Tear down a live transport after an awareness-accounting failure without
    * disabling configured auto-reconnect. The normal transport close handler
    * rejects requests, emits lifecycle state, and schedules the next bounded
-   * reconnect attempt. With reconnect disabled this leaves the server closed.
+   * reconnect attempt. With reconnect disabled the recycle ends the
+   * connection for good, as close() does: 'close' comes once the child's
+   * exit is confirmed, and a child it can't reap stays owned, holding the id.
    */
   async reconnectAfterFailure(): Promise<void> {
     this.pauseDataPlane();
+    if (!this.reconnectEnabled) {
+      await this.close();
+      return;
+    }
     if (this.closed) {
       this.scheduleReconnect();
       return;
@@ -1167,73 +1803,118 @@ export class McplServerConnection extends EventEmitter {
    * Attempt to reconnect by opening a fresh transport and performing the
    * handshake, then adopting that transport in place. Unlike the previous
    * approach this builds no throwaway connection instance, so there are no
-   * leaked listeners on a dead object.
+   * leaked listeners on a dead object. The attempt is close()'s to abort,
+   * and it settles only once its own launch is adopted, failed or cleaned up.
+   * One attempt at a time: a request that arrives while one is in flight (a
+   * recycle, say) starts nothing, since that attempt either adopts its
+   * launch or schedules the next retry itself. A second attempt would take
+   * close()'s ownership of the first (Iris-1827, room-293 #55410).
    */
-  private attemptReconnect(): Promise<void> {
-    if (this.reconnectPromise) return this.reconnectPromise;
-    const attempt = this.reconnectOnce();
-    this.reconnectPromise = attempt;
-    const clear = () => { if (this.reconnectPromise === attempt) this.reconnectPromise = null; };
-    void attempt.then(clear, clear);
-    return attempt;
+  private async attemptReconnect(): Promise<void> {
+    // A queued recovery timer may outlive an earlier successful handshake:
+    // only a connection that is down reconnects, so it never replaces a live
+    // transport.
+    if (this.reconnecting || !this.closed || !this.reconnectEnabled || !this.config || !this.hostCapabilities) return;
+    const abort = new AbortController();
+    const done = this.reconnectOnce(this.config, this.hostCapabilities, abort.signal);
+    this.reconnecting = { abort, done };
+    await done;
+    if (this.reconnecting?.done === done) this.reconnecting = null;
   }
 
-  private async reconnectOnce(): Promise<void> {
-    // A queued recovery timer may outlive an earlier successful handshake.
-    // Recheck disconnection before opening or replacing any owned transport.
-    if (!this.closed || !this.reconnectEnabled || !this.config || !this.hostCapabilities) return;
-
+  /** One reconnect attempt. It never rejects: each outcome is an event, a
+   *  scheduled retry, or a launch held as unreaped. */
+  private async reconnectOnce(
+    config: McplServerConfig,
+    hostCapabilities: McplHostCapabilities,
+    signal: AbortSignal,
+  ): Promise<void> {
     // Ordinal of this attempt: 0 was the initial connect, so the Nth retry
     // reports attempt N (reconnectAttempts counts failures so far).
     const attempt = Math.max(1, this.reconnectAttempts);
 
-    try {
-      const { transport, capabilities, droppedCapabilities, mcpToolsAdvertised } = await McplServerConnection.handshake(
-        this.config,
-        this.hostCapabilities,
-      );
-
-      if (!this.reconnectEnabled) {
-        // The prior transport was disconnected before this retry began. Keep
-        // the fresh, unadmitted transport owned by close(), including on a
-        // failed transport cleanup, instead of reviving a stopped connection.
-        // It isn't wired, and the handshake has removed its own listeners, so
-        // an error it reports from here on, such as a malformed frame from a
-        // WebSocket server while close() closes it, is logged here rather than
-        // thrown where nothing catches it.
-        transport.on('error', (err: Error) => {
-          console.error(`[mcpl] ${this.id}: a transport kept for close() reported an error: ${err.message}`);
-        });
-        this.transport = transport;
+    // The previous launch must be gone before another starts. A transport
+    // the host closed itself (reconnectAfterFailure) may still be reaping its
+    // child; one whose child already exited resolves at once.
+    const previous = this.transport;
+    if (previous) {
+      try {
+        await previous.close();
+      } catch (error) {
+        this.holdUnreaped(previous, errorOf(error));
+        if (!signal.aborted) this.emit('reconnect-failed', { error: this.unreapedFailure(), attempt, permanent: true });
         return;
       }
-
-      // Close the data plane before the new transport can emit. The reconnect
-      // lifecycle event bypasses buffering; its framework listener installs the
-      // awareness barrier synchronously, then releases control traffic needed
-      // to establish the server while data remains held.
-      this.pauseDataPlane();
-      this.resetPolicyForTransportBoundary();
-      this.transport = transport;
-      this.capabilities = capabilities;
-      this.droppedCapabilities = droppedCapabilities;
-      this.mcpToolsAdvertised = mcpToolsAdvertised;
-      this.allowHostCommands = this.config?.allowHostCommands === true;
-      this.closed = false;
-      this.nextRequestId = 1;
-      this.pendingRequests.clear();
-      this.wireTransport(transport);
-
-      console.error(`MCPL server "${this.id}" reconnected successfully`);
-      this.reconnectAttempts = 0;
-      this.emit('reconnect', { attempts: attempt });
-    } catch (error) {
-      console.error(`MCPL server "${this.id}" reconnect failed: ${(error as Error).message}${withStderr(error)}`);
-      this.reconnectAttempts = attempt + 1;
-      const stderrTail = stderrTailOf(error);
-      this.emit('reconnect-failed', { error: (error as Error).message, ...(stderrTail ? { stderrTail } : {}), attempt });
-      this.scheduleReconnect();
     }
+    if (signal.aborted) return;
+
+    let established: Awaited<ReturnType<typeof McplServerConnection.handshake>>;
+    try {
+      established = await McplServerConnection.handshake(config, hostCapabilities, signal);
+    } catch (error) {
+      const unreaped = error instanceof HandshakeCleanupError;
+      if (unreaped) this.holdUnreaped(error.transport, error.cleanup);
+      // Closed by the host meanwhile: not a failed attempt.
+      if (signal.aborted) return;
+      const failure = unreaped ? error.failure : errorOf(error);
+      const redact = (text: string) => redactServerText(text, this.config ?? {});
+      console.error(`MCPL server "${this.id}" reconnect failed: ${redact(failure.message)}${withStderr(failure, redact)}`);
+      this.reconnectAttempts = attempt + 1;
+      // No common protocol revision: every further attempt would restart the
+      // server to hear the same answer. Stop retrying; the configuration is
+      // what has to change. A launch that couldn't be reaped halts retrying
+      // for good: close() can confirm its exit, but close() is terminal, so
+      // nothing resumes this connection. Every other failure keeps the
+      // backoff loop.
+      if (error instanceof McplProtocolVersionError) this.reconnectEnabled = false;
+      const permanent = unreaped || error instanceof McplProtocolVersionError;
+      const message = unreaped ? `${failure.message}; ${this.unreapedFailure()}` : failure.message;
+      const stderrTail = stderrTailOf(failure);
+      this.emit('reconnect-failed', { error: message, ...(stderrTail ? { stderrTail } : {}), attempt, ...(permanent ? { permanent: true } : {}) });
+      if (!permanent) this.scheduleReconnect();
+      return;
+    }
+    const { transport, capabilities, droppedCapabilities, mcpToolsAdvertised, protocolVersion } = established;
+
+    if (signal.aborted) {
+      // Closed by the host while the handshake finished: this launch never
+      // serves. close() is waiting on this attempt, so it hears the verdict.
+      // The transport isn't wired, and the handshake has taken its own
+      // listeners off, so an error it reports while it closes, such as a
+      // malformed frame from a WebSocket server, is logged here rather than
+      // thrown where nothing catches it.
+      transport.on('error', (err: Error) => {
+        console.error(`[mcpl] ${this.id}: a transport closed before it served reported an error: ${redactServerText(err.message, config)}`);
+      });
+      await transport.close().catch((error: unknown) => this.holdUnreaped(transport, errorOf(error)));
+      return;
+    }
+
+    // Close both planes before the new transport can emit, as at initial
+    // connect: its traffic is admitted against the grant, which this
+    // boundary resets, so control traffic too (a server's channels/register
+    // right after initialize) must wait for the new grant rather than be
+    // refused against the empty one. The reconnect lifecycle event bypasses
+    // buffering; its framework listener installs the awareness barrier,
+    // re-establishes the grant (§5.3 policy responses are never buffered),
+    // and then opens the planes.
+    this.controlPlaneReady = false;
+    this.dataPlaneReady = false;
+    this.resetPolicyForTransportBoundary();
+    this.transport = transport;
+    this.capabilities = capabilities;
+    this.droppedCapabilities = droppedCapabilities;
+    this.mcpToolsAdvertised = mcpToolsAdvertised;
+    this.protocolVersion = protocolVersion;
+    this.allowHostCommands = this.config?.allowHostCommands === true;
+    this.closed = false;
+    this.nextRequestId = 1;
+    this.pendingRequests.clear();
+    this.wireTransport(transport);
+
+    console.error(`MCPL server "${this.id}" reconnected successfully`);
+    this.reconnectAttempts = 0;
+    this.emit('reconnect', { attempts: attempt });
   }
 
   // ==========================================================================
@@ -1257,7 +1938,34 @@ export class McplServerConnection extends EventEmitter {
     options: RequestOptions = {},
   ): Promise<unknown> {
     if (this.closed) {
-      return Promise.reject(new McplRequestError(`Cannot send request: connection to "${this.id}" is closed`, 'not-sent'));
+      // After this host's own close, which a restart makes before connecting
+      // again and a removal makes for good, only that this host closed it
+      // holds, and one next step holds for both: calling again reaches the
+      // restarted server, or fails where it's gone.
+      return Promise.reject(new McplRequestError(this.closedByThisHost
+        ? `The request wasn't sent: this host closed its connection to the "${this.id}" server, so nothing ran. ` +
+          'If calling it again fails, ask whoever runs this host.'
+        : `The request wasn't sent: the connection to the "${this.id}" server is closed, so nothing ran. ` +
+          (this.willReconnect
+            ? 'This host is reconnecting to it; try again later.'
+            : "This host won't reconnect to it on its own. If you need it, ask whoever runs this host."),
+        'not-sent',
+      ));
+    }
+    // Once the child's stdin or stdout has failed, the transport is ending
+    // it and writes nothing more to it, so a request is refused here as not
+    // sent rather than left to wait out its timeout. The method and the
+    // pipe's error are the operator's, so they go to the log.
+    const pipeFailure = this.transport?.pipeFailure;
+    if (pipeFailure) {
+      console.error(`MCPL server "${this.id}": ${method} not sent, since its stdio pipe failed: ${logDetail(pipeFailure.message)}`);
+      return Promise.reject(new McplRequestError(
+        `The request wasn't sent: this host can no longer write to the "${this.id}" server, so nothing ran. ` +
+          (this.willReconnect
+            ? 'This host is reconnecting to it; try again later.'
+            : "This host won't reconnect to it on its own. If you need it, ask whoever runs this host."),
+        'not-sent',
+      ));
     }
 
     const id = this.nextRequestId++;
@@ -1290,13 +1998,17 @@ export class McplServerConnection extends EventEmitter {
             });
             if (this.orphanedRequests.size > 4096) this.orphanedRequests.delete(this.orphanedRequests.keys().next().value!);
           }
+          // The method and id are the operator's, so they go to the log.
+          console.error(
+            `MCPL server "${this.id}" did not respond to ${method} (id=${id}) within ${timeoutMs}ms; ` +
+            'the request was abandoned here, not cancelled',
+          );
+          const seconds = timeoutMs / 1000;
           reject(new McplRequestError(
-            `MCPL server "${this.id}" did not respond to ${method} (id=${id}) ` +
-            `within ${timeoutMs}ms — the server may be hung. The response ` +
-            `outcome is unknown: the request was abandoned locally but was not ` +
-            `cancelled, so the tool may still have completed server-side; verify ` +
-            `state before retrying; a blind retry of a stateful/side-effecting ` +
-            `tool may duplicate it.`,
+            `The "${this.id}" server didn't answer within ${seconds} second${seconds === 1 ? '' : 's'}, ` +
+            'so whether the request took effect is unknown: ' +
+            'it was abandoned here, not cancelled, and may still complete on the server. ' +
+            'Check its effect before trying again, since repeating something that changes state may do it twice.',
             'no-response',
           ));
         }, timeoutMs);
@@ -1308,11 +2020,15 @@ export class McplServerConnection extends EventEmitter {
         this.transport!.writeLine(JSON.stringify(request));
       } catch (err) {
         // A synchronous write rejection sent no request. Remove its pending
-        // state and watchdog before reporting that it is safe to retry.
+        // state and watchdog before reporting that it is safe to retry. The
+        // method, id and the transport's words are the operator's.
         this.pendingRequests.delete(id);
         if (pending.timer) clearTimeout(pending.timer);
+        console.error(
+          `MCPL server "${this.id}": writing ${method} (id=${id}) failed: ${logDetail(err instanceof Error ? err.message : err)}`,
+        );
         reject(new McplRequestError(
-          `Cannot send ${method} to MCPL server "${this.id}": ${err instanceof Error ? err.message : String(err)}`,
+          `The request wasn't sent: this host couldn't write it to the "${this.id}" server, so nothing ran. Try again later.`,
           'not-sent',
         ));
       }
@@ -1414,6 +2130,9 @@ export class McplServerConnection extends EventEmitter {
    * Wire up the transport's line stream to route incoming JSON-RPC messages.
    */
   private setupMessageRouting(transport: McplTransport): void {
+    // The boundary this transport serves within: a line read once it has
+    // passed is the dead process's (afterBoundary).
+    const epoch = this.transportEpoch;
     transport.on('line', (line: string) => {
       let msg: JsonRpcRequest | JsonRpcResponse;
       try {
@@ -1427,7 +2146,7 @@ export class McplServerConnection extends EventEmitter {
       // before property access, just as malformed JSON lines are ignored.
       if (msg === null || typeof msg !== 'object' || Array.isArray(msg)) return;
       try {
-        this.dispatchMessage(msg);
+        this.dispatchMessage(msg, epoch);
       } catch (error) {
         const request = msg as { method?: unknown; id?: unknown };
         this.reportInboundFailure(error, {
@@ -1439,15 +2158,22 @@ export class McplServerConnection extends EventEmitter {
   }
 
   /** Contain synchronous dispatch failures; async RPC handlers own their promises. */
-  private dispatchMessage(msg: JsonRpcRequest | JsonRpcResponse): void {
+  private dispatchMessage(msg: JsonRpcRequest | JsonRpcResponse, epoch: number): void {
     // Is this a response to one of our outbound requests?
     if ('id' in msg && msg.id != null && !('method' in msg)) {
-      this.handleResponse(msg as JsonRpcResponse);
+      this.handleResponse(msg as JsonRpcResponse, epoch !== this.transportEpoch);
       return;
     }
 
     // It is an inbound request or notification from the server
     const request = msg as JsonRpcRequest;
+
+    // Read after its transport's boundary, it is the dead process's: the
+    // boundary's rule applies (afterBoundary).
+    if (epoch !== this.transportEpoch) {
+      this.afterBoundary(request, epoch);
+      return;
+    }
 
     // MCP's ping, which either side may send: its receiver answers promptly
     // with an empty result. It's answered as it arrives, before admission and
@@ -1506,16 +2232,53 @@ export class McplServerConnection extends EventEmitter {
     // Emit the typed event with params and (for requests) a respond callback
     if (request.id != null) {
       // Server expects a response — provide a respond helper
-      this.dispatchInboundEvent(eventName, request.params, {
-        id: request.id,
-        respond: (result: unknown) => this.sendResponse(request.id!, result),
-        respondError: (code: number, message: string, data?: unknown) =>
-          this.sendErrorResponse(request.id!, code, message, data),
-      });
+      this.dispatchInboundEvent(eventName, request.params, this.responderFor(request.id, epoch));
     } else {
       // Notification — no response expected
       this.dispatchInboundEvent(eventName, request.params);
     }
+  }
+
+  /**
+   * A request's responder, bound to the transport it came on (`epoch`): an
+   * answer, or a streamed inference's chunk, sent after that transport has
+   * closed reaches nothing, never a server that didn't ask it.
+   */
+  private responderFor(id: string | number, epoch: number) {
+    return {
+      id,
+      respond: (result: unknown) => this.sendResponse(id, result, epoch),
+      respondError: (code: number, message: string, data?: unknown) =>
+        this.sendErrorResponse(id, code, message, data, epoch),
+      sendChunk: (params: InferenceChunkParams) => this.sendInferenceChunk(params, epoch),
+    };
+  }
+
+  /**
+   * A request or notification read from a transport after its boundary has
+   * passed: the boundary's rule (resetPolicyForTransportBoundary). An
+   * incoming message or push is held as kept, for the next transport's
+   * grant, and any other is dropped and logged. (A response read then goes to
+   * handleResponse, flagged late.) A stdio
+   * server's transport closes on the child's 'exit', when its stdout may
+   * still be open, as it is while a process the server started holds it, and
+   * it is read until the next reconnect attempt closes its reader. No
+   * transport serves meanwhile, so what is held waits for the next grant
+   * (flushHeld). A connection closed for good, which won't reconnect, reads
+   * it while its writer lives, with no grant to come, so it drops and logs
+   * all of it; hold's bounds cap what any other keeps.
+   */
+  private afterBoundary(request: JsonRpcRequest, epoch: number): void {
+    const event = typeof request.method === 'string' && Object.hasOwn(McplServerConnection.METHOD_TO_EVENT, request.method)
+      ? McplServerConnection.METHOD_TO_EVENT[request.method] : undefined;
+    if (this.closedForGood || event === undefined || !McplServerConnection.WORLD_EVENTS.has(event)) {
+      console.error(
+        `[mcpl] ${this.id}: dropped a message read after its transport closed` +
+        `${this.closedForGood ? ', with no transport to come' : ''}: ${describeMethod(request.method)}`,
+      );
+      return;
+    }
+    this.hold(event, request.id != null ? [request.params, this.responderFor(request.id, epoch)] : [request.params], true);
   }
 
   /** Live delivery and delayed plane flushes share the same containment boundary. */
@@ -1570,8 +2333,12 @@ export class McplServerConnection extends EventEmitter {
   /**
    * Handle a JSON-RPC response by resolving/rejecting the corresponding pending request.
    */
-  private handleResponse(response: JsonRpcResponse): void {
-    const pending = this.pendingRequests.get(response.id);
+  private handleResponse(response: JsonRpcResponse, late = false): void {
+    // One read after its transport's boundary answers a request the close
+    // ended. It's matched against none of this connection's request records,
+    // since the next transport numbers its requests afresh, and goes the way
+    // of any late answer: a stateful one is surfaced as an orphaned response.
+    const pending = late ? undefined : this.pendingRequests.get(response.id);
     if (!pending) {
       // Orphaned response — the request already timed out (or was settled) and
       // was removed from pendingRequests. A late STATEFUL result must be
@@ -1579,8 +2346,8 @@ export class McplServerConnection extends EventEmitter {
       // Selected side-effecting calls are also surfaced even without state so
       // their outcome-unknown receipt remains visible. We cannot safely
       // re-inject either result because the original dispatch context is gone.
-      const orphaned = this.orphanedRequests.get(response.id);
-      this.orphanedRequests.delete(response.id);
+      const orphaned = late ? undefined : this.orphanedRequests.get(response.id);
+      if (!late) this.orphanedRequests.delete(response.id);
       // A push/render answered after its timeout (RFC-006 §5.3) is reported
       // with the render's featureSet, key, eventId and, for a channel-scoped
       // subject, channelId, kept from its request when the timeout fired, so
@@ -1622,19 +2389,32 @@ export class McplServerConnection extends EventEmitter {
     if (pending.timer) clearTimeout(pending.timer);
 
     if (response.error) {
-      // describeCause rather than the template's own conversion, as for an
-      // initialize error: the server's code and message can be any JSON
-      // value, and one with no primitive form, such as {"toString":1}, would
-      // throw here, after the request has left pendingRequests and its timer
-      // is cleared, so it would never settle. Both are the server's text, a
-      // code as much as a message, since a server can send a string, so both
-      // are bounded as errors.ts says.
-      pending.reject(
-        new McplRequestError(
-          `MCPL server "${this.id}" returned error for ${pending.method}: [${boundedForLog(describeCause(response.error.code))}] ${boundedForLog(describeCause(response.error.message))}`,
-          'error-response',
-          (response.error as { data?: unknown }).data,
-        ),
+      // The server's own words, after a word on whose they are, bounded as
+      // errors.ts says, since they're the server's text. Only a string is
+      // words: a message of any other JSON value reads as none. The method,
+      // id and JSON-RPC code are the operator's, so they go to the log, which
+      // prints any value a server can send without throwing (logValue). The
+      // caller's text keeps the server's words unredacted, as a JSON-RPC
+      // answer passes (redactServerText's scope); the log is a record of the
+      // server's text, so the message is redacted there, whatever JSON value
+      // it is, as every other line this connection writes is.
+      const said = typeof response.error.message === 'string' ? boundedForLog(response.error.message.trim()) : '';
+      // The call is settled before its log line: its entry is gone and its
+      // timer cleared, so nothing else would settle it, and a host's logger
+      // can throw. The dispatch's containment reports such a throw. (A
+      // configuration that can't be read withholds the message rather than
+      // throw: redactServerText.)
+      pending.reject(new McplRequestError(
+        said
+          ? `The "${this.id}" server answered with an error: ${said}`
+          : `The "${this.id}" server answered with an error without saying what went wrong, so whether the request took effect is unknown. ` +
+            'Check its effect before trying again.',
+        'error-response',
+        (response.error as { data?: unknown }).data,
+      ));
+      console.error(
+        `MCPL server "${this.id}" answered ${pending.method} (id=${response.id}) with error ${logValue(response.error.code)}: ` +
+        logValueRedacted(response.error.message, (text) => redactServerText(text, this.config ?? {})),
       );
     } else {
       pending.resolve(response.result);
@@ -1644,17 +2424,38 @@ export class McplServerConnection extends EventEmitter {
   /**
    * Send a successful JSON-RPC response back to the server.
    */
-  private sendResponse(id: string | number, result: unknown): void {
-    if (this.closed) return;
+  private sendResponse(id: string | number, result: unknown, epoch = this.transportEpoch): void {
+    // A closed connection's epoch is past every request's, so a refusal
+    // while it is closed is logged too.
+    if (!this.sameTransport(id, epoch) || this.closed) return;
     const response: JsonRpcResponse = { jsonrpc: '2.0', id, result };
     this.transport?.writeLine(JSON.stringify(response));
+  }
+
+  /** Whether a response to a request received on `epoch` may go out now.
+   *  The id is the server's, so it's logged as a field; `answer`, which the
+   *  caller has formatted for the log, ends the line. */
+  private sameTransport(id: string | number, epoch: number, answer?: string): boolean {
+    if (epoch === this.transportEpoch) return true;
+    console.error(
+      `[mcpl] ${this.id}: not answering request ${logValue(id)}: the transport it came on has closed${answer ? `, with ${answer}` : ''}`,
+    );
+    return false;
   }
 
   /**
    * Send a JSON-RPC error response back to the server.
    */
-  private sendErrorResponse(id: string | number, code: number, message: string, data?: unknown): void {
-    if (this.closed) return;
+  private sendErrorResponse(
+    id: string | number,
+    code: number,
+    message: string,
+    data?: unknown,
+    epoch = this.transportEpoch,
+  ): void {
+    // A refusal that can't be answered still says what it refused: a held
+    // message admitted under the next transport's grant is refused here.
+    if (!this.sameTransport(id, epoch, `error ${code} ${logDetail(message)}`) || this.closed) return;
     const response: JsonRpcResponse = {
       jsonrpc: '2.0',
       id,
@@ -1679,17 +2480,33 @@ export class McplServerConnection extends EventEmitter {
       if (!this.emitToErrorListeners(error)) console.error(`[mcpl] ${this.id}: transport error: ${logDetail(err.message)}`);
     });
 
-    transport.on('close', (info: TransportCloseInfo) => {
+    const lost = (info: TransportCloseInfo) => {
       if (!this.closed) {
         this.closed = true;
         this.resetPolicyForTransportBoundary();
+        // A teardown the host asked for via reconnectAfterFailure() arrives
+        // here too; it's reported as such below.
+        const byHost = this.hostCloseRequested;
+        this.hostCloseRequested = false;
 
-        // Reject all pending requests
-        for (const [id, pending] of this.pendingRequests) {
+        // Reject all pending requests. The words hold whether the server
+        // dropped or this host closed the transport to recover; how it closed
+        // is the operator's, so it goes to the log, not into the messages.
+        if (this.pendingRequests.size > 0) {
+          // Whatever the host asked for, the close's own details are kept, so
+          // a drop that races a recycle loses nothing.
+          const how = `${byHost ? 'closed by this host, ' : ''}` +
+            `code=${info.code ?? 'n/a'}, signal=${info.signal ?? 'n/a'}, reason=${closeReasonText(info)}`;
+          console.error(`MCPL server "${this.id}" disconnected (${how}) with ${this.unansweredRequests()}`);
+        }
+        for (const pending of this.pendingRequests.values()) {
           if (pending.timer) clearTimeout(pending.timer);
           pending.reject(
             new McplRequestError(
-              `MCPL server "${this.id}" disconnected unexpectedly (code=${info.code ?? 'n/a'}, signal=${info.signal ?? 'n/a'}, reason=${closeReasonText(info)}) while awaiting ${pending.method} (id=${id})`,
+              `The connection to the "${this.id}" server closed before it answered, so whether the request took effect is unknown. ` +
+              (this.reconnectEnabled
+                ? 'Check its effect before trying again; this host is reconnecting to it.'
+                : "This host won't reconnect to it on its own. If you need it, ask whoever runs this host."),
               'no-response',
             ),
           );
@@ -1699,10 +2516,7 @@ export class McplServerConnection extends EventEmitter {
 
         // Forward the transport's close info so listeners can tell a server
         // that refused the credential (WebSocket 4001) from a crash, and act
-        // before the reconnect below redials. A teardown the host asked for
-        // via reconnectAfterFailure() arrives here too; report it as such.
-        const byHost = this.hostCloseRequested;
-        this.hostCloseRequested = false;
+        // before the reconnect below redials.
         const closeInfo: McplConnectionCloseInfo = {
           transport: transport.kind,
           code: info.code ?? null,
@@ -1718,6 +2532,21 @@ export class McplServerConnection extends EventEmitter {
           this.scheduleReconnect();
         }
       }
+    };
+    transport.on('close', lost);
+    // A stdio child whose stdin or stdout failed, and that outlived SIGKILL
+    // too: the transport stays open, owning the child. The connection holds
+    // it as a launch it can't reap, as a reconnect does, which halts
+    // reconnecting, and is lost as on a close, with the permanent failure
+    // that raises the alert and takes its tools off the list. Its id stays
+    // held until close() confirms the exit. A close the host has begun
+    // reports the failure itself. During a handshake nothing listens yet:
+    // the handshake's own cleanup holds the launch, once the handshake fails.
+    transport.on('unreaped', (failure: Error) => {
+      if (this.closed || this.transport !== transport) return;
+      this.holdUnreaped(transport, failure);
+      lost({ reason: `its stdio pipe failed with ${transport.pipeFailure?.message ?? 'an error'}, and its child outlived SIGKILL` });
+      this.emit('reconnect-failed', { error: this.unreapedFailure(), attempt: Math.max(1, this.reconnectAttempts), permanent: true });
     });
   }
 }

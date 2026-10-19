@@ -64,12 +64,16 @@ class EphemeralToolModule implements Module {
 
 /** A tool that, while its call runs, has `duringCall` run: there, a test
  *  addresses the run as the event gate does, through the framework's
- *  addMessage with `forAgent`. */
+ *  addMessage with `forAgent`, or writes as a module does, through its
+ *  context (`ctx`). */
 class DuringCallToolModule implements Module {
   readonly name = 'test';
+  ctx: ModuleContext | null = null;
   duringCall: (() => void) | null = null;
 
-  async start(_ctx: ModuleContext): Promise<void> {}
+  async start(ctx: ModuleContext): Promise<void> {
+    this.ctx = ctx;
+  }
   async stop(): Promise<void> {}
 
   getTools(): ToolDefinition[] {
@@ -745,6 +749,106 @@ describe('runEphemeralToCompletion settle signal', () => {
       assert.deepStrictEqual(stored.slice(-3), ['worker: Done.', 'worker: my own words', 'Antra: look left'],
         'held to the turn end, and stored after the run\'s last reply');
     } finally {
+      await stopAndRemove(framework, tempDir);
+    }
+  });
+
+  it("a module's write with no target, which a host with no primary sends to its run, is the run's: stored in its namespace, with nothing left queued once it ends", async () => {
+    const { tempDir, storePath } = tempStorePath('ephemeral-untargeted-');
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'call_1', name: 'test--echo', input: {} },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+
+    const tools = new DuringCallToolModule();
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: [],
+      modules: [tools],
+      syncIntervalMs: 0,
+    });
+    const internals = framework as unknown as { deferredMessages: Array<{ forAgent?: string }> };
+    // While the run's tool call is pending, a module writes with no target,
+    // as its events do. The host has no primary, so the write goes to the
+    // run, its one registered agent, and waits for the run's turn.
+    const returned: string[] = [];
+    tools.duringCall = () => {
+      returned.push(tools.ctx!.addMessage('Antra', [{ type: 'text', text: 'look left' }]));
+    };
+    try {
+      const { agent, contextManager } = await createEphemeral(framework, 'worker');
+      const result = await runStartedEphemeral(framework, agent, contextManager);
+      assert.strictEqual(result.speech, 'Done.');
+      assert.strictEqual(returned.length, 1);
+      assert.match(returned[0]!, /^held:./, "deferred: the run was waiting on its tool, so the module's context answers the held write's handle");
+      assert.strictEqual(framework.getAgent(agent.name), null, 'deregistered');
+      const stored = contextManager.getAllMessages().map((m) =>
+        `${m.participant}: ${m.content.map((b) => (b.type === 'text' ? (b as { text: string }).text : `<${b.type}>`)).join(' ')}`);
+      assert.strictEqual(stored.filter((s) => s === 'Antra: look left').length, 1,
+        `stored once, in the run's namespace:\n${stored.join('\n')}`);
+      assert.deepStrictEqual(internals.deferredMessages, [], 'nothing is left queued');
+    } finally {
+      await stopAndRemove(framework, tempDir);
+    }
+  });
+
+  it('a write queued for a run that its store refuses leaves the queue at the run\'s release, logged', async () => {
+    const { tempDir, storePath } = tempStorePath('ephemeral-lost-');
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'call_1', name: 'test--echo', input: {} },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+
+    const tools = new DuringCallToolModule();
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: [],
+      modules: [tools],
+      syncIntervalMs: 0,
+    });
+    const internals = framework as unknown as {
+      addMessage(participant: string, content: Array<{ type: 'text'; text: string }>, metadata?: undefined, opts?: { forAgent?: string }): string;
+      deferredMessages: Array<{ forAgent?: string }>;
+      deferredWritesPersisted: boolean;
+    };
+    // The queue is persisted, as after a boot that restored one, so its
+    // recovery file is written as it changes.
+    internals.deferredWritesPersisted = true;
+    tools.duringCall = () => {
+      internals.addMessage('worker', [{ type: 'text', text: 'my own words' }], undefined, { forAgent: 'worker' });
+      internals.addMessage('Antra', [{ type: 'text', text: 'look left' }], undefined, { forAgent: 'worker' });
+    };
+    const errors: string[] = [];
+    const error = console.error;
+    try {
+      const { agent, contextManager } = await createEphemeral(framework, 'worker');
+      // The run's store refuses 'look left' each time it's written.
+      const add = contextManager.addMessage.bind(contextManager);
+      (contextManager as unknown as { addMessage: typeof add }).addMessage = (...args) => {
+        if ((args[1] as Array<{ text?: string }>).some((b) => b.text === 'look left')) throw new Error('disk full');
+        return add(...args);
+      };
+      console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+      const result = await runStartedEphemeral(framework, agent, contextManager);
+      console.error = error;
+      assert.strictEqual(result.speech, 'Done.');
+      assert.strictEqual(framework.getAgent(agent.name), null, 'deregistered');
+      const stored = contextManager.getAllMessages().map((m) =>
+        `${m.participant}: ${m.content.map((b) => (b.type === 'text' ? (b as { text: string }).text : `<${b.type}>`)).join(' ')}`);
+      assert.deepStrictEqual(stored.slice(-2), ['worker: Done.', 'worker: my own words'], 'what could be stored was');
+      assert.deepStrictEqual(internals.deferredMessages.filter((m) => m.forAgent === 'worker'), [], 'nothing is left queued for the run');
+      const file = JSON.parse(readFileSync(join(storePath, 'recovery', 'deferred-writes.json'), 'utf8')) as { pending: Array<{ forAgent?: string }> };
+      assert.deepStrictEqual(file.pending.filter((m) => m.forAgent === 'worker'), [], 'the recovery file keeps nothing for it');
+      assert.ok(errors.some((e) => e.includes('[deferred-flush] worker: failed to store a queued write before release (participant=Antra)')
+        && e.includes('disk full')), errors.join('\n'));
+      assert.ok(!errors.some((e) => e.includes('delivery target "worker" is not a registered agent')),
+        `no later flush meets it:\n${errors.join('\n')}`);
+    } finally {
+      console.error = error;
       await stopAndRemove(framework, tempDir);
     }
   });

@@ -10,9 +10,8 @@
   model's text as it is written, held, as before, while a tool-result
   guard's batch is pending.
   `mcpl:speech-routed` also reports speech publishes, with no stream id,
-  index or end: among them the `sleep` tool's announcement, and a
-  subconscious's `speak_in_channel` as it is sent, before its outcome is
-  known. A relay that voices the agent's prose takes the
-  `inference:published` stream, with its `inference:published_complete`, and
-  not `mcpl:speech-routed` as well, and takes each message's id from
-  `inference:published` to edit what it voiced.
+  index or end: among them the `sleep` tool's announcement and a
+  subconscious's `speak_in_channel`. A relay that voices the agent's prose
+  takes the `inference:published` stream, with its
+  `inference:published_complete`, and not `mcpl:speech-routed` as well, and
+  takes each message's id from `inference:published` to edit what it voiced.
