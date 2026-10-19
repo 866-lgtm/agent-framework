@@ -7053,7 +7053,7 @@ describe('on-agent-action', () => {
     const data = await withReadHook((n) => env.store.switchBranch(n % 2 === 1 ? 'other' : main),
       () => call(m, 'read', { path: 'work/a.txt' }));
     assert.equal(data.content, '     1\tA');
-    assert.equal(data.note, "The path couldn't be checked against disk (the selected branch kept changing while the scan ran), so this read shows the workspace's copy.");
+    assert.equal(data.note, "The path couldn't be checked against disk (the selected branch kept changing while the scan ran), so this read shows the workspace's copy. Read again to check it.");
     // A character page says so too, and so does a line page under a result
     // limit, each read starting on main, as the first did.
     const switching = (n: number) => env.store.switchBranch(n % 2 === 1 ? 'other' : main);
@@ -7094,7 +7094,7 @@ describe('on-agent-action', () => {
     env.store.createBranch('other', main);
     const error = await withReadHook((n) => env.store.switchBranch(n % 2 === 1 ? 'other' : main),
       () => refused(m, 'read', { path: 'work/b.txt' }));
-    assert.equal(error, 'work/b.txt is not in the workspace, and disk could not be checked (the selected branch kept changing while the scan ran).');
+    assert.equal(error, 'work/b.txt is not in the workspace, and disk could not be checked (the selected branch kept changing while the scan ran). Read again to check it.');
   });
 
   test('a branch switched away during the root check and back during a read is decided on the branch enumerated', async (t) => {

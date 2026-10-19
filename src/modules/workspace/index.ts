@@ -2987,8 +2987,12 @@ export class WorkspaceModule implements Module {
         // A pass that gave up (the selected branch kept changing) decided
         // nothing and leaves no report. It's read as a copy disk couldn't be
         // checked, with its reason, so the answer says the check didn't finish.
+        const gaveUp = !pass.reports.has(relativePath) && pass.incomplete.length > 0;
         const report = pass.reports.get(relativePath)
-          ?? (pass.incomplete.length > 0 ? { path: relativePath, state: 'unverified' as const, note: pass.incomplete[0]!.reason } : undefined);
+          ?? (gaveUp ? { path: relativePath, state: 'unverified' as const, note: pass.incomplete[0]!.reason } : undefined);
+        // A check that gave up may well finish on the next read, as grep's
+        // answer to the same says of grep.
+        const again = gaveUp ? ['Read again to check it.'] : [];
         // A mode taken in alone isn't a change to the text, so it leaves the
         // read nothing to say, as it leaves an edit nothing.
         const took = (op: TreeOp) => pass.ops.some((o) => o.path === relativePath && o.op === op && !o.modeOnly);
@@ -2999,12 +3003,12 @@ export class WorkspaceModule implements Module {
           return {
             error: took('deleted') && report?.state !== 'disk-only'
               ? `File not found: ${input.path}. Disk's copy was deleted since the workspace last agreed with it, and that was taken in first.`
-              : this.notInWorkspace(input.path, report),
+              : [this.notInWorkspace(input.path, report), ...again].join(' '),
           };
         }
         const blob = store.getBlob(entry.blobHash);
         if (!blob) return { error: `Blob not found for: ${input.path}` };
-        return { bytes: blob, notes: whichCopyRead(report, took('modified'), mount.config.mode === 'read-only') };
+        return { bytes: blob, notes: [...whichCopyRead(report, took('modified'), mount.config.mode === 'read-only'), ...again] };
       });
       if ('error' in found) return { success: false, error: found.error, isError: true };
       file = fileText(found.bytes);
