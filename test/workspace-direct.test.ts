@@ -120,20 +120,38 @@ async function withFsPromise<T>(name: 'lstat' | 'open', make: (original: (...arg
   }
 }
 
-/** The most calls of `node:fs/promises`'s `name` under way at once while `fn` runs, each held a turn so the others can start. */
-async function mostAtOnce(name: 'lstat' | 'open', fn: () => Promise<unknown>): Promise<number> {
+/**
+ * The most calls of `node:fs/promises`'s `name` on the files `counted` names
+ * under way at once while `fn` runs. The first are held until `width` of
+ * them are under way, and a moment longer, in which a reader wider than
+ * `width` would start more, so a reader `width` wide shows as `width` however
+ * fast the file system answers each step before the call. A narrower one is
+ * let go after 5 seconds, so it fails rather than hangs.
+ */
+async function mostAtOnce(name: 'lstat' | 'open', width: number, counted: RegExp, fn: () => Promise<unknown>): Promise<number> {
   let now = 0;
   let most = 0;
-  await withFsPromise(name, (original) => async (...args: any[]) => {
-    now++;
-    most = Math.max(most, now);
-    try {
-      await new Promise((resolve) => setImmediate(resolve));
-      return await original(...args);
-    } finally {
-      now--;
-    }
-  }, fn);
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => { release = resolve; });
+  const fallback = setTimeout(release, 5000);
+  let settle: NodeJS.Timeout | undefined;
+  try {
+    await withFsPromise(name, (original) => async (...args: any[]) => {
+      if (!counted.test(String(args[0]))) return original(...args);
+      now++;
+      most = Math.max(most, now);
+      if (now === width && settle === undefined) settle = setTimeout(release, 50);
+      try {
+        await released;
+        return await original(...args);
+      } finally {
+        now--;
+      }
+    }, fn);
+  } finally {
+    clearTimeout(fallback);
+    clearTimeout(settle);
+  }
   return most;
 }
 
@@ -545,8 +563,10 @@ test('a direct grep and listing read 16 files at a time', async (t) => {
   const env = new Env(t);
   for (let i = 0; i < 40; i++) env.file(`f${String(i).padStart(2, '0')}.txt`, 'needle\n');
   const m = await env.open();
-  assert.equal(await mostAtOnce('open', () => data(m, 'grep', { pattern: 'needle' })), 16);
-  assert.equal(await mostAtOnce('lstat', () => data(m, 'ls', { path: 'ref', recursive: true })), 16);
+  // The files' own calls: a walk's are on directories.
+  const files = /[\\/]f\d\d\.txt$/;
+  assert.equal(await mostAtOnce('open', 16, files, () => data(m, 'grep', { pattern: 'needle' })), 16);
+  assert.equal(await mostAtOnce('lstat', 16, files, () => data(m, 'ls', { path: 'ref', recursive: true })), 16);
 });
 
 test("a direct mount's reads close every file they open, whatever they answer", async (t) => {
