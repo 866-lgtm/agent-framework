@@ -2102,11 +2102,12 @@ export class AgentFramework {
   private streamBoundaryEnds = new WeakMap<YieldingStream, (end: StreamBoundaryEnd) => void>();
 
   /** A tool boundary injected fresh CONVERSATIONAL input (a real message,
-   *  or an edit the agent sees first; not a system marker or a reaction,
-   *  reaction removal, edit or deletion marker) into the live stream. Tells
-   *  driveStream to clear sticky explicit-send suppression before handling
-   *  the next model round. The signal itself never moves routing: the
-   *  boundary re-pins the turn's locus by its own rule (repinChannel). */
+   *  or an edit the coalescer marks as the agent's first view; not a system
+   *  marker or a reaction, reaction removal, edit or deletion marker) into
+   *  the live stream. Tells driveStream to clear sticky explicit-send
+   *  suppression before handling the next model round. The signal itself
+   *  never moves routing: the boundary re-pins the turn's locus by its own
+   *  rule (repinChannel). */
   private midTurnInputSignals: Set<string> = new Set();
   /** Last outbound locus announced to each agent as a durable `[routing]`
    *  window message. Announce-on-change only: steady state emits nothing
@@ -8482,10 +8483,11 @@ export class AgentFramework {
    * Mark an inference refusal visibly: react on the message that holds the
    * refused agent's conversational locus (the most recent incoming channel
    * message that isn't a reaction, reaction removal, edit or deletion
-   * marker, apart from an edit the agent sees first; an ephemeral run has
-   * none, so a subagent's refusal marks no message) with a category-specific
-   * emoji. Best-effort — failures are logged, never thrown, and non-Discord
-   * loci are silently skipped.
+   * marker, apart from an edit the coalescer delivers on acceptance as the
+   * agent's first view; an ephemeral run has none, so a subagent's refusal
+   * marks no message) with a category-specific emoji. Best-effort —
+   * failures are logged, never thrown, and non-Discord loci are silently
+   * skipped.
    */
   private async reactToRefusal(agentName: string, category: string): Promise<void> {
     try {
@@ -10943,8 +10945,8 @@ export class AgentFramework {
           // Non-conversational injections (`system: true` markers, and
           // reaction, reaction removal, edit and deletion markers) don't even
           // clear the send suppression: nothing new was said to the agent.
-          // An edit the agent sees first is the message it replaced, so it
-          // does (isConversationalInjection).
+          // An edit the coalescer marks as the agent's first view is the
+          // message it replaced, so it does (isConversationalInjection).
           if (midTurnInjections.some((inj) => isConversationalInjection(inj.metadata))) {
             this.midTurnInputSignals.add(agent.name);
           }
@@ -11012,11 +11014,11 @@ export class AgentFramework {
           // prose routed in earlier rounds already went to the old pin,
           // which was correct when it was delivered. Ambient chatter, system
           // markers, and reaction, reaction removal, edit and deletion
-          // markers (an edit the agent sees first aside, which counts as its
-          // message) still cannot move the pin — the 2026-07-21 Cairn hijack
-          // protection is unchanged; this extends the ratified
-          // addressed-outranks-ambient principle from turn start to
-          // boundaries. Locus mode only (explicit mode has no pin).
+          // markers (an edit the coalescer marks as the agent's first view
+          // aside, which counts as its message) still cannot move the pin —
+          // the 2026-07-21 Cairn hijack protection is unchanged; this extends
+          // the ratified addressed-outranks-ambient principle from turn start
+          // to boundaries. Locus mode only (explicit mode has no pin).
           // Skipped on endTurn/overBudget: no further prose this stream, and
           // a stale "for this turn" notice would be pure noise.
           //
@@ -11047,9 +11049,10 @@ export class AgentFramework {
             //    tracks nothing that matters here (antra, 2026-07-31).
             //    System markers and reaction, reaction removal, edit and
             //    deletion markers are already excluded by
-            //    isConversationalInjection (apart from an edit the agent
-            //    sees first), and the engaged-this-turn scope
-            //    keeps unrelated channels from moving the pin.
+            //    isConversationalInjection (apart from an edit the
+            //    coalescer marks as the agent's first view), and the
+            //    engaged-this-turn scope keeps unrelated channels from moving
+            //    the pin.
             // The last injection that qualifies wins (repinChannel).
             const routing = this.routingOf(agent.name);
             let newLocus: string | undefined;
@@ -14283,11 +14286,11 @@ export class AgentFramework {
    * The channel a message moves its turn's locus to, by the addressed
    * re-pin rule (2026-07-31, n=6 and n=7): a conversational message (by
    * isConversationalInjection: not a system marker, nor a reaction, reaction
-   * removal, edit or deletion marker, apart from an edit the agent sees
-   * first) that addressed the agent, or that follows up in a channel the
-   * turn sent into (TurnRouting.engaged). Undefined for any other message. A
-   * tool boundary weighs the messages it injects by it, and noteArrival the
-   * ones no boundary of the turn weighs.
+   * removal, edit or deletion marker, apart from an edit the coalescer marks
+   * as the agent's first view) that addressed the agent, or that follows up
+   * in a channel the turn sent into (TurnRouting.engaged). Undefined for any
+   * other message. A tool boundary weighs the messages it injects by it,
+   * and noteArrival the ones no boundary of the turn weighs.
    */
   private repinChannel(metadata: MessageMetadata | undefined, routing: TurnRouting): string | undefined {
     if (!isConversationalInjection(metadata)) return undefined;

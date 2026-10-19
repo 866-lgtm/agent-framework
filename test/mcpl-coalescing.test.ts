@@ -2362,24 +2362,32 @@ test("#157: a notice's render that lands while an earlier render of its subject 
  *  `unplaced` does, whose delivery is placed nowhere. The renders of `held`
  *  wait for `release`, and those of `blank` come back blank. `state` answers
  *  the host's read and shown questions for every placement it hasn't removed
- *  (removals).
+ *  (removals), and its `shownEvents` and `readEvents`, when given, for the
+ *  placements of the events they name.
  *  (slimepriestess's probe for #168, with the held renders and the other
  *  options added.) */
-function firstViewProbe(state: { shown: boolean; read: boolean }, { held = ['n1'], stored = [] as string[], unplaced = [] as string[], blank = [] as string[] } = {}) {
+function firstViewProbe(state: { shown: boolean; read: boolean; shownEvents?: Set<string>; readEvents?: Set<string> }, { held = ['n1'], stored = [] as string[], unplaced = [] as string[], blank = [] as string[] } = {}) {
   const delivered: Array<{ eventId: string; firstView?: true }> = [];
+  // Each placement's event, for the per-event read and shown answers.
+  const eventOf = new Map<string, string>();
+  const named = (p: { deferredId?: string; messageId?: string }, events?: Set<string>) => events?.has(eventOf.get(p.deferredId ?? p.messageId ?? '') ?? '') === true;
   const releases = new Map<string, () => void>();
   const gates = new Map(held.map((id) => [id, new Promise<void>((resolve) => { releases.set(id, resolve); })]));
   const started = new Map<string, () => void>();
   const renderStarted = new Map(held.map((id) => [id, new Promise<void>((resolve) => { started.set(id, resolve); })]));
   const r = removals();
   const host: CoalescerHost<null> = {
-    isUnread: (p) => !r.gone(p) && !state.read, isUnshown: (p) => !r.gone(p) && !state.shown && !state.read, remove: r.remove,
+    isUnread: (p) => !r.gone(p) && !state.read && !named(p, state.readEvents),
+    isUnshown: (p) => !r.gone(p) && !state.shown && !state.read && !named(p, state.shownEvents) && !named(p, state.readEvents),
+    remove: r.remove,
     deliver: async (occ) => {
       delivered.push({ eventId: occ.eventId, ...(occ.firstView ? { firstView: true as const } : {}) });
       if (unplaced.includes(occ.eventId)) return undefined;
-      return stored.includes(occ.eventId)
+      const placement = stored.includes(occ.eventId)
         ? { agent: 'agent', messageId: `stored-${delivered.length}` }
         : { agent: 'other', deferredId: `deferred-${delivered.length}` };
+      eventOf.set(placement.messageId ?? placement.deferredId!, occ.eventId);
+      return placement;
     },
     wakeForBatch: async () => {}, wakeToRead: async () => {}, cancelWake: () => {}, authorized: () => true,
     audience: async () => ['agent', 'other'],
@@ -2527,6 +2535,46 @@ for (const shown of [false, true]) test(`#157: beside a queued first-view render
 /** n1's render lands in 'other''s deferred queue as the agent's first view;
  *  `shown` says whether the agent is then shown it, and a retraction
  *  withdraws it. */
+/** A run of n1, the agent's first view, and n3's render, which joined it
+ *  unmarked, both queued for 'other'. */
+async function firstViewRunOfTwo(p: ReturnType<typeof firstViewProbe>): Promise<void> {
+  await firstViewQueuedWithBatchPending(p);
+  await p.coalescer.accept(p.occurrence('n3', { deferred: true, tags: ['chat:edited'] }));
+  await p.coalescer.assemble('agent');
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }, { eventId: 'n3' }], "n3's render joined n1's run unmarked");
+}
+
+/** Runs whose renders the agent may have seen differently: only a run none
+ *  of whose renders may have been shown, and none of whose renders has left
+ *  it read, hands its first view on. */
+const runMixes: Record<string, { shownEvents?: string[]; readEvents?: string[] }> = {
+  'its newest render shown and its oldest not': { shownEvents: ['n3'] },
+  'its oldest render shown and its newest not': { shownEvents: ['n1'] },
+  'its newest render read and its oldest not': { readEvents: ['n3'] },
+};
+const runEndings: Record<string, (p: ReturnType<typeof firstViewProbe>) => Promise<string>> = {
+  'a plain edit that displaces it is': async (p) => {
+    const e1 = await p.coalescer.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
+    assert.equal(e1.coalesce?.outcome, 'replaced', 'e1 displaced what is left of the run');
+    return 'e1';
+  },
+  'a retraction of it leaves the next batch': async (p) => {
+    await p.coalescer.accept(p.occurrence('r1', { retract: true, content: [] }));
+    await p.coalescer.accept(p.occurrence('n4', { deferred: true }));
+    await p.coalescer.assemble('agent');
+    return 'n4';
+  },
+};
+for (const [mix, seen] of Object.entries(runMixes)) for (const [ending, end] of Object.entries(runEndings)) test(`#157: with a run of renders that has ${mix}, ${ending} no first view`, async () => {
+  const state = { shown: false, read: false, shownEvents: new Set<string>(), readEvents: new Set<string>() };
+  const p = firstViewProbe(state);
+  await firstViewRunOfTwo(p);
+  for (const id of seen.shownEvents ?? []) state.shownEvents.add(id);
+  for (const id of seen.readEvents ?? []) state.readEvents.add(id);
+  const next = await end(p);
+  assert.deepEqual(p.delivered.at(-1), { eventId: next }, 'something of the run may have been shown');
+});
+
 async function firstViewRetracted(p: ReturnType<typeof firstViewProbe>, state: { shown: boolean }, shown: boolean) {
   await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
   await p.coalescer.assemble('agent');
@@ -2640,6 +2688,30 @@ for (const shown of [false, true]) test(`#157: a snapshot taken before a subject
   await restored.accept(p.occurrence('n2', { deferred: true }));
   await restored.assemble('agent');
   assert.deepEqual(p.delivered.at(-1), { eventId: 'n2', ...(shown ? {} : { firstView: true as const }) });
+});
+
+for (const shown of [false, true]) test(`#157: a snapshot that holds a first-view batch, restored with the records after it once their retry window has passed, ${shown ? "gives that batch's render no first view when a record ends the first view" : "leaves that batch's render the first view when nothing had shown the agent the last"}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [] });
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  // The last snapshot holds n1's batch pending, as the agent's first view.
+  const snapshot = p.coalescer.snapshot();
+  const records: CoalescingReceiptRecord[] = [];
+  p.host.recordReceipt = (record) => { records.push(structuredClone(record)); };
+  await p.coalescer.assemble('agent');
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }], "n1's render is the agent's first view");
+  state.shown = shown;
+  await p.coalescer.accept(p.occurrence('r1', { retract: true, content: [] }));
+  state.shown = false;
+  // The host comes back two hours after the crash. Past their retry window
+  // the records' batch facts aren't read, so the snapshot's batch is back,
+  // and the end a record carries holds for it too.
+  const later = Date.now() + 2 * 3_600_000;
+  const restored = new PushCoalescer<null>({ ...p.host, now: () => later });
+  restored.restore(snapshot);
+  restored.restoreReceipts(records);
+  await restored.assemble('agent');
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'n1', ...(shown ? {} : { firstView: true as const }) });
 });
 
 for (const shown of [false, true]) test(`#157: crash-window records restored after their retry window has passed ${shown ? "still end the first view, so the edit of a later initial plain occurrence is no first view" : "leave the edit of a later initial plain occurrence the first view when nothing had shown the agent the last"}`, async () => {

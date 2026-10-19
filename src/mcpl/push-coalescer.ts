@@ -170,11 +170,13 @@ interface Occupant {
   placement: CoalescingPlacement;
   /** A materialized batch (its result or its fallback), which later renders build on. */
   rendered?: true;
-  /** This occupant is the agent's first view of the subject, as `firstView`
-   *  defines it, so nothing of the subject has been read: a read takes the
-   *  occupant away. Unknown counts as not one. Only a run's oldest render can
-   *  carry it, since a render that joins a run finds a version placed. In
-   *  memory only: a snapshot's occupant comes back as read. */
+  /** This occupant was the agent's first view of the subject when it was
+   *  placed, as `firstView` defines it. It hands that view on only while
+   *  nothing of the subject has been read and nothing of its run may have
+   *  been shown (occupantLeaves). Unknown counts as not one. A plain
+   *  occurrence can carry it, and of a run's renders only the oldest, since a
+   *  render that joins a run finds a version placed. In memory only: a
+   *  snapshot's occupant comes back as read. */
   firstView?: true;
   /** The run's earlier renders, oldest first, each placed ahead of this one. */
   before?: Array<Omit<Occupant, 'before'>>;
@@ -199,10 +201,10 @@ interface SubjectState<E> {
   audienceAgent?: string;
   /** The agent's first view of the subject has ended: an occupant that may
    *  have been shown left it without handing a first view on
-   *  (occupantLeaves). No later batch or birth of the subject is a first
-   *  view while the coalescer keeps this record. An idle subject's record can
-   *  be evicted (prune), and an `initial` occurrence after that starts the
-   *  subject afresh. */
+   *  (occupantLeaves, endFirstView). No later batch or birth of the subject
+   *  is a first view while the coalescer keeps this record. An idle
+   *  subject's record can be evicted (prune), and an `initial` occurrence
+   *  after that starts the subject afresh. */
   firstViewEnded?: true;
   touchedAt: number;
 }
@@ -684,21 +686,28 @@ export class PushCoalescer<E = unknown> {
    * displaces it, or a retraction withdraws it, with any run of renders it
    * carries. Returns whether it was a first view that nothing may have shown
    * (isUnshown), which a replacement carries on: for a run, its oldest render
-   * carries the mark, and no render of it may have been shown. Any other
-   * occupant may have been seen, and this is the last point where the host
-   * can say so, since the removal takes its placements: the subject's first
-   * view ends here, for a batch pending or rendering, whose first delivery
-   * would come after it, and for every later batch and birth
-   * (firstViewEnded).
+   * carries the mark, and no render of it may have been shown. Nor may
+   * anything of the subject have been read: a member a request has read, or
+   * that is gone, leaves the run before this (refreshOccupant), and only the
+   * subject's history still says so. Any other occupant may have been seen,
+   * and this is the last point where the host can say so, since the removal
+   * takes its placements: the subject's first view ends here (endFirstView).
    */
   private occupantLeaves(state: SubjectState<E>, occupant: Occupant): boolean {
     const { before = [], ...newest } = occupant;
     const members = [...before, newest];
-    if (members[0].firstView === true && members.every((member) => this.host.isUnshown(member.placement))) return true;
+    if (state.history === 'none' && members[0].firstView === true && members.every((member) => this.host.isUnshown(member.placement))) return true;
+    this.endFirstView(state);
+    return false;
+  }
+
+  /** The subject's first view ends: for a batch pending or rendering, whose
+   *  first delivery would come after it, and for every later batch and
+   *  birth (firstViewEnded). */
+  private endFirstView(state: SubjectState<E>): void {
     state.firstViewEnded = true;
     if (state.batch) delete state.batch.firstView;
     if (state.rendering) delete state.rendering.batch.firstView;
-    return false;
   }
 
   private scheduleRecovery(subject: string, state: SubjectState<E>): void {
@@ -1149,12 +1158,13 @@ export class PushCoalescer<E = unknown> {
       // A first view's end is a fact about the subject, which holds while the
       // coalescer keeps it, not about the receipt, whose retry window says
       // nothing about it. So a record that carries it ends the subject's
-      // first view whatever its age. A subject this restore doesn't hold yet
-      // existed when the record was written and may have been shown, so it
-      // comes back with that end and an unknown history.
+      // first view whatever its age, for a batch the snapshot brought back
+      // too. A subject this restore doesn't hold yet existed when the record
+      // was written and may have been shown, so it comes back with that end
+      // and an unknown history.
       if (r.firstViewEnded) {
         const ended = this.subjects.get(r.subject);
-        if (ended) ended.firstViewEnded = true;
+        if (ended) this.endFirstView(ended);
         else this.subjects.set(r.subject, { history: 'unknown', touchedAt: now, firstViewEnded: true });
       }
       if (!fresh) continue;
