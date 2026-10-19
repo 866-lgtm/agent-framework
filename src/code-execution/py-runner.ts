@@ -143,9 +143,9 @@ const LAST_WORDS_CHARS = 2000;
 /**
  * How much of the host's log a pipe's output takes while no script of its
  * interpreter runs, from the start of its last exec, or its own start: lines
- * of up to 65,536 characters in all, each piece cut at LAST_WORDS_CHARS,
- * enough to see what a command a script left running is doing. The rest is
- * dropped.
+ * of up to 65,536 characters in all, counted as UTF-16 code units, each piece
+ * cut at LAST_WORDS_CHARS, enough to see what a command a script left running
+ * is doing. The rest is dropped.
  */
 const IDLE_LOG_CHARS = 65_536;
 /**
@@ -307,6 +307,8 @@ export class OutputStream {
   private retired = false;
   /** The wait that holds a retired pipe back (slow). */
   private resumer: ReturnType<typeof setTimeout> | null = null;
+  /** Bytes read since the last wait was set, which the next one charges (slow). */
+  private owed = 0;
 
   constructor(
     private readonly name: 'stdout' | 'stderr',
@@ -430,14 +432,27 @@ export class OutputStream {
     }
   }
 
-  /** Hold the pipe back for as long as these bytes take at IDLE_READ_BYTES_PER_SECOND, then read on. */
+  /**
+   * Hold the pipe back for as long as these bytes take at
+   * IDLE_READ_BYTES_PER_SECOND, then read on. Something else can resume the
+   * pipe during a wait, as Node does with a child's stdio when the child
+   * exits, so each piece holds it back again, and what came during a wait
+   * waits its own time once that wait ends.
+   */
   private slow(bytes: number): void {
-    if (this.resumer !== null) return;
     this.pipe.pause();
+    this.owed += bytes;
+    if (this.resumer === null) this.wait();
+  }
+
+  private wait(): void {
+    const ms = Math.ceil((this.owed * 1000) / IDLE_READ_BYTES_PER_SECOND);
+    this.owed = 0;
     this.resumer = setTimeout(() => {
       this.resumer = null;
-      this.pipe.resume();
-    }, Math.ceil((bytes * 1000) / IDLE_READ_BYTES_PER_SECOND));
+      if (this.owed > 0) this.wait();
+      else this.pipe.resume();
+    }, ms);
     // A command left running doesn't keep the host's process alive.
     this.resumer.unref();
   }

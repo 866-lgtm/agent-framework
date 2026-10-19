@@ -193,6 +193,21 @@ describe("OutputStream: what a pipe brings while no script of its interpreter ru
     await new Promise((resolve) => setTimeout(resolve, 300));
     assert.strictEqual(retired.pipe.isPaused(), false);
   });
+
+  it("holds a torn-down pipe back again when something else resumes it during a wait, as Node does when a child exits, and charges what came then", async () => {
+    const { pipe, stream } = open();
+    stream.retire();
+    await feed(pipe, ['\n'.repeat(65_536)]);
+    assert.strictEqual(pipe.isPaused(), true);
+    pipe.resume();
+    await feed(pipe, ['\n'.repeat(65_536)]);
+    assert.strictEqual(pipe.isPaused(), true);
+    // The two pieces take 125 ms at 1 MiB a second, so the pipe is still held
+    // back once the first piece's 63 ms have passed.
+    await new Promise((resolve) => setTimeout(resolve, 95));
+    assert.strictEqual(pipe.isPaused(), true);
+    await until(() => !pipe.isPaused(), 'the pipe to be read again');
+  });
 });
 
 describe('PyRunner (real python3)', () => {
@@ -1552,23 +1567,17 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
     });
   });
 
-  it("a command left running past its interpreter's reclaim is read at about 1 MiB a second, while it goes on writing, neither ended nor held", async () => {
-    await logging(async (logged) => {
+  it("a command writing as its interpreter is torn down is read at about 1 MiB a second from then on, while it goes on writing, neither ended nor held", async () => {
+    await logging(async () => {
       const dir = mkdtempSync(join(tmpdir(), 'pytc-flood-'));
       const progress = join(dir, 'progress');
-      const runner = new PyRunner({ onToolCall: async () => '', idleReclaimMs: 500 });
+      const runner = new PyRunner({ onToolCall: async () => '' });
       let pid = 0;
       try {
-        // Once its interpreter has been reclaimed, the command writes without
-        // end, saying how much it has written after each write. It gives up
-        // waiting after 20 s.
+        // The command writes without end from its start, saying how much it
+        // has written after each write.
         const command = [
-          'import os, sys, time',
-          'for _ in range(400):',
-          '    if os.path.exists(os.path.join(sys.argv[1], "reclaimed")): break',
-          '    time.sleep(0.05)',
-          'else:',
-          '    sys.exit(1)',
+          'import os, sys',
           'chunk = b"y\\n" * 32768',
           'n = 0',
           'while True:',
@@ -1583,16 +1592,17 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
         );
         pid = Number(first.stdout.trim());
         assert.ok(pid > 0, first.stdout);
-        await until(() => logged.some((l) => l.endsWith('reclaiming python interpreter (idle)')), 'the idle reclaim');
-        writeFileSync(join(dir, 'reclaimed'), '');
-        await until(() => existsSync(progress), 'the command to write');
-        const written = () => Number(readFileSync(progress, 'utf8'));
-        const start = written();
-        await until(() => written() > start, 'the command to go on writing');
+        const written = () => (existsSync(progress) ? Number(readFileSync(progress, 'utf8')) : 0);
+        // In full flow, read as it's written while its interpreter lives.
+        await until(() => written() > 16 * 1_048_576, 'the command to write');
+        // Nothing is read between this and the teardown, whose kill Node
+        // follows, as the interpreter exits, by resuming its pipes.
         const before = written();
+        runner.dispose();
         await new Promise((resolve) => setTimeout(resolve, 2000));
         const after = written();
         assert.ok(alive(pid), 'the command ended');
+        assert.ok(after > before, 'the command was held');
         // 2 MiB at 1 MiB a second, with what the pipe holds; read at full speed, gigabytes.
         assert.ok(after - before < 4 * 1_048_576, `read at ${after - before} bytes in 2 s`);
       } finally {

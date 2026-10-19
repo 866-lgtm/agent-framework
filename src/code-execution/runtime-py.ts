@@ -43,10 +43,12 @@
  * of it. Nothing a script or a command does with fds 0, 1 or 2 reaches the
  * protocol, short of pointing them at the runtime's channel, fds 3 and 4,
  * which can garble its messages while the script runs and, through a command
- * started holding the channel, for as long as that command runs. The runtime
- * puts them back as the host set them, blocking, at each exec's start, and puts
- * back fd 1 or 2 pointed at the channel at the script's end too, before
- * anything is flushed (_off_channel). Its own fds (3 and 4, and its copies of 0, 1 and 2) it
+ * started holding the channel, for as long as that command runs. A garbled
+ * exec_result leaves its script waiting out its time limit and the grace, and
+ * the interpreter is restarted, so the next script's variables are gone. The
+ * runtime puts fds 0, 1 and 2 back as the host set them, blocking, at each
+ * exec's start, and puts back fd 1 or 2 pointed at the channel at the script's
+ * end too, before anything is flushed (_off_channel). Its own fds (3 and 4, and its copies of 0, 1 and 2) it
  * checks at each exec's start and end, and fd 4 before each message: one a
  * script closed or replaced ends the interpreter, saying which
  * (_check_own_fds). So does a message or an end mark that can't be written, as
@@ -365,8 +367,9 @@ def _off_channel():
     # start puts it (_open_streams). What a script or its commands write onto
     # the channel, or read from it, can still garble the runtime's messages: the
     # script's own while it runs, and, from a command it started holding the
-    # channel, a later script's for as long as that command runs, each script
-    # bounded by its time limit. Only a channel per script would end that.
+    # channel, a later script's for as long as that command runs. A script
+    # whose exec_result is garbled waits out its time limit and the grace, and
+    # the interpreter is restarted. Only a channel per script would end that.
     # A copy a script closed or replaced is left alone, so nothing goes into
     # a file of the script's: the check at the exec's end ends the runtime.
     channel = [_OWN_FDS[fd][2] for fd in (3, 4) if fd in _OWN_FDS]
