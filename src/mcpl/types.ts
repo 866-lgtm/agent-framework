@@ -298,8 +298,12 @@ export interface McplServerConfig {
    * default: as a `token` query parameter (`?token=…`). `'header'`: as an
    * `Authorization: Bearer …` header, with no query parameter, so the
    * credential stays out of the url and of the access logs that record it.
-   * Set only on a WebSocket server; an http(s):// server always sends the
-   * header, and a stdio server sends no credential.
+   * A header carries a credential as configured only if it is printable
+   * ASCII (U+0020 to U+007E) with no space at either end, so header mode
+   * refuses any other: a static `token` when the server is added, an access
+   * provider's at the dial. Set only on a WebSocket server; an http(s)://
+   * server always sends the header, and a stdio server sends no credential.
+   * `null` counts as not set.
    */
   tokenTransport?: 'query' | 'header';
 

@@ -25,7 +25,7 @@ import { StringDecoder } from 'node:string_decoder';
 import WebSocket from 'ws';
 
 import type { McplServerConfig } from './types.js';
-import { describeCredentialError, noteDialSent, redactUrl, resolveServerBinding, tokenTransportProblem, urlAsDialed } from './protocol-family.js';
+import { describeCredentialError, headerCarries, noteDialSent, redactUrl, resolveServerBinding, tokenTransportProblem, urlAsDialed } from './protocol-family.js';
 import { assertBooleanSetting } from '../config-checks.js';
 import { logDetail } from './log-value.js';
 
@@ -530,7 +530,8 @@ export class WebSocketTransport extends McplTransport {
    * Dial `config.url` and resolve once the socket is OPEN. Sends the
    * credential (`config.token`, or the access provider's) as a `?token=`
    * query parameter, or with `tokenTransport: 'header'` as an
-   * `Authorization: Bearer` header on the upgrade. Rejects on connect error / timeout (and tears
+   * `Authorization: Bearer` header on the upgrade, refusing before the dial
+   * one a header can't carry as configured. Rejects on connect error / timeout (and tears
    * the socket down) so a failed dial never leaks an open handle. `signal`
    * ends a dial whose connection is closed meanwhile, at once, rather than
    * at the open timeout.
@@ -561,27 +562,25 @@ export class WebSocketTransport extends McplTransport {
       }
     }
     const url = buildWebSocketUrl(config, token);
-    // A provider's token is in this url, and the query may be re-encoded:
-    // the server's text is recorded with what the dial sent, the token in
-    // each form a token is replaced in.
+    // A provider's token is in this url when the dial sends it in the query,
+    // which may then be written again, and in the header alone in header
+    // mode: the server's text is recorded with what the dial sent, the token
+    // in each form a token is replaced in.
     noteDialSent(config, { url, token: token ?? undefined });
     // Error strings travel: traces, logs, tool results the model reads. They
     // get the endpoint, never the credential.
     const redacted = redactUrl(config.url);
     // In header mode the url carries no credential (buildWebSocketUrl): the
-    // upgrade request does. A control character can't go in a header, and a
-    // client's refusal of one can quote the value, so it is refused here,
-    // and the client's own refusal is never passed on as it reads.
+    // upgrade request does, if a header can carry it as configured
+    // (headerCarries). A static token is refused earlier, by
+    // serverConfigProblems; this refuses an access provider's, and a static
+    // one dialed past that check.
     let ws: WebSocket;
     if (config.tokenTransport === 'header' && token) {
-      if (/[\u0000-\u0008\u000a-\u001f\u007f]/.test(token)) {
-        throw new Error(`MCPL server "${config.id}" WebSocket connect failed: its credential holds a control character, which can't be sent in a header (${redacted})`);
+      if (!headerCarries(token)) {
+        throw new Error(`MCPL server "${config.id}" WebSocket connect failed: its credential isn't printable ASCII with no space at either end, which is all a header carries as configured (${redacted})`);
       }
-      try {
-        ws = new WebSocket(url, { headers: { Authorization: `Bearer ${token}` } });
-      } catch {
-        throw new Error(`MCPL server "${config.id}" WebSocket connect failed: the WebSocket client refused the upgrade request (${redacted})`);
-      }
+      ws = new WebSocket(url, { headers: { Authorization: `Bearer ${token}` } });
     } else {
       ws = new WebSocket(url);
     }

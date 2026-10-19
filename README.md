@@ -335,9 +335,14 @@ returns for a dial, goes as a `token` query parameter by default
 `Authorization: Bearer` header on the upgrade instead, with no query
 parameter, so it stays out of the url and of the access logs that record it;
 the provider still runs at every dial and reconnect. Switch a server to
-`'header'` once it reads the header. `tokenTransport` is refused on an
-http(s):// server, which always sends the header, and on a stdio server;
-`'header'` is refused with a url that carries a `token` parameter of its own.
+`'header'` once it reads the header. A header carries a credential as
+configured only if it is printable ASCII with no space at either end, so
+header mode refuses any other, without quoting it: a static `token` when the
+server is added, and an access provider's at the dial. `tokenTransport` is
+refused on an http(s):// server, which always sends the header, and on a
+stdio server; `'header'` is refused with a url that carries a `token`
+parameter or userinfo of its own, since whenever the Bearer header carries a
+credential it replaces the userinfo's Basic one.
 
 A modern server's tools get the same prefix, `enabledTools`/`disabledTools`,
 class overrides and dispatch as an MCPL server's, and `listMcplServers()`
