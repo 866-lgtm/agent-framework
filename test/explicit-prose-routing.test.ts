@@ -1631,6 +1631,48 @@ describe('explicit prose routing', () => {
     await framework.stop();
   });
 
+  it("explicit mode's typing and traces stay on its trigger channel across the turn's rounds", async () => {
+    // Explicit mode has no locus: its typing and traces show where the wake
+    // came from, and only a locus or hybrid turn's follow a moved locus.
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 't1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>#alpha done' }] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubRegistry(framework);
+    const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+    const typing: string[] = [];
+    registry.startTyping = (channelId: string) => { typing.push(`start ${channelId}`); };
+    registry.stopTyping = (channelId?: string) => { typing.push(`stop ${channelId ?? '(all)'}`); };
+    const traced = new Set<string | undefined>();
+    framework.onTrace((event) => {
+      const e = event as { type: string; blockType?: string; channelId?: string };
+      if ((e.type === 'inference:tokens' || e.type === 'inference:content_block') && e.blockType === 'text') traced.add(e.channelId);
+    });
+    const internals = framework as unknown as {
+      pendingRequests: InferenceRequest[];
+      processInferenceRequests(): Promise<void>;
+    };
+    try {
+      internals.pendingRequests.push({
+        agentName: 'assistant', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: Date.now(),
+        channelId: 'chan-alpha', addressed: true,
+      });
+      await internals.processInferenceRequests();
+      await framework.runUntilIdle();
+
+      assert.equal(module.calls.length, 1, 'control: round 1 ran its tool');
+      assert.deepEqual(routed, [{ text: 'done', locus: 'chan-alpha' }], 'control: round 2 ran and was delivered');
+      assert.ok(typing.includes('start chan-alpha'), `typing showed on the trigger channel: ${JSON.stringify(typing)}`);
+      assert.equal(typing.includes('stop chan-alpha'), false, `and stayed there until the turn ended: ${JSON.stringify(typing)}`);
+      assert.ok(typing.includes('stop (all)'), 'control: the turn\'s end stopped it');
+      assert.deepEqual([...traced], ['chan-alpha'], 'round 2 is traced in the trigger channel');
+    } finally {
+      await framework.stop();
+    }
+  });
+
   it('explicit mode streams nothing before a destination: unprefixed text never reaches the trigger channel', async () => {
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'Unprefixed musing.\n>>#alpha streamed after the prefix' },

@@ -188,7 +188,7 @@ describe('present while acting', () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  async function createFramework(agentOptions: { maxStreamTokens?: number } = {}): Promise<AgentFramework> {
+  async function createFramework(agentOptions: { maxStreamTokens?: number; proseRouting?: 'locus' | 'hybrid' } = {}): Promise<AgentFramework> {
     const framework = await AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
       membrane: membrane.asMembrane(),
@@ -405,6 +405,156 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
+  /**
+   * What the turn shows, beside what is delivered: the registry stub
+   * resolves `#cafe` and delivers to it, and records typing and the text
+   * traces with the round each belongs to.
+   */
+  function watchShown(framework: AgentFramework) {
+    const routed = stubChannelRegistry(framework);
+    const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+    registry.resolveProseTarget = (spec: string) => spec === '#cafe'
+      ? { channelId: 'discord:g:cafe', label: '#cafe' }
+      : { error: `no channel matches "${spec}"` };
+    registry.deliverSpeech = async (_agent: string, text: string, channelId: string) => {
+      routed.push({ text, locus: channelId });
+      return { status: 'delivered' as const, destination: { serverId: 'stub', channelId }, at: Date.now() };
+    };
+    const shown: string[] = [];
+    registry.startTyping = (channelId: string) => { shown.push(`start ${channelId}`); };
+    registry.stopTyping = (channelId?: string) => { shown.push(`stop ${channelId ?? '(all)'}`); };
+    // The text traces of the turn's first stream, by round.
+    const traced: Array<{ round: number; channelId?: string }> = [];
+    let streams = 0;
+    let round = 1;
+    framework.onTrace((event) => {
+      const e = event as { type: string; blockType?: string; channelId?: string };
+      if (e.type === 'inference:started') streams++;
+      if (streams !== 1) return;
+      if (e.type === 'inference:tool_calls_yielded') round++;
+      if ((e.type === 'inference:tokens' || e.type === 'inference:content_block') && e.blockType === 'text') traced.push({ round, channelId: e.channelId });
+    });
+    const tracedIn = (n: number) => [...new Set(traced.filter((t) => t.round === n).map((t) => t.channelId))];
+    /** Typing stopped on the first channel and, next, started on `to`, once. */
+    const typingMovedTo = (to: string) => {
+      const moved = shown.indexOf('stop chan-live-1');
+      return moved > 0 && shown[moved + 1] === `start ${to}` && shown.filter((x) => x === `start ${to}`).length === 1;
+    };
+    return { routed, shown, tracedIn, typingMovedTo };
+  }
+
+  function addressedFromDm(): void {
+    module.toolDelayMs = 25;
+    module.interjection = 'hey, quick question over here?';
+    module.interjectionMetadata = { channelId: 'discord:dm:antra', tags: ['chat:addressed'] };
+  }
+
+  for (const proseRouting of ['locus', 'hybrid'] as const) {
+    it(`${proseRouting} mode: after a re-pin, the next round's traces and typing follow the turn's locus`, async () => {
+      // The re-pin moves where round 2's prose is delivered, and the
+      // conversation the turn attends. The traces that tag each chunk with
+      // its channel, and the typing indicator, move with it.
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'Station four, proceeding.' },
+        { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'Answering the person who addressed me.' },
+      ] as ContentBlock[]));
+
+      const framework = await createFramework({ proseRouting });
+      const watched = watchShown(framework);
+      addressedFromDm();
+
+      trigger(framework);
+      await framework.runUntilIdle();
+
+      assert.deepEqual(watched.routed, [
+        { text: 'Station four, proceeding.', locus: 'chan-live-1' },
+        { text: 'Answering the person who addressed me.', locus: 'discord:dm:antra' },
+      ], 'control: delivery follows the re-pin');
+      assert.deepEqual(watched.tracedIn(1), ['chan-live-1'], 'round 1 is traced in the first channel');
+      assert.deepEqual(watched.tracedIn(2), ['discord:dm:antra'], 'round 2 is traced in the DM');
+      assert.ok(watched.typingMovedTo('discord:dm:antra'), `typing moves to the DM, once: ${JSON.stringify(watched.shown)}`);
+
+      await framework.stop();
+    });
+  }
+
+  it("hybrid mode: while a `>>>` destination holds, a re-pin moves the traces and typing to the conversation the turn now attends", async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>>#cafe Station four, proceeding.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Answering after the move.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework({ proseRouting: 'hybrid' });
+    const watched = watchShown(framework);
+    addressedFromDm();
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(watched.routed, [
+      { text: 'Station four, proceeding.', locus: 'discord:g:cafe' },
+      { text: 'Answering after the move.', locus: 'discord:g:cafe' },
+    ], 'control: delivery keeps the `>>>` destination after the re-pin');
+    assert.deepEqual(watched.tracedIn(1), ['chan-live-1'], "round 1's traces name the turn's locus, not the destination");
+    assert.deepEqual(watched.tracedIn(2), ['discord:dm:antra'], "round 2's traces name the locus the re-pin moved to");
+    assert.ok(watched.typingMovedTo('discord:dm:antra'), `typing moves to the DM: ${JSON.stringify(watched.shown)}`);
+
+    await framework.stop();
+  });
+
+  it('a provider that reports text before any block event still moves the traces and typing at the round after a re-pin', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Station four, proceeding.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Answering after the move.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const watched = watchShown(framework);
+    addressedFromDm();
+    dropBlockEvents();
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(watched.routed.map((r) => r.locus), ['chan-live-1', 'discord:dm:antra'], 'control: the re-pin moved round 2');
+    assert.deepEqual(watched.tracedIn(2), ['discord:dm:antra'], 'round 2 is traced in the DM');
+    assert.ok(watched.typingMovedTo('discord:dm:antra'), `typing moves to the DM: ${JSON.stringify(watched.shown)}`);
+
+    await framework.stop();
+  });
+
+  it("locus mode: a refusal before the retried round's first content traces the round's new locus", async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Station four, proceeding.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Answering after the retry.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const watched = watchShown(framework);
+    addressedFromDm();
+    refuseRoundOnce(2);
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(watched.routed.map((r) => r.locus), ['chan-live-1', 'discord:dm:antra'], 'control: the re-pin moved round 2');
+    assert.deepEqual(watched.tracedIn(2), ['discord:dm:antra'], "the retry's trace and round 2's name the DM");
+
+    await framework.stop();
+  });
+
   it('a follow-up in a channel the agent explicitly engaged this turn re-pins', async () => {
     // 2026-07-31 n=7 (q's #portables reply): the agent explicitly sent into
     // a channel this turn; someone replies there WITHOUT a mention (ambient
@@ -574,6 +724,75 @@ describe('present while acting', () => {
             return;
           }
           yield event;
+        }
+      };
+      return stream;
+    };
+  }
+
+  /**
+   * The first stream's Nth round (1-based) is refused once, before it
+   * streams anything: membrane's retrying event comes first.
+   */
+  function refuseRoundOnce(round: number): void {
+    const makeStream = membrane.streamYielding.bind(membrane);
+    let streams = 0;
+    membrane.streamYielding = (request, options) => {
+      const stream = makeStream(request, options);
+      if (++streams !== 1) return stream;
+      const iterate = stream[Symbol.asyncIterator].bind(stream);
+      stream[Symbol.asyncIterator] = async function* () {
+        let rounds = 1;
+        let refused = false;
+        for await (const event of { [Symbol.asyncIterator]: iterate }) {
+          if (rounds === round && !refused) {
+            refused = true;
+            yield { type: 'retrying', attempt: 1, maxAttempts: 1, reason: 'refusal' } as never;
+          }
+          yield event;
+          if (event.type === 'tool-calls') rounds++;
+        }
+      };
+      return stream;
+    };
+  }
+
+  /**
+   * Streams whose providers report text before any block callback: every
+   * stream yields its tokens with no block events.
+   */
+  function dropBlockEvents(): void {
+    const makeStream = membrane.streamYielding.bind(membrane);
+    membrane.streamYielding = (request, options) => {
+      const stream = makeStream(request, options);
+      const iterate = stream[Symbol.asyncIterator].bind(stream);
+      stream[Symbol.asyncIterator] = async function* () {
+        for await (const event of { [Symbol.asyncIterator]: iterate }) {
+          if (event.type !== 'block') yield event;
+        }
+      };
+      return stream;
+    };
+  }
+
+  /**
+   * Streams that report each round's tool results as content after its tool
+   * boundary, as membrane does in XML tool mode or for a result with an
+   * image: a tool_result block with its tokens.
+   */
+  function reportToolResults(): void {
+    const makeStream = membrane.streamYielding.bind(membrane);
+    membrane.streamYielding = (request, options) => {
+      const stream = makeStream(request, options);
+      const iterate = stream[Symbol.asyncIterator].bind(stream);
+      stream[Symbol.asyncIterator] = async function* () {
+        for await (const event of { [Symbol.asyncIterator]: iterate }) {
+          yield event;
+          if (event.type === 'tool-calls') {
+            yield { type: 'block', event: { event: 'block_start', index: 9, block: { type: 'tool_result' } } } as never;
+            yield { type: 'tokens', content: '{"ok":true}', meta: { type: 'tool_result', visible: true, blockIndex: 9 } } as never;
+            yield { type: 'block', event: { event: 'block_complete', index: 9, block: { type: 'tool_result' } } } as never;
+          }
         }
       };
       return stream;
@@ -1068,6 +1287,40 @@ describe('present while acting', () => {
       await framework.stop();
     });
   }
+
+  it("a budget restart that re-pins its turn stops the typing its earlier stream left in the old channel", async () => {
+    // The over-budget stream hands the turn on at a tool boundary, before any
+    // content of the next round, so it never shows the move itself: the
+    // restart's start, which takes the addressed message as an arrival,
+    // moves the indicator.
+    const overBudget = createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use');
+    overBudget.usage = { inputTokens: 100, outputTokens: 5 };
+    membrane.pushResponse(overBudget);
+
+    const framework = await createFramework({ maxStreamTokens: 20 });
+    const routed = stubChannelRegistry(framework);
+    const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+    const shown: string[] = [];
+    registry.startTyping = (channelId: string) => { shown.push(`start ${channelId}`); };
+    registry.stopTyping = (channelId?: string) => { shown.push(`stop ${channelId ?? '(all)'}`); };
+    module.toolDelayMs = 25;
+    module.interjection = 'quick question for you';
+    module.interjectionMetadata = addressed('discord:dm:antra');
+    feedStart(framework, 2, [{ type: 'text', text: 'After the restart.' }] as ContentBlock[]);
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.equal(membrane.calls.length, 2, 'control: the turn restarted for its budget');
+    assert.deepEqual(routed, [{ text: 'After the restart.', locus: 'discord:dm:antra' }], 'control: the restart re-pinned to the DM');
+    const started = shown.indexOf('start discord:dm:antra');
+    const stopped = shown.indexOf('stop chan-live-1');
+    assert.ok(started > 0 && stopped >= 0 && stopped < started, `typing stops in the old channel before it shows in the DM: ${JSON.stringify(shown)}`);
+
+    await framework.stop();
+  });
 
   for (const [label, messages, expected] of [
     ["keeps the turn's locus", [], 'chan-turn'],
@@ -1810,6 +2063,14 @@ describe('present while acting', () => {
     const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
     (registry as { handleChannelToolCall?: unknown }).handleChannelToolCall =
       async () => ({ success: true, data: { channelId: 'discord:guild:observatory', opened: true } });
+    const shown: string[] = [];
+    registry.startTyping = (channelId: string) => { shown.push(`start ${channelId}`); };
+    registry.stopTyping = (channelId?: string) => { shown.push(`stop ${channelId ?? '(all)'}`); };
+    const traced: Array<{ channelId?: string }> = [];
+    framework.onTrace((event) => {
+      const e = event as { type: string; blockType?: string; channelId?: string };
+      if ((e.type === 'inference:tokens' || e.type === 'inference:content_block') && e.blockType === 'text') traced.push(e);
+    });
 
     trigger(framework);
     await framework.runUntilIdle();
@@ -1817,12 +2078,77 @@ describe('present while acting', () => {
     assert.deepEqual(routed, [
       { text: 'Hello, observatory.', locus: 'discord:guild:observatory' },
     ], 'prose right after channel_open lands in the opened channel');
+    // What the turn shows follows the open, as it follows a re-pin.
+    assert.ok(traced.length > 0, 'control: the next round was traced');
+    assert.deepEqual([...new Set(traced.map((e) => e.channelId))], ['discord:guild:observatory'], 'the next round, the only one with text, is traced in the opened channel');
+    const moved = shown.indexOf('stop chan-live-1');
+    assert.ok(moved > 0 && shown[moved + 1] === 'start discord:guild:observatory', `typing moves to it: ${JSON.stringify(shown)}`);
     // The announcement rode the tool result the model saw.
     const results = membrane.lastStream!.receivedToolResults.flat() as Array<{ content?: unknown }>;
     assert.ok(
       JSON.stringify(results).includes('plain speech now lands in this channel'),
       'routing note present in the channel_open tool result',
     );
+
+    await framework.stop();
+  });
+
+  for (const reported of [false, true]) {
+  it(`a channel_open just before an empty final response doesn't start typing in the opened channel${reported ? ', when its result is reported as content (XML tool mode)' : ''}`, async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Opening the observatory.' },
+      { type: 'tool_use', id: 'c1', name: 'channel_open', input: { channelId: 'discord:guild:observatory' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([] as ContentBlock[]));
+    if (reported) reportToolResults();
+
+    const framework = await createFramework();
+    stubChannelRegistry(framework);
+    const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+    (registry as { handleChannelToolCall?: unknown }).handleChannelToolCall =
+      async () => ({ success: true, data: { channelId: 'discord:guild:observatory', opened: true } });
+    const shown: string[] = [];
+    registry.startTyping = (channelId: string) => { shown.push(`start ${channelId}`); };
+    registry.stopTyping = (channelId?: string) => { shown.push(`stop ${channelId ?? '(all)'}`); };
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.ok(shown.includes('start chan-live-1'), `control: typing showed while round 1 spoke: ${JSON.stringify(shown)}`);
+    const results = membrane.lastStream!.receivedToolResults.flat() as Array<{ content?: unknown }>;
+    assert.ok(JSON.stringify(results).includes('plain speech now lands in this channel'), 'control: the open succeeded and moved the turn there');
+    assert.equal(membrane.lastStream!.toolDepth, 1, 'control: the empty final response was the stream\'s last');
+    assert.equal(shown.includes('start discord:guild:observatory'), false, `the empty last round moves nothing: ${JSON.stringify(shown)}`);
+
+    await framework.stop();
+  });
+  }
+
+  it('a locus turn that starts with nowhere to speak shows typing where its channel_open moves it', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'channel_open', input: { channelId: 'discord:guild:observatory' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Hello, observatory.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+    registry.resolveLocus = () => null;
+    (registry as { handleChannelToolCall?: unknown }).handleChannelToolCall =
+      async () => ({ success: true, data: { channelId: 'discord:guild:observatory', opened: true } });
+    const shown: string[] = [];
+    registry.startTyping = (channelId: string) => { shown.push(`start ${channelId}`); };
+    registry.stopTyping = (...args: unknown[]) => { shown.push(args.length === 0 ? 'stop (all)' : `stop ${String(args[0])}`); };
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [
+      { text: 'Hello, observatory.', locus: 'discord:guild:observatory' },
+    ], 'control: the open gave the turn somewhere to speak');
+    assert.deepEqual(shown.filter((x) => x !== 'stop (all)'), ['start discord:guild:observatory'], `typing shows only in the opened channel, and nothing else is stopped: ${JSON.stringify(shown)}`);
 
     await framework.stop();
   });
