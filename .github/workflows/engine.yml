@@ -2,8 +2,9 @@ name: Engine
 
 # code_execution's engine module, src/code-execution/quickjs.wasm, is committed beside the sources
 # it's built from: the vendored quickjs-ng and engine/interface.c, built by engine/build.sh with a
-# pinned toolchain. This first copies the pinned quickjs-ng release with engine/vendor.sh and fails
-# unless that's the committed source, so the vendored copy is the release it names. Then it
+# pinned toolchain. This first copies the pinned quickjs-ng release, with the patches in
+# engine/patches, with engine/vendor.sh and fails unless that's the committed source, so the
+# vendored copy is the release it names with those patches. Then it
 # rebuilds the module and fails unless the bytes are the committed ones, so the module can't drift
 # from its sources in either direction. It runs only when one of them changes, since the toolchain
 # is a 143 MB download.
@@ -35,12 +36,13 @@ jobs:
         with:
           persist-credentials: false
 
-      # vendor.sh copies the pinned release's files over engine/quickjs-ng, so any difference from
-      # what's committed is an edit to the vendored source, or a pin it doesn't match.
+      # vendor.sh copies the pinned release's files, with the patches applied, over
+      # engine/quickjs-ng, so any difference from what's committed (an ignored or untracked file
+      # included) is an edit to the vendored source, a patch not committed, or a pin it doesn't match.
       - name: Copy the pinned quickjs-ng release and compare it with the committed source
         run: |
           engine/vendor.sh
-          changes=$(git status --porcelain -- engine/quickjs-ng)
+          changes=$(git status --porcelain --untracked-files=all --ignored -- engine/quickjs-ng)
           if [ -n "$changes" ]; then
             echo "$changes"
             echo "::error::engine/quickjs-ng isn't the release engine/vendor.sh pins, with the patches in engine/patches. Change the engine through vendor.sh's pin or a patch, run vendor.sh, and commit what it copies."
