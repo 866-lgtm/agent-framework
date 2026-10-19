@@ -40,7 +40,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { type BranchIntent, BranchIntents } from './branch-intent.js';
-import { IGNORED, NONBLOCK, OTHER_MOUNT, ROOT_REPLACED, ROOT_UNAVAILABLE, checkDir, checkRoot, diskSpelling, filesystemTrustsCtime, foldsCase, inOtherMount, leadsInto, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, looksBinary, nestedAtReal, nestedHolder, observePath, passedOverAt, readBytes, readPrefix, sniffImageMime, walkScope, type CheckedDir, type LinkFound, type MountView, type NestedMount, type WorkspaceEntries } from './observe.js';
+import { IGNORED, NONBLOCK, OTHER_MOUNT, OUTSIDE_INCLUDE, ROOT_REPLACED, ROOT_UNAVAILABLE, beginsWithDir, checkDir, checkRoot, coversLanding, diskSpelling, filesystemTrustsCtime, foldsCase, includePatternReadable, inOtherMount, insideMount, leadsInto, linkOnTheWay, linkRefusal, linkWords, locateRoot, looksBinary, namesHolder, namesNestedPlace, nestedAtReal, nestedHolder, observePath, parsedSpelling, passedOverAt, pathSegments, readBytes, readPrefix, shownLeads, sniffImageMime, walkScope, withinIncludes, type CheckedDir, type LinkFound, type MountView, type NestedMount, type WorkspaceEntries } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
 import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../../tool-result-history.js';
 import { type EditSpec, type FilePlan, countBudget, decodeForEdit, hintBudget, planFile } from './edit-plan.js';
@@ -149,15 +149,28 @@ class WorkspaceImageReadError extends Error {
  * link and, where it leads somewhere, its target, a symlink whose canonical
  * target lands outside the canonical mount root, or one among the path's
  * directories leading out of it (`escape`), a file swapped underneath the read
- * (`changed`), and a path in another mount's directory nested in the one
- * named, or reached through a symlink among the path's directories leading
- * there (`other_mount`), whose message names the mount that holds it and the
- * path to use there. A `mount_unavailable` for a root whose realpath or stat
- * fails otherwise carries that errno, such as EACCES.
+ * (`changed`), a path the mount's `include` doesn't cover (`outside_include`),
+ * and a path in another mount's directory nested in the one named
+ * (`other_mount`), whose message names the mount that holds it and the path
+ * to use there. A symlink leading into such a directory is `other_mount`
+ * only where its refusal names that mount: a directory, or a file that
+ * mount's include covers. Anywhere else, on a mount that doesn't follow
+ * symlinks, it gets the code of a link where it stands, `symlink` at the
+ * path itself and `parent_symlink` on its way, and on one that does,
+ * `escape`, as a path that leaves the mount. On a mount with an include, a
+ * link's message names its target only where a tool could name it: a
+ * directory, or a file the include covers. A link the include doesn't cover
+ * is outside the mount, and its message tells nothing of where it leads, so
+ * on a path's way its code is `parent_symlink` wherever it leads; named
+ * itself, it's refused as outside the include (`outside_include`), as any
+ * path the include doesn't cover is.
+ * A `mount_unavailable` for a root whose realpath or stat fails otherwise
+ * carries that errno, such as EACCES.
  */
 export type WorkspaceReadErrorCode =
   | 'unknown_mount'
   | 'traversal'
+  | 'outside_include'
   | 'other_mount'
   | 'mount_unavailable'
   | 'not_found'
@@ -181,6 +194,14 @@ export type WorkspaceReadStage =
   | 'realpath'
   | 'stat'
   | 'read';
+
+/** A path the mount's `include` doesn't cover: outside the mount. */
+class OutsideIncludeError extends Error {
+  constructor(shownPath: string, mount: MountConfig) {
+    super(`"${shownPath}" is outside the mount's include: mount "${mount.name}" holds only ${(mount.include ?? []).join(', ')}. `
+      + 'The host\'s operator sets the include in the mount\'s configuration, so calling again with this path changes nothing.');
+  }
+}
 
 /**
  * A file operation's path lies in another mount's directory nested in the
@@ -304,27 +325,34 @@ function matchesPartialPrefix(buffer: Buffer, prefix: Buffer): boolean {
  * link's reason, as the observations give it, after the path; or, for a
  * directory the walk couldn't ask, a failure to read, coded `not_found` with
  * the readlink's errno, as every failed lookup is. A link's code follows
- * where it leads, so a caller choosing advice by code gets advice that fits:
+ * where its refusal says it leads (shownLeads), so a caller choosing advice
+ * by code gets advice that fits, and the code says no more than the message:
  * `escape` for a link leading outside the mount, the code a path resolving
- * outside it gets too; `other_mount` for one into a nested mount's directory,
- * the code that mount's own paths get; and `parent_symlink` for any other,
- * which `symlink`, a file that is itself a link, leaves apart.
+ * outside it gets too; `other_mount` for one into a nested mount's directory
+ * where the message names that mount (namesHolder), the code that mount's own
+ * paths get; and for any other, a link the mount's include doesn't cover
+ * among them, the code of a link the mount doesn't follow where it stands:
+ * `symlink` at the path itself, as any other link there gets, and
+ * `parent_symlink` among its directories, judged on the parsed path
+ * (`relativePath`), whatever spelling the caller gave.
  */
 async function linkReadError(
-  mount: { config: { name: string; path: string } },
+  mount: { config: { name: string; path: string; include?: readonly string[] } },
   found: LinkFound,
   mountPrefixedPath: string,
-  nested: readonly { dir: string; name: string }[],
+  relativePath: string,
+  nested: readonly NestedMount[],
 ): Promise<WorkspaceReadError> {
   if (!('link' in found)) {
     return new WorkspaceReadError('not_found', `Unable to read file: ${mountPrefixedPath}: ${linkWords(mount.config.name, found, null)}`, 'readlink', found.code);
   }
   const rootReal = await realpath(mount.config.path).catch(() => resolve(mount.config.path));
-  const leads = await linkLeads(mount.config.path, rootReal, found.link);
-  const reason = `${mountPrefixedPath}: ${linkWords(mount.config.name, found, leads, nested)}`;
-  const code = leads.kind === 'outside' ? 'escape'
-    : leads.kind === 'inside' && nestedHolder(leads.target, nested) ? 'other_mount'
-    : 'parent_symlink';
+  const leads = await shownLeads(mount.config.path, rootReal, found, mount.config.include);
+  const reason = `${mountPrefixedPath}: ${linkWords(mount.config.name, found, leads, nested, mount.config.include)}`;
+  const holder = leads?.kind === 'inside' ? nestedHolder(leads.target, nested) : undefined;
+  const code = leads?.kind === 'outside' ? 'escape'
+    : leads?.kind === 'inside' && holder && namesHolder(leads, holder) ? 'other_mount'
+    : relativePath === found.link ? 'symlink' : 'parent_symlink';
   return new WorkspaceReadError(code, reason, 'readlink');
 }
 
@@ -356,6 +384,22 @@ interface NestedMountEntry {
   spellings: Array<{ dir: string; root: string }>;
 }
 
+/**
+ * A path as parsePath reads it: its mount, and its mount-relative and
+ * mount-prefixed paths as the parse spells them; with the root the parse
+ * judged it beneath, a direct mount's as the parse resolved it and any
+ * other's as configured, and, where a direct mount's root lies elsewhere
+ * than the last start placed it, the mounts nested in it there
+ * (movedNesting), null otherwise.
+ */
+interface ParsedPath {
+  mount: MountState;
+  relativePath: string;
+  path: string;
+  root: string;
+  moved: NestedMount[] | null;
+}
+
 /** How many links realBeneath follows to a place not made yet before it stops, as the kernel's limit does. */
 const LINKS_FOLLOWED = 40;
 
@@ -364,13 +408,14 @@ const LINKS_FOLLOWED = 40;
  * it, with the links on its way and in it taken out, read without holding
  * the process. Where nothing is there yet, a link leads where its target
  * would be, and anything else lies beneath its nearest existing directory's
- * real path, with the rest as given. A link's target is read from the
- * link's directory as it is on disk, and nothing is resolved lexically on
- * the way, so a `..` is taken from where the links before it lead, as the
+ * real path, with the rest as given, a `..` after a name that isn't there
+ * taken lexically. A link's target is read from the link's directory as it
+ * is on disk, so a `..` is taken from where the links before it lead, as the
  * kernel takes it. Where realpath fails for any other reason, such as a
- * loop or a lack of permission, the whole path as path.resolve reads it.
+ * loop or a lack of permission, the whole path as path.resolve reads it, and
+ * `unresolved`, where given, takes the first such code.
  */
-async function realBeneath(given: string, links = 0): Promise<string> {
+async function realBeneath(given: string, links = 0, unresolved?: { code?: string }): Promise<string> {
   // A trailing separator, as a link to a directory is often written, names
   // the same place, but readlink would then follow the link it names.
   const { root } = parse(given);
@@ -381,11 +426,30 @@ async function realBeneath(given: string, links = 0): Promise<string> {
   } catch (err) {
     const code = errnoOf(err);
     const parent = dirname(absolute);
-    if ((code !== 'ENOENT' && code !== 'ENOTDIR') || links >= LINKS_FOLLOWED || parent === absolute) return resolve(absolute);
-    const place = await realBeneath(parent, links);
+    if ((code !== 'ENOENT' && code !== 'ENOTDIR') || links > LINKS_FOLLOWED || parent === absolute) {
+      if (unresolved) unresolved.code ??= links > LINKS_FOLLOWED ? 'ELOOP' : code ?? 'EIO';
+      return resolve(absolute);
+    }
+    const place = await realBeneath(parent, links, unresolved);
     const target = await readlink(absolute).catch(() => null);
-    if (target !== null) return realBeneath(isAbsolute(target) ? target : `${place}${sep}${target}`, links + 1);
+    if (target !== null) return realBeneath(isAbsolute(target) ? target : `${place}${sep}${target}`, links + 1, unresolved);
     return join(place, basename(absolute));
+  }
+}
+
+/**
+ * A configured value as a refusal shows it: a number or a bigint as
+ * JavaScript writes it (JSON would say null for NaN, and throws for a
+ * bigint), anything else as JSON, or as String gives it where JSON can't,
+ * as for a list holding a bigint.
+ */
+function shownValue(value: unknown): string {
+  if (typeof value === 'number') return String(value);
+  if (typeof value === 'bigint') return `${value}n`;
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
   }
 }
 
@@ -878,6 +942,26 @@ export class WorkspaceModule implements Module {
       if (refused.length > 0) {
         throw new Error(`[workspace] Mount "${mount.name}" is direct, which reads disk as it is with no store, watcher or push: ${refused.join('; ')}`);
       }
+      const include: unknown = mount.include;
+      if (include !== undefined) {
+        // A pattern the matcher can't read would match nothing, and take every
+        // file out of the mount unsaid (includePatternReadable).
+        if (!Array.isArray(include) || include.length === 0) {
+          throw new Error(
+            `[workspace] Mount "${mount.name}": include must be a non-empty list of names, "*.ext" globs or "dir/**" globs, not ${shownValue(include)}`,
+          );
+        }
+        // By index: an entry that is itself undefined, or a hole, is unreadable too.
+        const at = include.findIndex((p) => !includePatternReadable(p));
+        if (at >= 0) {
+          const unreadable: unknown = include[at];
+          throw new Error(
+            `[workspace] Mount "${mount.name}": include must be a non-empty list of names, "*.ext" globs or "dir/**" globs, `
+            + `with no "." or ".." segment${sep === '\\' ? ' and no "\\", which this platform reads as a separator' : ''}; `
+            + `${shownValue(unreadable)} is none of these`,
+          );
+        }
+      }
     }
     // Detect overlapping mount paths: a mount nested inside another is that
     // mount's directory, which the outer mount passes over in every pass,
@@ -1052,6 +1136,7 @@ export class WorkspaceModule implements Module {
       followSymlinks: mount.config.followSymlinks === true,
       maxFileSize: mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE,
       ignore: this.ignoreOf(mount),
+      ...(mount.config.include ? { include: mount.config.include } : {}),
       others: this.othersOf(mount.config.name),
       nested: this.nestedOf(mount.config.name),
     };
@@ -1157,10 +1242,23 @@ export class WorkspaceModule implements Module {
   /** One store→disk push; the caller holds the mount's turn. */
   private async pushUnlocked(mount: MountState, paths: string[], opts: PushOptions = {}): Promise<PushResult> {
     const watcher = this.watchers.get(mount.config.name);
-    return pushPaths(this.getStore(), this.agreementOrThrow(), await this.runtime(mount), paths, {
+    // A path outside the mount's include never reaches disk, even when the
+    // workspace's history holds it from before the include. It's skipped,
+    // and a materialize counts it, with the reason.
+    const inside: string[] = [];
+    const outside: string[] = [];
+    for (const p of paths) {
+      // A key no spelling names, such as an earlier version's `a//b.txt`,
+      // isn't the mount's either, and isn't the include's to report.
+      if (!parsedSpelling(p)) continue;
+      (insideMount(p, mount.config.include) ? inside : outside).push(p);
+    }
+    const pushed = await pushPaths(this.getStore(), this.agreementOrThrow(), await this.runtime(mount), inside, {
       ...opts,
       beforeEffect: (p) => watcher?.suppress(p),
     });
+    for (const path of outside) pushed.skipped.push({ path, reason: OUTSIDE_INCLUDE });
+    return pushed;
   }
 
   async start(ctx: ModuleContext): Promise<void> {
@@ -1525,12 +1623,15 @@ export class WorkspaceModule implements Module {
     this.ctx = null;
   }
 
-  /** Mount names + modes, for peer callers (framework spill/journal paths)
-   *  that need a writable mount without reaching into private state. */
-  getMounts(): Array<{ name: string; mode: 'read-write' | 'read-only' }> {
+  /** Mount names + modes, and each mount's include where it sets one, for
+   *  peer callers (framework spill/journal paths) that need a mount for files
+   *  of their own, the first writable one without an include
+   *  (firstWritableMountName), without reaching into private state. */
+  getMounts(): Array<{ name: string; mode: 'read-write' | 'read-only'; include?: readonly string[] }> {
     return [...this.mounts.values()].map((m) => ({
       name: m.config.name,
       mode: m.config.mode === 'read-only' ? 'read-only' : 'read-write',
+      ...(m.config.include ? { include: [...m.config.include] } : {}),
     }));
   }
 
@@ -1680,7 +1781,7 @@ export class WorkspaceModule implements Module {
         inputSchema: {
           type: 'object' as const,
           properties: {
-            path: { type: 'string', description: 'Directory path (mount-prefixed, optional)' },
+            path: { type: 'string', description: 'Directory path (mount-prefixed, optional; without it, the mounts are listed, each with its include where it has one)' },
             recursive: { type: 'boolean', description: 'List recursively (default: false)' },
           },
         },
@@ -1729,7 +1830,9 @@ export class WorkspaceModule implements Module {
       {
         name: 'materialize',
         description: 'Write workspace files to the real filesystem. Use after writing/editing to push changes to disk. '
-          + 'Never deletes disk files unless applyDeletions is given; lists workspace deletions it left on disk.',
+          + 'Never deletes disk files unless applyDeletions is given; lists workspace deletions it left on disk. '
+          + 'On a mount with an include, what the include doesn\'t cover is never written, and one naming a '
+          + 'directory counts what it left beneath it under `passedOver`, by mount and reason, without naming it.',
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -1761,8 +1864,10 @@ export class WorkspaceModule implements Module {
           + 'reported nowhere else is counted under `passedOver`, by mount and reason: another mount\'s '
           + 'directory nested in this one, entries the mount\'s ignore list covers, and entries with an '
           + 'editor\'s swap or backup file name (`.name.swp` and `.name.swx` as the whole name, names ending '
-          + 'in `~` or in `.subl…tmp`), that hold nothing the workspace tracks (such a directory counts once, '
-          + 'with what lies beneath it). So a '
+          + 'in `~` or in `.subl…tmp`), each holding nothing the workspace tracks (such a directory counts '
+          + 'once, with what lies beneath it); and files and links outside the mount\'s include, a link '
+          + 'counted as "a symlink, not walked" instead where it leads to a directory on a mount that follows '
+          + 'symlinks, and wherever it leads on one that doesn\'t. So a '
           + 'total of 0, with no conflicts and nothing under `passedOver`, `incomplete` or `skipped`, means the '
           + 'sync looked everywhere and nothing had changed. A path the mount ignores, or an editor\'s file, is '
           + 'synced when you name it, and listed under `ignored`: a sync without a path passes over it. A path '
@@ -1959,8 +2064,11 @@ export class WorkspaceModule implements Module {
 
   /**
    * Resolve a mount-prefixed path (e.g. "tickets/2026-04-22-foo.md") to its
-   * absolute filesystem path. Returns null if the mount is unknown or the
-   * resolved path escapes the mount root.
+   * absolute filesystem path. Returns null if the mount is unknown or
+   * doesn't hold the path: one that leaves the mount's directory, lies in
+   * another mount's directory nested in it, or falls outside its include, or
+   * one that can't name a file of it, with a separator right after the
+   * mount's name or a lone UTF-16 surrogate.
    *
    * **Lexical containment only.** The guard reasons about `..` segments in the
    * path string; it knows nothing about what is on disk. A symlink inside the
@@ -1978,10 +2086,17 @@ export class WorkspaceModule implements Module {
    */
   resolveAbsolutePath(mountPrefixedPath: string): string | null {
     try {
-      // Synchronous, so the path as given: it reaches the same file, and
-      // the nested-mount check matches it as configured or as disk spells
-      // the nested mount's directory (readNesting).
-      const { mount, relativePath } = this.refuseNested({ ...this.parsePathAsGiven(mountPrefixedPath), path: mountPrefixedPath });
+      // Synchronous, so the path as given. The nested-mount check takes it
+      // in each spelling readNesting knows for the nested mount's directory,
+      // or in any spelling a disk that folds names may fold to one of them,
+      // erring toward that mount (holderOf's asGiven, beginsWithDir). The
+      // include judges it as given, so on a disk that
+      // folds names a covered name whose file disk spells otherwise returns
+      // that file's path, which the tools refuse, and a covered file named in
+      // another case is null, which the tools read. A path the mount doesn't
+      // hold, outside its include or in another mount's directory nested in
+      // it, is null, as for a path that leaves the mount's directory.
+      const { mount, relativePath } = this.refuseNotHeld({ ...this.parsePathAsGiven(mountPrefixedPath), path: mountPrefixedPath }, mountPrefixedPath, true);
       return resolve(mount.config.path, relativePath);
     } catch {
       return null;
@@ -2284,9 +2399,13 @@ export class WorkspaceModule implements Module {
     return { nesting, reals };
   }
 
-  /** The mounts nested in `mountName`, by directory, name and real root where it has one (MountView's `nested`), in each spelling known. */
+  /**
+   * The mounts nested in `mountName`, by directory, name, real root where it
+   * has one, and include (MountView's `nested`), in each spelling known.
+   */
   private nestedOf(mountName: string): NestedMount[] {
-    return (this.otherMounts.get(mountName) ?? []).flatMap((o) => o.spellings.map((s) => ({ dir: s.dir, name: o.name, real: o.real })));
+    return (this.otherMounts.get(mountName) ?? []).flatMap((o) =>
+      o.spellings.map((s) => ({ dir: s.dir, name: o.name, real: o.real, include: this.mounts.get(o.name)?.config.include })));
   }
 
   /**
@@ -2303,25 +2422,30 @@ export class WorkspaceModule implements Module {
    * `rootReal`, where that's elsewhere than the last start placed it, as when
    * a link it's configured through is repointed; null where the start's
    * placement holds, or where nothing is at `rootReal`, whose read says so. A
-   * direct mount reads beneath whatever directory is at its root, so each
-   * check judges a path by the root it resolved: a file tool's parse resolves
-   * it once for both its checks, and a read, a walk and grep's check of a
-   * path it's given each resolve it for themselves, so a root repointed
-   * during a call can only have a later check refuse what an earlier one let
-   * through. A mount configured beneath its configured path lies where that
-   * path now leads, as a start would place it: at its configured directory,
-   * and where that directory resolves beneath `rootReal` (realBeneath), its
-   * real root, each also as disk spells it (diskSpelling). Any other mount
-   * lies where the last start placed it, and is nested where that lies
-   * beneath `rootReal`. It resolves nothing but directories beneath this
-   * mount's own root, so a share elsewhere that doesn't answer holds only its
-   * own calls, unless such a directory is a link into it, where that mount's
-   * files lie. What it leaves to the next start: a mount configured elsewhere
-   * whose own root has moved since, as by a second link repointed, that
-   * mount's spellings through other links, and the other mounts' own
-   * placements, so a direct root moved into another mount's directory is
-   * that mount's too, as a nested mount's root moved while running stays
-   * placed.
+   * direct mount reads beneath whatever directory is at its root, so a check
+   * judges which mount a path is by the root it resolved. A tool's parse
+   * resolves it once: its respelling reads disk beneath it, its checks of the
+   * path it's given (parseFilePath's, refusesAsOutside, grep's) take the
+   * nesting there, and parseFilePath's resolves where the path lands beneath
+   * it; their other reads of disk go through the configured path. A read and
+   * a walk each resolve it for themselves, and judge the include and the
+   * nesting again beneath it. So a root repointed during a call can change
+   * which answer or refusal a path gets, but nothing a read or a walk serves
+   * is a file the include leaves out, or in another mount's directory as that
+   * nesting places it. A mount configured beneath its configured path lies
+   * where that path now leads, as a start would place it: at its configured
+   * directory, and where that directory resolves beneath `rootReal`
+   * (realBeneath), its real root, each also as disk spells it (diskSpelling).
+   * Any other mount lies where the last start placed it, and is nested where
+   * that lies beneath `rootReal`. Each carries its own include, as nestedOf
+   * gives it. It resolves nothing but directories beneath this mount's own
+   * root, so a share elsewhere that doesn't answer holds only its own calls,
+   * unless such a directory is a link into it, where that mount's files lie.
+   * What it leaves to the next start: a mount configured elsewhere whose own
+   * root has moved since, as by a second link repointed, that mount's
+   * spellings through other links, and the other mounts' own placements, so a
+   * direct root moved into another mount's directory is that mount's too, as
+   * a nested mount's root moved while running stays placed.
    */
   private async movedNesting(mount: MountState, rootReal: string): Promise<NestedMount[] | null> {
     const placed = this.placedRoots.get(mount.config.name);
@@ -2331,7 +2455,9 @@ export class WorkspaceModule implements Module {
     const nested: NestedMount[] = [];
     // A real root that holds this mount's own would claim its every path, so
     // such a mount is nested by its directories alone, as a start nests it.
-    const at = (dir: string, name: string, real: string): NestedMount => (isContainedPath(real, rootReal) ? { dir, name } : { dir, name, real });
+    const at = (dir: string, name: string, real: string): NestedMount => ({
+      dir, name, ...(isContainedPath(real, rootReal) ? {} : { real }), include: this.mounts.get(name)?.config.include,
+    });
     for (const inner of this.config.mounts) {
       if (inner.name === mount.config.name) continue;
       const configured = nestedDir(outerPath, resolve(inner.path));
@@ -2360,22 +2486,32 @@ export class WorkspaceModule implements Module {
    * of that mount, judged lexically where the path lands (`.`, `..` and
    * repeated separators resolved, as for the traversal guard; a link of the
    * outer mount isn't followed), with the path to use there; undefined when
-   * no nested mount's directory holds it.
+   * no nested mount's directory holds it. A path parsePath has respelled is
+   * compared with the directory's spellings exactly. One judged as given
+   * (`asGiven`, resolveAbsolutePath's) is compared loosely, as a disk that
+   * folds names may compare it (beginsWithDir), so it can't reach that
+   * mount's directory by spelling a segment otherwise. On a disk that tells
+   * names apart, that takes a directory of this mount's own spelled like the
+   * nested one in another way as that mount's too.
    */
-  private holderOf(mountName: string, relativePath: string, moved: NestedMount[] | null = null): { name: string; use: string } | undefined {
+  private holderOf(mountName: string, relativePath: string, asGiven = false, moved: NestedMount[] | null = null): { name: string; use: string } | undefined {
     const mount = this.mounts.get(mountName);
     if (!mount) return undefined;
-    const resolved = resolve(mount.config.path, relativePath);
+    const root = resolve(mount.config.path);
+    const resolved = resolve(root, relativePath);
+    if (!isContainedPath(root, resolved)) return undefined;
+    const segments = resolved === root ? [] : relative(root, resolved).split(sep);
     // A direct mount whose root a call found moved is judged by that call's
     // nesting (movedNesting), each directory beneath its configured path.
-    const spelled = moved !== null
-      ? moved.map((n) => ({ name: n.name, root: join(resolve(mount.config.path), ...n.dir.split('/')) }))
-      : (this.otherMounts.get(mountName) ?? []).flatMap((o) => o.spellings.map((s) => ({ name: o.name, root: s.root })));
-    const holder = spelled
-      .filter((s) => isContainedPath(s.root, resolved))
-      .sort((a, b) => b.root.length - a.root.length)[0];
+    const dirs = moved !== null
+      ? moved.map((n) => ({ name: n.name, dir: n.dir }))
+      : (this.otherMounts.get(mountName) ?? []).flatMap((o) => o.spellings.map((s) => ({ name: o.name, dir: s.dir })));
+    const holder = dirs
+      .filter((s) => beginsWithDir(segments, s.dir.split('/'), asGiven))
+      .map((s) => ({ name: s.name, depth: s.dir.split('/').length }))
+      .sort((a, b) => b.depth - a.depth)[0];
     if (!holder) return undefined;
-    const rest = relative(holder.root, resolved).split(sep).join('/');
+    const rest = segments.slice(holder.depth).join('/');
     return { name: holder.name, use: rest ? `${holder.name}/${rest}` : holder.name };
   }
 
@@ -2385,7 +2521,7 @@ export class WorkspaceModule implements Module {
    * it; for a listing, whose the path is.
    */
   private otherMountNote(mountName: string, relativePath: string, by: 'sync' | 'push' | 'list', moved: NestedMount[] | null = null): string {
-    const holder = this.holderOf(mountName, relativePath, moved);
+    const holder = this.holderOf(mountName, relativePath, false, moved);
     const what = by === 'sync' ? ', which no sync of this mount takes in' : by === 'push' ? ', which no push of this mount writes' : '';
     return holder
       ? `it lies in mount "${holder.name}", nested in this one${what}: use "${holder.use}"`
@@ -2394,92 +2530,224 @@ export class WorkspaceModule implements Module {
 
   /**
    * parsePath for the file operations (read, write, edit, delete, and the
-   * module's binary and disk reads and writes). A path in another mount's
-   * directory nested in this one is that mount's: this mount's passes don't
-   * observe it and its pushes don't write it, so its file operations refuse
-   * it, naming the innermost mount that holds it and the path to use there.
+   * module's binary and disk reads and writes), refused where the mount
+   * doesn't hold the path. A path in another mount's directory nested in
+   * this one is that mount's: this mount's passes don't observe it and its
+   * pushes don't write it, so the refusal names the innermost mount that
+   * holds it and the path to use there. A path the mount's include doesn't
+   * cover is outside the mount, whatever disk or the workspace's history has
+   * there. A directory is checked the same way, since a path can be a
+   * directory on one side and a file on the other.
    */
   private async parseFilePath(path: string): Promise<{ mount: MountState; relativePath: string; path: string }> {
     const spelled = await this.parsePath(path);
-    // After a trailing slash a store-backed mount's read finds no file. A
-    // direct mount's would read the file and answer with the slash.
-    if (spelled.mount.direct && spelled.relativePath.endsWith('/')) {
-      throw new Error(`Path not taken: ${JSON.stringify(path)} ends with "/", which a direct mount's file operations don't take: give the file's path without it`);
-    }
-    // A direct mount's root is resolved once here, so both checks below
-    // judge the path by one root and its nesting (movedNesting).
-    const mount = spelled.mount;
-    const root = resolve(mount.config.path);
-    const rootReal = mount.direct ? await realpath(root).catch(() => root) : root;
-    const moved = mount.direct ? await this.movedNesting(mount, rootReal) : null;
-    const parsed = this.refuseNested(spelled, moved);
-    // A path can also reach a nested mount's directory through a symlink on
-    // its way. No push of this mount writes it there and no read reads it,
-    // so it's refused here, before anything is stored, and the checks where
-    // disk is acted on refuse it again.
-    const refusal = await this.leadsIntoNested(mount, parsed.relativePath, parsed.path, moved ?? this.nestedOf(mount.config.name), rootReal);
+    // Both checks take the nesting the parse found, and the second resolves
+    // where the path lands beneath the root the parse resolved.
+    const { mount, root, moved } = spelled;
+    const parsed = this.refuseNotHeld(spelled, path, false, moved);
+    // A path can also reach a nested mount's directory, or a file this
+    // mount's own include leaves out, through a symlink on its way. No push
+    // of this mount writes it there and no read reads it, so it's refused
+    // here, before anything is stored, and the checks where disk is acted on
+    // refuse it again.
+    const refusal = await this.landingRefusal(mount, parsed.relativePath, parsed.path, moved ?? this.nestedOf(mount.config.name), root);
     if (refusal) throw refusal;
     return parsed;
   }
 
   /**
    * The refusal for a path of `mount` that reaches a nested mount's directory
-   * through a symlink on its way (nestedAtReal), or null where it doesn't. On
-   * a mount that doesn't follow the link, the refusal is the link's own
-   * (linkWords), as the readers and pushes give it. A mount with nothing
-   * nested has nothing to find, so it pays nothing.
+   * through a symlink on its way (nestedAtReal), or a file this mount's own
+   * include leaves out (coversLanding), or, on a mount that follows links
+   * with an include, one realpath can't resolve, or null where it doesn't.
+   * On a mount that doesn't follow the link, the refusal is the link's own
+   * (linkWords), as the readers and pushes give it. On one that does, it
+   * names the nested mount only where the place is that mount's
+   * (namesNestedPlace); anywhere else the place is no mount's, so the path
+   * leaves this one, in the disk readers' words, as it does where it lands
+   * on a file this mount's include leaves out. A mount with nothing nested,
+   * and without both an include and links followed, has nothing to find, so
+   * it pays nothing. A direct mount's file operation passes the nesting and
+   * the root its parse found (`nested`, `root`), so where the path lands is
+   * judged beneath the root that parse resolved.
    */
-  private async leadsIntoNested(mount: MountState, relativePath: string, path: string, nested = this.nestedOf(mount.config.name), root = resolve(mount.config.path)): Promise<Error | null> {
-    if (nested.length === 0) return null;
-    const holder = nestedAtReal(await realBeneath(resolve(root, relativePath)), nested);
-    if (!holder) return null;
+  private async landingRefusal(mount: MountState, relativePath: string, path: string, nested = this.nestedOf(mount.config.name), root = resolve(mount.config.path)): Promise<Error | null> {
+    const judged = mount.config.followSymlinks === true && mount.config.include !== undefined;
+    if (nested.length === 0 && !judged) return null;
+    const unresolved: { code?: string } = {};
+    const real = await realBeneath(resolve(root, relativePath), 0, unresolved);
+    // Where realpath can't resolve the path, as for a loop or a directory
+    // this process can't search, where it lands can't be judged, and a
+    // promise about content fails closed: the path is refused, by every file
+    // operation, in the words a disk read gives a path it can't resolve,
+    // whatever the place realpath stopped short of would say.
+    if (judged && unresolved.code !== undefined) return new WorkspaceReadError('not_found', `Unable to resolve file: ${path}`, 'realpath', unresolved.code);
+    const holder = nestedAtReal(real, nested);
+    if (!holder) {
+      if (!judged) return null;
+      const rootReal = await realBeneath(root);
+      if (!isContainedPath(rootReal, real) || await stat(real).then((info) => info.isDirectory(), () => false)) return null;
+      return await coversLanding({ include: mount.config.include }, rootReal, real, relativePath) ? null : new WorkspaceReadError('escape', `Symlink escape detected: ${path}`, 'realpath');
+    }
     if (mount.config.followSymlinks !== true) {
       const found = await linkOnTheWay({ root: mount.config.path, followSymlinks: false }, relativePath);
-      if (found !== null) return await linkReadError(mount, found, path, nested);
+      if (found !== null) return await linkReadError(mount, found, path, relativePath, nested);
     }
+    // On a mount with an include, the path to use there names each directory
+    // on the place's way as that mount's, so a place beneath anything else
+    // there, such as a file the include leaves out, isn't named; one beneath
+    // a directory not there yet is.
+    const onItsWay = holder.include === undefined
+      || await stat(dirname(real)).then((info) => info.isDirectory(), (err: unknown) => errnoOf(err) === 'ENOENT');
+    const directory = holder.include !== undefined && await stat(real).then((info) => info.isDirectory(), () => false);
+    if (!onItsWay || !namesNestedPlace(holder.rest, holder.include, directory)) return new WorkspaceReadError('escape', `Symlink escape detected: ${path}`, 'realpath');
     return new NestedMountError(path, mount.config.name, holder.name, holder.use, 'leads into');
   }
 
-  /** A parsed path, refused if it lies in a nested mount's directory (parseFilePath), by a call's moved nesting where it has one. */
-  private refuseNested<P extends { mount: MountState; relativePath: string; path: string }>(parsed: P, moved: NestedMount[] | null = null): P {
-    const holder = this.holderOf(parsed.mount.config.name, parsed.relativePath, moved);
+  /**
+   * A parsed path, refused where the mount doesn't hold it: in a nested
+   * mount's directory first, naming the mount that holds it, then outside
+   * the mount's include. Each is judged on the path as the caller parsed it:
+   * as disk spells it for parseFilePath, as given for resolveAbsolutePath,
+   * which is synchronous and says so (`asGiven`, so the nested-mount check
+   * folds where disk does). The include's refusal shows the path as given
+   * (`given`), since it answers the path the caller asked about.
+   */
+  private refuseNotHeld<P extends { mount: MountState; relativePath: string; path: string }>(parsed: P, given: string, asGiven = false, moved: NestedMount[] | null = null): P {
+    const holder = this.holderOf(parsed.mount.config.name, parsed.relativePath, asGiven, moved);
     if (holder) throw new NestedMountError(parsed.path, parsed.mount.config.name, holder.name, holder.use);
+    if (!insideMount(parsed.relativePath, parsed.mount.config.include)) {
+      throw new OutsideIncludeError(given, parsed.mount.config);
+    }
     return parsed;
   }
 
   /**
+   * Whether a mount-relative path names a file, as grep decides what a path
+   * it's given names: for a path the include covers, a file in the
+   * workspace's history, or anything but a directory on disk. Grep takes it
+   * as a directory only when neither side has a file there, and filters what
+   * it finds beneath it by the mount's include. A path the include doesn't
+   * cover names no file of the mount's, whatever disk or history holds
+   * there, so one refusesAsOutside lets through is a directory. A direct
+   * mount has no history: what a run of it as 'chronicle' left in the store
+   * isn't its own, so disk alone decides.
+   */
+  private async namesFile(mount: MountState, relativePath: string): Promise<boolean> {
+    return relativePath !== '' && insideMount(relativePath, mount.config.include) && (
+      (!mount.direct && this.getStore().treeGet(mount.treeStateId, relativePath) !== null) ||
+      await lstat(join(mount.config.path, relativePath)).then((s) => !s.isDirectory(), () => false)
+    );
+  }
+
+  /**
+   * Whether sync, materialize, grep, glob or ls refuses a path it's given as
+   * outside the mount's include. A path the include doesn't cover is a scope
+   * exactly where a listing names a directory: where disk has a directory
+   * reached from the mount's root through directories, with no link among
+   * them, or the workspace's history holds an entry beneath it that's the
+   * mount's own to list (withinIncludes). The one exception is a directory
+   * the ignore list covers, which a listing passes over and which is still a
+   * scope when it's named, since a sync that names it takes in what's there
+   * (#276). Anything else is refused, a file at the path included, which no
+   * scope tool takes up. The walk descends no link it meets. Where covered
+   * history makes a name a scope and disk has since put a link there, a
+   * mount that doesn't follow symlinks refuses the link, as it refuses any
+   * link on a path's way, and on a mount that does, a pass of the scope
+   * follows the link, and its answer shows whether the link leads out of the
+   * mount. A
+   * path in another mount's directory nested in this one is that mount's,
+   * whatever this mount's include says, so it isn't refused here: each tool
+   * names the mount that holds it, as the file operations do, a direct
+   * mount's judged by the nesting its parse found (`moved`, movedNesting). A
+   * direct mount has no history, as namesFile says.
+   */
+  private async refusesAsOutside(mount: MountState, relativePath: string, moved: NestedMount[] | null): Promise<boolean> {
+    if (this.holderOf(mount.config.name, relativePath, false, moved)) return false;
+    if (insideMount(relativePath, mount.config.include)) return false;
+    const own = { include: mount.config.include, nested: this.nestedOf(mount.config.name) };
+    if (!mount.direct && this.getStore().treeList(mount.treeStateId, relativePath + '/')
+      .some((entry) => withinIncludes(own, entry.path))) return false;
+    // A directory, and each directory above it to the mount's root, as the
+    // walk reaches it: through no link, since the walk descends none.
+    const segments = relativePath.split('/');
+    for (let i = 1; i <= segments.length; i++) {
+      const entry = await lstat(join(mount.config.path, ...segments.slice(0, i))).catch(() => null);
+      if (!entry?.isDirectory()) return true;
+    }
+    return false;
+  }
+
+  /**
    * Parse a mount-prefixed path into its mount and mount-relative path, as
-   * disk spells it (diskSpelling), with `path` the mount-prefixed path so
-   * spelled. On a disk that folds names, a path spelled otherwise reaches
-   * disk's file, so every tool takes it by disk's name: one name per file,
-   * and the names its answers give are disk's, except that a path that names
-   * a workspace entry exactly, or does once its directories take disk's
-   * spelling, keeps the entry's spelling. A path the workspace records an
-   * intent at, such as a deletion disk hasn't been given yet, counts as an
-   * entry here, so the calls that settle it reach it. The workspace's
-   * entries (entriesOf) stand in for disk where it has nothing yet, so a
-   * draft has one name too. Neither applies to a path that disk's spelling
-   * puts in a nested mount's directory. A direct mount holds no entries, so
-   * its paths take disk's spelling alone.
+   * disk spells it (diskSpelling). `path` is the mount-prefixed path in that
+   * spelling where it differs from the one spelling, and otherwise the path
+   * as the caller gave it. The path is read in its one spelling first
+   * (parsePathAsGiven), so the respelling only ever sees a path with no
+   * empty, `.` or `..` segment and no separator before its first. On a disk
+   * that folds names, a path spelled otherwise reaches disk's file, so every
+   * tool takes it by disk's name: one name per file, and the names its
+   * answers give are disk's, except that a path that names a workspace entry
+   * exactly, or does once its directories take disk's spelling, keeps the
+   * entry's spelling, and what lies past a link on the way keeps the
+   * caller's, since the step reads nothing past a link. A path the workspace
+   * records an intent at, such as a deletion disk hasn't been given yet,
+   * counts as an entry here, so the calls that settle it reach it. The
+   * workspace's entries (entriesOf) stand in for disk where it has nothing
+   * yet, so a draft has one name too. Neither applies to a path that disk's
+   * spelling puts in a nested mount's directory. A direct mount holds no
+   * entries, so its paths take disk's spelling alone. Past a nested mount's
+   * directory the path stays as given, since what lies there is that mount's
+   * to name. Every answer shows `path`, a name the include leaves out
+   * included, since how disk spells a name the caller gave is no content of
+   * that file, except the include's own refusal, which shows the path
+   * exactly as given (refuseNotHeld), since it answers the path asked about.
    * A handler that must read something at the moment it's asked, as
    * handleSync reads the branch a path sync adopts on, reads it before
-   * calling this, since this awaits disk. The entries are read when the
-   * step needs them, some after those awaits, from the branch current then.
+   * calling this, since this awaits disk. The entries are read when the step
+   * needs them, some after those awaits, from the branch current then.
    */
-  private async parsePath(path: string): Promise<{ mount: MountState; relativePath: string; path: string }> {
+  private async parsePath(path: string): Promise<ParsedPath> {
     const given = this.parsePathAsGiven(path);
-    // A direct mount refuses what a store-backed mount's store refuses as an
-    // invalid tree path, a `.` or `..` segment, which disk would otherwise
-    // take, so neither kind takes a path the other refuses.
-    if (given.mount.direct && given.relativePath.split('/').some((segment) => segment === '.' || segment === '..')) {
-      throw new Error(`Path not taken: ${JSON.stringify(path)} has a "." or ".." segment, which a direct mount doesn't take: give the path from the mount's root without it`);
-    }
-    const relativePath = await diskSpelling(resolve(given.mount.config.path), given.relativePath, given.mount.direct ? undefined : this.entriesOf(given.mount));
+    // A direct mount's root is resolved once here, so the respelling and the
+    // checks of the path that follow take one nesting (movedNesting), and a
+    // file operation's landing is resolved beneath this root.
+    const configured = resolve(given.mount.config.path);
+    const root = given.mount.direct ? await realpath(configured).catch(() => configured) : configured;
+    const moved = given.mount.direct ? await this.movedNesting(given.mount, root) : null;
+    const spelled = await diskSpelling(root, given.relativePath, given.mount.direct ? undefined : this.entriesOf(given.mount));
+    // Past a nested mount's directory the path stays as given: what lies
+    // there is that mount's, whose own include decides what a tool may name,
+    // so this mount doesn't respell it.
+    // The directory itself takes disk's spelling, as a listing names it.
+    // The respelling keeps each segment's place, so the given path's rest
+    // follows the directory's segments.
+    const depth = this.nestedDepth(given.mount.config.name, spelled, moved);
+    const relativePath = depth === undefined ? spelled
+      : [...spelled.split('/').slice(0, depth), ...given.relativePath.split('/').slice(depth)].join('/');
     return {
       mount: given.mount,
       relativePath,
       path: relativePath === given.relativePath ? path : `${given.mount.config.name}/${relativePath}`,
+      root,
+      moved,
     };
+  }
+
+  /**
+   * How many segments the innermost nested mount's directory that holds
+   * `relativePath` has, in a spelling it's known by (othersOf), or, for a
+   * direct mount whose root has moved, in the nesting there (`moved`);
+   * undefined when no nested mount's directory holds it.
+   */
+  private nestedDepth(mountName: string, relativePath: string, moved: NestedMount[] | null = null): number | undefined {
+    let depth: number | undefined;
+    for (const dir of moved?.map((n) => n.dir) ?? this.othersOf(mountName)) {
+      if (relativePath !== dir && !relativePath.startsWith(`${dir}/`)) continue;
+      const segments = dir.split('/').length;
+      if (depth === undefined || segments > depth) depth = segments;
+    }
+    return depth;
   }
 
   /**
@@ -2499,14 +2767,34 @@ export class WorkspaceModule implements Module {
       // given yet or a conflict, is the workspace's own name for the file
       // there, as an entry is, so the calls that settle it reach it.
       has: (path) => store.treeGet(mount.treeStateId, path) !== null || store.treeGet(intents.treeStateId, path) !== null,
-      under: (prefix) => store.treeList(mount.treeStateId, prefix).map((entry) => entry.path),
+      // Only an entry this mount's include covers spells a draft's path
+      // (insideMount): not a key no spelling names, such as `c/` or `a//b.txt`
+      // from an earlier version, nor one the include leaves out, which would
+      // respell a covered draft into a name the include leaves out. An entry
+      // in a nested mount's directory that this mount's include covers
+      // spells one whatever that mount's include says, so on a disk that
+      // folds names, a draft naming the directory in another spelling takes
+      // the entry's spelling and is judged as in it.
+      under: (prefix) => store.treeList(mount.treeStateId, prefix).map((entry) => entry.path).filter((path) => insideMount(path, mount.config.include)),
       holder: (path) => this.holderOf(mount.config.name, path)?.name,
       rootFoldsCase: this.rootFoldsCase.get(mount.config.name) ?? false,
     };
   }
 
   /**
-   * Parse a mount-prefixed path into (mountName, relativePath), as spelled.
+   * Parse a mount-prefixed path into its mount and the one mount-relative
+   * path every later step reads, as given, before disk's spelling
+   * (parsePath): `/` between segments (`\` read as `/` where it's the
+   * platform's separator), with no empty or `.` segment and no trailing `/`,
+   * and '' for the mount's root. So the traversal guard here and every later
+   * step judge one spelling of the path, which parsePath then respells name
+   * by name as disk lists them. A `..` segment takes back the segment before
+   * it, before anything looks the path up, so a mount's include judges the
+   * path every tool acts on, and one with nothing left to take back climbs
+   * above the mount's root and is refused, whatever it reaches afterwards. A
+   * separator straight after the mount's name would make the rest an
+   * absolute path, so that is refused too, and every reader that takes a
+   * path refuses it here, a disk reader included.
    */
   private parsePathAsGiven(path: string): { mount: MountState; relativePath: string } {
     // A file's name on disk is UTF-8, which can't hold a lone surrogate: the
@@ -2516,25 +2804,37 @@ export class WorkspaceModule implements Module {
     }
     const slashIdx = path.indexOf('/');
     const mountName = slashIdx >= 0 ? path.slice(0, slashIdx) : path;
-    const relativePath = slashIdx >= 0 ? path.slice(slashIdx + 1) : '';
+    const given = slashIdx >= 0 ? path.slice(slashIdx + 1) : '';
 
     const mount = this.mounts.get(mountName);
     if (!mount) {
       throw new Error(`Unknown mount: "${mountName}". Available: ${[...this.mounts.keys()].join(', ')}`);
     }
+    const segments = pathSegments(given);
+    if (given.startsWith('/') || (sep === '\\' && given.startsWith('\\'))) {
+      throw new Error(`Path traversal detected: "${path}" has a separator right after mount "${mountName}", which makes it an absolute path: give it from the mount's root.`);
+    }
+    const kept: string[] = [];
+    for (const segment of segments) {
+      if (segment !== '..') kept.push(segment);
+      else if (kept.pop() === undefined) {
+        throw new Error(`Path traversal detected: "${path}" climbs above the root of mount "${mountName}".`);
+      }
+    }
+    const relativePath = kept.join('/');
 
-    // Path traversal guard (CWE-22): ensure resolved path stays within mount.
-    // Containment must compare with the PLATFORM separator (isContainedPath):
-    // resolve() emits backslashes on Windows, so a '/'-suffixed root never
-    // prefix-matches there and every in-mount path was rejected as traversal.
-    // Against the resolved root, so a root configured with a trailing
-    // separator, or relative, contains its own paths, the root included.
+    // Path traversal guard (CWE-22), on the path every later step reads: on
+    // Windows a first segment such as `C:` names another drive. Containment
+    // must compare with the PLATFORM separator (isContainedPath): resolve()
+    // emits backslashes on Windows, so a '/'-suffixed root never prefix-matches
+    // there and every in-mount path was rejected as traversal. Against the
+    // resolved root, so a root configured with a trailing separator, or
+    // relative, contains its own paths, the root included.
     const root = resolve(mount.config.path);
     const resolved = resolve(root, relativePath);
     if (!isContainedPath(root, resolved)) {
       throw new Error(`Path traversal detected: "${path}" resolves outside mount "${mountName}"`);
     }
-
     return { mount, relativePath };
   }
 
@@ -2661,7 +2961,8 @@ export class WorkspaceModule implements Module {
    *    among the directories on its way beneath the mount's root, wherever it
    *    leads (linkOnTheWay), before anything resolves it: as `escape` for a
    *    link leading outside the mount, as `other_mount` for one into a nested
-   *    mount's directory, and as `parent_symlink` for any other.
+   *    mount's directory where its refusal names that mount, and as
+   *    `parent_symlink` for any other.
    * 2. `lstat` the lexical path — refuse directories; refuse a final-component
    *    symlink when the mount does not `followSymlinks`; refuse anything else
    *    that isn't a regular file, such as a FIFO, without opening it.
@@ -2725,7 +3026,7 @@ export class WorkspaceModule implements Module {
     // Every check below judges by the root this read opens under.
     const nested = await this.nestedFor(mount, realMountRoot);
     const onTheWay = await linkOnTheWay(linkView, relativePath, 'parents');
-    if (onTheWay !== null) throw await linkReadError(mount, onTheWay, mountPrefixedPath, nested);
+    if (onTheWay !== null) throw await linkReadError(mount, onTheWay, mountPrefixedPath, relativePath, nested);
 
     let fileInfo: Awaited<ReturnType<typeof lstat>>;
     try {
@@ -2812,14 +3113,23 @@ export class WorkspaceModule implements Module {
       }
 
       // A directory swapped for a link since the walk above is caught here, by
-      // what the path resolved to after the open.
+      // what the path resolved to after the open, and the check below holds
+      // the opened file to that path. A link put back after this realpath,
+      // leading to the opened file itself, passes both: a race this doesn't
+      // close.
       const resolvedThrough = await linkRefusal(linkView, realMountRoot, relativePath, realFilePath);
-      if (resolvedThrough !== null) throw await linkReadError(mount, resolvedThrough, mountPrefixedPath, nested);
+      if (resolvedThrough !== null) throw await linkReadError(mount, resolvedThrough, mountPrefixedPath, relativePath, nested);
 
-      if (!isContainedPath(realMountRoot, realFilePath)) {
+      const inside = isContainedPath(realMountRoot, realFilePath);
+      const holder = inside ? nestedAtReal(realFilePath, nested) : undefined;
+      // A place in a nested mount's directory that its include leaves out is
+      // no mount's, so the path leaves this one (namesNestedPlace), and so
+      // does one reaching a file this mount's own include leaves out
+      // (coversLanding).
+      const own = holder === undefined && inside && !(await coversLanding({ include: mount.config.include }, realMountRoot, realFilePath, relativePath));
+      if (!inside || own || (holder !== undefined && !namesNestedPlace(holder.rest, holder.include, false))) {
         throw new WorkspaceReadError('escape', `Symlink escape detected: ${mountPrefixedPath}`, 'realpath');
       }
-      const holder = nestedAtReal(realFilePath, nested);
       if (holder) throw new WorkspaceReadError('other_mount', leadsInto(mount.config.name, relativePath, holder), 'realpath');
 
       let pathStat: Stats;
@@ -2881,9 +3191,10 @@ export class WorkspaceModule implements Module {
    *   the descriptor that was checked.
    *
    * Throws {@link WorkspaceReadError} with a `code` distinguishing unknown
-   * mount, lexical traversal, a path in another mount's directory nested in
-   * the one named (`other_mount`), unavailable mount, missing or non-regular
-   * file, directory, policy-denied symlink, outside-mount target, and
+   * mount, lexical traversal, a path the mount's include doesn't cover
+   * (`outside_include`), a path in another mount's directory nested in the one named
+   * (`other_mount`), unavailable mount, missing or non-regular file,
+   * directory, policy-denied symlink, outside-mount target, and
    * file-changed-during-read.
    */
   async readFileFromDisk(
@@ -2901,7 +3212,8 @@ export class WorkspaceModule implements Module {
       // A link's refusal (parseFilePath) carries its own code.
       if (err instanceof WorkspaceReadError) throw err;
       const message = err instanceof Error ? err.message : String(err);
-      const code: WorkspaceReadErrorCode = err instanceof NestedMountError ? 'other_mount'
+      const code: WorkspaceReadErrorCode = err instanceof OutsideIncludeError ? 'outside_include'
+        : err instanceof NestedMountError ? 'other_mount'
         : message.startsWith('Unknown mount') ? 'unknown_mount' : 'traversal';
       throw new WorkspaceReadError(code, message, 'parse');
     }
@@ -3876,8 +4188,8 @@ export class WorkspaceModule implements Module {
    * Where an edit's path is in its mount, or why the call can't edit it: a
    * path no mount holds, one outside its mount or holding a lone surrogate
    * (parsePath), one a nested mount holds or that leads into one through a
-   * link (parseFilePath), a path that names its mount's root, one not spelled
-   * plainly, a read-only mount, or for edit_many a generated file. edit's
+   * link (parseFilePath), a path that names its mount's root, a read-only
+   * mount, or for edit_many a generated file. edit's
    * generated file is refused before it gets here, by the same rule
    * (handleToolCall checks a call's `path`, which edit_many's input lacks).
    */
@@ -3888,26 +4200,14 @@ export class WorkspaceModule implements Module {
   ): Promise<{ mount: MountState; relativePath: string; path: string } | Extract<EditProblem, { kind: 'file' }>> {
     const unusable = (text: string) => ({ kind: 'file' as const, edits: [], path, text, whole: true });
     try {
-      // As disk spells it, as every file tool takes its path, and a path in a
-      // mount nested inside this one is that mount's, which every file tool
-      // refuses here (parseFilePath).
+      // In the one spelling every file tool reads, as disk spells it, so two
+      // spellings of a file are one entry and, in one call, one plan
+      // (parsePathAsGiven); and a path in a mount nested inside this one is
+      // that mount's, which every file tool refuses here (parseFilePath).
       const where = await this.parseFilePath(path);
-      // The workspace keeps an entry for each spelling of a path, so a path
-      // with an empty, "." or ".." segment, a trailing separator, or on
-      // Windows a backslash, would be an entry apart from the file's own, and
-      // two spellings in one call two plans of one file. Its plain spelling is
-      // where it resolves in the mount, as the containment check resolves it.
-      // A path whose part in the mount starts with a separator is absolute:
-      // parsePath refuses it where it resolves outside the mount, and this
-      // check where it names a place inside, as not plain. One that resolves
-      // to the mount's root, its bare name included, names no file.
-      const root = resolve(where.mount.config.path);
-      const plain = relative(root, resolve(root, where.relativePath)).split(sep).join('/');
-      if (plain === '') return unusable(`${path} names the root of mount "${where.mount.config.name}", which isn't a file; ls ${where.mount.config.name} lists the files in it.`);
-      if (plain !== where.relativePath) {
-        const named = `${where.mount.config.name}/${plain}`;
-        return unusable(`${path} isn't the plain spelling of its path, and the workspace would keep it as an entry apart from ${named}, the same file on disk; name it ${named}.`);
-      }
+      // One that names the mount's root, its bare name included, names no
+      // file.
+      if (where.relativePath === '') return unusable(`${path} names the root of mount "${where.mount.config.name}", which isn't a file; ls ${where.mount.config.name} lists the files in it.`);
       if (where.mount.config.mode === 'read-only') return unusable(`Mount "${where.mount.config.name}" is read-only`);
       const generated = tool === 'edit_many' ? this.findGeneratedTextFile(path) : undefined;
       if (generated) return unusable(`${path}: ${this.generatedFileRefusal(generated, callerAgentName)}.`);
@@ -4039,17 +4339,24 @@ export class WorkspaceModule implements Module {
     if (!input.path) {
       // List all mounts, with the kind a mount configured direct runs as
       // this session and the ignore list it walks by, whose default no
-      // config shows.
+      // config shows, and each with its include where it has one, so the
+      // files a mount holds show before a path outside them is refused.
       const mounts = [...this.mounts.entries()].map(([name, m]) => ({
         name,
         path: m.config.path,
         mode: m.config.mode,
         ...(m.config.backend === 'direct' ? { backend: m.direct ? 'direct' : 'chronicle', ignore: this.ignoreOf(m) } : {}),
+        ...(m.config.include ? { include: [...m.config.include] } : {}),
       }));
       return { success: true, data: { mounts } };
     }
 
-    const { mount, relativePath, path } = await this.parsePath(input.path);
+    const { mount, relativePath, path, moved } = await this.parsePath(input.path);
+    // A path outside the mount's include that's no scope (refusesAsOutside)
+    // is refused, as glob refuses it, and shown as given.
+    if (await this.refusesAsOutside(mount, relativePath, moved)) {
+      return { success: false, error: new OutsideIncludeError(input.path, mount.config).message, isError: true };
+    }
     input = { ...input, path };
     const recursive = input.recursive === true;
 
@@ -4114,7 +4421,12 @@ export class WorkspaceModule implements Module {
       // anything else takes the mount's turn.
       const dirs = new Set(pass.dirs);
       const prefix = dir ? dir + '/' : '';
+      // History implies a directory only where it's the mount's own to name
+      // (withinIncludes): not history in a nested mount's directory that
+      // that mount's include leaves out.
+      const own = { include: mount.config.include, nested: this.nestedOf(mount.config.name) };
       for (const entry of store.treeList(mount.treeStateId, prefix || undefined)) {
+        if (!withinIncludes(own, entry.path)) continue;
         const slash = entry.path.indexOf('/', prefix.length);
         if (slash >= 0) dirs.add(entry.path.slice(0, slash));
       }
@@ -4178,7 +4490,16 @@ export class WorkspaceModule implements Module {
     // Search across mounts
     const mountsToSearch = input.path
       ? [await this.parsePath(input.path)]
-      : [...this.mounts.values()].map(m => ({ mount: m, relativePath: '' }));
+      : [...this.mounts.values()].map(m => ({ mount: m, relativePath: '', moved: null }));
+    // The path is a directory to search in. One outside the mount's include
+    // that's no scope (refusesAsOutside) is refused, as grep refuses it,
+    // rather than searched and reported as matching nothing.
+    if (input.path) {
+      const { mount, relativePath, moved } = mountsToSearch[0]!;
+      if (await this.refusesAsOutside(mount, relativePath, moved)) {
+        return { success: false, error: new OutsideIncludeError(input.path, mount.config).message, isError: true };
+      }
+    }
 
     // Every match lies beneath the pattern's literal directory, so the walk
     // starts there: past the walk's cap, a walk of the whole scope can stop
@@ -4224,7 +4545,15 @@ export class WorkspaceModule implements Module {
 
     const mountsToSearch = input.path
       ? [await this.parsePath(input.path)]
-      : [...this.mounts.values()].map(m => ({ mount: m, relativePath: '' }));
+      : [...this.mounts.values()].map(m => ({ mount: m, relativePath: '', moved: null }));
+    // A path outside the mount's include that's no scope is refused, as read
+    // refuses it, rather than searched and reported as holding no match.
+    if (input.path) {
+      const { mount, relativePath, moved } = mountsToSearch[0]!;
+      if (await this.refusesAsOutside(mount, relativePath, moved)) {
+        return { success: false, error: new OutsideIncludeError(input.path, mount.config).message, isError: true };
+      }
+    }
 
     type GrepMatch = { line: number; text: string; context?: string[] };
     const results: Array<{ file: string; state?: string; version: GrepText['version']; matches: GrepMatch[] }> = [];
@@ -4248,14 +4577,12 @@ export class WorkspaceModule implements Module {
       return found;
     };
 
-    for (const { mount, relativePath } of mountsToSearch) {
+    for (const { mount, relativePath, moved } of mountsToSearch) {
       // A path named in another mount's directory, as holderOf resolves it,
       // is that mount's: grep searches nothing of this mount's there, and
-      // says whose it is. A direct mount's is judged where its root lies now
-      // (movedNesting).
-      const root = resolve(mount.config.path);
-      const moved = mount.direct && relativePath !== '' ? await this.movedNesting(mount, await realpath(root).catch(() => root)) : null;
-      if (this.holderOf(mount.config.name, relativePath, moved)) {
+      // says whose it is. A direct mount's is judged by the nesting its parse
+      // found where its root lies now (movedNesting).
+      if (this.holderOf(mount.config.name, relativePath, false, moved)) {
         incomplete.push({ path: `${mount.config.name}/${relativePath}`, reason: this.otherMountNote(mount.config.name, relativePath, 'list', moved) });
         continue;
       }
@@ -4310,10 +4637,7 @@ export class WorkspaceModule implements Module {
       // A `path` naming a single file greps just that file; otherwise it is a
       // directory prefix. (A file path once produced the prefix "notes.md/"
       // and silently matched nothing.)
-      const fileScope = relativePath !== '' && (
-        store.treeGet(mount.treeStateId, relativePath) !== null ||
-        await lstat(join(mount.config.path, relativePath)).then((s) => !s.isDirectory(), () => false)
-      );
+      const fileScope = await this.namesFile(mount, relativePath);
       // What follows reads the tree and branch intent to go with the pass's
       // reports, synchronously. They must be the branch the pass decided
       // on: one selected in between would label its content with the other
@@ -4321,8 +4645,10 @@ export class WorkspaceModule implements Module {
       // again, and a branch that keeps changing leaves the scope unsearched.
       //
       // A copy held at a path that now leads into a nested mount's directory
-      // through a link is that mount's file too: read refuses it
-      // (parseFilePath), so grep searches none of it and says why. The pass
+      // through a link is that mount's file too, and one that now lands on a
+      // file this mount's include leaves out is no file of this mount's:
+      // read refuses either (parseFilePath), so grep searches none of it and
+      // says why. The pass
       // can't check such a path's disk, so only an unverified one can be
       // one. Asking awaits disk, so it's done before the branch is
       // compared, and a branch selected meanwhile runs the pass again.
@@ -4335,7 +4661,7 @@ export class WorkspaceModule implements Module {
         const asked = new Map<string, string>();
         for (const report of next.reports.values()) {
           if (report.state !== 'unverified') continue;
-          const refusal = await this.leadsIntoNested(mount, report.path, `${mount.config.name}/${report.path}`);
+          const refusal = await this.landingRefusal(mount, report.path, `${mount.config.name}/${report.path}`);
           if (refusal) asked.set(report.path, refusal.message);
         }
         if (next.branchId === undefined || next.branchId === store.currentBranch().id) {
@@ -4428,7 +4754,7 @@ export class WorkspaceModule implements Module {
     each: (text: GrepText) => void,
   ): Promise<{ skipped: GrepSkip[]; incomplete: Array<{ path: string; reason: string }> }> {
     const name = mount.config.name;
-    const fileScope = relativePath !== '' && await lstat(join(mount.config.path, relativePath)).then((s) => !s.isDirectory(), () => false);
+    const fileScope = await this.namesFile(mount, relativePath);
     const { view, rootReal, taken, incomplete } = fileScope
       ? { ...(await this.diskView(mount)), taken: [relativePath], incomplete: [] }
       : await this.diskWalk(mount, start, true);
@@ -4465,7 +4791,11 @@ export class WorkspaceModule implements Module {
         status[name] = { path: mount.config.path, mode: mount.config.mode, backend: 'direct', ignore: this.ignoreOf(mount) };
         continue;
       }
-      const entries = store.treeList(mount.treeStateId);
+      // What the workspace's history holds outside the mount's include isn't the mount's,
+      // and nor is what it holds in a nested mount's directory that mount's include leaves
+      // out (withinIncludes), which no listing names either.
+      const listable = { include: mount.config.include, nested: this.nestedOf(name) };
+      const entries = store.treeList(mount.treeStateId).filter((e) => withinIncludes(listable, e.path));
       const currentSeq = store.currentSequence();
       const { conflicts: conflictPaths, deletions: deletionPaths, owed } = this.heldChanges(mount);
       const pending = new Set([...conflictPaths, ...deletionPaths, ...owed]);
@@ -4510,11 +4840,15 @@ export class WorkspaceModule implements Module {
    * no change disk lacks, and its entry is judged by the evidence as any
    * other is. The fourth, intents that can't be read, may hold a deletion
    * or a conflict, so a mount configured direct counts them too (initStore).
+   * Each lies where the mount's include covers, as status counts them: what
+   * the workspace's history holds outside it is no change of the mount's,
+   * and no push writes it to disk (pushUnlocked).
    */
   private heldChanges(mount: MountState): { conflicts: string[]; deletions: string[]; owed: string[]; unreadable: string[] } {
     const store = this.getStore();
     const own = this.ownPaths(mount);
-    const intents = this.intents.get(mount.config.name)!.list().filter(([p]) => own(p));
+    // What the workspace's history holds outside the mount's include isn't the mount's.
+    const intents = this.intents.get(mount.config.name)!.list().filter(([p]) => insideMount(p, mount.config.include) && own(p));
     return {
       conflicts: intents.filter(([, bi]) => bi.conflict).map(([p]) => p),
       deletions: intents.filter(([p, bi]) => bi.tombstone && !store.treeGet(mount.treeStateId, p)).map(([p]) => p),
@@ -4552,18 +4886,23 @@ export class WorkspaceModule implements Module {
     // A tombstone is a deletion only where its entry is gone: one beside an
     // entry that's still there, left by a change that stopped partway
     // (commitToolChanges), would select an agreed entry, and a forced push
-    // would write it over a newer disk copy.
-    for (const [p, bi] of intents) if (bi.conflict || (bi.tombstone && !store.treeGet(mount.treeStateId, p))) selected.add(p);
+    // would write it over a newer disk copy. A deletion or conflict held
+    // outside the mount's include isn't the mount's, as status counts it:
+    // not taken up, so not reported skipped.
+    for (const [p, bi] of intents) {
+      if ((bi.conflict || (bi.tombstone && !store.treeGet(mount.treeStateId, p))) && insideMount(p, mount.config.include)) selected.add(p);
+    }
     return { paths: [...selected], inPlace: agreed > 0 };
   }
 
   /**
    * Whether a path of the mount is its own to push and to count as owed:
    * not in another mount's directory nested in it. Copies the mount's tree
-   * holds there (stored before the nesting) stay in its history and its
-   * listings (and in status's fileCount, which counts the tree), passed over
-   * by its syncs, and left out of what it pushes and of status's pending
-   * changes, conflicts and workspace deletions.
+   * holds there (stored before the nesting) stay in its history, and in its
+   * listings and status's fileCount where that mount's include covers them
+   * (withinIncludes). Its syncs pass over them, and
+   * they're left out of what it pushes and of status's pending changes,
+   * conflicts and workspace deletions.
    */
   private ownPaths(mount: MountState): (path: string) => boolean {
     const others = this.othersOf(mount.config.name);
@@ -4592,7 +4931,9 @@ export class WorkspaceModule implements Module {
     let agreed = 0;
     const own = this.ownPaths(mount);
     for (const e of store.treeList(mount.treeStateId)) {
-      if (!own(e.path)) continue;
+      // Outside the mount's include, or in another mount's directory nested
+      // in it: neither owed to disk nor counted as on it.
+      if (!insideMount(e.path, mount.config.include) || !own(e.path)) continue;
       const p = agreement.get(name, e.path);
       if (p === undefined) (intents.get(e.path)?.origin === 'store' ? owed : unchecked).push(e.path);
       else if (p.kind !== 'content' || p.hash !== e.blobHash) owed.push(e.path);
@@ -4613,7 +4954,16 @@ export class WorkspaceModule implements Module {
     const modesKept: Array<{ mount: string; path: string; reason: string }> = [];
 
     let explicit: { mount: MountState; relativePath: string } | null = null;
-    if (input.path) explicit = await this.parsePath(input.path);
+    if (input.path) {
+      const parsed = await this.parsePath(input.path);
+      explicit = parsed;
+      // A path outside the mount's include that's no scope (refusesAsOutside)
+      // is refused; beneath a directory, the push leaves out what the include
+      // doesn't cover.
+      if (await this.refusesAsOutside(parsed.mount, parsed.relativePath, parsed.moved)) {
+        return { success: false, error: new OutsideIncludeError(input.path, explicit.mount.config).message, isError: true };
+      }
+    }
 
     let mountsToMaterialize: Array<{ name: string; mount: MountState }>;
     if (explicit) {
@@ -4639,6 +4989,10 @@ export class WorkspaceModule implements Module {
     // whatever branch is current when its turn comes, unguarded. The push
     // then writes nothing if the branch changes after that.
     const blocked: Array<{ mount: string; reason: string }> = [];
+    // What the push left because the mount's include doesn't cover it is
+    // counted, as a sync's passedOver counts it, and not named: no tool names
+    // a file outside the include.
+    const passedOver: Array<{ mount: string; reason: string; count: number }> = [];
     const guarded: string[] = [];
     let proceeded = 0;
 
@@ -4684,10 +5038,13 @@ export class WorkspaceModule implements Module {
       for (const p of pushed.pendingDeletions) pendingDeletions.push({ mount: name, path: p });
       // Refusals ride the same skipped list as branch blocks: divergence must
       // be visible, not resolved silently either way.
+      let outside = 0;
       for (const s of pushed.skipped) {
+        if (s.reason === OUTSIDE_INCLUDE) { outside++; continue; }
         const reason = s.reason === NOT_PUSHED_IN_OTHER_MOUNT ? this.otherMountNote(name, s.path, 'push') : s.reason;
         blocked.push({ mount: name, reason: `${s.path}: ${reason}` });
       }
+      if (outside > 0) passedOver.push({ mount: name, reason: OUTSIDE_INCLUDE, count: outside });
       // Written paths whose mode stayed as disk had it: no refusal, so not
       // among what was skipped.
       for (const k of pushed.modesKept) modesKept.push({ mount: name, ...k });
@@ -4733,6 +5090,7 @@ export class WorkspaceModule implements Module {
           }
           : {}),
         ...(blocked.length > 0 ? { skipped: blocked } : {}),
+        ...(passedOver.length > 0 ? { passedOver } : {}),
         ...(modesKept.length > 0 ? { modesKept } : {}),
       },
       // What disk lost, then what it was written: kept in the stub if the
@@ -4799,7 +5157,13 @@ export class WorkspaceModule implements Module {
     // A path names its own mount; otherwise the given mount, or every mount.
     let targets: Array<{ name: string; mount: MountState; relativePath: string }>;
     if (input.path) {
-      const { mount, relativePath } = await this.parsePath(input.path);
+      const { mount, relativePath, moved } = await this.parsePath(input.path);
+      // A path outside the mount's include that's no scope (refusesAsOutside)
+      // is refused; beneath a directory, the walk passes over what the include
+      // doesn't cover.
+      if (await this.refusesAsOutside(mount, relativePath, moved)) {
+        return { success: false, error: new OutsideIncludeError(input.path, mount.config).message, isError: true };
+      }
       targets = [{ name: mount.config.name, mount, relativePath }];
     } else if (input.mount) {
       const m = this.mounts.get(input.mount);
@@ -4954,11 +5318,14 @@ export class WorkspaceModule implements Module {
    * The watcher's ops only choose which paths to look at: each path is
    * observed again and decided under the three-way rule, so an event that
    * arrives late or out of order can't delete or revert anything by itself.
+   * A path outside the mount (insideMount), such as one its include doesn't
+   * cover, is no pass's to decide (gather), so a batch of nothing else takes
+   * no turn of the mount.
    */
   private async handleFsChanges(mountName: string, changes: FsChange[]): Promise<void> {
     const mount = this.mounts.get(mountName);
     if (!this.store || !this.running() || !mount) return;
-    const paths = [...new Set(changes.map((c) => c.path))];
+    const paths = [...new Set(changes.map((c) => c.path))].filter((p) => insideMount(p, mount.config.include));
     if (paths.length === 0) return;
     await this.withMount(mount, () => this.passUnlocked(mount, { kind: 'paths', paths }));
   }
@@ -5233,11 +5600,6 @@ const UNREADABLE_INTENT = "its workspace intent can't be read; a sync of the pat
  */
 function watchOf(config: MountConfig): 'always' | 'on-agent-action' | 'never' {
   return config.watch ?? (config.backend === 'direct' ? 'never' : 'always');
-}
-
-/** A config value for a refusal: a number as JavaScript writes it (JSON would say null for NaN), anything else as JSON. */
-function shownValue(value: unknown): string {
-  return typeof value === 'number' ? String(value) : typeof value === 'bigint' ? `${value}n` : JSON.stringify(value) ?? String(value);
 }
 
 /**
