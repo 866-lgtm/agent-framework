@@ -842,6 +842,8 @@ export class WorkspaceModule implements Module {
   private otherMounts = new Map<string, NestedMountEntry[]>();
   /** Whether each mount's root folds case (foldsCase), where disk has it, as the last start read it. */
   private rootFoldsCase = new Map<string, boolean>();
+  /** Where the last start placed each mount's root (readNesting's `reals`). */
+  private placedRoots = new Map<string, string>();
   /**
    * Whether a file's mode is observed, taken in and applied (MountRuntime's
    * `modesObserved`): not on Windows, which reports no POSIX modes. A test
@@ -1071,9 +1073,12 @@ export class WorkspaceModule implements Module {
    * that against (MountConfig.backend), and its root as realpath resolves it,
    * or as given where that fails, as a pass's runtime takes it.
    */
-  private async diskView(mount: MountState): Promise<{ view: MountView; rootReal: string }> {
+  private async diskView(mount: MountState): Promise<{ view: MountView; rootReal: string; moved: NestedMount[] | null }> {
     const root = resolve(mount.config.path);
-    return { view: this.viewOf(mount, undefined), rootReal: await realpath(root).catch(() => root) };
+    const rootReal = await realpath(root).catch(() => root);
+    const view = this.viewOf(mount, undefined);
+    const moved = await this.movedNesting(mount, rootReal);
+    return { view: moved === null ? view : { ...view, nested: moved, others: moved.map((n) => n.dir) }, rootReal, moved };
   }
 
   /** The view reconciliation needs of a mount, refreshed per pass. */
@@ -1172,6 +1177,7 @@ export class WorkspaceModule implements Module {
     if (this.stopsBegun !== stops) return;
     this.otherMounts = nesting;
     this.rootFoldsCase = rootFoldsCase;
+    this.placedRoots = reals;
 
     this.ctx = ctx;
     this.stopped = false;
@@ -1435,10 +1441,12 @@ export class WorkspaceModule implements Module {
       ? `Mount "${mounts[0]![0]}" holds ${counted(mounts[0]![1])}`
       : `Mounts ${each.slice(0, -1).join(', ')} and ${each[each.length - 1]} hold`;
     const held = mounts.flatMap(([name, paths]) => paths.map((h) => `"${name}/${h.path}" (${h.what})`));
-    // Materialize doesn't settle an intent the workspace can't read, so the
-    // ways out say so wherever one is held, past the ten paths named too.
+    // Materialize settles an intent the workspace can't read only where the
+    // workspace holds a copy there, and says nothing of one it doesn't, so
+    // the ways out say what does wherever one is held, past the ten paths
+    // named too.
     const intents = mounts.some(([, paths]) => paths.some((h) => h.what === UNREADABLE_INTENT))
-      ? "Only a sync settles an intent it can't read. "
+      ? "Sync the path of an intent it can't read. "
       : '';
     const message = (one
       ? "A mount configured direct runs as 'chronicle' this session. To start it direct, settle each held change, then start it again: "
@@ -1961,6 +1969,10 @@ export class WorkspaceModule implements Module {
    * path for resolution-only purposes (write targets, nonexistent paths,
    * display); for reading file content, use {@link readFileFromDisk}, which
    * enforces the mount's `followSymlinks` policy and canonical containment.
+   * It judges other mounts' directories by where the last start placed them,
+   * so for a direct mount whose root has moved since, it can differ from
+   * `readFileFromDisk`, which takes the nesting where the root lies now
+   * (movedNesting), about which paths lie in another mount's directory.
    *
    * @deprecated for direct filesystem reads — call `readFileFromDisk()`.
    */
@@ -2278,18 +2290,89 @@ export class WorkspaceModule implements Module {
   }
 
   /**
+   * The mounts nested in `mount` as a call of it that resolved its root to
+   * `rootReal` sees them: movedNesting where that differs from where the
+   * last start placed it, the start's placement (nestedOf) otherwise.
+   */
+  private async nestedFor(mount: MountState, rootReal: string): Promise<NestedMount[]> {
+    return (await this.movedNesting(mount, rootReal)) ?? this.nestedOf(mount.config.name);
+  }
+
+  /**
+   * The mounts nested in a direct mount whose root a check resolved to
+   * `rootReal`, where that's elsewhere than the last start placed it, as when
+   * a link it's configured through is repointed; null where the start's
+   * placement holds, or where nothing is at `rootReal`, whose read says so. A
+   * direct mount reads beneath whatever directory is at its root, so each
+   * check judges a path by the root it resolved: a file tool's parse resolves
+   * it once for both its checks, and a read, a walk and grep's check of a
+   * path it's given each resolve it for themselves, so a root repointed
+   * during a call can only have a later check refuse what an earlier one let
+   * through. A mount configured beneath its configured path lies where that
+   * path now leads, as a start would place it: at its configured directory,
+   * and where that directory resolves beneath `rootReal` (realBeneath), its
+   * real root, each also as disk spells it (diskSpelling). Any other mount
+   * lies where the last start placed it, and is nested where that lies
+   * beneath `rootReal`. It resolves nothing but directories beneath this
+   * mount's own root, so a share elsewhere that doesn't answer holds only its
+   * own calls, unless such a directory is a link into it, where that mount's
+   * files lie. What it leaves to the next start: a mount configured elsewhere
+   * whose own root has moved since, as by a second link repointed, that
+   * mount's spellings through other links, and the other mounts' own
+   * placements, so a direct root moved into another mount's directory is
+   * that mount's too, as a nested mount's root moved while running stays
+   * placed.
+   */
+  private async movedNesting(mount: MountState, rootReal: string): Promise<NestedMount[] | null> {
+    const placed = this.placedRoots.get(mount.config.name);
+    if (!mount.direct || placed === undefined || placed === rootReal) return null;
+    if (!(await stat(rootReal).then(() => true, () => false))) return null;
+    const outerPath = resolve(mount.config.path);
+    const nested: NestedMount[] = [];
+    // A real root that holds this mount's own would claim its every path, so
+    // such a mount is nested by its directories alone, as a start nests it.
+    const at = (dir: string, name: string, real: string): NestedMount => (isContainedPath(real, rootReal) ? { dir, name } : { dir, name, real });
+    for (const inner of this.config.mounts) {
+      if (inner.name === mount.config.name) continue;
+      const configured = nestedDir(outerPath, resolve(inner.path));
+      if (configured !== undefined) {
+        const real = await realBeneath(join(rootReal, ...configured.split('/')));
+        nested.push(at(configured, inner.name, real));
+        const there = nestedDir(rootReal, real);
+        if (there !== undefined && there !== configured) nested.push(at(there, inner.name, real));
+        continue;
+      }
+      const real = this.placedRoots.get(inner.name);
+      const fromStart = real === undefined ? undefined : nestedDir(rootReal, real);
+      if (fromStart !== undefined) nested.push(at(fromStart, inner.name, real!));
+    }
+    // Each directory as disk spells it too, as a start adds it, so a path
+    // parsePath has respelled is judged on a disk that folds names.
+    for (const n of [...nested]) {
+      const dir = await diskSpelling(rootReal, n.dir);
+      if (!nested.some((m) => m.name === n.name && m.dir === dir)) nested.push({ ...n, dir });
+    }
+    return nested;
+  }
+
+  /**
    * The innermost mount nested in `mountName` whose directory holds a path
    * of that mount, judged lexically where the path lands (`.`, `..` and
    * repeated separators resolved, as for the traversal guard; a link of the
    * outer mount isn't followed), with the path to use there; undefined when
    * no nested mount's directory holds it.
    */
-  private holderOf(mountName: string, relativePath: string): { name: string; use: string } | undefined {
+  private holderOf(mountName: string, relativePath: string, moved: NestedMount[] | null = null): { name: string; use: string } | undefined {
     const mount = this.mounts.get(mountName);
     if (!mount) return undefined;
     const resolved = resolve(mount.config.path, relativePath);
-    const holder = (this.otherMounts.get(mountName) ?? [])
-      .flatMap((o) => o.spellings.filter((s) => isContainedPath(s.root, resolved)).map((s) => ({ name: o.name, root: s.root })))
+    // A direct mount whose root a call found moved is judged by that call's
+    // nesting (movedNesting), each directory beneath its configured path.
+    const spelled = moved !== null
+      ? moved.map((n) => ({ name: n.name, root: join(resolve(mount.config.path), ...n.dir.split('/')) }))
+      : (this.otherMounts.get(mountName) ?? []).flatMap((o) => o.spellings.map((s) => ({ name: o.name, root: s.root })));
+    const holder = spelled
+      .filter((s) => isContainedPath(s.root, resolved))
       .sort((a, b) => b.root.length - a.root.length)[0];
     if (!holder) return undefined;
     const rest = relative(holder.root, resolved).split(sep).join('/');
@@ -2301,8 +2384,8 @@ export class WorkspaceModule implements Module {
    * mount and the path to use: for a sync or a push, which of them leaves
    * it; for a listing, whose the path is.
    */
-  private otherMountNote(mountName: string, relativePath: string, by: 'sync' | 'push' | 'list'): string {
-    const holder = this.holderOf(mountName, relativePath);
+  private otherMountNote(mountName: string, relativePath: string, by: 'sync' | 'push' | 'list', moved: NestedMount[] | null = null): string {
+    const holder = this.holderOf(mountName, relativePath, moved);
     const what = by === 'sync' ? ', which no sync of this mount takes in' : by === 'push' ? ', which no push of this mount writes' : '';
     return holder
       ? `it lies in mount "${holder.name}", nested in this one${what}: use "${holder.use}"`
@@ -2323,12 +2406,18 @@ export class WorkspaceModule implements Module {
     if (spelled.mount.direct && spelled.relativePath.endsWith('/')) {
       throw new Error(`Path not taken: ${JSON.stringify(path)} ends with "/", which a direct mount's file operations don't take: give the file's path without it`);
     }
-    const parsed = this.refuseNested(spelled);
+    // A direct mount's root is resolved once here, so both checks below
+    // judge the path by one root and its nesting (movedNesting).
+    const mount = spelled.mount;
+    const root = resolve(mount.config.path);
+    const rootReal = mount.direct ? await realpath(root).catch(() => root) : root;
+    const moved = mount.direct ? await this.movedNesting(mount, rootReal) : null;
+    const parsed = this.refuseNested(spelled, moved);
     // A path can also reach a nested mount's directory through a symlink on
     // its way. No push of this mount writes it there and no read reads it,
     // so it's refused here, before anything is stored, and the checks where
     // disk is acted on refuse it again.
-    const refusal = await this.leadsIntoNested(parsed.mount, parsed.relativePath, parsed.path);
+    const refusal = await this.leadsIntoNested(mount, parsed.relativePath, parsed.path, moved ?? this.nestedOf(mount.config.name), rootReal);
     if (refusal) throw refusal;
     return parsed;
   }
@@ -2340,10 +2429,9 @@ export class WorkspaceModule implements Module {
    * (linkWords), as the readers and pushes give it. A mount with nothing
    * nested has nothing to find, so it pays nothing.
    */
-  private async leadsIntoNested(mount: MountState, relativePath: string, path: string): Promise<Error | null> {
-    const nested = this.nestedOf(mount.config.name);
+  private async leadsIntoNested(mount: MountState, relativePath: string, path: string, nested = this.nestedOf(mount.config.name), root = resolve(mount.config.path)): Promise<Error | null> {
     if (nested.length === 0) return null;
-    const holder = nestedAtReal(await realBeneath(resolve(mount.config.path, relativePath)), nested);
+    const holder = nestedAtReal(await realBeneath(resolve(root, relativePath)), nested);
     if (!holder) return null;
     if (mount.config.followSymlinks !== true) {
       const found = await linkOnTheWay({ root: mount.config.path, followSymlinks: false }, relativePath);
@@ -2352,9 +2440,9 @@ export class WorkspaceModule implements Module {
     return new NestedMountError(path, mount.config.name, holder.name, holder.use, 'leads into');
   }
 
-  /** A parsed path, refused if it lies in a nested mount's directory (parseFilePath). */
-  private refuseNested<P extends { mount: MountState; relativePath: string; path: string }>(parsed: P): P {
-    const holder = this.holderOf(parsed.mount.config.name, parsed.relativePath);
+  /** A parsed path, refused if it lies in a nested mount's directory (parseFilePath), by a call's moved nesting where it has one. */
+  private refuseNested<P extends { mount: MountState; relativePath: string; path: string }>(parsed: P, moved: NestedMount[] | null = null): P {
+    const holder = this.holderOf(parsed.mount.config.name, parsed.relativePath, moved);
     if (holder) throw new NestedMountError(parsed.path, parsed.mount.config.name, holder.name, holder.use);
     return parsed;
   }
@@ -2634,8 +2722,10 @@ export class WorkspaceModule implements Module {
     // directories on the way, wherever it leads. Asked again of the path's
     // resolution after the open, below.
     const linkView = { root: mount.config.path, followSymlinks: follow };
+    // Every check below judges by the root this read opens under.
+    const nested = await this.nestedFor(mount, realMountRoot);
     const onTheWay = await linkOnTheWay(linkView, relativePath, 'parents');
-    if (onTheWay !== null) throw await linkReadError(mount, onTheWay, mountPrefixedPath, this.nestedOf(mount.config.name));
+    if (onTheWay !== null) throw await linkReadError(mount, onTheWay, mountPrefixedPath, nested);
 
     let fileInfo: Awaited<ReturnType<typeof lstat>>;
     try {
@@ -2724,12 +2814,12 @@ export class WorkspaceModule implements Module {
       // A directory swapped for a link since the walk above is caught here, by
       // what the path resolved to after the open.
       const resolvedThrough = await linkRefusal(linkView, realMountRoot, relativePath, realFilePath);
-      if (resolvedThrough !== null) throw await linkReadError(mount, resolvedThrough, mountPrefixedPath, this.nestedOf(mount.config.name));
+      if (resolvedThrough !== null) throw await linkReadError(mount, resolvedThrough, mountPrefixedPath, nested);
 
       if (!isContainedPath(realMountRoot, realFilePath)) {
         throw new WorkspaceReadError('escape', `Symlink escape detected: ${mountPrefixedPath}`, 'realpath');
       }
-      const holder = nestedAtReal(realFilePath, this.nestedOf(mount.config.name));
+      const holder = nestedAtReal(realFilePath, nested);
       if (holder) throw new WorkspaceReadError('other_mount', leadsInto(mount.config.name, relativePath, holder), 'realpath');
 
       let pathStat: Stats;
@@ -3997,13 +4087,13 @@ export class WorkspaceModule implements Module {
   private async diskWalk(mount: MountState, dir: string, recursive: boolean): Promise<{
     view: MountView; rootReal: string; taken: string[]; dirs: string[]; incomplete: Array<{ path: string; reason: string }>;
   }> {
-    const { view, rootReal } = await this.diskView(mount);
+    const { view, rootReal, moved } = await this.diskView(mount);
     const walk = await walkScope(view, rootReal, dir, recursive, mount.config.walkCap ?? WALK_CAP, { named: true });
     const incomplete = walk.incomplete
       .filter((region) => region.kind === 'error' || region.kind === 'cap' || (region.kind === 'ignored' && region.path === dir && dir !== ''))
       .map((region) => ({
         path: region.path,
-        reason: region.reason === OTHER_MOUNT ? this.otherMountNote(mount.config.name, region.path, 'list') : region.reason,
+        reason: region.reason === OTHER_MOUNT ? this.otherMountNote(mount.config.name, region.path, 'list', moved) : region.reason,
       }));
     return {
       view,
@@ -4096,9 +4186,12 @@ export class WorkspaceModule implements Module {
     for (const { mount, relativePath } of mountsToSearch) {
       // A path named in another mount's directory, as holderOf resolves it,
       // is that mount's: grep searches nothing of this mount's there, and
-      // says whose it is.
-      if (this.holderOf(mount.config.name, relativePath)) {
-        incomplete.push({ path: `${mount.config.name}/${relativePath}`, reason: this.otherMountNote(mount.config.name, relativePath, 'list') });
+      // says whose it is. A direct mount's is judged where its root lies now
+      // (movedNesting).
+      const root = resolve(mount.config.path);
+      const moved = mount.direct && relativePath !== '' ? await this.movedNesting(mount, await realpath(root).catch(() => root)) : null;
+      if (this.holderOf(mount.config.name, relativePath, moved)) {
+        incomplete.push({ path: `${mount.config.name}/${relativePath}`, reason: this.otherMountNote(mount.config.name, relativePath, 'list', moved) });
         continue;
       }
       // A `path` and a filter whose directories don't overlap leave no file
@@ -5051,11 +5144,14 @@ const DIRECT_ROOT_REPLACED = 'the mount root was replaced as the file was opened
 
 /**
  * How the alert that a mount configured direct runs as 'chronicle' names an
- * intent the workspace can't read: materialize doesn't select one with no
- * workspace entry, or settle one with an entry, and a sync of its path
- * replaces it where it can read disk's copy.
+ * intent the workspace can't read. A sync of its path settles it, with
+ * disk's copy, or with none where disk has none, and where disk's file
+ * can't be read it skips the path and says why. Materialize settles one
+ * only where the workspace holds a copy there: a plain one skips it and says
+ * to sync, a forced one writes the copy, and where the workspace holds none
+ * it neither selects nor names it.
  */
-const UNREADABLE_INTENT = "its workspace intent can't be read, and only a sync of the path settles it";
+const UNREADABLE_INTENT = "its workspace intent can't be read; a sync of the path settles it or says why not";
 
 /**
  * A mount's watch mode as it runs. A mount configured direct watches

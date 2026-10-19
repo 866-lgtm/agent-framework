@@ -29,8 +29,9 @@ export interface MountConfig {
    *   runs, so no call waits behind one, and `sync`, `materialize` and the
    *   watch settings have nothing to act on. Only with `mode: 'read-only'`,
    *   and not with `watch` other than 'never', `watchDebounceMs`,
-   *   `watchRootPollMs`, `wakeOnChange` or `autoMaterialize`: each of those
-   *   would never act, and the workspace refuses the mount. Its `ignore`
+   *   `watchRootPollMs`, a `wakeOnChange` that would wake (true, or a
+   *   non-empty list) or `autoMaterialize: true`: each of those would never
+   *   act, and the workspace refuses the mount. Its `ignore`
    *   has a default (see there). Paths, links, other mounts' directories,
    *   size limits and the walk cap hold as on a 'chronicle' mount. Its
    *   tools, and the host's reads of its files, refuse a path with a `.` or
@@ -39,7 +40,14 @@ export interface MountConfig {
    *   a generated file is answered, and `resolveAbsolutePath` maps a path,
    *   as on any mount. Its tools read beneath whatever directory is at its
    *   root, with no check against the one a 'chronicle' run of it last
-   *   agreed with.
+   *   agreed with. Where that root now lies elsewhere than the last start
+   *   placed it, each call nests in it, as a start would now, every mount
+   *   configured beneath its path, where that path leads beneath its root,
+   *   and every other mount whose root, as that start placed it, lies
+   *   beneath where its root lies now. A mount configured elsewhere whose
+   *   own root has moved since, and the other mounts' own placements, wait
+   *   for the next start, so a direct root moved into another mount's
+   *   directory is still that mount's too.
    *
    * A mount configured 'direct' runs as 'chronicle' from a start that finds
    * the store holding changes there that disk lacks, on the branch selected
