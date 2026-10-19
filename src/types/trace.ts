@@ -1,3 +1,4 @@
+import type { ThinkingBindingEntry } from '@animalabs/membrane';
 import type { ProcessEvent } from './events.js';
 import type { ModuleProcessResponse } from './framework.js';
 import type { SessionUsage } from '../usage/types.js';
@@ -193,6 +194,19 @@ export type TraceEvent =
       type: 'inference:usage';
       agentName: string;
       tokenUsage: { input: number; output: number; cacheCreation?: number; cacheRead?: number };
+      /**
+       * The signed thinking this call sent that failed the provider's binding
+       * check, as the provider reported it (membrane's `RoundReport.thinking`):
+       * blocks it dropped before the model saw them, and blocks it showed the
+       * model anyway because the check isn't enforced. The provider reports
+       * them for a request that carried the binding control, as
+       * `thinkingBinding.dropBlock` sends it. Present only when the report
+       * names any block.
+       */
+      thinking?: {
+        dropped: ThinkingBindingEntry[];
+        mismatchAllowed: ThinkingBindingEntry[];
+      };
     })
   | (TraceEventBase & {
       type: 'inference:stream_resumed';

@@ -167,6 +167,38 @@ export interface AgentConfig {
     display?: 'summarized' | 'omitted';
   };
   /**
+   * How the provider binds this agent's signed thinking to the conversation
+   * before it. A host sets it from what it knows of the agent's model and
+   * route.
+   */
+  thinkingBinding?: {
+    /**
+     * Ask the provider to drop a signed thinking block whose earlier
+     * conversation has changed, as a fold changes it, rather than refuse the
+     * request. An account that enforces the binding otherwise answers such a
+     * request with a 400. One that doesn't drops those blocks itself, so there
+     * the model sees nothing different, and the report is what's new.
+     *
+     * It's sent as `thinking.block_binding.prefix_mismatch_behavior:
+     * "drop_block"` with the `thinking-binding-controls-2026-08-01` beta,
+     * which membrane's Anthropic and Bedrock adapters carry. On any other
+     * adapter it does nothing, so a host should refuse it there. On a model
+     * whose thinking is always on (Fable, Mythos), membrane carries it in an
+     * adaptive thinking config whatever `thinking.enabled` says; on any other
+     * model, only in the thinking config it sends while thinking is on.
+     * Opus 5.5, Haiku 5.5, Sonnet 5.5, Sonnet 5, Fable 5 and Fable 5.1
+     * accepted the config on 2026-10-18; Mythos hasn't been tried.
+     *
+     * Each call's report of the blocks the provider dropped goes to the
+     * `inference:usage` trace, and that call is left out of the context
+     * strategy's calibration, since the provider doesn't bill a block it
+     * dropped and the strategy still counts it.
+     *
+     * Default false: nothing is sent, and the account's default applies.
+     */
+    dropBlock?: boolean;
+  };
+  /**
    * How to handle a model content-policy refusal (`stop_reason: refusal`).
    * When `autoRewind` is on, a refused turn triggers an automatic rewind: the
    * framework redacts the triggering turn (the tool result or message that

@@ -20493,11 +20493,20 @@ export class AgentFramework {
             // agent's samples can fall out of its band for good
             // (context-manager #323). A strategy from before then ignores
             // the second argument.
+            // A call whose report names thinking the provider dropped billed
+            // less than the request held: the strategy still counts those
+            // blocks, so the call's ratio would pull its calibration low. It
+            // keeps its last value until drops stop, since what it tracks is
+            // the tokenizer's drift, which a dropped block doesn't move.
+            const thinkingReport = event.round?.thinking;
+            const thinkingDropped = (thinkingReport?.dropped.length ?? 0) > 0;
             try {
-              strat?.reportRealInputTokens?.(
-                realTotal,
-                compiledRequest ? { system: compiledRequest.system, tools: compiledRequest.tools } : undefined,
-              );
+              if (!thinkingDropped) {
+                strat?.reportRealInputTokens?.(
+                  realTotal,
+                  compiledRequest ? { system: compiledRequest.system, tools: compiledRequest.tools } : undefined,
+                );
+              }
             } catch { /* calibration is best-effort */ }
 
             const kvSubmission = takeKvSubmission?.();
@@ -20525,6 +20534,9 @@ export class AgentFramework {
                 cacheCreation: event.usage.cacheCreationTokens,
                 cacheRead: event.usage.cacheReadTokens,
               },
+              ...(thinkingReport && (thinkingDropped || thinkingReport.mismatchAllowed.length > 0)
+                ? { thinking: { dropped: thinkingReport.dropped, mismatchAllowed: thinkingReport.mismatchAllowed } }
+                : {}),
             });
             break;
           }
