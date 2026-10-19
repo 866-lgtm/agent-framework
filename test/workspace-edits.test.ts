@@ -2,7 +2,8 @@
 // count that differs shows the lines that matched, CRLF and a BOM are kept,
 // and edit_many stores every edit or none. Each answer keeps to the length
 // its call's result may have (ToolCall.resultMaxChars), unless its head and
-// its last line alone are longer.
+// its last line alone are longer; edit's receipt keeps its path and notes
+// whatever their length, and where they alone are longer it shows no region.
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -241,6 +242,302 @@ test('CRLF line ends in oldString and newString are read as LF, so a file keeps 
   assert.equal(await stored('crlf.txt'), 'A\r\nB\r\n');
 });
 
+test("a line whose own text ends in a CR shows its CRLF end's CR too, so lines copied across it from a receipt or a closest region edit where they came from", async (t) => {
+  const { call, stored, file } = setup(t);
+  // Lines 2 and 3 end in a CR before their CRLF end; lines 5 and 6 hold the
+  // same text with a CRLF end alone. Copied with one CR each, lines 2 and 3
+  // would read as "xx\nyy" before a CRLF end, which is lines 5 and 6.
+  const text = 'aa\r\nxx\r\r\nyy\r\r\nbb\r\nxx\r\nyy\r\n';
+  const linesTwoAndThree = (listing: string) => listing.split('\n').filter((line) => /^ {5}[23]\t/.test(line)).map((line) => line.slice(7)).join('\n');
+  await file('r.txt', text);
+  const receipt = dataOf(await call('edit', { path: 'work/r.txt', oldString: 'aa', newString: 'AA' }));
+  assert.equal(linesTwoAndThree(receipt.changed as string), 'xx\r\r\nyy\r\r');
+  dataOf(await call('edit', { path: 'work/r.txt', oldString: linesTwoAndThree(receipt.changed as string), newString: 'XX\nYY' }));
+  assert.equal(await stored('r.txt'), 'AA\r\nXX\r\nYY\r\nbb\r\nxx\r\nyy\r\n');
+  await file('h.txt', text);
+  const miss = errorOf(await call('edit', { path: 'work/h.txt', oldString: 'xx\nqq', newString: 'z' }));
+  assert.match(miss, /Closest region \(line 2, /);
+  dataOf(await call('edit', { path: 'work/h.txt', oldString: linesTwoAndThree(miss), newString: 'XX\nYY' }));
+  assert.equal(await stored('h.txt'), 'aa\r\nXX\r\nYY\r\nbb\r\nxx\r\nyy\r\n');
+  // A count refusal shows the lines it names the same way.
+  await file('c.txt', text);
+  assert.ok(errorOf(await call('edit', { path: 'work/c.txt', oldString: 'yy', newString: 'z' })).includes('     3\tyy\r\r\n     6\tyy'));
+  // A last line with no line end shows its own CR alone, in each.
+  const last = 'aa\r\nxx\r\r\nxx\r';
+  await file('l.txt', last);
+  assert.ok(errorOf(await call('edit', { path: 'work/l.txt', oldString: 'xx\nqq', newString: 'z' })).includes('     2\txx\r\r\n     3\txx\r\nMatch'));
+  assert.ok(errorOf(await call('edit', { path: 'work/l.txt', oldString: 'xx', newString: 'z' })).endsWith('     2\txx\r\r\n     3\txx\r'));
+  assert.equal(dataOf(await call('edit', { path: 'work/l.txt', oldString: 'aa', newString: 'AA' })).changed, '     1\tAA\n     2\txx\r\r\n     3\txx\r');
+  // A long matched line shows the CR where its excerpt reaches its end, and
+  // not where the excerpt is cut after a CR inside the line.
+  const long = `aa\r\n${'q'.repeat(300)}mm\r\r\nmm${'q'.repeat(237)}\r${'q'.repeat(100)}\r\nmm\r\n`;
+  await file('x.txt', long);
+  assert.ok(errorOf(await call('edit', { path: 'work/x.txt', oldString: 'mm', newString: 'z' }))
+    .endsWith(`     2\t\u2026${'q'.repeat(237)}mm\r\r\n     3\tmm${'q'.repeat(237)}\r\u2026\n     4\tmm`));
+});
+
+test("a receipt tells a line's own CRs from its line end's by the stored bytes, where the edit puts a CR before a line feed", async (t) => {
+  const { call, stored, file } = setup(t);
+  // A CR the edit puts before a bare LF makes the two a CRLF end on disk,
+  // shown without the CR, so lines copied from the receipt edit lines 1 and
+  // 2, not lines 3 and 4, whose first line's own text ends in a CR.
+  await file('b.txt', 'p\nq\nx\r\r\nq\n');
+  assert.equal(dataOf(await call('edit', { path: 'work/b.txt', oldString: 'p', newString: 'x\r' })).changed, '     1\tx\n     2\tq\n     3\tx\r\r');
+  assert.equal(await stored('b.txt'), 'x\r\nq\nx\r\r\nq\n');
+  dataOf(await call('edit', { path: 'work/b.txt', oldString: 'x\nq', newString: 'M\nN' }));
+  assert.equal(await stored('b.txt'), 'M\r\nN\nx\r\r\nq\n');
+  // One before a CRLF end is the line's own, and shows that end's CR too; two
+  // before a bare LF are the line's own and the end's, and show as stored.
+  await file('c.txt', 'a\r\nb\r\n');
+  assert.equal(dataOf(await call('edit', { path: 'work/c.txt', oldString: 'a', newString: 'a\r' })).changed, '     1\ta\r\r\n     2\tb');
+  await file('l.txt', 'a\nb\n');
+  assert.equal(dataOf(await call('edit', { path: 'work/l.txt', oldString: 'a', newString: 'a\r\r' })).changed, '     1\ta\r\r\n     2\tb');
+  await file('d.txt', 'a\r\nb\r\n');
+  assert.equal(dataOf(await call('edit', { path: 'work/d.txt', oldString: 'a', newString: 'A\r\r' })).changed, '     1\tA\r\r\r\n     2\tb');
+  // A long line's stretch that reaches its end shows the CR too.
+  await file('x.txt', `aa\r\n${'q'.repeat(2500)}mm\r\r\n`);
+  assert.ok((dataOf(await call('edit', { path: 'work/x.txt', oldString: 'mm', newString: 'MM' })).changed as string).endsWith(`${'q'.repeat(80)}MM\r\r`));
+});
+
+test("a receipt reads the stored bytes of its lines that end in a CR in one walk forward, not one from the start for each", () => {
+  // A new text whose last 300 lines' own text ends in a CR, in a CRLF file of
+  // 1,000 lines: its receipt shows each of them, searching the bytes once for
+  // each line feed it passes and once for each such line's own, 1,099 times,
+  // where a walk from the start for each would take some 195,000.
+  const bytes = Buffer.from(`${'p\r\n'.repeat(1_000)}`);
+  const last = planFile(decodeForEdit(bytes)!, bytes, [{ index: 0, oldText: `${'p\n'.repeat(999)}p`, newText: `${'p\n'.repeat(500)}${Array.from({ length: 300 }, () => 'y\r').join('\n')}`, expected: 1 }]);
+  assert.ok('plan' in last);
+  let finds = 0;
+  const search = Buffer.prototype.indexOf;
+  Object.defineProperty(last.plan.bytes, 'indexOf', {
+    value(this: Buffer, ...args: unknown[]) {
+      finds++;
+      return Reflect.apply(search, this, args) as number;
+    },
+  });
+  const changed = editReceipt('edit', [{ path: 'work/c.txt', plan: last.plan, notes: [] }], 1, 10_000_000).changed as string;
+  assert.equal((changed.match(/\ty\r\r/g) ?? []).length, 300);
+  assert.ok(finds >= 300 && finds < 3_000, `${finds} searches of the bytes`);
+});
+
+test("an oldString with the file's BOM at its start or a CR at its end, found in more than one reading, is refused, naming each one's lines", async (t) => {
+  const { call, stored, file } = setup(t);
+  // Line 2's own text ends in one CR and line 3's in two, before CRLF ends,
+  // so line 2 as read shows it, with its end's CR, is line 3's text as given.
+  const text = 'aa\r\nxx\r\r\nxx\r\r\r\n';
+  await file('r.txt', text);
+  assert.equal(errorOf(await call('edit', { path: 'work/r.txt', oldString: 'xx\r\r', newString: 'YY' })),
+    "The edit did nothing: oldString ends in a CR, and occurs in work/r.txt read more than one way, so which you mean can't be told. "
+    + "Include more of the text around it, such as the line before or after it, to say which.\n"
+    + "It occurs as given (on line 3) and with its last CR read as its CRLF line end's (on line 2).");
+  assert.equal(await stored('r.txt'), text);
+  // With its line end it's line 2's alone, and line 3 as read shows it is line 3's.
+  dataOf(await call('edit', { path: 'work/r.txt', oldString: 'xx\r\r\n', newString: 'YY\n' }));
+  assert.equal(await stored('r.txt'), 'aa\r\nYY\r\nxx\r\r\r\n');
+  dataOf(await call('edit', { path: 'work/r.txt', oldString: 'xx\r\r\r', newString: 'ZZ' }));
+  assert.equal(await stored('r.txt'), 'aa\r\nYY\r\nZZ\r\n');
+  // A last line with no line end, and a copy that stops at a CR inside a
+  // line, read two ways too; the text before or after the CR settles which.
+  await file('e.txt', 'x\r\nx\r');
+  assert.match(errorOf(await call('edit', { path: 'work/e.txt', oldString: 'x\r', newString: 'Y\r' })), /\nIt occurs as given \(on line 2\) and with its last CR read as its CRLF line end's \(on line 1\)\.$/);
+  dataOf(await call('edit', { path: 'work/e.txt', oldString: 'x\nx\r', newString: 'x\nY\r' }));
+  assert.equal(await stored('e.txt'), 'x\r\nY\r');
+  await file('i.txt', 'a\rb\r\na\r\n');
+  assert.match(errorOf(await call('edit', { path: 'work/i.txt', oldString: 'a\r', newString: 'c\r' })), /\nIt occurs as given \(on line 1\) and with its last CR read as its CRLF line end's \(on line 2\)\.$/);
+  dataOf(await call('edit', { path: 'work/i.txt', oldString: 'a\rb', newString: 'c\rb' }));
+  assert.equal(await stored('i.txt'), 'c\rb\r\na\r\n');
+  // A BOM the same, in edit_many's words.
+  await file('m.txt', '\uFEFFab\n\uFEFFab\n');
+  assert.ok(errorOf(await call('edit_many', { edits: [{ path: 'work/m.txt', oldString: '\uFEFFab', newString: 'c' }] })).includes(
+    "edit 1: oldString starts with a BOM, and occurs in work/m.txt read more than one way, so which you mean can't be told. "
+    + "Include more of the text around it, such as the line before or after it, to say which.\n"
+    + "It occurs as given (on line 2) and with its BOM read as the file's own (on line 1)."));
+  assert.equal(await stored('m.txt'), '\uFEFFab\n\uFEFFab\n');
+});
+
+test("an oldString that is a CR or a BOM alone, found as given, is refused where it could be a CRLF end's CR or the file's BOM", async (t) => {
+  const { call, stored, file } = setup(t);
+  // Line 1's CRLF end's CR, as a character page shows it, or line 2's own CR.
+  await file('r.txt', '\r\nx\r');
+  assert.match(errorOf(await call('edit', { path: 'work/r.txt', oldString: '\r', newString: 'Y' })),
+    /\nIt occurs as given \(on line 2\) and with its last CR read as its CRLF line end's \(on line 1\)\.$/);
+  assert.equal(await stored('r.txt'), '\r\nx\r');
+  // The file's BOM, which a character page shows before line 1, or the one in line 2's text.
+  await file('b.txt', '\uFEFF\nx\uFEFFy\n');
+  assert.match(errorOf(await call('edit', { path: 'work/b.txt', oldString: '\uFEFF', newString: 'Q' })),
+    /\nIt occurs as given \(on line 2\) and with its BOM read as the file's own \(on line 1\)\.$/);
+  assert.equal(await stored('b.txt'), '\uFEFF\nx\uFEFFy\n');
+  // Not found as given, it's never read as the line end's CR or the file's
+  // BOM alone, which would put its new text where they are: it misses.
+  await file('m.txt', '\r\nx');
+  assert.match(errorOf(await call('edit', { path: 'work/m.txt', oldString: '\r', newString: 'Y' })), /^The edit did nothing: oldString isn't in work\/m\.txt\./);
+  await file('o.txt', '\uFEFFx\n');
+  assert.match(errorOf(await call('edit', { path: 'work/o.txt', oldString: '\uFEFF', newString: 'Q' })), /^The edit did nothing: oldString isn't in work\/o\.txt\./);
+  // Deleted, it misses too, though read that way it would change nothing.
+  await file('n.txt', 'x\r\n');
+  assert.match(errorOf(await call('edit', { path: 'work/n.txt', oldString: '\r', newString: '' })), /^The edit did nothing: oldString isn't in work\/n\.txt\./);
+  // Deleted, a copy of the line end's CR still may mean it, which the file
+  // keeps, so the edit is refused, saying so; with the text around it, a
+  // lone CR is deleted.
+  await file('d.txt', 'a\rb\r\n');
+  assert.match(errorOf(await call('edit', { path: 'work/d.txt', oldString: '\r', newString: '' })),
+    /\nIt occurs as given \(on line 1\) and with its last CR read as its CRLF line end's \(on line 1\)\.\nWhere it occurs with its last CR read as its CRLF line end's, the edit changes nothing, since the file keeps its line ends\.$/);
+  assert.equal(await stored('d.txt'), 'a\rb\r\n');
+  dataOf(await call('edit', { path: 'work/d.txt', oldString: 'a\rb', newString: 'ab' }));
+  assert.equal(await stored('d.txt'), 'ab\r\n');
+});
+
+test("a single edit deleting a CR or a BOM, or a text ending or starting with one, is refused where a copy may mean the file's own, which it keeps", async (t) => {
+  const { call, stored, file } = setup(t);
+  // Each file holds the text as given somewhere else than where a character
+  // page shows the line end's CR or the file's BOM; each edit, read that
+  // way, changes nothing (Abigail-2676's cases).
+  const cases: Array<[string, string, string, RegExp]> = [
+    ['\r\nx\r', '\r', '', /as given \(on line 2\) and with its last CR read as its CRLF line end's \(on line 1\)\.\nWhere it occurs with its last CR read as its CRLF line end's, the edit changes nothing, since the file keeps its line ends\.$/],
+    ['x\r\nx\r', 'x\r', 'x', /as given \(on line 2\) and with its last CR read as its CRLF line end's \(on line 1\)\.\nWhere it occurs with its last CR read as its CRLF line end's, the edit changes nothing, since the file keeps its line ends\.$/],
+    ['p\r\nx\r\r\nq\r\n', '\r', '', /as given \(on line 2\) and with its last CR read as its CRLF line end's \(on lines 1, 2 and 3\)\.\nWhere it occurs with its last CR read as its CRLF line end's, the edit changes nothing, since the file keeps its line ends\.$/],
+    ['\uFEFFab\uFEFFc\r\n', '\uFEFF', '', /as given \(on line 1\) and with its BOM read as the file's own \(on line 1\)\.\nWhere it occurs with its BOM read as the file's own, the edit changes nothing, since the file keeps its BOM\.$/],
+    ['\uFEFFx\r\nz\uFEFFx\r\n', '\uFEFFx', 'x', /as given \(on line 2\) and with its BOM read as the file's own \(on line 1\)\.\nWhere it occurs with its BOM read as the file's own, the edit changes nothing, since the file keeps its BOM\.$/],
+    ['\uFEFF\r\nx\uFEFF\r\n', '\uFEFF\r', '', /with its last CR read as its CRLF line end's \(on line 2\) and with its BOM read as the file's own and its last CR as a CRLF line end's \(on line 1\)\.\nWhere it occurs with its BOM read as the file's own and its last CR as a CRLF line end's, the edit changes nothing, since the file keeps its BOM and line ends\.$/],
+  ];
+  for (const [k, [text, oldString, newString, said]] of cases.entries()) {
+    await file(`c${k}.txt`, text);
+    assert.match(errorOf(await call('edit', { path: `work/c${k}.txt`, oldString, newString })), said, `case ${k}`);
+    assert.equal(await stored(`c${k}.txt`), text, `case ${k}`);
+  }
+});
+
+test("an oldString with the file's BOM at its start and a CR at its end is read as the BOM and an empty first line's CRLF end beside another reading", async (t) => {
+  const { call, stored, file } = setup(t);
+  // Line 2's BOM before its CRLF end is one reading; the file's BOM and the
+  // empty line 1's CRLF end, as a character page shows them, is the other.
+  await file('e.txt', '\uFEFF\r\nx\uFEFF\r\n');
+  assert.match(errorOf(await call('edit', { path: 'work/e.txt', oldString: '\uFEFF\r', newString: 'Y' })),
+    /\nIt occurs with its last CR read as its CRLF line end's \(on line 2\) and with its BOM read as the file's own and its last CR as a CRLF line end's \(on line 1\)\.$/);
+  assert.equal(await stored('e.txt'), '\uFEFF\r\nx\uFEFF\r\n');
+  // Deleted, it's refused too, where the file's BOM and line 1's end are what
+  // a character page's copy shows.
+  assert.match(errorOf(await call('edit', { path: 'work/e.txt', oldString: '\uFEFF\r', newString: '' })),
+    /\nWhere it occurs with its BOM read as the file's own and its last CR as a CRLF line end's, the edit changes nothing, since the file keeps its BOM and line ends\.$/);
+  assert.equal(await stored('e.txt'), '\uFEFF\r\nx\uFEFF\r\n');
+  // Made the BOM alone, the edit changes nothing in either reading, the one
+  // that leaves nothing among them, and the refusal says so of both.
+  assert.match(errorOf(await call('edit', { path: 'work/e.txt', oldString: '\uFEFF\r', newString: '\uFEFF' })),
+    /\nIt occurs with its last CR read as its CRLF line end's \(on line 2\) and with its BOM read as the file's own and its last CR as a CRLF line end's \(on line 1\)\.\nWhere it occurs with its last CR read as its CRLF line end's or with its BOM read as the file's own and its last CR as a CRLF line end's, the edit changes nothing, since the file keeps its BOM and line ends\.$/);
+  assert.equal(await stored('e.txt'), '\uFEFF\r\nx\uFEFF\r\n');
+  // Where line 1 isn't empty, only line 2 holds it.
+  await file('f.txt', '\uFEFFa\r\nx\uFEFF\r\n');
+  dataOf(await call('edit', { path: 'work/f.txt', oldString: '\uFEFF\r', newString: 'Y' }));
+  assert.equal(await stored('f.txt'), '\uFEFFa\r\nxY\r\n');
+});
+
+test("a replaceAll of a CR or a BOM alone replaces those in the text, keeping CRLF line ends and the file's BOM", async (t) => {
+  const { call, stored, file } = setup(t);
+  await file('c.txt', 'a\rb\r\nc\r\n');
+  dataOf(await call('edit', { path: 'work/c.txt', oldString: '\r', newString: '|', replaceAll: true }));
+  assert.equal(await stored('c.txt'), 'a|b\r\nc\r\n');
+  await file('b.txt', '\uFEFFa\uFEFFb\n');
+  dataOf(await call('edit', { path: 'work/b.txt', oldString: '\uFEFF', newString: '-', replaceAll: true }));
+  assert.equal(await stored('b.txt'), '\uFEFFa-b\n');
+  // Deleting every lone CR keeps the CRLF line ends.
+  await file('d.txt', 'a\rb\r\nc\rd\r\n');
+  dataOf(await call('edit', { path: 'work/d.txt', oldString: '\r', newString: '', replaceAll: true }));
+  assert.equal(await stored('d.txt'), 'ab\r\ncd\r\n');
+});
+
+test("a replaceAll whose oldString, read as ending in a CRLF end's CR, changes nothing replaces the occurrences that change", async (t) => {
+  const { call, stored, file } = setup(t);
+  // Line 1's own text ends in a CR; line 2's "x" is "x\r" with its line end's
+  // CR, as a character page shows it, which the file keeps. One edit is
+  // refused, as a copy of line 2 may mean it; a replaceAll changes line 1.
+  await file('x.txt', 'x\r\r\nx\r\n');
+  assert.match(errorOf(await call('edit', { path: 'work/x.txt', oldString: 'x\r', newString: 'x' })),
+    /\nWhere it occurs with its last CR read as its CRLF line end's, the edit changes nothing, since the file keeps its line ends\.$/);
+  dataOf(await call('edit', { path: 'work/x.txt', oldString: 'x\r', newString: 'x', replaceAll: true }));
+  assert.equal(await stored('x.txt'), 'x\r\nx\r\n');
+  // Where no occurrence changes, a replaceAll has nothing to change.
+  await file('y.txt', 'x\r\ny\r\n');
+  assert.match(errorOf(await call('edit', { path: 'work/y.txt', oldString: 'x\r', newString: 'x', replaceAll: true })),
+    /^The edit did nothing: oldString and newString are the same once the BOM or the line end's CR that oldString carries is read as work\/y\.txt's own/);
+  assert.equal(await stored('y.txt'), 'x\r\ny\r\n');
+});
+
+test("an oldString found in two readings other than as given is refused, and one found in three names all three", async (t) => {
+  const { call, file } = setup(t);
+  // Line 1's own text ends in a CR, and line 2 starts with a BOM of its own
+  // text. "\uFEFFxx\r" is line 1 read without the BOM and line 2 read without
+  // the CR, and nowhere as given.
+  await file('t.txt', '\uFEFFxx\r\r\n\uFEFFxx\r\n');
+  assert.match(errorOf(await call('edit', { path: 'work/t.txt', oldString: '\uFEFFxx\r', newString: 'Y' })),
+    /\nIt occurs with its last CR read as its CRLF line end's \(on line 2\) and with its BOM read as the file's own \(on line 1\)\.$/);
+  // Line 3 holds it as given.
+  await file('u.txt', '\uFEFFxx\r\r\n\uFEFFxx\r\n\uFEFFxx\r\r\n');
+  assert.match(errorOf(await call('edit', { path: 'work/u.txt', oldString: '\uFEFFxx\r', newString: 'Y' })),
+    /\nIt occurs as given \(on line 3\), with its last CR read as its CRLF line end's \(on line 2\) and with its BOM read as the file's own \(on line 1\)\.$/);
+});
+
+test("a reading leaves out of the new text only what it leaves out of the old", async (t) => {
+  const { call, stored, file } = setup(t);
+  // Read without its CR, the new text keeps the BOM it starts with.
+  await file('c.txt', 'ab\r\nz\r\n');
+  dataOf(await call('edit', { path: 'work/c.txt', oldString: 'ab\r', newString: '\uFEFFcd\r' }));
+  assert.equal(await stored('c.txt'), '\uFEFFcd\r\nz\r\n');
+  // Read without the file's BOM, the new text keeps the CR it ends with.
+  await file('b.txt', '\uFEFFab\nz\n');
+  dataOf(await call('edit', { path: 'work/b.txt', oldString: '\uFEFFab', newString: 'cd\r' }));
+  assert.equal(await stored('b.txt'), '\uFEFFcd\r\nz\n');
+});
+
+test("a copy of a line whose own text ends in a CR is read without that CR before quotes are read as equal", async (t) => {
+  const { call, stored, file } = setup(t);
+  // Line 2, copied as read shows it, holds a curly quote; line 3, whose own
+  // text ends in two CRs, a straight one. Read without its last CR, the copy
+  // is line 2's, so line 2 is edited, not line 3, which the quote pass finds.
+  await file('q.txt', "aa\r\nx\u2019\r\r\nx'\r\r\r\n");
+  dataOf(await call('edit', { path: 'work/q.txt', oldString: 'x\u2019\r\r', newString: 'Y' }));
+  assert.equal(await stored('q.txt'), "aa\r\nY\r\nx'\r\r\r\n");
+});
+
+test("an oldString that starts with a BOM of its own text and ends in a CR is read without its CR alone, and without both", async (t) => {
+  const { call, stored, file } = setup(t);
+  // Lines 2 and 3 start with a BOM of their own text. Line 2, copied as read
+  // shows it, is line 3's text as given, and itself without its last CR.
+  await file('b.txt', '\uFEFFaa\r\n\uFEFFxx\r\r\n\uFEFFxx\r\r\r\n');
+  assert.equal(errorOf(await call('edit', { path: 'work/b.txt', oldString: '\uFEFFxx\r\r', newString: 'Y' })),
+    "The edit did nothing: oldString starts with a BOM and ends in a CR, and occurs in work/b.txt read more than one way, so which you mean can't be told. "
+    + "Include more of the text around it, such as the line before or after it, to say which.\n"
+    + "It occurs as given (on line 3) and with its last CR read as its CRLF line end's (on line 2).");
+  assert.equal(await stored('b.txt'), '\uFEFFaa\r\n\uFEFFxx\r\r\n\uFEFFxx\r\r\r\n');
+  dataOf(await call('edit', { path: 'work/b.txt', oldString: '\uFEFFxx\r\r\n', newString: 'Y\n' }));
+  assert.equal(await stored('b.txt'), '\uFEFFaa\r\nY\r\n\uFEFFxx\r\r\r\n');
+  // Without both, the file's BOM and the end's CR: line 1.
+  await file('c.txt', '\uFEFFab\r\n\uFEFFab\r\r\n');
+  assert.match(errorOf(await call('edit', { path: 'work/c.txt', oldString: '\uFEFFab\r', newString: 'Y' })),
+    /\nIt occurs as given \(on line 2\) and with its BOM read as the file's own and its last CR as a CRLF line end's \(on line 1\)\.$/);
+});
+
+test("the refusal of an oldString read more than one way counts each reading's occurrences and names the lines of its first 20", async (t) => {
+  const { call, file } = setup(t);
+  await file('n.txt', `${'xx\r\r\n'.repeat(25)}${'xx\r\r\r\n'.repeat(25)}`);
+  const error = errorOf(await call('edit', { path: 'work/n.txt', oldString: 'xx\r\r', newString: 'Y', replaceAll: true }));
+  assert.ok(error.endsWith("\nIt occurs as given (the first 20 on lines 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44 and 45) "
+    + "and with its last CR read as its CRLF line end's (the first 20 on lines 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19 and 20)."), error);
+});
+
+test("edit_many names the edit whose oldString reads more than one way, with no clash beside it", async (t) => {
+  const { call, stored, file } = setup(t);
+  const text = 'aa\r\nxx\r\r\nxx\r\r\r\n';
+  await file('r.txt', text);
+  assert.equal(errorOf(await call('edit_many', { edits: [
+    { path: 'work/r.txt', oldString: 'xx', newString: 'yy', occurrences: 2 },
+    { path: 'work/r.txt', oldString: 'xx\r\r', newString: 'Y' },
+  ] })), 'The edit_many call stored none of its edits: 1 problem.\n\n'
+    + "edit 2: oldString ends in a CR, and occurs in work/r.txt read more than one way, so which you mean can't be told. "
+    + "Include more of the text around it, such as the line before or after it, to say which.\n"
+    + "It occurs as given (on line 3) and with its last CR read as its CRLF line end's (on line 2).");
+  assert.equal(await stored('r.txt'), text);
+});
+
 test('replacing a whole file with nothing stores no bytes, and its receipt shows and names no line', async (t) => {
   const { call, stored, file } = setup(t);
   await file('e.txt', 'all of it\n');
@@ -259,24 +556,39 @@ test("an edit that would take a file past its mount's maxFileSize is refused", a
   assert.equal(dataOf(await call('edit', { path: 'work/s.txt', oldString: 'small', newString: 'x'.repeat(19) })).size, 20);
   assert.equal((await call('edit', { path: 'work/s.txt', oldString: 'x'.repeat(19), newString: 'small' })).success, true);
   // An edit whose counts take the file past the limit is refused before its
-  // text is built, from the least its bytes can be: a byte or more for each
-  // UTF-16 code unit.
+  // text is built, from the least its bytes can be: its new texts' UTF-8
+  // bytes, less the most each text they replace can take.
   assert.equal(errorOf(await call('edit', { path: 'work/s.txt', oldString: 'small', newString: 'much, much, much larger' })),
     "The edit did nothing: work/s.txt would be at least 24 bytes with this edit, past the 20-byte limit this mount sets on a file, so the workspace couldn't keep it. "
     + "An edit that leaves the file within the limit applies. The limit is the mount's maxFileSize setting, which only whoever runs the host can change.");
-  // One whose code units fit but whose UTF-8 doesn't is built, and refused by its bytes.
+  // So is one that only its UTF-8 takes past it: 11 code units, 21 bytes.
   assert.equal(errorOf(await call('edit', { path: 'work/s.txt', oldString: 'small', newString: 'é'.repeat(10) })),
-    "The edit did nothing: work/s.txt would be 21 bytes with this edit, past the 20-byte limit this mount sets on a file, so the workspace couldn't keep it. "
+    "The edit did nothing: work/s.txt would be at least 21 bytes with this edit, past the 20-byte limit this mount sets on a file, so the workspace couldn't keep it. "
     + "An edit that leaves the file within the limit applies. The limit is the mount's maxFileSize setting, which only whoever runs the host can change.");
   assert.equal(await stored('s.txt'), 'small\n');
-  // So is one that a CRLF file's CRs take past it: read as LF, these 20 bytes
-  // are 15, and the edit makes them 20, within the limit, but each of the
-  // five line ends keeps its CR.
-  await file('c.txt', 'ab\r\n'.repeat(5));
-  assert.equal(errorOf(await call('edit', { path: 'work/c.txt', oldString: 'b', newString: 'bc', replaceAll: true })),
-    "The edit did nothing: work/c.txt would be 25 bytes with this edit, past the 20-byte limit this mount sets on a file, so the workspace couldn't keep it. "
+  // One that the CRs of the line ends its new text takes in a CRLF file take
+  // past it is built, and refused by its bytes: the least counts each new
+  // line feed as one byte, so these 16 bytes are at least 20 with the edit,
+  // within the limit, and each new line end keeps the file's CR.
+  await file('c.txt', 'ab\r\n'.repeat(4));
+  assert.equal(errorOf(await call('edit', { path: 'work/c.txt', oldString: 'b', newString: 'b\n', replaceAll: true })),
+    "The edit did nothing: work/c.txt would be 24 bytes with this edit, past the 20-byte limit this mount sets on a file, so the workspace couldn't keep it. "
     + "An edit that leaves the file within the limit applies. The limit is the mount's maxFileSize setting, which only whoever runs the host can change.");
-  assert.equal(await stored('c.txt'), 'ab\r\n'.repeat(5));
+  assert.equal(await stored('c.txt'), 'ab\r\n'.repeat(4));
+  // The least never refuses an edit that fits. Each line end it replaces in
+  // a CRLF file is two bytes, so these 20 bytes stay 20:
+  await file('d.txt', 'ab\r\n'.repeat(5));
+  assert.equal(dataOf(await call('edit', { path: 'work/d.txt', oldString: 'b\n', newString: 'bcd', replaceAll: true })).size, 20);
+  // and each curly quote it replaces, matched as straight, three, so these 8
+  // bytes stay 8, at a limit of 8.
+  const quotes = setup(t, { maxFileSize: 8 });
+  await quotes.file('q.txt', '\u2018a\u2019\n');
+  assert.equal(dataOf(await quotes.call('edit', { path: 'work/q.txt', oldString: "'a'", newString: "'bbbbb'" })).size, 8);
+  // and each byte of a character it replaces, so "é" made "ab" stays 3 bytes,
+  // at a limit of 3.
+  const wide = setup(t, { maxFileSize: 3 });
+  await wide.file('w.txt', '\u00e9\n');
+  assert.equal(dataOf(await wide.call('edit', { path: 'work/w.txt', oldString: '\u00e9', newString: 'ab' })).size, 3);
 });
 
 // ---------------------------------------------------------------------------
@@ -785,15 +1097,109 @@ test('an edit names its path plainly: a path with an empty, "." or ".." segment 
   }
 });
 
-test("edits that find more occurrences between them than the file's text is long are refused as crowded", async (t) => {
+test("edits that ask for more occurrences between them than the file's text is long are refused as crowded", async (t) => {
   const { call, stored, file } = setup(t);
   await file('x.txt', `${'x'.repeat(100)}\n`);
   assert.equal(errorOf(await call('edit_many', {
     edits: ['a', 'b', 'c'].map((newString) => ({ path: 'work/x.txt', oldString: 'x', newString, occurrences: 100 })),
   })), 'The edit_many call stored none of its edits: 1 problem.\n\n'
-    + 'edits 1–3: they find 300 occurrences between them in work/x.txt, whose text, with its line ends read as LF, is 101 UTF-16 code units long, '
-    + 'so some of their matches overlap; give each its own stretch of text.');
+    + 'edits 1–3: they ask for 300 occurrences between them in work/x.txt, whose text, with its line ends read as LF, is 101 UTF-16 code units long, '
+    + 'so some of their matches would overlap; give each its own stretch of text.');
   assert.equal(await stored('x.txt'), `${'x'.repeat(100)}\n`);
+});
+
+test("a call counts occurrences its edits don't need, across its files, only as many as its mount lets a file hold bytes, and says where a count is a floor", async (t) => {
+  // The edit of a.txt counts all 1,000, 979 of them past its free 21, which
+  // leaves 21 of the call's 1,000; the edit of b.txt counts its free 21,
+  // those 21, and one more.
+  const { call, file } = setup(t, { maxFileSize: 1_000 });
+  await file('a.txt', 'a'.repeat(1_000));
+  await file('b.txt', 'a'.repeat(1_000));
+  const error = errorOf(await call('edit_many', { edits: [{ path: 'work/a.txt', oldString: 'a', newString: 'b' }, { path: 'work/b.txt', oldString: 'a', newString: 'c' }] }));
+  assert.match(error, /edit 1: oldString occurs 1000 times in work\/a\.txt \(the first 20 on line 1\), not 1\. Include more of the text around it to single out the one you mean, or set occurrences to 1000 if every one should change\.\n/);
+  assert.match(error, /edit 2: oldString occurs at least 43 times in work\/b\.txt \(the first 20 on line 1\), not 1\. Include more of the text around it to single out the one you mean\.\nThis call counted as many occurrences as one call may, so 43 is a floor: sent in a call of its own, the edit has every one counted, unless they overlap\.\n/);
+  // Sent alone, it has every one counted.
+  assert.match(errorOf(await call('edit_many', { edits: [{ path: 'work/b.txt', oldString: 'a', newString: 'c' }] })), /edit 1: oldString occurs 1000 times in work\/b\.txt/);
+});
+
+test("a file stored before its mount's limit was lowered sizes a call's count budget before any of its files is planned", async (t) => {
+  // big.txt, 3,000 bytes, is stored under a limit of 3,000, and a module over
+  // the same store lowers the limit to 1,000. The call's budget is 3,000, so
+  // both edits of small.txt, planned before big.txt, count all 1,000 of
+  // theirs; a budget of the limit would leave the second a floor of 43.
+  const { store, dir, file } = setup(t, { maxFileSize: 3_000 });
+  await file('small.txt', 'a'.repeat(1_000));
+  await file('big.txt', 'a'.repeat(3_000));
+  const lowered = new WorkspaceModule({ mounts: [{ name: 'work', path: dir, mode: 'read-write', watch: 'never', autoMaterialize: false, maxFileSize: 1_000 }] });
+  lowered.initStore(store);
+  const error = errorOf(await lowered.handleToolCall({ id: 'edit_many', name: 'edit_many', input: { edits: [
+    { path: 'work/small.txt', oldString: 'a', newString: 'b' },
+    { path: 'work/small.txt', oldString: 'a', newString: 'c' },
+    { path: 'work/big.txt', oldString: 'a', newString: 'd' },
+  ] } } as Parameters<WorkspaceModule['handleToolCall']>[0]));
+  assert.match(error, /\nedit 1: oldString occurs 1000 times in work\/small\.txt /);
+  assert.match(error, /\nedit 2: oldString occurs 1000 times in work\/small\.txt /);
+});
+
+test("an edit asking for more than 20 counts those it asks for freely, after the call's budget is spent", async (t) => {
+  // The two edits of "a" spend the call's budget of 1,030; the edit of "b"
+  // still counts its 30, and one more, freely, and finds what it asks for.
+  const { call, file } = setup(t, { maxFileSize: 1_030 });
+  await file('ab.txt', `${'a'.repeat(1_000)}${'b'.repeat(30)}`);
+  const error = errorOf(await call('edit_many', { edits: [
+    { path: 'work/ab.txt', oldString: 'a', newString: 'x' },
+    { path: 'work/ab.txt', oldString: 'a', newString: 'y' },
+    { path: 'work/ab.txt', oldString: 'b', newString: 'z', occurrences: 30 },
+  ] }));
+  assert.match(error, /^The edit_many call stored none of its edits: 2 problems\./);
+  assert.doesNotMatch(error, /edit 3/);
+});
+
+test("an edit matched with quotes read as equal, or read without its CR, counts against the call's budget too", async (t) => {
+  const { call, file } = setup(t, { maxFileSize: 1_000 });
+  await file('q.txt', "'".repeat(1_000));
+  const quoted = errorOf(await call('edit_many', { edits: ['b', 'c'].map((newString) => ({ path: 'work/q.txt', oldString: '\u2019', newString })) }));
+  assert.match(quoted, /edit 2: oldString occurs at least 43 times in work\/q\.txt \(the first 20 on line 1\), with straight and curly quotes treated as equal, not 1\. Include more of the text around it to single out the one you mean\.\nThis call counted as many occurrences as one call may, so 43 is a floor/);
+  // At a limit of 3,000, the first three edits count 979 each past their
+  // free 21, which leaves 63.
+  const crlf = setup(t, { maxFileSize: 3_000 });
+  await crlf.file('c.txt', 'x\r\n'.repeat(1_000));
+  const read = errorOf(await crlf.call('edit_many', { edits: ['a', 'b', 'c', 'd'].map((newString) => ({ path: 'work/c.txt', oldString: 'x\r', newString })) }));
+  assert.ok(read.includes(`edit 4: oldString occurs at least 85 times in work/c.txt (the first 20 on lines ${Array.from({ length: 19 }, (_, k) => k + 1).join(', ')} and 20), not 1. `
+    + 'Include more of the text around it to single out the one you mean.\nThis call counted as many occurrences as one call may, so 85 is a floor'), read);
+});
+
+test("edits of an oldString read more than one way, each found many times, each take about a pass over the file", async (t) => {
+  // Lines alternate between "x" with a CR of its own and "x" alone, before
+  // CRLF ends, so "x\r" reads as given on the one and without its CR on the
+  // other. Each edit's other reading stops once it has those a refusal shows.
+  const { call, file } = setup(t);
+  await file('m.txt', 'x\r\r\nx\r\n'.repeat(400_000));
+  const before = process.cpuUsage();
+  const error = errorOf(await call('edit_many', { edits: Array.from({ length: 200 }, (_, k) => ({ path: 'work/m.txt', oldString: 'x\r', newString: `${k}` })) }));
+  const used = process.cpuUsage(before);
+  assert.match(error, /^The edit_many call stored none of its edits: 200 problems\./);
+  assert.match(error, /\n\nedit 1: oldString ends in a CR, and occurs in work\/m\.txt read more than one way, so which you mean can't be told\./);
+  assert.ok((used.user + used.system) / 1000 < 4_000, `${(used.user + used.system) / 1000} ms of CPU`);
+});
+
+test("a crowded edit whose count stopped short of its ask, which no crowded problem names, is named by its count as a floor", async (t) => {
+  const { call, file } = setup(t, { maxFileSize: 2_500 });
+  await file('ab.txt', 'ab'.repeat(1_000));
+  const error = errorOf(await call('edit_many', { edits: [
+    { path: 'work/ab.txt', oldString: 'a', newString: 'x', occurrences: 1_500 },
+    { path: 'work/ab.txt', oldString: 'b', newString: 'y', occurrences: 1_500 },
+    { path: 'work/ab.txt', oldString: 'ab', newString: 'z', occurrences: 900 },
+  ] }));
+  assert.match(error, /^The edit_many call stored none of its edits: 3 problems\./);
+  assert.match(error, /\nedit 3: oldString occurs at least 561 times in work\/ab\.txt \(the first 20 on line 1\)\. Whether it occurs the 900 times it asks for can't be told from this call\.\nThis call counted as many occurrences as one call may, so 561 is a floor: sent in a call of its own, the edit has every one counted, unless they overlap\.\n/);
+  // Stopped at just what it asks for, it's a floor all the same.
+  const atAsk = errorOf(await call('edit_many', { edits: [
+    { path: 'work/ab.txt', oldString: 'a', newString: 'x', occurrences: 1_500 },
+    { path: 'work/ab.txt', oldString: 'b', newString: 'y', occurrences: 1_500 },
+    { path: 'work/ab.txt', oldString: 'ab', newString: 'z', occurrences: 561 },
+  ] }));
+  assert.match(atAsk, /\nedit 3: oldString occurs at least 561 times in work\/ab\.txt \(the first 20 on line 1\)\. Whether it occurs the 561 times it asks for can't be told from this call\.\n/);
 });
 
 test('every path is checked before any entry is set: a check that fails at the second file stores neither', async (t) => {
@@ -1058,12 +1464,11 @@ test('a receipt names a region too long to show by its lines without building it
   assert.ok(sliced < 5_000, `sliced ${sliced} code units`);
 });
 
-test('a receipt keeps to its cap with the longest notes it adds after its budget: twenty regions of eight-digit lines', () => {
-  // Two files of 10,000,400 lines, each with 25 edits far apart near its end:
-  // past what the regions may take, the note naming them lists twenty
-  // ranges of eight-digit line numbers.
-  const lines = 10_000_400;
-  const marks = Array.from({ length: 25 }, (_, k) => lines - 400 + k * 15);
+/**
+ * The plan of a file of `lines` empty lines but for `m<line>` on each line
+ * in `marks`, which ascend, with an edit of each to `M<line>`.
+ */
+function markedPlan(lines: number, marks: number[]): FilePlan {
   const parts: string[] = [];
   let at = 0;
   for (const mark of marks) {
@@ -1074,11 +1479,40 @@ test('a receipt keeps to its cap with the longest notes it adds after its budget
   const bytes = Buffer.from(parts.join(''));
   const planned = planFile(decodeForEdit(bytes)!, bytes, marks.map((mark, index) => ({ index, oldText: `m${mark}`, newText: `M${mark}`, expected: 1 })));
   assert.ok('plan' in planned);
-  const files = [0, 1].map((i) => ({ path: `work/f${i}.txt`, plan: planned.plan, notes: i ? [`Disk's copy of work/f${i}.txt had changed.`] : [] }));
+  return planned.plan;
+}
+
+test('a receipt keeps to its cap with the longest notes it adds after its budget: twenty regions of eight-digit lines', () => {
+  // Two files of 10,000,400 lines, each with 25 edits far apart near its end:
+  // past what the regions may take, the note naming them lists twenty
+  // ranges of eight-digit line numbers.
+  const lines = 10_000_400;
+  const plan = markedPlan(lines, Array.from({ length: 25 }, (_, k) => lines - 400 + k * 15));
+  const files = [0, 1].map((i) => ({ path: `work/f${i}.txt`, plan, notes: i ? [`Disk's copy of work/f${i}.txt had changed.`] : [] }));
   for (let maxChars = 700; maxChars <= 1_700; maxChars++) {
     const length = JSON.stringify(editReceipt('edit_many', files, 50, maxChars)).length;
     if (length > maxChars) assert.fail(`${length} characters at a cap of ${maxChars}`);
   }
+});
+
+test("a receipt keeps aside the longest note any of its files could add, not its last file's", () => {
+  // A file of 100,500 lines with 25 edits far apart near its end, then a file
+  // of one edit: past what the regions may take, the first file's note lists
+  // twenty ranges of six-digit lines, where the last file's would name line 1.
+  const lines = 100_500;
+  const files = [
+    { path: 'work/long.txt', plan: markedPlan(lines, Array.from({ length: 25 }, (_, k) => lines - 400 + k * 15)), notes: [] },
+    { path: 'work/short.txt', plan: markedPlan(1, [1]), notes: [] },
+  ];
+  const twenty = /lines \d{6}–\d{6}(?:, \d{6}–\d{6}){19}/;
+  let named = 0;
+  for (let maxChars = 700; maxChars <= 1_700; maxChars++) {
+    const receipt = editReceipt('edit_many', files, 26, maxChars);
+    const length = JSON.stringify(receipt).length;
+    if (length > maxChars) assert.fail(`${length} characters at a cap of ${maxChars}`);
+    if (twenty.test(receipt.changed as string)) named++;
+  }
+  assert.ok(named > 0, "no receipt named twenty of the first file's regions");
 });
 
 test("edit_many's receipt keeps to its cap with a last line that counts each of the four things it leaves out", () => {
@@ -1120,6 +1554,28 @@ test('a receipt keeps aside only what its own call can add: one edit of a file o
     assert.match(receipt.changed as string, start, tool);
     assert.ok(JSON.stringify(receipt).length <= whole + 300);
   }
+});
+
+test("what a receipt keeps aside doesn't grow with a line's length: twenty edits of a long line show their region with what twenty of a short one need", () => {
+  // For the note naming the region of twenty edits on one line, a receipt
+  // keeps aside twenty ranges that end by line 3, however long the line. Kept
+  // aside as twenty ranges as wide as the file is long in code units, it took
+  // 120 characters more for the long line than for the short one.
+  const start = Array.from({ length: 20 }, (_, k) => `m${k}|`.padEnd(50, 'a')).join('');
+  const showsAt = (text: string) => {
+    const bytes = Buffer.from(text);
+    const planned = planFile(decodeForEdit(bytes)!, bytes, Array.from({ length: 20 }, (_, k) => ({ index: k, oldText: `m${k}|`, newText: `M${k}|`, expected: 1 })));
+    assert.ok('plan' in planned);
+    const files = [{ path: 'work/line.txt', plan: planned.plan, notes: [] }];
+    const whole = JSON.stringify(editReceipt('edit_many', files, 20, 1_000_000)).length;
+    // Whether the region shows with `spare` characters past the whole receipt.
+    return (spare: number) => /^work\/line\.txt\n {5}1\t/.test(editReceipt('edit_many', files, 20, whole + spare).changed as string);
+  };
+  const short = showsAt(start);
+  const long = showsAt(start + 'a'.repeat(1_000_000));
+  let spare = 0;
+  while (!short(spare)) if (++spare > 2_000) assert.fail("the short line's region never showed");
+  assert.ok(long(spare), `the long line's region needs more than the ${spare} characters the short line's does`);
 });
 
 test("one call's misses share one search for closest regions across its files", async (t) => {

@@ -10,7 +10,7 @@
  * Edit and EditMany tools.
  */
 
-import { hasBom, numbered, safeCut } from './text.js';
+import { MAX_LINE_CHARS, hasBom, numbered, safeCut } from './text.js';
 
 /** One edit as the planner takes it. */
 export interface EditSpec {
@@ -85,30 +85,43 @@ function normalizeQuotes(value: string): string {
   return value.replace(/[‘’‚‛]/g, "'").replace(/[“”„‟]/g, '"');
 }
 
+/** What a reading of an old text leaves out of it, as matching leaves it out of the file's text. */
+export type Leaves = 'nothing' | 'cr' | 'bom' | 'both';
+
 /**
- * An edit as matching reads it when its old text carries what matching leaves
- * out of a file's text: the BOM, which decodeForEdit takes off before the
- * first line, at its start, or a line's CR, which matching reads as part of
- * the line end, at its end. A character page shows both. The edit without
- * them, its new text read the same way, so a replacement keeps the file's one
- * BOM and its CRLF line end; and where it may match: at the text's start, and
- * before a CRLF line end. Null when the old text carries neither where the
- * file has them, or is nothing without them.
+ * The readings of an edit other than as given, where its old text carries
+ * what matching leaves out of a file's text: the BOM, which decodeForEdit
+ * takes off before the first line, at its start, or a line's CR, which
+ * matching reads as part of the line end, at its end. A character page shows
+ * both, and a line whose own text ends in a CR shows its end's CR too
+ * (shownLine). Each reading leaves out the CR, the BOM, or both, its new text
+ * read the same way, so a replacement keeps the file's one BOM and its CRLF
+ * line end, and may match only where what it leaves out is the file's: at the
+ * text's start for the BOM, and before a CRLF line end for the CR. None where
+ * the old text carries neither where the file has them. A reading that
+ * leaves nothing, of an old text that is the BOM or the CR alone, is one too:
+ * planFile finds it where what it leaves out is the file's.
  */
-function readForm(spec: EditSpec, file: FileText, crAt: (lf: number) => boolean): { spec: EditSpec; accept: (at: number) => boolean } | null {
+function readingsOf(spec: EditSpec, file: FileText, crAt: (lf: number) => boolean): Array<{ spec: EditSpec; accept: (at: number) => boolean; leaves: Leaves }> {
   const leading = file.bom && spec.oldText.startsWith('\uFEFF');
   const trailing = file.crs.length > 0 && spec.oldText.endsWith('\r');
-  if (!leading && !trailing) return null;
-  const oldText = spec.oldText.slice(leading ? 1 : 0, trailing ? -1 : undefined);
-  if (!oldText) return null;
-  let newText = spec.newText;
-  if (leading && newText.startsWith('\uFEFF')) newText = newText.slice(1);
-  if (trailing && newText.endsWith('\r')) newText = newText.slice(0, -1);
-  return {
-    spec: { ...spec, oldText, newText },
-    // crs holds only LFs that followed a CR, so one there is a CRLF line end.
-    accept: (at) => (!leading || at === 0) && (!trailing || crAt(at + oldText.length)),
+  const read = (bom: boolean, cr: boolean, leaves: Leaves) => {
+    const oldText = spec.oldText.slice(bom ? 1 : 0, cr ? -1 : undefined);
+    let newText = spec.newText;
+    if (bom && newText.startsWith('\uFEFF')) newText = newText.slice(1);
+    if (cr && newText.endsWith('\r')) newText = newText.slice(0, -1);
+    return [{
+      spec: { ...spec, oldText, newText },
+      // crs holds only LFs that followed a CR, so one there is a CRLF line end.
+      accept: (at: number) => (!bom || at === 0) && (!cr || crAt(at + oldText.length)),
+      leaves,
+    }];
   };
+  return [
+    ...(trailing ? read(false, true, 'cr') : []),
+    ...(leading ? read(true, false, 'bom') : []),
+    ...(leading && trailing ? read(true, true, 'both') : []),
+  ];
 }
 
 /** Where an old text occurs in a file: what scan finds. */
@@ -120,7 +133,32 @@ interface Found {
   /** Whether one occurrence starts before the one before it ends. */
   overlapping: boolean;
   atLeast: boolean;
+  /** Whether it stopped because the call's count budget ran out, so `count` is a floor for that reason. */
+  spent: boolean;
 }
+
+/**
+ * What one call may count of occurrences no answer needs, all of its edits
+ * together: those past what an edit asks for and the one more that shows it
+ * finds more, which only make a refusal's count exact. applyEdits sizes it
+ * before it plans, to the larger of the mount's limit and the largest file
+ * the call names, in bytes, which no file's occurrences of a nonempty text
+ * pass, as a file has no more code units than bytes; so it's the same
+ * whatever order the files are planned in, and an edit's count in a call of
+ * its own is exact, even in a file stored before its mount's limit was
+ * lowered. planFile raises it to any text longer than it, for a caller that
+ * sizes it smaller. Past it, a count is a floor. Without it, each of many
+ * edits of a text with millions of occurrences counted them all, at a cost
+ * of the edits times the occurrences. COUNT_MAX, the default limit's, serves
+ * a caller with none.
+ */
+export interface CountBudget {
+  left: number;
+  /** What it holds in all: what it was sized to, or the longest text planned with it, if that's more. */
+  size: number;
+}
+export const COUNT_MAX = 5 * 1024 * 1024;
+export const countBudget = (maxBytes = COUNT_MAX): CountBudget => ({ left: maxBytes, size: maxBytes });
 
 /**
  * Where needle starts in haystack: every position, overlapping ones included,
@@ -133,15 +171,18 @@ interface Found {
  * long run of the same, at a cost of the run's length times the needle's.
  * With `accept`, only the positions it accepts are occurrences, and the stop
  * can't apply to the positions it passes over, so those are found in one
- * pass over the haystack (everyOccurrence).
+ * pass over the haystack (everyOccurrence). The first `free` occurrences are
+ * counted freely; each past them takes one from `budget`, and the scan stops
+ * once it's spent, its count then a floor (`spent`).
  */
-function scan(haystack: string, needle: string, keep: number, accept?: (at: number) => boolean): Found {
+function scan(haystack: string, needle: string, keep: number, accept?: (at: number) => boolean, free = Infinity, budget?: CountBudget): Found {
   const starts: number[] = [];
   let count = 0;
   let overlapping = false;
+  let spent = false;
   // indexOf finds the empty string at every position, never -1: callers refuse
   // an empty old text, and this keeps any other caller from looping.
-  if (!needle) return { starts, count, overlapping, atLeast: false };
+  if (!needle) return { starts, count, overlapping, atLeast: false, spent };
   let previous = -Infinity;
   // Takes the occurrence at `at`, and says whether to look for the next.
   const take = (at: number): boolean => {
@@ -150,17 +191,22 @@ function scan(haystack: string, needle: string, keep: number, accept?: (at: numb
     if (count < keep) starts.push(at);
     count++;
     previous = at;
-    return !(overlapping && count > SHOWN_MATCHES);
+    if (overlapping && count > SHOWN_MATCHES) return false;
+    if (count > free) {
+      if (!budget || budget.left <= 0) return !(spent = true);
+      budget.left--;
+    }
+    return true;
   };
   if (accept) {
     // Run before the answer is made, since the answer reads what it counts.
     const stopped = !everyOccurrence(haystack, needle, take);
-    return { starts, count, overlapping, atLeast: stopped };
+    return { starts, count, overlapping, atLeast: stopped, spent };
   }
   for (let at = haystack.indexOf(needle); at !== -1; at = haystack.indexOf(needle, at + 1)) {
-    if (!take(at)) return { starts, count, overlapping, atLeast: true };
+    if (!take(at)) return { starts, count, overlapping, atLeast: true, spent };
   }
-  return { starts, count, overlapping, atLeast: false };
+  return { starts, count, overlapping, atLeast: false, spent };
 }
 
 /**
@@ -243,7 +289,8 @@ export const HINT_MAX_CHARS = 2 * 1024 * 1024;
  * units of file text, all of them together: as much as one edit's miss may
  * (HINT_MAX_CHARS), so the closest-region search of an edit_many call of many
  * misses holds the event loop no longer than one edit's could. Matching itself
- * scans each file once per edit, as any edit must.
+ * scans each file once per edit, as any edit must, and what it counts past
+ * what the edits need takes from the call's count budget (CountBudget).
  */
 export interface HintBudget {
   left: number;
@@ -263,14 +310,26 @@ function closestRegion(value: string, needle: string, budget: HintBudget): strin
   }
   budget.left -= value.length;
   // The first line with a bigram to score: a line of one character, such as
-  // a closing brace, has none, and no line would score above it.
-  const probe = needle
+  // a closing brace, has none, and no line would score above it. At most its
+  // first MAX_LINE_CHARS code units, as many as a hint shows of a line, so a
+  // long old text holds no more than that.
+  const first = needle
     .split('\n')
     .map((l) => l.trim())
     .find((l) => l.length > 1) ?? needle.trim();
+  const probe = first.slice(0, safeCut(first, MAX_LINE_CHARS));
   // Dice coefficient over character bigrams: cheap, order-sensitive enough for
-  // "closest line".
-  const probeGrams = grams(probe);
+  // "closest line". Each line's bigrams are counted against the probe's, by
+  // a slot for each of the probe's, so what scoring holds follows the probe,
+  // not the longest line.
+  const slot = new Map<string, number>();
+  const most: number[] = [];
+  for (const [gram, n] of grams(probe)) {
+    slot.set(gram, most.length);
+    most.push(n);
+  }
+  const met = new Int32Array(most.length);
+  const touched: number[] = [];
   const probeTotal = Math.max(0, probe.length - 1);
   const lines = value.split('\n');
   // A final line end ends the last line rather than starting an empty one, as
@@ -280,9 +339,16 @@ function closestRegion(value: string, needle: string, budget: HintBudget): strin
   let bestScore = -1;
   lines.forEach((line, i) => {
     const trimmed = line.trim();
-    const lineGrams = grams(trimmed);
     let shared = 0;
-    for (const [gram, n] of lineGrams) shared += Math.min(n, probeGrams.get(gram) ?? 0);
+    for (let at = 0; at + 1 < trimmed.length; at++) {
+      const k = slot.get(trimmed.slice(at, at + 2));
+      if (k === undefined) continue;
+      if (met[k] === 0) touched.push(k);
+      if (met[k]! < most[k]!) shared++;
+      met[k] = met[k]! + 1;
+    }
+    for (const k of touched) met[k] = 0;
+    touched.length = 0;
     const total = probeTotal + Math.max(0, trimmed.length - 1);
     const score = total ? (2 * shared) / total : 0;
     if (score > bestScore) {
@@ -293,7 +359,21 @@ function closestRegion(value: string, needle: string, budget: HintBudget): strin
   if (bestScore <= 0) return '';
   const from = Math.max(0, best - 3);
   const to = Math.min(lines.length, best + 4);
-  return `Closest region (line ${best + 1}, similarity ${bestScore.toFixed(2)}):\n${numbered(lines.slice(from, to), from + 1)}`;
+  // Every line comes before a line feed but a last one the text doesn't end with.
+  const shown = lines.slice(from, to).map((line, k) => shownLine(line, from + k < lines.length - 1 || value.endsWith('\n')));
+  return `Closest region (line ${best + 1}, similarity ${bestScore.toFixed(2)}):\n${numbered(shown, from + 1)}`;
+}
+
+/**
+ * A line of the text edits are matched in, as an answer shows it: one whose
+ * own text ends in a CR, before a line feed, shows its line end's CR too, as
+ * read shows such a line. Matching reads a CR before a line feed in old text
+ * as part of the line end, so text copied across the line with one CR would
+ * match the same text with CRLF ends alone. In that text a CR before a line
+ * feed is always such a line's own, since lineEnds made each CRLF a line feed.
+ */
+export function shownLine(text: string, beforeLf: boolean): string {
+  return beforeLf && text.endsWith('\r') ? `${text}\r` : text;
 }
 
 /** How many matches a refusal names by line and shows. */
@@ -327,7 +407,7 @@ function matchedLines(value: string, starts: number[], lines: number[]): string 
       from = safeCut(value, from);
       to = safeCut(value, to);
     }
-    shown.push(`${String(line).padStart(6)}\t${from > lineFrom ? '…' : ''}${value.slice(from, to)}${to < lineTo ? '…' : ''}`);
+    shown.push(`${String(line).padStart(6)}\t${from > lineFrom ? '…' : ''}${shownLine(value.slice(from, to), to === lineTo && newline !== -1)}${to < lineTo ? '…' : ''}`);
   });
   return shown.join('\n');
 }
@@ -336,14 +416,23 @@ function matchedLines(value: string, starts: number[], lines: number[]): string 
 export type MatchProblem =
   /** The old text doesn't occur, even with straight and curly quotes treated as equal. */
   | { kind: 'miss'; edit: number; hint: string; crlf: boolean }
-  /** It occurs a number of times other than the one asked for, or its occurrences overlap one another. */
+  /**
+   * It occurs a number of times other than the one asked for, or its
+   * occurrences overlap one another, or the call's count budget stopped its
+   * count, which is then a floor, even at the number asked for.
+   */
   | {
     kind: 'count';
     edit: number;
     expected: number | 'all';
-    /** How many times it occurs, or with `atLeast` how many the scan found before it stopped at an overlap. */
+    /**
+     * How many times it occurs, or with `atLeast` how many the scan found
+     * before it stopped: at an overlap, or with `spent` where the call's count
+     * budget ran out (CountBudget).
+     */
     found: number;
     atLeast: boolean;
+    spent: boolean;
     /** The line of each of its first SHOWN_MATCHES occurrences, one per occurrence; `shown` shows each of those lines once. */
     lines: number[];
     shown: string;
@@ -353,18 +442,34 @@ export type MatchProblem =
   /** Two edits' matches overlap, or are the same text. */
   | { kind: 'clash'; edits: [number, number]; line: number; same: boolean }
   /**
-   * Edits that each found the occurrences they ask for, more of them between
-   * them than the text is long (`length`, in UTF-16 code units with line ends
-   * as LF): each takes one or more, and one edit's don't overlap one another,
-   * so some of different edits' do. Named in place of their clashes, whose
-   * places aren't kept (planFile).
+   * Edits that found the occurrences they ask for, or stopped counting short
+   * of them, asking between them for more than the text is long (`length`, in
+   * UTF-16 code units with line ends as LF): each takes one or more, and one
+   * edit's don't overlap one another, so some of different edits' would.
+   * Named in place of their clashes, whose places aren't kept (planFile).
    */
-  | { kind: 'crowded'; edits: number[]; found: number; length: number }
+  | { kind: 'crowded'; edits: number[]; asked: number; length: number }
   /**
    * It matches only without the BOM or the line end's CR its old text
    * carries (readForm), and without them it is the same as its new text.
    */
-  | { kind: 'same'; edit: number };
+  | { kind: 'same'; edit: number }
+  /**
+   * Its old text, which carries the file's BOM at its start (`bom`) or a CR
+   * at its end (`cr`), occurs in more than one reading, as given or without
+   * either or both (readingsOf), so which the edit means can't be told. Each
+   * reading's occurrences as a count's are: how many, and the lines of the
+   * first SHOWN_MATCHES; `same` where read that way the edit changes
+   * nothing, as the file keeps the BOM or line end's CR that reading leaves
+   * out.
+   */
+  | {
+    kind: 'readings';
+    edit: number;
+    bom: boolean;
+    cr: boolean;
+    readings: Array<{ leaves: Leaves; same: boolean; found: number; atLeast: boolean; lines: number[] }>;
+  };
 
 /** One replacement made, in the updated text. */
 export interface Change {
@@ -411,7 +516,7 @@ export interface FilePlan {
   replacements: number;
   /** The edits matched with straight and curly quotes treated as equal. */
   quoteNormalized: number[];
-  /** The edits matched without the BOM or the line end's CR their old text carried (readForm). */
+  /** The edits matched without the BOM or the line end's CR their old text carried (readingsOf). */
   readForm: number[];
   crlf: boolean;
   mixed: boolean;
@@ -454,15 +559,22 @@ function lineFeeds(value: string): number {
  * edit is matched in the file's text as read: its old text must occur the
  * number of times it asks for, counting overlapping occurrences (so "aa"
  * occurs twice in "aaa"), and occurrences that overlap one another can't each
- * be replaced. When old text is absent, it is matched again with straight and
- * curly quotes treated as equal, and then, if it carries the file's BOM at its
- * start or a line's CR at its end, without them (readForm); an edit that
- * matches only without them, and without them is the same as its new text,
- * has nothing to change. Two edits' matches may touch but not overlap. Only
- * the replaced text changes: every other byte stays as it was, and each new
- * text's line ends take, by position, those of the text it replaces. For
- * each occurrence an edit replaces it holds numbers, not objects: the
- * occurrence's start, and with several edits a key in one Float64Array. The
+ * be replaced. An old text that carries the file's BOM at its start or a
+ * line's CR at its end is also read without the one, the other or both
+ * (readingsOf): one found in more than one reading, as given among them, is
+ * refused, since which it means can't be told, a reading in which the edit
+ * changes nothing included, and one found only in another reading, and there
+ * the same as its new text, has nothing to change. An edit that replaces
+ * every occurrence counts no reading in which it changes nothing or that
+ * leaves nothing, since edits keep line ends and the BOM. Only where no
+ * reading finds it is it matched again with straight and curly quotes
+ * treated as equal. Two edits' matches may touch but not overlap. What a
+ * call counts past what its edits need takes from its count budget
+ * (CountBudget). Only the replaced text changes: every other byte stays as
+ * it was, and each new text's line ends take, by position, those of the
+ * text it replaces. For each occurrence an edit replaces it holds numbers,
+ * not objects: the occurrence's start, and with several edits a key in one
+ * Float64Array. The
  * new text is built a batch of pieces at a time, and of each edit's
  * replacements it keeps only what a receipt names. Two bounds keep a call
  * from holding more than its file: two or more edits whose asks, past what a
@@ -470,8 +582,8 @@ function lineFeeds(value: string): number {
  * starts than a refusal shows (one edit keeps the starts it finds, which the
  * text's length bounds), and a file whose counts take it past `maxBytes` is
  * refused as `tooLarge`, at least that many bytes, before its new text is
- * built. One that its CRs or multi-byte characters take past it is built
- * and returned, for its caller to refuse by its bytes.
+ * built. One that the CRLF ends its new text takes, or quotes read as equal,
+ * take past it is built and returned, for its caller to refuse by its bytes.
  */
 export function planFile(
   file: FileText,
@@ -479,6 +591,7 @@ export function planFile(
   specs: EditSpec[],
   hints: HintBudget = hintBudget(),
   maxBytes = Infinity,
+  counts: CountBudget = countBudget(),
 ): { plan: FilePlan } | { problems: MatchProblem[] } | { tooLarge: number } {
   const { raw, value, crs, lfs } = file;
   const crlf = crs.length > 0;
@@ -502,61 +615,144 @@ export function planFile(
   // hold millions for each.
   const pastShown = specs.reduce((sum, spec) => sum + (spec.expected === 'all' ? 0 : Math.max(spec.expected - SHOWN_MATCHES, 0)), 0);
   const crowded = specs.length > 1 && pastShown > value.length;
+  // The call's count budget holds as many as this text is long, at least:
+  // applyEdits sizes it to the larger of the mount's limit and the largest
+  // file the call names, and a caller that sizes it smaller has it raised
+  // here.
+  if (value.length > counts.size) {
+    counts.left += value.length - counts.size;
+    counts.size = value.length;
+  }
+  // Crowded edits whose counts stopped past what a refusal shows, and so
+  // can't be set against what they ask for, each with its count problem,
+  // made where the crowded check doesn't name it.
+  const uncounted: Array<{ spec: EditSpec; problem: () => MatchProblem }> = [];
   for (const spec of specs) {
     // Every occurrence when every one is replaced; otherwise enough to replace or to show.
     const keep = crowded ? SHOWN_MATCHES : spec.expected === 'all' ? Infinity : Math.max(spec.expected, SHOWN_MATCHES);
+    // What it counts freely: every occurrence it replaces, and the one more
+    // that shows it finds more than it asks for. Past that, a count only makes
+    // a refusal exact, and takes from the call's budget (CountBudget). Crowded
+    // edits are refused whatever they find (below), so they count freely no
+    // more than a refusal shows, but for one that replaces every occurrence,
+    // which asks for as many as there are, and so counts them all.
+    const free = spec.expected === 'all' ? Infinity : crowded ? SHOWN_MATCHES : Math.max(spec.expected, SHOWN_MATCHES) + 1;
+    const budget = counts;
     let matched = spec;
-    let { starts, count, overlapping, atLeast } = scan(value, spec.oldText, keep);
+    let { starts, count, overlapping, atLeast, spent } = scan(value, spec.oldText, keep, undefined, free, budget);
     let normalized = false;
-    if (count === 0) {
-      ({ starts, count, overlapping, atLeast } = scan((quoted ??= normalizeQuotes(value)), normalizeQuotes(spec.oldText), keep));
-      normalized = count > 0;
+    // An old text with the file's BOM at its start or a CR at its end reads
+    // more ways than as given: without either, or both, as a character page
+    // or a line shown with its CRLF end's CR gives it (readingsOf). A line
+    // whose own text ends in one CR, shown with its end's, reads as given as a
+    // line ending in two. Where more than one reading that changes something
+    // finds it, which the edit means can't be told, so it's refused; where one
+    // does, it's taken, before quotes are read as equal. That holds for one
+    // that changes nothing, its new text read the same way as its old: a copy
+    // of a line end's CR or the BOM, as a character page shows them, may mean
+    // them, which the file keeps, and alone it has nothing to change. Beside a
+    // match as given, a reading need only be found, and shown as a refusal
+    // shows it. A reading that leaves nothing, of an old text that is the BOM
+    // or a CR alone, is found where what it leaves out is the file's, the BOM
+    // at the text's start and a CR before each CRLF line end; it counts only
+    // beside another match, as an empty text can't be replaced. An edit that
+    // replaces every occurrence counts neither: edits keep line ends and the
+    // BOM, so where a reading changes nothing, or leaves nothing, it can only
+    // mean the occurrences that change.
+    const all = spec.expected === 'all';
+    const emptyAt = (leaves: Leaves): number[] => (leaves === 'cr' ? crs : file.bom && (leaves === 'bom' || crAt(0)) ? [0] : []);
+    const allReads = readingsOf(spec, file, crAt)
+      .filter((read) => read.spec.oldText || !all)
+      .map((read) => {
+        if (read.spec.oldText) {
+          return { read, found: count > 0 ? scan(value, read.spec.oldText, SHOWN_MATCHES, read.accept, SHOWN_MATCHES) : scan(value, read.spec.oldText, keep, read.accept, free, budget) };
+        }
+        const at = emptyAt(read.leaves);
+        return { read, found: { starts: at.slice(0, SHOWN_MATCHES), count: at.length, overlapping: false, atLeast: false, spent: false } };
+      })
+      .filter(({ found }) => found.count > 0);
+    const same = ({ read }: { read: { spec: EditSpec } }): boolean => read.spec.oldText === read.spec.newText;
+    const counted = all ? allReads.filter((reading) => !same(reading)) : allReads;
+    const others = (count > 0 ? 1 : 0) + counted.filter(({ read }) => read.spec.oldText).length;
+    const reads = counted.filter(({ read }) => read.spec.oldText || others > 0);
+    if (reads.length + (count > 0 ? 1 : 0) > 1) {
+      const where = (found: Found) => ({ found: found.count, atLeast: found.atLeast, lines: lineNumbersAt(value, found.starts.slice(0, SHOWN_MATCHES)) });
+      problems.push({
+        kind: 'readings',
+        edit: spec.index,
+        bom: file.bom && spec.oldText.startsWith('\uFEFF'),
+        cr: crlf && spec.oldText.endsWith('\r'),
+        readings: [
+          ...(count > 0 ? [{ leaves: 'nothing' as const, same: false, ...where({ starts, count, overlapping, atLeast, spent }) }] : []),
+          ...reads.map((reading) => ({ leaves: reading.read.leaves, same: same(reading), ...where(reading.found) })),
+        ],
+      });
+      continue;
+    }
+    if (count === 0 && reads.length === 1 && !same(reads[0]!)) {
+      const { read, found: where } = reads[0]!;
+      ({ starts, count, overlapping, atLeast, spent } = where);
+      matched = read.spec;
+      readForms.push(spec.index);
+    } else if (count === 0 && reads.length < 2 && allReads.some((reading) => reading.read.spec.oldText && same(reading))) {
+      // Read as the file's own, the BOM or CR was all the edit changed. A
+      // reading that leaves nothing is never taken alone, so it misses.
+      problems.push({ kind: 'same', edit: spec.index });
+      continue;
     }
     if (count === 0) {
-      const read = readForm(spec, file, crAt);
-      if (read) {
-        ({ starts, count, overlapping, atLeast } = scan(value, read.spec.oldText, keep, read.accept));
-        // Read as the file's own, the BOM or CR was all the edit changed.
-        if (count > 0 && read.spec.oldText === read.spec.newText) {
-          problems.push({ kind: 'same', edit: spec.index });
-          continue;
-        }
-        if (count > 0) {
-          matched = read.spec;
-          readForms.push(spec.index);
-        }
-      }
+      ({ starts, count, overlapping, atLeast, spent } = scan((quoted ??= normalizeQuotes(value)), normalizeQuotes(spec.oldText), keep, undefined, free, budget));
+      normalized = count > 0;
     }
     if (count === 0) {
       problems.push({ kind: 'miss', edit: spec.index, hint: closestRegion(value, spec.oldText, hints), crlf });
       continue;
     }
-    if (overlapping || (spec.expected !== 'all' && count !== spec.expected)) {
-      const first = starts.slice(0, SHOWN_MATCHES);
-      const lines = lineNumbersAt(value, first);
-      problems.push({
-        kind: 'count',
-        edit: spec.index,
-        expected: spec.expected,
-        found: count,
-        atLeast,
-        lines,
-        shown: matchedLines(value, first, lines),
-        quoteNormalized: normalized,
-        overlapping,
-      });
+    // A count the budget stopped is a floor, and so isn't the one asked for
+    // even where it's that many, which only a crowded edit's can be.
+    if (overlapping || (spec.expected !== 'all' && (count !== spec.expected || spent))) {
+      const found = { count, atLeast, spent, overlapping, normalized, first: starts.slice(0, SHOWN_MATCHES) };
+      const problem = (): MatchProblem => {
+        const lines = lineNumbersAt(value, found.first);
+        return {
+          kind: 'count',
+          edit: spec.index,
+          expected: spec.expected,
+          found: found.count,
+          atLeast: found.atLeast,
+          spent: found.spent,
+          lines,
+          shown: matchedLines(value, found.first, lines),
+          quoteNormalized: found.normalized,
+          overlapping: found.overlapping,
+        };
+      };
+      // A crowded edit whose count stopped at no more than it asks for may
+      // find what it asks for: the crowded check below names it, or else its
+      // count, as a floor.
+      if (crowded && spent && !overlapping && count <= (spec.expected as number)) uncounted.push({ spec, problem });
+      else problems.push(problem());
       continue;
     }
     if (normalized) quoteNormalized.push(spec.index);
     applied.push({ spec: matched, starts, count });
   }
   if (crowded) {
-    // Where the edits that found what they ask for found more occurrences
-    // than the text is long, some of theirs overlap, though where isn't kept,
-    // so they're named as crowded; otherwise only the loop's problems are,
-    // since some edit didn't find what it asked for.
-    const found = applied.reduce((sum, { count }) => sum + count, 0);
-    if (found > value.length) problems.push({ kind: 'crowded', edits: applied.map(({ spec }) => spec.index), found, length: value.length });
+    // Where the edits that found what they ask for, and those whose counts
+    // stopped short of it, ask between them for more occurrences than the
+    // text is long, each takes one or more, so some overlap, though where
+    // isn't kept: they're named as crowded. Otherwise some edit found other
+    // than it asks for, and each that stopped short is named by its count,
+    // which says it's a floor.
+    // An edit that replaces every occurrence asks for as many as it found.
+    const asks = [
+      ...applied.map(({ spec, count }) => ({ edit: spec.index, asked: spec.expected === 'all' ? count : spec.expected })),
+      ...uncounted.map(({ spec }) => ({ edit: spec.index, asked: spec.expected as number })),
+    ].sort((a, b) => a.edit - b.edit);
+    const asked = asks.reduce((sum, ask) => sum + ask.asked, 0);
+    if (asked > value.length) problems.push({ kind: 'crowded', edits: asks.map((ask) => ask.edit), asked, length: value.length });
+    // A loop, not a spread: a call's edits can be more than a spread passes.
+    else for (const { problem } of uncounted) problems.push(problem());
     return { problems };
   }
   // Every replacement in file order. One edit's starts are that already; for
@@ -626,14 +822,20 @@ export function planFile(
   for (const clash of clashes) problems.push({ kind: 'clash', edits: clash.edits, line: lineAt.get(clash.at)!, same: clash.same });
   if (problems.length) return { problems };
 
-  // The new text's length in UTF-16 code units, its line ends read as LF, is
-  // known from the counts, and its UTF-8 bytes are at least that many (each
-  // code unit takes one or more, and a CRLF file's CRs only add), so a file
-  // the edits take past maxBytes is refused before a text that could run to
-  // gigabytes is built. One that this floor leaves within it but its CRs or
-  // its multi-byte characters take past it is built, no longer than twice
-  // maxBytes in code units, and its caller refuses it by its bytes.
-  const leastBytes = applied.reduce((length, { spec, count }) => length + count * (spec.newText.length - spec.oldText.length), value.length + (file.bom ? 3 : 0));
+  // The new bytes are at least the file's, and for each replacement its new
+  // text's, less the most its replaced text can take: its own bytes, in a
+  // file with CRLF line ends one more for each line feed, which it may hold
+  // as two, and matched with quotes read as equal, two more for each straight
+  // quote, which a curly one takes as three. That's exact for a file with no
+  // CRLF line end matched as given. So a file
+  // the edits take past maxBytes is refused before its new text, which could
+  // run to gigabytes, is built. One that this floor leaves within it but the
+  // CRLF ends its new text takes, or its quotes, take past it is built, and
+  // its caller refuses it by its bytes.
+  const quotesRead = new Set(quoteNormalized);
+  const straightQuotes = (text: string) => text.length - text.replace(/['"]/g, '').length;
+  const leastBytes = applied.reduce((size, { spec, count }) => size + count * (Buffer.byteLength(spec.newText)
+    - Buffer.byteLength(spec.oldText) - (crlf ? lineFeeds(spec.oldText) : 0) - (quotesRead.has(spec.index) ? 2 * straightQuotes(spec.oldText) : 0)), bytes.length);
   if (leastBytes > maxBytes) return { tooLarge: leastBytes };
 
   const endingAt = (lf: number) => (crAt(lf) ? '\r\n' : '\n');

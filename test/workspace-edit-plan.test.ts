@@ -9,6 +9,8 @@ import {
   type FilePlan,
   type MatchProblem,
   HINT_MAX_CHARS,
+  COUNT_MAX,
+  countBudget,
   decodeForEdit,
   hintBudget,
   lineNumbersAt,
@@ -93,10 +95,191 @@ test('a file the edits would take past maxBytes is refused before its new text i
   // A BOM's three bytes count.
   const bom = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), bytes]);
   assert.deepEqual(planFile(decodeForEdit(bom)!, bom, [spec(0, 'a', 'bbb', 'all')], hintBudget(), 15), { tooLarge: 16 });
-  // The least counts UTF-16 code units, so a text whose UTF-8 runs longer is
-  // planned, and its bytes are for the caller to check.
-  const wide = planFile(file, bytes, [spec(0, 'a', 'é', 'all')], hintBudget(), 5);
-  assert.ok('plan' in wide && wide.plan.bytes.length === 9);
+  // The least counts UTF-8 bytes, so a text that widens only in UTF-8 is
+  // refused too.
+  assert.deepEqual(planFile(file, bytes, [spec(0, 'a', 'é', 'all')], hintBudget(), 8), { tooLarge: 9 });
+  // A new text's line feed that a CRLF file writes as CRLF adds a byte the
+  // least leaves out, so such a text is planned, and its bytes are for the
+  // caller to check.
+  const crlf = Buffer.from('a\r\nb\r\n');
+  const longer = planFile(decodeForEdit(crlf)!, crlf, [spec(0, 'a', 'x\ny')], hintBudget(), 8);
+  assert.ok('plan' in longer && longer.plan.bytes.length === 9);
+});
+
+test('a replaceAll that widens its file past maxBytes only in UTF-8 is refused in a small heap', () => {
+  // 5,242,880 a's, each made U+0800, three bytes: built, the new text ran an
+  // 80 MiB heap out of memory before its bytes were refused.
+  const moduleUrl = new URL('../src/modules/workspace/edit-plan.js', import.meta.url).href;
+  const child = spawnSync(process.execPath, ['--max-old-space-size=80', '--input-type=module', '-e', `
+    const { decodeForEdit, planFile } = await import(${JSON.stringify(moduleUrl)});
+    const bytes = Buffer.from('a'.repeat(5_242_880));
+    console.log(JSON.stringify(planFile(decodeForEdit(bytes), bytes, [{ index: 0, oldText: 'a', newText: '\\u0800', expected: 'all' }], undefined, 5 * 1024 * 1024)));
+  `], { encoding: 'utf8', timeout: 120_000 });
+  assert.equal(child.status, 0, child.stderr || `stopped by ${child.signal}`);
+  assert.deepEqual(JSON.parse(child.stdout), { tooLarge: 15_728_640 });
+});
+
+test("a miss's closest region holds what its old text's first line and the file's lines need, not their every bigram, in a small heap", () => {
+  // A random old text of 3,240,000 code units against a small file, and a
+  // random line of 1,960,000 against a short old text: holding each one's
+  // bigrams ran a 128 MiB heap, and an 80 MiB one, out of memory.
+  const moduleUrl = new URL('../src/modules/workspace/edit-plan.js', import.meta.url).href;
+  const child = spawnSync(process.execPath, ['--max-old-space-size=64', '--input-type=module', '-e', `
+    const { decodeForEdit, planFile } = await import(${JSON.stringify(moduleUrl)});
+    let a = 7;
+    const random = (n, lo, hi) => {
+      const units = new Uint16Array(n);
+      for (let i = 0; i < n; i++) {
+        a = (a + 0x6d2b79f5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        units[i] = lo + Math.floor((((t ^ (t >>> 14)) >>> 0) / 4294967296) * (hi - lo));
+      }
+      return new TextDecoder('utf-16le').decode(units);
+    };
+    const small = Buffer.from('hello\\nworld\\n');
+    const probe = planFile(decodeForEdit(small), small, [{ index: 0, oldText: random(3_240_000, 0x20, 0xd7ff), newText: 'x', expected: 1 }]);
+    const line = Buffer.from(random(1_960_000, 0x80, 0x800));
+    const long = planFile(decodeForEdit(line), line, [{ index: 0, oldText: 'not in it', newText: 'x', expected: 1 }]);
+    console.log(JSON.stringify([probe.problems[0].kind, long.problems[0].kind]));
+  `], { encoding: 'utf8', timeout: 120_000 });
+  assert.equal(child.status, 0, child.stderr || `stopped by ${child.signal}`);
+  assert.deepEqual(JSON.parse(child.stdout), ['miss', 'miss']);
+});
+
+test("a call counts occurrences past what its edits need only within its budget, and past it a count is a floor", () => {
+  // Three edits each asking for one of 5,000,000: the first counts them all;
+  // the budget then has COUNT_MAX less those past the first 21, so the second
+  // stops one past it, and the third one past its free 21.
+  const bytes = Buffer.from('a'.repeat(5_000_000));
+  const counts = countBudget();
+  const problems = planFile(decodeForEdit(bytes)!, bytes, [spec(0, 'a', 'b'), spec(1, 'a', 'c'), spec(2, 'a', 'd')], hintBudget(), Infinity, counts);
+  assert.ok('problems' in problems);
+  const left = COUNT_MAX - (5_000_000 - 21);
+  assert.deepEqual(problems.problems.map((p) => p.kind === 'count' && [p.found, p.atLeast, p.spent]), [[5_000_000, false, false], [21 + left + 1, true, true], [22, true, true]]);
+  // Two hundred such edits hold the event loop no longer than a few counts.
+  const before = process.cpuUsage();
+  planFile(decodeForEdit(bytes)!, bytes, Array.from({ length: 200 }, (_, k) => spec(k, 'a', 'b')));
+  const used = process.cpuUsage(before);
+  assert.ok((used.user + used.system) / 1000 < 2_000, `${(used.user + used.system) / 1000} ms of CPU`);
+});
+
+test("a crowded edit whose count the budget stopped short of its ask, or at it, is named by that count where the crowded check names none", () => {
+  // Asking 1,500, 1,500 and 900 of a text 2,000 long, the edits are crowded.
+  // At a budget of 2,000, the first two count all 1,000 of theirs, which
+  // leaves 40, and are count problems; the third runs it out at 61. What's
+  // left, 900, fits the text, so no crowded problem names it, and its count
+  // does (Abigail-2676's case).
+  const bytes = Buffer.from('ab'.repeat(1_000));
+  const counted = (asked: number) => {
+    const planned = planFile(decodeForEdit(bytes)!, bytes, [spec(0, 'a', 'x', 1_500), spec(1, 'b', 'y', 1_500), spec(2, 'ab', 'z', asked)], hintBudget(), Infinity, countBudget(2_000));
+    assert.ok('problems' in planned);
+    return planned.problems.map((p) => p.kind === 'count' && [p.edit, p.found, p.atLeast, p.spent]);
+  };
+  assert.deepEqual(counted(900), [[0, 1_000, false, false], [1, 1_000, false, false], [2, 61, true, true]]);
+  // A count the budget stopped at just what the edit asks for is a floor too.
+  assert.deepEqual(counted(61), [[0, 1_000, false, false], [1, 1_000, false, false], [2, 61, true, true]]);
+});
+
+test("an edit's count in a call of its own is exact, in a text longer than the call's limit", () => {
+  // As in a file stored before its mount's limit was lowered: the budget is
+  // raised to the text's length, which no count passes.
+  const bytes = Buffer.from('a'.repeat(1_500));
+  const planned = planFile(decodeForEdit(bytes)!, bytes, [spec(0, 'a', 'b')], hintBudget(), Infinity, countBudget(1_000));
+  assert.ok('problems' in planned);
+  assert.deepEqual(planned.problems.map((p) => p.kind === 'count' && [p.found, p.atLeast, p.spent]), [[1_500, false, false]]);
+});
+
+test("crowded edits among which one replaces every occurrence ask for as many as it finds, however little of the budget is left", () => {
+  const bytes = Buffer.from(`${'x'.repeat(100)}\n`);
+  assert.deepEqual(planFile(decodeForEdit(bytes)!, bytes, [spec(0, 'x', 'a', 'all'), spec(1, 'x', 'b', 100), spec(2, 'x', 'c', 100)]),
+    { problems: [{ kind: 'crowded', edits: [0, 1, 2], asked: 300, length: 101 }] });
+  // The first edit spends all but 21 of a budget of 1,001; the second stops
+  // at 42, short of its ask; the third, replacing every occurrence, counts
+  // all 1,000 regardless.
+  const long = Buffer.from(`${'x'.repeat(1_000)}\n`);
+  const planned = planFile(decodeForEdit(long)!, long, [spec(0, 'x', 'a', 990), spec(1, 'x', 'b', 990), spec(2, 'x', 'c', 'all')], hintBudget(), Infinity, countBudget(1_000));
+  assert.ok('problems' in planned);
+  assert.deepEqual(planned.problems.map((p) => (p.kind === 'count' ? [p.kind, p.edit, p.found] : p)), [['count', 0, 1_000], { kind: 'crowded', edits: [1, 2], asked: 1_990, length: 1_001 }]);
+});
+
+test("a reading in which an edit changes nothing counts toward a refusal for one edit, and not for one that replaces every occurrence", () => {
+  // Line 1's own text ends in a CR; line 2's "x", with its CRLF end's CR, is
+  // "x\r" read that way, where the edit changes nothing.
+  const bytes = Buffer.from('x\r\r\nx\r\n');
+  assert.deepEqual(planFile(decodeForEdit(bytes)!, bytes, [spec(0, 'x\r', 'x')]), { problems: [{
+    kind: 'readings', edit: 0, bom: false, cr: true,
+    readings: [{ leaves: 'nothing', same: false, found: 1, atLeast: false, lines: [1] }, { leaves: 'cr', same: true, found: 1, atLeast: false, lines: [2] }],
+  }] });
+  const all = planFile(decodeForEdit(bytes)!, bytes, [spec(0, 'x\r', 'x', 'all')]);
+  assert.ok('plan' in all, JSON.stringify(all));
+  assert.equal(all.plan.bytes.toString(), 'x\r\nx\r\n');
+});
+
+test("one count budget raised for a text longer than it is raised once for each length, however many such texts it plans", () => {
+  // Raised to 1,500 by the first text, whose one edit counts all but 21 of
+  // it, the budget leaves the second text's edit its free 21, those 21, and
+  // one more.
+  const counts = countBudget(1_000);
+  const bytes = Buffer.from('a'.repeat(1_500));
+  const counted = (newText: string) => {
+    const planned = planFile(decodeForEdit(bytes)!, bytes, [spec(0, 'a', newText)], hintBudget(), Infinity, counts);
+    assert.ok('problems' in planned);
+    return planned.problems.map((p) => p.kind === 'count' && [p.found, p.atLeast, p.spent]);
+  };
+  assert.deepEqual(counted('b'), [[1_500, false, false]]);
+  assert.deepEqual(counted('c'), [[43, true, true]]);
+});
+
+test("crowded edits whose counts stopped short, where the crowded check names none, are each named, by a loop, and their problems made only then", () => {
+  // The first edit asks for more than there are and counts them all; the
+  // second runs the budget out; the next 199,999, each asking 21, stop at 21
+  // and between them ask for no more than the text holds. Each is named.
+  const text = `${'a'.repeat(4_199)}\n`.repeat(1_000);
+  const bytes = Buffer.from(text);
+  const specs = [spec(0, 'a', 'x', 10_000_000), ...Array.from({ length: 200_000 }, (_, k) => spec(k + 1, 'a', 'y', 21))];
+  const planned = planFile(decodeForEdit(bytes)!, bytes, specs);
+  assert.ok('problems' in planned);
+  assert.equal(planned.problems.length, 200_001);
+  assert.ok(planned.problems.every((p) => p.kind === 'count'));
+  // Where the crowded check names them, their problems aren't made: 200,000
+  // edits of one line of 2,000,000 that a crowded refusal names take no
+  // longer than their counts.
+  const line = Buffer.from('a'.repeat(2_000_000));
+  const before = process.cpuUsage();
+  const crowded = planFile(decodeForEdit(line)!, line, Array.from({ length: 200_000 }, (_, k) => spec(k, 'a', 'y', 3_000)));
+  const used = process.cpuUsage(before);
+  assert.ok('problems' in crowded && crowded.problems.some((p) => p.kind === 'crowded'));
+  assert.ok((used.user + used.system) / 1000 < 4_000, `${(used.user + used.system) / 1000} ms of CPU`);
+});
+
+test("a miss's closest region is the line most like the first 2,000 code units of the old text's first line, its bigrams each counted as often as that line has them", () => {
+  // Line 2 is the old text's first 2,000 code units; line 3 its next 3,000.
+  const words = (from: number, count: number) => Array.from({ length: count }, (_, k) => `w${from + k}`).join(' ');
+  const head = words(0, 500).slice(0, 2_000);
+  const tail = words(5_000, 700).slice(0, 3_000);
+  const region = (text: string, oldText: string) => {
+    const found = problems(text, [spec(0, oldText, 'z')]);
+    assert.equal(found[0]?.kind, 'miss');
+    const line = /Closest region \(line (\d+), /.exec((found[0] as { hint: string }).hint);
+    return line ? Number(line[1]) : undefined;
+  };
+  assert.equal(region(`intro\n${head}\n${tail}\n`, `${head}${tail}q`), 2);
+  // "abab..." has the old text's "ab" five times, which counts once: line 2,
+  // "abcx", shares two of "abcd"'s three bigrams and is closer.
+  assert.equal(region('ababababab\nabcx\n', 'abcd'), 2);
+});
+
+test("a miss's closest region over 100,000 lines that share a bigram with the old text takes under 2 s of CPU", () => {
+  const text = 'abc\n'.repeat(100_000);
+  const before = process.cpuUsage();
+  const [miss] = problems(text, [spec(0, 'abd', 'z')]);
+  assert.ok(miss?.kind === 'miss' && miss.hint.startsWith('Closest region (line 1, similarity 0.50)'), JSON.stringify(miss));
+  const used = process.cpuUsage(before);
+  assert.ok((used.user + used.system) / 1000 < 2_000, `${(used.user + used.system) / 1000} ms of CPU`);
+});
+
+test("in a file with no CRLF line end, the size floor is exact for an old text with line feeds", () => {
+  const bytes = Buffer.from('a\nb\n');
+  assert.deepEqual(planFile(decodeForEdit(bytes)!, bytes, [spec(0, 'a\n', 'bbb\n')], hintBudget(), 5), { tooLarge: 6 });
 });
 
 test('a replaceAll that would grow its file past maxBytes is refused in a small heap', () => {
@@ -118,7 +301,7 @@ test("edits whose asks past what a refusal shows come to more than the text is l
   // Three edits that each find the 100 they ask for: 300 between them in a
   // text 101 UTF-16 code units long, its line ends read as LF, so some overlap.
   assert.deepEqual(problems(text, [spec(0, 'x', 'a', 100), spec(1, 'x', 'b', 100), spec(2, 'x', 'c', 100)]),
-    [{ kind: 'crowded', edits: [0, 1, 2], found: 300, length: 101 }]);
+    [{ kind: 'crowded', edits: [0, 1, 2], asked: 300, length: 101 }]);
   // One that finds fewer than it asks for is named as it always is, and the
   // rest alone don't overflow the text, so nothing else is named.
   const [count] = problems(text, [spec(0, 'x', 'a', 100), spec(1, 'x', 'b', 150)]);
@@ -147,7 +330,7 @@ test('edits asking for millions of occurrences each are refused in a small heap'
     console.log(JSON.stringify(planFile(decodeForEdit(bytes), bytes, specs)));
   `], { encoding: 'utf8', timeout: 120_000 });
   assert.equal(child.status, 0, child.stderr || `stopped by ${child.signal}`);
-  assert.deepEqual(JSON.parse(child.stdout), { problems: [{ kind: 'crowded', edits: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], found: 12_000_000, length: 1_000_000 }] });
+  assert.deepEqual(JSON.parse(child.stdout), { problems: [{ kind: 'crowded', edits: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], asked: 12_000_000, length: 1_000_000 }] });
 });
 
 test('an occurrence is a position: overlapping occurrences count, and they can\'t each be replaced', () => {

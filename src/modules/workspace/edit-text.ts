@@ -4,13 +4,14 @@
  * first changed region. What can grow with a call, problems, notes, files and
  * regions, is held to the length the call's result may have
  * (ToolCall.resultMaxChars). Past it, a problem keeps its first line, a region
- * is named by its lines, and the answer's last line counts what it left out.
+ * is named by its lines, and the answer's last line counts what it left out;
+ * edit's receipt keeps its path and notes whatever their length.
  *
  * Ported from anima-research/hands-mcp's src/edit.ts, where it words the Edit
  * and EditMany tools' answers.
  */
 
-import { type Change, type FilePlan, type MatchProblem, SHOWN_MATCHES } from './edit-plan.js';
+import { type Change, type FilePlan, type Leaves, type MatchProblem, SHOWN_MATCHES } from './edit-plan.js';
 import { MAX_LINE_CHARS, jsonLength, numberedLine, safeCut } from './text.js';
 
 /** The tool a call came through, which words its refusals and receipt. */
@@ -99,6 +100,14 @@ function firstEdit(problem: EditProblem): number {
 
 const plural = (count: number, one: string, many = `${one}s`) => (count === 1 ? one : many);
 
+/** How a refusal names a reading of an old text, by what it leaves out (readingsOf). */
+const READS: Record<Leaves, string> = {
+  nothing: 'as given',
+  cr: "with its last CR read as its CRLF line end's",
+  bom: "with its BOM read as the file's own",
+  both: "with its BOM read as the file's own and its last CR as a CRLF line end's",
+};
+
 /** A problem as an agent reads it, without the label edit_many puts before it. */
 function problemText(problem: EditProblem, tool: EditTool): string {
   switch (problem.kind) {
@@ -126,10 +135,19 @@ function problemText(problem: EditProblem, tool: EditTool): string {
       const differs = typeof expected === 'number' && (problem.atLeast ? found > expected : found !== expected);
       const hint = overlapping
         ? 'Include more of the text around it to single out the text you mean.'
-        : typeof expected === 'number' && found > expected
-          ? `Include more of the text around it to single out the ${expected === 1 ? 'one' : 'ones'} you mean, or set occurrences to ${found} if every one should change.`
-          : `Set occurrences to ${found} if those are all.`;
-      return `${occurs}${quotes}${differs ? `, not ${expected}` : ''}${overlap}. ${hint}\n${problem.shown}`;
+        : problem.spent && !differs
+          ? `Whether it occurs the ${expected} ${plural(expected as number, 'time')} it asks for can't be told from this call.`
+          : problem.spent
+            ? `Include more of the text around it to single out the ${expected === 1 ? 'one' : 'ones'} you mean.`
+          : typeof expected === 'number' && found > expected
+            ? `Include more of the text around it to single out the ${expected === 1 ? 'one' : 'ones'} you mean, or set occurrences to ${found} if every one should change.`
+            : `Set occurrences to ${found} if those are all.`;
+      // Why a count is a floor goes on a line of its own, so it doesn't push
+      // the hint past the first line's cut (cutLine).
+      const floor = problem.spent && !overlapping
+        ? `This call counted as many occurrences as one call may, so ${found} is a floor: sent in a call of its own, the edit has every one counted, unless they overlap.\n`
+        : '';
+      return `${occurs}${quotes}${differs ? `, not ${expected}` : ''}${overlap}. ${hint}\n${floor}${problem.shown}`;
     }
     case 'clash': {
       const [a, b] = problem.edits;
@@ -138,10 +156,25 @@ function problemText(problem: EditProblem, tool: EditTool): string {
         : `edits ${a + 1} and ${b + 1} overlap in ${problem.path} (from line ${problem.line}); give each its own stretch of text, or make them one edit.`;
     }
     case 'crowded':
-      return `they find ${problem.found.toLocaleString('en-US')} occurrences between them in ${problem.path}, whose text, with its line ends read as LF, is ${problem.length.toLocaleString('en-US')} UTF-16 code units long, `
-        + 'so some of their matches overlap; give each its own stretch of text.';
+      return `they ask for ${problem.asked.toLocaleString('en-US')} occurrences between them in ${problem.path}, whose text, with its line ends read as LF, is ${problem.length.toLocaleString('en-US')} UTF-16 code units long, `
+        + 'so some of their matches would overlap; give each its own stretch of text.';
     case 'same':
       return `oldString and newString are the same once the BOM or the line end's CR that oldString carries is read as ${problem.path}'s own, which the file keeps, so there's nothing to change.`;
+    case 'readings': {
+      const carries = problem.bom && problem.cr ? 'starts with a BOM and ends in a CR' : problem.bom ? 'starts with a BOM' : 'ends in a CR';
+      const ways = problem.readings.map((reading) => `${READS[reading.leaves]} (${countLines(reading)})`);
+      const list = ways.length < 3 ? ways.join(' and ') : `${ways.slice(0, -1).join(', ')} and ${ways.at(-1)}`;
+      // A reading that changes nothing means the file's own BOM or line end's
+      // CR, which an edit can't change, so the refusal says so.
+      const same = problem.readings.filter((reading) => reading.same);
+      const kept = [same.some((reading) => reading.leaves !== 'cr') && 'BOM', same.some((reading) => reading.leaves !== 'bom') && 'line ends'].filter(Boolean).join(' and ');
+      // The lines of each reading follow on a line of their own, so however
+      // long they run, they don't push the hint past the first line's cut
+      // (cutLine).
+      return `oldString ${carries}, and occurs in ${problem.path} read more than one way, so which you mean can't be told. `
+        + `Include more of the text around it, such as the line before or after it, to say which.\nIt occurs ${list}.`
+        + (same.length ? `\nWhere it occurs ${same.map((reading) => READS[reading.leaves]).join(' or ')}, the edit changes nothing, since the file keeps its ${kept}.` : '');
+    }
   }
 }
 
@@ -332,6 +365,30 @@ export function shownRegions(plan: FilePlan, budget: { left: number }, maxChars:
       last.end = Math.max(last.end, region.end);
     } else regions.push(region);
   }
+  // A line shows as the stored bytes hold it, its CRLF end's CR left out
+  // unless the line's own text ends in a CR, as a line of the old text shows
+  // (shownLine). A CR before a line feed in the updated text is the line's
+  // own, unless the edit put it before a bare LF: on disk the two are then a
+  // CRLF end, and the line's own text doesn't end in it. The new bytes tell
+  // these apart by the CRs before the line feed, read only for a line whose
+  // text ends in a CR, at a place that moves forward with the regions' lines.
+  // A file's line n is line n of its bytes, since both hold the same line
+  // feeds, and a BOM's bytes are neither a line feed nor a CR.
+  let byteAt = 0;
+  let byteLine = 1;
+  const asStored = (text: string, n: number, beforeLf: boolean): string => {
+    if (!beforeLf || !text.endsWith('\r')) return text;
+    for (; byteLine < n; byteLine++) byteAt = plan.bytes.indexOf(10, byteAt) + 1;
+    const lf = plan.bytes.indexOf(10, byteAt);
+    let own = 0;
+    while (own < text.length && text.charCodeAt(text.length - 1 - own) === 13) own++;
+    let stored = 0;
+    while (stored <= own && lf - 1 - stored >= byteAt && plan.bytes[lf - 1 - stored] === 13) stored++;
+    // A CRLF end after the line's own CRs; or a bare LF, whose last CR read
+    // takes as the end's unless another comes before it.
+    if (stored > own) return `${text}\r`;
+    return own > 1 ? text : text.slice(0, -1);
+  };
   const out: string[] = [];
   const omitted: string[] = [];
   for (const region of regions) {
@@ -345,7 +402,7 @@ export function shownRegions(plan: FilePlan, budget: { left: number }, maxChars:
     for (let lineStart = region.start, n = region.from; fits && lineStart < region.end; n++) {
       const newline = plan.updated.indexOf('\n', lineStart);
       const lineEnd = newline === -1 || newline >= region.end ? region.end : newline;
-      const text = plan.updated.slice(lineStart, lineEnd);
+      const text = asStored(plan.updated.slice(lineStart, lineEnd), n, lineEnd === newline);
       // A line too long to show whole shows its start, or, where edits' first
       // changes start on it, a stretch from shortly before each.
       const columns = text.length > MAX_LINE_CHARS ? firsts.filter((first) => first.line === n).map((first) => first.at - lineStart) : [];
