@@ -672,6 +672,22 @@ test("ls without a path and status give a direct mount's kind and ignore list, a
   assert.deepEqual((await data<Record<string, Record<string, unknown>>>(named, 'status')).ref!.ignore, ['vendor']);
 });
 
+test('a direct mount refuses every tool that writes, edit_many included, as read-only', async (t) => {
+  const env = new Env(t);
+  env.file('a.ts', 'alpha\n');
+  const m = await env.open();
+  const states = env.stateIds();
+  const calls: Array<[string, Record<string, unknown>]> = [
+    ['write', { path: 'ref/a.ts', content: 'beta\n' }],
+    ['edit', { path: 'ref/a.ts', oldString: 'alpha', newString: 'beta' }],
+    ['edit_many', { edits: [{ path: 'ref/a.ts', oldString: 'alpha', newString: 'beta' }] }],
+    ['delete', { path: 'ref/a.ts' }],
+  ];
+  for (const [name, input] of calls) assert.match(await failure(m, name, input), /Mount "ref" is read-only/, name);
+  assert.equal((await data<{ content: string }>(m, 'read', { path: 'ref/a.ts' })).content, '     1\talpha');
+  assert.deepEqual(env.stateIds(), states, 'no state was made');
+});
+
 test('sync passes over a direct mount, and says so rather than that nothing changed', async (t) => {
   const env = new Env(t);
   env.file('src/a.ts', 'a\n');
