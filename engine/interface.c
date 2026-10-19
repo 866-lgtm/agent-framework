@@ -172,8 +172,6 @@ static const JSMallocFunctions limited_malloc_funcs = {
 static int interrupt_handler(JSRuntime *r, void *opaque) {
     (void)r;
     (void)opaque;
-    if (interrupted)
-        return 1;
     if (host_interrupt()) {
         interrupted = true;
         return 1;
@@ -194,17 +192,9 @@ static JSValue js_host(JSContext *c, JSValueConst this_val, int argc, JSValueCon
     JSValue promise = JS_NewPromiseCapability(c, funcs);
     if (JS_IsException(promise))
         return promise;
-    JSValue entry = JS_NewArray(c);
+    /* JS_NewArrayFrom takes both functions, and frees them if it fails. */
+    JSValue entry = JS_NewArrayFrom(c, 2, funcs);
     if (JS_IsException(entry)) {
-        JS_FreeValue(c, funcs[0]);
-        JS_FreeValue(c, funcs[1]);
-        JS_FreeValue(c, promise);
-        return JS_EXCEPTION;
-    }
-    /* JS_SetPropertyUint32 takes each value, and frees it if it fails. */
-    if (JS_SetPropertyUint32(c, entry, 0, funcs[0]) < 0 ||
-        JS_SetPropertyUint32(c, entry, 1, funcs[1]) < 0) {
-        JS_FreeValue(c, entry);
         JS_FreeValue(c, promise);
         return JS_EXCEPTION;
     }
@@ -501,10 +491,10 @@ static JSValue error_json(JSValue v) {
             }
             p = s;
         }
-        if (JS_IsString(p))
-            JS_SetPropertyStr(ctx, o, keys[i], p);
-        else
+        if (!JS_IsString(p))
             JS_FreeValue(ctx, p);
+        else if (JS_SetPropertyStr(ctx, o, keys[i], p) < 0)
+            JS_FreeValue(ctx, JS_GetException(ctx));
     }
     JS_FreeValue(ctx, v);
     JSValue text = JS_JSONStringify(ctx, o, JS_UNDEFINED, JS_UNDEFINED);

@@ -200,8 +200,10 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
     host_output: (stream: number, ptr: number, len: number) =>
       guard(() => slots.output(stream === 2 ? 2 : 1, text(ptr, len))),
   };
-  // The few WASI calls libc makes: the clocks, random bytes for Math.random's seed, and stdio,
-  // which only the engine's own diagnostics reach (an assertion's message before it traps).
+  // The few WASI calls libc makes: the clocks (the real-time one for Date.now and the seed QuickJS
+  // gives Math.random, the monotonic one for performance.now), four random bytes libc asks for
+  // once as the module loads, and stdio, which only the engine's own diagnostics reach (an
+  // assertion's message before it traps).
   const wasi = {
     clock_time_get: (id: number, _precision: bigint, out: number) => {
       let ns: bigint;

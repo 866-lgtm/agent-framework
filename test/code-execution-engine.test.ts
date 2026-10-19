@@ -109,6 +109,8 @@ test('settling an id that isn\'t pending throws, and leaves the run as it was', 
   const { e } = await engine();
   e.start(PRELUDE, 'await tool("t")', 's.js');
   assert.throws(() => e.settle(9, true, '1', UNFIT), EngineError);
+  // Not a whole id: the module would read 1.5 as call 1.
+  assert.throws(() => e.settle(1.5, true, '1', UNFIT), EngineError);
   assert.equal(fulfilled(e.settle(1, true, '1', UNFIT)), 1);
   assert.throws(() => e.settle(1, true, '1', UNFIT), /no pending call/);
   e.dispose();
@@ -188,19 +190,31 @@ test('the interrupt stops a spinning script for good', async () => {
 
 test('the interrupt reaches a script spinning in jobs, and later settles answer interrupted', async () => {
   let stop = false;
-  const { e } = await engine({ interrupt: () => stop });
-  e.start(PRELUDE, 'const v = await tool("t"); for (;;) { await 0 }', 's.js');
+  const { e } = await engine({ interrupt: () => stop }, { memoryMaxBytes: 8 * MiB });
+  e.start(PRELUDE, 'tool("u"); const v = await tool("t"); for (;;) { await 0 }', 's.js');
   stop = true;
-  assert.deepEqual(e.settle(1, true, '1', UNFIT), { kind: 'interrupted' });
+  assert.deepEqual(e.settle(2, true, '1', UNFIT), { kind: 'interrupted' });
+  // A settle after that does nothing for the stopped run: a result too large for its memory isn't
+  // even read, so it isn't reported unfit.
+  assert.deepEqual(e.settle(1, true, JSON.stringify('x'.repeat(12 * MiB)), UNFIT), { kind: 'interrupted' });
   e.dispose();
 });
 
 test('a slot that throws ends the run with an EngineError, and the engine refuses calls after', async () => {
-  const { e } = await engine({ hostCall: () => { throw new Error('the bridge is broken'); } });
-  assert.throws(() => e.start(PRELUDE, 'await tool("t")', 's.js'), (err: unknown) =>
+  // A script that catches the failure and calls again in the same run doesn't reach the slot a
+  // second time, so nothing more goes out once the run has failed. The calls are direct, as the
+  // child's prelude makes them: an awaited call's rejection comes in a job, which never runs.
+  let calls = 0;
+  const { e } = await engine({ hostCall: () => { calls++; throw new Error('the bridge is broken'); } });
+  assert.throws(() => e.start(PRELUDE, 'try { __host("a", "{}") } catch {}\n__host("b", "{}")', 's.js'), (err: unknown) =>
     err instanceof EngineError && /the bridge is broken/.test(err.message));
+  assert.equal(calls, 1);
   assert.throws(() => e.settle(1, true, '1', UNFIT), EngineError);
   e.dispose();
+  const out = await engine({ output: () => { throw new Error('the output pipe is gone'); } });
+  assert.throws(() => out.e.start(PRELUDE, 'try { print("x") } catch {}\n1', 's.js'), (err: unknown) =>
+    err instanceof EngineError && /the output pipe is gone/.test(err.message));
+  out.e.dispose();
 });
 
 test('the guest has JavaScript and the three slots, and nothing that reaches the host', async () => {
@@ -213,6 +227,18 @@ test('the guest has JavaScript and the three slots, and nothing that reaches the
        now: Date.now() > 1.7e12, random: Math.random() < 1, regexp: /a(b)/.exec('ab')[1] })`, 's.js');
   // No module loader: an import fails, whatever it names.
   assert.deepEqual(fulfilled(s), { present: [], imported: 'ReferenceError', now: true, random: true, regexp: 'b' });
+  e.dispose();
+});
+
+test('the guest reads the host\'s clocks: Date.now, and a performance.now that advances', async () => {
+  const { e } = await engine();
+  const before = Date.now();
+  const v = fulfilled(e.start(PRELUDE, `
+    const t0 = performance.now();
+    for (let i = 0; i < 2e6 && performance.now() - t0 < 5; i++);
+    [Date.now(), performance.now() - t0 >= 5]`, 's.js')) as [number, boolean];
+  assert.ok(v[0] >= before && v[0] <= Date.now(), `Date.now() in the guest was ${v[0]}`);
+  assert.equal(v[1], true);
   e.dispose();
 });
 
@@ -239,9 +265,9 @@ test('a script reaching the memory limit gets a catchable out-of-memory error, a
 test('a result too large for the guest\'s memory rejects the call with the child\'s own error', async () => {
   // Too large to copy in at all, and small enough to copy but too large once parsed: many small
   // objects take several times their JSON's size. Neither may reach the script as an out of
-  // memory at the call's await, which would read as a failed call (Ada-1017's call): the call
-  // rejects with the child's ResultTooLarge, and settle says so. With the host's copy outside the
-  // limit, the second case's parse failed with a bare null and no refusal counted.
+  // memory at the call's await, which would read as a failed call that the script might repeat,
+  // though the call took effect: the call rejects with the child's ResultTooLarge, and settle
+  // says so.
   const one = '{"id":123456,"name":"item-123456","ok":true}';
   for (const [shape, memoryMaxBytes, json] of [
     ['a long string', 8 * MiB, JSON.stringify({ data: 'x'.repeat(12 * MiB) })],
@@ -254,6 +280,16 @@ test('a result too large for the guest\'s memory rejects the call with the child
     assert.deepEqual(fulfilled(s), ['ResultTooLarge', json.length], shape);
     e.dispose();
   }
+});
+
+test('a result counts against the limit while its call settles, so a script that fills memory then gets a catchable error', async () => {
+  // The result's copy stays in the guest's memory until settle returns, and the script runs on
+  // meanwhile. With the copy outside the limit, memory ran out before the limit refused anything,
+  // and the script caught a bare null.
+  const { e } = await engine({}, { memoryMaxBytes: 32 * MiB });
+  e.start(PRELUDE, 'const r = await tool("big"); let a = [], caught; try { for (;;) a.push({ n: a.length }); } catch (err) { caught = err === null ? "null" : err.message; } a = null; [r.length, caught]', 's.js');
+  assert.deepEqual(fulfilled(e.settle(1, true, JSON.stringify('x'.repeat(6 * MiB)), UNFIT)), [6 * MiB, 'out of memory']);
+  e.dispose();
 });
 
 test('a result that fits, beside one that didn\'t, settles as usual', async () => {
