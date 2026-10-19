@@ -237,6 +237,21 @@ test('a first line that alone would pass the limit is cut where it fits', async 
   assert.match(tiny.note!, /Line 1 is cut: read its rest with offsetChars=0 and limitChars=1500, then continue with offset=2\.$/);
 });
 
+test('a first line cut to fit, read from a later offset, is numbered and placed in the file', async t => {
+  const { read } = await setup(t, `a\nb\n${'"'.repeat(1500)}\nnext\n`);
+  const page = (await read({ offset: 3 }, 1_000)).data as LinePage;
+  assert.deepEqual([page.fromLine, page.toLine], [3, 3]);
+  const [, shown, rest, at] = /^ {5}3\t("*) \[… (\d+) more chars; read them with offsetChars=(\d+)\]$/.exec(page.content)!;
+  assert.ok(shown.length > 0 && shown.length < 1500, `${shown.length}`);
+  // The rest starts past lines 1 and 2, "a\n" and "b\n", in the stored text.
+  assert.equal(Number(at), 4 + shown.length);
+  assert.equal(page.note, `Stopped at line 3 to stay within the 1000-character result limit (file has 4). Line 3 is cut: read its rest with offsetChars=${at} and limitChars=${rest}, then continue with offset=4.`);
+  // The rest read with both reads to the line's end and no further.
+  const more = (await read({ offsetChars: Number(at), limitChars: Number(rest) }, 24_000)).data as CharPage;
+  assert.equal(more.content, '"'.repeat(Number(rest)));
+  assert.equal(more.nextOffsetChars, 4 + 1500);
+});
+
 test('a page whose last line is cut names where its rest starts before the next line', async t => {
   const long = 'z'.repeat(3000);
   const { read } = await setup(t, `short\n${long}\n${long}\n${long}\n`);
