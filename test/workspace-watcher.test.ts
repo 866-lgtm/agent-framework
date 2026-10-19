@@ -131,8 +131,9 @@ async function waitFor(predicate: () => boolean, message: string, timeoutMs = EV
 }
 
 /**
- * A polling watcher, once chokidar's first scan is done. A change made before
- * then can be part of the files chokidar starts from (ignoreInitial), and is
+ * A polling watcher, once chokidar's first scan is done and its poll reports
+ * changes (changesFlow). A change made before then can be part of the files
+ * chokidar starts from (ignoreInitial), or of the poll's first stat, and is
  * then never reported. If the watcher has reported an error and isn't ready
  * when the wait checks, the wait fails with that error, and a watcher that
  * doesn't get ready is stopped.
@@ -144,6 +145,7 @@ async function readyWithPolling(): Promise<{ watcher: MountWatcher; batches: FsC
   try {
     await waitFor(() => ready || failed !== undefined, 'expected the watcher to be ready');
     if (!ready) throw failed;
+    await changesFlow(tmp, collected.batches, []);
   } catch (error) {
     await collected.watcher.stop();
     throw error;
@@ -330,8 +332,10 @@ describe('MountWatcher lifecycle', () => {
     try {
       assert.ok(existsSync(nested), 'start() should have created the watched path');
       // A file written before chokidar's first scan is done can be part of
-      // what it starts from (ignoreInitial), and then is never reported.
+      // what it starts from (ignoreInitial), or of the poll's first stat, just
+      // after onReady, and then is never reported.
       await waitFor(() => ready, 'onReady should have fired');
+      await changesFlow(nested, batches, []);
       writeFileSync(join(nested, 'ticket.md'), 'hi');
       await changeFor(batches, 'ticket.md');
     } finally {
@@ -455,6 +459,7 @@ describe('MountWatcher lifecycle', () => {
 
     try {
       await waitFor(() => ready, 'expected initial watcher ready');
+      await changesFlow(tmp, batches, []);
 
       const file = join(tmp, 'normal.md');
       writeFileSync(file, 'v1');
@@ -738,6 +743,7 @@ describe('MountWatcher lifecycle', () => {
         await (watcher as unknown as { reattach(): Promise<void> }).reattach();
         assert.ok(errors.some((e) => e.message === 'close failed'), "the re-attach reported its close's failure");
         await waitFor(() => readyCount === 2, 'expected the watcher to attach again');
+        await changesFlow(tmp, batches, []);
         writeFileSync(join(tmp, 'after.md'), 'x');
         await changeFor(batches, 'after.md', 'created');
       } finally {
