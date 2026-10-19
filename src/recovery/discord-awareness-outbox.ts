@@ -1341,9 +1341,11 @@ function indexed(doc: LedgerDocument): LedgerState {
 
 /**
  * Write the document: compact JSON to a temporary file beside the ledger,
- * synced, renamed over it, and the directory synced, so the rename is on
- * disk too. Serialized before the first await, so the text is the document
- * as the act left it.
+ * synced, renamed over it, then its directory synced, for the ledger's entry
+ * in it, and that directory's parent, for the directory's own entry, which
+ * is new when a write, this one or an earlier one, had to make it, as the
+ * framework's writeRecoveryFile does. Serialized before the first await, so
+ * the text is the document as the act left it.
  */
 async function writeLedgerFile(path: string, doc: LedgerDocument): Promise<void> {
   const text = `${JSON.stringify(doc)}\n`;
@@ -1363,9 +1365,27 @@ async function writeLedgerFile(path: string, doc: LedgerDocument): Promise<void>
     await unlink(temporary).catch(() => undefined);
     throw error;
   }
+  await syncDirectory(directory);
+  await syncDirectory(dirname(directory));
+}
+
+/**
+ * Sync a directory, so its entries reach the disk. As in the framework's
+ * syncRecoveryDirectory, there's none on win32, where a directory can't be
+ * opened, and a sync refused with EINVAL or EBADF, the answer where the
+ * filesystem can't sync a directory, is let go, since it would come again on
+ * every write. Any other failure fails the write it belongs to, where
+ * syncRecoveryDirectory raises an alert instead: the act then reports from
+ * what the file holds, as a write that didn't complete.
+ */
+async function syncDirectory(directory: string): Promise<void> {
+  if (process.platform === 'win32') return;
   const handle = await open(directory, 'r');
   try {
     await handle.sync();
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== 'EINVAL' && code !== 'EBADF') throw error;
   } finally {
     await handle.close();
   }

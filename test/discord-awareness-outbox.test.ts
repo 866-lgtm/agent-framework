@@ -598,6 +598,20 @@ test('a retirement that reached the file before its write failed reads back as r
   assert.equal(outbox.batchStatus(batch.id), 'retired');
 }));
 
+test("a write syncs its directory's parent too: one whose parent can't be synced reads back as written", { skip: asRoot }, withLedger(async (outbox, h) => {
+  const batch = (await outbox.prepare(input([ref('m1')])))!;
+  // The rename lands and the ledger's directory syncs; its parent, the
+  // store's directory, can't be opened to sync.
+  const parent = dirname(dirname(h.path));
+  chmodSync(parent, 0o300);
+  try {
+    await assert.rejects(outbox.discard(batch.id), /EACCES/);
+  } finally {
+    chmodSync(parent, 0o700);
+  }
+  assert.equal(outbox.batchStatus(batch.id), 'retired');
+}));
+
 test('a prepare whose write failed says what the ledger may hold, and retires a batch that reached it', { skip: asRoot }, withLedger(async (outbox, h) => {
   await outbox.prepare(input([ref('m0')]));
   const dir = dirname(h.path);
