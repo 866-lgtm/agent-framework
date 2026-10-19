@@ -567,6 +567,22 @@ test('a stop asked for once stays a stop, and what it cuts off a failure\'s read
   e.dispose();
 });
 
+test('once a stop has come, a failure with no message gets no stand-in for one', async () => {
+  // Each thrown object has no message. Without the stop, the engine would tell it by its JSON or
+  // its string form; here the first a non-enumerable name getter ends at the stop (its JSON would
+  // be {"code":5}), and the second's toJSON does (its toString would give "made up").
+  for (const thrown of [
+    'Object.defineProperty({ code: 5 }, "name", { get() { for (;;) {} } })',
+    '{ toJSON() { for (;;) {} }, toString() { return "made up" } }',
+  ]) {
+    let checks = 0;
+    const { e } = await engine({ interrupt: () => ++checks > 100 });
+    const s = e.start(PRELUDE, `queueMicrotask(() => { throw ${thrown} }); 1`, 's.js');
+    assert.deepEqual(s, { kind: 'failed', name: '', message: '' }, thrown);
+    e.dispose();
+  }
+});
+
 test('a stop while a throw at the start is read stays a stop, which later calls answer without reading it again', async () => {
   // The prelude makes a call, then throws an object whose message getter spins until the stop:
   // the script's own ending, cut off by a stop, as a rejection's would be.
@@ -612,8 +628,10 @@ test('a settle whose resolve call is stopped on its way in is dropped, and the s
   }
   assert.deepEqual(await settledStopped(lo), { s: { kind: 'interrupted', dropped: true }, ran: false });
   // One call fewer, the asking falls just after the resolve function ran: the result is handed over.
-  const after = await settledStopped(lo - 1);
-  assert.equal(after.s.dropped, undefined, JSON.stringify(after));
+  if (lo > 0) {
+    const after = await settledStopped(lo - 1);
+    assert.equal(after.s.dropped, undefined, JSON.stringify(after));
+  }
 });
 
 test('a result that reaches a stopped run is dropped', async () => {

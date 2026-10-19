@@ -194,8 +194,11 @@ static const JSMallocFunctions limited_malloc_funcs = {
     limited_calloc, limited_malloc, limited_free, limited_realloc, limited_usable_size,
 };
 
-/* Once the host has stopped the guest, every later check stops it too, without asking again: a
-   failure's read runs guest code after a stop (its getters), and that code mustn't run on. */
+/* Once the host has stopped the guest, every later check stops it too, without asking again, so
+   a stop holds for good even if the host would say otherwise later. A failure's read runs the
+   script's code after a stop (getters of what it threw), and a check ends that code. QuickJS
+   checks at its first poll and once in 10,000 after, so code runs on until the next check, not
+   less. */
 static int interrupt_handler(JSRuntime *r, void *opaque) {
     (void)r;
     (void)opaque;
@@ -531,7 +534,10 @@ int engine_settle(uint32_t id, int ok, char *json, uint32_t json_len, char *unfi
 }
 
 /* The text of a value or an error, for engine_result. Takes v. Returns a JS string, undefined,
-   or an exception. */
+   or an exception. Reading an object's parts can run the script's own code (a getter, a toString),
+   and after a stop they're still read: code that spins is ended at the next check, which leaves
+   that part out. But once a stop has come, no stand-in is made for a missing message, since its
+   JSON or string form would run more of the script's code and wouldn't be the message. */
 static JSValue error_json(JSValue v) {
     /* No prototype, so a toJSON the script put on Object.prototype doesn't serialize it. */
     JSValue o = JS_NewObjectProto(ctx, JS_NULL);
@@ -546,8 +552,7 @@ static JSValue error_json(JSValue v) {
         stack = JS_GetPropertyStr(ctx, v, "stack");
         /* An object with no message of its own, such as a plain object thrown, or one whose
            message can't be read, is told by its JSON, or by its string form when it has none,
-           rather than left blank. Once a stop has come, that's left out too: it would run more of
-           the script's code, which the stop stops, and give something other than the message. */
+           rather than left blank. */
         if (JS_IsException(message)) {
             JS_FreeValue(ctx, JS_GetException(ctx));
             message = JS_UNDEFINED;
@@ -558,10 +563,11 @@ static JSValue error_json(JSValue v) {
                 JS_FreeValue(ctx, JS_GetException(ctx));
                 message = JS_UNDEFINED;
             }
-            if (JS_IsUndefined(message))
+            if (JS_IsUndefined(message) && !interrupted)
                 message = JS_ToString(ctx, v);
         }
     } else {
+        /* A primitive's string form runs no script code (a Symbol has none, and is left out). */
         message = JS_ToString(ctx, v);
     }
     /* A getter that throws, or a value with no string form, leaves that part out. */
@@ -655,14 +661,14 @@ static uint8_t *read_ending(int st) {
    Returns 0 in any other state, when it can't allocate, or when a stop lands while the script's own
    ending is read, which leaves none to give. The ending is fixed before it's read. The script's own
    code that serializing runs (a toJSON, a getter), and the jobs it queues, which run before this
-   returns unless the run has failed (then none run), can't reach the host; a reaction it attaches
-   to a promise still pending runs when that settles, as the script's other continuations do after
-   its ending. A stop in those jobs comes after the ending was read, so this returns the ending; a
+   returns until the run fails or is stopped, can't reach the host; a reaction it attaches to a
+   promise still pending runs when that settles, as the script's other continuations do after its
+   ending. A stop in those jobs comes after the ending was read, so this returns the ending; a
    failure there ends the run after its ending, which engine_state then answers. An exception that
    ended the run is what ended it however its read goes, so a stop while it's read leaves out the
-   parts the stop cut off, and the rest is returned. Data nested deeper than the host's stack allows
-   can overflow it in JS_JSONStringify, which throws out of the module: the binding reports that as
-   a crash. */
+   parts the stop cut off (see error_json), and the rest is returned. Data nested deeper than the
+   host's stack allows can overflow it in JS_JSONStringify, which throws out of the module: the
+   binding reports that as a crash. */
 EXPORT("engine_result")
 uint8_t *engine_result(void) {
     int st = state();

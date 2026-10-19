@@ -41,8 +41,9 @@ export interface EngineSlots {
    * good: the engine doesn't ask again, the call in progress answers `interrupted`, and so does
    * every call after, with two exceptions. A stop in the jobs that reading the script's ending
    * queued, after the ending was read whole, lets that call answer the ending, and the calls after
-   * it answer `interrupted`. And a run that has failed stays `failed`, a stop while its exception
-   * is read included.
+   * it answer `interrupted`. And a run answered `failed` stays so, a stop while its exception is
+   * read included; a throw as the run starts is the script's own ending, answered `rejected`, which
+   * a stop while it's read turns into `interrupted`, as for any rejection.
    */
   interrupt(): boolean;
   /** The guest called `__output(stream, text)`: stream 1 is out, 2 is err. */
@@ -71,8 +72,8 @@ export type RunState =
    * failed in the engine itself; or the engine couldn't settle a call. The fields are the
    * exception's, read as the engine reads a `rejected` one (an Error's name, message and stack; a
    * value with no message of its own, its JSON or string form), less any part a stop cut off while
-   * it was read. Every later call answers the same, a stop after it included, and no later result
-   * reaches the script.
+   * it was read; after a stop, no stand-in is made for a missing message. Every later call answers
+   * the same, a stop after it included, and no later result reaches the script.
    */
   | { kind: 'failed'; name: string; message: string; stack?: string }
   /** `interrupt()` returned true while it ran. */
