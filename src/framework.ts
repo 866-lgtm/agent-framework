@@ -6730,8 +6730,8 @@ export class AgentFramework {
    * memory-only: they land within the turn, at a tool boundary or at its
    * end, and a crash before then loses them. That window runs to the turn's
    * end for a message held there and what is queued behind it, and, on a
-   * stream that can't carry injected messages, for every message deferred
-   * during the turn.
+   * stream that declares it can't carry injected messages (membrane's XML
+   * prefill path, from 0.6.0), for every message deferred during the turn.
    *
    * A write that fails, or a queue over the cap, which writes nothing,
    * leaves the record as it last held it, except that store only, a write
@@ -11502,7 +11502,8 @@ export class AgentFramework {
           // A live stream handed these messages after the results follows
           // them in its next round, not the tool loop of a reply to
           // [Continue]: that round's rows carry no prompt. One that doesn't
-          // say whether it carries them (membrane 0.5.87) counts as carrying
+          // say whether it carries them (membrane 0.5.x, whose native path
+          // carries them and whose XML path drops them) counts as carrying
           // them here, as at the drain above. A boundary that ends the turn,
           // restarts the stream or falls back to a new start below hands
           // them to no live stream, and a new start reads its own prompt from
@@ -11684,8 +11685,11 @@ export class AgentFramework {
             }
             // Streaming path: convert results and resume the stream.
             // Mid-turn messages collected above ride along as injected user
-            // messages (membrane ≥0.5.72) — appended after the tool_result
-            // envelope so the next round of THIS turn hears them.
+            // messages. Membrane's native path (from 0.5.72) appends them
+            // after the tool_result envelope, so the next round of THIS turn
+            // hears them. Its XML prefill path drops them with a warning on
+            // 0.5.x, and from 0.6.0 declares it can't carry them, so none are
+            // collected for it.
             currentState.stream.provideToolResults(
               agent.toolResultGuard.submissionResults(membraneResults),
               midTurnInjections.length > 0 ? { injectedMessages: midTurnInjections } : undefined,
@@ -17433,8 +17437,11 @@ export class AgentFramework {
             if (liveRound) liveProseRouting = true;
             // Whether this round's tool-result batch (and anything queued
             // with it) will be presented to the model before it speaks
-            // again: the producer says so when it can; otherwise native
-            // rounds (verbatim roundContent) carry injections.
+            // again: the producer says so when it can (membrane from 0.6.0).
+            // Otherwise, as on membrane 0.5.x, every round counts as
+            // presenting it. That holds for 0.5.x's native rounds, while its
+            // XML path drops what's injected, so a 'now' notice there reaches
+            // the agent at its next compile instead.
             const presentsInjections =
               (event.context as { supportsInjectedMessages?: boolean }).supportsInjectedMessages ?? true;
             // Queued under this turn's routing, whenever it posts, and
@@ -21413,10 +21420,12 @@ export class AgentFramework {
    * (releaseWindowNowOrAfterResume), since a write could land mid-surgery.
    *
    * The agent never reads its window again, so every failed-reply notice it
-   * never read is passed to the primary, by name, once: each one stored in
-   * its window above its consumed watermark (flushed there at its turn's end,
-   * or stored while it was idle) and not heard at a tool boundary, and each
-   * one still queued for it. Writes still
+   * may not have read is passed to the primary, by name, once: each one
+   * stored in its window above its consumed watermark (flushed there at its
+   * turn's end, stored while it was idle, or injected at a tool boundary
+   * whose stream didn't say whether it carries injections, which may have
+   * dropped it), and each one still queued for it. One heard at a boundary
+   * whose stream declares it carries them is under the watermark. Writes still
    * queued would wait for a boundary it never reaches, and the flush that
    * finds it gone would drop them, so they land in its own window now, which
    * Chronicle keeps for investigation. Its stream is over or cancelled, so it
@@ -21455,15 +21464,16 @@ export class AgentFramework {
   }
 
   /**
-   * The failed-reply notices stored in `agent`'s window that it never read:
-   * those above the lower of its consumed watermark and the point where the
-   * watermark's branch and the current one part (branchesPartAt), or every
-   * one, when it never compiled. The watermark moves at a compile, and at a
-   * tool boundary whose
+   * The failed-reply notices stored in `agent`'s window that it may not have
+   * read: those above the lower of its consumed watermark and the point where
+   * the watermark's branch and the current one part (branchesPartAt), or
+   * every one, when it has no watermark. The watermark is set at the agent's
+   * creation and moves at a committing compile, and at a tool boundary whose
    * stream declares it carries the messages injected there
-   * (markContextConsumed), so a notice the live stream heard is under it, and
-   * one a boundary stored without sending (a turn a tool ended, a budget
-   * restart, a stream that may drop injections) is above it.
+   * (markContextConsumed), so a notice such a stream heard is under it. One
+   * a boundary stored without sending (a turn a tool ended, a budget
+   * restart) is above it, and so is one injected into a stream that didn't
+   * say whether it carries injections, which may have dropped it or heard it.
    */
   private unreadFailedReplies(agent: Agent): MessageMetadata[] {
     try {

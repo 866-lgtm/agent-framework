@@ -17,12 +17,13 @@
  * to its prefix (context-manager #155) refuses a reply whose stored prefix
  * holds a message its request didn't.
  *
- * A message the stream carried has been read: RFC-006's consumed watermark
- * covers it, so a coalesced replacement can no longer remove it. Only a
- * stream that declares it carries injected messages (membrane's native
- * path) is known to have carried them. One that declares it can't (membrane's
- * XML prefill path) gets none, and what is queued waits for the turn's end.
- * One that doesn't say (membrane 0.5.87) gets them, and they stay unread.
+ * A message a stream declares it carried has been read: RFC-006's consumed
+ * watermark covers it, so a coalesced replacement can no longer remove it.
+ * Only a stream that declares it carries injected messages (membrane's native
+ * path, from 0.6.0) is known to have carried them. One that declares it can't
+ * (membrane's XML prefill path, from 0.6.0) gets none, and what is queued
+ * waits for the turn's end. One that doesn't say (membrane 0.5.x) gets them,
+ * and they stay unread, though its native path carries them.
  */
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
@@ -291,7 +292,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
   }
 
   it('a message injected into a stream that declares it carries injections is read: the consumed watermark covers it', async () => {
-    membrane.supportsInjectedMessages = true; // membrane's native path declares it
+    membrane.supportsInjectedMessages = true; // membrane's native path declares it, from 0.6.0
     const framework = await runTurn('move', [{ participant: 'Antra', content: text('look left') }]);
     assert.deepEqual(injected(), ['Antra: look left']);
     assert.equal(unread(framework, 'look left'), false, 'a coalesced replacement must not remove what the agent heard');
@@ -310,7 +311,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
   });
 
   it('a stream that can\'t carry injections gets none: what is queued waits for the turn to end', async () => {
-    membrane.supportsInjectedMessages = false; // membrane's XML prefill path declares it
+    membrane.supportsInjectedMessages = false; // membrane's XML prefill path declares it, from 0.6.0
     const framework = await runTurn('move', [{ participant: 'Antra', content: text('look left') }]);
     assert.deepEqual(atBoundary(), undefined, 'the boundary drained nothing');
     assert.equal(membrane.lastStream!.receivedToolResultOptions[0], undefined, 'nothing was injected');
