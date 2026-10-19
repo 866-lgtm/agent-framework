@@ -29,6 +29,7 @@ import { AgentFramework, PYTHON_RUNTIME_SOURCE, PyRunner, buildInjectedTools } f
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import { PYTC_STOP_ROWS_DRIVER } from './helpers/pytc-stop-rows.js';
+import { UNREACHED_WATCHDOG, silenceRun } from './helpers/run-watchdog.js';
 
 const ECHO_TOOLS: { pyName: string; toolName: string }[] = [
   { pyName: 'test__echo', toolName: 'test--echo' },
@@ -2189,14 +2190,13 @@ describe("a round that runs code_execution is routed once its scripts return (re
       // slow call. Its threshold is too long for python3's start to trip it, so
       // the run is made to look idle only once the script is in the slow call,
       // and the next poll disposes it.
-      const run = h.framework.runEphemeralToCompletion(created.agent, created.contextManager, { startupTimeoutMs: 15000, idleTimeoutMs: 60_000, idlePollMs: 20 });
+      const run = h.framework.runEphemeralToCompletion(created.agent, created.contextManager, { ...UNREACHED_WATCHDOG, startupTimeoutMs: 15000 });
       const stalled = assert.rejects(run, /stalled/);
       h.framework.start();
       const deadline = Date.now() + 15000;
       while (Date.now() < deadline && !h.log.includes('tool:slow')) await new Promise((r) => setTimeout(r, 10));
       assert.ok(h.log.includes('tool:slow'), 'the script reached the slow call');
-      const runs = (h.framework as unknown as { ephemeralRuns: Map<string, { lastActivity: number }> }).ephemeralRuns;
-      runs.get(created.agent.name)!.lastActivity = 0;
+      silenceRun(h.framework, created.agent.name);
       await stalled;
       // The script now returns, and its result arrives with the framework still running.
       let resulted!: () => void;

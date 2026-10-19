@@ -18,6 +18,7 @@ import type {
 } from '../src/index.js';
 import { AgentFramework, ShutdownTimeoutError } from '../src/index.js';
 import { createMockResponse, HeldStream, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
+import { UNREACHED_WATCHDOG, silenceRun } from './helpers/run-watchdog.js';
 
 class EphemeralToolModule implements Module {
   readonly name = 'test';
@@ -462,7 +463,8 @@ describe('runEphemeralToCompletion settle signal', () => {
   it("a run whose retry stop() cancels ends with the refusal when its idle watchdog fires before stop()'s sweep", { timeout: 60_000 }, async () => {
     // The run's stream can't start, and stop() cancels its retry while it
     // waits on a resident's stream. The run's inference had started, so its
-    // idle watchdog is the one that fires first.
+    // idle watchdog is the one that fires, once the test makes the run look
+    // idle, and before stop()'s sweep.
     const { tempDir, storePath } = tempStorePath('ephemeral-held-stop-idle-');
     let release!: () => void;
     const released = new Promise<void>((resolve) => { release = resolve; });
@@ -484,9 +486,12 @@ describe('runEphemeralToCompletion settle signal', () => {
       framework.start();
       push('go');
       await residentStreaming;
-      const run = framework.runEphemeralToCompletion(agent, contextManager, { idleTimeoutMs: 300, idlePollMs: 50 });
+      const run = framework.runEphemeralToCompletion(agent, contextManager, UNREACHED_WATCHDOG);
       await inDelay;
       const stopped = framework.stop();
+      // stop() has closed admission before it returns, so the watchdog's
+      // next poll ends the run as a stop.
+      silenceRun(framework, agent.name);
       // As above: the held stream is released only after this.
       await assert.rejects(run, /refused: the framework is stopping \(no stream-driver activity for \d+s after inference started\)/);
       release();
