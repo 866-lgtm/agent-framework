@@ -395,7 +395,7 @@ describe("a message a tune-out holds stays out of what the residents are shown, 
     }
   });
 
-  it("with backlogCap 0, a cancel the subconscious makes itself hands its report every held message, oldest first, and the dump none", async () => {
+  it("with backlogCap 0, a cancel in the subconscious's name hands its report every held message, oldest first, and the dump none", async () => {
     const { framework, ctx, module, membrane, internals, emit, close } = await open(0);
     let release: () => void = () => {};
     try {
@@ -415,8 +415,10 @@ describe("a message a tune-out holds stays out of what the residents are shown, 
       emit('t5b', 'T5-HELD-2 more chatter while the turn is alive');
       await waitFor('the second held write', () => rowWith(ctx.queryMessages({}).messages, 'T5-HELD-2')?.held === true);
 
-      // The subconscious cancels, with a note it wrote before it could see
-      // the held messages; the notice and a report turn bring it them.
+      // The cancel cancel_tuneout makes, with the subconscious as its source
+      // and a note, though called here while only the resident's turn runs:
+      // the note was written before the held messages could be seen, so the
+      // notice and a report turn bring them.
       assert.ok(internals.tuneOutCoordinator!.cancel('disc', CHANNEL, 'subconscious', 'subconscious judgment', 'Someone needs you here.').ok);
       await waitFor('the dump', () => !!rowWith(ctx.queryMessages({}).messages, '<tuned-out-backlog'));
       const dumpText = textOf(rowWith(ctx.queryMessages({}).messages, '<tuned-out-backlog')!);

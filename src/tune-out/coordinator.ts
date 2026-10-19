@@ -377,10 +377,12 @@ export class TuneOutCoordinator {
     // messages the dump can't give the resident whole come with the notice,
     // each with its own content, as its view can't have them until they're
     // stored. A cancel the subconscious makes itself gets the notice and the
-    // turn only when some do: its note, if it wrote one, speaks for what it
-    // saw, and it wrote that before it could see them.
+    // turn when some do, since it wrote its note before it could see them,
+    // and when it wrote no note and the cap cut anything, since nothing else
+    // then covers what the dump leaves out. Otherwise its note speaks for
+    // what it saw.
     const selfCancel = source === 'subconscious';
-    if (subName && (!selfCancel || heldForReport.length > 0)) {
+    if (subName && (!selfCancel || heldForReport.length > 0 || (!subconsciousNote && truncated > 0))) {
       const truncNote = truncated > 0
         ? ` ${truncated} of ${backlog.length} diverted messages were above the cap and not delivered raw to the resident.`
         : '';
