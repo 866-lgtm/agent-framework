@@ -13,7 +13,7 @@ import { join } from 'node:path';
 import type { Module, ToolResult } from '../src/index.js';
 import { AgentFramework, PassthroughStrategy } from '../src/index.js';
 import { scriptEndText, scriptEndTextWithin } from '../src/code-execution/result-text.js';
-import { MockMembrane } from './helpers/mock-membrane.js';
+import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 const CUT = /\[… (\d+) characters cut …\]\n/;
 const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
@@ -206,6 +206,7 @@ describe('code_execution result text, through the framework (real python3)', () 
       codeExecution?: Record<string, unknown>;
       agents?: Parameters<typeof AgentFramework.create>[0]['agents'];
       toolResultInlineMaxChars?: number;
+      membrane?: MockMembrane;
     },
     body: (
       framework: AgentFramework,
@@ -223,7 +224,7 @@ describe('code_execution result text, through the framework (real python3)', () 
       : null;
     const framework = await AgentFramework.create({
       storePath: join(tempDir, 'store.chronicle'),
-      membrane: new MockMembrane().asMembrane(),
+      membrane: (opts.membrane ?? new MockMembrane()).asMembrane(),
       agents: opts.agents ?? [],
       modules: workspace ? [workspace as unknown as Module] : [],
       syncIntervalMs: 0,
@@ -289,6 +290,38 @@ describe('code_execution result text, through the framework (real python3)', () 
       assert.strictEqual(Number(notice[1]), whole.length);
       // Hosts read the fields, whole, in structured.
       assert.deepStrictEqual(r.structured, { stdout: 'x'.repeat(30_000), stderr, return_code: 1 });
+    });
+  });
+
+  it('through a model\'s own call, the model reads and the history keeps the ending first and the end of each stream', async () => {
+    // The calls above are made in process, so nothing stores their results.
+    // Here the model makes the call: what it reads on the wire and what its
+    // history stores go through the framework's storing too, whose own spill
+    // would keep only a head if the text were past the cap.
+    const membrane = new MockMembrane();
+    const code = 'import sys\nsys.stdout.write("x" * 30000 + "\\nstdout ends here\\n")\nsys.stderr.write("an error line\\n")\nraise SystemExit(5)';
+    membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'call_long', name: 'code_execution', input: { code } }], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+    await withFramework({ workspace: true, membrane }, async (framework, readSpill) => {
+      const created = await framework.createEphemeralAgent({ name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all' });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+      const running = framework.runEphemeralToCompletion(created.agent, created.contextManager);
+      framework.start();
+      await running;
+      const wire = (membrane.lastStream!.receivedToolResults.flat() as Array<{ toolUseId: string; content: string }>)
+        .find((r) => r.toolUseId === 'call_long')!.content;
+      assert.ok(wire.length <= 24_000 && wire.length > 23_000, `${wire.length} characters against the default inline cap`);
+      assert.ok(wire.startsWith('exit code: 1\n--- stderr ---\nan error line\nTraceback'), wire.slice(0, 120));
+      assert.ok(wire.includes('SystemExit: 5\n--- stdout ---\nxxx'), 'stderr whole, ending in the exit, ahead of stdout');
+      const notice = /\nstdout ends here\n\[cut to fit; the whole output \(\d+ chars\): workspace file (files\/tool-results\/\d{4}-\d{2}-\d{2}-output-call_long\.txt)\. [^\n]*\]$/.exec(wire);
+      assert.ok(notice, wire.slice(-300));
+      assert.ok((await readSpill(notice[1])).endsWith('stdout ends here\n'));
+      // The history holds the very text the model read.
+      const stored = created.contextManager.getAllMessages().flatMap((m) => m.content)
+        .find((b) => b.type === 'tool_result' && (b as { toolUseId?: string }).toolUseId === 'call_long') as unknown as { content: unknown };
+      const storedText = typeof stored.content === 'string' ? stored.content
+        : (stored.content as Array<{ type: string; text?: string }>).filter((b) => b.type === 'text').map((b) => b.text).join('');
+      assert.strictEqual(storedText, wire);
     });
   });
 
