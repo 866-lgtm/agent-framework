@@ -1263,8 +1263,10 @@ export class ChannelRegistry {
       `host tries it again ${later}, or now if you call ${tool} again. ${withStop(said)}`;
   }
 
-  /** A registration's entry: nothing about its transport is known until a
-   *  receipt for its target confirms it open or closed. */
+  /** A registration's entry, or a push's (ensureChannelRegistered): nothing
+   *  about its transport is known until a receipt for its target confirms it
+   *  open or closed, or, where the host doesn't direct the lifecycle, the
+   *  channel's traffic shows it open (handleIncoming). */
   private registerEntry(key: string, serverId: string, descriptor: ChannelDescriptor): void {
     const entry: ChannelEntry = { serverId, descriptor, open: false };
     this.channels.set(key, entry);
@@ -1858,17 +1860,17 @@ export class ChannelRegistry {
     // label to record. A real label is recorded before the entry exists:
     // an append that throws registers nothing, so the next push tries again.
     if (label) this.appendLabelSighting(channelId, label, extractDmMeta(extraMetadata));
-    const key = `${serverId}:${channelId}`;
-    this.channels.set(key, {
-      serverId,
-      descriptor: {
-        id: channelId,
-        type: serverId,
-        label: label ?? channelId,
-        direction: 'bidirectional',
-        metadata: { lazyRegistered: true, ...(extraMetadata ?? {}) },
-      },
-      open: false,
+    // Its transport is as unknown as a registration's (registerEntry). After
+    // a restart, a push for a channel no registration has comes here, and
+    // the server may still hold a channel an earlier process opened. Counting
+    // it confirmed closed would answer a close or a decline as already done
+    // and send nothing, even where the server still delivers.
+    this.registerEntry(`${serverId}:${channelId}`, serverId, {
+      id: channelId,
+      type: serverId,
+      label: label ?? channelId,
+      direction: 'bidirectional',
+      metadata: { lazyRegistered: true, ...(extraMetadata ?? {}) },
     });
     this.emitTraceFn({
       type: 'mcpl:channel-lazy-registered',
