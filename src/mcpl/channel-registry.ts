@@ -648,11 +648,21 @@ function unreachableRemedy(reach: Exclude<ServerReach, 'up'>): string {
   }
 }
 
+/** Whether an entry was made from a push (ensureChannelRegistered) and is
+ *  still as the push made it: a registration replaces it (registerEntry),
+ *  and a channels/changed update replaces its descriptor in place. */
+function madeFromPush(entry: ChannelEntry): boolean {
+  return (entry.descriptor.metadata as { lazyRegistered?: boolean } | undefined)?.lazyRegistered === true;
+}
+
 /** When reconciling applies a recorded decision: at the server's next
  *  registration of the channel, where this host directs its channels'
- *  lifecycle then (reconcileChannels, §14.1). */
-function laterClause(serverId: string): string {
-  return `when the "${serverId}" server next registers this channel, if this host may open and close its channels then`;
+ *  lifecycle then (reconcileChannels, §14.1). A channel made from a push
+ *  may never be registered at all, so for one the text says "if". */
+function laterClause(entry: ChannelEntry): string {
+  return madeFromPush(entry)
+    ? `if the "${entry.serverId}" server registers this channel at a time this host may open and close its channels`
+    : `when the "${entry.serverId}" server next registers this channel, if this host may open and close its channels then`;
 }
 
 /** A channel decision the lifecycle log refused to append, as on a full
@@ -1163,7 +1173,7 @@ export class ChannelRegistry {
     const channel = `"${entry.descriptor.id}"`;
     const tool = action === 'open' ? 'channel_open' : 'channel_close';
     const done = action === 'open' ? 'opened' : 'closed';
-    const later = laterClause(entry.serverId);
+    const later = laterClause(entry);
     // A decision never recorded is no decision a later one overtook, and
     // nothing about the channel changed, whatever its transport's state.
     if (err instanceof ChannelLifecycleError && err.kind === 'unrecorded') {
@@ -1265,8 +1275,9 @@ export class ChannelRegistry {
 
   /** A registration's entry, or a push's (ensureChannelRegistered): nothing
    *  about its transport is known until a receipt for its target confirms it
-   *  open or closed, or, where the host doesn't direct the lifecycle, the
-   *  channel's traffic shows it open (handleIncoming). */
+   *  open or closed, or the channel's traffic shows it open where the host
+   *  doesn't direct the lifecycle, or for an entry made from a push, which
+   *  has no target (handleIncoming). */
   private registerEntry(key: string, serverId: string, descriptor: ChannelDescriptor): void {
     const entry: ChannelEntry = { serverId, descriptor, open: false };
     this.channels.set(key, entry);
@@ -1596,8 +1607,8 @@ export class ChannelRegistry {
       // self-attest a channel identity without ever passing
       // channels/register authorization). A server whose channel genuinely
       // exists registers it first; discord's DM case goes through
-      // ensureChannelRegistered on push/event, which creates a CLOSED
-      // routable entry rather than an open self-attested one.
+      // ensureChannelRegistered on push/event, which creates a routable
+      // entry that isn't open, rather than an open self-attested one.
       const incomingKey = `${serverId}:${message.channelId}`;
       if (!this.channels.has(incomingKey)) {
         // Loud, coalesced or not, like every other refusal of a message, but
@@ -1690,21 +1701,25 @@ export class ChannelRegistry {
         // only for a confirmed target, and only for a channel still decided
         // open or tuned out. After a retarget, traffic for this id may still
         // come from the old subscription, and a close receipt that landed
-        // first (or during the coalescer's await) stands. Where the host
-        // doesn't direct it, the server opens its own channels and its
-        // traffic is the only evidence the host gets, so it marks the
-        // channel open, as it always has. The entry is the one the message
-        // was accepted for: one a re-registration put in its place meanwhile
-        // waits for its own evidence. Durable desired state still changes
-        // exclusively through lifecycle operations. A marker is evidence like
-        // any other message.
+        // first (or during the coalescer's await) stands. An entry made from
+        // a push has no target a retarget could have left behind, so for the
+        // receipt rule's own reason its traffic shows the transport open,
+        // for a channel decided open or tuned out. It stops being made from
+        // a push when a registration replaces it (registerEntry) or a
+        // channels/changed update replaces its descriptor in place, and the
+        // receipt rule holds from then. Where the host doesn't direct the
+        // lifecycle, the server opens its own channels and its traffic is
+        // the only evidence the host gets, so it marks the channel open, as
+        // it always has. The entry is the one the message was accepted for:
+        // one a re-registration put in its place meanwhile waits for its own
+        // evidence. Durable desired state still changes exclusively through
+        // lifecycle operations. A marker is evidence like any other message.
         if (this.directsLifecycle(serverId)) {
-          if (this.unconfirmedChannelTargets.has(incomingEntry)) return;
+          if (this.unconfirmedChannelTargets.has(incomingEntry) && !madeFromPush(incomingEntry)) return;
           const desired = this.getDesiredState(serverId, message.channelId);
           if (desired !== 'open' && desired !== 'tuned-out') return;
-        } else {
-          this.unconfirmedChannelTargets.delete(incomingEntry);
         }
+        this.unconfirmedChannelTargets.delete(incomingEntry);
         incomingEntry.open = true;
       };
       if (!coalesced) markAccepted();
@@ -1829,7 +1844,7 @@ export class ChannelRegistry {
       // arrived with no label/recipient info gets a usable name the next
       // time a message reveals it (labels must show people, not ids).
       if (
-        (existing.descriptor.metadata as { lazyRegistered?: boolean } | undefined)?.lazyRegistered &&
+        madeFromPush(existing) &&
         label && existing.descriptor.label === channelId
       ) {
         const metadata = extraMetadata
@@ -2002,7 +2017,7 @@ export class ChannelRegistry {
    */
   isDeclaredChannel(serverId: string, channelId: string): boolean {
     const entry = this.channels.get(`${serverId}:${channelId}`);
-    return !!entry && !(entry.descriptor.metadata as { lazyRegistered?: boolean } | undefined)?.lazyRegistered;
+    return !!entry && !madeFromPush(entry);
   }
 
   getDescriptor(channelId: string): ChannelDescriptor | undefined {
@@ -4175,7 +4190,7 @@ export class ChannelRegistry {
         // have closed it first, and one that came back since says that.
         const went = error instanceof ChannelLifecycleError && (error.kind === 'cancelled' || error.kind === 'unlisted');
         closeError = withStop(
-          `The decline is recorded, and this host closes the channel ${laterClause(entry.serverId)}; ` +
+          `The decline is recorded, and this host closes the channel ${laterClause(entry)}; ` +
           (!went ? `closing it now didn't complete: ${lifecycleClause(error)}`
             : this.channels.has(`${entry.serverId}:${input.channelId}`)
               ? 'its registration went and came back while the close was out'

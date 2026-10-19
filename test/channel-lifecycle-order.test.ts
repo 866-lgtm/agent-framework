@@ -2650,8 +2650,9 @@ test("the agent's channel_open over a channel speech opened is the agent's decis
 
 // A channel only a push has registered (ensureChannelRegistered) starts with
 // its transport unknown, as a registration's does: after a restart the server
-// may still hold a channel an earlier process opened. In each test below the
-// server holds it open.
+// may still hold a channel an earlier process opened. Its traffic shows it
+// open, since it has no target a retarget could have left behind. In each
+// test below the server holds it open.
 
 test('a close of a channel only a push has registered, decided closed before a restart, is sent to the server, not answered as already closed', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'push-registered-close-'));
@@ -2689,22 +2690,26 @@ test('a decline in a channel only a push has registered sends its close through 
   assert.equal(f.actual.get('x'), false);
 });
 
-test("a close refused for the grant, in a channel only a push has registered, doesn't say the channel is closed", async () => {
+test("a close refused for the grant, in a channel only a push has registered, doesn't say the channel is closed, nor once the close is recorded", async () => {
   const f = fixture();
   f.actual.set('x', true);
   f.setGrant(ALL_CAPABILITY_PATHS.filter((path) => path !== 'channels.lifecycle'));
   f.registry.ensureChannelRegistered('test', 'x', 'x');
-  const result = await f.tool('close');
-  assert.equal(result.success, false);
-  assert.equal(result.error,
-    'This host isn\'t permitted to open or close the "test" server\'s channels, so this close of channel "x" didn\'t ' +
-    'go through, and calling channel_close again won\'t change that. The close stays recorded, and happens when the ' +
-    '"test" server next registers this channel, if this host may open and close its channels then. If you need it, ' +
-    'ask whoever runs this host.');
+  // The second close finds the first one's decision recorded.
+  for (const attempt of [1, 2]) {
+    const result = await f.tool('close');
+    assert.equal(result.success, false, `close ${attempt}`);
+    assert.equal(result.error,
+      'This host isn\'t permitted to open or close the "test" server\'s channels, so this close of channel "x" didn\'t ' +
+      'go through, and calling channel_close again won\'t change that. The close stays recorded, and happens if the ' +
+      '"test" server registers this channel at a time this host may open and close its channels. If you need it, ask ' +
+      'whoever runs this host.', `close ${attempt}`);
+    assert.equal(f.registry.getDesiredState('test', 'x'), 'closed', `close ${attempt}`);
+  }
   assert.deepEqual(f.calls, []);
 });
 
-test("traffic in a tuned-out channel only a push has registered shows it open only where the server directs the channel's lifecycle", async () => {
+test('traffic in a tuned-out channel only a push has registered shows it open, whether or not this host directs its lifecycle, so a decline leaves the tune-out', async () => {
   for (const directs of [true, false]) {
     const f = fixture();
     f.actual.set('x', true);
@@ -2714,10 +2719,13 @@ test("traffic in a tuned-out channel only a push has registered shows it open on
       epochId: 'e1', cadenceSeconds: 60, backlogCap: 20, maxWakes: 3, startedAtSequence: 1,
     }, 'agent-tool');
     await f.registry.handleIncoming('test', { messages: [message()] });
-    // Where this host directs the lifecycle, only a receipt for its own
-    // request confirms the transport; where the server does, its traffic is
-    // the only evidence.
-    assert.equal(f.isOpen(), !directs, `directs: ${directs}`);
+    // An entry made from a push has no target a retarget could have left
+    // behind, so its traffic shows the transport open even where this host
+    // directs the lifecycle.
+    assert.equal(f.isOpen(), true, `directs: ${directs}`);
+    const declined = await f.registry.handleChannelToolCall('channel_decline', { serverId: 'test', channelId: 'x', messageId: 'm1' });
+    assert.equal(declined.success, false, `directs: ${directs}`);
+    assert.equal(f.registry.getDesiredState('test', 'x'), 'tuned-out', `directs: ${directs}`);
     assert.deepEqual(f.calls, [], `directs: ${directs}`);
   }
 });
