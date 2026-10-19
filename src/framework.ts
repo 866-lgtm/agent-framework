@@ -14411,18 +14411,26 @@ export class AgentFramework {
    * Window notice for a reply whose channel couldn't be opened: the reply
    * went out through its send tool, but the open that engaging the channel
    * asks for failed. Without it the agent would wait for a conversation it
-   * won't see. It goes to the agent whose reply it was, or to the primary
-   * when no agent is named, as the opened notice does. An agent that has
+   * won't see. It goes to the agent whose reply it was, or, when no agent
+   * is named, where addMessage delivers an unrouted message (deliveryAgent:
+   * the primary, else the first registered agent), as the opened notice
+   * does, and its advice is judged for that agent. An agent that has
    * ended is told nothing, and nor is anyone in its place: the notice is
    * about what that agent can do next. It names channel_open as the way to
    * try again only to an agent that can call it: a conversation fork's
    * channel_open is refused outright (dispatchChannelToolCall), and an
-   * agent's allowedTools can leave it out. System message, as the opened
-   * notice is.
+   * agent's allowedTools can leave it out. Where the host couldn't record
+   * putting the channel's decision back, it says the channel stays selected
+   * for opening, as speech's failure does, and what that means, in
+   * channel_open's own failure's words: a later delivery or reconnect tries
+   * again, and channel_close withdraws that, named only to an agent that can
+   * call it here (a fork may close only its home channel). System message,
+   * as the opened notice is.
    */
   private recordReplyOpenFailedNotice(
     agentName: string | undefined,
     channel: { channelId: string; label?: string },
+    staysSelected = false,
   ): void {
     const shown = channel.label && channel.label !== channel.channelId
       ? `${channel.label} (${channel.channelId})`
@@ -14433,7 +14441,16 @@ export class AgentFramework {
     }
     const who = agentName || this.deliveryAgent()?.name;
     const canOpen = who !== undefined && !this.conversationAgentHomes.has(who) && this.canAgentUseTool(who, 'channel_open');
+    // A fork's channel_close is refused for any channel but its home, as
+    // dispatchChannelToolCall reads it.
+    const home = who !== undefined ? this.conversationAgentHomes.get(who) : undefined;
+    const canClose = who !== undefined && (!home || home === channel.channelId) &&
+      this.canAgentUseTool(who, 'channel_close');
     const text = `[channels] Not open: ${shown}. Your reply there went out, but opening the channel failed.` +
+      (staysSelected
+        ? " It stays selected for opening, as the host couldn't record undoing that: a later delivery or reconnect tries again" +
+          (canClose ? ', and channel_close withdraws that.' : '.')
+        : '') +
       (canOpen ? ' channel_open tries again.' : '');
     try {
       this.addMessage(
@@ -14442,7 +14459,7 @@ export class AgentFramework {
         { system: true, kind: 'channel-notice' } as MessageMetadata,
         agentName ? { forAgent: agentName } : undefined,
       );
-      console.error(`[channel] reply open-failed notice -> ${agentName || 'primary'}: ${shown}`);
+      console.error(`[channel] reply open-failed notice -> ${who ?? 'no agent'}: ${shown}`);
     } catch (err) {
       console.error('recordReplyOpenFailedNotice failed:', err);
     }
@@ -24919,7 +24936,7 @@ export class AgentFramework {
           if (target) {
             this.channelRegistry
               .openIfClosedForSend(target, serverId)
-              .then(({ status, channelId, label, opening }) => {
+              .then(({ status, channelId, label, opening, staysSelected }) => {
                 // Turn-scoped engagement record (mid-turn re-pin, 2026-07-31
                 // n=7): a human follow-up in a channel the agent explicitly
                 // sent into this turn counts as conversationally addressed.
@@ -24957,7 +24974,7 @@ export class AgentFramework {
                     `[channel] ${agentName}: ${toolName} delivered to ${target} but the open-on-send failed` +
                       (tell ? '; the agent is told' : ''),
                   );
-                  if (tell) this.recordReplyOpenFailedNotice(agentName, { channelId: channelId ?? target, label });
+                  if (tell) this.recordReplyOpenFailedNotice(agentName, { channelId: channelId ?? target, label }, staysSelected === true);
                 }
               })
               .catch((err) => console.error('[channel] open-on-send error:', err));

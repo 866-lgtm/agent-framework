@@ -64,6 +64,10 @@ class ChannelLifecycleCancelledError extends Error {}
  *  its round-trip, such as the agent's own close or channel_open, replaced
  *  the one the open wrote. That decision stands, and nothing is put back. */
 class ChannelOpenOvertakenError extends Error {}
+/** The failure of an open by speech or a reply whose put-back couldn't be
+ *  recorded: the decision to open stays, so the channel stays selected for
+ *  opening, and reconciliation may open it later. */
+class ChannelOpenPutBackUnrecordedError extends Error {}
 const CHANNEL_LIFECYCLE_LOG_ID = 'mcpl/channel-lifecycle';
 
 /** The sources of a decision the agent itself made: channel_open and
@@ -2923,9 +2927,10 @@ export class ChannelRegistry {
         } catch (putBackErr) {
           // The caller reports both: the channel isn't open, but it stays
           // selected for opening, so reconciliation may open it later.
-          throw new Error(
+          throw new ChannelOpenPutBackUnrecordedError(
             `${err instanceof Error ? err.message : String(err)}; the channel stays selected for opening, ` +
               `as the host couldn't record undoing that: ${putBackErr instanceof Error ? putBackErr.message : String(putBackErr)}`,
+            { cause: err },
           );
         }
         // The decision put back is a closed one: an open that turned the
@@ -3136,7 +3141,9 @@ export class ChannelRegistry {
    * transport of a channel already selected open or tuned out. It isn't one
    * either where a decision made during its round-trip replaced it
    * (ChannelOpenOvertakenError), or where queued lifecycle work left the
-   * channel closed before any open was sent.
+   * channel closed before any open was sent. `staysSelected` says the
+   * put-back couldn't be recorded, so the channel stays selected for opening
+   * (ChannelOpenPutBackUnrecordedError).
    */
   async openIfClosedForSend(
     rawChannelId: string,
@@ -3146,6 +3153,7 @@ export class ChannelRegistry {
     channelId?: string;
     label?: string;
     opening?: boolean;
+    staysSelected?: true;
   }> {
     let matches = [...this.channels.values()].filter(
       (e) => e.descriptor.id === rawChannelId && (!serverId || e.serverId === serverId),
@@ -3193,6 +3201,9 @@ export class ChannelRegistry {
       });
       const current = this.channels.get(`${entry.serverId}:${entry.descriptor.id}`);
       return { status: 'open-failed', channelId: entry.descriptor.id, opening,
+        // Where the put-back couldn't be recorded, the channel stays selected
+        // for opening, and the agent is told so, as speech's failure says.
+        ...(err instanceof ChannelOpenPutBackUnrecordedError ? { staysSelected: true as const } : {}),
         ...(current ? { label: current.descriptor.label } : {}) };
     }
   }
