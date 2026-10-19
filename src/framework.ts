@@ -18293,10 +18293,11 @@ export class AgentFramework {
       return this.draftsToolResult(origin.agentName, call.input);
     }
 
-    // The utils meta-tool, for callers that await a tool's result. The puppet
-    // and a host, through executeToolCall, reach the utilities the agent's
-    // allowedTools permits, as the model does; a module, through callTool, is
-    // trusted and reaches them all.
+    // The utils meta-tool, for callers that await a tool's result. A call
+    // through executeToolCall (the puppet, a host) reaches what its agent's
+    // allowedTools permits, as the model's does, and an unidentified caller
+    // is unrestricted, as executeToolCall's doc says; a module, through
+    // callTool, is trusted and reaches every utility.
     if (call.name === 'utils') {
       return this.handleUtilsToolCall(call.callerAgentName ?? '__ephemeral__', call, { inProcess: true, trustedModule: origin.kind === 'module' });
     }
