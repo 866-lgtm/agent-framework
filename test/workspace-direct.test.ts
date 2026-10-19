@@ -1321,6 +1321,36 @@ test('each kind of change the store holds keeps a mount configured direct from s
   }
 });
 
+test("a tombstone beside an entry that's still there keeps no mount configured direct from starting direct, and holds it once the entry is gone", async (t) => {
+  const env = new Env(t);
+  env.file('k.ts', 'kept\n');
+  const chronicle = await env.openChronicle();
+  await data(chronicle, 'ls', { path: 'ref' });
+  await env.close(chronicle);
+  // A deletion whose removal failed after its tombstone was written, and
+  // whose put-back failed too, leaves its tombstone beside the entry
+  // (commitToolChanges); it's given here directly. Disk agreed with the
+  // entry, which is still there, so the store holds no change disk lacks.
+  const entry = env.store.treeGet('workspace/ref/tree', 'k.ts');
+  assert.ok(entry);
+  const intents = new BranchIntents(env.store, 'workspace/ref/intent');
+  intents.put('k.ts', { tombstone: { hash: entry.blobHash } });
+  const m = await env.open();
+  assert.deepEqual(env.alerts, []);
+  assert.equal((await data<Record<string, Record<string, unknown>>>(m, 'status')).ref!.backend, 'direct');
+  assert.deepEqual(intents.get('k.ts'), { tombstone: { hash: entry.blobHash } }, 'a direct start leaves the store as it was');
+
+  // With the entry gone, the same tombstone is a workspace deletion disk
+  // lacks, and the mount runs as 'chronicle'.
+  await env.close(m);
+  env.store.treeRemove('workspace/ref/tree', 'k.ts');
+  env.alerts = [];
+  const held = await env.open();
+  assert.equal(env.alerts.length, 1);
+  assert.ok(env.alerts[0]!.message.endsWith('Mount "ref" holds 1 change that disk lacks: "ref/k.ts" (deleted in the workspace).'), env.alerts[0]!.message);
+  assert.equal((await data<Record<string, Record<string, unknown>>>(held, 'status')).ref!.backend, 'chronicle');
+});
+
 test('mounts configured direct that the store holds changes on are named in one alert', async (t) => {
   const env = new Env(t);
   const other = join(env.root, 'other');

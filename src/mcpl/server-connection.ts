@@ -530,8 +530,8 @@ export class McplServerConnection extends EventEmitter {
 
   // Event buffering: control-plane traffic can be released independently from
   // inference-bearing data-plane traffic. This lets a server finish its own
-  // registration (and answer host tools/call requests) while startup/reconnect
-  // reconciliation keeps agent wakes behind a durable barrier.
+  // registration (and answer host tools/call requests) while its data plane
+  // stays held, as through a quiesce.
   private controlPlaneReady = false;
   private dataPlaneReady = false;
   private bufferedEvents: HeldItem[] = [];
@@ -674,8 +674,8 @@ export class McplServerConnection extends EventEmitter {
         `(long pause backlog${dropped > 0 ? `; ${dropped} dropped at cap` : ''})`,
       );
     }
-    // Re-enter the gate for every buffered item. A control handler (notably
-    // tools/list_changed) may install a newer data-plane barrier while this
+    // Re-enter the gate for every buffered item. A control handler (a
+    // host/command quiesce, say) may pause the data plane while this
     // snapshot is being flushed; later data items must observe that pause.
     this.flushHeld(pending);
   }
@@ -839,9 +839,8 @@ export class McplServerConnection extends EventEmitter {
 
   /**
    * Close the data plane synchronously while leaving an already-released
-   * control plane live. Used before list-change reconciliation so no new
-   * inference event can beat barrier installation. A reconnect closes both
-   * planes instead.
+   * control plane live. Used by quiesce, and by reconnectAfterFailure before
+   * its teardown. A reconnect closes both planes instead.
    */
   pauseDataPlane(): void {
     this.dataPlaneReady = false;
@@ -849,8 +848,8 @@ export class McplServerConnection extends EventEmitter {
 
   /**
    * Override emit to buffer server→host events until the corresponding plane
-   * is ready. Lifecycle events always pass through so reconnect can install a
-   * new data-plane gate before the fresh transport is exposed.
+   * is ready. Lifecycle events always pass through so the reconnect listener
+   * runs before the fresh transport's buffered traffic is released.
    */
   override emit(event: string | symbol, ...args: unknown[]): boolean {
     const name = typeof event === 'string' ? event : '';
@@ -1903,9 +1902,8 @@ export class McplServerConnection extends EventEmitter {
     // boundary resets, so control traffic too (a server's channels/register
     // right after initialize) must wait for the new grant rather than be
     // refused against the empty one. The reconnect lifecycle event bypasses
-    // buffering; its framework listener installs the awareness barrier,
-    // re-establishes the grant (§5.3 policy responses are never buffered),
-    // and then opens the planes.
+    // buffering; its framework listener re-establishes the grant (§5.3
+    // policy responses are never buffered), and then opens the planes.
     this.controlPlaneReady = false;
     this.dataPlaneReady = false;
     this.resetPolicyForTransportBoundary();
