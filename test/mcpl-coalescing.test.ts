@@ -1777,7 +1777,7 @@ test("a provider recovery whose released wakes start no turn ends and reopens au
   assert.equal(internals.providerAccelerationRecoveries.has('agent'), true, 'and the recovery stays for that turn to end');
 });
 
-test("a provider hold keeps a wake to read a render, a batch wake and an ordinary wake apart, though they share a millisecond", async (t) => {
+test("a provider hold keeps a wake to read a render, a batch wake, a batch-only merge and an ordinary wake apart, though they share a millisecond", async (t) => {
   const f = await fixture(); t.after(f.close);
   const internals = f.framework as unknown as TurnInternals;
   const timer = setTimeout(() => {}, 60_000);
@@ -1785,10 +1785,17 @@ test("a provider hold keeps a wake to read a render, a batch wake and an ordinar
   internals.providerAccelerationCooldowns.set('agent', { startedAt: Date.now(), until: Date.now() + 60_000, timer, heldRequests: [], reason: 'held', failures: 1 });
   const at = Date.now();
   const wake = (extra: Partial<Wake> = {}): Wake => ({ agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: at, ...extra });
-  internals.pendingRequests.push(wake(), wake({ coalescingSubject: 'doc', coalescingBatch: true }), wake({ readsDeferredWrite: 'render-1' }), wake({ readsDeferredWrite: 'render-2' }));
+  // A trigger merged from batches of two subjects carries no single
+  // subject: only its subjects tell it from an ordinary wake, or from a
+  // merge of other batches.
+  const merged = wake({ coalescingBatch: true, coalescingBatchSubjects: ['doc', 'notes'] });
+  internals.pendingRequests.push(merged, wake(), wake({ coalescingSubject: 'doc', coalescingBatch: true }), wake({ readsDeferredWrite: 'render-1' }), wake({ readsDeferredWrite: 'render-2' }),
+    wake({ coalescingBatch: true, coalescingBatchSubjects: ['doc', 'other'] }));
   await settles(internals.processInferenceRequests(), 'the held pass');
   const held = internals.providerAccelerationCooldowns.get('agent')?.heldRequests ?? [];
-  assert.deepEqual(held.map((r) => [r.coalescingSubject, r.readsDeferredWrite]), [[undefined, undefined], ['doc', undefined], [undefined, 'render-1'], [undefined, 'render-2']], 'each is held: none stands for another, which a withdrawal or a read could take with it');
+  assert.deepEqual(held.map((r) => [r.coalescingSubject, r.coalescingBatchSubjects?.join(','), r.readsDeferredWrite]),
+    [[undefined, 'doc,notes', undefined], [undefined, undefined, undefined], ['doc', undefined, undefined], [undefined, undefined, 'render-1'], [undefined, undefined, 'render-2'], [undefined, 'doc,other', undefined]],
+    'each is held: none stands for another, which a withdrawal or a read could take with it');
 });
 
 test("an assembly that throws closes the window in which its writes bypass the turn's deferral", async (t) => {

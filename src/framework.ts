@@ -3960,13 +3960,17 @@ export class AgentFramework {
     return { delayMs: ownMs, ownMs, stated: false };
   }
   /** Whether two requests are one wake, for a provider hold's dedup: the
-   *  same agent, reason, source, time and channel, and the same
-   *  coalescingSubject and readsDeferredWrite, since a wake with either can be
-   *  withdrawn or dropped on its own, and must not stand for one without. */
+   *  same agent, reason, source, time and channel, and the same coalescing
+   *  marks: a batch wake's subject, a batch-only merge's subjects (it has no
+   *  single subject), and the write a wake reads. A wake with any of them
+   *  can be withdrawn or dropped on its own, and must not stand for one
+   *  without. (coalescingBatch is set only beside one of the first two.) */
   private sameInferenceRequest(a: InferenceRequest, b: InferenceRequest): boolean {
+    const batchSubjects = (r: InferenceRequest) => (r.coalescingBatchSubjects ?? []).join('\n');
     return a.agentName === b.agentName && a.reason === b.reason && a.source === b.source &&
       a.timestamp === b.timestamp && a.channelId === b.channelId &&
-      a.coalescingSubject === b.coalescingSubject && a.readsDeferredWrite === b.readsDeferredWrite;
+      a.coalescingSubject === b.coalescingSubject && batchSubjects(a) === batchSubjects(b) &&
+      a.readsDeferredWrite === b.readsDeferredWrite;
   }
   private consultProviderHold(error: Error, agentName: string): { holdMs: number; reason: string } | undefined {
     if (!this.providerHoldHook) return undefined;
