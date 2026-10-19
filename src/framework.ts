@@ -22582,19 +22582,19 @@ export class AgentFramework {
     return connection;
   }
 
-  /** Per-server §17.8 fetch limiter: at most one in-flight fetch, at most
-   *  one queued behind it (announcements coalesce into it), floor between
-   *  completed fetches — the host bounds the rate; it never depends on
-   *  server coalescing. A queued refresh runs only on the transport of the
-   *  latest announcement it holds (`queuedEpoch`), and its receipt reports
-   *  the domains of every announcement coalesced into it there
+  /** Per-connection §17.8 fetch limiter, keyed by the connection, so one
+   *  that replaces a removed server under its id starts its own: at most one
+   *  fetch in flight; announcements during it coalesce into one refresh run
+   *  after it, and announcements within the floor after a fetch into one run
+   *  once the floor has passed — the host bounds the rate; it never depends
+   *  on server coalescing. A queued refresh runs only on the transport of
+   *  the latest announcement it holds (`queuedEpoch`), and its receipt
+   *  reports the domains of the announcements coalesced into it there
    *  (`queuedDomains`), since its fetch answers them all. The next
    *  transport's initialize and policy exchange start afresh, and its own
    *  announcements queue their own, so an earlier transport's hints are
-   *  dropped. A server's removal discards its entry, so a replacement
-   *  connection starts its own, and a timer of the one it replaced, which
-   *  holds the old entry, finds it gone and does nothing. */
-  private manifestRefreshState: Map<string, { inFlight: boolean; queued: boolean; lastCompletedAt: number; queuedEpoch?: number; queuedDomains?: string[] }> = new Map();
+   *  dropped. */
+  private manifestRefreshState = new WeakMap<McplServerConnection, { inFlight: boolean; queued: boolean; lastCompletedAt: number; queuedEpoch?: number; queuedDomains?: Set<string> }>();
   private static readonly MANIFEST_FETCH_FLOOR_MS = 5_000;
 
   /**
@@ -22641,15 +22641,22 @@ export class AgentFramework {
     // may leave out: read the one the receipt reports here, before anything
     // is applied, so no later step can throw on them.
     const announcedDomains = announcedDomainsOf(announce);
-    const st = this.manifestRefreshState.get(connection.id)
+    const st = this.manifestRefreshState.get(connection)
       ?? { inFlight: false, queued: false, lastCompletedAt: 0 };
-    this.manifestRefreshState.set(connection.id, st);
+    this.manifestRefreshState.set(connection, st);
     // A queued announcement's transport, and the domains of every
     // announcement coalesced on it; one from a newer transport starts afresh.
     const queueOn = (): void => {
-      const same = st.queuedEpoch === connection.transportEpoch;
-      st.queuedDomains = [...new Set([...(same ? st.queuedDomains ?? [] : []), ...announcedDomains])];
+      if (st.queuedEpoch !== connection.transportEpoch) st.queuedDomains = undefined;
+      st.queuedDomains ??= new Set();
+      for (const domain of announcedDomains) st.queuedDomains.add(domain);
       st.queuedEpoch = connection.transportEpoch;
+    };
+    // The queued domains, taken by the run that reports them.
+    const takeQueued = (): { domains: string[] } => {
+      const domains = [...(st.queuedDomains ?? [])];
+      st.queuedDomains = undefined;
+      return { domains };
     };
     if (st.inFlight) {
       // Coalesce: one queued refresh re-runs after the current fetch — the
@@ -22664,12 +22671,10 @@ export class AgentFramework {
       if (!st.queued) {
         st.queued = true;
         setTimeout(() => {
-          if (this.manifestRefreshState.get(connection.id) !== st) return;
           if (st.queued && !st.inFlight) {
             st.queued = false;
-            const domains = st.queuedDomains;
-            st.queuedDomains = undefined;
-            if (st.queuedEpoch === connection.transportEpoch) this.rerunManifestRefresh(connection, { domains }, recorded);
+            const queued = takeQueued();
+            if (st.queuedEpoch === connection.transportEpoch) this.rerunManifestRefresh(connection, queued, recorded);
           }
         }, AgentFramework.MANIFEST_FETCH_FLOOR_MS - sinceLast).unref?.();
       }
@@ -22836,18 +22841,19 @@ export class AgentFramework {
       st.lastCompletedAt = Date.now();
       if (st.queued) {
         st.queued = false;
-        const { queuedEpoch, queuedDomains } = st;
-        st.queuedDomains = undefined;
+        const { queuedEpoch } = st;
+        const queued = takeQueued();
         setTimeout(() => {
-          if (this.manifestRefreshState.get(connection.id) !== st) return;
-          if (connection.transportEpoch === queuedEpoch) this.rerunManifestRefresh(connection, { domains: queuedDomains }, recorded);
+          if (connection.transportEpoch === queuedEpoch) this.rerunManifestRefresh(connection, queued, recorded);
         }, AgentFramework.MANIFEST_FETCH_FLOOR_MS).unref?.();
       }
     }
   }
 
   /** A refresh handleManifestChanged schedules for itself, after the fetch
-   *  floor or behind a fetch in flight. It's contained as the announcement's
+   *  floor or behind a fetch in flight. Its announcement is the domains of
+   *  the announcements it coalesced (`{ domains }`), the one field
+   *  handleManifestChanged reads of one. It's contained as the announcement's
    *  own run is. Its fetch's own failure is logged by the fetch's catch, as
    *  in 0.22.x; any other failure emits mcpl:request-handler-error and a
    *  stderr line through the containment. */
@@ -23232,7 +23238,6 @@ export class AgentFramework {
         if (owner === id) this.mcplPrefixMap.delete(prefix);
       }
       this.mcplServerConfigs.delete(id);
-      this.manifestRefreshState.delete(id);
 
       await this.refreshMcplTools();
       this.emitMcplToolDiff(oldToolNames, id);

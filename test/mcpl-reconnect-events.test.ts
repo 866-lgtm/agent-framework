@@ -840,7 +840,7 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     assert.equal(logged.filter((line) => line.includes('kept-request bound (10000) — dropped 10000 request(s) a closed transport left')).length, 2, logged.join('\n'));
   });
 
-  it('counts the requests read from the closed transport toward the kept bound as it holds them, and says at the flush how many it dropped', async () => {
+  it('counts the requests read from the closed transport toward the kept bound as it holds them', async () => {
     const { lateSends, held } = await heldAcrossBoundary('channels/incoming', incoming, 9_999);
     const logged: string[] = [];
     const consoleError = console.error;
@@ -848,14 +848,11 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     try {
       lateSends({ id: 20_001, method: 'channels/incoming', params: incoming(20_001) }); // the 10,000th kept
       lateSends({ id: 20_002, method: 'channels/incoming', params: incoming(20_002) }); // past the bound
-      assert.equal(held().length, 10_000);
-      assert.ok(logged.some((line) => line.includes('kept-request bound (10000) — dropped 1 request(s) a closed transport left')), logged.join('\n'));
-      connection!.establishGrant(new CapabilityGrant(new Set(['channels.incoming']), []));
-      connection!.ready();
     } finally {
       console.error = consoleError;
     }
-    assert.ok(logged.some((line) => line.includes('1 request(s) a closed transport left were dropped at the kept-request bound (10000) during this pause')), logged.join('\n'));
+    assert.equal(held().length, 10_000);
+    assert.ok(logged.some((line) => line.includes('kept-request bound (10000) — dropped 1 request(s) a closed transport left')), logged.join('\n'));
   });
 
   it("starts the next pause's counts afresh after a flush", async () => {
@@ -913,18 +910,6 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     assert.deepEqual([c.keptRequests, c.heldRequests], [10_000, 0]);
   });
 
-  it('caps notifications where a flush that crossed a boundary joins what it held, the oldest going', (t) => {
-    const logged: string[] = [];
-    t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
-    const between = Reflect.construct(McplServerConnection, ['between', null, null]) as McplServerConnection;
-    const items = Array.from({ length: 1_200 }, (_, n) => ({ event: 'channels-incoming', args: [incoming(n)], kept: true as const }));
-    (between as unknown as { replaceHeld(items: unknown[]): void }).replaceHeld(items);
-    const held = (between as unknown as { bufferedEvents: Array<{ args: Array<{ messages: Array<{ messageId: string }> }> }> }).bufferedEvents;
-    assert.equal(held.length, 1_000);
-    assert.equal(held[0]!.args[0]!.messages[0]!.messageId, 'm200', 'the oldest 200 went');
-    assert.ok(logged.some((line) => line.includes('buffered-event cap (1000) — dropped 200 responder-less event(s) where a flush crossed a transport boundary')), logged.join('\n'));
-  });
-
   it("a control-plane flush keeps what a boundary kept out of the next transport's budget", async () => {
     const { serverSends, written, held } = await heldAcrossBoundary('channels/incoming', incoming);
     // A quiesce opens the control plane first; the kept messages are data.
@@ -967,9 +952,13 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     connection = await McplServerConnection.connect(makeConfig(), HOST_CAPS);
     connection.establishGrant(new CapabilityGrant(new Set(['channels.incoming', 'inferenceRequest', 'pushEvents']), []));
     const seen: string[] = [];
-    let closing: Promise<void> | undefined;
-    // A listener that closes the connection while the flush is still going.
-    connection.on('channels-incoming', () => { seen.push('incoming'); closing = connection!.close(); });
+    // A listener during which the transport drops, while the flush is still
+    // going: the connection will reconnect, so what the server reported about
+    // the world is kept for the next transport's grant.
+    connection.on('channels-incoming', () => {
+      seen.push('incoming');
+      (connection as unknown as { transport: { emit(event: string, info: unknown): void } }).transport.emit('close', { code: 1, signal: null });
+    });
     connection.on('inference-request', () => { seen.push('inference'); });
     connection.on('push-event', () => { seen.push('push'); });
     const serverSends = (message: Record<string, unknown>) =>
@@ -988,7 +977,6 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     } finally {
       console.error = consoleError;
     }
-    await closing;
     assert.deepStrictEqual(seen, ['incoming'], 'nothing after the boundary reached a listener');
     const held = (connection as unknown as { bufferedEvents: Array<{ event: string }> }).bufferedEvents.map((item) => item.event);
     assert.deepStrictEqual(held, ['push-event'], 'the push is kept, the inference requests and the filter dropped');
@@ -996,7 +984,6 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
       logged.some((line) => line.includes('dropped 3 held message(s) from a transport that closed: 2 inference-request, 1 tools-observe')),
       logged.join('\n'),
     );
-    connection = null;
   });
 
   it("sends a streamed inference's chunks only on the transport its request came on", async () => {
@@ -1103,14 +1090,131 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     for (const [id, method] of [[7, 'ping'], [8, 'featureSets/changed'], [9, 'scope/elevate'], [10, 'no/such-method']] as const) {
       dead.emit('line', JSON.stringify({ jsonrpc: '2.0', id, method }));
     }
-    dead.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 1, result: {} })); // a response, too
     for (const method of ['ping', 'featureSets/changed', 'scope/elevate', 'no/such-method']) {
       assert.ok(logged.some((line) => line.includes(`dropped a message read after its transport closed: method ${method}`)), `${method}:\n${logged.join('\n')}`);
     }
-    assert.ok(logged.some((line) => line.includes('dropped a response read after its transport closed')), logged.join('\n'));
     assert.equal(logged.some((line) => line.includes('answered -32601')), false, 'nothing is said to have been answered');
     assert.equal((connection as unknown as { bufferedEvents: unknown[] }).bufferedEvents.length, heldBefore, 'nothing is held');
     assert.deepEqual(written, [], 'nothing is written');
+  });
+
+  it('surfaces a stateful response read after its transport closed as an orphaned response, as any late answer is', async () => {
+    writeFileSync(FLAG_FILE, '');
+    connection = await McplServerConnection.connect({ ...makeConfig(), reconnect: false }, HOST_CAPS);
+    connection.ready();
+    let closed = 0;
+    connection.on('close', () => { closed++; });
+    const orphaned: Array<{ id: unknown; hadState: boolean }> = [];
+    connection.on('orphaned-response', (info: { id: unknown; hadState: boolean }) => { orphaned.push(info); });
+    type Wire = { emit(event: string, line: string): void };
+    const dead = (connection as unknown as { transport: Wire }).transport;
+    connection.sendToolsList().catch(() => {});
+    await waitFor(() => closed === 1, 5000, 'the transport closed');
+    dead.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 41, result: { state: { step: 2 } } }));
+    assert.deepEqual(orphaned.map(({ id, hadState }) => ({ id, hadState })), [{ id: 41, hadState: true }]);
+  });
+
+  it("never lets a response read from a transport after its close answer a request of the next transport's", async () => {
+    writeFileSync(FLAG_FILE, '');
+    connection = await McplServerConnection.connect(makeConfig(), HOST_CAPS);
+    let reconnected = 0;
+    connection.on('reconnect', () => { reconnected++; });
+    type Wire = { emit(event: string, line: string): void };
+    const dead = (connection as unknown as { transport: Wire }).transport;
+    connection.sendToolsList().catch(() => {});
+    await waitFor(() => reconnected === 1, 5000, 'reconnect after crash');
+    // The next transport's first request, which this fixture never answers;
+    // the next transport numbers its requests from 1 again.
+    let settled = false;
+    connection.sendManifestRequest().then(() => { settled = true; }, () => { settled = true; });
+    const next = (connection as unknown as { transport: { writeLine(line: string): void } }).transport;
+    const answered: unknown[] = [];
+    const write = next.writeLine.bind(next);
+    next.writeLine = (line: string) => {
+      const sent = JSON.parse(line) as { id?: unknown; method?: unknown };
+      if (sent.method === undefined) answered.push(sent.id);
+      write(line);
+    };
+    const consoleError = console.error;
+    console.error = () => {};
+    try {
+      dead.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 1, result: { version: '0.5' } }));
+      // Nor is anything the dead process asked answered on the next transport.
+      dead.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'ping' }));
+      dead.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 8, method: 'no/such-method' }));
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      console.error = consoleError;
+    }
+    assert.equal(settled, false, "the dead transport's response answers nothing");
+    assert.deepStrictEqual(answered, [], 'neither its ping nor its unknown method is answered on the next transport');
+  });
+
+  it("never takes a response read from a transport after its close for a late answer to the next transport's request", async () => {
+    writeFileSync(FLAG_FILE, '');
+    connection = await McplServerConnection.connect(makeConfig(), HOST_CAPS);
+    connection.ready();
+    let reconnected = 0;
+    connection.on('reconnect', () => { reconnected++; });
+    const orphaned: unknown[] = [];
+    connection.on('orphaned-response', (info: unknown) => { orphaned.push(info); });
+    type Wire = { emit(event: string, line: string): void };
+    const dead = (connection as unknown as { transport: Wire }).transport;
+    connection.sendToolsList().catch(() => {});
+    await waitFor(() => reconnected === 1, 5000, 'reconnect after crash');
+    // A request of the next transport's that timed out, numbered as the dead
+    // process's was.
+    const records = (connection as unknown as { orphanedRequests: Map<number, { method: string }> }).orphanedRequests;
+    records.set(1, { method: 'push/render' });
+    dead.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 1, result: {} }));
+    // Reported or held: the reconnect closed the control plane, so an audit
+    // would wait there for the next grant.
+    const held = (connection as unknown as { bufferedEvents: Array<{ event: string }> }).bufferedEvents.map((item) => item.event);
+    assert.deepStrictEqual([...orphaned, ...held.filter((event) => event === 'orphaned-response')], [], 'not reported as the late answer to it');
+    assert.deepStrictEqual(records.get(1), { method: 'push/render' }, 'and its record stays for its own answer');
+  });
+
+  it('drops and logs the world messages a connection closed for good held at its boundary, since no grant will come', async () => {
+    writeFileSync(FLAG_FILE, '');
+    connection = await McplServerConnection.connect({ ...makeConfig(), reconnect: false }, HOST_CAPS);
+    let closed = 0;
+    connection.on('close', () => { closed++; });
+    const serverSends = (message: Record<string, unknown>) =>
+      (connection as unknown as { transport: { emit(event: string, line: string): void } }).transport
+        .emit('line', JSON.stringify({ jsonrpc: '2.0', ...message }));
+    const logged: string[] = [];
+    const consoleError = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      serverSends({ method: 'channels/incoming', params: incoming(1) }); // held while both planes are closed, as after connect
+      connection.sendToolsList().catch(() => {});
+      await waitFor(() => closed === 1, 5000, 'the transport closed');
+    } finally {
+      console.error = consoleError;
+    }
+    const held = (connection as unknown as { bufferedEvents: Array<{ event: string }> }).bufferedEvents.map((item) => item.event);
+    assert.equal(held.includes('channels-incoming'), false, held.join(', '));
+    assert.ok(logged.some((line) => line.includes('dropped 1 held message(s) from a transport that closed, with no transport to come: 1 channels-incoming')), logged.join('\n'));
+  });
+
+  it('drops and logs the world messages a connection held when the host closes it', async () => {
+    writeFileSync(FLAG_FILE, '');
+    connection = await McplServerConnection.connect(makeConfig(), HOST_CAPS);
+    const serverSends = (message: Record<string, unknown>) =>
+      (connection as unknown as { transport: { emit(event: string, line: string): void } }).transport
+        .emit('line', JSON.stringify({ jsonrpc: '2.0', ...message }));
+    const logged: string[] = [];
+    const consoleError = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      serverSends({ id: 5, method: 'channels/incoming', params: incoming(5) }); // held while both planes are closed, as after connect
+      await connection.close();
+    } finally {
+      console.error = consoleError;
+    }
+    const held = (connection as unknown as { bufferedEvents: Array<{ event: string }> }).bufferedEvents.map((item) => item.event);
+    assert.equal(held.includes('channels-incoming'), false, held.join(', '));
+    assert.ok(logged.some((line) => line.includes('dropped 1 held message(s) from a transport that closed, with no transport to come: 1 channels-incoming')), logged.join('\n'));
   });
 
   it('drops and logs a world message a connection closed for good reads after its close, since no grant will come', async (t) => {

@@ -19,8 +19,9 @@
   and a manifest fetched from a transport that has closed isn't installed,
   nor a refresh queued on it run on the next one. A queued refresh's receipt
   reports the domains of the announcements it coalesced on its transport,
-  and a server's removal discards its refresh state, so a timer of the
-  removed connection no longer drops its replacement's queued refresh. A
+  each once, and the refresh limiter is kept per connection, so a connection
+  that replaces a removed server under its id starts its own, where a timer
+  of the removed connection could drop its replacement's queued refresh. A
   reconnect is still announced (`mcpl:server-reconnected`, `module:added`)
   once its attempt has settled, granted or not, and now also when another
   gate replaced its own before the awareness drain ended, where it used to
@@ -37,15 +38,21 @@
   admitted under the next transport's grant: the next process announces its
   own. So is such a message read from the transport after it closed, as can
   happen when a process a stdio server started still holds its stdout, until
-  a reconnect attempt, if one comes, closes the transport's reader, and so
-  is a response read then. A connection closed for good drops and logs
-  everything it reads late, since no grant will come. Incoming channel
-  messages and pushes still held, or read from the transport after it
-  closed, are kept and admitted under the next grant, since a bridge that
-  recorded them as forwarded won't send them again, and they stay held while
-  no transport serves, even when a gate readies every connection meanwhile;
-  the host's own reports about the transport, such as a `connect-failed`, go
-  on. Requests kept this way don't count against the 10,000 held requests a
+  a reconnect attempt, if one comes, closes the transport's reader. A
+  response read then is matched against none of the connection's requests,
+  since the next transport numbers its own afresh, and, as any late answer,
+  is surfaced as an orphaned response if it carries state, which waits, as
+  the host's other reports do, for the control plane to open. A connection
+  closed for good as its transport closes, by the host's close of a live
+  connection or a drop with reconnect off, drops and logs the incoming
+  messages and pushes it still holds then, and every request or notification
+  it reads late, since no grant will come. Incoming channel messages and
+  pushes still held, or read from the transport after it closed, are kept
+  and admitted under the next grant, since a bridge that recorded them as
+  forwarded won't send them again, and they stay held while no transport
+  serves, even when a gate readies every connection meanwhile; the host's
+  own reports about the transport, such as a `connect-failed`, go on.
+  Requests kept this way don't count against the 10,000 held requests a
   server may have waiting, since no server waits on their answers any more:
   they have a bound of their own, the same 10,000, past which one is dropped
   and logged, so a dead process's backlog doesn't refuse the next process's

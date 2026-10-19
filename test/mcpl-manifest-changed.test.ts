@@ -326,7 +326,7 @@ test('a refresh queued behind a fetch whose transport closed meanwhile is not ru
   const run = fw.handleManifestChanged(connection, { revision: 'sha256:a', domains: ['capabilities'] });
   // A second announcement from the same transport while the first fetch is out queues behind it.
   void fw.handleManifestChanged(connection, { revision: 'sha256:b', domains: ['capabilities'] });
-  assert.equal(fw.manifestRefreshState.get('srv').queued, true, 'queued behind the fetch');
+  assert.equal(fw.manifestRefreshState.get(connection).queued, true, 'queued behind the fetch');
   answer();
   await run;
   // The next transport's initialize and policy exchange start afresh, so the
@@ -350,18 +350,18 @@ test('a refresh queued behind a fetch on the same transport runs once the floor 
   assert.deepEqual(receipts.at(-1)?.announcedDomains, ['second'], 'with the announcement it holds');
 });
 
-test('a refresh two announcements queued behind a fetch reports both their domains', async (t) => {
+test('a refresh two announcements queued behind a fetch reports both their domains, each once', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
   const { fw, connection, traces } = makeHarness();
   const run = fw.handleManifestChanged(connection, { revision: 'sha256:a', domains: ['a'] });
-  void fw.handleManifestChanged(connection, { revision: 'sha256:b', domains: ['b'] }); // both coalesce behind the fetch
-  void fw.handleManifestChanged(connection, { revision: 'sha256:c', domains: ['c'] });
+  void fw.handleManifestChanged(connection, { revision: 'sha256:b', domains: ['b', 'x'] }); // both coalesce behind the fetch
+  void fw.handleManifestChanged(connection, { revision: 'sha256:c', domains: ['c', 'x'] });
   await run;
   t.mock.timers.tick(5_000);
   await settle();
   assert.equal(connection.events.filter((e) => e.kind === 'fetch').length, 2, 'one trailing fetch');
   const receipts = traces.filter((x) => x.type === 'mcpl:manifest-change-receipt');
-  assert.deepEqual(receipts.at(-1)?.announcedDomains, ['b', 'c'], 'its fetch answers both');
+  assert.deepEqual(receipts.at(-1)?.announcedDomains, ['b', 'x', 'c'], 'its fetch answers both');
 });
 
 test('a later refresh coalesced on the same transport reports only its own announcements', async (t) => {
@@ -382,17 +382,18 @@ test('a later refresh coalesced on the same transport reports only its own annou
   assert.deepEqual(receipts.map((x) => x.announcedDomains), [['a'], ['b'], ['c'], ['d']]);
 });
 
-test("a timer a removed server's fetch set leaves its replacement alone", async (t) => {
+test("a connection that replaces a removed server under its id starts its own limiter, beside the timer the removed one's fetch set", async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
   const { fw, connection } = makeHarness();
   const run = fw.handleManifestChanged(connection, { revision: 'sha256:a', domains: [] });
   void fw.handleManifestChanged(connection, { revision: 'sha256:b', domains: [] }); // queues behind the fetch
   await run; // its finally sets the queued refresh's timer
-  fw.manifestRefreshState.delete('srv'); // the server is removed
+  connection.transportEpoch++; // the server is removed: its close crosses a boundary
   const replacement = new ManifestFake();
   replacement.capabilities = connection.capabilities;
   replacement.establishGrant(connection.grant);
   await fw.handleManifestChanged(replacement, { revision: 'sha256:c', domains: [] });
+  assert.equal(replacement.events.filter((e) => e.kind === 'fetch').length, 1, 'fetched at once, under no floor of the removed one');
   t.mock.timers.tick(5_000);
   await settle();
   assert.equal(connection.events.filter((e) => e.kind === 'fetch').length, 1, 'nothing more on the removed connection');
@@ -404,7 +405,7 @@ test('a refresh queued under the floor whose transport closed before it was due 
   const { fw, connection } = makeHarness();
   await fw.handleManifestChanged(connection, { revision: 'sha256:a', domains: [] });
   void fw.handleManifestChanged(connection, { revision: 'sha256:b', domains: [] }); // inside the floor: queued
-  assert.equal(fw.manifestRefreshState.get('srv').queued, true, 'queued under the floor');
+  assert.equal(fw.manifestRefreshState.get(connection).queued, true, 'queued under the floor');
   connection.transportEpoch++; // its transport closed
   t.mock.timers.tick(5_000);
   await settle();
@@ -430,10 +431,10 @@ test("a timer of a removed server's refresh leaves its replacement's queued refr
   const { fw, connection, traces } = makeHarness();
   await fw.handleManifestChanged(connection, { revision: 'sha256:a', domains: [] });
   void fw.handleManifestChanged(connection, { revision: 'sha256:b', domains: ['removed'] }); // its floor timer is pending
-  // The server is removed, which discards its entry, and a replacement
+  // The server is removed, its close crossing a boundary, and a replacement
   // connection under the same id announces twice: once at once, once under
   // its own floor.
-  fw.manifestRefreshState.delete('srv');
+  connection.transportEpoch++;
   const replacement = new ManifestFake();
   replacement.capabilities = connection.capabilities;
   replacement.establishGrant(connection.grant);
