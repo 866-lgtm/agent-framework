@@ -1330,6 +1330,16 @@ describe('present while acting', () => {
       [ambient('discord:guild:portables')], 'discord:guild:portables'],
     ['leaves it for a reaction in a channel the turn engaged',
       [{ channelId: 'discord:guild:portables', tags: ['chat:reaction'] }], 'chan-turn'],
+    ['leaves it for a reaction removal in a channel the turn engaged',
+      [{ channelId: 'discord:guild:portables', tags: ['chat:reaction-remove'] }], 'chan-turn'],
+    ['leaves it for an edit in a channel the turn engaged',
+      [{ channelId: 'discord:guild:portables', tags: ['chat:edited'] }], 'chan-turn'],
+    ['leaves it for a deletion in a channel the turn engaged',
+      [{ channelId: 'discord:guild:portables', tags: ['chat:deleted'] }], 'chan-turn'],
+    // An edit of a message addressed to the agent can arrive tagged
+    // chat:addressed too; it still moves nothing.
+    ['leaves it for an edit that carries the addressed tag',
+      [{ channelId: 'discord:dm:q', tags: ['chat:edited', 'chat:addressed'] }], 'chan-turn'],
   ] as const) {
     it(`a re-inference on unstreamed tool results ${label}`, async () => {
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Carrying on.' }] as ContentBlock[]));
@@ -2288,9 +2298,47 @@ describe('present while acting', () => {
     await framework.runUntilIdle();
 
     assert.deepEqual(routed, [], 'post-send prose stayed suppressed after a reaction');
+    // That verdict counts only if the reaction was in the round: one that
+    // missed it would leave the suppression set as well.
+    const injected = JSON.stringify(membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? []);
+    assert.ok(injected.includes('[reaction] @someone reacted'), 'the reaction was injected at the send\'s tool boundary');
 
     await framework.stop();
   });
+
+  for (const tag of ['chat:reaction-remove', 'chat:edited', 'chat:deleted']) {
+    it(`a ${tag} marker injected mid-turn does not clear send suppression (#157)`, async () => {
+      // Edits, deletions and reaction removals (RFC-001 core tags, delivered
+      // as synthetic incoming messages by e.g. zulip_mcp#23) are markers
+      // ABOUT an existing message — the same category as a reaction.
+      // Before #157 only `chat:reaction` was exempt, so an
+      // "[edited] Ann: typo fix" arriving right after an explicit send
+      // re-opened auto-routing and double-posted the same-round prose.
+      membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'c1', name: 'robot--send_message', input: { text: 'reply to room4' } },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'Sent it.' },
+      ] as ContentBlock[]));
+
+      const framework = await createFramework();
+      const routed = stubChannelRegistry(framework);
+      module.interjection = `[${tag}] marker about an earlier message`;
+      module.interjectionChannelId = null;
+      module.interjectionMetadata = { channelId: '999888777', tags: [tag] };
+
+      trigger(framework);
+      await framework.runUntilIdle();
+
+      assert.deepEqual(routed, [], `post-send prose stayed suppressed after a ${tag} marker`);
+      // That verdict counts only if the marker was in the round: a marker that
+      // missed it would leave the suppression set as well.
+      const injected = JSON.stringify(membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? []);
+      assert.ok(injected.includes(`[${tag}] marker about an earlier message`), `the ${tag} marker was injected at the send's tool boundary`);
+
+      await framework.stop();
+    });
+  }
 
   it('text-only turns route to the turn-frozen locus, not a live re-resolution', async () => {
     // The text-only dispatch runs after the agent is idle; a live resolution

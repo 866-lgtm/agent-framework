@@ -81,6 +81,7 @@ import { ModuleRegistry, checkedToolResult, ensureStateRegistered, storableToolR
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { prefixesMeet, prefixesMeetError } from './mcpl/prefix-rule.js';
 import { logDetail, logValue } from './mcpl/log-value.js';
+import { isMarkerTagged } from './mcpl/tags.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './mcpl/capability-grant.js';
 import { maskNegotiatedCapabilities } from './mcpl/capability-mask.js';
@@ -286,14 +287,26 @@ const silenceCauseOf = (calls: Array<{ name: string; input?: unknown }>): 'send'
  * True when an injected message is real conversational input — something the
  * agent might actually be replying to — rather than ambient machinery.
  * System markers (`system: true` — send-failed notices, routing notices) and
- * reactions (`chat:reaction` tag, MCPL RFC-001) don't count: they must not
- * clear explicit-send suppression, and they never influence routing.
+ * non-conversational marker tags (reactions added/removed, edits, deletions
+ * — MCPL RFC-001) don't count: they are about an existing message, so they
+ * neither clear explicit-send suppression nor re-pin a turn's locus at a tool
+ * boundary. An edit can also be the first version of a message the agent
+ * sees: when the coalescer delivers a version of a message of which no
+ * version may have been shown to the agent (still queued, or stored above
+ * every reader's shown watermark), the host marks the delivery
+ * (`firstView`), and an edit so marked counts as the message it
+ * replaced. A doubt counts as shown, so a message a scalar watermark covers
+ * without having been shown gets no mark. A reaction or deletion so marked
+ * is still a notice about that message and stays a marker. An edit of a
+ * message the host never received looks like any other edit and stays a
+ * marker too. A marker that wakes the agent can still set that turn's speech
+ * channel (agent-framework#189).
  */
 const isConversationalInjection = (metadata?: MessageMetadata): boolean => {
   if (!metadata) return true;
   const m = metadata as Record<string, unknown>;
   if (m.system === true) return false;
-  if (Array.isArray(m.tags) && m.tags.includes('chat:reaction')) return false;
+  if (isMarkerTagged(m.tags, m.firstView === true)) return false;
   return true;
 };
 
@@ -612,6 +625,9 @@ interface CoalescedChannelEvent {
   assemblingFor?: string;
   /** RFC-006 §3.2: deliver into this agent only (replacement / notice audience). */
   deliverTo?: string;
+  /** The coalescer's mark: the agent's first view of the message (see
+   *  CoalescedOccurrence.firstView). */
+  firstView?: boolean;
   /** Host acceptance time (epoch ms), stamped where the message was admitted. */
   acceptedAt?: number;
   /** Framework-owned source envelope, frozen at a coalesced occurrence's
@@ -2138,10 +2154,13 @@ export class AgentFramework {
   // successor's record is never touched.
   private streamBoundaryEnds = new WeakMap<YieldingStream, (end: StreamBoundaryEnd) => void>();
 
-  /** A tool boundary injected fresh CONVERSATIONAL input (a real message —
-   *  not a reaction or a system marker) into the live stream. Tells
-   *  driveStream to clear sticky explicit-send suppression before handling
-   *  the next model round. Never affects routing: the turn locus is frozen. */
+  /** A tool boundary injected fresh CONVERSATIONAL input (a real message,
+   *  or an edit the coalescer marks as the agent's first view; not a system
+   *  marker or a reaction, reaction removal, edit or deletion marker) into
+   *  the live stream. Tells driveStream to clear sticky explicit-send
+   *  suppression before handling the next model round. The signal itself
+   *  never moves routing: the boundary re-pins the turn's locus by its own
+   *  rule (repinChannel). */
   private midTurnInputSignals: Set<string> = new Set();
   /** Last outbound locus announced to each agent as a durable `[routing]`
    *  window message. Announce-on-change only: steady state emits nothing
@@ -8507,9 +8526,12 @@ export class AgentFramework {
   /**
    * Mark an inference refusal visibly: react on the message that holds the
    * refused agent's conversational locus (the most recent incoming channel
-   * message; an ephemeral run has none, so a subagent's refusal marks no
-   * message) with a category-specific emoji. Best-effort — failures are
-   * logged, never thrown, and non-Discord loci are silently skipped.
+   * message that isn't a reaction, reaction removal, edit or deletion
+   * marker, apart from an edit the coalescer delivers on acceptance as the
+   * agent's first view; an ephemeral run has none, so a subagent's refusal
+   * marks no message) with a category-specific emoji. Best-effort —
+   * failures are logged, never thrown, and non-Discord loci are silently
+   * skipped.
    */
   private async reactToRefusal(agentName: string, category: string): Promise<void> {
     try {
@@ -11227,12 +11249,13 @@ export class AgentFramework {
           // A newly injected CONVERSATIONAL message begins a new
           // conversational round inside the same provider inference. Remember
           // that boundary for driveStream: an explicit send in the preceding
-          // round must not silence the reply. Routing is deliberately NOT
-          // affected — the turn locus is frozen at turn start, so ambient
-          // chatter, reactions, and system markers injected mid-turn can no
-          // longer hijack where the agent's prose lands. Non-conversational
-          // injections (reactions, `system: true` markers) don't even clear
-          // the send suppression: nothing new was said to the agent.
+          // round must not silence the reply. The signal itself never moves
+          // routing; the boundary re-pins by repinChannel's rule (below).
+          // Non-conversational injections (`system: true` markers, and
+          // reaction, reaction removal, edit and deletion markers) don't even
+          // clear the send suppression: nothing new was said to the agent.
+          // An edit the coalescer marks as the agent's first view is the
+          // message it replaced, so it does (isConversationalInjection).
           if (midTurnInjections.some((inj) => isConversationalInjection(inj.metadata))) {
             this.midTurnInputSignals.add(agent.name);
           }
@@ -11298,11 +11321,13 @@ export class AgentFramework {
           // hospital scene into antra's DM). Re-pin the turn locus to the
           // LAST addressed conversational injection, at segment granularity:
           // prose routed in earlier rounds already went to the old pin,
-          // which was correct when it was delivered. Ambient chatter,
-          // reactions, and system markers still cannot move the pin — the
-          // 2026-07-21 Cairn hijack protection is unchanged; this extends
-          // the ratified addressed-outranks-ambient principle from turn
-          // start to boundaries. Locus mode only (explicit mode has no pin).
+          // which was correct when it was delivered. Ambient chatter, system
+          // markers, and reaction, reaction removal, edit and deletion
+          // markers (an edit the coalescer marks as the agent's first view
+          // aside, which counts as its message) still cannot move the pin —
+          // the 2026-07-21 Cairn hijack protection is unchanged; this extends
+          // the ratified addressed-outranks-ambient principle from turn start
+          // to boundaries. Locus mode only (explicit mode has no pin).
           // Skipped on endTurn/overBudget: no further prose this stream, and
           // a stale "for this turn" notice would be pure noise.
           //
@@ -11331,9 +11356,12 @@ export class AgentFramework {
             //    fleet's participants include agent-residents whose speech
             //    is as conversational as anyone's — the Discord bot flag
             //    tracks nothing that matters here (antra, 2026-07-31).
-            //    Reactions and system markers are already excluded by
-            //    isConversationalInjection, and the engaged-this-turn scope
-            //    keeps unrelated channels from moving the pin.
+            //    System markers and reaction, reaction removal, edit and
+            //    deletion markers are already excluded by
+            //    isConversationalInjection (apart from an edit the
+            //    coalescer marks as the agent's first view), and the
+            //    engaged-this-turn scope keeps unrelated channels from moving
+            //    the pin.
             // The last injection that qualifies wins (repinChannel).
             const routing = this.routingOf(agent.name);
             let newLocus: string | undefined;
@@ -11429,12 +11457,14 @@ export class AgentFramework {
             // the watermark of the turn's compile and read as unread, so a
             // coalesced replacement could remove a message the agent heard
             // and answered (and that its later replies were minted after).
-            // Only a stream that declares it carries them is marked
+            // Only a stream that declares it carries them is marked read
             // (supportsInjectedMessages true: membrane's native path). One
             // that doesn't say may be membrane 0.5.87's XML path, which
             // drops them with a warning, and a message marked read there
             // could no longer be replaced though the agent never saw it. So
             // without the declaration they stay unread, as before this mark.
+            // The shown mark moves at every boundary that injects, declared
+            // or not, since there a doubt counts as shown.
             // The mark is the store's head, a scalar, as a compile's is: it
             // also covers what was stored since the compile without being
             // carried, such as another slot's messages, and a write that
@@ -11443,8 +11473,11 @@ export class AgentFramework {
             // Under context-manager#160 such a write already gives the
             // replies stored after it stamps their requests didn't carry,
             // whatever the mark says; deferring those writers is the fix.
-            if (midTurnInjections.length > 0 && currentState.supportsInjectedMessages === true) {
-              agent.markContextConsumed();
+            if (midTurnInjections.length > 0) {
+              // Possibly shown, whatever the stream declares: the first-view
+              // mark (CoalescerHost.isUnshown) counts a doubt as shown.
+              agent.markContextShown();
+              if (currentState.supportsInjectedMessages === true) agent.markContextConsumed();
             }
             agent.setStreaming(currentState.stream);
             this.emitTrace({
@@ -11644,6 +11677,7 @@ export class AgentFramework {
     eventId?: string;
     assemblingFor?: string;
     deliverTo?: string;
+    firstView?: boolean;
     acceptedAt?: number;
     inboundSource?: InboundSource;
   }): Promise<CoalescingPlacement | undefined> {
@@ -11669,6 +11703,9 @@ export class AgentFramework {
     };
     if (event.threadId) metadata.threadId = event.threadId;
     if (event.tags) metadata.tags = event.tags;
+    // The coalescer's mark is the host's alone: a server's own is dropped.
+    if (event.firstView === true) metadata.firstView = true;
+    else delete metadata.firstView;
     // The inbound source envelope (mcpl/inbound-source.ts): frozen at the
     // occurrence's acceptance when the coalescer delivers, else stamped now
     // from this event. Written after the adapter's metadata, so an adapter
@@ -12571,6 +12608,7 @@ export class AgentFramework {
     let unreadable: { agent: string; error: unknown } | undefined;
     const coalescer = new PushCoalescer<CoalescedDelivery>({
       isUnread: (p) => this.isUnreadPlacement(p),
+      isUnshown: (p) => this.isUnreadPlacement(p, 'shown'),
       remove: (p) => this.removePlacement(p),
       deliver: (occ, materialized, assemblingFor) => this.deliverCoalesced(occ, materialized, assemblingFor),
       wakeForBatch: (occ) => this.wakeForCoalescedBatch(occ),
@@ -12764,7 +12802,16 @@ export class AgentFramework {
         identity: { messageId: message.messageId, author: message.author, threadId: message.threadId },
         event: { lane: 'channel', event: { ...event, eventId: message.eventId, inboundSource } },
       });
-      return { messageId: message.messageId, accepted: true, coalesce: result.coalesce };
+      // The registry's anchor follows a delivery the coalescer marked as the
+      // agent's first view, as the turn's locus does. The receipt says so for
+      // this acceptance, and for a retry it answers, whose first attempt
+      // delivered the message but failed before its acknowledgement. A
+      // receipt restored after a restart carries no mark, so a retry it
+      // answers leaves the anchor where a marker would, as the host already
+      // counts what was stored before a restart as shown: every agent's
+      // shown watermark starts at the head at boot.
+      const firstView = this.pushCoalescer.receiptFirstView(serverId, this.coalescingBinding(serverId), message.eventId);
+      return { messageId: message.messageId, accepted: true, coalesce: result.coalesce, ...(firstView ? { firstView: true as const } : {}) };
     });
   }
 
@@ -12900,6 +12947,7 @@ export class AgentFramework {
   ): Promise<CoalescingPlacement | undefined> {
     const coalescingSubject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
     const narrowing = occ.deliverTo ? { deliverTo: occ.deliverTo } : {};
+    const firstViewMark = occ.firstView ? { firstView: true } : {};
     // The envelope frozen at acceptance travels unchanged; this delivery only
     // adds the fact that it carries the rendered body.
     const frozenSource = (source: InboundSource | undefined): { inboundSource?: InboundSource } =>
@@ -12907,7 +12955,7 @@ export class AgentFramework {
         ? { inboundSource: materialized && source.kind !== 'surface' ? { ...source, materialized: true } : source }
         : {};
     if (occ.event.lane === 'channel') {
-      const event = { ...occ.event.event, coalescingSubject, ...narrowing, ...(assemblingFor ? { assemblingFor } : {}) };
+      const event = { ...occ.event.event, coalescingSubject, ...narrowing, ...firstViewMark, ...(assemblingFor ? { assemblingFor } : {}) };
       const placement = await this.handleMcplChannelIncoming(event);
       await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
       return placement;
@@ -12937,6 +12985,7 @@ export class AgentFramework {
         coalescingSubject,
         eventId: occ.eventId,
         ...narrowing,
+        ...firstViewMark,
         ...(assemblingFor ? { assemblingFor } : {}),
         ...frozenSource(push.inboundSource),
       };
@@ -12954,6 +13003,7 @@ export class AgentFramework {
       // assembled; the wake that started it is not repeated.
       ...(assemblingFor ? { assemblingFor, triggerInference: false } : {}),
       ...(occ.deliverTo ? { targetAgents: [occ.deliverTo] } : {}),
+      ...firstViewMark,
       ...frozenSource(occ.event.event.inboundSource),
     };
     const placement = this.handleMcplPushEvent(event);
@@ -13022,20 +13072,25 @@ export class AgentFramework {
     }
   }
 
-  private isUnreadPlacement(p: CoalescingPlacement): boolean {
+  /** Unread (the coalescer's isUnread) by the consumed watermark, or, by the
+   *  shown watermark, never possibly shown (its isUnshown). A placement still
+   *  in the deferred queue is both. */
+  private isUnreadPlacement(p: CoalescingPlacement, by: 'consumed' | 'shown' = 'consumed'): boolean {
     this.resolvePlacement(p);
     if (p.deferredId) return this.deferredMessages.some((m) => m.id === p.deferredId);
     if (!p.messageId) return false;
     const agent = this.agents.get(p.agent);
-    return !!agent && this.isUnreadStoredMessage(agent, p.messageId);
+    return !!agent && this.isUnreadStoredMessage(agent, p.messageId, by);
   }
 
   /**
    * Unread = stored, above the agent's consumed watermark on the current
    * branch, not a body-group shard (immutable), and not folded into any
    * summary (compression is consumption, §3.3). Conservative on every doubt.
+   * By the shown watermark (Agent.getShownWatermark), the same test says the
+   * message may never have been shown.
    */
-  private isUnreadStoredMessage(agent: Agent, messageId: MessageId): boolean {
+  private isUnreadStoredMessage(agent: Agent, messageId: MessageId, by: 'consumed' | 'shown' = 'consumed'): boolean {
     const cm = agent.getContextManager();
     let message: ReturnType<ContextManager['getMessage']>;
     try { message = cm.getMessage(messageId); } catch { return false; }
@@ -13059,7 +13114,7 @@ export class AgentFramework {
     const branch = cm.currentBranch().name;
     const ts = message.timestamp instanceof Date ? message.timestamp.getTime() : Number(message.timestamp);
     for (const reader of readers) {
-      const watermark = reader.getConsumedWatermark();
+      const watermark = by === 'shown' ? reader.getShownWatermark() : reader.getConsumedWatermark();
       if (!watermark || watermark.branch !== branch || message.sequence <= watermark.sequence) return false;
       // Compression is consumption (§3.3): folded into any reader's summary.
       try {
@@ -13131,6 +13186,9 @@ export class AgentFramework {
       ...(event.tags ? { tags: event.tags } : {}),
       ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
     };
+    // The coalescer's mark is the host's alone: a server's own is dropped.
+    if (event.firstView === true) metadata.firstView = true;
+    else delete metadata.firstView;
     // `origin.channelId` is the server-internal raw id (a bare Discord
     // snowflake) — unroutable as a locus and unresolvable by the agent. Store
     // the composite MCPL id instead wherever we can derive it, so anything
@@ -14544,10 +14602,12 @@ export class AgentFramework {
 
   /**
    * The channel a message moves its turn's locus to, by the addressed
-   * re-pin rule (2026-07-31, n=6 and n=7): a conversational message (not a
-   * reaction or a system marker) that addressed the agent, or that follows
-   * up in a channel the turn sent into (TurnRouting.engaged). Undefined for
-   * any other message. A tool boundary weighs the messages it injects by it,
+   * re-pin rule (2026-07-31, n=6 and n=7): a conversational message (by
+   * isConversationalInjection: not a system marker, nor a reaction, reaction
+   * removal, edit or deletion marker, apart from an edit the coalescer marks
+   * as the agent's first view) that addressed the agent, or that follows up
+   * in a channel the turn sent into (TurnRouting.engaged). Undefined for any
+   * other message. A tool boundary weighs the messages it injects by it,
    * and noteArrival the ones no boundary of the turn weighs.
    */
   private repinChannel(metadata: MessageMetadata | undefined, routing: TurnRouting): string | undefined {
@@ -16802,7 +16862,8 @@ export class AgentFramework {
 
       // A new conversational message, not merely a tool result, means any
       // earlier explicit delivery has completed its conversational job.
-      // Routing is NOT touched: the turn locus stays frozen.
+      // The signal itself never moves routing; the boundary re-pins by
+      // repinChannel's rule.
       turnSilenced = trigger?.suppressProse === true;
       silenceCause = turnSilenced ? 'private' : null;
     };

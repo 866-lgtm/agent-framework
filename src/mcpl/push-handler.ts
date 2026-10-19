@@ -50,6 +50,9 @@ export interface McplPushEvent {
   coalescingSubject?: string;
   /** RFC-006 assembly: materialized for this agent's turn (store directly). */
   assemblingFor?: string;
+  /** The coalescer's mark: the agent's first view of the subject (see
+   *  CoalescedOccurrence.firstView). */
+  firstView?: boolean;
   /** Host acceptance time (epoch ms), stamped where the push is admitted. */
   acceptedAt?: number;
   /** Framework-owned source envelope, frozen at a coalesced occurrence's
