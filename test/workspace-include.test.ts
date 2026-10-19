@@ -1306,15 +1306,18 @@ describe('mount include', () => {
       };
       await until(() => !!internals.mounts.get('work')!.watcherReadyAt && env.store.treeGet(TREE, 'gate.json') !== null,
         'the watcher is ready and the catch-up scan took gate.json');
-      // Each batch the watcher hands over, with its handling, each turn of the mount taken, and each pass of
-      // the mount from here on.
-      const batches: Array<{ paths: string[]; handled: Promise<void> }> = [];
+      // Each batch the watcher hands over, with its handling and the turns of the mount it took, each turn of
+      // the mount taken, and each pass of the mount from here on. The handler asks for its turn, if it takes
+      // one, before its first await, so the turns counted across its call are its batch's own: anything else
+      // the watcher hands over meanwhile, as macOS's watcher may with a late event, counts only for itself.
+      const batches: Array<{ paths: string[]; handled: Promise<void>; turns: number }> = [];
       const passes: string[][] = [];
       let turns = 0;
       const handle = internals.handleFsChanges.bind(m);
       internals.handleFsChanges = (mount, changes) => {
+        const before = turns;
         const handled = handle(mount, changes);
-        batches.push({ paths: changes.map((c) => c.path), handled });
+        batches.push({ paths: changes.map((c) => c.path), handled, turns: turns - before });
         return handled;
       };
       const withMount = internals.withMount.bind(m);
@@ -1328,9 +1331,15 @@ describe('mount include', () => {
       env.writeDisk('notes.txt', 'outside the include\n');
       await until(() => batches.some((b) => b.paths.includes('notes.txt')), 'the watcher reports the uncovered file');
       // Its batch's handling has ended, so whatever it would take, it has taken.
-      for (const b of batches.filter((b) => b.paths.includes('notes.txt'))) await b.handled;
-      assert.equal(turns, 0, 'no turn of the mount is taken for it');
-      assert.equal(passes.length, 0, `no pass of the mount: ${JSON.stringify(passes)}`);
+      const withIt = batches.filter((b) => b.paths.includes('notes.txt'));
+      for (const b of withIt) await b.handled;
+      const seen = JSON.stringify(batches.map((b) => ({ paths: b.paths, turns: b.turns })));
+      // A batch of nothing but the uncovered file takes no turn of the mount. One that hands it over beside
+      // something the include covers takes its turn for that, and its pass leaves the uncovered file out.
+      for (const b of withIt) {
+        if (b.paths.every((p) => p === 'notes.txt')) assert.equal(b.turns, 0, `no turn of the mount is taken for it: ${seen}`);
+      }
+      assert.ok(passes.every((paths) => !paths.includes('notes.txt')), `no pass of the mount names it: ${JSON.stringify(passes)}; ${seen}`);
       assert.ok(!named('work/notes.txt'), `and no event: ${JSON.stringify(events)}`);
       // A covered change, as a control: the watcher reports it, a pass takes it in, and its event goes out.
       env.writeDisk('gate.json', '{"v":2}\n');
