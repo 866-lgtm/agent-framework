@@ -1354,7 +1354,7 @@ describe('present while acting', () => {
       // fallback's re-inference. Messages arrive before that starts.
       const open: Routing = {
         locus: 'chan-turn', triggerChannel: 'chan-turn', engaged: new Set(['discord:guild:portables']),
-        destination: null, continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
+        continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
       };
       internals.turnRouting.set('assistant', open);
       internals.openLogical.set('assistant', open);
@@ -1383,7 +1383,7 @@ describe('present while acting', () => {
     };
     const open: Routing = {
       locus: 'chan-turn', triggerChannel: 'chan-turn', engaged: new Set(),
-      destination: null, continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
+      continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
     };
     internals.turnRouting.set('assistant', open);
     internals.openLogical.set('assistant', open);
@@ -1534,7 +1534,7 @@ describe('present while acting', () => {
       recordTurnCheckpoint(agentName: string): void;
     };
     const open: Routing = {
-      locus: 'chan-turn', engaged: new Set(), destination: null,
+      locus: 'chan-turn', engaged: new Set(),
       continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
     };
     internals.openLogical.set('assistant', open);
@@ -1563,7 +1563,7 @@ describe('present while acting', () => {
     // live, and stop() ended every open turn. Its budget restart now runs,
     // and its stream fails and is retried.
     const turn: Routing = {
-      locus: 'chan-turn', triggerChannel: 'chan-turn', engaged: new Set(), destination: null,
+      locus: 'chan-turn', triggerChannel: 'chan-turn', engaged: new Set(),
       continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
     };
     internals.turnRouting.set('assistant', turn);
@@ -1610,7 +1610,7 @@ describe('present while acting', () => {
     // Built by hand, as #312's silent-start test does: production runs no
     // silent turn while a prose turn is open.
     const open: Routing = {
-      locus: 'chan-turn', engaged: new Set(), destination: null,
+      locus: 'chan-turn', engaged: new Set(),
       continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
     };
     internals.openLogical.set('assistant', open);
