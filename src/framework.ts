@@ -336,11 +336,17 @@ const isConversationalInjection = (metadata?: MessageMetadata): boolean => {
 /**
  * Rough token estimate for the blocks a continuation round is about to
  * append to the live wire (issue #92 physical-window projection): the
- * spilled tool-result strings at chars/4, a flat per-image cost for native
- * image blocks the wire path preserves (provider vision tokens are
- * resolution-dependent; 1600 ≈ a max-size Anthropic tile), mid-turn injected
- * text at chars/4, and a small per-block envelope allowance. Deliberately a
- * ceiling-ish heuristic — the cost of overestimating is one early recompile;
+ * spilled tool-result strings at chars/4, a flat per-image cost for the
+ * native image blocks a tool result carries (provider vision tokens are
+ * resolution-dependent; 1600 ≈ one image at Anthropic's largest size), a
+ * mid-turn message's text at chars/4 and its other blocks about as
+ * context-manager's store prices them (injectedBlockTokens), and a small
+ * per-block envelope allowance. On membrane's native tool path a mid-turn
+ * message rides into the next round with its stored content as it is
+ * (provideToolResults' injectedMessages); its XML tool path drops injected
+ * messages, so there the estimate errs high. Deliberately a
+ * ceiling-ish heuristic, but for a mid-turn message's media at the store's
+ * flat prices — the cost of overestimating is one early recompile;
  * the cost of underestimating is the 400 this projection exists to prevent.
  */
 function estimateAppendedRoundTokens(
@@ -359,15 +365,52 @@ function estimateAppendedRoundTokens(
       }
     }
   }
+  let injectedTokens = 0;
   for (const inj of injections) {
     for (const block of inj.content) {
       if (block.type === 'text' && typeof (block as { text?: unknown }).text === 'string') {
         chars += (block as { text: string }).text.length;
+      } else {
+        injectedTokens += injectedBlockTokens(block);
       }
     }
   }
   const blockCount = toolResults.length + injections.length;
-  return Math.ceil(chars / 4) + images * 1600 + blockCount * 20;
+  return Math.ceil(chars / 4) + images * 1600 + injectedTokens + blockCount * 20;
+}
+
+/**
+ * A mid-turn message's non-text block, priced about as context-manager's store
+ * prices it (MessageStore's raw estimate at 0.14.1): an image at its
+ * `tokenEstimate` stamp, or 1600 without one, and a document, audio or video
+ * at 1000. These are the store's flat estimates, not ceilings: a PDF's pages
+ * can cost more than 1000. Of the writers in agent-framework, channel
+ * messages and MCPL bring images, MCPL push events and channel messages
+ * bring audio, and none writes a document or a video; a host module's
+ * addMessage can write any of them. Two departures err high. A generated
+ * image, which the store prices at 0, is priced as an image, since
+ * membrane's Anthropic formatter sends it as one. A stamp that isn't a
+ * finite number, 0 or more, is priced at 1600, where the store takes it as
+ * given: a NaN would make the whole projection NaN, and the round would
+ * never restart. Thinking and other blocks are priced at 0: they come from
+ * provider responses, stored as the agent's own messages, and nothing in
+ * agent-framework writes them under another participant, though a host
+ * module's addMessage could.
+ */
+function injectedBlockTokens(block: ContentBlock): number {
+  switch (block.type) {
+    case 'image':
+    case 'generated_image': {
+      const stamp = (block as { tokenEstimate?: unknown }).tokenEstimate;
+      return typeof stamp === 'number' && Number.isFinite(stamp) && stamp >= 0 ? stamp : 1600;
+    }
+    case 'document':
+    case 'audio':
+    case 'video':
+      return 1000;
+    default:
+      return 0;
+  }
 }
 
 /**
