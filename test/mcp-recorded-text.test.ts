@@ -189,8 +189,9 @@ test("a legacy initial connect that fails while its configuration can't be read 
   } finally { await connection.close(); }
 });
 
-test('a real discover-then-tools/list 404 is redacted in the framework error trace', async (t) => {
-  t.mock.method(console, 'error', () => {});
+test("a real discover-then-tools/list 404 is redacted in the host's log line, and the framework's trace of it carries no credential", async (t) => {
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => lines.push(args.map(String).join(' ')));
   const dir = mkdtempSync(join(tmpdir(), 'mcp-list-text-'));
   const traces: Array<{ type: string; error?: string }> = [];
   const server = echo404Server();
@@ -203,8 +204,15 @@ test('a real discover-then-tools/list 404 is redacted in the framework error tra
       modules: [{ name: 'watcher', async start(ctx: ModuleContext) { ctx.onTrace(event => traces.push(event as never)); }, async stop() {}, getTools: () => [], async handleToolCall() { return { success: false }; }, async onProcess() { return {}; } }],
       mcplServers: [{ id: 'echo', url: `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/mcp/s/${secret}/mcp` }],
     });
-    assert.ok(traces.some(e => e.type === 'mcpl:server-error' && e.error?.includes('Cannot POST /api/mcp/s/redacted/mcp')), JSON.stringify(traces));
+    // The failed request is reported once: its status and the server's words
+    // in the host's log line, redacted, and the listing's failure in the
+    // framework's trace, in the agent's words (#556).
+    assert.ok(lines.some(line => /^MCP server "echo" tools\/list failed with HTTP 404: .*Cannot POST \/api\/mcp\/s\/redacted\/mcp/.test(line)), lines.join('\n'));
+    assert.deepEqual(traces.filter(e => e.type === 'mcpl:server-error').map(e => e.error), [
+      'tools/list failed: The request to the "echo" server failed before an answer came back. Listing changes nothing on the server, so it\'s safe to try again.',
+    ]);
     assert.ok(!JSON.stringify(traces).includes(secret));
+    assert.ok(!lines.join('\n').includes(secret));
   } finally {
     await framework?.stop();
     server.closeAllConnections();

@@ -132,6 +132,12 @@ class NotWrittenError extends Error {
  *  transport inside the caller's async chain, so the scope reaches `send`. */
 const wireScope = new AsyncLocalStorage<WireRecord>();
 
+/** A send in flight, its transport, and what that transport reported
+ *  meanwhile, held until the send settles (ObservedTransport.send). A
+ *  scope that names no transport, a notification's or a settled send's,
+ *  holds nothing. */
+const sendScope = new AsyncLocalStorage<{ wire: ObservedTransport | null; held: Error[] }>();
+
 /**
  * The boundary between the SDK and the actual transport. It records, for the
  * logical request in scope, each request of the observed method that it
@@ -172,15 +178,35 @@ class ObservedTransport implements Transport {
       if (record) wireScope.run(record, () => this.onmessage?.(message, extra));
       else this.onmessage?.(message, extra);
     };
-    this.inner.onerror = (error) => this.onerror?.(error);
+    // An error this transport reports while one of its sends is in flight
+    // waits for that send to settle: the SDK's HTTP send reports a failure
+    // here and then throws it, and whoever sent it reports what it throws
+    // (#556). Anything else is reported at once, another transport's report
+    // made in a send's async context too.
+    this.inner.onerror = (error) => {
+      const sending = sendScope.getStore();
+      if (sending?.wire === this) sending.held.push(error);
+      else this.onerror?.(error);
+    };
     this.inner.onclose = () => this.onclose?.();
     await this.inner.start();
   }
 
   async send(message: JSONRPCMessage, options?: TransportSendOptions): Promise<void> {
+    if ('method' in message && !('id' in message)) {
+      // A notification's sender can swallow what its send throws (the SDK's
+      // listen teardown does), so what its transport reports is reported at
+      // once, whatever send it was made in.
+      await sendScope.run({ wire: null, held: [] }, () => this.inner.send(message, options));
+      return;
+    }
     const record = wireScope.getStore();
     let undo: (() => void) | undefined;
     if (record && 'method' in message && 'id' in message && message.method === record.method) {
+      // Every transport writes a message as JSON, so one JSON can't write (a
+      // BigInt, a cycle) never leaves this host: it's refused here, before
+      // it's marked handed off (#556).
+      JSON.stringify(message);
       const prior = { handedOff: record.handedOff, currentId: record.currentId, answer: record.answer, error: record.error };
       // Handed off from here on: past this point nothing proves it unsent,
       // unless the transport says it wrote nothing.
@@ -194,14 +220,29 @@ class ObservedTransport implements Transport {
         Object.assign(record, prior);
       };
     }
+    // A request's or a response's sender reports what its send throws: a
+    // call through its outcome, the connect through its failure, the SDK
+    // through its own report. So what the transport reports meanwhile is held
+    // here, and the failure the send threw isn't reported a second time (#556).
+    const sending: { wire: ObservedTransport | null; held: Error[] } = { wire: this, held: [] };
+    let thrown: unknown;
     try {
-      await this.inner.send(message, options);
+      await sendScope.run(sending, () => this.inner.send(message, options));
     } catch (error) {
+      thrown = error;
       // Refused before any write: this leg never reached the server, so the
       // record is as it was before it. Any other throw (an HTTP send can fail
       // after part of the request went out) leaves it handed off.
       if (error instanceof NotWrittenError) undo?.();
       throw error;
+    } finally {
+      // Settled: what was held goes on, but for the failure the send threw,
+      // and the scope lets go of this transport, which work the send started
+      // still carries.
+      const { held } = sending;
+      sending.wire = null;
+      sending.held = [];
+      for (const error of held) if (error !== thrown) this.onerror?.(error);
     }
   }
 
@@ -278,8 +319,8 @@ class SpawnerStdioTransport implements Transport {
     private readonly onStderr: (line: string) => void,
     /** The child's pipe failed and it outlived SIGKILL too, so the line
      *  stays open, owning it (the line's 'unreaped'): `reason` names the
-     *  pipe's error. */
-    private readonly onUnreaped: (reason: string) => void,
+     *  pipe's error, and `failure` is the reap's. */
+    private readonly onUnreaped: (reason: string, failure: Error) => void,
   ) {
     this.recorded = serverTextRedactor(config);
   }
@@ -313,7 +354,7 @@ class SpawnerStdioTransport implements Transport {
     line.on('stderr', (text: string) => this.onStderr(text));
     line.on('error', (error: Error) => this.onerror?.(error));
     line.on('close', () => this.onclose?.());
-    line.on('unreaped', () => this.onUnreaped(`its stdio pipe failed with ${line.pipeFailure?.message ?? 'an error'}`));
+    line.on('unreaped', (failure: Error) => this.onUnreaped(`its stdio pipe failed with ${line.pipeFailure?.message ?? 'an error'}`, failure));
   }
 
   async send(message: JSONRPCMessage): Promise<void> {
@@ -470,7 +511,8 @@ export class ModernMcpConnection extends EventEmitter {
    *  While it's true the connection owns that child, so whatever registered
    *  it keeps its id held; close() retries the reap. It's settled only once
    *  a reap has finished: while a lost session's reap or a close runs, it
-   *  reads false, so read it once lossReaped() or close() has settled. */
+   *  may not read true yet, so read it once lossReaped() or close() has
+   *  settled. */
   get holdsUnreapedChild(): boolean {
     return this.unreaped.length > 0;
   }
@@ -483,10 +525,15 @@ export class ModernMcpConnection extends EventEmitter {
   }
 
   /** A failed generation's cleanup couldn't reap its child: keep owning it,
-   *  and halt reconnecting until close() settles it. */
-  private holdUnreaped(session: Session, failure: Error): void {
+   *  and halt reconnecting until close() settles it. It's reported as an
+   *  'error' at once, unless the caller reports it later itself. */
+  private holdUnreaped(session: Session, failure: Error, report = true): void {
     if (this.unreaped.some((held) => held.session === session)) return;
     this.unreaped.push({ session, failure });
+    if (report) this.reportUnreaped(failure);
+  }
+
+  private reportUnreaped(failure: Error): void {
     this.emit('error', new Error(
       `MCP server "${this.id}": ${failure.message}. Not starting another launch while it may still be running; close the connection to retry the reap.`,
     ));
@@ -584,11 +631,11 @@ export class ModernMcpConnection extends EventEmitter {
       ? new SpawnerStdioTransport(
         this.config,
         (line) => { if (this.isCurrent(generation)) this.deliverStderr(line); },
-        // A child whose pipe failed and that outlived SIGKILL: a loss, whose
-        // reap finds the child still running and holds the launch, as for any
-        // launch it can't reap. During a connect there is no session to lose
+        // A child whose pipe failed and that outlived SIGKILL: a loss whose
+        // launch is already known unreaped, so it's held as the loss is
+        // handled (handleLost). During a connect there is no session to lose
         // yet: the connect's own cleanup holds it, once the connect fails.
-        (reason) => { if (this.isCurrent(generation)) this.handleLost(generation, reason); },
+        (reason, failure) => { if (this.isCurrent(generation)) this.handleLost(generation, reason, failure); },
       )
       : new StreamableHTTPClientTransport(new URL(this.config.url!), { authProvider: bearerAuth(this.config) });
     const wire = new ObservedTransport(inner);
@@ -762,8 +809,10 @@ export class ModernMcpConnection extends EventEmitter {
     }
   }
 
-  /** The transport went away (child exit, or a closed HTTP client). */
-  private handleLost(generation: number, reason: string): void {
+  /** The transport went away (child exit, or a closed HTTP client).
+   *  `unreaped`: the child's pipe failed and it outlived SIGKILL, so its
+   *  launch is already known unreaped. */
+  private handleLost(generation: number, reason: string, unreaped?: Error): void {
     const session = this.session;
     if (session?.generation !== generation) return;
     this.session = null;
@@ -775,18 +824,34 @@ export class ModernMcpConnection extends EventEmitter {
     // reconnect's does, and is a permanent failure, as that one is: no
     // later attempt will come. The reap starts, and is recorded, before
     // 'close' is emitted, so a listener that throws can't skip it.
+    const permanent = () => this.emit('reconnect-failed', { error: `${reason}; ${this.unreapedFailure()}`, attempt: Math.max(1, this.reconnectAttempts), permanent: true });
     const done = ModernMcpConnection.closeSession(session).then((failure) => {
       if (this.losing?.session === session) this.losing = null;
+      // A close() the host made meanwhile reports the failure itself.
+      if (unreaped) {
+        // Held as the loss was handled, whatever the reap found now.
+        if (!this.closedByHost) permanent();
+        return;
+      }
       if (failure) {
         this.holdUnreaped(session, failure);
-        // A close() the host made meanwhile reports the failure itself.
-        if (!this.closedByHost) {
-          this.emit('reconnect-failed', { error: `${reason}; ${this.unreapedFailure()}`, attempt: Math.max(1, this.reconnectAttempts), permanent: true });
-        }
+        if (!this.closedByHost) permanent();
       } else if (this.willReconnect) this.scheduleReconnect();
     });
     this.losing = { session, done };
-    this.emit('close', { reason });
+    // A launch already known unreaped is held now, before 'close', so the
+    // calls the reap's close ends, which classify their failure only once
+    // this returns, and any made meanwhile, read that this host won't
+    // reconnect, as the legacy engine has it (#540's review, R1-1). It's
+    // reported after 'close', which is where the other route reports a hold
+    // too, whatever the 'close' listeners do, so a listener that throws can
+    // skip neither 'close' nor the report.
+    if (unreaped) this.holdUnreaped(session, unreaped, false);
+    try {
+      this.emit('close', { reason });
+    } finally {
+      if (unreaped) this.reportUnreaped(unreaped);
+    }
   }
 
   /** The legacy engine's backoff: doubling from the base interval, capped,
@@ -1013,9 +1078,9 @@ export class ModernMcpConnection extends EventEmitter {
    * The rules apply in this order. The call's answer is the server's final
    * one: an error or a `complete` result.
    * - nothing handed to the transport: `not-sent`, whatever was raised (a
-   *   pre-dispatch validation, a signal already aborted, no transport, a send
-   *   Connectome's stdio line refused before writing, an HTTP refusal before
-   *   any request went out);
+   *   pre-dispatch validation, a signal already aborted, no transport, a
+   *   message JSON can't write, a send Connectome's stdio line refused
+   *   before writing);
    * - the most recent leg answered with a JSON-RPC error: `error-response`
    *   with that error's data;
    * - the most recent leg answered with a complete result: the server

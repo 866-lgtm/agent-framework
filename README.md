@@ -414,7 +414,10 @@ some version was read (or history is unknown). `initial: true` on a create lets
 the host know the subject's history is complete, so a create → edit → delete
 that nobody read leaves no trace. `deferred: true` (push only) holds a batch of
 notices outside context and asks the server for the content with `push/render`
-when a turn is assembled.
+when a turn is assembled. Each render describes what changed since the one
+before it, so neither a later render nor a notice replaces an earlier render
+the model hasn't read: the newer render lands after it, and a retraction or a
+later plain occurrence withdraws the unread renders, newest first.
 
 Plain content stays in context and is delivered on arrival through the ordinary
 channel/push path; the host only remembers where it landed. "Unread" means:
