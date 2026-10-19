@@ -61,10 +61,12 @@ function valueAt(value: unknown, path: string): unknown {
 /**
  * A row as a module's context answers it: marked `heldFromResidents` when it
  * carries the stamp a tune-out puts on a message it holds from the residents
- * (`metadata.tuneOut`). That's the stamp every resident's viewFilter leaves
- * out of its compiled view (framework.ts, createAgent), so a marked row is
- * one the store keeps and no resident's view shows. Any other row comes back
- * as it is.
+ * (`metadata.tuneOut`). Every resident's viewFilter leaves a stamped row out
+ * of its compiled view (framework.ts, createAgent), and a tool boundary
+ * stores a stamped write without injecting it into the live turn, so a
+ * marked row is one the store keeps and that itself enters no resident's
+ * window (ModuleMessage.heldFromResidents says where its text can still
+ * reach one). Any other row comes back as it is.
  */
 export function asModuleRow<T extends Pick<StoredMessage, 'metadata'>>(row: T): T & { heldFromResidents?: true } {
   return (row.metadata as { tuneOut?: unknown } | undefined)?.tuneOut ? { ...row, heldFromResidents: true } : row;

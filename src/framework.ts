@@ -10924,6 +10924,11 @@ export class AgentFramework {
               // Every other resident reads what this boundary stores; for its
               // own agent, the boundary weighs what it injects below.
               this.noteForOtherResidents(agent, msg.metadata, id);
+              // A message a tune-out holds from the residents is stored (the
+              // subconscious reads it) and left out of every resident's
+              // compiled view; injecting it here would put in the live turn
+              // what the next compile hides (#232 gap 5).
+              if ((msg.metadata as { tuneOut?: unknown } | undefined)?.tuneOut) continue;
               const injection = {
                 participant: msg.participant,
                 content,
@@ -20731,11 +20736,12 @@ export class AgentFramework {
 
   /**
    * The writes held for `reader`'s store (heldWritesFor) as the rows a
-   * module's context reads: each under its handle, marked `held`, with the
-   * participant, content and metadata it was written with, the time it was
-   * first held as its timestamp, and a sequence after every row the store
-   * holds, in queue order. The sequence and timestamp are provisional: the
-   * stored row has the store's own.
+   * module's context reads: each under its handle, marked `held`, and
+   * `heldFromResidents` too when its metadata carries a tune-out's stamp
+   * (asModuleRow), with the participant, content and metadata it was
+   * written with, the time it was first held as its timestamp, and a
+   * sequence after every row the store holds, in queue order. The sequence
+   * and timestamp are provisional: the stored row has the store's own.
    */
   private heldRows(reader: Agent): ModuleMessage[] {
     const writes = this.heldWritesFor(reader);

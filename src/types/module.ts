@@ -46,11 +46,15 @@ export type ModuleMessage = StoredMessage & {
   /**
    * True on a message a tune-out holds from the residents: one that arrived
    * in a tuned-out channel, stamped `metadata.tuneOut` as it came in. The
-   * store keeps it, and no resident's compiled view shows it, during the
-   * tune-out or after it; the subconscious reads it. A cancel brings the
-   * residents the text of the newest stored ones, up to the tune-out's
-   * `backlogCap`, in one `<tuned-out-backlog>` row of its own, which isn't
-   * marked. A module that builds on what the residents see, such as one
+   * store keeps it, and the row itself enters no resident's window: no
+   * compiled view shows it, during the tune-out or after it, and a tool
+   * boundary of a turn alive when it arrived stores it without injecting
+   * it. The subconscious reads it. Its text can still reach a resident in
+   * rows of their own, which aren't marked, such as the cancel's
+   * `<tuned-out-backlog>` row, with the text of the newest stored ones up to
+   * the tune-out's `backlogCap`, and the result of a tool that reads history
+   * on request, such as a channel's `fetch_history` or the history module's
+   * `extract`. A module that builds on what the residents see, such as one
    * choosing from the recent conversation, leaves a marked row out, and one
    * that matches what's stored, such as a sync's dedupe, keeps it. A held
    * write (`held`) is marked too when it carries the stamp. Absent on every
