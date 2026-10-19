@@ -1075,32 +1075,85 @@ describe('mount include', () => {
       writeFileSync(join(root, 'qz', 'c.txt'), 'what the directory put in its place holds\n');
       assert.equal(await coversLanding({ root, include: ['qz/**'] }, rootReal, join(rootReal, 'QZ', 'c.txt'), 'qz/c.txt'), false);
     }
+    // Where disk tells case apart, a link at the path itself, however disk got it there, is no level of the
+    // landing's own: `gt.json` leads to `GT.JSON`, which the include leaves out.
+    writeFileSync(join(root, 'GT.JSON'), "not the mount's\n");
+    if (!existsSync(join(root, 'gt.json'))) {
+      symlinkSync('GT.JSON', join(root, 'gt.json'));
+      assert.equal(await coversLanding({ root, include: ['gt.json'] }, rootReal, join(rootReal, 'GT.JSON'), 'gt.json'), false);
+    }
+    // On a disk that folds names, a file a write would create beneath a directory the path names in another
+    // spelling than disk's lands where it's named: neither side has the file, and the directory is one. Judged
+    // where it lands instead, as disk spells it, `notes/new.txt` is one `Notes/**` doesn't cover.
+    mkdirSync(join(root, 'notes'));
+    writeFileSync(join(root, 'notes', 'a.txt'), 'covered as named\n');
+    if (existsSync(join(root, 'NOTES'))) {
+      const notes = { root, include: ['Notes/**'] };
+      assert.equal(await coversLanding(notes, rootReal, join(rootReal, 'notes', 'a.txt'), 'Notes/a.txt'), true);
+      assert.equal(await coversLanding(notes, rootReal, join(rootReal, 'notes', 'new.txt'), 'Notes/new.txt'), true);
+      assert.equal(await coversLanding(notes, rootReal, join(rootReal, 'notes', 'deep', 'new.txt'), 'Notes/deep/new.txt'), true);
+    }
   });
 
   test("history the outer mount took in where a nested mount now holds the directory is no mount's where that mount's include leaves it out: no listing, sync or grep names it", async (t) => {
     const env = new Env(t);
     env.writeDisk('inner/secret.txt', "needle: not the inner mount's\n");
     env.writeDisk('inner/private/p.txt', "not the inner mount's either\n");
+    env.writeDisk('inner/public/k.json', '{}\n');
     env.writeDisk('inner/k.json', '{}\n');
     const before = await env.open();
     await call(before, 'sync', {});
     assert.ok(env.tree().includes('inner/secret.txt'), `taken in before the mount was nested: ${env.tree()}`);
     await env.stop(before);
-    // Only history implies `inner/private` now.
+    // Only history implies `inner/private` and `inner/public` now.
     rmSync(join(env.dir, 'inner/private'), { recursive: true, force: true });
+    rmSync(join(env.dir, 'inner/public'), { recursive: true, force: true });
     const m = await openNested(env, false);
     try {
       const listing = JSON.stringify(await call(m, 'ls', { path: 'work', recursive: true }));
       assert.ok(!listing.includes('secret') && !listing.includes('private'), listing);
-      // Nor does a listing of that mount's directory name a directory only such history implies.
-      const there = JSON.stringify(await call(m, 'ls', { path: 'work/inner' }));
-      assert.ok(!there.includes('private') && !there.includes('secret'), there);
+      // Nor does a listing of that mount's directory name a directory only such history implies, while one
+      // that history that mount covers implies is named.
+      const there = await call(m, 'ls', { path: 'work/inner' });
+      assert.ok(!JSON.stringify(there).includes('private') && !JSON.stringify(there).includes('secret'), JSON.stringify(there));
+      assert.ok(JSON.stringify(there).includes('public'), JSON.stringify(there));
+      // status counts what the listings name: k.json and public/k.json.
+      assert.equal((await call(m, 'status', {})).work.fileCount, 2);
       const synced = JSON.stringify(await call(m, 'sync', {}));
       assert.ok(!synced.includes('secret'), synced);
       assert.equal((await call(m, 'grep', { path: 'work', pattern: 'needle' })).totalMatches, 0);
       assert.ok(env.tree().includes('inner/secret.txt'), 'history keeps it as it was');
     } finally {
       await m.stop();
+    }
+  });
+
+  test("a directory gone from disk is a scope where history the mount's own listing names lies beneath it, and not where only history in a nested mount's directory that mount's include leaves out does", async (t) => {
+    for (const [entries, scope] of [[['old/inner/secret.json'], false], [['old/inner/secret.json', 'old/inner/gate.json'], true]] as const) {
+      const env = new Env(t);
+      for (const path of entries) env.writeDisk(path, '{}\n');
+      const before = await env.open({ include: ['*.json'] });
+      await call(before, 'sync', {});
+      await env.stop(before);
+      rmSync(join(env.dir, 'old'), { recursive: true, force: true });
+      const m = new WorkspaceModule({ mounts: [
+        { name: 'work', path: env.dir, mode: 'read-write', watch: 'never', include: ['*.json'] },
+        { name: 'inner', path: join(env.dir, 'old', 'inner'), mode: 'read-write', watch: 'never', include: ['gate.json'] },
+      ] });
+      m.initStore(env.store);
+      await m.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
+      try {
+        const listed = await call(m, 'ls', { path: 'work' }) as { entries: Array<{ path?: string; name?: string }> };
+        assert.equal(listed.entries.some((e) => (e.path ?? e.name) === 'old'), scope, JSON.stringify(listed));
+        for (const name of ['ls', 'sync', 'glob', 'grep']) {
+          const input = name === 'grep' || name === 'glob' ? { path: 'work/old', pattern: 'x' } : { path: 'work/old' };
+          const res = await m.handleToolCall({ id: 't', name, input });
+          if (scope) assert.equal(res.success, true, `${name}: ${res.error}`);
+          else assert.match(String(res.error), /"work\/old" is outside the mount's include/, name);
+        }
+      } finally {
+        await m.stop();
+      }
     }
   });
 

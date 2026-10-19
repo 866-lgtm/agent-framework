@@ -387,17 +387,22 @@ test("a segment on a path's way that isn't a directory and that the include does
   mkdirSync(join(dir, 'real'));
   writeFileSync(join(dir, 'real', 'a.json'), '{}\n');
   symlinkSync('real', join(dir, 'link'));
-  for (const [path, disk] of [['work/SECRET.TXT/a.json', 'secret.txt'], ['work/LINK/a.json', '"work/link"']] as const) {
-    // Nothing beneath it is served, and the refusal names the segment in the one spelling, disk's.
+  for (const [path, given, disk, segment] of [['work/SECRET.TXT/a.json', 'SECRET.TXT', 'secret.txt', 'secret.txt'], ['work/LINK/a.json', 'LINK', '"work/link"', 'link']] as const) {
+    // Nothing beneath it is served, and the refusal names the segment in the one spelling, disk's, and never
+    // as the caller spelled it.
     const read = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
     assert.equal(read.success, false, path);
-    assert.ok(String(read.error).includes(disk), `${path}: ${read.error}`);
+    assert.ok(String(read.error).includes(disk) && !String(read.error).includes(given), `${path}: ${read.error}`);
     let message = '';
     await assert.rejects(workspace.readFileFromDisk(path), (err: unknown) => { message = String((err as Error).message); return err instanceof WorkspaceReadError; });
-    assert.ok(message.includes(disk), `${path}: ${message}`);
+    assert.ok(message.includes(disk) && !message.includes(given), `${path}: ${message}`);
     const deleted = await workspace.handleToolCall({ id: 'delete', name: 'delete', input: { path } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
     assert.equal(deleted.success, false, path);
-    assert.ok(String(deleted.error).includes(disk), `${path}: ${deleted.error}`);
+    assert.ok(String(deleted.error).includes(disk) && !String(deleted.error).includes(given), `${path}: ${deleted.error}`);
+    // What a sync of the path says it skipped names it the same way.
+    const synced = JSON.stringify(await workspace.handleToolCall({ id: 'sync', name: 'sync', input: { path } } as Parameters<WorkspaceModule['handleToolCall']>[0]));
+    assert.ok(!synced.includes(given), `${path}: ${synced}`);
+    if (segment === 'link') assert.ok(synced.includes('link/a.json'), `the sync names what it skipped in disk's spelling: ${synced}`);
   }
   // The include's own refusal answers the path asked about, as given.
   const outside = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path: 'work/SECRET.TXT' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);

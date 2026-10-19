@@ -58,10 +58,13 @@ export interface MountConfig {
    * It's the mount's boundary for content: no workspace path reads, stores,
    * serves or writes back a file it doesn't cover, and no tool lists,
    * matches or names one, beyond echoing a path it was given, which it may
-   * spell as disk does. A walk passes
-   * over one and counts it under `passedOver`, no pass decides a change the
-   * watcher reports there, and a materialize doesn't write it back even when
-   * the workspace's history holds it. A materialize that names a directory
+   * spell as disk does. A walk passes over one and counts it under
+   * `passedOver`, and passes over a link its names don't cover with the
+   * reason a mount without an include gives a link it doesn't enter, "a
+   * symlink, not walked", where the link leads to a directory, and wherever
+   * it leads on a mount that doesn't follow links. No pass decides a change
+   * the watcher reports there, and a materialize doesn't write it back even
+   * when the workspace's history holds it. A materialize that names a directory
    * inside the mount counts each such entry beneath it under `passedOver`,
    * with the reason and without its path, a deletion or conflict held there
    * included; one of the whole mount takes none of them up. The file
@@ -97,9 +100,11 @@ export interface MountConfig {
    * spells otherwise is outside the mount, and the include's refusal shows
    * the path as given. A path that names one of the workspace's entries
    * exactly, or does once its directories take disk's spelling, keeps the
-   * entry's spelling, as the parse gives it. Other answers name a path as
-   * the parse spells it, a name the include leaves out included, since how
-   * disk spells a name the caller gave is no content of that file. Where a
+   * entry's spelling, as the parse gives it, and what lies past a link on
+   * the way keeps the caller's spelling, since the parse reads nothing past
+   * a link. Other answers name a path as the parse spells it, a name the
+   * include leaves out included, since how disk spells a name the caller
+   * gave is no content of that file. Where a
    * followed path lands is judged as disk spells it there, and a path that
    * meets no link where the parse names it.
    * `resolveAbsolutePath`, which is synchronous, judges the include on the

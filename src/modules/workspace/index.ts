@@ -2346,16 +2346,17 @@ export class WorkspaceModule implements Module {
    * outside the mount's include. A path the include doesn't cover is a scope
    * exactly where a listing names a directory: where disk has a directory
    * reached from the mount's root through directories, with no link among
-   * them, or the workspace's history holds an entry beneath it that the
-   * include covers. The one exception is a directory the ignore list covers,
-   * which a listing passes over and which is still a scope when it's named,
-   * since a sync that names it takes in what's there (#276). Anything else is
-   * refused, a file at the path included, which no scope tool takes up. The
-   * walk descends no link it meets. Where covered history
-   * makes a name a scope and disk has since put a link there, a mount that
-   * doesn't follow symlinks refuses the link, as it refuses any link on a
-   * path's way, and on a mount that does, a pass of the scope follows the
-   * link, and its answer shows whether the link leads out of the mount. A
+   * them, or the workspace's history holds an entry beneath it that's the
+   * mount's own to list (withinIncludes). The one exception is a directory
+   * the ignore list covers, which a listing passes over and which is still a
+   * scope when it's named, since a sync that names it takes in what's there
+   * (#276). Anything else is refused, a file at the path included, which no
+   * scope tool takes up. The walk descends no link it meets. Where covered
+   * history makes a name a scope and disk has since put a link there, a
+   * mount that doesn't follow symlinks refuses the link, as it refuses any
+   * link on a path's way, and on a mount that does, a pass of the scope
+   * follows the link, and its answer shows whether the link leads out of the
+   * mount. A
    * path in another mount's directory nested in this one is that mount's,
    * whatever this mount's include says, so it isn't refused here: each tool
    * names the mount that holds it, as the file operations do.
@@ -2363,8 +2364,9 @@ export class WorkspaceModule implements Module {
   private async refusesAsOutside(mount: MountState, relativePath: string): Promise<boolean> {
     if (this.holderOf(mount.config.name, relativePath)) return false;
     if (insideMount(relativePath, mount.config.include)) return false;
+    const own = { include: mount.config.include, nested: this.nestedOf(mount.config.name) };
     if (this.getStore().treeList(mount.treeStateId, relativePath + '/')
-      .some((entry) => insideMount(entry.path, mount.config.include))) return false;
+      .some((entry) => withinIncludes(own, entry.path))) return false;
     // A directory, and each directory above it to the mount's root, as the
     // walk reaches it: through no link, since the walk descends none.
     const segments = relativePath.split('/');
@@ -2379,28 +2381,29 @@ export class WorkspaceModule implements Module {
    * Parse a mount-prefixed path into its mount and mount-relative path, as
    * disk spells it (diskSpelling). `path` is the mount-prefixed path in that
    * spelling where it differs from the one spelling, and otherwise the path
-   * as the caller gave it, which a refusal then shows. The path is read in
-   * its one spelling first (parsePathAsGiven), so the respelling only ever
-   * sees a path with no empty, `.` or `..` segment and no separator before
-   * its first. On a disk that folds names, a path spelled otherwise reaches
-   * disk's file, so every tool takes it by disk's name: one name per file,
-   * and the names its answers give are disk's, except that a path that names
-   * a workspace entry exactly, or does once its directories take disk's
-   * spelling, keeps the entry's spelling. A path the workspace records an
-   * intent at, such as a deletion disk hasn't been given yet, counts as an
-   * entry here, so the calls that settle it reach it. The workspace's
-   * entries (entriesOf) stand in for disk where it has nothing yet, so a
-   * draft has one name too. Neither applies to a path that disk's spelling
-   * puts in a nested mount's directory. Past a nested mount's directory the
-   * path stays as given, since what lies there is that mount's to name, and
-   * the include's own refusal shows a path as given too (refuseNotHeld).
-   * Every other answer names a path in this spelling, a name the include
-   * leaves out included: how disk spells a name the caller gave is no
-   * content of that file. A handler that
-   * must read something at the moment it's asked, as handleSync reads the
-   * branch a path sync adopts on, reads it before calling this, since this
-   * awaits disk. The entries are read when the step needs them, some after
-   * those awaits, from the branch current then.
+   * as the caller gave it. The path is read in its one spelling first
+   * (parsePathAsGiven), so the respelling only ever sees a path with no
+   * empty, `.` or `..` segment and no separator before its first. On a disk
+   * that folds names, a path spelled otherwise reaches disk's file, so every
+   * tool takes it by disk's name: one name per file, and the names its
+   * answers give are disk's, except that a path that names a workspace entry
+   * exactly, or does once its directories take disk's spelling, keeps the
+   * entry's spelling, and what lies past a link on the way keeps the
+   * caller's, since the step reads nothing past a link. A path the workspace
+   * records an intent at, such as a deletion disk hasn't been given yet,
+   * counts as an entry here, so the calls that settle it reach it. The
+   * workspace's entries (entriesOf) stand in for disk where it has nothing
+   * yet, so a draft has one name too. Neither applies to a path that disk's
+   * spelling puts in a nested mount's directory. Past a nested mount's
+   * directory the path stays as given, since what lies there is that mount's
+   * to name. Every answer shows `path`, a name the include leaves out
+   * included, since how disk spells a name the caller gave is no content of
+   * that file, except the include's own refusal, which shows the path
+   * exactly as given (refuseNotHeld), since it answers the path asked about.
+   * A handler that must read something at the moment it's asked, as
+   * handleSync reads the branch a path sync adopts on, reads it before
+   * calling this, since this awaits disk. The entries are read when the step
+   * needs them, some after those awaits, from the branch current then.
    */
   private async parsePath(path: string): Promise<{ mount: MountState; relativePath: string; path: string }> {
     const given = this.parsePathAsGiven(path);
@@ -4225,9 +4228,12 @@ export class WorkspaceModule implements Module {
 
     for (const [name, mount] of this.mounts) {
       if (input.mount !== undefined && name !== input.mount) continue;
-      // What the workspace's history holds outside the mount's include isn't the mount's.
+      // What the workspace's history holds outside the mount's include isn't the mount's,
+      // and nor is what it holds in a nested mount's directory that mount's include leaves
+      // out (withinIncludes), which no listing names either.
       const inside = (p: string): boolean => insideMount(p, mount.config.include);
-      const entries = store.treeList(mount.treeStateId).filter((e) => inside(e.path));
+      const listable = { include: mount.config.include, nested: this.nestedOf(name) };
+      const entries = store.treeList(mount.treeStateId).filter((e) => withinIncludes(listable, e.path));
       const currentSeq = store.currentSequence();
       const own = this.ownPaths(mount);
       const intents = this.intents.get(name)!.list().filter(([p]) => inside(p) && own(p));
@@ -4301,8 +4307,8 @@ export class WorkspaceModule implements Module {
    * Whether a path of the mount is its own to push and to count as owed:
    * not in another mount's directory nested in it. Copies the mount's tree
    * holds there (stored before the nesting) stay in its history, and in its
-   * listings where that mount's include covers them (withinIncludes), and in
-   * status's fileCount, which counts the tree. Its syncs pass over them, and
+   * listings and status's fileCount where that mount's include covers them
+   * (withinIncludes). Its syncs pass over them, and
    * they're left out of what it pushes and of status's pending changes,
    * conflicts and workspace deletions.
    */

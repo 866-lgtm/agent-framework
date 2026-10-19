@@ -328,24 +328,44 @@ export function withinIncludes(view: Pick<MountView, 'include' | 'nested'>, path
  * lands where it's named, and is judged as named. realpath can spell such a
  * path otherwise only as a disk that folds names does, with disk's stored
  * names on macOS and Windows where a path keeps a workspace entry's
- * spelling, so where the spellings differ only so, a link is looked for on
- * the way (linkOnTheWay's walk), and the path as named must be the landing's
- * own file; both so, the path is judged as named. Otherwise, or where a link
- * or a directory it couldn't ask lies on the way, the landing is judged, as
- * disk spells it, since realpath keeps the spelling a link's target gives,
- * which on a disk that folds names need not be disk's (diskSpelling). So a
- * link swapped for a directory between the realpath and the walk can only
- * make the landing judged: on a disk that tells case apart, the directory's
- * file at the named path is another file than the one the link led to.
+ * spelling, so where the spellings differ only so, the path is judged as
+ * named where it reaches the landing itself, level by level (sameLevels).
+ * Otherwise the landing is judged, as disk spells it, since realpath keeps
+ * the spelling a link's target gives, which on a disk that folds names need
+ * not be disk's (diskSpelling).
  */
 export async function judgedAt(root: string, rootReal: string, real: string, given: string): Promise<string> {
   const landed = relative(rootReal, real).split(sep).join('/');
   if (landed === given) return given;
-  if (foldedLoosely(landed) === foldedLoosely(given) && (await linkOnTheWay({ root, followSymlinks: false }, given)) === null) {
-    const [named, landing] = await Promise.all([join(rootReal, given), real].map((at) => stat(at, { bigint: true }).catch(() => null)));
-    if (named && landing && sameFile(named, landing)) return given;
-  }
+  if (foldedLoosely(landed) === foldedLoosely(given) && await sameLevels(rootReal, given, landed)) return given;
   return diskSpelling(rootReal, landed);
+}
+
+/**
+ * Whether `given` reaches `landed`, two spellings of a path beneath
+ * `rootReal`, level by level: each directory on the way and the file itself
+ * are, as `lstat` finds them, one and the same on both sides, so the path as
+ * named passes through no link of its own that the landing doesn't. Beneath
+ * the last level both sides have, where neither has the next, a file a write
+ * would create there lands where it's named. A level only one side has, or
+ * one this can't ask, is no such path. On a disk that folds names a level
+ * both spellings share is one entry, so a link disk puts there after the
+ * realpath meets both alike: that's the open's check to catch, as where the
+ * spellings match.
+ */
+async function sameLevels(rootReal: string, given: string, landed: string): Promise<boolean> {
+  const named = given.split('/');
+  const landing = landed.split('/');
+  if (named.length !== landing.length) return false;
+  const level = (segments: string[], i: number) => lstat(join(rootReal, ...segments.slice(0, i)), { bigint: true })
+    .then((st) => st, (err: unknown) => (errno(err) === 'ENOENT' || errno(err) === 'ENOTDIR' ? null : undefined));
+  for (let i = 1; i <= named.length; i++) {
+    const [a, b] = await Promise.all([level(named, i), level(landing, i)]);
+    if (a === undefined || b === undefined) return false;
+    if (a === null && b === null) return true;
+    if (a === null || b === null || !sameFile(a, b)) return false;
+  }
+  return true;
 }
 
 /**
