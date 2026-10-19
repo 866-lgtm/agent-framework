@@ -337,7 +337,7 @@ function matchesPartialPrefix(buffer: Buffer, prefix: Buffer): boolean {
  * (`relativePath`), whatever spelling the caller gave. Where the link leads is
  * read beneath `rootReal`, the root the check that found it resolved, so the
  * link and its target are judged beneath one root, by that root's nesting
- * (`nested`); left out, it's the mount's configured root, resolved now.
+ * (`nested`).
  */
 async function linkReadError(
   mount: { config: { name: string; path: string; include?: readonly string[] } },
@@ -345,13 +345,12 @@ async function linkReadError(
   mountPrefixedPath: string,
   relativePath: string,
   nested: readonly NestedMount[],
-  rootReal?: string,
+  rootReal: string,
 ): Promise<WorkspaceReadError> {
   if (!('link' in found)) {
     return new WorkspaceReadError('not_found', `Unable to read file: ${mountPrefixedPath}: ${linkWords(mount.config.name, found, null)}`, 'readlink', found.code);
   }
-  const real = rootReal ?? await realpath(mount.config.path).catch(() => resolve(mount.config.path));
-  const leads = await shownLeads(rootReal ?? mount.config.path, real, found, mount.config.include);
+  const leads = await shownLeads(rootReal, rootReal, found, mount.config.include);
   const reason = `${mountPrefixedPath}: ${linkWords(mount.config.name, found, leads, nested, mount.config.include)}`;
   const holder = leads?.kind === 'inside' ? nestedHolder(leads.target, nested) : undefined;
   const code = leads?.kind === 'outside' ? 'escape'
@@ -1162,12 +1161,14 @@ export class WorkspaceModule implements Module {
    * A direct mount as its tools read it: its view, with no root identity,
    * since it promises what's at its root now and keeps no evidence to check
    * that against (MountConfig.backend), and its root as realpath resolves it,
-   * or as given where that fails, as a pass's runtime takes it.
+   * or as given where that fails, as a pass's runtime takes it. The view
+   * reads beneath that root, so a walk or a read judges and opens its files
+   * beneath one root, however its configured path is repointed meanwhile.
    */
   private async diskView(mount: MountState): Promise<{ view: MountView; rootReal: string; moved: NestedMount[] | null }> {
     const root = resolve(mount.config.path);
     const rootReal = await realpath(root).catch(() => root);
-    const view = this.viewOf(mount, undefined);
+    const view = { ...this.viewOf(mount, undefined), root: rootReal };
     const moved = await this.movedNesting(mount, rootReal);
     return { view: moved === null ? view : { ...view, nested: moved, others: moved.map((n) => n.dir) }, rootReal, moved };
   }
@@ -2430,7 +2431,8 @@ export class WorkspaceModule implements Module {
    * The mounts nested in a direct mount whose root a check resolved to
    * `rootReal`, where that's elsewhere than the last start placed it, as when
    * a link it's configured through is repointed; null where the start's
-   * placement holds, or where nothing is at `rootReal`, whose read says so. A
+   * placement holds, or where nothing is at `rootReal`: there the parse's
+   * checks keep the start's placement, and a read says the root is gone. A
    * direct mount reads beneath whatever directory is at its root, so a check
    * judges which mount a path is by the root it resolved. A tool's parse
    * resolves it once, and its respelling and its checks of the path it's
@@ -2445,25 +2447,34 @@ export class WorkspaceModule implements Module {
    * have it serve a file the new root spells otherwise, as a rename during a
    * call can on any mount (sameLevels). A mount configured beneath its
    * configured path lies where that path now leads, as a start would place
-   * it: at its configured directory, and where that directory resolves
-   * beneath `rootReal` (realBeneath), its real root, each also as disk spells
-   * it (diskSpelling). Any other mount lies where the last start placed it:
-   * it's nested where its real root lies beneath `rootReal`, and where its
+   * it: at its configured directory, beneath each directory on the way there
+   * that resolves to `rootReal` (realBeneath), and where its directory
+   * resolves beneath `rootReal`, its real root, each also as disk spells it
+   * (diskSpelling). Any other mount lies where the last start placed it: it's
+   * nested where its real root lies beneath `rootReal`, and where its
    * configured path lies beneath a directory that start found at `rootReal`.
-   * Each carries its own include, as nestedOf gives it. It resolves nothing
-   * but directories beneath this mount's own root, so a share elsewhere that
-   * doesn't answer holds only its own calls, unless such a directory is a
-   * link into it, where that mount's files lie. What it leaves to the next
-   * start: a mount configured elsewhere whose own root has moved since, as by
-   * a second link repointed, that mount's spellings through other links, and
-   * the other mounts' own placements, so a direct root moved into another
-   * mount's directory is that mount's too, as a nested mount's root moved
-   * while running stays placed.
+   * A mount configured at this mount's own path lies where its root does, so
+   * it's nested nowhere in it. Each carries its own include, as nestedOf
+   * gives it. It resolves nothing but directories beneath this mount's own
+   * root, so a share elsewhere that doesn't answer holds only its own calls,
+   * unless such a directory is a link into it, where that mount's files lie.
+   * What it leaves to the next start: a mount configured elsewhere whose own
+   * root has moved since, as when a link on its configured path is repointed,
+   * this mount's own reached through another link among them, that mount's
+   * spellings through other links, and the other mounts' own placements, so a
+   * direct root moved into another mount's directory is that mount's too, as
+   * a nested mount's root moved while running stays placed.
    */
   private async movedNesting(mount: MountState, rootReal: string): Promise<NestedMount[] | null> {
-    const placed = this.placedRoots.get(mount.config.name);
+    // One start's placements, whatever a start in the meantime sets.
+    const { placedRoots, placedAbove } = this;
+    const placed = placedRoots.get(mount.config.name);
     if (!mount.direct || placed === undefined || placed === rootReal) return null;
-    if (!(await stat(rootReal).then(() => true, () => false))) return null;
+    const there = await stat(rootReal).then(() => true, (err: unknown) => {
+      const code = errnoOf(err);
+      return code !== 'ENOENT' && code !== 'ENOTDIR';
+    });
+    if (!there) return null;
     const outerPath = resolve(mount.config.path);
     const nested: NestedMount[] = [];
     // A real root that holds this mount's own would claim its every path, so
@@ -2471,30 +2482,41 @@ export class WorkspaceModule implements Module {
     const at = (dir: string, name: string, real: string): NestedMount => ({
       dir, name, ...(isContainedPath(real, rootReal) ? {} : { real }), include: this.mounts.get(name)?.config.include,
     });
+    const add = (dirs: Array<string | undefined>, name: string, real: string) => {
+      for (const dir of dirs) {
+        if (dir !== undefined && !nested.some((n) => n.name === name && n.dir === dir)) nested.push(at(dir, name, real));
+      }
+    };
     for (const inner of this.config.mounts) {
       if (inner.name === mount.config.name) continue;
-      const configured = nestedDir(outerPath, resolve(inner.path));
+      const innerPath = resolve(inner.path);
+      // A mount configured at this mount's own path lies where this root
+      // does, so a start nests it nowhere in it.
+      if (innerPath === outerPath) continue;
+      // Each directory above its configured path that is this root on disk,
+      // as a start finds it (readNesting's throughRoot): one beneath this
+      // mount's configured path where it resolves beneath this root now, and
+      // one above it where the last start found it.
+      const above = (placedAbove.get(inner.name) ?? []).filter((a) => nestedDir(outerPath, a.dir) === undefined && a.real === rootReal).map((a) => nestedDir(a.dir, innerPath));
+      const configured = nestedDir(outerPath, innerPath);
       if (configured !== undefined) {
         const real = await realBeneath(join(rootReal, ...configured.split('/')));
-        nested.push(at(configured, inner.name, real));
-        const there = nestedDir(rootReal, real);
-        if (there !== undefined && there !== configured) nested.push(at(there, inner.name, real));
+        const segments = configured.split('/');
+        const between: string[] = [];
+        for (let i = 1; i < segments.length; i++) {
+          if (await realBeneath(join(rootReal, ...segments.slice(0, i))) === rootReal) between.push(segments.slice(i).join('/'));
+        }
+        add([configured, ...between, ...above, nestedDir(rootReal, real)], inner.name, real);
         continue;
       }
-      // As a start nests it: where its real root, as the last start placed
-      // it, lies beneath this root, and where its configured path lies
-      // beneath a directory that start found to be where this root now lies
-      // (readNesting's throughRoot).
-      const real = this.placedRoots.get(inner.name);
+      // Any other mount, as the last start placed it: where its real root
+      // lies beneath this root, and where its configured path lies beneath a
+      // directory that start found to be where this root now lies. One that
+      // leads here only since, as through this mount's own link, waits for
+      // the next start.
+      const real = placedRoots.get(inner.name);
       if (real === undefined) continue;
-      const innerPath = resolve(inner.path);
-      const dirs = [
-        nestedDir(rootReal, real),
-        ...(this.placedAbove.get(inner.name) ?? []).filter((a) => a.real === rootReal).map((a) => nestedDir(a.dir, innerPath)),
-      ];
-      for (const dir of dirs) {
-        if (dir !== undefined && !nested.some((n) => n.name === inner.name && n.dir === dir)) nested.push(at(dir, inner.name, real));
-      }
+      add([nestedDir(rootReal, real), ...above], inner.name, real);
     }
     // Each directory as disk spells it too, as a start adds it, so a path
     // parsePath has respelled is judged on a disk that folds names.
@@ -2591,11 +2613,13 @@ export class WorkspaceModule implements Module {
    * leaves this one, in the disk readers' words, as it does where it lands
    * on a file this mount's include leaves out. A mount with nothing nested,
    * and without both an include and links followed, has nothing to find, so
-   * it pays nothing. A direct mount's file operation passes the nesting and
-   * the root its parse found (`nested`, `root`), so where the path lands, and
-   * any link on its way, is judged beneath the root that parse resolved.
+   * it pays nothing. The caller gives the nesting and the root to judge by
+   * (`nested`, `root`): a direct mount's file operation those its parse
+   * found, so where the path lands, and any link on its way, is judged
+   * beneath the root that parse resolved; otherwise the start's nesting and
+   * the configured path.
    */
-  private async landingRefusal(mount: MountState, relativePath: string, path: string, nested = this.nestedOf(mount.config.name), root = resolve(mount.config.path)): Promise<Error | null> {
+  private async landingRefusal(mount: MountState, relativePath: string, path: string, nested: readonly NestedMount[], root: string): Promise<Error | null> {
     const judged = mount.config.followSymlinks === true && mount.config.include !== undefined;
     if (nested.length === 0 && !judged) return null;
     const unresolved: { code?: string } = {};
@@ -2656,10 +2680,11 @@ export class WorkspaceModule implements Module {
    * cover names no file of the mount's, whatever disk or history holds
    * there, so one refusesAsOutside lets through is a directory. A direct
    * mount has no history: what a run of it as 'chronicle' left in the store
-   * isn't its own, so disk alone decides, beneath the root its parse resolved
-   * (`root`).
+   * isn't its own, so disk alone decides. Disk is read beneath `root`: a
+   * direct mount's is the root its parse resolved, a store-backed mount's
+   * its configured path.
    */
-  private async namesFile(mount: MountState, relativePath: string, root = resolve(mount.config.path)): Promise<boolean> {
+  private async namesFile(mount: MountState, relativePath: string, root: string): Promise<boolean> {
     return relativePath !== '' && insideMount(relativePath, mount.config.include) && (
       (!mount.direct && this.getStore().treeGet(mount.treeStateId, relativePath) !== null) ||
       await lstat(join(root, relativePath)).then((s) => !s.isDirectory(), () => false)
@@ -3048,8 +3073,10 @@ export class WorkspaceModule implements Module {
     // mount that doesn't follow symlinks goes through none among the
     // directories on the way, wherever it leads. Asked again of the path's
     // resolution after the open, below.
-    // Every check below judges by the root this read opens under, and reads
-    // the links on the path's way beneath it.
+    // The checks below judge by the root step 0 checked, and read the links
+    // on the path's way beneath it. The lstat and the open go through the
+    // configured path, and step 5 refuses a read whose root is no longer the
+    // directory step 0 checked, so what's served is judged beneath one root.
     const linkView = { root: realMountRoot, followSymlinks: follow };
     const nested = await this.nestedFor(mount, realMountRoot);
     const onTheWay = await linkOnTheWay(linkView, relativePath, 'parents');
@@ -4664,7 +4691,7 @@ export class WorkspaceModule implements Module {
       // A `path` naming a single file greps just that file; otherwise it is a
       // directory prefix. (A file path once produced the prefix "notes.md/"
       // and silently matched nothing.)
-      const fileScope = await this.namesFile(mount, relativePath);
+      const fileScope = await this.namesFile(mount, relativePath, resolve(mount.config.path));
       // What follows reads the tree and branch intent to go with the pass's
       // reports, synchronously. They must be the branch the pass decided
       // on: one selected in between would label its content with the other
@@ -4688,7 +4715,7 @@ export class WorkspaceModule implements Module {
         const asked = new Map<string, string>();
         for (const report of next.reports.values()) {
           if (report.state !== 'unverified') continue;
-          const refusal = await this.landingRefusal(mount, report.path, `${mount.config.name}/${report.path}`);
+          const refusal = await this.landingRefusal(mount, report.path, `${mount.config.name}/${report.path}`, this.nestedOf(mount.config.name), resolve(mount.config.path));
           if (refusal) asked.set(report.path, refusal.message);
         }
         if (next.branchId === undefined || next.branchId === store.currentBranch().id) {

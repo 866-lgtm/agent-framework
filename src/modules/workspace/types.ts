@@ -152,8 +152,9 @@ export interface MountConfig {
    * include doesn't cover, and a listing that isn't recursive names each
    * directory directly beneath its path that disk has, and each that a
    * covered entry in history implies, with only the files the include
-   * covers. A direct mount has no history (`backend`), so there disk alone
-   * decides each of these. `ignore` still applies to what `include` covers.
+   * covers. A mount running direct has no history (`backend`), so there
+   * disk alone decides each of these. `ignore` still applies to what
+   * `include` covers.
    *
    * On a disk that folds names, the parse reads a path in disk's spelling,
    * as the walk names what it lists, so a covered name whose file disk

@@ -7,7 +7,7 @@
 
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -107,7 +107,7 @@ function watched(m: WorkspaceModule): string[] {
 }
 
 /** Run `fn` with `node:fs/promises`'s `name`, as the module's imports see it, replaced by what `make` makes of it. */
-async function withFsPromise<T>(name: 'lstat' | 'open' | 'realpath', make: (original: (...args: any[]) => Promise<any>) => (...args: any[]) => Promise<any>, fn: () => Promise<T>): Promise<T> {
+async function withFsPromise<T>(name: 'lstat' | 'open' | 'realpath' | 'stat', make: (original: (...args: any[]) => Promise<any>) => (...args: any[]) => Promise<any>, fn: () => Promise<T>): Promise<T> {
   const fsp = createRequire(import.meta.url)('node:fs/promises') as Record<string, (...args: any[]) => Promise<any>>;
   const original = fsp[name]!;
   fsp[name] = make(original);
@@ -1083,12 +1083,14 @@ test("a file tool's parse reads a link on the way beneath the root it resolved, 
 test("a mount configured in a moved direct root's new directory, through a link to that directory, is nested as a start there nests it", async (t) => {
   const env = new Env(t);
   // `work` is configured at `b/work`, a link to `b` itself, so a start with
-  // `ref` at `b` nests `work` at `work`, by its configured path alone.
+  // `ref` at `b` nests `work` at `work`, by its configured path alone, and
+  // not at `b/work`, which `b` holds too, as no directory above `b` is `b`.
   const a = join(env.root, 'a');
   const b = join(env.root, 'b');
   mkdirSync(a, { recursive: true });
-  mkdirSync(b, { recursive: true });
+  mkdirSync(join(b, 'b', 'work'), { recursive: true });
   writeFileSync(join(b, 'file.txt'), 'b file\n');
+  writeFileSync(join(b, 'b', 'work', 'own.txt'), 'b own\n');
   symlinkSync('.', join(b, 'work'));
   const link = join(env.root, 'link');
   symlinkSync(a, link);
@@ -1101,6 +1103,7 @@ test("a mount configured in a moved direct root's new directory, through a link 
     read: await call(m, 'read', { path: 'ref/work/file.txt' }),
     disk: await m.readFileFromDisk('ref/work/file.txt').then(() => 'read', (err: unknown) => (err instanceof WorkspaceReadError ? err.code : String(err))),
     own: (await data<{ content: string }>(m, 'read', { path: 'ref/file.txt' })).content,
+    alike: (await data<{ content: string }>(m, 'read', { path: 'ref/b/work/own.txt' })).content,
     found: (await data<{ results: Array<{ file: string }> }>(m, 'grep', { pattern: 'b file', path: 'ref' })).results.map((r) => r.file),
   });
   const fromStart = await answers(started);
@@ -1138,6 +1141,198 @@ test("a mount configured at a link into a moved direct root's new directory is n
   assert.equal(fromStart.disk, 'other_mount');
   assert.deepEqual(fromStart.found, ['ref/own.txt']);
   assert.deepEqual(await answers(moved), fromStart);
+});
+
+test("a mount configured beneath a moved direct root, through a directory there that's the root itself, is nested beneath that directory too, as a start there nests it", async (t) => {
+  const env = new Env(t);
+  // `work` is configured at `link/sub/work`. At `b`, `sub` and `work` are
+  // links to `.`, so a start with `ref` at `b` nests `work` at `sub/work`
+  // and, beneath `sub`, which is `b` itself, at `work`.
+  const a = join(env.root, 'a');
+  const b = join(env.root, 'b');
+  mkdirSync(join(a, 'sub', 'work'), { recursive: true });
+  mkdirSync(b, { recursive: true });
+  writeFileSync(join(b, 'file.txt'), 'b file\n');
+  symlinkSync('.', join(b, 'sub'));
+  symlinkSync('.', join(b, 'work'));
+  const link = join(env.root, 'link');
+  symlinkSync(a, link);
+  const mounts: [Partial<MountConfig>, MountConfig[]] = [{ path: link, followSymlinks: true }, [{ name: 'work', path: join(link, 'sub', 'work'), mode: 'read-only', backend: 'direct' }]];
+  const moved = await env.open(...mounts);
+  rmSync(link);
+  symlinkSync(b, link);
+  const started = await new Env(t).open(...mounts);
+  const answers = async (m: WorkspaceModule) => ({
+    read: await call(m, 'read', { path: 'ref/work/file.txt' }),
+    disk: await m.readFileFromDisk('ref/work/file.txt').then(() => 'read', (err: unknown) => (err instanceof WorkspaceReadError ? err.code : String(err))),
+    ls: await call(m, 'ls', { path: 'ref/work' }),
+  });
+  const fromStart = await answers(started);
+  assert.match(fromStart.read.error ?? '', /lies in mount "work", nested in mount "ref"/);
+  assert.equal(fromStart.disk, 'other_mount');
+  assert.deepEqual(await answers(moved), fromStart);
+});
+
+test("a mount configured beneath a direct root moved to a directory above its configured path is nested beneath that directory too, as a start there nests it", async (t) => {
+  const env = new Env(t);
+  // `ref` is configured at `b/link`, which leads first to `a` and then to
+  // `.`, `b` itself; `work` is configured at `b/link/work`. A start with
+  // `ref` at `b` nests `work` at `work` and, beneath `b`, at `link/work`.
+  const a = join(env.root, 'a');
+  const b = join(env.root, 'b');
+  mkdirSync(join(a, 'work'), { recursive: true });
+  mkdirSync(join(b, 'work'), { recursive: true });
+  writeFileSync(join(b, 'work', 'f.txt'), 'work f\n');
+  const link = join(b, 'link');
+  symlinkSync(a, link);
+  const mounts: [Partial<MountConfig>, MountConfig[]] = [{ path: link, followSymlinks: true }, [{ name: 'work', path: join(link, 'work'), mode: 'read-only', backend: 'direct' }]];
+  const moved = await env.open(...mounts);
+  rmSync(link);
+  symlinkSync('.', link);
+  const started = await new Env(t).open(...mounts);
+  const answers = async (m: WorkspaceModule) => ({
+    read: await call(m, 'read', { path: 'ref/link/work/f.txt' }),
+    disk: await m.readFileFromDisk('ref/link/work/f.txt').then(() => 'read', (err: unknown) => (err instanceof WorkspaceReadError ? err.code : String(err))),
+  });
+  const fromStart = await answers(started);
+  assert.match(fromStart.read.error ?? '', /lies in mount "work", nested in mount "ref"/);
+  assert.equal(fromStart.disk, 'other_mount');
+  assert.deepEqual(await answers(moved), fromStart);
+});
+
+test("a mount configured at a moved direct root's own path is nested nowhere in it, as a start there nests it", async (t) => {
+  const env = new Env(t);
+  // `ref` and `twin` are both configured at `link`. It leads first to `a`,
+  // which lies in `b` as `sub`, and then to `b`, where a start nests
+  // neither mount in the other.
+  const b = join(env.root, 'b');
+  const a = join(b, 'sub');
+  mkdirSync(a, { recursive: true });
+  writeFileSync(join(a, 'f.txt'), 'sub f\n');
+  const link = join(env.root, 'link');
+  symlinkSync(a, link);
+  const mounts: [Partial<MountConfig>, MountConfig[]] = [{ path: link }, [{ name: 'twin', path: link, mode: 'read-only', backend: 'direct' }]];
+  const moved = await env.open(...mounts);
+  rmSync(link);
+  symlinkSync(b, link);
+  const started = await new Env(t).open(...mounts);
+  const answers = async (m: WorkspaceModule) => ({
+    read: await call(m, 'read', { path: 'ref/sub/f.txt' }),
+    disk: await m.readFileFromDisk('ref/sub/f.txt').then(() => 'read', (err: unknown) => (err instanceof WorkspaceReadError ? err.code : String(err))),
+  });
+  const fromStart = await answers(started);
+  assert.equal((fromStart.read.data as { content: string }).content, '     1\tsub f');
+  assert.equal(fromStart.disk, 'read');
+  assert.deepEqual(await answers(moved), fromStart);
+});
+
+test("a direct mount whose moved root can't be looked at for a reason other than absence nests what a start there would, not what the last start placed", async (t) => {
+  const env = new Env(t);
+  // `work` lies at `b/work`, outside `a`, so the start with `ref` at `a`
+  // nests nothing; at `b`, it's nested at `work`.
+  const a = join(env.root, 'a');
+  const b = join(env.root, 'b');
+  mkdirSync(a, { recursive: true });
+  mkdirSync(join(b, 'work'), { recursive: true });
+  writeFileSync(join(b, 'work', 'file.txt'), 'work file\n');
+  const link = join(env.root, 'link');
+  symlinkSync(a, link);
+  const m = await env.open({ path: link }, [{ name: 'work', path: join(b, 'work'), mode: 'read-only', backend: 'direct' }]);
+  rmSync(link);
+  symlinkSync(b, link);
+  // A look at the moved root fails, as on an I/O error, though everything
+  // else reads it: the nesting is still judged beneath it.
+  const realB = realpathSync(b);
+  const answer = await withFsPromise('stat', (original) => async (...args: any[]) => {
+    if (args[0] === realB) throw Object.assign(new Error(`EIO: i/o error, stat '${realB}'`), { code: 'EIO' });
+    return original(...args);
+  }, () => call(m, 'read', { path: 'ref/work/file.txt' }));
+  assert.match(answer.error ?? '', /lies in mount "work", nested in mount "ref"/);
+});
+
+test("a direct grep of a named file reads it beneath the root its read resolved, though the root is repointed before the open", async (t) => {
+  const env = new Env(t);
+  // `b` lies in `a` as `sub`, and at `b`, `file.txt` is a link into `work`'s
+  // directory there, at a file `work`'s include leaves out.
+  const a = join(env.root, 'a');
+  const b = join(a, 'sub');
+  mkdirSync(join(a, 'work'), { recursive: true });
+  mkdirSync(join(b, 'work'), { recursive: true });
+  writeFileSync(join(a, 'file.txt'), 'a needle\n');
+  writeFileSync(join(b, 'work', 'secret.env'), 'S=needle\n');
+  symlinkSync(join('work', 'secret.env'), join(b, 'file.txt'));
+  const link = join(env.root, 'link');
+  symlinkSync(a, link);
+  const m = await env.open({ path: link, followSymlinks: true }, [{ name: 'work', path: join(link, 'work'), mode: 'read-only', backend: 'direct', include: ['*.json'] }]);
+  // The parse resolves the root at `a`, and the read resolves it again; the
+  // link is repointed to `b` as that answers, before the file is opened.
+  let resolved = 0;
+  const found = await withFsPromise('realpath', (original) => async (...args: any[]) => {
+    const real = await original(...args);
+    if (args[0] === link && ++resolved === 2) {
+      rmSync(link);
+      symlinkSync(b, link);
+    }
+    return real;
+  }, () => data<{ results: Array<{ file: string; matches: Array<{ text: string }> }> }>(m, 'grep', { pattern: 'needle', path: 'ref/file.txt' }));
+  assert.equal(resolved, 2);
+  assert.deepEqual(found.results.map((r) => [r.file, r.matches.map((x) => x.text)]), [['ref/file.txt', ['a needle']]]);
+});
+
+test("a direct grep judges whether a path it's given names a file beneath the root its parse resolved, though the root moves after", async (t) => {
+  const env = new Env(t);
+  // At `a`, `notes` is a file; at `b`, a directory.
+  const a = join(env.root, 'a');
+  const b = join(env.root, 'b');
+  mkdirSync(a, { recursive: true });
+  mkdirSync(join(b, 'notes'), { recursive: true });
+  writeFileSync(join(a, 'notes'), 'a needle\n');
+  writeFileSync(join(b, 'notes', 'inner.md'), 'b needle\n');
+  const link = join(env.root, 'link');
+  symlinkSync(a, link);
+  const m = await env.open({ path: link });
+  // The parse resolves the root at `a`, and the link is repointed to `b` as
+  // that answers: the path is judged a file beneath `a`, and the read,
+  // which resolves the root again, finds a directory there.
+  let repointed = false;
+  const found = await withFsPromise('realpath', (original) => async (...args: any[]) => {
+    const real = await original(...args);
+    if (!repointed && args[0] === link) {
+      repointed = true;
+      rmSync(link);
+      symlinkSync(b, link);
+    }
+    return real;
+  }, () => data<{ results: unknown[]; skipped: Array<{ file: string; reason: string }> }>(m, 'grep', { pattern: 'needle', path: 'ref/notes' }));
+  assert.ok(repointed);
+  assert.deepEqual([found.results, found.skipped], [[], [{ file: 'ref/notes', reason: 'a directory' }]]);
+});
+
+test("a direct listing judges whether a path its include leaves out is a directory beneath the root its parse resolved, though the root moves after", async (t) => {
+  const env = new Env(t);
+  // The include covers `*.md` alone. At `a`, `dir` is a directory, which a
+  // listing may name; at `b`, a file it leaves out.
+  const a = join(env.root, 'a');
+  const b = join(env.root, 'b');
+  mkdirSync(join(a, 'dir'), { recursive: true });
+  mkdirSync(b, { recursive: true });
+  writeFileSync(join(b, 'dir'), 'b dir\n');
+  const link = join(env.root, 'link');
+  symlinkSync(a, link);
+  const m = await env.open({ path: link, include: ['*.md'] });
+  assert.match(await failure(await new Env(t).open({ path: b, include: ['*.md'] }), 'ls', { path: 'ref/dir' }), /is outside the mount's include/);
+  let repointed = false;
+  const listed = await withFsPromise('realpath', (original) => async (...args: any[]) => {
+    const real = await original(...args);
+    if (!repointed && args[0] === link) {
+      repointed = true;
+      rmSync(link);
+      symlinkSync(b, link);
+    }
+    return real;
+  }, () => call(m, 'ls', { path: 'ref/dir' }));
+  assert.ok(repointed);
+  assert.doesNotMatch(listed.error ?? '', /is outside the mount's include/);
 });
 
 test("a direct mount whose root moves between a read's parse and its open names the mount a link on the way leads into, by the root it opens under", async (t) => {
