@@ -525,7 +525,7 @@ import { toolArgsProblems } from './tool-args.js';
 import { EventGate, formatShadowWarning } from './gate/event-gate.js';
 import { UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
-import { McplProtocolVersionError, McplUnreapedLaunchError, stderrTailOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
+import { McplProtocolVersionError, McplRequestError, McplUnreapedLaunchError, stderrTailOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
 import { ModernMcpConnection } from './mcpl/modern-connection.js';
 import { WITHHELD_TEXT, asText, credentialRedactor, redactUrl, redactServerText, resolveServerBinding, serverConfigProblems, serverCredentialPatterns, serverTextRedactor, type CredentialPattern } from './mcpl/protocol-family.js';
 import { MALFORMED_CONTENT_NOTICE, normalizeStandardToolResult } from './mcpl/tool-result-normalize.js';
@@ -549,16 +549,35 @@ import { firstFreeBranchName } from './branch-names.js';
 import {
   DEFAULT_DISCORD_AWARENESS_EMOJI,
   DiscordAwarenessOutbox,
+  DiscordAwarenessRefusal,
   defaultDiscordAwarenessOutboxPath,
   extractDiscordAwarenessRefs,
+  selectDiscordAwarenessRefs,
+  checkedDiscordAwarenessMarks,
+  boundDiscordAwarenessText,
+  discordChannelOf,
+  isPermanentDiscordReactionFailure,
+  unsyncedWriteText,
   type DiscordAwarenessBatch,
+  type DiscordAwarenessView,
+  type DiscordAwarenessCancelReceipt,
+  type DiscordAwarenessImportedUnsent,
+  type DiscordAwarenessMarks,
+  type DiscordAwarenessPrepareInput,
+  type DiscordAwarenessRequest,
+  type DiscordAwarenessRetractReceipt,
+  type DiscordAwarenessRetirement,
+  type DiscordAwarenessScope,
+  type DiscordAwarenessSettlement,
 } from './recovery/discord-awareness-outbox.js';
 import {
   OperatorActionError,
   OperatorLog,
   capIds,
   defaultOperatorLogPath,
+  type SurgeryMarkerFacts,
   type SurgeryMarkerReceipt,
+  type SurgeryMarksPreview,
   type OperatorLogEntry,
   type OperatorLogInput,
   type OperatorRequester,
@@ -986,25 +1005,12 @@ type DiscordAwarenessDrainOutcome =
   | { status: 'delivered'; delivered: number; failed: number }
   | { status: 'unavailable'; accounted: number };
 
-interface DiscordAwarenessBarrier {
-  generation: number;
-  requiresBarrier: boolean;
-  promise: Promise<DiscordAwarenessDrainOutcome>;
-}
-
-/** Several drains' outcomes as one: unavailable only if every one was. */
-function combineDrainOutcomes(outcomes: DiscordAwarenessDrainOutcome[]): DiscordAwarenessDrainOutcome {
-  if (outcomes.every((outcome) => outcome.status === 'unavailable')) {
-    return {
-      status: 'unavailable',
-      accounted: outcomes.reduce((count, outcome) => count + (outcome.status === 'unavailable' ? outcome.accounted : 0), 0),
-    };
-  }
-  return {
-    status: 'delivered',
-    delivered: outcomes.reduce((count, outcome) => count + (outcome.status === 'delivered' ? outcome.delivered : 0), 0),
-    failed: outcomes.reduce((count, outcome) => count + (outcome.status === 'delivered' ? outcome.failed : 0), 0),
-  };
+/** One drain pass's place in the registry (see runDiscordAwarenessDrain). */
+interface DiscordAwarenessDrainPass {
+  /** Set as the pass stops claiming. */
+  ended: boolean;
+  /** Its promise, once registered. */
+  drain?: Promise<DiscordAwarenessDrainOutcome>;
 }
 
 function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
@@ -1375,10 +1381,20 @@ class DefaultInferencePolicy implements InferencePolicy {
   }
 }
 
+/** The batch scope a publication choice records (`none` for local surgery). */
+function marksScope(marks: DiscordAwarenessMarks | undefined): 'none' | DiscordAwarenessScope {
+  return !marks || marks === 'none' ? 'none' : marks.scope;
+}
+
+/** A publication choice, summarized for the operator log (refs counted, not listed). */
+function describeMarksChoice(marks: DiscordAwarenessMarks | undefined): Record<string, unknown> | 'none' {
+  if (!marks || marks === 'none') return 'none';
+  return { scope: marks.scope, ...(marks.refs ? { authorizedRefs: marks.refs.length } : {}) };
+}
+
 function describeMarkers(m: SurgeryMarkerReceipt): string {
-  if (m.status === 'queued') return `queued:${m.queued}`;
-  if (m.status === 'not-scheduled') return 'not-scheduled(batch retired)';
-  if (m.status === 'unresolved') return `unresolved(batch ${m.batchId} may still be delivered)`;
+  if (m.status === 'queued') return `queued:${m.queued}(${m.scope}; unmarked ${m.unmarked})`;
+  if (m.status === 'not-scheduled') return 'not-scheduled(none will be sent)';
   return 'none';
 }
 
@@ -1412,10 +1428,6 @@ function hostCommandRequester(serverId: string, params: HostCommandParams): Oper
   };
 }
 
-function isPermanentDiscordReactionFailure(message: string): boolean {
-  return /unknown message|unknown channel|missing access|missing permissions|missing permission|cannot access|channel .* not found|message .* not found/i
-    .test(message);
-}
 
 /**
  * Default error policy - retry with exponential backoff.
@@ -1463,8 +1475,8 @@ const MAINTENANCE_TICKS_PER_PASS = 8;
  *  one that hangs. A framework create() never started has no streams, event
  *  loop, maintenance or guard annotations to wait on, so the waits that can
  *  take it are on operator operations, then on modules and MCPL servers
- *  together, and then on awareness drains that a failed startup barrier left
- *  running. */
+ *  together, and then on awareness drains still running, such as its
+ *  startup's delivery. */
 const FAILED_CREATE_TEARDOWN_TIMEOUT_MS = 30_000;
 
 /** Local per-residence provider admission (AF #114 bounded first slice). */
@@ -1604,6 +1616,16 @@ interface HostCommandParams {
    *  (regardless of participant) are no longer on the active branch.
    *  Mutually exclusive with `turns`. */
   messages?: number;
+  /** Message-granular undo: awareness marks on the removed Discord
+   *  messages, `none` (the default), `addressed` or `all`. Any other value
+   *  is refused, and so is a choice other than `none` for `hide` or an undo
+   *  by turns, which place no marks. */
+  marks?: string;
+  /** For the `marks` command: `list`, `cancel` or `retract`. */
+  action?: string;
+  /** For the `marks` command: a batch id; for cancel also a retract request
+   *  id; for retract also `all`. */
+  target?: string;
   /** For the `hide` command: Discord message id of the (first) message to
    *  remove. With `toMessageId`, removes the inclusive range between them. */
   fromMessageId?: string;
@@ -2542,7 +2564,7 @@ export class AgentFramework {
   /** Modern-MCP (2026-07-28) servers, by id; read through modernServers().
    *  They are kept apart from the MCPL registry on purpose: they have no
    *  grant, planes or server→host traffic, so the MCPL machinery (quiesce's
-   *  plane pauses, awareness gates, policy) never sees them. They take part
+   *  plane pauses, policy) never sees them. They take part
    *  only through the tool paths, and their list changes reach agents
    *  through ordinary admission. */
   private modernMcpConnections: Map<string, ModernMcpConnection> | undefined;
@@ -2567,8 +2589,9 @@ export class AgentFramework {
    *  subsystem can be lazily initialized by connectMcplServer when the
    *  framework started with zero configured servers. */
   private mcplInferenceRoutingConfig: import('./mcpl/types.js').InferenceRoutingPolicy | null = null;
-  /** Durable, non-Chronicle projection queue for messages removed by a branch. */
-  private discordAwarenessOutbox: DiscordAwarenessOutbox | null = null;
+  /** The awareness ledger; null for a framework with neither storePath nor
+   *  discordAwarenessOutboxPath, which refuses a marks choice. */
+  private readonly discordAwarenessOutbox: DiscordAwarenessOutbox | null;
   private discordAwarenessEmoji = DEFAULT_DISCORD_AWARENESS_EMOJI;
   private discordAwarenessDeadlineMs = DEFAULT_DISCORD_AWARENESS_DEADLINE_MS;
   /** Durable JSONL record of operator-initiated mutations (see operator-log.ts). */
@@ -2583,9 +2606,10 @@ export class AgentFramework {
   private surgeryHold: { verb: string; agentName: string; since: number } | null = null;
   /** Serialize per-server drains so reconnect and an online undo cannot race. */
   private discordAwarenessDrains: Map<string, Promise<DiscordAwarenessDrainOutcome>> = new Map();
-  /** Framework-global inference gate; older generations cannot release it. */
-  private discordAwarenessBarrier: DiscordAwarenessBarrier | null = null;
-  private discordAwarenessBarrierGeneration = 0;
+  /** The servers whose running pass a later trigger joined
+   *  (drainDiscordAwarenessOutbox): before it leaves, that pass tries once
+   *  more what it had already tried. */
+  private discordAwarenessDrainsJoined = new Set<string>();
 
   // EventGate (null when FrameworkConfig.gate is omitted)
   private eventGate: EventGate | null = null;
@@ -2669,9 +2693,9 @@ export class AgentFramework {
    * try again in the same process: the framework it had begun is stopped, as
    * stop() stops one, but giving up after 30 s on each of stop()'s cleanup
    * waits, for an operator's operations already running, then for its
-   * modules and MCPL servers, and then for awareness drains a failed startup
-   * barrier left running, and a store it opened is closed. A store the
-   * caller passed in is left open.
+   * modules and MCPL servers, and then for awareness drains still running,
+   * such as its startup's delivery, and a store it opened is closed. A store
+   * the caller passed in is left open.
    */
   static async create(config: FrameworkConfig): Promise<AgentFramework> {
     // Before anything opens or starts: a refused config must leave nothing behind.
@@ -2809,10 +2833,35 @@ export class AgentFramework {
       });
     }
 
+    // The awareness ledger is a file under the store, or at
+    // discordAwarenessOutboxPath. A framework with neither has none, and
+    // refuses a marks choice.
     const discordAwarenessOutboxPath = config.discordAwarenessOutboxPath
       ?? (config.storePath ? defaultDiscordAwarenessOutboxPath(config.storePath) : undefined);
     const discordAwarenessOutbox = discordAwarenessOutboxPath
-      ? new DiscordAwarenessOutbox(discordAwarenessOutboxPath)
+      ? new DiscordAwarenessOutbox(discordAwarenessOutboxPath, {
+        store,
+        // The start's reconciliation is the ledger's first act, so the
+        // framework is built when a version 2 ledger's rewrite announces
+        // what it drops. One earlier would be refused here, before the
+        // rewrite is written, rather than write it unannounced.
+        announceImport: (unsent) => {
+          if (!building.framework) throw new Error('The awareness ledger was rewritten before the framework was built');
+          building.framework.announceDiscordAwarenessImport(unsent);
+        },
+        // A directory sync that fails after a write's rename, as
+        // syncRecoveryDirectory reports one for the recovery files.
+        onUnsyncedWrite: (directory, error) => {
+          const message = unsyncedWriteText(directory, discordAwarenessOutboxPath, error);
+          if (!building.framework) {
+            console.error(`[discord-awareness] ${message}`);
+            return;
+          }
+          building.framework.opsAlert('recovery-sync', 'framework', message, {
+            data: { record: discordAwarenessOutboxPath, directory, code: (error as NodeJS.ErrnoException)?.code },
+          });
+        },
+      })
       : null;
 
     const operatorLogPath = config.operatorLogPath === false
@@ -2844,27 +2893,8 @@ export class AgentFramework {
     );
     framework.providerHoldHook = config.providerHold;
 
-    // If an offline recovery process crashed after switching Chronicle but
-    // before committing its prepared marker batch, the active branch is the
-    // commit record. Promote it now; no quarantined content is read.
-    if (discordAwarenessOutbox) {
-      try {
-        const activated = discordAwarenessOutbox.activatePreparedForBranch(
-          store.currentBranch().name,
-          store.listBranches(),
-        );
-        if (activated > 0) {
-          console.error(
-            `[discord-awareness] recovered ${activated} prepared batch(es) for active branch ${store.currentBranch().name}`,
-          );
-        }
-      } catch (error) {
-        // The branch may be safe, but reporting the framework ready while its
-        // durable awareness projection is unreadable creates a half-ready
-        // host whose data plane can never be released safely.
-        throw new DiscordAwarenessAccountingError('startup reconciliation', error);
-      }
-    }
+    // Before any delivery.
+    await framework.reconcileDiscordAwarenessAtStartup();
 
     // Restore persisted usage data (if any) from prior session
     framework.restoreUsageState();
@@ -3024,12 +3054,12 @@ export class AgentFramework {
     }
 
     // Restore persisted quiesce mode (issue #122) BEFORE initializeMcpl: the
-    // flag must be set before any data-plane barrier completion can run, or
-    // the startup funnel would open the data planes on a host that shut down
-    // mid-maintenance. Staged connections boot with both planes closed, so a
-    // quiesced boot needs no re-pause — completeMcplDataPlaneGate consults
-    // the flag and holds data planes (control planes come up normally). The
-    // gate already exists at this point, so the suppression is wired here too.
+    // flag must be set before startup opens any plane, or it would open the
+    // data planes on a host that shut down mid-maintenance. Staged
+    // connections boot with both planes closed, so a quiesced boot needs no
+    // re-pause — readyMcplPlanes consults the flag and holds data planes
+    // (control planes come up normally). The gate already exists at this
+    // point, so the suppression is wired here too.
     //
     // Both records live OUTSIDE branch history (recovery/ files next to the
     // store): a historical rollback must not be able to erase the marker of
@@ -3659,17 +3689,17 @@ export class AgentFramework {
       if (result.status === 'rejected') shutdownErrors.push(result.reason);
     }
 
-    // A Discord awareness drain sends nothing once stop() has begun
-    // (drainDiscordAwarenessOutbox), and closing its server above ended any
-    // call it had in flight. Wait for each still running to record that call,
-    // so that none writes the ledger after stop() has returned, or after a
-    // failed create() has rejected, when its caller may already have started
-    // another. One whose wait runs out is reported, and stays in
-    // discordAwarenessDrains until it settles, so a later stop() waits for it
-    // again. A drain that rejects, such as on a ledger write that failed,
-    // settles its wait as a stream's rejection does: the barrier that started
-    // it reports the failure (failMcplDataPlaneGate, or create()'s rejection
-    // at startup).
+    // A Discord awareness drain claims nothing once stop() has begun
+    // (runDiscordAwarenessDrain), and closing its server above rejected the
+    // request it had on the wire before awaiting the transport. Wait for each
+    // still running to record that outcome, so that none writes the ledger
+    // after stop() has returned, or after a failed create() has rejected,
+    // when its caller may already have started another. One whose wait runs
+    // out is reported, and stays in discordAwarenessDrains until it settles,
+    // so a later stop() waits for it again. A drain that rejects, such as on
+    // a ledger write that failed, settles its wait as a stream's rejection
+    // does: its failure is reported where it was started (a background
+    // delivery's log and alert, a sync's caller).
     const drains = [...this.discordAwarenessDrains].map(([serverId, drain]) => ({
       label: `awareness drain:${serverId}`,
       promise: drain.then(() => {}, () => {}),
@@ -6177,27 +6207,10 @@ export class AgentFramework {
       this.hostModeRecordMayBeQuiesced = false;
     } finally {
       this.resumeInFlight = false;
-      // Reopen MCPL data planes through the existing barrier funnel — NOT a
-      // bespoke ready() loop. The funnel inherits completeMcplDataPlaneGate's
-      // nested-install guard (a flushed tools-list-changed can install a
-      // newer barrier mid-flush), drains any awareness work accumulated
-      // during the window before opening, and replaces a stale failed
-      // barrier by identity. In `finally` so that nothing above can leave
-      // the host un-quiesced with every data plane still paused.
-      if (this.mcplServerRegistry) {
-        const barrier = this.installMcplDataPlaneGate();
-        this.releaseMcplDataPlaneGate(barrier);
-        try {
-          await barrier.promise;
-          this.completeMcplDataPlaneGate(barrier);
-        } catch (error) {
-          // The host has resumed, so report the failed barrier without undoing
-          // that. While serving, failMcplDataPlaneGate recycles the
-          // connections and their reconnect flows reopen the data planes;
-          // while the host stops, it releases the barrier instead.
-          await this.failMcplDataPlaneGate(barrier, 'quiesce resume', error);
-        }
-      }
+      // Reopen MCPL data planes (quiesced is already false). In `finally`
+      // so that nothing above can leave the host un-quiesced with every data
+      // plane still paused.
+      this.readyMcplPlanes();
 
       this.emitTrace({
         type: 'host:resume',
@@ -8827,9 +8840,17 @@ export class AgentFramework {
     /** For message-granular undo: whether awareness marks were scheduled
      *  (not whether Discord has accepted them). */
     markers?: SurgeryMarkerReceipt;
+    /** For the `marks` command: the ledger's batches and retracts (`list`)
+     *  or the action's receipt. */
+    awareness?:
+      | DiscordAwarenessView[]
+      | DiscordAwarenessCancelReceipt
+      | DiscordAwarenessRetractReceipt;
     hidden?: number;
     /** For `hide`: the Discord (channelId, messageId) of each removed message
-     *  that carried one — so the surface can mark them with a reaction. */
+     *  that carried one. A hide places no framework marks and refuses a
+     *  marks choice: a surface that marks hidden messages, as discord-mcpl
+     *  0.3.0's `/hide` does, places those marks itself, outside the ledger. */
     hiddenRefs?: Array<{ channelId: string; messageId: string }>;
     lastVisible?: { participant?: string; role?: string; preview?: string } | null;
     /** For `unstick`: acknowledges the forced-rewind loop has started; the
@@ -8854,13 +8875,57 @@ export class AgentFramework {
       params.command !== 'resume' &&
       params.command !== 'maintain' &&
       params.command !== 'host-status' &&
+      params.command !== 'marks' &&
       params.command !== 'release-provider-wait'
     ) {
       return { ok: false, error: `Unknown host command: ${String(params.command)}` };
     }
+    if ((params.command === 'undo' || params.command === 'hide') && params.marks !== undefined && params.marks !== 'none') {
+      // A publication choice is never guessed: a mistyped scope is refused
+      // rather than silently treated as none (or as anything else), and so
+      // is a choice the command can't carry out. Only an undo by messages,
+      // which rolls back, marks what it removes: hide's marks are
+      // discord-mcpl's own, and an undo by turns places none. The verbs that
+      // remove nothing take no choice and ignore the field.
+      if (params.command === 'hide' || !(typeof params.messages === 'number' && params.messages > 0)) {
+        return {
+          ok: false,
+          error: `marks apply only to an undo by messages; ${params.command === 'hide' ? 'hide' : 'an undo by turns'} places none (got ${JSON.stringify(params.marks)})`,
+        };
+      }
+      if (params.marks !== 'addressed' && params.marks !== 'all') {
+        return { ok: false, error: `marks must be none, addressed or all (got ${JSON.stringify(params.marks)})` };
+      }
+    }
 
     // Host-scoped verbs (issue #122) — no agent resolution.
     const requester = params.requesterName ?? params.requesterId ?? `mcpl:${serverId}`;
+    if (params.command === 'marks') {
+      // The awareness ledger's operator controls, for surfaces that act
+      // through host/command (the web UI calls the framework methods).
+      const by = { requester: hostCommandRequester(serverId, params) };
+      const target = params.target;
+      try {
+        switch (params.action) {
+          case 'list':
+            return { ok: true, awareness: this.listDiscordAwareness() };
+          case 'cancel':
+            if (!target) return { ok: false, error: 'marks cancel needs target (a batch or retract request id)' };
+            return { ok: true, awareness: await this.cancelDiscordAwareness(target, by) };
+          case 'retract':
+            if (!target) return { ok: false, error: 'marks retract needs target (a batch id, or all)' };
+            return { ok: true, awareness: await this.retractDiscordAwareness(target, by) };
+          default:
+            return { ok: false, error: 'marks needs action list, cancel or retract' };
+        }
+      } catch (error) {
+        return {
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+          ...(error instanceof OperatorActionError ? { code: error.code } : {}),
+        };
+      }
+    }
     if (params.command === 'quiesce') {
       // quiesce() clamps timeoutMs to [1s, 10m] itself — one clamp for every ingress.
       console.error(`[host-command] quiesce by=${requester} (server=${serverId})`);
@@ -9169,6 +9234,11 @@ export class AgentFramework {
           messageId: String(target.id),
           branchName: this.newOperatorBranchName(`undo-msgs/${agentName}/${Date.now()}`),
           requester: hostCommandRequester(serverId, params),
+          // An immediate act: the choice and its application are the same
+          // moment, so the scope is evaluated now (no frozen refs needed).
+          marks: params.marks === 'addressed' || params.marks === 'all'
+            ? { scope: params.marks }
+            : 'none',
         });
         return {
           ok: true,
@@ -9210,10 +9280,6 @@ export class AgentFramework {
     if (undone === 0) {
       return { ok: true, undone: 0, requested, lastVisible: null };
     }
-
-    // The branch has moved: delivery of the marks it changes starts behind
-    // the data-plane gate, and the command doesn't wait for Discord.
-    this.startDiscordAwarenessDelivery('turn undo', agentName);
 
     return { ok: true, undone, requested, lastVisible: await this.lastVisiblePreview(agentName) };
   }
@@ -9521,14 +9587,14 @@ export class AgentFramework {
   // ==========================================================================
 
   /**
-   * Switch the store to an existing branch, start the delivery of the
-   * Discord awareness marks the move changes (startDiscordAwarenessDelivery),
-   * and re-materialize the config mount from it. Resolves once the mount has
-   * run; if it fails, it rejects with the store already moved. The marks'
-   * delivery isn't awaited, and its failure doesn't fail the switch. The
-   * store has moved by the time the call returns, before its promise
-   * settles, and a refusal moves nothing. An operator's operation: refused
-   * once stop() has begun, and waited for by stop() while it runs.
+   * Switch the store to an existing branch and re-materialize the config
+   * mount from it. A switch adds or removes no Discord awareness marks: they
+   * are one-shot, a surgery's or an operator's explicit choice. Resolves once
+   * the mount has run; if it fails, it rejects with the store already moved.
+   * It moves the store once any maintenance already running has finished, so
+   * the move can come after the call returns, and a refusal moves nothing.
+   * An operator's operation: refused once stop() has begun, and waited for
+   * by stop() while it runs.
    *
    * The branch moves under every agent sharing the store, so the switch
    * reserves the store as a surgery does: every agent must be idle, or it is
@@ -9542,11 +9608,6 @@ export class AgentFramework {
       // A maintenance tick already running finishes before the switch.
       if (this.maintenanceRunning()) await this.settleMaintenancePass();
       this.store.switchBranch(name);
-      // Reversible Discord awareness markers are part of the branch
-      // projection. Their delivery starts behind the data-plane gate, which
-      // goes up before the store is released, and the switch doesn't wait
-      // for Discord.
-      this.startDiscordAwarenessDelivery('branch switch');
       const ws = this.moduleRegistry.getModule('workspace');
       if (ws && 'materializeMount' in ws) {
         await (ws as { materializeMount: (m: string) => Promise<void> }).materializeMount('_config');
@@ -9842,6 +9903,84 @@ export class AgentFramework {
   }
 
   /**
+   * A surgery's marker batch, recorded before its body change. If it can't
+   * be recorded, the surgery doesn't start, and the error says what the
+   * ledger may hold (DiscordAwarenessOutbox.prepare). Without a ledger there
+   * is none: a marks choice was refused before this (refuseMarksWithoutLedger),
+   * and a suppression runs with no record to resume it from.
+   */
+  private async prepareMarkerBatch(what: string, input: DiscordAwarenessPrepareInput): Promise<DiscordAwarenessBatch | null> {
+    if (!this.discordAwarenessOutbox) return null;
+    try {
+      return await this.discordAwarenessOutbox.prepare(input);
+    } catch (error) {
+      throw new OperatorActionError(
+        'failed',
+        `${what} not started, nothing changed: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      );
+    }
+  }
+
+  /**
+   * A marks choice needs a ledger to keep it: a framework that has none
+   * refuses one before anything is planned or changed.
+   */
+  private refuseMarksWithoutLedger(marks: DiscordAwarenessMarks): void {
+    if (marks === 'none' || this.discordAwarenessOutbox) return;
+    throw new OperatorActionError(
+      'invalid',
+      'marks need the awareness ledger, and this framework has none: it was created with neither storePath nor ' +
+        'discordAwarenessOutboxPath',
+    );
+  }
+
+  /**
+   * After a failed surgery has put the source back: retire its prepared
+   * awareness batch, but only when the store is confirmed on the source. If
+   * it isn't, the batch stays prepared as the evidence of an unfinished body
+   * (a start on its target finishes a suppression's removals). Either way
+   * none of its marks is ever sent: a start retires what this can't.
+   * Never throws: the caller is already reporting the surgery's failure;
+   * returns a clause to append to it.
+   */
+  private async retireAfterRestore(
+    batch: DiscordAwarenessBatch | null,
+    sourceBranch: string,
+    agentName: string,
+  ): Promise<string> {
+    if (!batch || !this.discordAwarenessOutbox) return '';
+    const suppression = !!batch.suppressionIntervals?.length;
+    if (this.store.currentBranch().name !== sourceBranch) {
+      return `; awareness batch ${batch.id} kept, since the source branch could not be confirmed: ` + (suppression
+        ? `a start on ${batch.targetBranch} finishes its removals and retires it`
+        : 'the next start retires it') + ', none of its marks sent';
+    }
+    try {
+      await this.discordAwarenessOutbox.discard(batch.id);
+      return `; awareness batch ${batch.id} retired, none of its marks sent`;
+    } catch (error) {
+      const detail = boundDiscordAwarenessText(error instanceof Error ? error.message : String(error));
+      // A write that fails leaves the batch as it was: prepared.
+      const kept = `awareness batch ${batch.id} could not be retired (${detail}); it stays prepared, none of its ` +
+        'marks to be sent';
+      if (!suppression) return `; ${kept}, until the next start retires it`;
+      // A suppression's removals stay pending for its target branch: a start
+      // on a branch with that name finishes them there.
+      let forked = true;
+      try {
+        forked = this.store.listBranches().some((branch) => branch.name === batch.targetBranch);
+      } catch { /* unknown: say what a start on an existing branch would do */ }
+      const what = `${kept}. Its removals stay pending for ${batch.targetBranch}: a start on a branch with that ` +
+        'name would finish them there and retire the batch' + (forked
+        ? `, and ${batch.targetBranch} is kept, so delete it unless you want that`
+        : '');
+      this.opsAlert('discord-awareness-unresolved', agentName, `A failed suppression's ${what}`, { data: { batchId: batch.id }, key: batch.id });
+      return `; ${what}`;
+    }
+  }
+
+  /**
    * After a failed switch or redaction: put the store back on `sourceBranch`
    * if it moved, and return a sentence saying what actually happened. Never
    * throws — the caller reports the original failure with this appended.
@@ -9869,14 +10008,17 @@ export class AgentFramework {
    * Roll the active branch back so `messageId` becomes its tail: fork the
    * chronicle at that message (origin-sequence time-travel branch) and switch
    * to the fork. Everything after the message stays on the source branch.
-   * Discord messages that left the live context get awareness markers via the
-   * durable outbox, exactly as message-granular `undo` does.
+   *
+   * The rollback is local to the resident. Marking removed Discord messages
+   * with an awareness reaction is a separate, explicit publication choice
+   * (`marks`, default `none`); `previewSurgeryMarks` shows what each scope
+   * would cover, and passing its `refs` binds the choice to exactly that set.
    *
    * Returns once the switch has landed: the body is applied, with a
    * marker-scheduling receipt (`markers`). It does not wait for Discord to
-   * accept the reactions: delivery is started, behind the MCPL data-plane
-   * gate, and continues without the caller or the store reservation waiting
-   * on it; its per-message outcomes stay in the outbox ledger.
+   * accept the reactions: delivery is started and continues without the
+   * caller, the store reservation or MCPL traffic waiting on it; what
+   * Discord answers is kept in the awareness ledger.
    *
    * Throws `OperatorActionError` (`agent-busy`, `unknown-message`, …) — the
    * agent must be idle; nothing is queued.
@@ -9889,6 +10031,8 @@ export class AgentFramework {
       note?: string;
       /** Branch name for the fork (default `rollback/<agent>/<ts>`, or with `-2`, `-3`, … appended when the store already holds that name). */
       branchName?: string;
+      /** Publication choice for awareness marks; default `none`. */
+      marks?: DiscordAwarenessMarks;
     },
   ): Promise<{
     agentName: string;
@@ -9910,33 +10054,22 @@ export class AgentFramework {
       agent: agentName,
       ...(opts.requester ? { requester: opts.requester } : {}),
       ...(opts.note ? { note: opts.note } : {}),
-      params: { messageId: opts.messageId },
+      params: { messageId: opts.messageId, marks: describeMarksChoice(opts.marks) },
     };
     try {
-      const agent = this.agents.get(agentName);
-      if (!agent) throw new OperatorActionError('unknown-agent', `Unknown agent: ${agentName}`);
-      const cm = agent.getContextManager();
-      const total = cm.getMessageCount();
-      const requestedIndex = locateMessageIndex(cm, opts.messageId);
-      if (requestedIndex < 0) {
-        throw new OperatorActionError('unknown-message', `Message ${opts.messageId} is not on the active branch`);
-      }
-      // Never bisect a body group: chronicle refuses that for removals
-      // (byte-faithful reassembly needs the whole run) and branchAt has no
-      // such guard of its own. Snap to the run's last shard.
-      const run = bodyGroupRun(cm, requestedIndex);
-      const targetIndex = run.to;
-      const tailMessageId = run.toId;
-      const messagesRemoved = total - targetIndex - 1;
-      if (messagesRemoved <= 0) {
-        throw new OperatorActionError('invalid', `Message ${opts.messageId} is already the tail of the active branch`);
-      }
-      const discarded = cm.getMessageWindow(targetIndex + 1, messagesRemoved, { resolveBlobs: false }).messages;
+      const marks = checkedDiscordAwarenessMarks(opts.marks);
+      this.refuseMarksWithoutLedger(marks);
+      const { cm, tailMessageId, messagesRemoved, discarded } = this.planRollback(agentName, opts.messageId);
       const removedRefs = extractDiscordAwarenessRefs(discarded);
+      const selection = selectDiscordAwarenessRefs(discarded, marks);
       const sourceBranch = this.store.currentBranch().name;
       const targetBranch = opts.branchName ?? this.newOperatorBranchName(`rollback/${agentName}/${Date.now()}`);
       if (targetBranch === sourceBranch) {
         throw new OperatorActionError('invalid', 'Rollback branch name must differ from the active branch');
+      }
+      // A known collision is refused before anything is prepared.
+      if (this.store.listBranches().some((branch) => branch.name === targetBranch)) {
+        throw new OperatorActionError('invalid', `Rollback branch ${targetBranch} already exists`);
       }
 
       // Gate + reserve the whole store (see reserveStoreForSurgery); held
@@ -9949,18 +10082,21 @@ export class AgentFramework {
       try {
         // A maintenance tick already running finishes before the switch.
         if (this.maintenanceRunning()) await this.settleMaintenancePass();
-        // Prepare the external side effect before switching Chronicle. If the
-        // process dies after the switch but before activate(), startup
-        // promotes this batch by matching targetBranch to the active branch.
-        // If the fork/switch itself throws, the batch is retired so it cannot
-        // arm a later branch that happens to reuse the name.
-        const markerBatch = this.discordAwarenessOutbox?.prepare({
+        // Record the marks choice before switching Chronicle. If the process
+        // dies after the switch but before activate(), the next start retires
+        // the batch, none of its marks sent, and its alert names the redo: a
+        // start never activates a surgery's marks. If the fork or switch
+        // itself throws, the batch is retired here.
+        const markerBatch = await this.prepareMarkerBatch('Rollback', {
           agentName,
           sourceBranch,
           targetBranch,
-          refs: removedRefs,
+          refs: selection.refs,
+          scope: marksScope(marks),
+          unmarked: selection.unmarked,
+          notRemoved: selection.notRemoved,
           emoji: this.discordAwarenessEmoji,
-        }) ?? null;
+        });
 
         try {
           branchName = cm.branchAt(tailMessageId as MessageId, targetBranch);
@@ -9970,22 +10106,25 @@ export class AgentFramework {
           // initialization, so a rejection here can leave the store on the
           // new branch with an uninitialized strategy. Retire the batch and
           // go back to the source; keep the branch for diagnosis.
-          if (markerBatch) this.discordAwarenessOutbox!.discard(markerBatch.id);
           const restored = await this.restoreSourceBranch(cm, sourceBranch, targetBranch, agentName);
+          const retired = await this.retireAfterRestore(markerBatch, sourceBranch, agentName);
           throw new OperatorActionError(
             'failed',
-            `Rollback failed; ${restored}: ${error instanceof Error ? error.message : String(error)}`,
+            `Rollback failed; ${restored}${retired}: ${error instanceof Error ? error.message : String(error)}`,
             { cause: error },
           );
         }
         // The body change has landed. Nothing after this point turns the
         // rollback into a failure: marks are an outbox outcome, reported
         // apart from the body (`markers`).
-        markers = this.activateSurgeryMarkers(markerBatch, 'rollback', agentName);
-        // Installs the MCPL data-plane gate synchronously, before the store is
-        // released, and starts delivery without awaiting it (the first
-        // reaction request may already be on the wire when this returns).
-        this.startDiscordAwarenessDelivery('rollback', agentName);
+        markers = await this.activateSurgeryMarkers(markerBatch, 'rollback', agentName, {
+          scope: marksScope(marks) as SurgeryMarkerReceipt['scope'],
+          unmarked: selection.unmarked,
+          notRemoved: selection.notRemoved,
+        });
+        // Starts delivery without awaiting it (the first reaction request may
+        // already be on the wire when this returns); it never gates traffic.
+        this.deliverDiscordAwarenessInBackground('rollback', agentName);
         this.materializeConfigMountAfterBranchSwitch();
       } finally {
         release();
@@ -10029,9 +10168,10 @@ export class AgentFramework {
    * source branch: fork at the current head (by default `suppress/<agent>/<ts>`,
    * numbered `-2`, `-3`, … when the store already holds that name), redact
    * the messages on the fork, switch to it. Shards of a body group are always
-   * removed together. Discord originals get awareness markers via the outbox;
-   * the batch is `explicit`-activated only after every removal succeeded, and
-   * a crash mid-way is finished at next boot (resumePreparedDiscordSuppressions).
+   * removed together. With a marks choice, the Discord originals get awareness
+   * marks through the ledger: the batch is activated only after every removal
+   * succeeded, and a crash mid-way is finished at next boot
+   * (resumePreparedDiscordSuppressions), its marks retired unsent.
    * Like rollbackToMessage, it returns once the body change has landed, with
    * a marker-scheduling receipt (`markers`); delivery continues without the
    * caller waiting on it.
@@ -10048,6 +10188,8 @@ export class AgentFramework {
       note?: string;
       /** Branch name for the fork (default `suppress/<agent>/<ts>`, or with `-2`, `-3`, … appended when the store already holds that name). */
       branchName?: string;
+      /** Publication choice for awareness marks; default `none`. */
+      marks?: DiscordAwarenessMarks;
     },
   ): Promise<{
     agentName: string;
@@ -10067,48 +10209,23 @@ export class AgentFramework {
       agent: agentName,
       ...(opts.requester ? { requester: opts.requester } : {}),
       ...(opts.note ? { note: opts.note } : {}),
-      params: { messageIds: requestedIds },
+      params: { messageIds: requestedIds, marks: describeMarksChoice(opts.marks) },
     };
     try {
-      const agent = this.agents.get(agentName);
-      if (!agent) throw new OperatorActionError('unknown-agent', `Unknown agent: ${agentName}`);
-      if (requestedIds.length === 0) throw new OperatorActionError('invalid', 'No message ids given');
-      const cm = agent.getContextManager();
-      const total = cm.getMessageCount();
-
-      const located = locateMessageIndices(cm, new Set(requestedIds));
-      const missing = requestedIds.filter((id) => !located.has(id));
-      if (missing.length > 0) {
-        throw new OperatorActionError(
-          'unknown-message',
-          `Not on the active branch: ${missing.slice(0, 5).join(', ')}${missing.length > 5 ? ` (+${missing.length - 5})` : ''}`,
-        );
-      }
-
-      // Build removal intervals (index-ordered, newest first). A shard expands
-      // to its whole body group — chronicle refuses to bisect one — and a
-      // group interval is always removed as a RANGE: `removeMessage` refuses
-      // any sharded message even when the group is down to one shard.
-      const intervals = new Map<string, ReturnType<typeof bodyGroupRun>>();
-      for (const id of requestedIds) {
-        const run = bodyGroupRun(cm, located.get(id)!.index);
-        intervals.set(`${run.from}-${run.to}`, run);
-      }
-      const ordered = [...intervals.values()].sort((a, b) => b.from - a.from);
-      const messagesRemoved = ordered.reduce((n, iv) => n + (iv.to - iv.from + 1), 0);
-      if (messagesRemoved >= total) {
-        throw new OperatorActionError('invalid', `Cannot suppress all ${total} message(s) — at least one must remain`);
-      }
-      const targeted = ordered.flatMap((iv) =>
-        cm.getMessageWindow(iv.from, iv.to - iv.from + 1, { resolveBlobs: false }).messages,
-      );
+      const marks = checkedDiscordAwarenessMarks(opts.marks);
+      this.refuseMarksWithoutLedger(marks);
+      const { cm, ordered, messagesRemoved, targeted } = this.planSuppression(agentName, requestedIds);
       const removedIds = targeted.map((m) => String(m.id));
       const removedRefs = extractDiscordAwarenessRefs(targeted);
+      const selection = selectDiscordAwarenessRefs(targeted, marks);
 
       const sourceBranch = this.store.currentBranch().name;
       const targetBranch = opts.branchName ?? this.newOperatorBranchName(`suppress/${agentName}/${Date.now()}`);
       if (targetBranch === sourceBranch) {
         throw new OperatorActionError('invalid', 'Suppression branch name must differ from the active branch');
+      }
+      if (this.store.listBranches().some((branch) => branch.name === targetBranch)) {
+        throw new OperatorActionError('invalid', `Suppression branch ${targetBranch} already exists`);
       }
       // Gate + reserve the whole store (see reserveStoreForSurgery); held
       // until the fork is fully redacted and its marker scheduling has been
@@ -10120,37 +10237,38 @@ export class AgentFramework {
       try {
         // A maintenance tick already running finishes before the fork.
         if (this.maintenanceRunning()) await this.settleMaintenancePass();
-        const markerBatch = this.discordAwarenessOutbox?.prepare({
+        const markerBatch = await this.prepareMarkerBatch('Suppression', {
           agentName,
           sourceBranch,
           targetBranch,
-          refs: removedRefs,
+          refs: selection.refs,
+          scope: marksScope(marks),
+          unmarked: selection.unmarked,
+          notRemoved: selection.notRemoved,
           emoji: this.discordAwarenessEmoji,
-          // Seeing targetBranch active does not prove the removals finished;
-          // only this operation activates the batch, after the last redaction.
-          activationPolicy: 'explicit',
+          // Seeing targetBranch active does not prove the removals finished:
+          // a start on it applies them again while the batch is prepared, and
+          // only this operation activates it, after the last redaction.
           suppressionIntervals: ordered.map((iv) => ({ fromId: iv.fromId, toId: iv.toId })),
-        }) ?? null;
-        // Anything short of activation retires the batch: a prepared explicit
-        // batch re-arms through preparedSuppressionsForBranch the moment its
-        // target branch (or a descendant) becomes active — e.g. an operator
-        // opening the failed fork to look — and an un-completable resume
-        // there aborts framework start.
-        const retireBatch = (): void => {
-          if (markerBatch) this.discordAwarenessOutbox!.discard(markerBatch.id);
-        };
+        });
+        // A failure short of activation puts the source back first, and only
+        // then retires the batch: a prepared suppression's batch is resumed at
+        // startup whenever its exact target branch is active (e.g. after an
+        // operator opens the failed fork to look), and an un-completable
+        // resume there aborts framework start. If the source can't be
+        // confirmed, the batch stays as the unfinished body's evidence.
 
         try {
           createdBranch = await cm.fork(targetBranch);
         } catch (error) {
           // fork() switches the chronicle branch before awaiting strategy
           // initialization; a rejection can leave the store on the new
-          // branch. Retire the batch and go back to the source.
-          retireBatch();
+          // branch. Go back to the source, then retire the batch.
           const restored = await this.restoreSourceBranch(cm, sourceBranch, targetBranch, agentName);
+          const retired = await this.retireAfterRestore(markerBatch, sourceBranch, agentName);
           throw new OperatorActionError(
             'failed',
-            `Suppression failed creating ${targetBranch}; ${restored}: ${error instanceof Error ? error.message : String(error)}`,
+            `Suppression failed creating ${targetBranch}; ${restored}${retired}: ${error instanceof Error ? error.message : String(error)}`,
             { cause: error },
           );
         }
@@ -10163,27 +10281,31 @@ export class AgentFramework {
           // A partially suppressed branch is not safe to serve from. Keep it
           // for diagnosis, put the agent back on the untouched source — and
           // say honestly whether that restore happened.
-          retireBatch();
           const restored = await this.restoreSourceBranch(cm, sourceBranch, createdBranch, agentName);
+          const retired = await this.retireAfterRestore(markerBatch, sourceBranch, agentName);
           throw new OperatorActionError(
             'failed',
-            `Suppression failed on ${createdBranch}; ${restored}: ${error instanceof Error ? error.message : String(error)}`,
+            `Suppression failed on ${createdBranch}, which is kept for diagnosis: it may be partly suppressed, so ` +
+              `don't serve from it, and delete it once it has been looked at; ${restored}${retired}: ` +
+              `${error instanceof Error ? error.message : String(error)}`,
             { cause: error },
           );
         }
         // Every redaction committed: the body change has landed and the fork
         // is safe to serve from. Activating the marker batch is bookkeeping
         // about a world-side effect; if it fails, the suppression still
-        // stands, and the receipt says what became of the marks: not
-        // scheduled once the batch is retired, or unresolved if it can't be.
-        // (The batch's resume journal has nothing left to do, since every
-        // interval has committed, so retiring the batch gives up only the
-        // marks.)
-        markers = this.activateSurgeryMarkers(markerBatch, 'suppress', agentName);
-        // Installs the MCPL data-plane gate synchronously, before the store is
-        // released, and starts delivery without awaiting it (the first
-        // reaction request may already be on the wire when this returns).
-        this.startDiscordAwarenessDelivery('suppress', agentName);
+        // stands, and the receipt says the marks were not scheduled: the
+        // batch is retired, or left for a start to retire. (The batch's
+        // resume record has nothing left to do, since every interval has
+        // committed, so retiring the batch gives up only the marks.)
+        markers = await this.activateSurgeryMarkers(markerBatch, 'suppress', agentName, {
+          scope: marksScope(marks) as SurgeryMarkerReceipt['scope'],
+          unmarked: selection.unmarked,
+          notRemoved: selection.notRemoved,
+        });
+        // Starts delivery without awaiting it (the first reaction request may
+        // already be on the wire when this returns); it never gates traffic.
+        this.deliverDiscordAwarenessInBackground('suppress', agentName);
         this.materializeConfigMountAfterBranchSwitch();
       } finally {
         release();
@@ -10223,120 +10345,276 @@ export class AgentFramework {
   }
 
   /**
+   * The messages a rollback to `messageId` would remove, validated, without
+   * changing anything. Never bisects a body group: chronicle refuses that
+   * for removals and branchAt has no such guard, so the target snaps to the
+   * group's last shard.
+   */
+  private planRollback(agentName: string, messageId: string) {
+    const agent = this.agents.get(agentName);
+    if (!agent) throw new OperatorActionError('unknown-agent', `Unknown agent: ${agentName}`);
+    const cm = agent.getContextManager();
+    const total = cm.getMessageCount();
+    const requestedIndex = locateMessageIndex(cm, messageId);
+    if (requestedIndex < 0) {
+      throw new OperatorActionError('unknown-message', `Message ${messageId} is not on the active branch`);
+    }
+    const run = bodyGroupRun(cm, requestedIndex);
+    const targetIndex = run.to;
+    const tailMessageId = run.toId;
+    const messagesRemoved = total - targetIndex - 1;
+    if (messagesRemoved <= 0) {
+      throw new OperatorActionError('invalid', `Message ${messageId} is already the tail of the active branch`);
+    }
+    const discarded = cm.getMessageWindow(targetIndex + 1, messagesRemoved, { resolveBlobs: false }).messages;
+    return { cm, tailMessageId, messagesRemoved, discarded };
+  }
+
+  /**
+   * The removal intervals a suppression of `requestedIds` would apply
+   * (index-ordered, newest first), validated, without changing anything. A
+   * shard expands to its whole body group (chronicle refuses to bisect one),
+   * and a group interval is always removed as a range.
+   */
+  private planSuppression(agentName: string, requestedIds: string[]) {
+    const agent = this.agents.get(agentName);
+    if (!agent) throw new OperatorActionError('unknown-agent', `Unknown agent: ${agentName}`);
+    if (requestedIds.length === 0) throw new OperatorActionError('invalid', 'No message ids given');
+    const cm = agent.getContextManager();
+    const total = cm.getMessageCount();
+    const located = locateMessageIndices(cm, new Set(requestedIds));
+    const missing = requestedIds.filter((id) => !located.has(id));
+    if (missing.length > 0) {
+      throw new OperatorActionError(
+        'unknown-message',
+        `Not on the active branch: ${missing.slice(0, 5).join(', ')}${missing.length > 5 ? ` (+${missing.length - 5})` : ''}`,
+      );
+    }
+    const intervals = new Map<string, ReturnType<typeof bodyGroupRun>>();
+    for (const id of requestedIds) {
+      const run = bodyGroupRun(cm, located.get(id)!.index);
+      intervals.set(`${run.from}-${run.to}`, run);
+    }
+    const ordered = [...intervals.values()].sort((a, b) => b.from - a.from);
+    const messagesRemoved = ordered.reduce((n, iv) => n + (iv.to - iv.from + 1), 0);
+    if (messagesRemoved >= total) {
+      throw new OperatorActionError('invalid', `Cannot suppress all ${total} message(s) — at least one must remain`);
+    }
+    const targeted = ordered.flatMap((iv) =>
+      cm.getMessageWindow(iv.from, iv.to - iv.from + 1, { resolveBlobs: false }).messages,
+    );
+    return { cm, ordered, messagesRemoved, targeted };
+  }
+
+  /**
+   * What a rollback or suppression would remove, and which Discord messages
+   * each publication scope would mark, without changing anything or reading
+   * message content. A surface shows this before an operator chooses
+   * `marks`; passing a scope's `refs` back as `marks.refs` binds the choice
+   * to exactly that set, so a later application never widens it.
+   */
+  previewSurgeryMarks(
+    agentName: string,
+    target: { rollbackTo: string } | { suppress: string[] },
+  ): SurgeryMarksPreview {
+    const messages = 'rollbackTo' in target
+      ? this.planRollback(agentName, target.rollbackTo).discarded
+      : this.planSuppression(agentName, [...new Set(target.suppress.map(String))]).targeted;
+    const scopeView = (scope: DiscordAwarenessScope): SurgeryMarksPreview['scopes'][DiscordAwarenessScope] => {
+      const { refs } = selectDiscordAwarenessRefs(messages, { scope });
+      const channels = new Map<string, number>();
+      for (const ref of refs) channels.set(ref.channelId, (channels.get(ref.channelId) ?? 0) + 1);
+      return {
+        count: refs.length,
+        channels: [...channels].map(([channelId, count]) => ({ channelId, count })),
+        refs,
+      };
+    };
+    return {
+      messagesRemoved: messages.length,
+      addressable: extractDiscordAwarenessRefs(messages).length,
+      emoji: this.discordAwarenessEmoji,
+      scopes: { addressed: scopeView('addressed'), all: scopeView('all') },
+    };
+  }
+
+  /** The awareness ledger's batches and retract requests, for operator surfaces. */
+  listDiscordAwareness(): DiscordAwarenessView[] {
+    return this.discordAwarenessOutbox?.view() ?? [];
+  }
+
+  /**
+   * Stop all further sends and retries of a batch's marks, or of a retract
+   * request's removals (by its request id). Never removes a reaction and
+   * never undoes one: requests already on the wire, or whose outcome is
+   * unknown, are reported and may still land.
+   */
+  async cancelDiscordAwareness(
+    target: string,
+    opts: { requester?: OperatorRequester; note?: string } = {},
+  ): Promise<DiscordAwarenessCancelReceipt> {
+    this.refuseOperatorAfterStop('awareness cancel');
+    return this.trackOperatorOperation('awareness:cancel', () => this.awarenessOperatorAction(
+      'awareness-cancel', { target }, opts, (outbox) => outbox.cancel(target, describeRequester(opts.requester))));
+  }
+
+  /**
+   * Remove this bot's awareness mark, through each ref's configured MCPL
+   * route, from a batch's refs, or (`all`) from every ref of every batch not
+   * retired and every reaction the ledger holds. The receipt says how many
+   * removals were queued and on how many of those reactions an earlier add
+   * may land afterwards.
+   */
+  async retractDiscordAwareness(
+    target: string | 'all',
+    opts: { requester?: OperatorRequester; note?: string } = {},
+  ): Promise<DiscordAwarenessRetractReceipt> {
+    this.refuseOperatorAfterStop('awareness retract');
+    return this.trackOperatorOperation('awareness:retract', async () => {
+      const receipt = await this.awarenessOperatorAction('awareness-retract', { target }, opts, (outbox) =>
+        outbox.retract(target, describeRequester(opts.requester)));
+      this.deliverDiscordAwarenessInBackground('retract', 'operator');
+      return receipt;
+    });
+  }
+
+  private async awarenessOperatorAction<T extends object>(
+    kind: string,
+    params: Record<string, unknown>,
+    opts: { requester?: OperatorRequester; note?: string },
+    act: (outbox: DiscordAwarenessOutbox) => Promise<T>,
+  ): Promise<T> {
+    const logBase: OperatorLogInput = {
+      kind,
+      agent: '*',
+      ...(opts.requester ? { requester: opts.requester } : {}),
+      ...(opts.note ? { note: opts.note } : {}),
+      params,
+    };
+    try {
+      if (!this.discordAwarenessOutbox) {
+        throw new DiscordAwarenessRefusal(
+          'This framework has no awareness ledger (it was created with neither storePath nor ' +
+            'discordAwarenessOutboxPath), so it holds no marks',
+        );
+      }
+      const result = await act(this.discordAwarenessOutbox);
+      this.recordOperatorAction({ ...logBase, result: { ...result } as Record<string, unknown> });
+      console.error(`[discord-awareness] ${kind} ${JSON.stringify(params)} by=${describeRequester(opts.requester)}: ${JSON.stringify(result)}`);
+      return result;
+    } catch (error) {
+      this.recordOperatorAction({ ...logBase, error: error instanceof Error ? error.message : String(error) });
+      if (error instanceof OperatorActionError) throw error;
+      // A request the ledger won't carry out is the caller's to change; any
+      // other error is a failure to read or write the ledger.
+      throw new OperatorActionError(
+        error instanceof DiscordAwarenessRefusal ? 'invalid' : 'failed',
+        error instanceof Error ? error.message : String(error),
+        { cause: error },
+      );
+    }
+  }
+
+  /**
    * Record a surgery's prepared marker batch as active once its body change
    * has landed, and say what happened. Never throws: the body is already
    * applied, so a ledger failure here is reported in the receipt rather than
    * as a failed surgery an operator might retry. A batch that could not be
-   * activated is retired, so no later reconciliation can deliver it behind a
-   * receipt saying it was not scheduled (`not-scheduled`). If retiring fails
-   * too, the receipt says only that the outcome is `unresolved`: the batch is
-   * retained, and it may still be delivered. A rollback's batch
-   * (activated by target branch) may be promoted by the very next
-   * reconciliation, the one the delivery it starts runs; a suppression's
-   * (activated explicitly) waits for the next start.
+   * activated is retired, so no later start can deliver it behind a receipt
+   * saying it was not scheduled (`not-scheduled`). If retiring fails too, it
+   * stays prepared, and a start retires it, unsent: the receipt is
+   * `not-scheduled` either way.
    *
-   * A batch with no refs (a suppression journal with nothing addressable) is
-   * still activated, which closes its resume journal. It schedules no marks,
-   * so it reports `none` whatever the ledger does. If it can be neither
-   * activated nor retired, its journal is left prepared and closes at the
-   * next start: every interval it names has already committed, so the resume
-   * skips them all and activates it.
+   * A batch with no refs (a suppression's resume record, with nothing
+   * addressable) is still activated, which closes it. It schedules no marks,
+   * so it reports `none` whatever the ledger does, and a failure is logged.
+   * If it can be neither activated nor retired, it stays prepared, and
+   * closes at the next start on its branch: every interval it names has
+   * already committed, so the resume skips them all and retires it.
    */
-  private activateSurgeryMarkers(
+  private async activateSurgeryMarkers(
     batch: DiscordAwarenessBatch | null,
     verb: 'rollback' | 'suppress',
     agentName: string,
-  ): SurgeryMarkerReceipt {
-    if (!batch) return { status: 'none', queued: 0 };
-    try {
-      this.discordAwarenessOutbox!.activate(batch.id);
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      let retired = false;
-      let retireDetail = '';
-      try {
-        retired = this.discordAwarenessOutbox!.discard(batch.id);
-      } catch (discardError) {
-        retireDetail = discardError instanceof Error ? discardError.message : String(discardError);
+    facts: SurgeryMarkerFacts,
+  ): Promise<SurgeryMarkerReceipt> {
+    if (!batch || !this.discordAwarenessOutbox) return { ...facts, status: 'none', queued: 0 };
+    const settled = await this.discordAwarenessOutbox.settleActivation(batch.id);
+    if (batch.refs.length === 0) {
+      // A suppression-only batch carries no marks, so the receipt has
+      // nothing to report. Its activation closes the body's resume record:
+      // if that failed, the operator hears what became of it.
+      if (settled.status === 'not-scheduled') {
+        console.error(
+          `[discord-awareness] agent=${agentName}: ${verb} applied, but its resume record (awareness batch ` +
+            `${batch.id}, no marks) could not be closed: ${settled.error}`,
+        );
       }
-      console.error(
-        `[discord-awareness] ${verb} agent=${agentName}: body applied, but marker batch ${batch.id} ` +
-          `could not be activated (${detail}); ` +
-          (retired ? 'batch retired' : `batch retained${retireDetail ? ` (retire failed: ${retireDetail})` : ''}`),
-      );
-      if (batch.refs.length === 0) return { status: 'none', queued: 0 };
-      this.opsAlert(
-        retired ? 'discord-awareness-not-scheduled' : 'discord-awareness-unresolved',
-        agentName,
-        retired
-          ? `${verb} applied, but its ${batch.refs.length} awareness mark(s) were not scheduled ` +
-            `(batch ${batch.id} retired): ${detail}`
-          : `${verb} applied, but awareness batch ${batch.id} (${batch.refs.length} mark(s)) could be ` +
-            `neither activated nor retired; it may still be delivered: ${detail}`,
-        { data: { batchId: batch.id, retired } },
-      );
-      return retired
-        ? { status: 'not-scheduled', queued: 0, error: detail }
-        : { status: 'unresolved', queued: 0, batchId: batch.id, error: detail };
+      return { ...facts, status: 'none', queued: 0 };
     }
-    if (batch.refs.length === 0) return { status: 'none', queued: 0 };
-    return { status: 'queued', queued: batch.refs.length, batchId: batch.id };
+    return this.settledMarkerReceipt(settled, batch.id, batch.refs.length, verb, agentName, facts);
   }
 
   /**
-   * Start awareness delivery after a branch move (a surgery, a switch, an
-   * undo or redo) without the caller awaiting it. No operator response waits
-   * for Discord to accept marks: the MCPL data-plane gate alone holds channel
-   * traffic that arrives after it until they are attempted.
-   * The sync's body installs that gate synchronously, before its first
-   * await, so calling this while a surgery still holds the store puts the
-   * gate up before the store is released. With no drain running, the
-   * drain starts in the same synchronous run (the first reaction request can
-   * be written before this returns); with one running, this generation's pass
-   * follows it (drainForGeneration). Either way delivery continues
-   * independently: the caller's response and any store reservation stop
-   * waiting on remote reactions. A turn may run during delivery when its wake
-   * carries no channel traffic (a scheduler timer, a provider admission), and
-   * also when its channel traffic was admitted before the gate went up
-   * (queued when a surgery began, or arriving during its switch or fork): the
-   * surgery's store reservation, which used to hold such a turn through the
-   * drain, now ends once the gate is up. A failure is accounted by the gate
-   * itself: the current generation's failure recycles the connections (or,
-   * once the host is stopping, releases the gate instead), and a superseded
-   * one leaves that to the newer generation, whose own pass meets the same
-   * ledger. Here it is logged and raised as an ops alert, and the next sync,
-   * reconnect or start delivers what is still pending.
-   *
-   * Like a server's drain, the delivery runs apart from the operation that
-   * started it: it isn't an operator's operation. A drain already running
-   * when stop() begins sends nothing more, and stop() waits for it to record
-   * the call it had in flight, which closing the connections ends; what it
-   * hasn't sent stays pending in the durable outbox, unrecorded. Once stop()
-   * has begun, none is started, since there's no point opening a drain that
-   * the teardown is about to cut off: the marks stay pending, and the next
-   * start's barrier reconciles the outbox with the branch and delivers them.
-   *
-   * @param after What moved the branch, for the log and the alert
-   *   ("rollback", "branch switch", "undo" …).
-   * @param agentName The agent the move was for, or "framework" for a
-   *   branch switch that names none.
+   * The receipt for a batch whose body change has landed, from what the
+   * ledger settled. Anything short of `queued` is logged and raised as an
+   * ops alert: the body stands either way.
    */
-  startDiscordAwarenessDelivery(after: string, agentName = 'framework'): void {
-    if (!this.discordAwarenessOutbox) return;
+  private settledMarkerReceipt(
+    settled: DiscordAwarenessSettlement,
+    batchId: string,
+    marks: number,
+    verb: 'rollback' | 'suppress',
+    agentName: string,
+    facts: SurgeryMarkerFacts,
+  ): SurgeryMarkerReceipt {
+    if (settled.status === 'queued') return { ...facts, status: 'queued', queued: settled.queued, batchId };
+    console.error(
+      `[discord-awareness] ${verb} agent=${agentName}: body applied, but marker batch ${batchId} ` +
+        `was not activated, and none of its marks will be sent: ${settled.error}`,
+    );
+    this.opsAlert(
+      'discord-awareness-not-scheduled',
+      agentName,
+      `${verb} applied, but its ${marks} awareness mark(s) were not scheduled and none will be sent ` +
+        `(batch ${batchId}): ${settled.error}`,
+      { data: { batchId }, key: batchId },
+    );
+    return { ...facts, status: 'not-scheduled', queued: 0, error: settled.error };
+  }
+
+  /**
+   * Start awareness delivery without the caller awaiting it. The drain starts
+   * now and continues independently. Delivery never gates MCPL traffic or
+   * turns; a failure is logged and raised as an ops alert, and the queued
+   * work stays in the ledger for the next pass. It isn't an
+   * operator's operation, as syncDiscordAwarenessMarkers is: stop() waits
+   * for running drains only once it has closed their servers, within its
+   * budget, and once stop() has begun none is started, since the teardown
+   * would cut it off. The next start delivers what is due. A quiesce doesn't
+   * hold it, as it holds turns and what servers send: a delivery starts no
+   * turn, and the answers to the host's own requests are never held, so a
+   * surgery made during a quiesce has its marks sent then.
+   */
+  private deliverDiscordAwarenessInBackground(
+    occasion: 'rollback' | 'suppress' | 'retract' | 'startup' | 'connect' | 'list-change' | 'reconnect' | 'joined',
+    agentName: string,
+    onlyServerId?: string,
+  ): void {
     if (this.stopHasBegun()) {
       console.error(
-        `[discord-awareness] delivery after ${after} agent=${agentName} not started: ` +
-          'the framework is stopping; the next start delivers what is pending',
+        `[discord-awareness] delivery after ${occasion} agent=${agentName} not started: ` +
+          'the framework is stopping; the next start delivers what is due',
       );
       return;
     }
-    this.runDiscordAwarenessSync().catch((error) => {
-      const detail = error instanceof Error ? error.message : String(error);
-      console.error(`[discord-awareness] delivery after ${after} agent=${agentName} failed: ${detail}`);
+    this.runDiscordAwarenessSync(onlyServerId).catch((error) => {
+      const detail = boundDiscordAwarenessText(error instanceof Error ? error.message : String(error));
+      console.error(`[discord-awareness] delivery after ${occasion} failed: ${detail}`);
       this.opsAlert(
         'discord-awareness-delivery',
         agentName,
-        `Awareness mark delivery after ${after} failed: ${detail}`,
+        `Awareness mark delivery after ${occasion} failed: ${detail}`,
       );
     });
   }
@@ -21103,7 +21381,13 @@ export class AgentFramework {
     kind: string,
     agentName: string,
     rawMessage: string,
-    opts?: { data?: Record<string, unknown>; skipLog?: boolean },
+    opts?: {
+      data?: Record<string, unknown>;
+      skipLog?: boolean;
+      /** Tells this alert apart from others of its agent and kind for the
+       *  webhook's cooldown, such as the batch a retirement names. */
+      key?: string;
+    },
   ): void {
     // A JavaScript caller of notifyOps or notifyOpsAlert can pass a message
     // that isn't a string; it's described as a thrown value is, rather than
@@ -21126,7 +21410,7 @@ export class AgentFramework {
 
     const hook = process.env.CONNECTOME_OPS_WEBHOOK;
     if (!hook) return;
-    const key = `${agentName}:${kind}`;
+    const key = opts?.key === undefined ? `${agentName}:${kind}` : `${agentName}:${kind}:${opts.key}`;
     const now = Date.now();
     if (now - (this.opsAlertLastSent.get(key) ?? 0) < this.opsAlertCooldownMs) return;
     // Stamp BEFORE the async post so a burst can't race past the cooldown.
@@ -21740,10 +22024,9 @@ export class AgentFramework {
 
     for (const config of serverConfigs) {
       try {
-        // Stage every startup connection with both planes closed. This removes
-        // server-order dependence: no early heartbeat/shell push can become
-        // model-visible before a later Discord connection has joined the same
-        // awareness generation.
+        // Stage every startup connection with both planes closed, and open
+        // them together once all are staged, so startup does not depend on
+        // server order.
         await this.connectMcplServerInternal(config, true);
       } catch (error) {
         // An accounting failure ends startup. create()'s release closes every
@@ -21780,16 +22063,11 @@ export class AgentFramework {
       }
     }
 
-    // Start the durable drain only after all startup connections are staged.
-    // The awareness tools/call is written before control-plane registration is
-    // flushed, preserving the server-side queue -> registration -> call order.
-    // A barrier that fails ends startup the same way, and create()'s release
-    // closes the servers. (A lazy initialization from connectMcplServer has
-    // connected none yet.)
-    const startupBarrier = this.installMcplDataPlaneGate();
-    this.releaseMcplDataPlaneGate(startupBarrier);
-    await startupBarrier.promise;
-    this.completeMcplDataPlaneGate(startupBarrier);
+    // Every startup connection is staged with its grant established: open
+    // them together (a quiesced boot keeps data planes held). Awareness marks
+    // never gate this: queued marks are delivered in the background.
+    this.readyMcplPlanes();
+    this.deliverDiscordAwarenessInBackground('startup', 'host');
 
     // Discover tools from all connected servers
     await this.refreshMcplTools();
@@ -21881,42 +22159,49 @@ export class AgentFramework {
   }
 
   /**
-   * Reconcile the durable ledger with Chronicle, then deliver every server's
-   * work. A drain still running is waited for and then followed by a fresh
-   * pass (drainForGeneration). Like the other operator entry points, it's
-   * refused once stop() has begun, and stop() waits for one already running.
-   * The framework's own branch moves start their delivery without awaiting
-   * it (startDiscordAwarenessDelivery).
+   * Deliver every server's queued awareness operations now (or only
+   * `onlyServerId`'s) and wait for this pass, and for a pass already under
+   * way on a server, whose last request may still be on the wire with
+   * nothing left due. Like the other operator entry points, it's refused
+   * once stop() has begun, and stop() waits for one already running.
+   * Delivery never gates MCPL traffic or turns: the framework's own
+   * deliveries run in the background (deliverDiscordAwarenessInBackground).
+   * A server that is not connected is skipped (its work stays queued until
+   * it connects).
    */
   async syncDiscordAwarenessMarkers(onlyServerId?: string): Promise<void> {
     this.refuseOperatorAfterStop('awareness sync');
-    return this.trackOperatorOperation('awareness:sync', () => this.runDiscordAwarenessSync(onlyServerId));
+    return this.trackOperatorOperation('awareness:sync', () => {
+      // A pass under way may have nothing left due, so the pass below would
+      // leave its server out. Only an operator's sync waits for it: a
+      // background delivery doesn't take on other occasions' passes.
+      const running = [...this.discordAwarenessDrains]
+        .filter(([serverId]) => onlyServerId === undefined || serverId === onlyServerId)
+        .map(([, drain]) => drain);
+      return Promise.all([this.runDiscordAwarenessSync(onlyServerId), ...running]).then(() => {});
+    });
   }
 
-  /** The sync's work. It installs the MCPL data-plane gate before its first
-   *  await, so a caller that starts it while holding the store puts the gate
-   *  up before releasing the store. */
-  private async runDiscordAwarenessSync(_onlyServerId?: string): Promise<void> {
-    if (!this.discordAwarenessOutbox) return;
-    // A targeted retry may discover pending work for other Discord servers
-    // during reconciliation. Safety is global, so one generation accounts for
-    // all pending operations before releasing any MCPL data plane.
-    const barrier = this.installMcplDataPlaneGate();
-    this.releaseMcplDataPlaneGate(barrier);
-    try {
-      await barrier.promise;
-      this.completeMcplDataPlaneGate(barrier);
-    } catch (error) {
-      await this.failMcplDataPlaneGate(barrier, 'explicit synchronization', error);
-      throw error;
-    }
+  /** One delivery pass over every server with due work, or only `onlyServerId`'s. */
+  private async runDiscordAwarenessSync(onlyServerId?: string): Promise<void> {
+    const serverIds = [...new Set(
+      this.readDiscordAwarenessDue(onlyServerId).map((request) => request.serverId),
+    )];
+    await Promise.all(serverIds.map((serverId) => this.drainDiscordAwarenessOutbox(serverId)));
   }
 
+  /**
+   * Finish the removals of every suppression pending on the active branch
+   * (an interrupted surgery's, or a version 2 ledger's that 0.22.x never
+   * activated). Its batch is then retired, none of its marks sent, and
+   * reported with the redo that applies them (reportRetiredAwareness): a
+   * start never activates a surgery's marks. An interval whose messages are
+   * only partly present can't be finished safely, and stops the start.
+   */
   private async resumePreparedDiscordSuppressions(): Promise<void> {
     if (!this.discordAwarenessOutbox) return;
-    const batches = this.discordAwarenessOutbox.preparedSuppressionsForBranch(
+    const batches = this.discordAwarenessOutbox.pendingSuppressionsFor(
       this.store.currentBranch().name,
-      this.store.listBranches(),
     );
     for (const batch of batches) {
       const agent = this.agents.get(batch.agentName);
@@ -21938,141 +22223,361 @@ export class AgentFramework {
         }
         removeStoredMessages(cm, from, to);
       }
-      this.discordAwarenessOutbox.activate(batch.id);
-      console.error(`[discord-awareness] resumed suppression batch ${batch.id}`);
+      // The body is the surgery's own effect, which the operator chose: it
+      // is finished. Marks wait on no crash: a prepared batch is retired,
+      // and reported before that is recorded, as at reconciliation.
+      await this.discordAwarenessOutbox.completeSuppression(batch.id, () => this.reportRetiredAwareness({
+        batchId: batch.id,
+        agentName: batch.agentName,
+        sourceBranch: batch.sourceBranch,
+        targetBranch: batch.targetBranch,
+        // A version 2 ledger's undelivered marks were reported when its
+        // rewrite dropped them.
+        marks: batch.cancelled || batch.scope === 'legacy' ? 0 : batch.refs.length,
+        suppression: true,
+        ...(batch.scope === 'legacy' ? { imported: true } : {}),
+      }, { finished: true }));
     }
   }
 
   /**
-   * Deliver every due ref independently. Permanent Discord failures are kept
-   * in the ledger for audit but do not block later operations; retryable
-   * failures remain pending for the next reconnect/list-change attempt.
-   * Once stop() has begun, a drain sends nothing more and records nothing
-   * for what it hasn't sent: that stays pending, as it was, for the next
-   * start's barrier. stop() closes the connections and then waits for each
-   * drain still running to record the call it had in flight.
+   * The start's reconciliation of the awareness ledger, before any
+   * delivery. It derives nothing from branch ancestry and activates nothing
+   * (recoverAtStartup): a batch an interrupted surgery left is retired, none
+   * of its marks sent, except a suppression whose removals are pending, which
+   * a start on its branch finishes (resumePreparedDiscordSuppressions); a
+   * request the previous process left on the wire is recorded unanswered. No
+   * content is read. Before it writes any of that, it logs what it does,
+   * reports each retirement (reportRetiredAwareness) and raises the delivery
+   * alert for reactions that reach the bound: each is written once, so a
+   * notice given after the write would be lost for good if the write landed
+   * and the process ended before the notice. A ledger it can't read stops
+   * the start: it can't tell whether a suppression's body is pending.
+   */
+  private async reconcileDiscordAwarenessAtStartup(): Promise<void> {
+    if (!this.discordAwarenessOutbox) return;
+    try {
+      await this.discordAwarenessOutbox.recoverAtStartup(
+        (planned) => this.announceDiscordAwarenessRecovery(planned),
+      );
+    } catch (error) {
+      // The branch may be safe, but reporting the framework ready while its
+      // durable awareness ledger is unreadable creates a half-ready host.
+      throw new DiscordAwarenessAccountingError('startup reconciliation', error);
+    }
+  }
+
+  /** What a start's reconciliation retires and records unanswered, before it is written. */
+  private announceDiscordAwarenessRecovery(
+    planned: { retired: DiscordAwarenessRetirement[]; unknownAttempts: number; givenUp: number },
+  ): void {
+    if (planned.retired.length > 0 || planned.unknownAttempts > 0) {
+      console.error(
+        `[discord-awareness] startup: retiring ${planned.retired.length} batch(es) a surgery left ` +
+          `unfinished, none of their marks sent; recording ${planned.unknownAttempts} request(s) the previous ` +
+          'process left on the wire as unanswered',
+      );
+    }
+    for (const retirement of planned.retired) this.reportRetiredAwareness(retirement);
+    if (planned.givenUp > 0) {
+      // The alert a delivery pass raises when it gives up on operations:
+      // these reach the bound here, with no pass to report them.
+      this.opsAlert(
+        'discord-awareness-delivery',
+        'host',
+        `Nothing more is sent for ${planned.givenUp} awareness mark(s): their third unconfirmed attempt ` +
+          'was still unanswered when the previous process ended',
+        { data: { givenUp: planned.givenUp } },
+      );
+    }
+  }
+
+  /**
+   * A version 2 ledger's rewrite as version 3, before it is written (the
+   * outbox's announceImport): the work agent-framework 0.22.x had still to
+   * do is never sent, since nobody chose it, and the batches it never
+   * activated are retired (a suppression whose body may be pending, once a
+   * start on its branch finishes the body). A retract of a batch 0.22.x
+   * activated takes off the mark of the batch's emoji from each of its
+   * messages, whichever batch placed it.
+   */
+  private announceDiscordAwarenessImport(unsent: DiscordAwarenessImportedUnsent[]): void {
+    this.opsAlert(
+      'discord-awareness-import-unsent',
+      'host',
+      `This start rewrites the awareness ledger as version 3, and the marks agent-framework 0.22.x had still to add ` +
+        'or remove won\'t be sent, since nobody chose them: ' +
+        unsent.map((batch) => `batch ${batch.batchId} (${batch.agentName}, ${batch.sourceBranch} to ` +
+          `${batch.targetBranch}): ${batch.adds} to add, ${batch.removals} to remove`).join('; ') +
+        '. A batch 0.22.x never activated placed no marks. To take off the marks it placed for a batch it ' +
+        'activated, retract that batch through the host command marks (action retract): a retract takes off ' +
+        'the mark of the batch\'s emoji from each of its messages, whichever batch placed it',
+      { data: { batches: unsent } },
+    );
+  }
+
+  /**
+   * Report a batch a start retires, before that is recorded, with the redo
+   * that applies what was lost: the
+   * surgery again from its source, if that still has every message the
+   * surgery removed (a hide there, or the source's deletion, changes that),
+   * onto a new branch name, choosing marks again (framework.switchBranch,
+   * then rollbackToMessage or suppressMessages; offline, the recover CLI).
+   * A batch doesn't say which surgery made it: an offline recovery's reads
+   * as a rollback's, or as a suppression's when the recovery suppressed, so
+   * the report names both. One with marks not applied raises an ops alert;
+   * one without (no marks chosen, or its marks cancelled) is only logged.
+   */
+  private reportRetiredAwareness(retirement: DiscordAwarenessRetirement, opts: { finished?: boolean } = {}): void {
+    const { batchId, agentName, sourceBranch, targetBranch, marks } = retirement;
+    if (retirement.imported) {
+      // A version 2 ledger's batch: its rewrite dropped and reported the
+      // work it had still to do.
+      const body = opts.finished ? `, having finished its removals on ${targetBranch}` : '';
+      console.error(`[discord-awareness] this start retires version 2 awareness batch ${batchId} of ${agentName}${body}`);
+      return;
+    }
+    const kind = retirement.suppression ? 'a suppression, or an offline recovery that suppressed' : 'a rollback, or an offline recovery';
+    const about = `The surgery of ${agentName} from ${sourceBranch} onto ${targetBranch} (awareness batch ${batchId}: ${kind})`;
+    const redo = `redo the surgery from ${sourceBranch}, if it still has every message the surgery removed, onto a new ` +
+      'branch name';
+    const unmarked = `Its ${marks} awareness mark(s) weren't applied, since a start never activates a surgery's marks. `;
+    const body = opts.finished ? `; this start finished its removals on ${targetBranch}` : '';
+    if (marks === 0) {
+      console.error(`[discord-awareness] ${about} was interrupted${body}. This start retires it, with no marks to apply`);
+      return;
+    }
+    this.opsAlert(
+      'discord-awareness-not-scheduled',
+      agentName,
+      `${about} was interrupted${body}. ${unmarked}To apply them, ${redo}, with its marks`,
+      { data: { batchId, marks }, key: batchId },
+    );
+  }
+
+  /**
+   * Deliver one server's owed awareness requests, one at a time, oldest act
+   * first. Every request is written ahead to the ledger before it can leave,
+   * and its answer is recorded from what the connection can actually know
+   * (McplRequestError.outcome): a request that was never written stays
+   * owed, one written and never answered may land, and a Discord answer is
+   * definitive (permanent when Discord says the message or channel is gone
+   * or inaccessible). A server that is not connected is skipped: its work
+   * simply stays queued.
    */
   private drainDiscordAwarenessOutbox(
     serverId: string,
   ): Promise<DiscordAwarenessDrainOutcome> {
-    if (!this.discordAwarenessOutbox) {
-      return Promise.resolve({ status: 'delivered', delivered: 0, failed: 0 });
-    }
+    const outbox = this.discordAwarenessOutbox;
+    if (!outbox) return Promise.resolve({ status: 'delivered', delivered: 0, failed: 0 });
     const existing = this.discordAwarenessDrains.get(serverId);
-    if (existing) return existing;
+    if (existing) {
+      this.discordAwarenessDrainsJoined.add(serverId);
+      return existing;
+    }
 
-    const drain = (async () => {
-      // A drain started once stop() has begun sends and records nothing. This
-      // comes before the connection check, whose "not attempted" record would
-      // otherwise mark every pending operation.
-      if (this.stopHasBegun()) {
-        console.error(
-          `[discord-awareness] ${serverId}: drain not started: the framework is stopping; ` +
-            'the next start delivers what is pending',
-        );
-        return { status: 'delivered' as const, delivered: 0, failed: 0 };
-      }
+    const pass: DiscordAwarenessDrainPass = { ended: false };
+    const drain = this.runDiscordAwarenessDrain(serverId, pass, outbox);
+    // A pass that ended before its first await (the route was down, stop()
+    // had begun, or reading the ledger failed) is never registered.
+    if (!pass.ended) {
+      pass.drain = drain;
+      this.discordAwarenessDrains.set(serverId, drain);
+    }
+    return drain;
+  }
+
+  /**
+   * One pass of drainDiscordAwarenessOutbox. It leaves the registry in the
+   * microtasks that follow its last claim, a claim that found nothing owed,
+   * so a registered pass always has a claim ahead of it or running: a
+   * trigger that joins it is served by it, unless its route goes away or
+   * stop() begins first, when the pass stops claiming and the work stays
+   * queued for the next pass. Within a pass, a request is claimed once; a
+   * trigger that joined it also has what the pass already tried claimed
+   * once more before it leaves, so an operator's sync, a retract or a
+   * reconnect meeting a running pass doesn't leave a retryable mark untried. A request made owed after its last claim
+   * starts a new pass: the act that makes it owed runs after that claim's,
+   * and resolves only once its write is on disk, by when the pass has left.
+   * Leaving any later, when its promise settles, would let a request join a
+   * pass that will never claim again, and that work would stay due until
+   * some unrelated trigger.
+   */
+  private async runDiscordAwarenessDrain(
+    serverId: string,
+    pass: DiscordAwarenessDrainPass,
+    outbox: DiscordAwarenessOutbox,
+  ): Promise<DiscordAwarenessDrainOutcome> {
+    try {
       const connection = this.mcplServerRegistry?.getServer(serverId);
       if (!connection?.isConnected) {
-        const operations = this.readDiscordAwarenessPending(serverId);
-        for (const operation of operations) {
-          this.writeDiscordAwarenessFailure(
-            operation.batchId,
-            operation.ref,
-            operation.action,
-            'Awareness delivery not attempted: MCPL connection unavailable',
-            false,
-          );
-        }
-        if (operations.length > 0) {
+        const waiting = this.readDiscordAwarenessDue(serverId).length;
+        if (waiting > 0) {
           console.error(
-            `[discord-awareness] ${serverId}: connection unavailable; ` +
-              `durably deferred=${operations.length}`,
+            `[discord-awareness] ${serverId}: connection unavailable; ${waiting} mark request(s) stay queued`,
           );
         }
-        return { status: 'unavailable' as const, accounted: operations.length };
+        return { status: 'unavailable' as const, accounted: waiting };
       }
 
       let delivered = 0;
       let failed = 0;
+      let givenUp = 0;
+      let firstGivenUp: string | undefined;
       const attempted = new Set<string>();
+      const signature = (request: DiscordAwarenessRequest) =>
+        `${request.emoji}\0${request.serverId}\0${request.channelId}\0${request.messageId}\0${request.due}`;
+      let announced = false;
       while (true) {
-        const operations = this.readDiscordAwarenessPending(serverId).filter((operation) => {
-          const key = `${operation.batchId}\0${operation.ref.channelId}\0${operation.ref.messageId}\0${operation.action}`;
-          if (attempted.has(key)) return false;
-          attempted.add(key);
-          return true;
-        });
-        if (operations.length === 0) break;
-        for (const [index, operation] of operations.entries()) {
-          // Once stop() has begun, nothing more is sent. What this read took
-          // counts as attempted, so the loop ends once a read finds nothing new.
-          if (this.stopHasBegun()) {
+        // A host that is stopping starts nothing new (stopHasBegun, the
+        // operator entry points' own rule): its due marks wait for the next
+        // start, and the log says how many this pass didn't send. A route
+        // that went away (shutdown, or a disconnect that will reconnect)
+        // leaves the rest queued too: claiming would only write requests that
+        // cannot be sent.
+        if (this.stopHasBegun()) {
+          const unsent = this.readDiscordAwarenessDue(serverId)
+            .filter((request) => !attempted.has(signature(request))).length;
+          if (unsent > 0) {
             console.error(
-              `[discord-awareness] ${serverId}: ${operations.length - index} mark(s) not sent: ` +
+              `[discord-awareness] ${serverId}: ${unsent} mark(s) not sent: ` +
                 'the framework is stopping; the next start delivers them',
             );
-            break;
           }
-          const ref = operation.ref;
-          const channelId = ref.channelId.startsWith('discord:')
-            ? ref.channelId.split(':').at(-1)!
-            : ref.channelId;
-          let deliveryError: string | undefined;
+          break;
+        }
+        if (!connection.isConnected) break;
+        // One request at a time, chosen and written ahead in one act from
+        // the ledger as it is now: a cancel or retract made while the
+        // previous request was on the wire takes effect here.
+        let request: DiscordAwarenessRequest | null;
+        try {
+          request = await outbox.claim(serverId, (candidate) => attempted.has(signature(candidate)));
+        } catch (error) {
+          throw new DiscordAwarenessAccountingError('request write-ahead', error);
+        }
+        if (!request) {
+          // A trigger that joined this pass asked for what is owed now, what
+          // the pass already tried included: that is tried once more, under
+          // the same bound, before the pass leaves.
+          if (this.discordAwarenessDrainsJoined.delete(serverId) && attempted.size > 0) {
+            attempted.clear();
+            continue;
+          }
+          break;
+        }
+        if (this.stopHasBegun()) {
+          // Stop began while the request was being written ahead: it isn't
+          // sent, and stays owed. (A route that went away meanwhile refuses
+          // the request itself, as not sent.)
           try {
-            const tool = operation.action === 'add' ? 'add_reaction' : 'remove_reaction';
-            const result = await connection.sendToolsCallWithDeadline(tool, {
-              channelId,
-              messageId: ref.messageId,
-              emoji: operation.emoji,
-            }, this.discordAwarenessDeadlineMs);
-            if (result.isError) {
-              deliveryError = result.content
-                .map((content) => content.text ?? '')
-                .filter(Boolean)
-                .join('; ') || `Discord ${tool} returned an error`;
-            }
+            await outbox.recordOutcome(request, 'not-sent');
           } catch (error) {
-            deliveryError = error instanceof Error ? error.message : String(error);
+            throw new DiscordAwarenessAccountingError('outcome write', error);
           }
-
-          if (deliveryError !== undefined) {
-            const permanent = isPermanentDiscordReactionFailure(deliveryError);
-            this.writeDiscordAwarenessFailure(
-              operation.batchId,
-              ref,
-              operation.action,
-              deliveryError,
-              permanent,
-            );
-            failed++;
-            console.error(
-              `[discord-awareness] ${operation.action} failed for ${ref.channelId}/${ref.messageId}` +
-                ` (${permanent ? 'permanent' : 'retryable'}): ${deliveryError}`,
-            );
+          continue;
+        }
+        attempted.add(signature(request));
+        if (!announced) {
+          announced = true;
+          console.error(`[discord-awareness] ${serverId}: delivering queued marks`);
+        }
+        const channelId = discordChannelOf(request.channelId);
+        const tool = request.action === 'add' ? 'add_reaction' : 'remove_reaction';
+        let outcome: 'confirmed' | 'failed' | 'not-sent' | 'unknown';
+        let detail: string | undefined;
+        try {
+          const result = await connection.sendToolsCallWithDeadline(tool, {
+            channelId,
+            messageId: request.messageId,
+            emoji: request.emoji,
+          }, this.discordAwarenessDeadlineMs);
+          if (result.isError) {
+            outcome = 'failed';
+            detail = result.content
+              .map((content) => content.text ?? '')
+              .filter(Boolean)
+              .join('; ') || `Discord ${tool} returned an error`;
           } else {
-            this.writeDiscordAwarenessSuccess(operation.batchId, ref, operation.action);
-            delivered++;
+            outcome = 'confirmed';
           }
+        } catch (error) {
+          detail = error instanceof Error ? error.message : String(error);
+          // Only a request refused before it was written is known not to
+          // have reached the server. A JSON-RPC error answer may come after
+          // the server acted (McplRequestError's contract), and an error the
+          // connection didn't classify may follow a write: both are unknown,
+          // unless the answer is a refusal no retry can change, which says
+          // the reaction wasn't placed or removed.
+          outcome = error instanceof McplRequestError && error.outcome === 'not-sent'
+            ? 'not-sent'
+            : error instanceof McplRequestError && error.outcome === 'error-response' && isPermanentDiscordReactionFailure(detail)
+              ? 'failed'
+              : 'unknown';
+        }
+        // Classify on the full text, then keep only a redacted, bounded
+        // copy: the server's own words can carry its credentials.
+        const permanent = outcome === 'failed' && isPermanentDiscordReactionFailure(detail ?? '');
+        if (detail !== undefined) {
+          detail = boundDiscordAwarenessText(redactServerText(detail, this.mcplServerConfigs.get(serverId) ?? {}));
+        }
+        let ended: boolean;
+        try {
+          ended = await outbox.recordOutcome(request, outcome, permanent ? { permanent: true } : {});
+        } catch (error) {
+          throw new DiscordAwarenessAccountingError('outcome write', error);
+        }
+        if (outcome === 'confirmed') {
+          delivered++;
+        } else {
+          failed++;
+          if (ended) {
+            givenUp++;
+            firstGivenUp ??= `${request.action} ${request.channelId}/${request.messageId}: ${outcome}: ${detail ?? ''}`;
+          }
+          console.error(
+            `[discord-awareness] ${request.action} ${request.channelId}/${request.messageId}: ${outcome}` +
+              `${ended ? ' (not sent again)' : outcome === 'failed' ? ' (retryable)' : ''}` +
+              `: ${detail ?? ''}`,
+          );
         }
       }
       if (delivered > 0 || failed > 0) {
         console.error(
-          `[discord-awareness] ${serverId}: delivered=${delivered} failed=${failed}`,
+          `[discord-awareness] ${serverId}: confirmed=${delivered} not-confirmed=${failed}`,
+        );
+      }
+      if (givenUp > 0) {
+        // One alert per pass for the requests it ended without a
+        // confirmation: refused for good, or at their third unconfirmed
+        // attempt. The ledger keeps them as failed (marks list).
+        this.opsAlert(
+          'discord-awareness-delivery',
+          'host',
+          `Nothing more is sent for ${givenUp} awareness mark(s) on ${serverId}: Discord refused them for good, ` +
+            `or three attempts went unconfirmed (first: ${firstGivenUp})`,
+          { data: { serverId, givenUp } },
         );
       }
       return { status: 'delivered' as const, delivered, failed };
-    })().finally(() => {
-      this.discordAwarenessDrains.delete(serverId);
-    });
-
-    this.discordAwarenessDrains.set(serverId, drain);
-    return drain;
+    } finally {
+      pass.ended = true;
+      if (pass.drain !== undefined && this.discordAwarenessDrains.get(serverId) === pass.drain) {
+        this.discordAwarenessDrains.delete(serverId);
+        // A trigger that joined a pass which ended before serving it (its
+        // route went away, as a restarted server's old connection does, or
+        // a write failed) gets a pass of its own, once this one has left.
+        if (this.discordAwarenessDrainsJoined.delete(serverId) && !this.stopHasBegun()) {
+          this.deliverDiscordAwarenessInBackground('joined', 'host', serverId);
+        }
+      }
+    }
   }
 
-  private readDiscordAwarenessPending(serverId?: string) {
+  private readDiscordAwarenessDue(serverId?: string): DiscordAwarenessRequest[] {
+    if (!this.discordAwarenessOutbox) return [];
     try {
-      return this.discordAwarenessOutbox!.pending(serverId);
+      return this.discordAwarenessOutbox.due(serverId);
     } catch (error) {
       throw new DiscordAwarenessAccountingError(
         `ledger read${serverId ? ` for ${serverId}` : ''}`,
@@ -22081,114 +22586,21 @@ export class AgentFramework {
     }
   }
 
-  private writeDiscordAwarenessSuccess(
-    batchId: string,
-    ref: import('./recovery/discord-awareness-outbox.js').DiscordAwarenessRef,
-    action: import('./recovery/discord-awareness-outbox.js').DiscordAwarenessAction,
-  ): void {
-    try {
-      this.discordAwarenessOutbox!.recordSuccess(batchId, ref, action);
-    } catch (error) {
-      throw new DiscordAwarenessAccountingError('recordSuccess ledger write', error);
-    }
-  }
-
-  private writeDiscordAwarenessFailure(
-    batchId: string,
-    ref: import('./recovery/discord-awareness-outbox.js').DiscordAwarenessRef,
-    action: import('./recovery/discord-awareness-outbox.js').DiscordAwarenessAction,
-    errorMessage: string,
-    permanent: boolean,
-  ): void {
-    try {
-      this.discordAwarenessOutbox!.recordFailure(
-        batchId,
-        ref,
-        action,
-        errorMessage,
-        permanent,
-      );
-    } catch (error) {
-      throw new DiscordAwarenessAccountingError('recordFailure ledger write', error);
-    }
-  }
-
-  private beginDiscordAwarenessBarrier(): {
-    requiresBarrier: boolean;
-    promise: Promise<DiscordAwarenessDrainOutcome>;
-  } {
-    if (!this.discordAwarenessOutbox) {
-      return {
-        requiresBarrier: false,
-        promise: Promise.resolve({ status: 'delivered', delivered: 0, failed: 0 }),
-      };
-    }
-    try {
-      this.discordAwarenessOutbox.reconcileForBranch(
-        this.store.currentBranch().name,
-        this.store.listBranches(),
-      );
-    } catch (error) {
-      throw new DiscordAwarenessAccountingError('branch reconciliation', error);
-    }
-    const pending = this.readDiscordAwarenessPending();
-    // A drain that is still running holds operations it read before this
-    // reconciliation, and it sends them whatever the ledger now says. A branch
-    // move can hide them from `pending`: restoring a rollback's source makes
-    // its marks undesired, and an add whose reply has not arrived is not yet
-    // present, so the ledger shows nothing to do while the drain goes on to
-    // send its saved adds and then the removals they need. So a generation
-    // accounts for every running drain as well as for every pending
-    // operation, and waits for those drains instead of releasing the data
-    // planes beside them (drainForGeneration).
-    const serverIds = [...new Set([
-      ...pending.map((operation) => operation.ref.serverId),
-      ...this.discordAwarenessDrains.keys(),
-    ])];
-    if (serverIds.length === 0) {
-      return {
-        requiresBarrier: false,
-        promise: Promise.resolve({ status: 'delivered', delivered: 0, failed: 0 }),
-      };
-    }
-    const promise = Promise.all(
-      serverIds.map((serverId) => this.drainForGeneration(serverId)),
-    ).then(combineDrainOutcomes);
-    return { requiresBarrier: true, promise };
-  }
-
   /**
-   * One server's drain for a new generation: a gate completes only after
-   * every operation pending when it was armed has been attempted. A drain
-   * already running can't promise that. It never re-sends a key it has
-   * attempted, so an operation re-pended while it runs (a rollback, its undo,
-   * then a redo, all mid-drain) stays pending, and it may already have made
-   * its last read of the ledger, missing a batch activated since. So a
-   * generation that finds a drain running waits for it, then drains again
-   * with a fresh pass that reads the ledger anew. Two generations waiting on
-   * the same drain share the fresh pass that follows it. Once stop() has
-   * begun, a drain sends nothing more, so a gate armed then completes with
-   * what it found pending left for the next start.
+   * Open MCPL connections' planes (every connection when none is given). A
+   * connection whose policy exchange is in flight stays closed, both planes,
+   * until its grant exists: its exchange's caller opens it once that settles
+   * (mcplPlanesMayOpen). A quiesced host (issue #122) opens only control
+   * planes, so data planes stay held for the whole maintenance window;
+   * resume() calls this again once the flag is cleared. Otherwise a control
+   * plane comes up even while quiesced, since host/command (and with it
+   * resume) rides it.
    */
-  private drainForGeneration(serverId: string): Promise<DiscordAwarenessDrainOutcome> {
-    const running = this.discordAwarenessDrains.get(serverId);
-    if (!running) return this.drainDiscordAwarenessOutbox(serverId);
-    return running.then((first) => this.drainDiscordAwarenessOutbox(serverId)
-      .then((fresh) => combineDrainOutcomes([first, fresh])));
-  }
-
-  /**
-   * Wait out the awareness gate for an inbound event: the generation current
-   * now, and any generation installed while waiting, until none is current
-   * or the current one is one already waited for. A handler that waited only
-   * for the generation it first saw would go on behind a newer one armed
-   * meanwhile. Rejects as the generation it waited for rejects.
-   */
-  private async awaitDiscordAwarenessBarriers(): Promise<void> {
-    let waited: DiscordAwarenessBarrier | null = null;
-    for (let barrier = this.discordAwarenessBarrier; barrier && barrier !== waited; barrier = this.discordAwarenessBarrier) {
-      waited = barrier;
-      await barrier.promise;
+  private readyMcplPlanes(connections?: McplServerConnection[]): void {
+    for (const connection of connections ?? this.mcplServerRegistry?.getAllServers() ?? []) {
+      if (!this.mcplPlanesMayOpen(connection)) continue;
+      if (this.quiesced) connection.readyControlPlane();
+      else connection.ready();
     }
   }
 
@@ -22196,16 +22608,15 @@ export class AgentFramework {
    * Per connection, the transport epoch whose §5.3 policy exchange is in
    * flight: a connect's, from when the registry hands the connection back,
    * or a reconnect's, from its 'reconnect' event. Until the exchange settles,
-   * that transport's traffic must wait for its grant, so a gate that opens
-   * every connection's planes meanwhile (another server's list change, a
-   * resume, an awareness sync, startup's staged open) passes it by
-   * (mcplPlanesMayOpen), and the exchange's own caller opens them once it
-   * settles (openMcplPlanesAfterExchange).
+   * that transport's traffic must wait for its grant, so readyMcplPlanes,
+   * which a resume and startup's staged open run over every connection,
+   * passes it by (mcplPlanesMayOpen), and the exchange's own caller opens its
+   * planes once it settles.
    */
   private readonly mcplPolicyExchanges = new WeakMap<McplServerConnection, number>();
 
-  /** Whether a gate may open this connection's planes: no policy exchange is
-   *  in flight on its current transport (see mcplPolicyExchanges). */
+  /** Whether readyMcplPlanes may open this connection's planes: no policy
+   *  exchange is in flight on its current transport (see mcplPolicyExchanges). */
   private mcplPlanesMayOpen(connection: McplServerConnection): boolean {
     const exchange = this.mcplPolicyExchanges.get(connection);
     return exchange === undefined || exchange !== connection.transportEpoch;
@@ -22213,15 +22624,15 @@ export class AgentFramework {
 
   /**
    * Run a connection's §5.3 policy exchange with its planes held: it is
-   * marked in flight for the transport it runs on, so no gate releases that
-   * transport's traffic before its grant exists. With `epoch`, it runs only
-   * on that transport: a runtime connect passes the one it registered, and
-   * if that transport is gone, the exchange isn't run, since a reconnect
+   * marked in flight for the transport it runs on, so no opener releases
+   * that transport's traffic before its grant exists. With `epoch`, it runs
+   * only on that transport: a runtime connect passes the one it registered,
+   * and if that transport is gone, the exchange isn't run, since a reconnect
    * that adopts a next transport, if one comes, runs that one's. With
    * `closeOnFailure`, as for a runtime connect or restart, an exchange that
    * throws closes the connection for good, through the registry, before it
    * lifts the marker: left live, the connection would be half registered,
-   * and unmarked before its close, a gate completing in between would let
+   * and unmarked before its close, an opener running in between would let
    * out what it held with no grant. A close that fails keeps the connection
    * registered, but closed for good, it readies nothing but its own reports.
    * Without `closeOnFailure`, as for a reconnect or a staged startup connect,
@@ -22249,141 +22660,6 @@ export class AgentFramework {
       // A newer transport's exchange may have taken the marker over.
       if (this.mcplPolicyExchanges.get(connection) === epoch) this.mcplPolicyExchanges.delete(connection);
     }
-  }
-
-  /**
-   * Open a connection's planes once its exchange has settled, when the gate
-   * its connect or reconnect installed was replaced during the exchange: the
-   * newer gate passed the connection by, and if it has completed, nothing
-   * else would open it. A connection whose transport dropped meanwhile is
-   * readied as any gate readies one between transports, so its own reports
-   * go on. How far follows what is held now: while a gate is up, only the
-   * control plane opens, since a gate holds data planes alone, and its
-   * completion, which no longer passes this connection by, opens the data
-   * plane; a quiesced host (issue #122) likewise opens only control planes;
-   * otherwise both open.
-   */
-  private openMcplPlanesAfterExchange(connection: McplServerConnection): void {
-    if (!this.mcplPlanesMayOpen(connection)) return;
-    if (this.discordAwarenessBarrier !== null || this.quiesced) connection.readyControlPlane();
-    else connection.ready();
-  }
-
-  /**
-   * Install one framework-global Discord-awareness generation before releasing
-   * any inference-bearing event. With pending work or a drain still running,
-   * every MCPL data plane is paused while the control planes remain live,
-   * but for a connection whose policy exchange is in flight, which neither
-   * the release nor the completion opens (mcplPlanesMayOpen).
-   * With neither, ready() runs synchronously so request responders preserve
-   * their historical same-stack behavior.
-   */
-  private installMcplDataPlaneGate(): DiscordAwarenessBarrier {
-    for (const connection of this.mcplServerRegistry?.getAllServers() ?? []) {
-      connection.pauseDataPlane();
-    }
-    const generation = ++this.discordAwarenessBarrierGeneration;
-
-    let begun: ReturnType<AgentFramework['beginDiscordAwarenessBarrier']>;
-    try {
-      begun = this.beginDiscordAwarenessBarrier();
-    } catch (error) {
-      begun = {
-        requiresBarrier: true,
-        promise: Promise.reject(error),
-      };
-    }
-    const barrier: DiscordAwarenessBarrier = { generation, ...begun };
-    this.discordAwarenessBarrier = barrier;
-    return barrier;
-  }
-
-  private releaseMcplDataPlaneGate(
-    barrier: DiscordAwarenessBarrier,
-  ): void {
-    if (this.discordAwarenessBarrier !== barrier) return;
-    if (barrier.requiresBarrier) {
-      for (const connection of this.mcplServerRegistry?.getAllServers() ?? []) {
-        // A connection whose policy exchange is in flight stays closed; its
-        // exchange opens it (openMcplPlanesAfterExchange).
-        if (this.mcplPlanesMayOpen(connection)) connection.readyControlPlane();
-      }
-      return;
-    }
-    this.completeMcplDataPlaneGate(barrier);
-  }
-
-  private completeMcplDataPlaneGate(
-    barrier: DiscordAwarenessBarrier,
-  ): boolean {
-    if (this.discordAwarenessBarrier !== barrier) return false;
-    this.discordAwarenessBarrier = null;
-    for (const connection of this.mcplServerRegistry?.getAllServers() ?? []) {
-      // ready() can synchronously flush a nested list-change notification that
-      // installs a newer global generation. Never let this older completion
-      // release any remaining server behind that newer gate. (The quiesce
-      // check sits AFTER this guard: readyControlPlane can also synchronously
-      // flush a control event that installs a newer barrier.)
-      if (this.discordAwarenessBarrier !== null) return false;
-      // A connection whose policy exchange is in flight stays closed, both
-      // planes, until its grant exists: its exchange opens it
-      // (openMcplPlanesAfterExchange).
-      if (!this.mcplPlanesMayOpen(connection)) continue;
-      // Host quiesce (issue #122): this is the single point every barrier
-      // completion and reconnect flow funnels through, so holding here keeps
-      // data planes paused across awareness drains and reconnects for the
-      // whole window. Control planes come up normally (host/command rides the
-      // control plane, so resume stays deliverable); resume() performs the
-      // real ready() flush through this same funnel once its feasibility gate
-      // passes and the flag is cleared.
-      if (this.quiesced) {
-        connection.readyControlPlane();
-        continue;
-      }
-      connection.ready();
-    }
-    return this.discordAwarenessBarrier === null;
-  }
-
-  private async failMcplDataPlaneGate(
-    barrier: DiscordAwarenessBarrier,
-    context: string,
-    error: unknown,
-  ): Promise<void> {
-    if (this.discordAwarenessBarrier !== barrier) return;
-    const err = error instanceof Error ? error : new Error(String(error));
-    console.error(`[discord-awareness] ${context} failed globally:`, err.message);
-    const connections = this.mcplServerRegistry?.getAllServers() ?? [];
-    for (const connection of connections) {
-      this.emitTrace({
-        type: 'mcpl:server-error',
-        serverId: connection.id,
-        error: `Discord awareness accounting unhealthy: ${err.message}`,
-      });
-    }
-    // A stopping host closes these connections itself, so recycling them now
-    // would start reconnects only for stop() to close them again. Release the
-    // barrier instead, as a completed one is released: nothing waits on a
-    // rejected barrier, and unless the host is quiesced, what the pause held
-    // back reaches the listeners' stopping refusal, except what a connection
-    // closed for good held, which stays held.
-    if (this.queue?.isClosed) {
-      this.completeMcplDataPlaneGate(barrier);
-      return;
-    }
-    await Promise.all(connections.map(async (connection) => {
-      await connection.reconnectAfterFailure().catch((closeError) => {
-        console.error(
-          `[discord-awareness] could not recycle unhealthy connection ${connection.id}:`,
-          closeError instanceof Error ? closeError.message : closeError,
-        );
-        // One without reconnect is closed, keeping a child it couldn't
-        // reap, so it won't serve again: its tools leave the agents' list,
-        // as a failed disconnect's do. One with reconnect is its reconnect
-        // loop's to settle, which halts (and refreshes) or serves again.
-        if (!connection.willReconnect) this.handleToolsListChanged(connection.id);
-      });
-    }));
   }
 
   /**
@@ -22429,7 +22705,7 @@ export class AgentFramework {
    */
   private async connectMcplServerInternal(
     config: import('./mcpl/types.js').McplServerConfig,
-    deferAwareness = false,
+    staged = false,
     claim?: McpRestartClaim,
   ): Promise<McplServerConnection | ModernMcpConnection> {
     if (this.stopHasBegun()) {
@@ -22450,7 +22726,7 @@ export class AgentFramework {
     if (taken) throw new Error(taken);
     const hold = this.holdMcpServerId(config.id, 'connect');
     try {
-      return await this.connectHeldMcplServer(config, family, deferAwareness, hold.displaced);
+      return await this.connectHeldMcplServer(config, family, staged, hold.displaced);
     } finally {
       hold.release();
     }
@@ -22463,24 +22739,25 @@ export class AgentFramework {
   private async connectHeldMcplServer(
     config: import('./mcpl/types.js').McplServerConfig,
     family: 'legacy' | 'modern',
-    deferAwareness: boolean,
+    staged: boolean,
     displaced: () => boolean,
   ): Promise<McplServerConnection | ModernMcpConnection> {
     if (!this.mcplServerRegistry || !this.mcplHostCapabilities) {
       throw new Error('MCPL subsystem is not initialized');
     }
 
-    // Every legacy connect needs a readable awareness ledger: a runtime
-    // connect's awareness barrier reconciles it, and a stdio child taking the
-    // protective default derives that from it. Read it first, so an
-    // unreadable ledger refuses the connect before anything is registered
-    // under its id or spawned (a reconnecting server would otherwise be left
-    // registered as a closed stub). With no outbox configured nothing is read.
-    // A modern connection has no awareness barrier and no reaction default.
-    // A ledger that breaks after this read meets the spawn's own read: a
-    // connect with `reconnect` then leaves its stub retrying until the ledger
-    // reads again, as a reconnect does, and one without refuses.
-    if (family === 'legacy') this.getPlacedReactionBaseline();
+    // A legacy stdio server with no baseline of its own takes the protective
+    // default, which is derived from the awareness ledger. Read it first, so
+    // an unreadable ledger refuses that connect explicitly, rather than
+    // spawning a child with a partial default, and before anything is
+    // registered under its id or spawned (a reconnecting server would
+    // otherwise be left registered as a closed stub). No other connect is
+    // refused over the ledger: awareness never gates MCPL, and a modern
+    // connection has no reaction default. A ledger that breaks after this
+    // read meets the spawn's own read: a connect with `reconnect` then leaves
+    // its stub retrying until the ledger reads again, as a reconnect does,
+    // and one without refuses.
+    if (family === 'legacy' && this.derivesReactionBaseline(config)) this.getPlacedReactionBaseline();
 
     // Register prefix + config for tool dispatch routing (idempotent with
     // the pre-registration pass in initializeMcpl). One config gives an id
@@ -22579,10 +22856,9 @@ export class AgentFramework {
     const abort = new AbortController();
     this.legacyConnectAborts().set(config.id, abort);
     try {
-      // Its policy exchange is in flight from its registration, through a
-      // runtime connect's awareness accounting, until the exchange settles: a
-      // gate that completes meanwhile (a resume, another server's list change
-      // or reconnect) passes the connection by, so nothing opens its planes
+      // Its policy exchange is in flight from its registration until the
+      // exchange settles: an opener that runs meanwhile (a resume, startup's
+      // staged open) passes the connection by, so nothing opens its planes
       // before its grant exists.
       connection = await this.mcplServerRegistry.addServer(
         connectionConfig,
@@ -22634,103 +22910,45 @@ export class AgentFramework {
       throw new Error(`MCP server "${config.id}" was not connected: ${why}${cleanup}`);
     }
 
-    // Wire listeners before either startup staging or the runtime global gate
-    // releases control traffic needed for registration and marker service.
+    // Wire listeners before any plane opens.
     this.wireMcplEvents(connection, config);
 
-    if (deferAwareness) {
-      // Staged startup: both planes are closed, so the §5.3 policy
-      // round-trip cannot let any buffered traffic slip — establish the
-      // grant now, before staging ever releases.
-      await this.settlePolicyExchange(config, connection);
+    // §5.3 initial policy handshake with both planes still closed (PR #79
+    // review blocker 3: an early control flush released channels-register/
+    // changed before any grant existed). The grant is established (or
+    // knowingly left empty) before ANY buffered traffic flows. A runtime
+    // connect runs it on the transport it registered: one that closed or was
+    // replaced since has no exchange here, and a reconnect that adopts a next
+    // transport, if one comes, runs that one's. A runtime connect or restart
+    // whose policy registration throws has its new connection closed for
+    // good by the exchange (closeOnFailure), through the registry, before its
+    // marker lifts: left live, it would be half registered. A staged startup
+    // connect's failure goes to initializeMcpl's loop, which logs it and goes
+    // on with the other servers.
+    await this.settlePolicyExchange(config, connection, staged ? {} : { closeOnFailure: true, epoch: registeredEpoch });
+    if (staged) {
       // Announced while the transport it registered still serves, checked
       // now. One whose transport dropped meanwhile, or a stub that has none
       // yet, is announced by the first reconnect still connected once its
-      // attempt settles, granted or not.
+      // attempt settles, granted or not. Staged startup opens every
+      // connection together (initializeMcpl).
       if (connection.transportEpoch === registeredEpoch && connection.isConnected) {
         this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
       }
       return connection;
     }
 
-    const awarenessBarrier = this.installMcplDataPlaneGate();
-    // NO early release: both planes stay closed through accounting AND the
-    // §5.3 policy round-trip below (PR #79 review blocker 3 — the early
-    // control flush released channels-register/changed before any grant
-    // existed). The awareness drain rides tools/call RESPONSES, which are
-    // never event-buffered, so it needs no plane release to make progress.
-    try {
-      await awarenessBarrier.promise;
-    } catch (error) {
-      // A connect cannot fail open on a broken awareness ledger. Disable the
-      // reconnecting stub/connection before propagating the distinct error to
-      // the runtime connect or restart that asked for it. (A startup connect
-      // defers awareness and returns before this gate; a startup that fails
-      // ends in create()'s release, which closes its servers.)
-      // That close goes through the registry, which drops the entry itself
-      // rather than waiting for a 'close' event: close() emits none for a
-      // connection that's down between retries, such as a stub waiting for
-      // its next retry, and a stub left registered would refuse a later
-      // connect of its id as already registered.
-      // Then fail the gate, as every other runtime gate does when its
-      // accounting fails. Installing it paused every registered server's
-      // data plane, and left standing it would hold their data until some
-      // other gate completed. While serving, failMcplDataPlaneGate recycles
-      // those servers, so a server without `reconnect: true` stays closed;
-      // while stopping, it releases the gate. It runs after the close, which
-      // has taken this connection out of the registry unless the close
-      // failed, which closeFailedRuntimeConnect logs.
-      // Ordering matters: awareness accounting settles BEFORE the §5.3
-      // policy round-trip below, so an accounting failure aborts with the
-      // grant still empty and every buffered event still behind the gate —
-      // a failed connect never reports a released data plane. (The reverse
-      // order let a push arrive during the policy await and get flushed by
-      // teardown.)
-      // Its exchange marker lifts only after the close, so no gate opens it
-      // in between; closed for good, it readies nothing but its own reports.
-      await this.closeFailedRuntimeConnect(connection, 'awareness accounting');
-      this.mcplPolicyExchanges.delete(connection);
-      await this.failMcplDataPlaneGate(awarenessBarrier, `connect of MCPL server "${config.id}"`, error);
-      throw error;
-    }
-
-    // §5.3 initial policy handshake — after accounting, before the gate
-    // completes: the grant is established (or knowingly left empty) before
-    // ANY buffered traffic (control or data) flows. complete() then
-    // ready()s both planes through the admission gate.
-    // On the transport the connect registered: one that closed or was
-    // replaced during the accounting has no exchange here, and a reconnect
-    // that adopts a next transport, if one comes, runs that one's.
-    try {
-      await this.settlePolicyExchange(config, connection, { closeOnFailure: true, epoch: registeredEpoch });
-    } catch (error) {
-      // A policy registration that throws would leave the new connection
-      // live and half registered, and the gate standing over every other
-      // server's data. So the exchange has closed the connection for good
-      // through the registry, as the catch above does, before lifting its
-      // marker; complete the gate rather than fail it: accounting succeeded,
-      // so nothing calls for a recycle. A close that fails keeps the
-      // connection registered, but a connection closed for good readies
-      // nothing but its own reports, so this completion, and any later one,
-      // leaves it paused.
-      // Every exit of a runtime connect settles the gate it installed.
-      this.completeMcplDataPlaneGate(awarenessBarrier);
-      throw error;
-    }
-    // Its own gate opens it while that gate is current. A newer gate that
-    // replaced it during the exchange passed the connection by, whether or
-    // not its transport still serves.
-    const replaced = this.discordAwarenessBarrier !== awarenessBarrier;
-    this.completeMcplDataPlaneGate(awarenessBarrier);
-    if (replaced) this.openMcplPlanesAfterExchange(connection);
-
+    this.readyMcplPlanes([connection]);
     // Announced while the transport it registered still serves, checked
-    // now, after the completion's flush. One whose transport dropped
-    // meanwhile, or a stub that has none yet, is announced by the first
-    // reconnect still connected once its attempt settles, granted or not.
+    // now, after the open's flush. One whose transport dropped meanwhile, or
+    // a stub that has none yet, is announced by the first reconnect still
+    // connected once its attempt settles, granted or not.
     if (connection.transportEpoch === registeredEpoch && connection.isConnected) {
       this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
     }
+    // A connection can make queued awareness work deliverable; it never
+    // waits on it.
+    this.deliverDiscordAwarenessInBackground('connect', 'host');
     return connection;
   }
 
@@ -23159,6 +23377,16 @@ export class AgentFramework {
   // ==========================================================================
 
   /**
+   * Whether this server's child takes the framework's protective reaction
+   * default: a stdio server with no baseline declared in its env or
+   * inherited from the host. Only such a connect reads the awareness
+   * ledger (getPlacedReactionBaseline).
+   */
+  private derivesReactionBaseline(config: McplServerConfig): boolean {
+    return !isWebSocketTransport(config) && !this.declaredReactionBaseline(config);
+  }
+
+  /**
    * Snapshot the protective Discord reaction default for this deployment, as
    * suppression tokens: the forms the Discord adapter's suppression matcher
    * reads, not marker payloads for an add, a remove or a replay. It covers
@@ -23489,13 +23717,12 @@ export class AgentFramework {
     }
     const collision = this.mcplPrefixCollision(config, id);
     if (collision) throw new Error(collision);
-    // A legacy connect reads the awareness ledger: its awareness barrier
-    // reconciles it, and a stdio child taking the protective default derives
-    // that from it. Read it before disconnecting, so an unreadable ledger
-    // refuses the restart and leaves the running child up, whatever the
-    // server's baseline or transport. (No outbox configured: nothing to read.)
-    // A modern connection reads neither.
-    if (family === 'legacy') this.getPlacedReactionBaseline();
+    // A legacy server that takes the protective default reads the awareness
+    // ledger at its connect. Read it before disconnecting, so an unreadable
+    // ledger refuses that restart and leaves the running child up. A server
+    // with a baseline of its own, a WebSocket one or a modern one restarts
+    // whatever the ledger's state: awareness never gates MCPL.
+    if (family === 'legacy' && this.derivesReactionBaseline(config)) this.getPlacedReactionBaseline();
 
     const claim: McpRestartClaim = { restarting: id };
     const prefix = config.toolPrefix ?? `mcpl--${config.id}`;
@@ -23918,7 +24145,7 @@ export class AgentFramework {
       };
       try {
         // Invoke immediately: control-plane responses must retain their
-        // ACK-before-reconcile ordering and data-plane barrier semantics.
+        // ACK-before-reconcile ordering.
         const result = handler(params, tracked);
         if (result) {
           // On this path the report runs as a rejection handler, where a
@@ -23980,12 +24207,8 @@ export class AgentFramework {
       params: PushEventParams,
       responder?: { respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
-      // Only when a generation is current: with none, the event is handled in
-      // the turn it arrives, as it always was (the push coalescer's ordering of
-      // a push against its retraction depends on that).
-      if (this.discordAwarenessBarrier) await this.awaitDiscordAwarenessBarriers();
-      // Checked here, after the barrier and before anything records the
-      // push as accepted: a stopped host refuses it.
+      // Checked before anything records the push as accepted: a stopped
+      // host refuses it.
       if (this.queue?.isClosed) {
         this.refuseServerItem('push/event', connection.id, responder);
         return;
@@ -24013,7 +24236,6 @@ export class AgentFramework {
         return;
       }
       if (this.inferenceRouter && responder) {
-        if (this.discordAwarenessBarrier) await this.awaitDiscordAwarenessBarriers();
         // A stopping host starts no inference for a server: refused, like a
         // push, before the router runs.
         if (this.queue?.isClosed) {
@@ -24118,7 +24340,6 @@ export class AgentFramework {
       params: ChannelsIncomingParams,
       responder?: { respond: (result: unknown) => void; respondError?: (code: number, message: string) => void },
     ) => {
-      if (this.discordAwarenessBarrier) await this.awaitDiscordAwarenessBarriers();
       if (this.queue?.isClosed) {
         this.refuseServerItem('channels/incoming', connection.id, responder);
         return;
@@ -24132,7 +24353,6 @@ export class AgentFramework {
       responder?: { respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
       if (!responder) return;
-      if (this.discordAwarenessBarrier) await this.awaitDiscordAwarenessBarriers();
       // A stopping host runs no host command: refused like the requests
       // above, before its handler runs, from the moment stop() has begun.
       if (this.stopHasBegun()) {
@@ -24145,29 +24365,12 @@ export class AgentFramework {
 
     // Handle dynamic tool list changes (notifications/tools/list_changed).
     // Contained like every inbound handler: a synchronous failure here emits
-    // mcpl:request-handler-error. A failure of the awareness accounting its
-    // barrier waits on is global, and failMcplDataPlaneGate reports it for
-    // every connection (mcpl:server-error) as it recycles them.
+    // mcpl:request-handler-error.
     onRequest('tools-list-changed', () => {
-      // Pause before starting any async refresh. This listener runs
-      // synchronously in the transport line callback, so a following inbound
-      // data event cannot pass before the new barrier exists.
-      const awarenessBarrier = this.installMcplDataPlaneGate();
-      this.releaseMcplDataPlaneGate(awarenessBarrier);
-      try {
-        this.handleToolsListChanged(connection.id);
-      } finally {
-        // A throw from the refresh is contained like the handler's; the gate
-        // is still completed when its barrier settles, or failed with it, as
-        // on the way through.
-        void awarenessBarrier.promise.then(() => {
-          this.completeMcplDataPlaneGate(awarenessBarrier);
-        }).catch((error) => this.failMcplDataPlaneGate(
-          awarenessBarrier,
-          'tools-list reconciliation',
-          error,
-        ));
-      }
+      this.handleToolsListChanged(connection.id);
+      // A server re-listing its tools is a natural moment to retry queued
+      // awareness work for it; delivery never holds its traffic.
+      this.deliverDiscordAwarenessInBackground('list-change', 'host');
     });
 
     // Re-establish full server registration on reconnect. The 'close' handler
@@ -24178,19 +24381,16 @@ export class AgentFramework {
     // preserved across the transient close are resumed by idempotent
     // registration. Then refresh tools (server may have different tools).
     connection.on('reconnect', (info?: { attempts?: number }) => {
-      // Install the barrier synchronously so any inbound event emitted after
-      // reconnect observes it before doing work that could wake an agent. The
-      // connection closed both planes before wiring the fresh transport.
-      const awarenessBarrier = this.installMcplDataPlaneGate();
-      // Async: the §5.3 policy Request must be answered (re-establishing the
-      // grant) before either plane opens — otherwise the first post-reconnect
-      // traffic, control included (the server's channels/register), lands
-      // while the grant is still empty and is rejected fail-closed instead of
-      // delivered. The exchange is marked in flight for this transport
-      // synchronously, here (settlePolicyExchange), so no other gate opens
-      // the planes meanwhile.
+      // The connection closed both planes before wiring the fresh transport.
+      // Re-establish the grant first: the §5.3 policy Request must be
+      // answered before either plane opens — otherwise the first
+      // post-reconnect traffic, control included (the server's
+      // channels/register), lands while the grant is still empty and is
+      // rejected fail-closed instead of delivered. The exchange is marked in
+      // flight for this transport synchronously, here (settlePolicyExchange),
+      // so no opener opens the planes meanwhile (readyMcplPlanes).
       const epoch = connection.transportEpoch;
-      const reregistered = (async () => {
+      void (async () => {
         try {
           const config = this.mcplServerConfigs.get(connection.id);
           if (config) await this.settlePolicyExchange(config, connection);
@@ -24201,32 +24401,18 @@ export class AgentFramework {
           );
         }
         // Settled, granted or not (an unanswered or refused policy leaves the
-        // grant empty and the connection MCP-only, as at initial connect). A
-        // transport that dropped meanwhile isn't relisted or announced here:
+        // grant empty and the connection MCP-only, as at initial connect):
+        // open the planes. A connection whose transport dropped meanwhile is
+        // readied as any opener readies one between transports, so its own
+        // reports go on; one whose next transport's exchange is in flight
+        // stays closed, and that reconnect's handler opens it once it settles.
+        this.readyMcplPlanes([connection]);
+        // A transport that dropped meanwhile isn't relisted or announced here:
         // its close reported it gone, and a next reconnect, if one comes,
-        // relists and announces it.
-        // Its own gate opens it while that gate is current. A newer gate that
-        // replaced it during the exchange passed the connection by, whether
-        // or not its transport still serves: a connection between transports
-        // is readied as any gate readies one, so its own reports go on.
-        const replaced = this.discordAwarenessBarrier !== awarenessBarrier;
-        this.releaseMcplDataPlaneGate(awarenessBarrier);
-        if (replaced) this.openMcplPlanesAfterExchange(connection);
-        // Relisted while this transport still serves, checked after the
-        // release's flush, whose listeners can close it.
-        if (connection.transportEpoch === epoch && connection.isConnected) this.handleToolsListChanged(connection.id);
-      })();
-      // The gate completes, and the data planes go ready, only once both the
-      // awareness drain and the re-registration have finished. A drain can
-      // settle first (one already running, or little to send), and the grant
-      // must exist before the first data-plane event flows.
-      void Promise.all([awarenessBarrier.promise, reregistered]).then(() => {
-        if (awarenessBarrier.requiresBarrier) this.completeMcplDataPlaneGate(awarenessBarrier);
-        // Announced while this transport is still the connection's, whether
-        // its own gate completed or a newer one replaced it. One that dropped
-        // meanwhile, even after its exchange, has had its close's
-        // module:removed, and a next reconnect, if one comes, announces it.
+        // relists and announces it. Checked after the open's flush, whose
+        // listeners can close it.
         if (connection.transportEpoch !== epoch || !connection.isConnected) return;
+        this.handleToolsListChanged(connection.id);
         this.emitTrace({
           type: 'mcpl:server-reconnected',
           serverId: connection.id,
@@ -24235,11 +24421,10 @@ export class AgentFramework {
         // Mirror the module:removed emitted on 'close' so module-lifecycle
         // consumers see the server come back, not just vanish.
         this.emitTrace({ type: 'module:added', moduleName: `mcpl:${connection.id}` });
-      }).catch((error) => this.failMcplDataPlaneGate(
-        awarenessBarrier,
-        'reconnect reconciliation',
-        error,
-      ));
+        // Work queued while the route was down can be sent now; it never
+        // holds this connection's traffic.
+        this.deliverDiscordAwarenessInBackground('reconnect', 'host');
+      })();
     });
 
     // Surface connect/reconnect failures. Before these traces existed the
@@ -24393,8 +24578,7 @@ export class AgentFramework {
    * A list change, including the relist after a reconnect, takes the legacy
    * engine's refresh path (`handleToolsListChanged`), so any wake it causes
    * goes through ordinary admission: it parks under quiesce or a hold like
-   * every other wake. It installs no awareness gate, since that gate orders
-   * MCPL data-plane traffic, which this family doesn't carry.
+   * every other wake.
    */
   private wireModernEvents(connection: ModernMcpConnection, config: McplServerConfig): void {
     const recorded = serverTextRedactor(config);
