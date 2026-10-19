@@ -571,26 +571,26 @@ test('a direct read whose root is replaced as it reads says to read again', asyn
   assert.equal(await failure(m, 'read', { path: 'ref/a.txt' }), 'File not found: ref/a.txt');
 });
 
-test("every mount takes a path's '.' and empty segments, trailing slash and '..' as the file they name, and answers with one spelling", async (t) => {
+test("a direct mount refuses a '.' or '..' segment, and a file operation's trailing slash, in words of its own", async (t) => {
   const env = new Env(t);
   env.file('a.ts', 'alpha\n');
   env.file('dir/x.ts', 'alpha x\n');
-  symlinkSync(join(env.root, 'elsewhere'), join(env.ref, 'link'));
-  for (const m of [await env.open(), await env.openChronicle()]) {
-    const kind = m.getTools().some((tool) => /\bdirect\b/.test(tool.description)) ? 'direct' : 'chronicle';
-    for (const path of ['ref/./a.ts', 'ref/dir/../a.ts', 'ref/a.ts/', 'ref//a.ts', 'ref/link/../a.ts', 'ref/../ref/a.ts']) {
-      assert.deepEqual(await data(m, 'read', { path }), { path: 'ref/a.ts', totalLines: 1, fromLine: 1, toLine: 1, content: '     1\talpha' }, `${kind} ${path}`);
-    }
-    assert.equal((await data<{ path: string }>(m, 'ls', { path: 'ref/dir/' })).path, 'ref/dir', kind);
-    assert.equal((await data<{ path: string }>(m, 'ls', { path: 'ref/dir/..' })).path, 'ref', kind);
-    for (const path of ['ref/dir/', 'ref/./dir', 'ref//dir']) {
-      assert.deepEqual((await data<{ results: Array<{ file: string }> }>(m, 'grep', { pattern: 'alpha', path })).results.map((r) => r.file), ['ref/dir/x.ts'], `${kind} ${path}`);
-      assert.deepEqual((await data<{ matches: Array<{ path: string }> }>(m, 'glob', { pattern: '*.ts', path })).matches.map((x) => x.path), ['ref/dir/x.ts'], `${kind} ${path}`);
-    }
-    for (const path of ['ref/../outside.txt', 'ref/dir/../../outside.txt']) {
-      assert.match(await failure(m, 'read', { path }), /^Path traversal detected/, `${kind} ${path}`);
-    }
-  }
+  env.file('dot.png', PNG);
+  const m = await env.open();
+  const segment = (path: string) => `Path not taken: ${JSON.stringify(path)} has a "." or ".." segment, which a direct mount doesn't read: name the file from the mount's root without it`;
+  for (const path of ['ref/./a.ts', 'ref/dir/../a.ts', 'ref/dir/..']) assert.equal(await failure(m, 'read', { path }), segment(path), path);
+  assert.equal(await failure(m, 'ls', { path: 'ref/./dir' }), segment('ref/./dir'));
+  assert.equal(await failure(m, 'glob', { pattern: '*.ts', path: 'ref/dir/..' }), segment('ref/dir/..'));
+  assert.equal(await failure(m, 'grep', { pattern: 'alpha', path: 'ref/./dir' }), segment('ref/./dir'));
+  // A path that leaves the mount is refused as traversal, as before.
+  assert.match(await failure(m, 'read', { path: 'ref/../outside.txt' }), /^Path traversal detected/);
+
+  const slash = (path: string) => `Path not taken: ${JSON.stringify(path)} ends with "/", which a direct mount's file operations don't read: name the file without it`;
+  assert.equal(await failure(m, 'read', { path: 'ref/a.ts/' }), slash('ref/a.ts/'));
+  assert.equal(await failure(m, 'read_image', { path: 'ref/dot.png/' }), slash('ref/dot.png/'));
+  assert.deepEqual(await m.readBinary('ref/a.ts/'), { error: slash('ref/a.ts/') });
+  // A directory's path may end with one.
+  assert.deepEqual((await data(m, 'ls', { path: 'ref/dir/' })).entries, [{ name: 'x.ts', type: 'file', size: 8 }]);
 });
 
 test("ls without a path and status give a direct mount's kind and ignore list, and a 'chronicle' mount's as before", async (t) => {
@@ -732,7 +732,7 @@ test("a mount the store holds changes on that disk lacks runs as 'chronicle', sa
   warned.mock.restore();
   // The ways out come before the list of what's held, so a webhook that
   // keeps only a long alert's start and end still gives them.
-  const message = 'Mount "ref" runs as \'chronicle\' this session, not direct: the workspace holds 4 changes there that disk lacks. '
+  const message = 'Mount "ref" runs as \'chronicle\' this session, not direct: there the workspace holds 4 changes that disk lacks. '
     + 'To start it direct, settle each: sync its path to take disk\'s copy, or materialize it with the mount configured '
     + '\'chronicle\' and read-write, as materialize\'s answer directs. The first start that finds none starts it direct. '
     + 'Held: "ref/both.ts" (in conflict), "ref/deleted.ts" (deleted in the workspace), "ref/dot.img" (in conflict), '
@@ -740,9 +740,13 @@ test("a mount the store holds changes on that disk lacks runs as 'chronicle', sa
   assert.deepEqual(env.alerts, [{ kind: 'workspace-mount-not-direct', agent: 'framework', message, data: { held: { ref: 4 } } }]);
   assert.deepEqual(warned.mock.calls.map((c) => c.arguments), [[`[workspace] ${message}`]]);
   // As a 'chronicle' mount, unwatched, with no catch-up scan to take turns
-  // with its syncs, its changes in view.
+  // with its syncs, its changes in view, and saying what it runs as and the
+  // ignore list it walks by.
+  const ignore = ['node_modules', 'dist', '.git', 'build', 'coverage', 'target', '__pycache__', '.venv'];
+  assert.deepEqual((await data(held, 'ls')).mounts, [{ name: 'ref', path: env.ref, mode: 'read-only', backend: 'chronicle', ignore }]);
   const status = await data<Record<string, Record<string, unknown>>>(held, 'status');
-  assert.equal(status.ref!.backend, undefined);
+  assert.equal(status.ref!.backend, 'chronicle');
+  assert.deepEqual(status.ref!.ignore, ignore);
   assert.equal(status.ref!.watch, 'never');
   assert.deepEqual(watched(held), []);
   assert.equal(status.ref!.pendingChanges, 4);
@@ -786,35 +790,38 @@ test("the changes that keep a mount from starting direct are named ten at a time
   assert.equal(env.alerts.length, 1);
   const unreadable = (path: string) => `"ref/${path}" (its workspace intent can't be read)`;
   const shown = [unreadable('aa.ts'), unreadable('d00.ts'), ...Array.from({ length: 8 }, (_, i) => `"ref/d0${i + 1}.ts" (changed in the workspace)`)];
+  // An intent it can't read is counted as one, not as a change.
+  assert.ok(env.alerts[0]!.message.startsWith("Mount \"ref\" runs as 'chronicle' this session, not direct: there the workspace holds 10 changes that disk lacks and 2 intents it can't read. "), env.alerts[0]!.message);
   assert.ok(env.alerts[0]!.message.endsWith(`Held: ${shown.join(', ')}, and 2 more.`), env.alerts[0]!.message);
   assert.deepEqual(env.alerts[0]!.data, { held: { ref: 12 } });
 });
 
 test('each kind of change the store holds keeps a mount configured direct from starting direct on its own', async (t) => {
-  const cases: Array<[string, (env: Env) => Promise<void>, string]> = [
+  const cases: Array<[string, (env: Env) => Promise<void>, string, string]> = [
     ['a workspace deletion', async (env) => {
       env.file('gone.ts', 'kept on disk\n');
       const chronicle = await env.openChronicle();
       await data(chronicle, 'ls', { path: 'ref' });
       await data(chronicle, 'delete', { path: 'ref/gone.ts' });
       await env.close(chronicle);
-    }, '"ref/gone.ts" (deleted in the workspace)'],
+    }, '1 change that disk lacks', '"ref/gone.ts" (deleted in the workspace)'],
     ['a conflict', async (env) => {
       await env.close(await env.openChronicle());
       new BranchIntents(env.store, 'workspace/ref/intent').put('c.ts', { conflict: { kind: 'both-changed', at: 0, disk: null } });
-    }, '"ref/c.ts" (in conflict)'],
+    }, '1 change that disk lacks', '"ref/c.ts" (in conflict)'],
     ["an intent that can't be read", async (env) => {
       await env.close(await env.openChronicle());
       env.store.treeSet('workspace/ref/intent', 'u.ts', { blobHash: 'f'.repeat(64), size: 2, mode: 0 });
-    }, `"ref/u.ts" (its workspace intent can't be read)`],
+    }, "1 intent it can't read", `"ref/u.ts" (its workspace intent can't be read)`],
   ];
-  for (const [kind, hold, named] of cases) {
+  for (const [kind, hold, counted, named] of cases) {
     const env = new Env(t);
     await hold(env);
     const m = await env.open();
     assert.equal(env.alerts.length, 1, kind);
+    assert.ok(env.alerts[0]!.message.startsWith(`Mount "ref" runs as 'chronicle' this session, not direct: there the workspace holds ${counted}. `), env.alerts[0]!.message);
     assert.ok(env.alerts[0]!.message.endsWith(`Held: ${named}.`), env.alerts[0]!.message);
-    assert.equal((await data<Record<string, Record<string, unknown>>>(m, 'status')).ref!.backend, undefined, kind);
+    assert.equal((await data<Record<string, Record<string, unknown>>>(m, 'status')).ref!.backend, 'chronicle', kind);
   }
 });
 
@@ -828,13 +835,21 @@ test('mounts configured direct that the store holds changes on are named in one 
   await data(chronicle, 'write', { path: 'other/c.ts', content: 'c\n' });
   await env.close(chronicle);
 
-  await env.open({}, [{ name: 'other', path: other, mode: 'read-only', backend: 'direct' }]);
+  const both = await env.open({}, [{ name: 'other', path: other, mode: 'read-only', backend: 'direct' }]);
   assert.equal(env.alerts.length, 1);
-  assert.ok(env.alerts[0]!.message.startsWith('Mounts "ref" and "other" run as \'chronicle\' this session, not direct: the workspace holds '
-    + 'changes there that disk lacks (1 in "ref", 2 in "other"). To start one direct, settle each:'), env.alerts[0]!.message);
+  assert.ok(env.alerts[0]!.message.startsWith('Mounts "ref" and "other" run as \'chronicle\' this session, not direct: there the workspace holds '
+    + 'changes that disk lacks (1 in "ref", 2 in "other"). To start one direct, settle each:'), env.alerts[0]!.message);
   assert.ok(env.alerts[0]!.message.endsWith('Held: "ref/a.ts" (changed in the workspace), "other/b.ts" (changed in the workspace), '
     + '"other/c.ts" (changed in the workspace).'), env.alerts[0]!.message);
   assert.deepEqual(env.alerts[0]!.data, { held: { ref: 1, other: 2 } });
+  await env.close(both);
+
+  // An intent it can't read, in either mount, is named as one.
+  env.store.treeSet('workspace/other/intent', 'u.ts', { blobHash: 'f'.repeat(64), size: 2, mode: 0 });
+  env.alerts = [];
+  await env.open({}, [{ name: 'other', path: other, mode: 'read-only', backend: 'direct' }]);
+  assert.ok(env.alerts[0]!.message.startsWith('Mounts "ref" and "other" run as \'chronicle\' this session, not direct: there the workspace holds '
+    + "changes that disk lacks or intents it can't read (1 in \"ref\", 3 in \"other\"). "), env.alerts[0]!.message);
 });
 
 test('a start of the same module decides again whether a mount configured direct runs direct', async (t) => {

@@ -32,9 +32,12 @@ export interface MountConfig {
    *   `watchRootPollMs`, `wakeOnChange` or `autoMaterialize`: each of those
    *   would never act, and the workspace refuses the mount. Its `ignore`
    *   has a default (see there). Paths, links, other mounts' directories,
-   *   size limits and the walk cap hold as on a 'chronicle' mount. Its
-   *   tools read beneath whatever directory is at its root, with no check
-   *   against the one a 'chronicle' run of it last agreed with.
+   *   size limits and the walk cap hold as on a 'chronicle' mount. It
+   *   refuses a path with a `.` or `..` segment, which a 'chronicle'
+   *   mount's store refuses, and a file's path ending in `/`, where a
+   *   'chronicle' mount's read finds no file. Its tools read beneath
+   *   whatever directory is at its root, with no check against the one a
+   *   'chronicle' run of it last agreed with.
    *
    * A mount configured 'direct' runs as 'chronicle' from a start that finds
    * the store holding changes there that disk lacks, on the branch selected
@@ -43,9 +46,10 @@ export interface MountConfig {
    * of those. They stay in view, and the workspace says so on stderr and
    * through the framework's ops alerts, naming them and the ways to start it
    * direct. It runs unwatched, and walks by the direct kind's default
-   * ignore list where its config names none. A mount that ran direct and
-   * runs as 'chronicle' again takes in what disk changed meanwhile, as
-   * after any time away.
+   * ignore list where its config names none; `ls` without a path, and
+   * `status`, give its `backend` as 'chronicle' and that list. A mount that
+   * ran direct and runs as 'chronicle' again takes in what disk changed
+   * meanwhile, as after any time away.
    */
   backend?: 'chronicle' | 'direct';
   /**

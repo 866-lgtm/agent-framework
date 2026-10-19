@@ -988,7 +988,7 @@ export class WorkspaceModule implements Module {
       const held = this.heldChanges(state);
       const what = new Map<string, string>();
       for (const path of held.owed) what.set(path, 'changed in the workspace');
-      for (const path of held.unreadable) what.set(path, "its workspace intent can't be read");
+      for (const path of held.unreadable) what.set(path, UNREADABLE_INTENT);
       for (const path of held.deletions) what.set(path, 'deleted in the workspace');
       for (const path of held.conflicts) what.set(path, 'in conflict');
       if (what.size === 0) continue;
@@ -1405,10 +1405,21 @@ export class WorkspaceModule implements Module {
     const mounts = [...this.notDirect];
     const names = mounts.map(([name]) => `"${name}"`);
     const named = names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
-    const changes = (n: number) => `${n} change${n === 1 ? '' : 's'}`;
+    // An intent the workspace can't read may hold a change or may not, so
+    // it's counted as what it is.
+    const unreadable = (paths: Array<{ what: string }>) => paths.filter((h) => h.what === UNREADABLE_INTENT).length;
+    const counted = (paths: Array<{ what: string }>) => {
+      const u = unreadable(paths);
+      const c = paths.length - u;
+      return [
+        c > 0 ? `${c} change${c === 1 ? '' : 's'} that disk lacks` : '',
+        u > 0 ? `${u} intent${u === 1 ? '' : 's'} it can't read` : '',
+      ].filter((part) => part !== '').join(' and ');
+    };
     const why = mounts.length === 1
-      ? `Mount ${named} runs as 'chronicle' this session, not direct: the workspace holds ${changes(mounts[0]![1].length)} there that disk lacks.`
-      : `Mounts ${named} run as 'chronicle' this session, not direct: the workspace holds changes there that disk lacks (` +
+      ? `Mount ${named} runs as 'chronicle' this session, not direct: there the workspace holds ${counted(mounts[0]![1])}.`
+      : `Mounts ${named} run as 'chronicle' this session, not direct: there the workspace holds changes that disk lacks` +
+        `${mounts.some(([, paths]) => unreadable(paths) > 0) ? " or intents it can't read" : ''} (` +
         `${mounts.map(([name, held]) => `${held.length} in "${name}"`).join(', ')}).`;
     const held = mounts.flatMap(([name, paths]) => paths.map((h) => `"${name}/${h.path}" (${h.what})`));
     const message = `${why} To start ${mounts.length === 1 ? 'it' : 'one'} direct, settle each: sync its path to take disk's copy, ` +
@@ -2232,7 +2243,13 @@ export class WorkspaceModule implements Module {
    * it, naming the innermost mount that holds it and the path to use there.
    */
   private async parseFilePath(path: string): Promise<{ mount: MountState; relativePath: string; path: string }> {
-    const parsed = this.refuseNested(await this.parsePath(path));
+    const spelled = await this.parsePath(path);
+    // After a trailing slash a store-backed mount's read finds no file. A
+    // direct mount's would read the file and answer with the slash.
+    if (spelled.mount.direct && spelled.relativePath.endsWith('/')) {
+      throw new Error(`Path not taken: ${JSON.stringify(path)} ends with "/", which a direct mount's file operations don't read: name the file without it`);
+    }
+    const parsed = this.refuseNested(spelled);
     // A path can also reach a nested mount's directory through a symlink on
     // its way. No push of this mount writes it there and no read reads it,
     // so it's refused here, before anything is stored, and the checks where
@@ -2289,11 +2306,17 @@ export class WorkspaceModule implements Module {
    */
   private async parsePath(path: string): Promise<{ mount: MountState; relativePath: string; path: string }> {
     const given = this.parsePathAsGiven(path);
+    // A store-backed mount's store refuses a `.` or `..` segment as an
+    // invalid tree path. A direct mount reads disk, which would take it and
+    // answer with the path so spelled, giving one file several names.
+    if (given.mount.direct && given.relativePath.split('/').some((segment) => segment === '.' || segment === '..')) {
+      throw new Error(`Path not taken: ${JSON.stringify(path)} has a "." or ".." segment, which a direct mount doesn't read: name the file from the mount's root without it`);
+    }
     const relativePath = await diskSpelling(resolve(given.mount.config.path), given.relativePath, given.mount.direct ? undefined : this.entriesOf(given.mount));
     return {
       mount: given.mount,
       relativePath,
-      path: relativePath === given.relativePath ? given.path : `${given.mount.config.name}/${relativePath}`,
+      path: relativePath === given.relativePath ? path : `${given.mount.config.name}/${relativePath}`,
     };
   }
 
@@ -2321,13 +2344,9 @@ export class WorkspaceModule implements Module {
   }
 
   /**
-   * Parse a mount-prefixed path into its mount and mount-relative path, with
-   * its `.` and empty segments and a trailing slash dropped and each `..`
-   * taken lexically, and `path` the mount-prefixed path so spelled: the path
-   * as given where nothing was dropped, so each file has one spelling. A
-   * path that leaves the mount is refused.
+   * Parse a mount-prefixed path into (mountName, relativePath), as spelled.
    */
-  private parsePathAsGiven(path: string): { mount: MountState; relativePath: string; path: string } {
+  private parsePathAsGiven(path: string): { mount: MountState; relativePath: string } {
     // A file's name on disk is UTF-8, which can't hold a lone surrogate: the
     // store would keep one name and disk another.
     if (LONE_SURROGATE.test(path)) {
@@ -2335,7 +2354,7 @@ export class WorkspaceModule implements Module {
     }
     const slashIdx = path.indexOf('/');
     const mountName = slashIdx >= 0 ? path.slice(0, slashIdx) : path;
-    const asGiven = slashIdx >= 0 ? path.slice(slashIdx + 1) : '';
+    const relativePath = slashIdx >= 0 ? path.slice(slashIdx + 1) : '';
 
     const mount = this.mounts.get(mountName);
     if (!mount) {
@@ -2348,18 +2367,13 @@ export class WorkspaceModule implements Module {
     // prefix-matches there and every in-mount path was rejected as traversal.
     // Against the resolved root, so a root configured with a trailing
     // separator, or relative, contains its own paths, the root included.
-    // The path the tools take is the one this resolves to, so each file has
-    // one spelling: `.` and empty segments are dropped, a trailing slash
-    // with them, and a `..` takes back the segment before it, lexically, as
-    // a shell's `cd` reads `link/..`.
     const root = resolve(mount.config.path);
-    const resolved = resolve(root, asGiven.split('/').filter((segment) => segment !== '' && segment !== '.').join('/'));
+    const resolved = resolve(root, relativePath);
     if (!isContainedPath(root, resolved)) {
       throw new Error(`Path traversal detected: "${path}" resolves outside mount "${mountName}"`);
     }
-    const relativePath = resolved === root ? '' : relative(root, resolved).split(sep).join('/');
 
-    return { mount, relativePath, path: relativePath === asGiven ? path : relativePath ? `${mountName}/${relativePath}` : mountName };
+    return { mount, relativePath };
   }
 
   /**
@@ -3443,13 +3457,14 @@ export class WorkspaceModule implements Module {
 
   private async handleLs(input: LsInput): Promise<ToolResult> {
     if (!input.path) {
-      // List all mounts, with a direct mount's kind and the ignore list it
-      // walks by, whose default no config shows.
+      // List all mounts, with the kind a mount configured direct runs as
+      // this session and the ignore list it walks by, whose default no
+      // config shows.
       const mounts = [...this.mounts.entries()].map(([name, m]) => ({
         name,
         path: m.config.path,
         mode: m.config.mode,
-        ...(m.direct ? { backend: 'direct', ignore: this.ignoreOf(m) } : {}),
+        ...(m.config.backend === 'direct' ? { backend: m.direct ? 'direct' : 'chronicle', ignore: this.ignoreOf(m) } : {}),
       }));
       return { success: true, data: { mounts } };
     }
@@ -3876,6 +3891,10 @@ export class WorkspaceModule implements Module {
       status[name] = {
         path: mount.config.path,
         mode: mount.config.mode,
+        // A mount configured direct runs as 'chronicle' this session
+        // (chooseKinds), by the direct kind's ignore list where its config
+        // names none.
+        ...(mount.config.backend === 'direct' ? { backend: 'chronicle', ignore: this.ignoreOf(mount) } : {}),
         watch: watchOf(mount.config),
         fileCount: entries.length,
         lastMaterializedSeq: mount.lastMaterializedSeq,
@@ -4604,6 +4623,9 @@ const LONE_SURROGATE = /\p{Cs}/u;
 
 /** Why a direct mount's read stopped when another directory was put at its root as it read. */
 const DIRECT_ROOT_REPLACED = 'the mount root was replaced while the file was read: reading it again reads the directory there now';
+
+/** How the alert that a mount configured direct runs as 'chronicle' names an intent the workspace can't read. */
+const UNREADABLE_INTENT = "its workspace intent can't be read";
 
 /**
  * A mount's watch mode as it runs. A mount configured direct watches
