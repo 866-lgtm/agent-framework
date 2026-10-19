@@ -637,14 +637,80 @@ describe('notices about an agent\'s own action', () => {
       const primary = t.mock.method(framework.getAgent('primary')!.getContextManager(), 'addMessage');
       const forkCm = t.mock.method(fork.getContextManager(), 'addMessage');
 
-      state.recordChannelAutoOpenNotice(fork.name, [{ channelId: 'c-1', label: '#one' }], 'opened-by-reply');
+      // The fork's own home channel, which it can close.
+      state.recordChannelAutoOpenNotice(fork.name, [{ channelId: 'missing-channel', label: '#home' }], 'opened-by-reply');
       assert.equal(forkCm.mock.callCount(), 1);
       assert.equal(primary.mock.callCount(), 0);
-      assert.match(JSON.stringify(forkCm.mock.calls[0]!.arguments[1]), /Now open: #one \(c-1\): your own message into the closed channel opened it/);
+      assert.match(JSON.stringify(forkCm.mock.calls[0]!.arguments[1]),
+        /Now open: #home \(missing-channel\): your own message into the closed channel opened it\. .*use channel_close/);
 
       state.recordChannelAutoOpenNotice(undefined, [{ channelId: 'c-2' }], 'subscription-policy');
       assert.equal(primary.mock.callCount(), 1, 'no agent caused a policy open');
       assert.equal(forkCm.mock.callCount(), 1);
+    });
+
+    it("tells a fork whose send opened a channel away from its home that it opened, without channel_close, which it can't call there, and tells the primary by name, which can", async (t) => {
+      const fork = await spawnFork();
+      const state = internals(framework);
+      const primary = t.mock.method(framework.getAgent('primary')!.getContextManager(), 'addMessage');
+      const forkCm = t.mock.method(fork.getContextManager(), 'addMessage');
+
+      state.recordChannelAutoOpenNotice(fork.name, [{ channelId: 'c-1', label: '#one' }], 'opened-by-reply');
+
+      assert.equal(forkCm.mock.callCount(), 1);
+      assert.equal(JSON.stringify(forkCm.mock.calls[0]!.arguments[1]), JSON.stringify([{ type: 'text', text:
+        '[channels] Now open: #one (c-1): your own message into the closed channel opened it. What an open channel delivers to you depends on its server.' }]));
+      assert.equal(primary.mock.callCount(), 1, 'the primary is told too');
+      assert.equal(JSON.stringify(primary.mock.calls[0]!.arguments[1]), JSON.stringify([{ type: 'text', text:
+        `[channels] Now open: #one (c-1): opened by ${fork.name}'s reply; ${fork.name} can't close it. ` +
+        "What an open channel delivers to you depends on its server. If you don't want it, use channel_close; your choice outranks policy." }]));
+      assert.equal((primary.mock.calls[0]!.arguments[2] as { speaker?: unknown } | undefined)?.speaker, fork.name);
+
+      // The advice left out is advice the fork can't take: its channel_close
+      // there is refused.
+      const results: Array<{ success?: boolean; error?: string }> = [];
+      const push = framework.pushEvent.bind(framework);
+      (framework as unknown as { pushEvent: (e: { type: string; result?: { success?: boolean; error?: string } }) => void }).pushEvent = (e) => {
+        if (e.type === 'tool-result') results.push(e.result!); else push(e as never);
+      };
+      try {
+        (framework as unknown as { dispatchChannelToolCall(agent: string, call: { id: string; name: string; input: Record<string, unknown> }): void })
+          .dispatchChannelToolCall(fork.name, { id: 'close-away', name: 'channel_close', input: { channelId: 'c-1' } });
+        for (let i = 0; i < 50 && results.length === 0; i++) await new Promise((resolve) => setImmediate(resolve));
+      } finally {
+        (framework as unknown as { pushEvent: unknown }).pushEvent = push;
+      }
+      assert.equal(results[0]?.success, false);
+      assert.match(results[0]?.error ?? '', /closing c-1 is not allowed/);
+    });
+
+    it('tells the primary, by name, of a channel notice a fork could act on and never read, when the fork is released', async () => {
+      const fork = await spawnFork();
+      const state = internals(framework);
+      state.recordChannelAutoOpenNotice(fork.name, [{ channelId: 'missing-channel', label: '#home' }], 'opened-by-reply');
+
+      reap(fork.name);
+
+      const told = framework.getAgent('primary')!.getContextManager().getAllMessages()
+        .filter((m) => JSON.stringify(m.content).includes('#home'));
+      assert.equal(told.length, 1, 'the primary is told once');
+      assert.equal((told[0]!.content[0] as { text: string }).text,
+        `[channels] Now open: #home (missing-channel): opened by ${fork.name}'s reply; ${fork.name} has ended. ` +
+        "What an open channel delivers to you depends on its server. If you don't want it, use channel_close; your choice outranks policy.");
+      assert.equal((told[0]!.metadata as { speaker?: unknown } | undefined)?.speaker, fork.name);
+    });
+
+    it("passes on no channel notice its reader couldn't act on: the primary was told then, once", async () => {
+      const fork = await spawnFork();
+      const state = internals(framework);
+      state.recordChannelAutoOpenNotice(fork.name, [{ channelId: 'c-1', label: '#one' }], 'opened-by-reply');
+
+      reap(fork.name);
+
+      const told = framework.getAgent('primary')!.getContextManager().getAllMessages()
+        .filter((m) => JSON.stringify(m.content).includes('#one'));
+      assert.equal(told.length, 1, 'only the notice of the time');
+      assert.match(JSON.stringify(told[0]!.content), new RegExp(`${fork.name} can't close it`));
     });
 
     it('tells the primary, by name, of a channel an ended agent\'s send opened, and the primary\'s channel_close closes it', async (t) => {
@@ -736,6 +802,47 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(state.deferredMessages.length, 0);
     });
 
+    it('passes a restored channel notice its gone reader could act on to the primary, by name, under its own id; one it couldn\'t is dropped, logged', async (t) => {
+      const state = internals(framework);
+      const errors: string[] = [];
+      t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+      (state.deferredMessages as unknown as Array<Record<string, unknown>>).push(
+        {
+          id: 'w-4', seq: 4, participant: 'user', forAgent: 'conversation-gone',
+          content: [{ type: 'text', text: '[channels] Now open: #four (c-4): your own message into the closed channel opened it.' }],
+          metadata: { system: true, kind: 'channel-notice', passOn: { notice: 'channel-opened', cause: 'opened-by-reply', channels: [{ channelId: 'c-4', label: '#four' }] } },
+        },
+        {
+          id: 'w-5', seq: 5, participant: 'user', forAgent: 'conversation-gone',
+          content: [{ type: 'text', text: '[channels] Not open: #five (c-5). Your reply there went out, but opening the channel failed.' }],
+          metadata: { system: true, kind: 'channel-notice', passOn: { notice: 'reply-open-failed', channel: { channelId: 'c-5', label: '#five' }, selectedForOpening: 'server-bootstrap' } },
+        },
+        {
+          // Its reader couldn't act on it, or an earlier build stored it: no inputs.
+          id: 'w-6', seq: 6, participant: 'user', forAgent: 'conversation-gone',
+          content: [{ type: 'text', text: '[channels] Now open: #six (c-6): your own message into the closed channel opened it.' }],
+          metadata: { system: true, kind: 'channel-notice' },
+        },
+      );
+
+      await state.flushDeferredWrites('boot-recovery');
+
+      const told = framework.getAgent('primary')!.getContextManager().getAllMessages()
+        .filter((m) => JSON.stringify(m.content).includes('conversation-gone'));
+      assert.deepEqual(told.map((m) => (m.content[0] as { text: string }).text), [
+        "[channels] Now open: #four (c-4): opened by conversation-gone's reply; conversation-gone has ended. " +
+          "What an open channel delivers to you depends on its server. If you don't want it, use channel_close; your choice outranks policy.",
+        "[channels] Not open: #five (c-5). conversation-gone's reply there went out, but opening the channel failed; conversation-gone has ended. " +
+          "It's selected for opening again, as its server announces it open: the host tries again, and channel_close withdraws that.",
+      ]);
+      assert.deepEqual(told.map((m) => (m.metadata as { deferredWriteId?: unknown; speaker?: unknown }).deferredWriteId), ['w-4', 'w-5']);
+      assert.deepEqual(told.map((m) => (m.metadata as { speaker?: unknown }).speaker), ['conversation-gone', 'conversation-gone']);
+      const all = framework.getAgent('primary')!.getContextManager().getAllMessages().map((m) => JSON.stringify(m.content));
+      assert.equal(all.filter((c) => c.includes('#six')).length, 0);
+      assert.ok(errors.some((e) => /"conversation-gone" is not a registered agent — message dropped \(participant=user\)/.test(e)));
+      assert.equal(state.deferredMessages.length, 0);
+    });
+
     it('passes a restored failure notice on as the same queue entry while the primary is mid-turn: it waits under its own id', async () => {
       const state = internals(framework);
       (state.deferredMessages as unknown as Array<Record<string, unknown>>).push({
@@ -756,13 +863,13 @@ describe('notices about an agent\'s own action', () => {
     });
 
     it('counts as read, across branches, only what an agent\'s window shares with the branch it read up to the point they part', async () => {
-      const state = internals(framework) as unknown as { unreadFailedReplies(agent: unknown): Array<{ tag?: unknown }> };
+      const state = internals(framework) as unknown as { unreadNoticesForPrimary(agent: unknown): Array<{ tag?: unknown }> };
       const agent = framework.getAgent('secondary')!;
       const cm = agent.getContextManager();
       const store = framework.getStore();
       const notice = (tag: string) => cm.getMessage(cm.addMessage('user', [{ type: 'text', text: `[discord-send-failed] ${tag}` }],
         { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', tag } as never))!;
-      const tags = () => state.unreadFailedReplies(agent).map((m) => m.tag);
+      const tags = () => state.unreadNoticesForPrimary(agent).map((m) => m.tag);
 
       const read = notice('read');
       agent.markContextConsumed();
@@ -782,13 +889,13 @@ describe('notices about an agent\'s own action', () => {
     });
 
     it('counts as unread a notice stored on a branch after the agent read past the point where it parts from another', async () => {
-      const state = internals(framework) as unknown as { unreadFailedReplies(agent: unknown): Array<{ tag?: unknown }> };
+      const state = internals(framework) as unknown as { unreadNoticesForPrimary(agent: unknown): Array<{ tag?: unknown }> };
       const agent = framework.getAgent('secondary')!;
       const cm = agent.getContextManager();
       const store = framework.getStore();
       const notice = (tag: string) => cm.getMessage(cm.addMessage('user', [{ type: 'text', text: `[discord-send-failed] ${tag}` }],
         { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', tag } as never))!;
-      const tags = () => state.unreadFailedReplies(agent).map((m) => m.tag);
+      const tags = () => state.unreadNoticesForPrimary(agent).map((m) => m.tag);
 
       notice('before the branch');
       const home = store.currentBranch().name;
@@ -806,13 +913,13 @@ describe('notices about an agent\'s own action', () => {
     });
 
     it('counts as unread what the current branch has from a branch between it and the one the agent read on', async () => {
-      const state = internals(framework) as unknown as { unreadFailedReplies(agent: unknown): Array<{ tag?: unknown }> };
+      const state = internals(framework) as unknown as { unreadNoticesForPrimary(agent: unknown): Array<{ tag?: unknown }> };
       const agent = framework.getAgent('secondary')!;
       const cm = agent.getContextManager();
       const store = framework.getStore();
       const notice = (tag: string) => cm.getMessage(cm.addMessage('user', [{ type: 'text', text: `[discord-send-failed] ${tag}` }],
         { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', tag } as never))!;
-      const tags = () => state.unreadFailedReplies(agent).map((m) => m.tag);
+      const tags = () => state.unreadNoticesForPrimary(agent).map((m) => m.tag);
 
       notice('read at home');
       const home = store.currentBranch().name;
@@ -833,13 +940,13 @@ describe('notices about an agent\'s own action', () => {
     });
 
     it('counts as unread, across a branch made after the agent read, what was stored after its watermark', async () => {
-      const state = internals(framework) as unknown as { unreadFailedReplies(agent: unknown): Array<{ tag?: unknown }> };
+      const state = internals(framework) as unknown as { unreadNoticesForPrimary(agent: unknown): Array<{ tag?: unknown }> };
       const agent = framework.getAgent('secondary')!;
       const cm = agent.getContextManager();
       const store = framework.getStore();
       const notice = (tag: string) => cm.getMessage(cm.addMessage('user', [{ type: 'text', text: `[discord-send-failed] ${tag}` }],
         { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', tag } as never))!;
-      const tags = () => state.unreadFailedReplies(agent).map((m) => m.tag);
+      const tags = () => state.unreadNoticesForPrimary(agent).map((m) => m.tag);
 
       notice('read');
       agent.markContextConsumed();
@@ -1099,7 +1206,23 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(count(messages, 'A reply by worker'), 1, 'and, still queued at the release, it goes on to the primary by name');
     });
 
-    it('passes a failed reply still queued when a run ends unquiesced on to the primary as the same queue entry', async () => {
+    const queuedForTheRun = [
+      {
+        what: 'a failed reply',
+        content: [{ type: 'text', text: `${SEND_FAILED} Your previous reply (5 chars) could not be delivered to #x (missing-channel).` }],
+        metadata: { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', reason: 'no registered channel', textLen: 5 },
+        inRun: SEND_FAILED,
+        toPrimary: 'A reply by worker',
+      },
+      {
+        what: 'a channel notice the run could act on',
+        content: [{ type: 'text', text: '[channels] Now open: #seven (c-7): your own message into the closed channel opened it.' }],
+        metadata: { system: true, kind: 'channel-notice', passOn: { notice: 'channel-opened', cause: 'opened-by-delivery', channels: [{ channelId: 'c-7', label: '#seven' }] } },
+        inRun: 'Now open: #seven',
+        toPrimary: "opened by worker's reply; worker has ended",
+      },
+    ];
+    for (const queued of queuedForTheRun) it(`passes ${queued.what} still queued when a run ends unquiesced on to the primary as the same queue entry`, async () => {
       let release!: () => void;
       const released = new Promise<void>((resolve) => { release = resolve; });
       runMembrane.streamYielding = (request) => {
@@ -1115,12 +1238,10 @@ describe('notices about an agent\'s own action', () => {
       const done = runFramework.runEphemeralToCompletion(created.agent, created.contextManager, { idleTimeoutMs: 300, idlePollMs: 50 });
       for (let i = 0; i < 400 && !state.activeStreams.has('worker'); i++) await new Promise((resolve) => setTimeout(resolve, 5));
       assert.ok(state.activeStreams.has('worker'), 'the run\'s stream started');
-      // A failed reply queued for the run's turn end, which the run's stall
-      // then ends first.
+      // A notice queued for the run's turn end, which the run's stall then
+      // ends first.
       (state.deferredMessages as unknown as Array<Record<string, unknown>>).push({
-        id: 'w-late', seq: 1_000_000, participant: 'user', forAgent: 'worker',
-        content: [{ type: 'text', text: `${SEND_FAILED} Your previous reply (5 chars) could not be delivered to #x (missing-channel).` }],
-        metadata: { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', reason: 'no registered channel', textLen: 5 },
+        id: 'w-late', seq: 1_000_000, participant: 'user', forAgent: 'worker', content: queued.content, metadata: queued.metadata,
       });
       await assert.rejects(done, /stalled/);
       release();
@@ -1131,11 +1252,11 @@ describe('notices about an agent\'s own action', () => {
       const archive = await ContextManager.open({
         store: runFramework.getStore(), namespace: 'subagent/worker', isolate: true, strategy: new PassthroughStrategy(),
       });
-      const record = archive.getAllMessages().filter((m) => JSON.stringify(m.content).includes(SEND_FAILED));
+      const record = archive.getAllMessages().filter((m) => JSON.stringify(m.content).includes(queued.inRun));
       assert.equal(record.length, 1, 'it landed in the run\'s window');
       assert.equal(idOf(record[0]), 'w-late');
       const told = runFramework.getAgent('primary')!.getContextManager().getAllMessages()
-        .filter((m) => JSON.stringify(m.content).includes('A reply by worker'));
+        .filter((m) => JSON.stringify(m.content).includes(queued.toPrimary));
       assert.equal(told.length, 1, 'the primary is told once');
       assert.equal(idOf(told[0]), 'w-late', 'as the same entry, under its id');
     });
@@ -1213,7 +1334,7 @@ describe('notices about an agent\'s own action', () => {
 
       assert.equal(state.deferredMessages.length, 0);
       assert.equal(count(await archived(), 'Queued for the run.'), 1, 'what was queued landed in its window');
-      assert.ok(errors.some((e) => e.includes('[route-failure] worker: could not read its window for unread failed replies')));
+      assert.ok(errors.some((e) => e.includes('[route-failure] worker: could not read its window for unread notices the primary would take')));
     });
 
     it('resumes past a run that ended while the host was quiesced: resume doesn\'t weigh its context', async (t) => {
