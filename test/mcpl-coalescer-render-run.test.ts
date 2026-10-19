@@ -34,6 +34,8 @@ function makeHost(options: Options = {}) {
   let saved: () => CoalescingSnapshot = () => { throw new Error('nothing saved'); };
   const host: CoalescerHost<null> = {
     isUnread: (placement) => queue.some((m) => m.id === placement.deferredId) && !read.has(placement.deferredId ?? ''),
+    // Nothing here shows a render without a request reading it.
+    isUnshown: (placement) => queue.some((m) => m.id === placement.deferredId) && !read.has(placement.deferredId ?? ''),
     remove: (placement) => {
       const id = placement.deferredId ?? '';
       if (options.unremovable?.has(id)) return false;

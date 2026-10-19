@@ -107,14 +107,16 @@ function makeRegistry(
   };
 }
 
-function incoming(channelId: string, text: string, channelName?: string) {
+function incoming(channelId: string, text: string, channelName?: string, tags?: string[], threadId?: string) {
   return {
     messages: [{
       channelId,
-      messageId: 'm1',
+      messageId: tags ? `marker-${channelId}` : 'm1',
       author: { id: 'u1', name: 'Antra' },
       timestamp: '2026-05-30T00:00:00.000Z',
       content: [{ type: 'text' as const, text }],
+      tags,
+      threadId,
       metadata: channelName ? { channelName } : undefined,
     }],
   };
@@ -164,6 +166,40 @@ test('routeSpeech surfaces a failure when the server reports delivered:false', a
   assert.match(failures[0].reason, /delivered:false/);
   assert.equal(failures[0].outcome, 'failed', 'the server said nothing was delivered');
   assert.ok(traces.some(t => t.type === 'mcpl:speech-route-failed' && t.outcome === 'failed'));
+});
+
+test('routeSpeech counts a publish reply that leaves delivered out as unconfirmed, not delivered', async () => {
+  const { registry, failures } = makeRegistry({});
+  seedRegistered(registry, 'discord', 'ch-x');
+  registry.handleIncoming('discord', incoming('ch-x', 'hi'));
+
+  const res = await registry.routeSpeech('cairn', 'a reply', registry.resolveLocus('cairn'));
+
+  assert.equal(res, null, 'no delivery is confirmed, so the stream gets none of it');
+  assert.equal(failures.length, 1, 'and the route failure is reported');
+  assert.equal(failures[0].outcome, 'unknown', 'as a post that may or may not exist');
+});
+
+test('routeSpeech reports each delivered publish as mcpl:speech-routed, with nothing that ties it to a stream or ends one', async () => {
+  const { registry, traces } = makeRegistry({ delivered: true });
+  seedRegistered(registry, 'discord', 'ch-x');
+  registry.handleIncoming('discord', incoming('ch-x', 'hi'));
+
+  const before = traces.length;
+  await registry.routeSpeech('cairn', 'first reply', registry.resolveLocus('cairn'));
+  await registry.routeSpeech('cairn', 'second reply', registry.resolveLocus('cairn'));
+
+  // The first publish also opens the channel, and says so in a trace of its
+  // own; every other trace the two sends give is checked.
+  const routed = traces.slice(before).filter((t) => t.type !== 'mcpl:channel-opened-by-send');
+  assert.deepEqual(routed.map((t) => ({ type: t.type, channelId: t.channelId, text: t.text, delivered: t.delivered })), [
+    { type: 'mcpl:speech-routed', channelId: 'ch-x', text: 'first reply', delivered: true },
+    { type: 'mcpl:speech-routed', channelId: 'ch-x', text: 'second reply', delivered: true },
+  ], 'one trace per publish, with its whole text, and none that ends an utterance');
+  for (const t of routed) {
+    assert.deepEqual(['inferenceId', 'streamId', 'index'].filter((key) => key in t), [],
+      'no stream id or index, unlike inference:published');
+  }
 });
 
 test('routeSpeech routes a conversation fork to its HOME channel, not the global last-inbound (item 3)', async () => {
@@ -557,6 +593,68 @@ test('DM prose targets resolve people-first: @name, prefix-lenient names, and <@
   const missing = registry.resolveProseTarget('@nobody');
   assert.ok('error' in missing && /send_dm/.test(missing.error), 'no-match points at send_dm');
   assert.ok('error' in missing && (missing.candidates?.length ?? 0) === 2, 'lists known DMs by name');
+});
+
+test('non-conversational markers do not retarget the default publish locus (#157)', async () => {
+  // A reaction/edit/delete marker (RFC-001 tags) is ABOUT a message, not one
+  // the agent replies to: arriving on chanB it must not flip the
+  // process-global defaultPublishChannel away from the real conversation on
+  // chanA, and must not become context.incoming's reply anchor.
+  const { registry, lookup } = makeRegistry(undefined);
+  seedRegistered(registry, 'discord', 'chanA');
+  seedRegistered(registry, 'discord', 'chanB');
+  // The host directs this server's lifecycle (the mock's grant includes
+  // channels.lifecycle), so traffic repairs a channel's open state only
+  // while the channel is decided open (#210). chanB is.
+  (registry as unknown as {
+    setDesiredState(s: string, c: string, d: 'open' | 'closed', src: string): void;
+  }).setDesiredState('discord', 'chanB', 'open', 'agent-tool');
+  registry.handleIncoming('discord', incoming('chanA', 'hi from A', undefined, undefined, 'thread-A'));
+
+  for (const tag of ['chat:reaction', 'chat:reaction-remove', 'chat:edited', 'chat:deleted']) {
+    lookup('chanB')!.open = false;
+    registry.handleIncoming('discord', incoming('chanB', `[${tag}] marker`, undefined, [tag]));
+    assert.equal(registry.getDefaultPublishChannel(), 'chanA',
+      `a ${tag} marker on chanB must not steal the default publish locus`);
+    const anchor = registry.buildChannelContext()?.incoming;
+    assert.equal(anchor?.messageId, 'm1', `a ${tag} marker leaves the reply anchor's message`);
+    assert.equal(anchor?.threadId, 'thread-A', `a ${tag} marker leaves the reply anchor's thread`);
+    // The liveness repair still runs for a marker, as for any message: a
+    // server sending channels/incoming for a channel decided open is
+    // evidence that its transport is open.
+    assert.equal(lookup('chanB')?.open, true, `a ${tag} marker still repairs chanB's open state`);
+    // On the anchor's own channel, a marker leaves the anchor too.
+    registry.handleIncoming('discord', incoming('chanA', `[${tag}] marker on A`, undefined, [tag]));
+    const sameChannel = registry.buildChannelContext()?.incoming;
+    assert.equal(sameChannel?.messageId, 'm1', `a ${tag} marker on the anchor's channel leaves its message`);
+    assert.equal(sameChannel?.threadId, 'thread-A', `a ${tag} marker on the anchor's channel leaves its thread`);
+  }
+
+  // A real message still retargets: the skip is tag-scoped, not a freeze.
+  const real = incoming('chanB', 'real message on B', undefined, undefined, 'thread-B');
+  real.messages[0]!.messageId = 'm2';
+  registry.handleIncoming('discord', real);
+  assert.equal(registry.getDefaultPublishChannel(), 'chanB');
+  const after = registry.buildChannelContext()?.incoming;
+  assert.equal(after?.messageId, 'm2', 'a real message becomes the reply anchor');
+  assert.equal(after?.threadId, 'thread-B', 'with its own thread');
+  // One with no thread leaves none behind.
+  const unthreaded = incoming('chanA', 'real message on A, no thread');
+  unthreaded.messages[0]!.messageId = 'm3';
+  registry.handleIncoming('discord', unthreaded);
+  const last = registry.buildChannelContext()?.incoming;
+  assert.equal(last?.messageId, 'm3', 'a real message with no thread becomes the reply anchor');
+  assert.equal(last?.threadId, undefined, 'and takes no thread from the one before it');
+});
+
+test('a marker on a NEVER-conversed channel leaves the locus null, not marker-anchored (#157)', async () => {
+  const { registry } = makeRegistry(undefined);
+  seedRegistered(registry, 'discord', 'chanB');
+  registry.handleIncoming('discord', incoming('chanB', '[edited] marker', undefined, ['chat:edited']));
+  assert.equal(registry.getDefaultPublishChannel(), null,
+    'an edit marker alone must not establish a publish locus');
+  assert.equal(registry.buildChannelContext()?.incoming, undefined,
+    'nor a reply anchor');
 });
 
 test('proseTargetFor: one whitespace-free token per channel that resolves back to it', async () => {

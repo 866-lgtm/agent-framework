@@ -37,7 +37,7 @@ import type {
 import type { McplServerRegistry } from './server-registry.js';
 import type { FeatureSetManager } from './feature-set-manager.js';
 import type { ToolDefinition, ToolResult, ProcessEvent } from '../types/index.js';
-import { expandCoreTags } from './tags.js';
+import { expandCoreTags, isMarkerTagged } from './tags.js';
 import { coalesceRejectionReason, EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
 import { isVisiblyEmptyConversion } from './visible-content.js';
 import { logDetail, logValue } from './log-value.js';
@@ -391,11 +391,11 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'channel_publish',
-    description: 'Publish a message to a channel. If channelId is omitted, publishes to the channel this conversation is bound to, if any, else to the most recent incoming channel. A subagent has neither, and must name one.',
+    description: "Publish a message to a channel. If channelId is omitted, publishes to your conversation's channel if you are bound to one; otherwise to the channel of the most recent incoming message this host received on any channel, whether or not you've been shown it. Reactions, reaction removals, deletions and edits don't set it, though an edit of a message you hadn't been shown can count as that message. A message pushed to you rather than posted on a channel never sets it. A subagent has neither default, so it must name a channel.",
     inputSchema: {
       type: 'object' as const,
       properties: {
-        channelId: { type: 'string', description: 'ID of the channel to publish to (defaults to the conversation\'s bound channel, else the most recent incoming channel; required of a subagent)' },
+        channelId: { type: 'string', description: "ID of the channel to publish to (defaults to your conversation's channel if you are bound to one; otherwise the channel of the most recent incoming message this host received on any channel, whether or not you've been shown it, other than a reaction, reaction removal, deletion or edit, though an edit of a message you hadn't been shown can count; a message pushed to you rather than posted on a channel never sets it; required of a subagent)" },
         content: { type: 'string', description: 'Text content to publish' },
         text: { type: 'string', description: 'Alias for content' },
       },
@@ -598,13 +598,16 @@ interface ChannelRegistryOptions {
    * RFC-006: an admitted `channels/incoming` message carrying `coalesce`, with
    * the event the ordinary path would have queued. The handler decides
    * replace / append / withdraw and returns the per-message result. Throws a
-   * `CoalesceError` for a malformed or unauthorized occurrence.
+   * `CoalesceError` for a malformed or unauthorized occurrence. `firstView`
+   * says the coalescer delivered the message as the agent's first view of it,
+   * with the delivery's own `firstView` mark; it is the host's own, and isn't
+   * in the answer to the server.
    */
   handleCoalescedIncoming?: (
     serverId: string,
     message: ChannelIncomingMessage,
     event: McplChannelIncomingEvent,
-  ) => Promise<ChannelIncomingMessageResult>;
+  ) => Promise<ChannelIncomingMessageResult & { firstView?: true }>;
   /** Chronicle store used for durable desired channel lifecycle state. */
   store?: JsStore;
   /** Callback to determine whether an incoming message should trigger inference. */
@@ -658,9 +661,11 @@ interface ChannelRegistryOptions {
    * forks are spawned bound to a single channel (the framework tracks this in
    * `conversationAgentHomes` / `ConversationRouter.channelForAgent`); their
    * plain-text speech must route THERE. The process-global `defaultPublishChannel`
-   * tracks only the most-recent inbound across ALL channels, so with one fork per
-   * channel running concurrently it misroutes a fork's reply to whichever channel
-   * last spoke (item 3). Returns undefined for the trunk/primary agent, which has
+   * tracks only the most recent inbound message across ALL channels (reaction,
+   * reaction-removal, edit and deletion markers aside, apart from an edit the
+   * coalescer delivers on acceptance as the agent's first view), so with one
+   * fork per channel running concurrently it misroutes a fork's reply to
+   * whichever channel last spoke (item 3). Returns undefined for the trunk/primary agent, which has
    * no home and correctly falls back to the global locus (heartbeats, etc.).
    */
   homeChannelResolver?: (agentName: string) => string | undefined;
@@ -670,11 +675,12 @@ interface ChannelRegistryOptions {
    * turn. This is the fix for single-TRUNK agents (the only mode
    * connectome-host runs — it never exposes conversation forks). A trunk agent
    * has no fork home, so without this its plain-text speech falls back to the
-   * process-global `defaultPublishChannel`, which tracks the most-recent inbound
-   * across ALL channels and misroutes a reply to whichever channel last spoke
-   * under concurrency (item-3 redux). The framework keeps both on the live
-   * turn's routing state and exposes them here. For a heartbeat / no-trigger
-   * turn it resolves to undefined until the turn's locus is resolved, so that
+   * process-global `defaultPublishChannel`, which tracks the most recent inbound
+   * message across ALL channels (markers aside) and misroutes a reply to
+   * whichever channel last spoke under concurrency (item-3 redux). The
+   * framework keeps both on the live turn's routing state and exposes them
+   * here. For a heartbeat / no-trigger turn it resolves to undefined until the
+   * turn's locus is resolved, so that
    * resolution takes the global fallback, which the turn then keeps.
    * Consulted AFTER `homeChannelResolver` (a fork's home always wins), BEFORE
    * `defaultPublishChannel`.
@@ -796,10 +802,13 @@ export class ChannelRegistry {
    */
   private dmClassified = new Map<string, true>();
 
-  /** Most recent incoming channel ID — used for speech routing / default publish. */
+  /** The channel of the most recent incoming message that isn't a reaction,
+   *  reaction removal, edit or deletion marker, apart from an edit the
+   *  coalescer delivers on acceptance as the agent's first view: used for
+   *  speech routing and the default publish. */
   private defaultPublishChannel: string | null = null;
 
-  /** Most recent incoming message metadata, used for buildChannelContext. */
+  /** The same message's id and thread, used for buildChannelContext. */
   private defaultPublishMessageId: string | null = null;
   private defaultPublishThreadId: string | undefined = undefined;
 
@@ -853,6 +862,15 @@ export class ChannelRegistry {
    *  closes its own channels, and sends no receipt the host could wait for. */
   private directsLifecycle(serverId: string): boolean {
     return CapabilityGrant.of(this.serverRegistry.getServer(serverId)).has('channels.lifecycle');
+  }
+
+  /** Whether a decided close holds words back from a channel: only where
+   *  the host directs the server's lifecycle. Without that grant the host
+   *  can't close the channel, and words go into a transport that is open,
+   *  as the open step's engagesDecidedClosed reads it too. */
+  private closeStands(entry: ChannelEntry): boolean {
+    return this.getDesiredState(entry.serverId, entry.descriptor.id) === 'closed' &&
+      this.directsLifecycle(entry.serverId);
   }
 
   /** A registration's entry: nothing about its transport is known until a
@@ -1261,10 +1279,17 @@ export class ChannelRegistry {
       // A coalesced item is "accepted" only once the coalescer admits it, so
       // for those this runs after the hook (below).
       const incomingEntry = this.channels.get(incomingKey)!;
-      const markAccepted = () => {
-        this.defaultPublishChannel = message.channelId;
-        this.defaultPublishMessageId = message.messageId;
-        this.defaultPublishThreadId = message.threadId;
+      const markAccepted = (firstView = false) => {
+        // Non-conversational markers (a reaction added or removed, an edit, a
+        // deletion) are ABOUT a message, not one the agent replies to: they
+        // must not retarget the default publish locus or become
+        // `context.incoming`'s reply anchor. An edit the coalescer delivered
+        // as the agent's first view counts as the message it replaced.
+        if (!isMarkerTagged(message.tags, firstView)) {
+          this.defaultPublishChannel = message.channelId;
+          this.defaultPublishMessageId = message.messageId;
+          this.defaultPublishThreadId = message.threadId;
+        }
         // Where the host directs this server's lifecycle, only a receipt for
         // the current target confirms it: traffic shows the transport open
         // only for a confirmed target, and only for a channel still decided
@@ -1276,7 +1301,8 @@ export class ChannelRegistry {
         // channel open, as it always has. The entry is the one the message
         // was accepted for: one a re-registration put in its place meanwhile
         // waits for its own evidence. Durable desired state still changes
-        // exclusively through lifecycle operations.
+        // exclusively through lifecycle operations. A marker is evidence like
+        // any other message.
         if (this.directsLifecycle(serverId)) {
           if (this.unconfirmedChannelTargets.has(incomingEntry)) return;
           const desired = this.getDesiredState(serverId, message.channelId);
@@ -1335,8 +1361,8 @@ export class ChannelRegistry {
         // the coalescer, which replaces, appends or withdraws. Malformed
         // `coalesce` is a per-message failure; siblings are unaffected.
         try {
-          const result = await this.handleCoalescedIncoming!(serverId, message, event);
-          if (result.accepted) markAccepted();
+          const { firstView, ...result } = await this.handleCoalescedIncoming!(serverId, message, event);
+          if (result.accepted) markAccepted(firstView === true);
           results.push(result);
         } catch (error) {
           const err = error as Error & { code?: number; field?: string };
@@ -1559,7 +1585,10 @@ export class ChannelRegistry {
   // ==========================================================================
 
   /**
-   * Get the default publish channel ID (most recent incoming channel).
+   * Get the default publish channel ID: the channel of the most recent
+   * incoming message that isn't a reaction, reaction removal, edit or
+   * deletion marker, apart from an edit the coalescer delivers on acceptance
+   * as the agent's first view.
    */
   getDefaultPublishChannel(): string | null {
     return this.defaultPublishChannel;
@@ -1725,7 +1754,10 @@ export class ChannelRegistry {
 
     const context: ChannelContext = {};
 
-    // Incoming: the most-recent inbound message (what the agent is replying to).
+    // Incoming: the most recent inbound message that isn't a reaction,
+    // reaction removal, edit or deletion marker, apart from an edit the
+    // coalescer delivers on acceptance as the agent's first view (what the
+    // agent is replying to).
     // Left process-global — per-channel inbound tracking (the right messageId for
     // a fork's own channel) is a separate concern from the outbound routing fix.
     if (fallback && this.defaultPublishMessageId) {
@@ -2663,8 +2695,9 @@ export class ChannelRegistry {
   /**
    * Join outstanding lifecycle work without recording new intent. Retargeting
    * may have invalidated open confirmation while the decision remains pending.
-   * A close that settles during the wait remains authoritative; waiting for
-   * it is not an instruction to open the channel again.
+   * A close that settles during the wait remains authoritative where the host
+   * directs the server's lifecycle (closeStands); waiting for it is not an
+   * instruction to open the channel again.
    */
   private async waitForOpenChannel(entry: ChannelEntry): Promise<ChannelEntry> {
     const lifecycleKey = this.lifecycleKey(entry.serverId, entry.descriptor.id);
@@ -2686,7 +2719,7 @@ export class ChannelRegistry {
     }
     const current = this.channels.get(`${entry.serverId}:${entry.descriptor.id}`);
     if (!current) throw new Error('Channel registration was removed while delivery waited');
-    if (!current.open || this.getDesiredState(current.serverId, current.descriptor.id) === 'closed') {
+    if (!current.open || this.closeStands(current)) {
       throw new Error('Channel is not confirmed open for delivery, or was selected for closure while delivery waited');
     }
     return current;
@@ -3583,12 +3616,13 @@ export class ChannelRegistry {
   }
 
   /**
-   * MCPL Spec 14.3 outgoing streaming: forward a moderated text delta to the
-   * server owning the channel, AS THE MODEL GENERATES. Emitted only when that
-   * server declared `channels.streaming` in its initialize capabilities —
-   * servers that never opted in (the whole existing fleet) receive nothing.
-   * Fire-and-forget and never throws: streaming is an observer surface; the
-   * authoritative delivery is the eventual channels/publish.
+   * MCPL Spec 14.3 outgoing streaming: forward a text delta to the server
+   * owning the channel. The framework sends each piece of prose once its
+   * publish succeeds, so a stream carries only what was published.
+   * Emitted only when that server's grant has `channels.streaming` —
+   * servers that never opted in receive nothing. Fire-and-forget and never
+   * throws: streaming is an observer surface; the authoritative delivery is
+   * channels/publish.
    */
   sendOutgoingChunk(
     channelId: string,
@@ -3733,16 +3767,21 @@ export class ChannelRegistry {
    * may declare the channel inbound-only meanwhile, or a removal take it
    * away. So the check just before the publish, after every await, reads
    * the channel's registration as it is then, and refuses one that is gone
-   * or inbound-only. A removal during a wait already fails it there
-   * (waitForOpenChannel); the check also catches one made after the last
-   * wait, as the opening's notice can. Words refused after an open for a
-   * declaration leave the channel open, and the agent gets the failure for
-   * the words. An open by delivery (`openSource` 'opened-by-delivery', the
-   * default) that turned a closed channel open also gives the notice that
-   * it's open, which says how to close it. One that only
-   * reconfirmed the transport of a channel already decided open or tuned out
-   * changes no decision, and gives none. When the registration is gone, the
-   * failure says the channel was removed.
+   * or inbound-only, or whose server's grant no longer has channels.publish.
+   * A removal during a wait already fails it there (waitForOpenChannel); the
+   * check also catches one made after the last wait, as the opening's notice
+   * can. A registration nothing has confirmed open, such as one that
+   * replaced the one waited for or a retarget of it, or one whose close now
+   * stands (where the host directs the server's lifecycle), is treated as at
+   * the first wait: the words wait for its queued lifecycle work, and the
+   * check runs again on the registration that work leaves. Words refused
+   * after an open for a declaration leave the channel open, and the agent
+   * gets the failure for the words. An open by delivery (`openSource`
+   * 'opened-by-delivery', the default) that turned a closed channel open
+   * also gives the notice that it's open, which says how to close it.
+   * One that only reconfirmed the transport of a channel already decided
+   * open or tuned out changes no decision, and gives none. When the
+   * registration is gone, the failure says the channel was removed.
    *
    * Only the connector's `delivered: true` confirms a post. `failed` means
    * nothing was posted: the attempt stopped before the request was written,
@@ -3787,15 +3826,21 @@ export class ChannelRegistry {
       return { status: 'failed', destination, reason: `server "${entry.serverId}" not found`, at: at() };
     }
     // §14.1: channels/publish requires channels.publish in the grant. The
-    // host not sending is the enforcement.
-    if (!CapabilityGrant.of(server).has('channels.publish')) {
-      return {
-        status: 'failed',
-        destination,
-        reason: `channels.publish not in "${entry.serverId}"'s effective grant (§14.1)`,
-        at: at(),
-      };
-    }
+    // host not sending is the enforcement, here and at the last check.
+    const ungranted = (): PublishOutcome => ({
+      status: 'failed',
+      destination,
+      reason: `channels.publish not in "${entry.serverId}"'s effective grant (§14.1)`,
+      at: at(),
+    });
+    if (!CapabilityGrant.of(server).has('channels.publish')) return ungranted();
+
+    const prevented = (err: unknown): PublishOutcome => ({
+      status: 'failed',
+      destination,
+      reason: `lifecycle work prevented delivery: ${connectorText(err instanceof Error ? err.message : String(err))}`,
+      at: at(),
+    });
 
     // Lifecycle work already queued for the channel settles first: words go
     // out only into the channel it leaves, and fail visibly if it leaves
@@ -3804,12 +3849,7 @@ export class ChannelRegistry {
       try {
         entry = await this.waitForOpenChannel(entry);
       } catch (err) {
-        return {
-          status: 'failed',
-          destination,
-          reason: `lifecycle work prevented delivery: ${connectorText(err instanceof Error ? err.message : String(err))}`,
-          at: at(),
-        };
+        return prevented(err);
       }
     }
 
@@ -3867,14 +3907,35 @@ export class ChannelRegistry {
     // open's or any other: a registration that is gone, or inbound-only, at
     // this moment takes nothing. The entry is read from the map rather than
     // taken from the last wait: the opening's notice runs in between, and
-    // publish() resumes a microtask after the wait.
-    const current = this.channels.get(`${entry.serverId}:${entry.descriptor.id}`);
+    // publish() resumes a microtask after the wait. A registration nothing
+    // has confirmed open, such as one that replaced the one waited for
+    // (registered with open: false) or a retarget of it (marked unconfirmed),
+    // or one whose close now stands (closeStands), is treated as at the
+    // first wait: the words wait for its queued lifecycle work, and
+    // waitForOpenChannel refuses what that work leaves unconfirmed or with
+    // its close standing. The loop opens nothing itself. The check then runs
+    // again on the registration that stands. waitForOpenChannel returns
+    // only a registration it found open and whose close doesn't stand, or
+    // throws, so the loop ends unless the channel keeps changing.
+    const key = `${entry.serverId}:${entry.descriptor.id}`;
+    let current = this.channels.get(key);
+    while (current && !isInboundOnly(current) && (!current.open || this.closeStands(current))) {
+      try {
+        entry = await this.waitForOpenChannel(current);
+      } catch (err) {
+        return prevented(err);
+      }
+      current = this.channels.get(key);
+    }
     if (!current) {
       return { status: 'failed', destination, reason: 'the channel was removed before the words were published', at: at() };
     }
     if (isInboundOnly(current)) {
       return { status: 'failed', destination, reason: inboundOnlyReason(current), at: at() };
     }
+    // A grant reduced during any of the waits holds at once (§6.7): the
+    // words already on their way take it too.
+    if (!CapabilityGrant.of(server).has('channels.publish')) return ungranted();
 
     let result: unknown;
     try {
@@ -4015,8 +4076,11 @@ export class ChannelRegistry {
       };
     }
 
-    // Resolve channelId: default to the most recent incoming channel, which an
-    // ephemeral run never takes (takesGlobalFallback), so it names one.
+    // Resolve channelId: default to the channel of the most recent incoming
+    // message that isn't a reaction, reaction removal, edit or deletion
+    // marker, apart from an edit the coalescer delivers on acceptance as the
+    // agent's first view. An ephemeral run never takes that default
+    // (takesGlobalFallback), so it names one.
     const caller = origin?.kind === 'agent' ? origin.agentName : undefined;
     const channelId = input.channelId ?? (caller !== undefined ? this.globalFallbackFor(caller) : this.defaultPublishChannel);
     if (!channelId) {
