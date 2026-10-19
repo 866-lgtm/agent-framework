@@ -559,7 +559,7 @@ import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
 import { toolArgsProblems } from './tool-args.js';
 import { EventGate, formatShadowWarning } from './gate/event-gate.js';
-import { UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
+import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import { McplProtocolVersionError, McplRequestError, McplUnreapedLaunchError, stderrTailOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
 import { ModernMcpConnection } from './mcpl/modern-connection.js';
@@ -2326,6 +2326,11 @@ export class AgentFramework {
   private usedEphemeralAgentNames: Map<string, 'run' | 'conversation'> = new Map();
   /** One-shot generation tickets minted by createEphemeralAgent. */
   private ephemeralCandidates: WeakMap<Agent, ContextManager> = new WeakMap();
+  /** Every agent createEphemeralAgent made, for as long as the object lives:
+   *  its usage counts in the usage record's one shared ephemeral entry. Kept
+   *  by the object, not the run's record (ephemeralRuns), which its cleanup
+   *  drops before a cancelled stream may count its last usage. */
+  private ephemeralAgents: WeakSet<Agent> = new WeakSet();
   /** Warn only once per Agent instance after utilities are registered. */
   private emptyUtilityPermissionWarnings: WeakSet<Agent> = new WeakSet();
   /** Physical ephemeral frames deliberately disposed by their run watchdog/caller.
@@ -3016,8 +3021,14 @@ export class AgentFramework {
     // Before any delivery.
     await framework.reconcileDiscordAwarenessAtStartup();
 
-    // Restore persisted usage data (if any) from prior session
-    framework.restoreUsageState();
+    // Restore persisted usage data (if any) from prior session. The names it
+    // never folds into the shared ephemeral entry: the configured agents', and
+    // the subconscious's when one is configured, enabled or not, since a
+    // subconscious disabled now may have run and left its own entry.
+    framework.restoreUsageState([
+      ...config.agents.map((agent) => String(agent.name)),
+      ...(config.subconscious ? [String(config.subconscious.name ?? 'Subconscious')] : []),
+    ]);
 
     // Create agents
     for (const agentConfig of config.agents) {
@@ -7429,8 +7440,18 @@ export class AgentFramework {
    *
    *  This is create()'s first read of framework/state, so it also refuses a
    *  framework/state that isn't an object: every reader of that state would
-   *  take it as holding nothing, and its first write would replace it. */
-  private restoreUsageState(): void {
+   *  take it as holding nothing, and its first write would replace it.
+   *
+   *  A stored entry restores into the shared ephemeral entry, rather than
+   *  under its own name, when it is marked as the shared entry, when it was an
+   *  ephemeral agent's from before they shared one entry, its name having an
+   *  ephemeral agent's namespace in the store (subagent/<name>, as
+   *  createEphemeralAgent opens it), or when it is the shared entry an earlier
+   *  framework wrote back without its mark. A name a persistent agent has keeps
+   *  an unmarked entry either way: one in `configured`, or one with a
+   *  resident's or a conversation agent's namespace (agents/<name>,
+   *  conversations/<name>). */
+  private restoreUsageState(configured: readonly string[]): void {
     const refuse = (problem: string, cause?: unknown): Error => new Error(
       `the usage totals (${FRAMEWORK_STATE_ID}, usage) ${problem}. The framework doesn't start without them, ` +
         `since the next inference would store fresh totals over them. ` +
@@ -7459,9 +7480,14 @@ export class AgentFramework {
     if (problem === 'not a record') throw refuse(`are ${jsonKind(usage)}, not a usage record`);
     if (problem === 'totals') throw refuse(`are a record whose totals aren't token counts`);
     if (problem === 'byAgent') throw refuse(`are a record whose byAgent isn't a list`);
+    const states = new Set(this.store.listStates().map((state) => state.id));
+    const persistent = (name: string): boolean => configured.includes(name) ||
+      states.has(`agents/${name}/context`) || states.has(`conversations/${name}/context`);
     this.usageTracker = new UsageTracker({
       emitTrace: (e: UsageUpdatedEvent) => this.emitTrace({ ...e }),
       restored: usage as PersistedUsageState,
+      wasEphemeral: (name) =>
+        (states.has(`subagent/${name}/context`) || name === EPHEMERAL_USAGE_NAME) && !persistent(name),
     });
   }
 
@@ -7879,6 +7905,7 @@ export class AgentFramework {
       this.adoptToolResultGuard(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
       this.ephemeralCandidates.set(agent, contextManager);
+      this.ephemeralAgents.add(agent);
 
       const cleanup = () => {
         // Don't close the store — it's shared. Just release the CM.
@@ -16565,7 +16592,7 @@ export class AgentFramework {
       if (!usage) return;
       this.usageTracker.onInferenceCompleted(agent.name, usage, usage.estimatedCost
         ? { total: usage.estimatedCost.total, currency: usage.estimatedCost.currency }
-        : undefined);
+        : undefined, this.ephemeralAgents.has(agent));
       this.persistUsageState();
     };
     // ...and is carried by exactly one of its inference-log entries, so
