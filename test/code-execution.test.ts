@@ -83,14 +83,16 @@ const NATIVE_CRASH_UNSEEN = 'check whether native code the script calls crashes,
 /**
  * What a script's result says when its interpreter exits after the script's own
  * result came, before all of its output arrived (py-runner's interpreterExit,
- * ended), with the advice for a runtime that ended itself over `taken`, if given.
+ * ended), with the advice for a runtime that ended itself over `taken`, if given,
+ * and `check` for the advice's first step after a crash's signal, as exitedUnder's.
  */
-const exitedAfterEnd = (how: string, taken?: string, background = false): string =>
+const exitedAfterEnd = (how: string, taken?: string, background = false, check?: string): string =>
   `script ended, but the Python interpreter ${how} before all of its output reached the host, so some of it may be missing`
   + `${background ? '' : ', and variables from earlier scripts are gone'}. If it happens again, `
   + (taken
     ? `check whether the script closes, shuts down or replaces ${taken}, as the runtime's line above says`
-    : `check whether the script itself ends the process, for example ${how.startsWith('was ended by') ? 'by using too much memory' : 'with os._exit()'}`)
+    : check ?? `check whether the script itself ends the process, for example ${
+      how === 'was ended by SIGKILL' ? 'by using too much memory' : how.startsWith('was ended by') ? 'with os.kill()' : 'with os._exit()'}`)
   + '; if not, ask whoever runs this host.';
 
 /** The result's text after the runtime ended itself because a script took one of its file descriptors. */
