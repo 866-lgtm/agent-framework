@@ -15063,8 +15063,8 @@ export class AgentFramework {
    * (dispatchChannelToolCall), and an agent's allowedTools can leave it out.
    * Where the channel is selected for opening, it says so and why, as
    * speech's failure does, and what that means: where the host couldn't
-   * record putting the channel's decision back, in channel_open's own
-   * failure's words, a later delivery or reconnect tries again; where the
+   * record putting the channel's decision back, a later delivery or
+   * reconnect tries again; where the
    * server's latest announcement or the subscription policy lifted the
    * default put back, the host tries again itself, so channel_open isn't
    * named. Either way channel_close withdraws that, named only to an agent
