@@ -90,6 +90,8 @@ test('a long line is cut at 2000 characters, with the offsetChars that reads the
   const rest = long.length - 1999;
   const at = 1 + 'short\r\n'.length + 1999;
   assert.equal(lines[1], `     2\t${'x'.repeat(1999)} [… ${rest} more chars; read them with offsetChars=${at}]`);
+  // A script's call, at 5,000,000 characters, cuts the line the same way.
+  assert.equal(((await read({}, 5_000_000)).data as LinePage).content.split('\n')[1], lines[1]);
   const more = (await read({ offsetChars: at, limitChars: rest })).data as CharPage;
   assert.equal(more.content, '😀' + 'y'.repeat(1000));
   assert.equal(lines[2], '     3\tlast');
