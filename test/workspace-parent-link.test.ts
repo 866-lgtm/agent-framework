@@ -291,7 +291,9 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
       env.writeDisk('l/x.txt', 'v1\n');
       const m = await env.open(t);
       env.swapLForLink(target);
-      const expected = `work/nope/../l/x.txt: ${linkedReason(target)}`;
+      // The path is read as `work/l/x.txt`, its `..` taken lexically, as
+      // every workspace path is, and named so.
+      const expected = `work/l/x.txt: ${linkedReason(target)}`;
       await assert.rejects(m.readFileFromDisk('work/nope/../l/x.txt'), (err: unknown) => {
         assert.ok(err instanceof WorkspaceReadError, String(err));
         assert.equal(err.code, linkedCode(target));

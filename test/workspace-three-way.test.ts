@@ -1097,10 +1097,11 @@ describe("another mount's directory, to the outer mount's file tools and pushes"
     assert.deepEqual(whole.results, []);
     assert.deepEqual(regions(whole), []);
     // Named, it's the answer to what was asked: its region names the holder.
-    for (const [path, use] of [['work/a/b', 'deep'], ['work/a/b/inner.txt', 'deep/inner.txt'], ['work/a//b/inner.txt', 'deep/inner.txt']]) {
+    // A path with an empty segment is named as it reads, without it.
+    for (const [path, named, use] of [['work/a/b', 'work/a/b', 'deep'], ['work/a/b/inner.txt', 'work/a/b/inner.txt', 'deep/inner.txt'], ['work/a//b/inner.txt', 'work/a/b/inner.txt', 'deep/inner.txt']]) {
       const found = await call(m, 'grep', { path, pattern: 'stale' });
       assert.deepEqual(found.results, [], path);
-      assert.deepEqual(regions(found), [[path, `it lies in mount "deep", nested in this one: use "${use}"`]], path);
+      assert.deepEqual(regions(found), [[named, `it lies in mount "deep", nested in this one: use "${use}"`]], path);
     }
     // A file there the outer store doesn't hold is named too.
     env.writeDisk('a/b/other.txt', 'stale words');

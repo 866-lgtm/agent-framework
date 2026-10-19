@@ -7,15 +7,18 @@
 
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { setFlagsFromString } from 'node:v8';
+import { runInNewContext } from 'node:vm';
 import { JsStore } from '@animalabs/chronicle';
 // A namespace, so this file loads where the module lacks inOrder, and only
 // the tests that call it fail there.
 import * as workspaceModule from '../src/modules/workspace/index.js';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
+import { BranchIntents } from '../src/modules/workspace/branch-intent.js';
 import type { MountConfig } from '../src/modules/workspace/types.js';
 import type { ModuleContext } from '../src/types/module.js';
 import type { ProcessEvent, ToolResult } from '../src/types/events.js';
@@ -61,15 +64,26 @@ class Env {
       mounts: [{ name: 'ref', path: this.ref, mode: 'read-only', backend: 'direct', ...mount }, ...more],
     });
     m.initStore(this.store);
-    await m.start({
+    await m.start(this.context());
+    this.live.push(m);
+    return m;
+  }
+
+  /** A module context as a host gives one, recording events and ops alerts. */
+  context(): ModuleContext {
+    return {
       isRestart: false,
       getState: () => null,
       setState: () => {},
       pushEvent: (e: ProcessEvent) => this.events.push(e),
       notifyOps: (kind: string, agent: string, message: string, data?: Record<string, unknown>) => this.alerts.push({ kind, agent, message, data }),
-    } as unknown as ModuleContext);
-    this.live.push(m);
-    return m;
+    } as unknown as ModuleContext;
+  }
+
+  /** Stop the module and start it again, with the store it has. */
+  async restart(m: WorkspaceModule): Promise<void> {
+    await m.stop();
+    await m.start(this.context());
   }
 
   /** The same mount as a 'chronicle' one, read-write and unwatched. */
@@ -92,18 +106,35 @@ function watched(m: WorkspaceModule): string[] {
   return [...(m as unknown as { watchers: Map<string, unknown> }).watchers.keys()];
 }
 
-/** Run `fn` with `node:fs/promises`'s `lstat`, as the module's imports see it, replaced by what `make` makes of it. */
-async function withLstat<T>(make: (original: (...args: any[]) => Promise<any>) => (...args: any[]) => Promise<any>, fn: () => Promise<T>): Promise<T> {
+/** Run `fn` with `node:fs/promises`'s `name`, as the module's imports see it, replaced by what `make` makes of it. */
+async function withFsPromise<T>(name: 'lstat' | 'open', make: (original: (...args: any[]) => Promise<any>) => (...args: any[]) => Promise<any>, fn: () => Promise<T>): Promise<T> {
   const fsp = createRequire(import.meta.url)('node:fs/promises') as Record<string, (...args: any[]) => Promise<any>>;
-  const original = fsp.lstat!;
-  fsp.lstat = make(original);
+  const original = fsp[name]!;
+  fsp[name] = make(original);
   syncBuiltinESMExports();
   try {
     return await fn();
   } finally {
-    fsp.lstat = original;
+    fsp[name] = original;
     syncBuiltinESMExports();
   }
+}
+
+/** The most calls of `node:fs/promises`'s `name` under way at once while `fn` runs, each held a turn so the others can start. */
+async function mostAtOnce(name: 'lstat' | 'open', fn: () => Promise<unknown>): Promise<number> {
+  let now = 0;
+  let most = 0;
+  await withFsPromise(name, (original) => async (...args: any[]) => {
+    now++;
+    most = Math.max(most, now);
+    try {
+      await new Promise((resolve) => setImmediate(resolve));
+      return await original(...args);
+    } finally {
+      now--;
+    }
+  }, fn);
+  return most;
 }
 
 function call(m: WorkspaceModule, name: string, input: Record<string, unknown> = {}): Promise<ToolResult> {
@@ -122,13 +153,13 @@ async function failure(m: WorkspaceModule, name: string, input: Record<string, u
   return result.error!;
 }
 
-test('a direct mount reads disk as it is now, and its tools record nothing in the store', async (t) => {
+test('a direct mount reads disk as it is now, and records nothing in the store from its start on', async (t) => {
   const env = new Env(t);
   env.file('src/a.ts', 'one\n');
   env.file('img/dot.png', PNG);
-  const m = await env.open();
   const states = env.stateIds();
   const sequence = env.store.currentSequence();
+  const m = await env.open();
 
   assert.equal((await data<{ content: string }>(m, 'read', { path: 'ref/src/a.ts' })).content, '     1\tone');
   appendFileSync(join(env.ref, 'src/a.ts'), 'two\n');
@@ -141,10 +172,10 @@ test('a direct mount reads disk as it is now, and its tools record nothing in th
   await data(m, 'status');
   await data(m, 'sync');
   assert.deepEqual('data' in (await m.readBinary('ref/src/a.ts')), true);
+  await m.onToolBatchComplete();
 
   assert.deepEqual(env.stateIds(), states, 'no state was made');
-  assert.ok(!states.some((id) => id.startsWith('workspace/ref/')), `the mount's states: ${states}`);
-  assert.equal(env.store.currentSequence(), sequence, 'nothing was recorded');
+  assert.equal(env.store.currentSequence(), sequence, 'nothing was recorded, its disk evidence included');
   assert.deepEqual(env.events.filter((e) => e.type !== 'workspace:mounted').map((e) => e.type), [], 'no change was evented');
   assert.deepEqual(watched(m), [], 'no watcher runs, though watch is left out');
 });
@@ -242,12 +273,13 @@ test('the default ignore list keeps whole walks out of what it covers, and a pat
   env.file('node_modules/pkg/dist/built.js', 'needle\n');
   env.file('dist/out.js', 'needle\n');
   const m = await env.open();
-  assert.deepEqual((await data(m, 'ls', { path: 'ref' })).entries, [{ name: 'src', type: 'directory' }]);
-  assert.deepEqual((await data<{ matches: unknown[] }>(m, 'glob', { pattern: '**/*.js' })).matches, [{ path: 'ref/src/a.js', size: 7 }]);
-  assert.deepEqual(
-    (await data<{ results: Array<{ file: string }> }>(m, 'grep', { pattern: 'needle' })).results.map((r) => r.file),
-    ['ref/src/a.js'],
-  );
+  // A whole walk passes over what the list covers, and doesn't count it as
+  // a region it couldn't reach.
+  assert.deepEqual(await data(m, 'ls', { path: 'ref' }), { path: 'ref', entries: [{ name: 'src', type: 'directory' }], count: 1 });
+  assert.deepEqual(await data(m, 'glob', { pattern: '**/*.js' }), { pattern: '**/*.js', matches: [{ path: 'ref/src/a.js', size: 7 }], count: 1 });
+  const grep = await data<{ results: Array<{ file: string }>; incomplete?: unknown }>(m, 'grep', { pattern: 'needle' });
+  assert.deepEqual(grep.results.map((r) => r.file), ['ref/src/a.js']);
+  assert.equal(grep.incomplete, undefined);
   // Named, by a path or a pattern's directory: walked, the rest of the list
   // applying beneath it.
   assert.deepEqual((await data(m, 'ls', { path: 'ref/node_modules/pkg' })).entries, [{ name: 'index.js', type: 'file', size: 7 }]);
@@ -338,7 +370,7 @@ test("a direct listing names a directory it couldn't list", { skip: IS_ROOT ? 'r
   }
 });
 
-test("a direct mount's read and grep load no more than the size limit, and refuse a file that grows past it as it's read", async (t) => {
+test("a direct mount's read loads none of a file over the size limit and grep only its head, and both refuse one that grows past it as it's read", async (t) => {
   const env = new Env(t);
   env.file('grows.txt', 'x'.repeat(8));
   env.file('huge.txt', 'y'.repeat(100_000));
@@ -377,6 +409,22 @@ test("a direct mount's read and grep say so where reading a file fails", async (
   });
 });
 
+test("read on a direct mount says why it couldn't open a file", { skip: IS_ROOT ? 'root opens every file' : false }, async (t) => {
+  const env = new Env(t);
+  env.file('noperm.txt', 'secret\n');
+  env.file('shut/b.ts', 'b\n');
+  const m = await env.open();
+  chmodSync(join(env.ref, 'noperm.txt'), 0o000);
+  chmodSync(join(env.ref, 'shut'), 0o000);
+  try {
+    assert.equal(await failure(m, 'read', { path: 'ref/noperm.txt' }), 'Unable to read file: ref/noperm.txt (EACCES)');
+    assert.equal(await failure(m, 'read', { path: 'ref/shut/b.ts' }), 'Unable to read file: ref/shut/b.ts (EACCES)');
+  } finally {
+    chmodSync(join(env.ref, 'noperm.txt'), 0o644);
+    chmodSync(join(env.ref, 'shut'), 0o755);
+  }
+});
+
 test('a file gone between the walk that listed it and its read is neither listed nor searched', async (t) => {
   const env = new Env(t);
   const names = Array.from({ length: 40 }, (_, i) => `f${String(i).padStart(2, '0')}.txt`);
@@ -392,7 +440,7 @@ test('a file gone between the walk that listed it and its read is neither listed
   assert.equal(grep.skipped, undefined);
   // A listing looks at each file by its path, where this one is removed first.
   env.file('f30.txt', 'needle\n');
-  const listed = await withLstat((lstat) => async (...args: any[]) => {
+  const listed = await withFsPromise('lstat', (lstat) => async (...args: any[]) => {
     if (args[0] === gone) rmSync(gone, { force: true });
     return lstat(...args);
   }, () => data<{ entries: Array<{ path: string }> }>(m, 'ls', { path: 'ref', recursive: true }));
@@ -420,13 +468,129 @@ test('grep on a direct mount lists what it doesn\'t search, with why', async (t)
   });
 });
 
+test('grep on a direct mount that follows links names a link to a directory as its listing does', async (t) => {
+  const env = new Env(t);
+  env.file('dir/x.ts', 'needle\n');
+  symlinkSync(join(env.ref, 'dir'), join(env.ref, 'linkdir'));
+  const m = await env.open({ followSymlinks: true });
+  const listed = await data<{ entries: Array<{ path: string }> }>(m, 'ls', { path: 'ref', recursive: true });
+  assert.deepEqual(listed.entries.find((e) => e.path === 'linkdir'), { path: 'linkdir', note: 'a symlink to a directory, not walked' });
+  assert.deepEqual((await data<{ skipped?: unknown[] }>(m, 'grep', { pattern: 'needle' })).skipped, [
+    { file: 'ref/linkdir', reason: 'a symlink to a directory, not walked' },
+  ]);
+});
+
 test("grep's results come in path order, however its reads finish", async (t) => {
   const env = new Env(t);
   const names = Array.from({ length: 40 }, (_, i) => `f${String(i).padStart(2, '0')}.txt`);
   for (const name of [...names].reverse()) env.file(`many/${name}`, `${name} needle\n`.repeat(1 + (names.indexOf(name) % 7) * 500));
   const m = await env.open();
-  const files = (await data<{ results: Array<{ file: string }> }>(m, 'grep', { pattern: 'needle' })).results.map((r) => r.file);
-  assert.deepEqual(files, names.map((name) => `ref/many/${name}`));
+  // The first file's reads are held back, so it finishes after the rest.
+  const first = String(statSync(join(env.ref, 'many', names[0]!), { bigint: true }).ino);
+  const slow = new WeakSet<object>();
+  const result = await withFileHandle({
+    stat: (stat) => async function (this: object, ...args: unknown[]) {
+      const seen = await stat.apply(this, args);
+      if (String(seen.ino) === first) slow.add(this);
+      return seen;
+    },
+    read: (read) => async function (this: object, ...args: unknown[]) {
+      if (slow.has(this)) await new Promise((resolve) => setTimeout(resolve, 50));
+      return read.apply(this, args);
+    },
+  }, () => data<{ results: Array<{ file: string }> }>(m, 'grep', { pattern: 'needle' }));
+  assert.deepEqual(result.results.map((r) => r.file), names.map((name) => `ref/many/${name}`));
+});
+
+test('a direct grep and listing read 16 files at a time', async (t) => {
+  const env = new Env(t);
+  for (let i = 0; i < 40; i++) env.file(`f${String(i).padStart(2, '0')}.txt`, 'needle\n');
+  const m = await env.open();
+  assert.equal(await mostAtOnce('open', () => data(m, 'grep', { pattern: 'needle' })), 16);
+  assert.equal(await mostAtOnce('lstat', () => data(m, 'ls', { path: 'ref', recursive: true })), 16);
+});
+
+test("a direct mount's reads close every file they open, whatever they answer", async (t) => {
+  const env = new Env(t);
+  env.file('a.txt', 'needle\n');
+  env.file('bin.dat', Buffer.from([0x61, 0x00, 0x62]));
+  env.file('big.txt', 'x'.repeat(100));
+  env.file('dot.png', PNG);
+  const m = await env.open({ maxFileSize: 90 });
+  // Each handle a read opens is fstat'd; a closed one's fd reads -1.
+  const opened = new Set<{ fd: number }>();
+  await withFileHandle({
+    stat: (stat) => async function (this: { fd: number }, ...args: unknown[]) {
+      opened.add(this);
+      return stat.apply(this, args);
+    },
+  }, async () => {
+    for (const path of ['ref/a.txt', 'ref/bin.dat', 'ref/big.txt']) await call(m, 'read', { path });
+    await call(m, 'grep', { pattern: 'needle' });
+    await call(m, 'read_image', { path: 'ref/dot.png' });
+    await m.readBinary('ref/bin.dat');
+  });
+  assert.ok(opened.size >= 9, `opened ${opened.size}`);
+  assert.deepEqual([...opened].map((handle) => handle.fd).filter((fd) => fd !== -1), []);
+});
+
+test("grep gives a skipped file's size as its reads found it, when the file changes as it's read", async (t) => {
+  const env = new Env(t);
+  env.file('grows.txt', 'x'.repeat(8));
+  env.file('bin.dat', Buffer.from('a\0bcdefg'));
+  const m = await env.open({ maxFileSize: 10 });
+  // Grown past the limit after its open's fstat, then cut short before its
+  // size is read again: at least a byte past the limit, as its reads found.
+  const grows = join(env.ref, 'grows.txt');
+  let stats = 0;
+  const grown = await withFileHandle({
+    stat: (stat) => async function (this: object, ...args: unknown[]) {
+      stats++;
+      if (stats === 2) truncateSync(grows, 5);
+      const seen = await stat.apply(this, args);
+      if (stats === 1) appendFileSync(grows, 'x'.repeat(1000));
+      return seen;
+    },
+  }, () => data<{ skipped: unknown[] }>(m, 'grep', { pattern: 'x', path: 'ref/grows.txt' }));
+  assert.deepEqual(grown.skipped, [{ file: 'ref/grows.txt', reason: 'over the size limit (10 bytes)', size: 11 }]);
+  // Cut short after its fstat, within the limit: the bytes read.
+  const bin = join(env.ref, 'bin.dat');
+  const shrunk = await changedAfterFstat(bin, () => truncateSync(bin, 4), () => data<{ skipped: unknown[] }>(m, 'grep', { pattern: 'b', path: 'ref/bin.dat' }));
+  assert.deepEqual(shrunk.skipped, [{ file: 'ref/bin.dat', reason: 'binary: a NUL in its first 8 KB', size: 4 }]);
+});
+
+test('a direct read whose root is replaced as it reads says to read again', async (t) => {
+  const env = new Env(t);
+  env.file('a.txt', 'a\n');
+  const m = await env.open();
+  const error = await changedAfterFstat(join(env.ref, 'a.txt'), () => {
+    renameSync(env.ref, `${env.ref}-before`);
+    mkdirSync(env.ref);
+  }, () => failure(m, 'read', { path: 'ref/a.txt' }));
+  assert.equal(error, 'Mount unavailable: ref: the mount root was replaced while the file was read: reading it again reads the directory there now');
+  assert.equal(await failure(m, 'read', { path: 'ref/a.txt' }), 'File not found: ref/a.txt');
+});
+
+test("every mount takes a path's '.' and empty segments, trailing slash and '..' as the file they name, and answers with one spelling", async (t) => {
+  const env = new Env(t);
+  env.file('a.ts', 'alpha\n');
+  env.file('dir/x.ts', 'alpha x\n');
+  symlinkSync(join(env.root, 'elsewhere'), join(env.ref, 'link'));
+  for (const m of [await env.open(), await env.openChronicle()]) {
+    const kind = m.getTools().some((tool) => /\bdirect\b/.test(tool.description)) ? 'direct' : 'chronicle';
+    for (const path of ['ref/./a.ts', 'ref/dir/../a.ts', 'ref/a.ts/', 'ref//a.ts', 'ref/link/../a.ts', 'ref/../ref/a.ts']) {
+      assert.deepEqual(await data(m, 'read', { path }), { path: 'ref/a.ts', totalLines: 1, fromLine: 1, toLine: 1, content: '     1\talpha' }, `${kind} ${path}`);
+    }
+    assert.equal((await data<{ path: string }>(m, 'ls', { path: 'ref/dir/' })).path, 'ref/dir', kind);
+    assert.equal((await data<{ path: string }>(m, 'ls', { path: 'ref/dir/..' })).path, 'ref', kind);
+    for (const path of ['ref/dir/', 'ref/./dir', 'ref//dir']) {
+      assert.deepEqual((await data<{ results: Array<{ file: string }> }>(m, 'grep', { pattern: 'alpha', path })).results.map((r) => r.file), ['ref/dir/x.ts'], `${kind} ${path}`);
+      assert.deepEqual((await data<{ matches: Array<{ path: string }> }>(m, 'glob', { pattern: '*.ts', path })).matches.map((x) => x.path), ['ref/dir/x.ts'], `${kind} ${path}`);
+    }
+    for (const path of ['ref/../outside.txt', 'ref/dir/../../outside.txt']) {
+      assert.match(await failure(m, 'read', { path }), /^Path traversal detected/, `${kind} ${path}`);
+    }
+  }
 });
 
 test("ls without a path and status give a direct mount's kind and ignore list, and a 'chronicle' mount's as before", async (t) => {
@@ -505,6 +669,7 @@ test('a direct mount whose config sets what would never act there is refused, na
   };
   const lead = '[workspace] Mount "ref" is direct, which reads disk as it is with no store, watcher or push: ';
   assert.equal(refused({ mode: 'read-write' }), `${lead}mode must be 'read-only', not "read-write"`);
+  assert.equal(refused({ mode: undefined }), `${lead}mode must be 'read-only' (left out, it's 'read-write')`);
   assert.equal(refused({ watch: 'always' }), `${lead}watch "always" would watch nothing (leave it out, or set 'never')`);
   assert.equal(refused({ watch: 'on-agent-action' }), `${lead}watch "on-agent-action" would watch nothing (leave it out, or set 'never')`);
   assert.equal(refused({ watchDebounceMs: 100 }), `${lead}watchDebounceMs would tune no watcher (leave it out)`);
@@ -530,13 +695,18 @@ test('tool descriptions mention the direct kind only on a host with a direct mou
   const descriptions = (m: WorkspaceModule) => Object.fromEntries(m.getTools().map((tool) => [tool.name, tool.description]));
   const chronicle = descriptions(await env.openChronicle());
   for (const [name, description] of Object.entries(chronicle)) assert.doesNotMatch(description, /\bdirect\b/, name);
-  const direct = descriptions(await env.open());
-  for (const name of Object.keys(chronicle)) {
-    if (name === 'ls' || name === 'grep' || name === 'sync') {
-      assert.ok(direct[name]!.startsWith(chronicle[name]!) && direct[name]!.length > chronicle[name]!.length, name);
-      assert.match(direct[name]!, /direct mount/, name);
-    } else {
-      assert.equal(direct[name], chronicle[name], name);
+  // A host with a writable 'chronicle' mount beside a direct one, as one
+  // coding in a checkout with its neighbours mounted to read.
+  const work = join(env.root, 'work');
+  mkdirSync(work);
+  for (const direct of [descriptions(await env.open()), descriptions(await env.open({}, [{ name: 'work', path: work, mode: 'read-write', watch: 'never' }]))]) {
+    for (const name of Object.keys(chronicle)) {
+      if (name === 'ls' || name === 'glob' || name === 'grep' || name === 'sync') {
+        assert.ok(direct[name]!.startsWith(chronicle[name]!) && direct[name]!.length > chronicle[name]!.length, name);
+        assert.match(direct[name]!, /direct mount/, name);
+      } else {
+        assert.equal(direct[name], chronicle[name], name);
+      }
     }
   }
 });
@@ -546,40 +716,54 @@ test("a mount the store holds changes on that disk lacks runs as 'chronicle', sa
   env.file('drafted.ts', 'disk\n');
   env.file('deleted.ts', 'kept on disk\n');
   env.file('both.ts', 'v1\n');
+  env.file('dot.img', GIF);
   const chronicle = await env.openChronicle();
   await data(chronicle, 'ls', { path: 'ref' });
   await data(chronicle, 'write', { path: 'ref/drafted.ts', content: 'draft\n' });
   await data(chronicle, 'delete', { path: 'ref/deleted.ts' });
   await data(chronicle, 'write', { path: 'ref/both.ts', content: 'v2\n' });
+  assert.equal((await chronicle.writeBinary('ref/dot.img', PNG, 'image/png')).success, true);
   env.file('both.ts', 'v3\n');
   assert.equal((await data<{ entries: Array<{ name: string; state: string }> }>(chronicle, 'ls', { path: 'ref' })).entries.find((e) => e.name === 'both.ts')!.state, 'conflict');
   await env.close(chronicle);
 
+  const warned = t.mock.method(console, 'warn', () => {});
   const held = await env.open({ walkCap: 1 });
-  assert.deepEqual(env.alerts, [{
-    kind: 'workspace-mount-not-direct',
-    agent: 'framework',
-    message: 'Mount "ref" runs as \'chronicle\' this session, though its config makes it direct: the workspace holds changes '
-      + 'there that disk lacks, which a direct mount wouldn\'t show: "ref/both.ts" (in conflict), "ref/deleted.ts" (deleted in '
-      + 'the workspace), "ref/drafted.ts" (changed in the workspace). To start it direct, finish them (with the mount configured '
-      + '\'chronicle\' and read-write, materialize them) or give them up (sync each path, which takes disk\'s copy); the first '
-      + 'start that finds none starts it direct.',
-    data: { mount: 'ref', held: 3 },
-  }]);
+  warned.mock.restore();
+  // The ways out come before the list of what's held, so a webhook that
+  // keeps only a long alert's start and end still gives them.
+  const message = 'Mount "ref" runs as \'chronicle\' this session, not direct: the workspace holds 4 changes there that disk lacks. '
+    + 'To start it direct, settle each: sync its path to take disk\'s copy, or materialize it with the mount configured '
+    + '\'chronicle\' and read-write, as materialize\'s answer directs. The first start that finds none starts it direct. '
+    + 'Held: "ref/both.ts" (in conflict), "ref/deleted.ts" (deleted in the workspace), "ref/dot.img" (in conflict), '
+    + '"ref/drafted.ts" (changed in the workspace).';
+  assert.deepEqual(env.alerts, [{ kind: 'workspace-mount-not-direct', agent: 'framework', message, data: { held: { ref: 4 } } }]);
+  assert.deepEqual(warned.mock.calls.map((c) => c.arguments), [[`[workspace] ${message}`]]);
   // As a 'chronicle' mount, unwatched, with no catch-up scan to take turns
   // with its syncs, its changes in view.
   const status = await data<Record<string, Record<string, unknown>>>(held, 'status');
   assert.equal(status.ref!.backend, undefined);
   assert.equal(status.ref!.watch, 'never');
   assert.deepEqual(watched(held), []);
-  assert.equal(status.ref!.pendingChanges, 3);
+  assert.equal(status.ref!.pendingChanges, 4);
   const capped = (await data<{ incomplete: Array<{ path: string; reason: string }> }>(held, 'sync')).incomplete.map((region) => region.reason);
   assert.ok(capped.some((reason) => /^the walk cap \(1\) was reached: the next sync of the mount resumes after ref\//.test(reason)), JSON.stringify(capped));
-  assert.equal((await data<{ content: string }>(held, 'read', { path: 'ref/drafted.ts' })).content, '     1\tdraft');
   assert.ok(held.getTools().every((tool) => !/\bdirect\b/.test(tool.description)));
-
-  for (const path of ['ref/drafted.ts', 'ref/deleted.ts', 'ref/both.ts']) await data(held, 'sync', { path });
   await env.close(held);
+
+  // Every tool reads the workspace's copy there, the draft and the image.
+  env.alerts = [];
+  const again = await env.open();
+  assert.equal(env.alerts.length, 1, 'each start that finds them says so');
+  assert.equal((await data<{ content: string }>(again, 'read', { path: 'ref/drafted.ts' })).content, '     1\tdraft');
+  assert.equal((await data<{ entries: Array<{ name: string; state?: string }> }>(again, 'ls', { path: 'ref' })).entries.find((e) => e.name === 'drafted.ts')?.state, 'workspace-draft');
+  assert.deepEqual((await data<{ matches: Array<{ path: string; state?: string }> }>(again, 'glob', { pattern: 'drafted.ts' })).matches.map((x) => [x.path, x.state]), [['ref/drafted.ts', 'workspace-draft']]);
+  assert.deepEqual((await data<{ results: Array<{ file: string; version: string }> }>(again, 'grep', { pattern: 'draft' })).results.map((r) => [r.file, r.version]), [['ref/drafted.ts', 'workspace']]);
+  assert.equal((await data<Array<{ mimeType?: string }>>(again, 'read_image', { path: 'ref/dot.img' }))[1]!.mimeType, 'image/png');
+  assert.deepEqual(await again.readBinary('ref/dot.img'), { data: PNG });
+
+  for (const path of ['ref/drafted.ts', 'ref/deleted.ts', 'ref/both.ts', 'ref/dot.img']) await data(again, 'sync', { path });
+  await env.close(again);
   env.alerts = [];
   const direct = await env.open();
   assert.deepEqual(env.alerts, []);
@@ -589,17 +773,121 @@ test("a mount the store holds changes on that disk lacks runs as 'chronicle', sa
 
 test("the changes that keep a mount from starting direct are named ten at a time, an intent that can't be read among them", async (t) => {
   const env = new Env(t);
+  env.file('d00.ts', 'disk\n');
   const chronicle = await env.openChronicle();
+  await data(chronicle, 'ls', { path: 'ref' });
   for (let i = 0; i < 11; i++) await data(chronicle, 'write', { path: `ref/d${String(i).padStart(2, '0')}.ts`, content: `${i}\n` });
   await env.close(chronicle);
-  // A recorded intent whose blob the store doesn't hold.
-  env.store.treeSet('workspace/ref/intent', 'aa.ts', { blobHash: 'f'.repeat(64), size: 2, mode: 0 });
+  // Recorded intents whose blob the store doesn't hold: one alone, and one at
+  // a changed file, which is named for the intent.
+  for (const path of ['aa.ts', 'd00.ts']) env.store.treeSet('workspace/ref/intent', path, { blobHash: 'f'.repeat(64), size: 2, mode: 0 });
 
   await env.open();
   assert.equal(env.alerts.length, 1);
-  const shown = Array.from({ length: 9 }, (_, i) => `"ref/d0${i}.ts" (changed in the workspace)`).join(', ');
-  assert.match(env.alerts[0]!.message, new RegExp(`disk lacks, which a direct mount wouldn't show: "ref/aa\\.ts" \\(its workspace intent can't be read\\), ${shown.replace(/[.()]/g, '\\$&')}, and 2 more\\. To start it direct`));
-  assert.deepEqual(env.alerts[0]!.data, { mount: 'ref', held: 12 });
+  const unreadable = (path: string) => `"ref/${path}" (its workspace intent can't be read)`;
+  const shown = [unreadable('aa.ts'), unreadable('d00.ts'), ...Array.from({ length: 8 }, (_, i) => `"ref/d0${i + 1}.ts" (changed in the workspace)`)];
+  assert.ok(env.alerts[0]!.message.endsWith(`Held: ${shown.join(', ')}, and 2 more.`), env.alerts[0]!.message);
+  assert.deepEqual(env.alerts[0]!.data, { held: { ref: 12 } });
+});
+
+test('each kind of change the store holds keeps a mount configured direct from starting direct on its own', async (t) => {
+  const cases: Array<[string, (env: Env) => Promise<void>, string]> = [
+    ['a workspace deletion', async (env) => {
+      env.file('gone.ts', 'kept on disk\n');
+      const chronicle = await env.openChronicle();
+      await data(chronicle, 'ls', { path: 'ref' });
+      await data(chronicle, 'delete', { path: 'ref/gone.ts' });
+      await env.close(chronicle);
+    }, '"ref/gone.ts" (deleted in the workspace)'],
+    ['a conflict', async (env) => {
+      await env.close(await env.openChronicle());
+      new BranchIntents(env.store, 'workspace/ref/intent').put('c.ts', { conflict: { kind: 'both-changed', at: 0, disk: null } });
+    }, '"ref/c.ts" (in conflict)'],
+    ["an intent that can't be read", async (env) => {
+      await env.close(await env.openChronicle());
+      env.store.treeSet('workspace/ref/intent', 'u.ts', { blobHash: 'f'.repeat(64), size: 2, mode: 0 });
+    }, `"ref/u.ts" (its workspace intent can't be read)`],
+  ];
+  for (const [kind, hold, named] of cases) {
+    const env = new Env(t);
+    await hold(env);
+    const m = await env.open();
+    assert.equal(env.alerts.length, 1, kind);
+    assert.ok(env.alerts[0]!.message.endsWith(`Held: ${named}.`), env.alerts[0]!.message);
+    assert.equal((await data<Record<string, Record<string, unknown>>>(m, 'status')).ref!.backend, undefined, kind);
+  }
+});
+
+test('mounts configured direct that the store holds changes on are named in one alert', async (t) => {
+  const env = new Env(t);
+  const other = join(env.root, 'other');
+  mkdirSync(other);
+  const chronicle = await env.open({ backend: 'chronicle', mode: 'read-write', watch: 'never' }, [{ name: 'other', path: other, mode: 'read-write', watch: 'never' }]);
+  await data(chronicle, 'write', { path: 'ref/a.ts', content: 'a\n' });
+  await data(chronicle, 'write', { path: 'other/b.ts', content: 'b\n' });
+  await data(chronicle, 'write', { path: 'other/c.ts', content: 'c\n' });
+  await env.close(chronicle);
+
+  await env.open({}, [{ name: 'other', path: other, mode: 'read-only', backend: 'direct' }]);
+  assert.equal(env.alerts.length, 1);
+  assert.ok(env.alerts[0]!.message.startsWith('Mounts "ref" and "other" run as \'chronicle\' this session, not direct: the workspace holds '
+    + 'changes there that disk lacks (1 in "ref", 2 in "other"). To start one direct, settle each:'), env.alerts[0]!.message);
+  assert.ok(env.alerts[0]!.message.endsWith('Held: "ref/a.ts" (changed in the workspace), "other/b.ts" (changed in the workspace), '
+    + '"other/c.ts" (changed in the workspace).'), env.alerts[0]!.message);
+  assert.deepEqual(env.alerts[0]!.data, { held: { ref: 1, other: 2 } });
+});
+
+test('a start of the same module decides again whether a mount configured direct runs direct', async (t) => {
+  const env = new Env(t);
+  env.file('drafted.ts', 'disk\n');
+  const chronicle = await env.openChronicle();
+  await data(chronicle, 'write', { path: 'ref/drafted.ts', content: 'draft\n' });
+  await env.close(chronicle);
+
+  const m = await env.open();
+  assert.equal(env.alerts.length, 1);
+  await env.restart(m);
+  assert.equal(env.alerts.length, 2, 'a start that finds the change still held says so again');
+  await data(m, 'sync', { path: 'ref/drafted.ts' });
+  await env.restart(m);
+  assert.equal(env.alerts.length, 2, 'the start that finds none says nothing');
+  assert.equal((await data<Record<string, Record<string, unknown>>>(m, 'status')).ref!.backend, 'direct');
+  assert.equal((await data<{ content: string }>(m, 'read', { path: 'ref/drafted.ts' })).content, '     1\tdisk');
+});
+
+test('changes held on a branch not selected at the start keep no mount from starting direct', async (t) => {
+  const env = new Env(t);
+  env.file('drafted.ts', 'disk\n');
+  const main = env.store.currentBranch().name;
+  env.store.createBranch('side', main);
+  env.store.switchBranch('side');
+  const chronicle = await env.openChronicle();
+  await data(chronicle, 'write', { path: 'ref/drafted.ts', content: 'draft\n' });
+  await env.close(chronicle);
+
+  env.store.switchBranch(main);
+  const direct = await env.open();
+  assert.deepEqual(env.alerts, [], 'the branch selected holds none');
+  await env.close(direct);
+  env.store.switchBranch('side');
+  await env.open();
+  assert.equal(env.alerts.length, 1, 'the branch that holds it keeps the mount store-backed');
+});
+
+test("a mount configured direct with no ignore list walks by the direct kind's default while it runs as 'chronicle'", async (t) => {
+  const env = new Env(t);
+  env.file('src/a.ts', 'a\n');
+  env.file('node_modules/p/i.js', 'i\n');
+  env.file('.git/HEAD', 'ref: refs/heads/main\n');
+  const chronicle = await env.openChronicle();
+  await data(chronicle, 'write', { path: 'ref/drafted.ts', content: 'draft\n' });
+  await env.close(chronicle);
+
+  const held = await env.open();
+  assert.equal(env.alerts.length, 1, "it runs as 'chronicle'");
+  const listed = (await data<{ entries: Array<{ path: string }> }>(held, 'ls', { path: 'ref', recursive: true })).entries.map((e) => e.path);
+  assert.deepEqual(listed.filter((path) => !['drafted.ts', 'src/a.ts'].includes(path)), []);
+  assert.deepEqual(env.store.treeList('workspace/ref/tree').map((e) => e.path).sort(), ['drafted.ts', 'src/a.ts']);
 });
 
 test("a mount that ran direct takes in what disk changed meanwhile when it runs as 'chronicle' again", async (t) => {
@@ -658,6 +946,26 @@ test('inOrder hands each result on in order, at most `width` at once', async () 
   });
   assert.deepEqual(order, [0, 1, 2, 3, 4, 5, 6, 7]);
   assert.equal(running.most, 3);
+});
+
+test('inOrder lets each result go once it has handed it on', async () => {
+  setFlagsFromString('--expose_gc');
+  const gc = runInNewContext('gc') as () => void;
+  const handed: Array<WeakRef<object>> = [];
+  let firstKept: boolean | undefined;
+  // Each work ends in a later task than the one before it, so a WeakRef made
+  // in one is no longer held for its task when gc runs in another.
+  await workspaceModule.inOrder(Array.from({ length: 10 }, (_, i) => i), 2, async (i) => {
+    await new Promise((resolve) => setImmediate(resolve));
+    return { i, bytes: Buffer.alloc(64 * 1024) };
+  }, (result, i) => {
+    handed.push(new WeakRef(result));
+    if (i === 9) {
+      gc();
+      firstKept = handed[0]!.deref() !== undefined;
+    }
+  });
+  assert.equal(firstKept, false);
 });
 
 test('inOrder rejects in turn for a work that rejects before its turn, leaving no rejection unhandled', async () => {

@@ -1264,7 +1264,8 @@ export interface BytesResult {
  * A mount-relative file's bytes, through the same located descriptor as
  * readPath, for a direct mount's tools, which keep nothing: at most `limit`
  * of them, and none hashed. A file over `limit` at its fstat has only its
- * head read, and one that grew past it since is read no further than it.
+ * head read, and one that grew past it since is read no further than it. A
+ * link to a directory gets the reason a listing gives it.
  */
 export async function readBytes(
   view: MountView,
@@ -1273,7 +1274,15 @@ export async function readBytes(
   limit: number,
 ): Promise<BytesResult | Exclude<Observation, { kind: 'file' }>> {
   const opened = await openContained(view, rootReal, relativePath);
-  if (!('handle' in opened)) return opened;
+  if (!('handle' in opened)) {
+    // A walk takes a link to a directory as an entry, where the mount follows
+    // links: it's named as a listing names it (observePath).
+    if (opened.kind === 'unobserved' && opened.reason === 'a directory') {
+      const seen = await observePath(view, rootReal, relativePath);
+      return seen.kind === 'file' ? opened : seen;
+    }
+    return opened;
+  }
   const { handle, info } = opened;
   try {
     const size = Number(info.size);

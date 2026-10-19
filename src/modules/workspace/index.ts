@@ -851,7 +851,7 @@ export class WorkspaceModule implements Module {
   private savedState: WorkspaceModuleState | null = null;
   /**
    * The mounts configured direct that run as 'chronicle' this session, with
-   * the changes the store held there that disk lacked (initStore), for
+   * the changes the store held there that disk lacked (chooseKinds), for
    * ensureRunning to say once both halves of the lifecycle have run.
    */
   private notDirect = new Map<string, Array<{ path: string; what: string }>>();
@@ -958,17 +958,33 @@ export class WorkspaceModule implements Module {
     for (const [name, intent] of intents) this.intents.set(name, intent);
 
     // What disk last agreed with, per mount and path: global records, so a
-    // branch switch never rewinds it.
+    // branch switch never rewinds it. A mount configured direct has its
+    // evidence read only where a 'chronicle' run left its states, for what
+    // the store holds there that disk lacks (chooseKinds); one that never ran
+    // so has none to read, and none is begun for it.
     this.agreement = new DiskAgreement(store, { modesObserved: () => this.modesObserved });
-    this.agreement.open(this.config.mounts.map((m) => ({ name: m.name, root: resolve(m.path) })));
+    this.agreement.open(this.config.mounts.filter((m) => intents.has(m.name)).map((m) => ({ name: m.name, root: resolve(m.path) })));
 
-    // A mount configured direct runs as 'chronicle' this session while the
-    // store holds changes there that disk lacks, so they stay in view
-    // (MountConfig.backend); ensureRunning says so. A path held more than
-    // one way is named for the last way set here.
+    this.chooseKinds();
+    this.applySavedState();
+    this.ensureRunning();
+  }
+
+  /**
+   * Whether each mount configured direct runs direct: not while the store
+   * holds changes there that disk lacks, on the branch selected then, so
+   * they stay in view (MountConfig.backend); it runs as 'chronicle' instead,
+   * and ensureRunning says so. Decided when initStore gives the store, and
+   * again at each start, which knows how the mounts nest, so a start that
+   * finds none held starts the mount direct. A path held more than one way
+   * is named for the last way set here.
+   */
+  private chooseKinds(): void {
     this.notDirect = new Map();
-    for (const [name, state] of mounts) {
-      if (!state.direct || !this.intents.has(name)) continue;
+    for (const [name, state] of this.mounts) {
+      if (state.config.backend !== 'direct') continue;
+      state.direct = true;
+      if (!this.intents.has(name)) continue;
       const held = this.heldChanges(state);
       const what = new Map<string, string>();
       for (const path of held.owed) what.set(path, 'changed in the workspace');
@@ -979,9 +995,6 @@ export class WorkspaceModule implements Module {
       state.direct = false;
       this.notDirect.set(name, [...what].sort(([a], [b]) => a.localeCompare(b)).map(([path, label]) => ({ path, what: label })));
     }
-
-    this.applySavedState();
-    this.ensureRunning();
   }
 
   // ==========================================================================
@@ -1027,9 +1040,14 @@ export class WorkspaceModule implements Module {
     };
   }
 
-  /** A mount's ignore list as it runs: its config's, or, for a direct mount that names none, the direct kind's default (MountConfig.ignore). */
+  /**
+   * A mount's ignore list: its config's, or, for a mount configured direct
+   * that names none, the direct kind's default (MountConfig.ignore), whichever
+   * kind it runs as this session, as its watch mode goes by its config
+   * (watchOf).
+   */
   private ignoreOf(mount: MountState): string[] {
-    return mount.config.ignore ?? (mount.direct ? [...DIRECT_MOUNT_IGNORE] : []);
+    return mount.config.ignore ?? (mount.config.backend === 'direct' ? [...DIRECT_MOUNT_IGNORE] : []);
   }
 
   /**
@@ -1278,11 +1296,14 @@ export class WorkspaceModule implements Module {
   /**
    * Start chokidar watchers and emit workspace:mounted events.
    * Idempotent: safe to call from both start() and initStore(), fires once
-   * per mount regardless of which runs second.
+   * per mount regardless of which runs second. Once both have run, it
+   * decides again which mounts configured direct run direct, now that the
+   * mounts' nesting is known, and says which don't, once for this start.
    */
   private ensureRunning(): void {
     if (!this.ctx || this.mounts.size === 0) return;
-    for (const [name, held] of this.notDirect) this.sayNotDirect(name, held);
+    this.chooseKinds();
+    if (this.notDirect.size > 0) this.sayNotDirect();
 
     for (const [name, mount] of this.mounts) {
       if (this.watchers.has(name)) continue;
@@ -1372,21 +1393,30 @@ export class WorkspaceModule implements Module {
   }
 
   /**
-   * Say, for whoever runs the host, that a mount configured direct runs as
-   * 'chronicle' this session (initStore), which changes the store holds there
-   * that disk lacks are why, and the two ways to start it direct: as an ops
-   * alert (the framework's failures log, its `ops:alert` trace and, where
-   * one is set, its webhook), and on stderr.
+   * Say, for whoever runs the host, which mounts configured direct run as
+   * 'chronicle' this session (chooseKinds), which changes the store holds
+   * there that disk lacks are why, and the two ways to start one direct: on
+   * stderr, and as one ops alert for them all (the framework's failures log,
+   * its `ops:alert` trace and, where one is set, its webhook, which posts
+   * one alert of a kind per cooldown and only the start and end of a long
+   * one). So the ways out come before the list of what's held.
    */
-  private sayNotDirect(name: string, held: Array<{ path: string; what: string }>): void {
-    const shown = held.slice(0, 10).map((h) => `"${name}/${h.path}" (${h.what})`).join(', ');
-    const more = held.length > 10 ? `, and ${held.length - 10} more` : '';
-    const message = `Mount "${name}" runs as 'chronicle' this session, though its config makes it direct: ` +
-      `the workspace holds changes there that disk lacks, which a direct mount wouldn't show: ${shown}${more}. ` +
-      'To start it direct, finish them (with the mount configured \'chronicle\' and read-write, materialize them) ' +
-      'or give them up (sync each path, which takes disk\'s copy); the first start that finds none starts it direct.';
+  private sayNotDirect(): void {
+    const mounts = [...this.notDirect];
+    const names = mounts.map(([name]) => `"${name}"`);
+    const named = names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+    const changes = (n: number) => `${n} change${n === 1 ? '' : 's'}`;
+    const why = mounts.length === 1
+      ? `Mount ${named} runs as 'chronicle' this session, not direct: the workspace holds ${changes(mounts[0]![1].length)} there that disk lacks.`
+      : `Mounts ${named} run as 'chronicle' this session, not direct: the workspace holds changes there that disk lacks (` +
+        `${mounts.map(([name, held]) => `${held.length} in "${name}"`).join(', ')}).`;
+    const held = mounts.flatMap(([name, paths]) => paths.map((h) => `"${name}/${h.path}" (${h.what})`));
+    const message = `${why} To start ${mounts.length === 1 ? 'it' : 'one'} direct, settle each: sync its path to take disk's copy, ` +
+      "or materialize it with the mount configured 'chronicle' and read-write, as materialize's answer directs. " +
+      `The first start that finds none starts it direct. Held: ${held.slice(0, 10).join(', ')}` +
+      `${held.length > 10 ? `, and ${held.length - 10} more` : ''}.`;
     console.warn(`[workspace] ${message}`);
-    this.ctx?.notifyOps?.('workspace-mount-not-direct', 'framework', message, { mount: name, held: held.length });
+    this.ctx?.notifyOps?.('workspace-mount-not-direct', 'framework', message, { held: Object.fromEntries(mounts.map(([name, paths]) => [name, paths.length])) });
   }
 
   private async initialScan(mountName: string): Promise<void> {
@@ -1470,7 +1500,7 @@ export class WorkspaceModule implements Module {
   // ==========================================================================
 
   getTools(): ToolDefinition[] {
-    // Where a mount runs direct, three descriptions say what that changes.
+    // Where a mount runs direct, four descriptions say what that changes.
     // A host with none keeps them as they were, and its residents' caches.
     const direct = [...this.mounts.values()].some((m) => m.direct);
     const lsDirect = direct
@@ -1481,6 +1511,7 @@ export class WorkspaceModule implements Module {
       ? ' On a direct mount, grep searches disk\'s files as they are now (version disk), and lists as skipped, with why, '
         + 'those it doesn\'t: binary, over the size limit, or not read, such as a link the mount doesn\'t follow.'
       : '';
+    const globDirect = direct ? ' On a direct mount, a match carries its size, or a note where the mount doesn\'t take it, and no state.' : '';
     const syncDirect = direct ? ' A direct mount is listed under `skipped`: its tools read disk as it is, so there\'s nothing to take in.' : '';
     return [
       {
@@ -1573,7 +1604,7 @@ export class WorkspaceModule implements Module {
       },
       {
         name: 'glob',
-        description: 'Find files matching a glob pattern, checked against disk first; each match carries its state, as ls describes.',
+        description: 'Find files matching a glob pattern, checked against disk first; each match carries its state, as ls describes.' + globDirect,
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -2262,7 +2293,7 @@ export class WorkspaceModule implements Module {
     return {
       mount: given.mount,
       relativePath,
-      path: relativePath === given.relativePath ? path : `${given.mount.config.name}/${relativePath}`,
+      path: relativePath === given.relativePath ? given.path : `${given.mount.config.name}/${relativePath}`,
     };
   }
 
@@ -2290,9 +2321,13 @@ export class WorkspaceModule implements Module {
   }
 
   /**
-   * Parse a mount-prefixed path into (mountName, relativePath), as spelled.
+   * Parse a mount-prefixed path into its mount and mount-relative path, with
+   * its `.` and empty segments and a trailing slash dropped and each `..`
+   * taken lexically, and `path` the mount-prefixed path so spelled: the path
+   * as given where nothing was dropped, so each file has one spelling. A
+   * path that leaves the mount is refused.
    */
-  private parsePathAsGiven(path: string): { mount: MountState; relativePath: string } {
+  private parsePathAsGiven(path: string): { mount: MountState; relativePath: string; path: string } {
     // A file's name on disk is UTF-8, which can't hold a lone surrogate: the
     // store would keep one name and disk another.
     if (LONE_SURROGATE.test(path)) {
@@ -2300,7 +2335,7 @@ export class WorkspaceModule implements Module {
     }
     const slashIdx = path.indexOf('/');
     const mountName = slashIdx >= 0 ? path.slice(0, slashIdx) : path;
-    const relativePath = slashIdx >= 0 ? path.slice(slashIdx + 1) : '';
+    const asGiven = slashIdx >= 0 ? path.slice(slashIdx + 1) : '';
 
     const mount = this.mounts.get(mountName);
     if (!mount) {
@@ -2313,13 +2348,18 @@ export class WorkspaceModule implements Module {
     // prefix-matches there and every in-mount path was rejected as traversal.
     // Against the resolved root, so a root configured with a trailing
     // separator, or relative, contains its own paths, the root included.
+    // The path the tools take is the one this resolves to, so each file has
+    // one spelling: `.` and empty segments are dropped, a trailing slash
+    // with them, and a `..` takes back the segment before it, lexically, as
+    // a shell's `cd` reads `link/..`.
     const root = resolve(mount.config.path);
-    const resolved = resolve(root, relativePath);
+    const resolved = resolve(root, asGiven.split('/').filter((segment) => segment !== '' && segment !== '.').join('/'));
     if (!isContainedPath(root, resolved)) {
       throw new Error(`Path traversal detected: "${path}" resolves outside mount "${mountName}"`);
     }
+    const relativePath = resolved === root ? '' : relative(root, resolved).split(sep).join('/');
 
-    return { mount, relativePath };
+    return { mount, relativePath, path: relativePath === asGiven ? path : relativePath ? `${mountName}/${relativePath}` : mountName };
   }
 
   /**
@@ -2424,11 +2464,13 @@ export class WorkspaceModule implements Module {
    * with the code and errno readRoot gives what is at its path now (its stage
    * and words are this check's): gone, or not a directory, with ENOENT or
    * ENOTDIR, so a caller reads a root gone mid-read as one gone before it; or
-   * another directory, with none.
+   * another directory, with none. A direct mount reads whatever directory is
+   * at its root (MountConfig.backend), so for it, another directory there is
+   * one the next read reads.
    */
   private async rootMoved(mount: MountState): Promise<WorkspaceReadError> {
     const errno = await rootAbsence(resolve(mount.config.path));
-    const reason = errno === undefined ? ROOT_REPLACED : ROOT_UNAVAILABLE;
+    const reason = errno !== undefined ? ROOT_UNAVAILABLE : mount.direct ? DIRECT_ROOT_REPLACED : ROOT_REPLACED;
     return new WorkspaceReadError('mount_unavailable', `Mount unavailable: ${mount.config.name}: ${reason}`, 'root', errno);
   }
 
@@ -3007,7 +3049,10 @@ export class WorkspaceModule implements Module {
         if (fileStat.size > maxSize) throw new Error(over);
       });
     } catch (err) {
-      return { error: err instanceof Error ? err.message : String(err) };
+      // A refusal that names only the path says why with its errno, as a
+      // failed read below does.
+      const bare = err instanceof WorkspaceReadError && err.errno !== undefined && err.message === `Unable to read file: ${path}`;
+      return { error: bare ? `${err.message} (${err.errno})` : err instanceof Error ? err.message : String(err) };
     }
     try {
       // No more than the limit is loaded, as for a file over it at its fstat.
@@ -4500,20 +4545,24 @@ interface Listing {
 /**
  * Run `work` on each item, at most `width` at once, and hand each result to
  * `each` in the items' order, as soon as it and those before it are done.
- * A `work` that rejects rejects this when its turn comes; any started after
- * it finish unheard. Exported for its tests.
+ * A result handed on is let go, so what's held at once is at most `width`
+ * results, as a direct grep's file contents are. A `work` that rejects
+ * rejects this when its turn comes; any started after it finish unheard.
+ * Exported for its tests.
  */
 export async function inOrder<T, R>(items: readonly T[], width: number, work: (item: T) => Promise<R>, each: (result: R, item: T) => void): Promise<void> {
-  const started: Array<Promise<R>> = [];
+  const waiting: Array<Promise<R>> = [];
+  let started = 0;
   for (let i = 0; i < items.length; i++) {
-    while (started.length < items.length && started.length < i + width) {
-      const running = work(items[started.length]!);
+    while (started < items.length && started < i + width) {
+      const running = work(items[started]!);
       // Handled from the start, so a rejection that comes before its turn
       // isn't an unhandled one; awaiting it below still throws it.
       running.catch(() => {});
-      started.push(running);
+      waiting.push(running);
+      started++;
     }
-    each(await started[i]!, items[i]!);
+    each(await waiting.shift()!, items[i]!);
   }
 }
 
@@ -4553,6 +4602,9 @@ function stateView(report: PathReport): Record<string, unknown> {
 /** A lone UTF-16 surrogate, which UTF-8 can't store: in `u` mode, a pair is one code point. */
 const LONE_SURROGATE = /\p{Cs}/u;
 
+/** Why a direct mount's read stopped when another directory was put at its root as it read. */
+const DIRECT_ROOT_REPLACED = 'the mount root was replaced while the file was read: reading it again reads the directory there now';
+
 /**
  * A mount's watch mode as it runs. A mount configured direct watches
  * nothing, whichever kind it runs as this session: its config takes no
@@ -4574,7 +4626,9 @@ function shownValue(value: unknown): string {
  */
 function directRefusals(mount: MountConfig): string[] {
   const refused: string[] = [];
-  if (mount.mode !== 'read-only') refused.push(`mode must be 'read-only', not ${shownValue(mount.mode)}`);
+  if (mount.mode !== 'read-only') {
+    refused.push(mount.mode === undefined ? "mode must be 'read-only' (left out, it's 'read-write')" : `mode must be 'read-only', not ${shownValue(mount.mode)}`);
+  }
   if (mount.watch !== undefined && mount.watch !== 'never') refused.push(`watch ${shownValue(mount.watch)} would watch nothing (leave it out, or set 'never')`);
   for (const key of ['watchDebounceMs', 'watchRootPollMs'] as const) {
     if (mount[key] !== undefined) refused.push(`${key} would tune no watcher (leave it out)`);
