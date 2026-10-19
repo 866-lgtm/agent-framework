@@ -21,7 +21,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
@@ -540,6 +540,34 @@ describe('surgery and awareness marks', () => {
     assert.ok(calls().slice(sentBeforeRetract).every((c) => c.name === 'remove_reaction'), 'the retract revived no add');
     const kinds = framework.getOperatorLog({ limit: 10 }).map((e) => e.kind);
     assert.ok(kinds.includes('awareness-cancel') && kinds.includes('awareness-retract'));
+  });
+
+  it("a retract whose ledger directory can't be synced after its write stands: it returns its receipt, raises recovery-sync, and its removals go out", { skip: process.getuid?.() === 0 }, async () => {
+    await start(true);
+    const { tail } = seed(2);
+    // Every reaction is answered at once.
+    writeFileSync(holdPath, '1');
+    const result = await framework.rollbackToMessage('resident', { messageId: tail, marks: { scope: 'all' } });
+    assert.equal(result.markers.status, 'queued');
+    await waitFor('both adds to be confirmed', () => entries().filter((entry) => entry.confirmed === 'present').length === 2);
+    const alerts: Array<{ kind: string; message: string }> = [];
+    framework.onTrace((event) => {
+      if (event.type === 'ops:alert') alerts.push(event as unknown as { kind: string; message: string });
+    });
+    // The ledger's directory can be written, and not opened to sync.
+    const ledgerDir = join(storePath, 'recovery');
+    chmodSync(ledgerDir, 0o300);
+    let retracted: Awaited<ReturnType<AgentFramework['retractDiscordAwareness']>>;
+    try {
+      retracted = await framework.retractDiscordAwareness('all');
+      await waitFor('both removals to be sent', () => calls().filter((call) => call.name === 'remove_reaction').length === 2);
+    } finally {
+      chmodSync(ledgerDir, 0o700);
+    }
+    assert.equal(retracted.removalsQueued, 2);
+    assert.ok(alerts.some((alert) => alert.kind === 'recovery-sync'
+      && alert.message === `syncing ${ledgerDir} failed, so ${join(ledgerDir, 'discord-awareness-outbox.json')} may not survive a crash: `
+        + `EACCES: permission denied, open '${ledgerDir}'`), JSON.stringify(alerts));
   });
 
   it('a caller-supplied store has no ledger unless discordAwarenessOutboxPath names one: without it a marks choice is refused before anything changes', async () => {

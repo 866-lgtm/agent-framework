@@ -1381,7 +1381,9 @@ async function writeLedgerFile(
     try {
       await syncDirectory(synced);
     } catch (error) {
-      onUnsynced(synced, error);
+      try {
+        onUnsynced(synced, error);
+      } catch { /* the write stands: a report that fails changes nothing in the file */ }
     }
   }
 }

@@ -55,7 +55,10 @@ interface Harness {
   /** Each directory a write couldn't sync after its rename, as reported. */
   unsynced: string[];
   /** A fresh instance over the same file: what a restarted process reads. */
-  open(opts?: { announceImport?: (unsent: DiscordAwarenessImportedUnsent[]) => void }): DiscordAwarenessOutbox;
+  open(opts?: {
+    announceImport?: (unsent: DiscordAwarenessImportedUnsent[]) => void;
+    onUnsyncedWrite?: (directory: string, error: unknown) => void;
+  }): DiscordAwarenessOutbox;
   /** The file as written now. */
   file(): any;
   /** A reaction's entry in the file, by message (and emoji). */
@@ -645,6 +648,18 @@ test("a write whose directory, or the directory's parent, can't be synced after 
   }
   assert.equal(statusOf(h.open(), other.id), 'retired', 'in the file');
   assert.deepEqual(h.unsynced, [dirname(h.path), dirname(dirname(h.path))]);
+}));
+
+test("a report of an unsynced directory that throws doesn't fail the write it reports", { skip: asRoot }, withLedger(async (outbox, h) => {
+  const batch = (await outbox.prepare(input([ref('m1')])))!;
+  const reporting = h.open({ onUnsyncedWrite: () => { throw new Error('injected report failure'); } });
+  chmodSync(dirname(h.path), 0o300);
+  try {
+    assert.deepEqual(await reporting.settleActivation(batch.id), { status: 'queued', queued: 1 });
+  } finally {
+    chmodSync(dirname(h.path), 0o700);
+  }
+  assert.equal(statusOf(h.open(), batch.id), 'active');
 }));
 
 test("a prepare whose write failed leaves the ledger as it was, and says why", { skip: asRoot }, withLedger(async (outbox, h) => {

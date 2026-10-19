@@ -172,8 +172,10 @@ test('the mandatory awareness deadline still bounds a hung reaction with request
     framework = await AgentFramework.create(config({ requestTimeoutMs: 0, awarenessDeadlineMs: 150 }));
     await waitFor('the hung add to be recorded unanswered', () => entry('m1')?.confirmed === 'unknown');
     assert.deepEqual(entry('m1')!.mayLand, ['add']);
-    assert.ok(logged.some((line) => line.startsWith('[discord-awareness] add discord:g1:c1/m1: unknown') && /didn't answer within/.test(line)),
-      logged.join('\n'));
+    // The file holds the answer from its rename; the drain logs it once the
+    // write, the directories' syncs included, is done.
+    await waitFor('the drain to log the unanswered add with the deadline', () => logged.some((line) =>
+      line.startsWith('[discord-awareness] add discord:g1:c1/m1: unknown') && /didn't answer within/.test(line)));
   } finally {
     writeFileSync(paths.hold, '1');
     await framework?.stop();
