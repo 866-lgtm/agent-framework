@@ -237,6 +237,32 @@ test('a first line that alone would pass the limit is cut where it fits', async 
   assert.match(tiny.note!, /Line 1 is cut: read its rest with offsetChars=0 and limitChars=1500, then continue with offset=2\.$/);
 });
 
+test("a first line cut to fit is the longest cut that fits, where the rest's length loses a digit too", async t => {
+  // The rest's length is in the marker and in the note, so at the cut where it
+  // goes from 1,000 to 999 the page loses two characters for the one it gains,
+  // and is a character shorter than at the cut before. Plain letters take one
+  // character each as JSON, so some limit in this range lands on that dip.
+  const { read } = await setup(t, 'a'.repeat(1_500));
+  const withCut = (page: LinePage, cut: number) => JSON.stringify({
+    ...page,
+    note: `Line 1 is cut: read its rest with offsetChars=${cut} and limitChars=${1_500 - cut}.`,
+    content: `     1\t${'a'.repeat(cut)} [… ${1_500 - cut} more chars; read them with offsetChars=${cut}]`,
+  }).length;
+  const cuts = new Set<number>();
+  for (let limit = 700; limit <= 760; limit++) {
+    const result = await read({}, limit);
+    assert.ok(stored(result) <= limit, `${stored(result)} > ${limit}`);
+    const page = result.data as LinePage;
+    const cut = /^ {5}1\t(a*) \[/.exec(page.content)![1].length;
+    cuts.add(cut);
+    assert.equal(withCut(page, cut), stored(result));
+    for (let more = 1; more <= 4; more++) assert.ok(withCut(page, cut + more) > limit, `at ${limit}, a cut of ${cut + more} fits where ${cut} was shown`);
+  }
+  // The range covers the dip. Cuts of 499 and 500 are never the longest that
+  // fits, since the page of each is as long as the page two cuts on.
+  assert.ok(cuts.has(498) && cuts.has(501) && !cuts.has(499) && !cuts.has(500), [...cuts].join(' '));
+});
+
 test('a first line cut to fit, read from a later offset, is numbered and placed in the file', async t => {
   const { read } = await setup(t, `a\nb\n${'"'.repeat(1500)}\nnext\n`);
   const page = (await read({ offset: 3 }, 1_000)).data as LinePage;

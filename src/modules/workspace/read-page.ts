@@ -119,21 +119,30 @@ export function linePage(path: string, file: FileText, offset: number, limit: nu
     return { success: true, data: page(first + best, shownLines.join('\n'), noteAt(first + best)) };
   }
   // No page fits with its first line as a page shows it: the loop tried that
-  // page first, since a read's limit is at least 1, and it is pageWith(over).
+  // page first, since a read's limit is at least 1, and it is pageWith(top).
   // So the line is cut shorter, at the most the page has room for, and ends
-  // the page: its note names where the line's rest starts, since that comes
-  // next. Each cut is measured on the page itself, since its note names the
-  // cut. Every cut below `over` shows a marker, and a longer one never makes
-  // the page shorter: the text gains at least a character where the marker's
-  // count loses at most a digit, and the offsets only grow. So the search
-  // finds the longest cut that fits.
+  // the page: its note names where the line's rest starts and how long it is,
+  // since that comes next. Each cut is measured on the page itself, since its
+  // note names the cut. Every cut below `top` shows a marker. A longer cut
+  // adds a character of text at least, and the offsets only grow, but the
+  // rest's length is in the marker and in the note, so where it loses a digit
+  // the page loses two characters: it can be one character shorter than the
+  // page a cut before. The search takes the page as growing with the cut.
+  // Such a dip is one cut, and the next is many cuts away, so the longest cut
+  // that fits is the one the search finds or, past a dip, at most two cuts
+  // further, four code units at most, and those are tried too.
   const pageWith = (chars: number) => page(first + 1, shown(first, chars), noteAt(first + 1, chars));
+  const fitsAt = (chars: number) => JSON.stringify(pageWith(chars)).length <= maxChars;
+  const top = Math.min(lines[first].length, MAX_LINE_CHARS);
   let fits = 0;
-  let over = Math.min(lines[first].length, MAX_LINE_CHARS);
+  let over = top;
   while (over - fits > 1) {
     const mid = Math.floor((fits + over) / 2);
-    if (JSON.stringify(pageWith(mid)).length <= maxChars) fits = mid; else over = mid;
+    if (fitsAt(mid)) fits = mid; else over = mid;
   }
+  // The search ends with `fits + 1` measured as too long, or as `top`.
+  const found = fits;
+  for (let chars = found + 2; chars <= found + 4 && chars < top; chars++) if (fitsAt(chars)) fits = chars;
   return { success: true, data: pageWith(fits) };
 }
 
