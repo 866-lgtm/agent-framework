@@ -1065,6 +1065,12 @@ function isTurnContinuation(reason: string): boolean {
   return reason === 'context_budget_restart' || reason === 'tool_results_ready'
     || reason === 'tool_result_guard_retry';
 }
+
+/** Wake sources the framework generates for itself (bounce wakes,
+ *  continuations, retries, unsticks, admission requeues). A wake from any
+ *  other source — a channel message, a heartbeat or other server event, a
+ *  gate flush, a timer, an operator nudge — is a cause of its own. */
+const FRAMEWORK_WAKE_SOURCES = new Set(['framework', 'scheduler']);
 const CONVERSATION_ROUTER_STATE_ID = 'framework/conversation-router';
 const INFERENCE_LOG_ID = 'framework/inference-log';
 const PROCESS_LOG_ID = 'framework/process-log';
@@ -13735,6 +13741,16 @@ export class AgentFramework {
       // requests[0] in that mixed batch bypassed the turn lock because a
       // restart existed, then treated the continuation as a fresh turn.
       const trigger = budgetRestart ?? requests[0];
+      // The bounce-wake cap (bounceProse) stops a bounce → wake → bounce loop
+      // that nothing else feeds. A turn with a cause of its own is not that
+      // loop, so the count starts again. Otherwise only a delivered prose
+      // envelope reset it, and a resident that recovers from bounces with a
+      // send tool kept the count for good: every later bounce, a reply to a
+      // fresh message included, appended its notice without a wake.
+      // (Optional chaining: prototype-built harnesses leave the map unset.)
+      if (requests.some((r) => !FRAMEWORK_WAKE_SOURCES.has(r.source))) {
+        this.proseBounceStreaks?.delete(agentName);
+      }
       // Route this turn's auto-published speech to the channel that triggered
       // it (item-3 redux). A batched wake may carry several triggering channels
       // (messages arrived in >1 channel while the agent was busy/idle):
@@ -15492,7 +15508,9 @@ export class AgentFramework {
     }
   }
 
-  /** Cap on consecutive bounce-triggered wakes (notices still append after). */
+  /** Cap on consecutive bounce-triggered wakes (notices still append after).
+   *  The count resets on a delivered prose envelope, and when a turn starts
+   *  with a cause of its own (processInferenceRequests). */
   private static readonly PROSE_BOUNCE_WAKE_CAP = 2;
 
   /**
