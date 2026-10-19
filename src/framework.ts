@@ -2174,8 +2174,8 @@ type ChannelOpenedCause = 'subscription-policy' | 'opened-by-delivery' | 'opened
  *  it's addressed to (none: where addMessage delivers an unrouted message),
  *  and what its log line says. A reader's notice that says the primary was
  *  told carries `untold`, its words without saying so, which
- *  writeChannelNotices writes instead where the primary's notice, written
- *  before it, didn't land. */
+ *  writeChannelNotices writes instead where the write of the primary's
+ *  notice, before it, failed. */
 interface ChannelNotice {
   text: string;
   untold?: string;
@@ -15101,8 +15101,11 @@ export class AgentFramework {
    * Write a builder's channel notices in order, each on its own: one that
    * can't be written is logged, and the rest are still written. A reader's
    * notice that says the primary was told comes after the primary's, and is
-   * written in its `untold` words where the primary's didn't land, so it
-   * never says the primary was told of what its window doesn't hold. Through
+   * written in its `untold` words where the primary's write failed, so it
+   * never says the primary was told of a notice that wasn't written. A write
+   * addMessage defers to the primary's next boundary, as it does any write
+   * to an agent mid-turn, counts as written: a memory-only queue loses it at
+   * exit, as it loses any deferred write. Through
    * framework.addMessage for mid-turn safety (deferral + hear-while-acting
    * injection): an open a delivery forces happens inside a live turn, and a
    * direct context-manager append there would store the notice out of order.
@@ -15230,26 +15233,30 @@ export class AgentFramework {
 
   /**
    * Whether `who` holds the traffic of every one of `channelIds`, so that
-   * what an open channel delivers is in its window. A conversation fork
-   * holds only its home's: where conversations are routed, an incoming
-   * message goes to the fork bound to its channel or nowhere, and never to
-   * the primary (handleMcplChannelIncoming). Elsewhere an incoming message is
-   * stored with no forAgent, in deliveryAgent()'s store, and where that's the
-   * residents' shared slot, every ordinary resident reads it
-   * (isOrdinaryResident); a run's store is its own. (A push names its
-   * channel and lands in the primary's window either way, but it comes
-   * whether or not the channel is open, so it isn't what opening one
+   * what an open channel delivers is in its window. Where conversations are
+   * routed, an incoming message goes to the fork its channel is bound to, or
+   * nowhere, and never to the primary (handleMcplChannelIncoming), so a fork
+   * holds only its home's, and only while the router binds its home to it: a
+   * fork whose binding has expired, closing, holds none. Elsewhere an
+   * incoming message is stored with no forAgent, in deliveryAgent()'s store,
+   * and where that's the residents' shared slot, every agent that reads the
+   * slot holds it (sharedSlotAgents: the ordinary residents, and the
+   * subconscious through its merged view); a run's store is its own. (A push
+   * names its channel and lands in the primary's window either way, but it
+   * comes whether or not the channel is open, so it isn't what opening one
    * delivers.)
    */
   private holdsChannelTraffic(who: string | undefined, channelIds: readonly string[]): boolean {
     if (who === undefined) return false;
     const home = this.conversationAgentHomes.get(who);
-    if (home !== undefined) return channelIds.every((id) => id === home);
+    if (home !== undefined) {
+      return channelIds.every((id) => id === home && this.conversationRouter?.getBinding(id)?.agentName === who);
+    }
     if (this.conversationRouter) return false;
     const delivery = this.deliveryAgent();
     const agent = this.agents.get(who);
     if (delivery === undefined || agent === undefined) return false;
-    return agent === delivery || (this.isOrdinaryResident(agent) && this.isOrdinaryResident(delivery));
+    return agent === delivery || (this.sharedSlotAgents.has(agent) && this.isOrdinaryResident(delivery));
   }
 
   /**
@@ -15277,8 +15284,8 @@ export class AgentFramework {
    * may give the primary's name as its own; the primary's name to any other
    * agent, a fork made from another template included.
    */
-  private primaryForReader(reader: string | undefined, primary: string | undefined): string {
-    return reader !== undefined && this.forkOfPrimary(reader) ? 'Your primary' : primary ?? 'The primary';
+  private primaryForReader(reader: string | undefined, primary: string): string {
+    return reader !== undefined && this.forkOfPrimary(reader) ? 'Your primary' : primary;
   }
 
   /** Whether `agentName` is a conversation fork made from the primary: the

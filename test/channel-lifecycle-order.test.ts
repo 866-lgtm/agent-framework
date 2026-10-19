@@ -2479,6 +2479,10 @@ test("where a reply's reader can't close a channel selected for opening, the pri
         { text: forkByName + stays + ', and channel_close withdraws that.', metadata: { system: true, kind: 'channel-notice', speaker: 'fork' } },
         { text: facts + stays + '.' + told('Your primary'), metadata: { system: true, kind: 'channel-notice' }, forAgent: 'fork' },
       ] },
+    { why: 'a fork that has ended, its home still known while it is released, the channel selected again', name: 'fork', agents: [['primary', []]],
+      homes: [['fork', 'y']], primary: 'primary', selectedForOpening: 'server-bootstrap',
+      told: [{ text: '[channels] Not open: #x (x). A reply from your fork in y, named fork, went out there, but opening the channel failed; that fork has ended.' +
+        again + ', and channel_close withdraws that.', metadata: { system: true, kind: 'channel-notice', speaker: 'fork' } }] },
     { why: 'a fork away from its home, the channel left closed', name: 'fork', agents: [['fork', []], ['primary', []]], homes: [['fork', 'y']],
       primary: 'primary',
       told: [{ text: facts, metadata: { system: true, kind: 'channel-notice' }, forAgent: 'fork' }] },
@@ -2536,7 +2540,7 @@ test('the opened notice names channel_close only to a reader that can call it, s
   const cases: Array<{
     why: string; name?: string; cause?: 'opened-by-reply' | 'subscription-policy'; channels?: Array<{ channelId: string; label?: string }>;
     agents: Array<[string, string[]]>; homes?: Array<[string, string]>; labels?: Array<[string, string]>; isolated?: string[];
-    router?: boolean; template?: string; primary: string | null;
+    router?: boolean; template?: string; expired?: string[]; subconscious?: string; primary: string | null;
     told: Array<{ text: string; metadata: unknown; forAgent?: string }>;
   }> = [
     { why: "a second resident that can close it, which reads the residents' shared slot", name: 'helper', agents: [['helper', []], ['primary', []]], primary: 'primary',
@@ -2564,6 +2568,11 @@ test('the opened notice names channel_close only to a reader that can call it, s
       ] },
     { why: 'a fork at its home', name: 'fork', agents: [['fork', []], ['primary', []]], homes: [['fork', 'x']], router: true, primary: 'primary',
       told: [{ text: own + optOut + close, metadata: opened(fromReply), forAgent: 'fork' }] },
+    { why: 'a fork at its home whose binding has expired, closing: its home routes to it no more', name: 'fork', agents: [['fork', []], ['primary', []]],
+      homes: [['fork', 'x']], router: true, expired: ['fork'], primary: 'primary',
+      told: [{ text: own + close, metadata: opened(fromReply), forAgent: 'fork' }] },
+    { why: 'the subconscious, which reads the shared slot through its merged view', name: 'sub', agents: [['sub', []], ['primary', []]], subconscious: 'sub', primary: 'primary',
+      told: [{ text: own + optOut + close, metadata: opened(fromReply), forAgent: 'sub' }] },
     { why: 'a second resident whose allowedTools leave channel_close out', name: 'helper', agents: [['helper', ['channel_close']], ['primary', []]], primary: 'primary',
       told: [
         { text: "[channels] Now open: #x (x): a message from helper into the closed channel opened it, and helper can't close it." + optOut + close,
@@ -2613,8 +2622,14 @@ test('the opened notice names channel_close only to a reader that can call it, s
     framework.primaryAgentName = c.primary;
     framework.usedEphemeralAgentNames = new Set();
     framework.conversationAgentHomes = new Map(c.homes ?? []);
-    framework.conversationRouter = c.router ? { templateAgent: c.template ?? 'primary' } : undefined;
-    // Residents read one shared slot; a fork's store, or a run's, is its own.
+    // Each fork is bound to its home, unless its binding has expired.
+    const bound = new Map((c.homes ?? []).filter(([fork]) => !(c.expired ?? []).includes(fork)).map(([fork, home]) => [home, fork]));
+    framework.conversationRouter = c.router
+      ? { templateAgent: c.template ?? 'primary', getBinding: (id: string) => (bound.has(id) ? { channelId: id, agentName: bound.get(id) } : undefined) }
+      : undefined;
+    framework.subconsciousAgentName = c.subconscious;
+    // Residents, and the subconscious through its merged view, read one shared
+    // slot; a fork's store, or a run's, is its own.
     framework.sharedSlotAgents = new Set([...framework.agents.values()]
       .filter((a: { name: string }) => !framework.conversationAgentHomes.has(a.name) && !(c.isolated ?? []).includes(a.name)));
     const labels = new Map(c.labels ?? []);

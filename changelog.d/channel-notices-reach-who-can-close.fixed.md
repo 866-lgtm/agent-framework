@@ -9,8 +9,8 @@
   that it was.
 - The opened notice says "What an open channel delivers to you depends on
   its server" only to an agent whose window holds the channel's traffic.
-  Before, a conversation fork was told it of a channel other than its home,
-  whose messages never reach it.
+  Before, a conversation fork was told this about a channel other than its
+  home, whose messages never reach it.
 - The primary's notices name a conversation fork by the channel it's bound
   to, then by its generated name. The notice of an open by an agent that has
   ended says "a message from" it, where it said "opened by X's reply" whether
