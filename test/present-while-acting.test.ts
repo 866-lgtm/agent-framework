@@ -1871,8 +1871,8 @@ describe('present while acting', () => {
     it(`a ${tag} marker injected mid-turn does not clear send suppression (#157)`, async () => {
       // Edits, deletions and reaction removals (RFC-001 core tags, delivered
       // as synthetic incoming messages by e.g. zulip_mcp#23) are markers
-      // ABOUT a message the agent has seen — the same category as a
-      // reaction. Before #157 only `chat:reaction` was exempt, so an
+      // ABOUT an existing message — the same category as a reaction.
+      // Before #157 only `chat:reaction` was exempt, so an
       // "[edited] Ann: typo fix" arriving right after an explicit send
       // re-opened auto-routing and double-posted the same-round prose.
       membrane.pushResponse(createMockResponse([

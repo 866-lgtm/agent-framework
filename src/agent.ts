@@ -939,8 +939,9 @@ export class Agent {
    * awaits, and at every tool boundary that injects, whether or not the
    * stream says it carries injected messages. So nothing above it can have
    * been shown. A compile that throws assembled nothing, and gives its move
-   * back. A scalar counts a prefix, so a message stored below it without
-   * having been shown counts as shown, which errs toward a marker.
+   * back where it can (unshowFailedCompile). A scalar counts a prefix, so a
+   * message stored below it without having been shown counts as shown, which
+   * errs toward a marker.
    */
   private shownWatermark: { branch: string; sequence: number } | null = null;
 
@@ -973,7 +974,14 @@ export class Agent {
 
   /** A committing compile that threw assembled nothing, so its own move of
    *  the shown watermark goes back, unless a boundary or another compile has
-   *  moved the watermark since. */
+   *  moved the watermark since. It goes back to the watermark as the compile
+   *  found it, which can be another compile's claim that has failed as well.
+   *  Of two overlapping committing compiles, if the first to start throws
+   *  first, it gives nothing back (the second's claim is current), and if
+   *  the second then throws, it restores the first's failed claim. Messages
+   *  up to that claim then count as shown, although no request held those
+   *  above the watermark the first compile found, which errs toward a marker
+   *  until the next compile or boundary moves the watermark. */
   private unshowFailedCompile(
     watermark: { branch: string; sequence: number } | null,
     before: { branch: string; sequence: number } | null,

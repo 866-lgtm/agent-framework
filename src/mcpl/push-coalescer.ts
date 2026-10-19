@@ -195,8 +195,11 @@ export interface CoalescingSnapshot {
     audienceAgent?: string;
     /** The subject's first view has ended (SubjectState.firstViewEnded). A
      *  snapshot written before this field existed has none and reads as not
-     *  ended, so once after an upgrade a subject whose first view had
-     *  already ended can give one delivery a spurious `firstView`. */
+     *  ended. So after an upgrade, a subject whose first view had ended
+     *  without a read is granted a first view again. Until the agent is shown
+     *  or reads a version of it, each delivery that would mark a first view (a
+     *  render, or a plain occurrence that replaces an unread version or a
+     *  pending notice) carries a spurious `firstView`. */
     firstViewEnded?: true;
     /** `firstView` only on a batch that wasn't rendering: one that was may
      *  have been shown. */
