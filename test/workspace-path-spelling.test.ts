@@ -361,6 +361,98 @@ test("through a link a mount follows, the include judges where the path lands as
   assert.ok(!listing.includes('y.txt'), listing);
 });
 
+test("a covered name whose file disk spells otherwise is outside the include, judged as disk spells it", { skip: FOLDING_ONLY }, async (t) => {
+  const { workspace, dir } = await setup(t, (d) => [
+    { name: 'work', path: d, mode: 'read-write', watch: 'never', include: ['gate.json'] },
+  ]);
+  writeFileSync(join(dir, 'GATE.JSON'), '{}\n');
+  const read = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path: 'work/gate.json' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+  assert.equal(read.success, false);
+  assert.match(String(read.error), /"work\/gate\.json" is outside the mount's include/);
+});
+
+test("a segment on a path's way that isn't a directory and that the include doesn't cover keeps the caller's spelling in a refusal", { skip: FOLDING_ONLY }, async (t) => {
+  const { workspace, dir } = await setup(t, (d) => [
+    { name: 'work', path: d, mode: 'read-write', watch: 'never', include: ['*.json'] },
+  ]);
+  writeFileSync(join(dir, 'secret.txt'), 'outside the include\n');
+  mkdirSync(join(dir, 'real'));
+  writeFileSync(join(dir, 'real', 'a.json'), '{}\n');
+  symlinkSync('real', join(dir, 'link'));
+  for (const [path, given, disk, segment] of [['work/SECRET.TXT/a.json', 'SECRET.TXT', 'secret.txt', 'secret.txt'], ['work/LINK/a.json', 'LINK', '"work/link"', 'link']] as const) {
+    const read = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+    assert.equal(read.success, false, path);
+    assert.ok(String(read.error).includes(given) && !String(read.error).includes(disk), `${path}: ${read.error}`);
+    let message = '';
+    await assert.rejects(workspace.readFileFromDisk(path), (err: unknown) => { message = String((err as Error).message); return err instanceof WorkspaceReadError; });
+    assert.ok(message.includes(given) && !message.includes(disk), `${path}: ${message}`);
+    // A delete's answer, and what a sync of the path says it skipped, name it the same way.
+    const deleted = await workspace.handleToolCall({ id: 'delete', name: 'delete', input: { path } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+    assert.equal(deleted.success, false, path);
+    assert.ok(String(deleted.error).includes(given) && !String(deleted.error).includes(disk), `${path}: ${deleted.error}`);
+    const synced = JSON.stringify(await workspace.handleToolCall({ id: 'sync', name: 'sync', input: { path } } as Parameters<WorkspaceModule['handleToolCall']>[0]));
+    assert.ok(!synced.includes(`${segment}/a.json`) && !synced.includes(`work/${segment}`), `${path}: ${synced}`);
+    if (segment === 'link') assert.ok(synced.includes('LINK/a.json'), `the sync names what it skipped as given: ${synced}`);
+  }
+});
+
+test("a path is judged as disk spells it, where the answer keeps the caller's spelling of an uncovered link on its way", { skip: FOLDING_ONLY }, async (t) => {
+  const { workspace, dir } = await setup(t, (d) => [
+    { name: 'work', path: d, mode: 'read-write', watch: 'never', followSymlinks: true, include: ['LINK/**', 'real/**'] },
+  ]);
+  mkdirSync(join(dir, 'real'));
+  writeFileSync(join(dir, 'real', 'a.txt'), 'covered where it lands\n');
+  symlinkSync('real', join(dir, 'link'));
+  // Disk spells the path `link/a.txt`, which `LINK/**` doesn't cover.
+  const read = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path: 'work/LINK/a.txt' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+  assert.equal(read.success, false);
+  assert.match(String(read.error), /"work\/LINK\/a\.txt" is outside the mount's include/);
+});
+
+test("a link's target is judged and named as disk spells it, on a mount that doesn't follow links", { skip: FOLDING_ONLY }, async (t) => {
+  const { workspace, dir } = await setup(t, (d) => [
+    { name: 'work', path: d, mode: 'read-write', watch: 'never', include: ['*.json'] },
+  ]);
+  // The link's target spells a file inside the include that disk spells outside it, and the other way round.
+  writeFileSync(join(dir, 'Y.JSON'), 'outside the include as disk spells it\n');
+  symlinkSync('y.json', join(dir, 'l.json'));
+  writeFileSync(join(dir, 'k.json'), '{}\n');
+  symlinkSync('K.JSON', join(dir, 'w.json'));
+  const said = async (path: string): Promise<string> => {
+    let message = '';
+    await assert.rejects(workspace.readFileFromDisk(path), (err: unknown) => { message = String((err as Error).message); return err instanceof WorkspaceReadError; });
+    return message;
+  };
+  // A link on a path's way is described by where it leads; one at the path itself is refused as a link.
+  const uncovered = await said('work/l.json/a.json');
+  assert.ok(!/y\.json/i.test(uncovered), uncovered);
+  assert.match(await said('work/w.json/a.json'), /"work\/w\.json" is a symlink to "work\/k\.json"/);
+});
+
+test("a key no spelling names, as an earlier version stored, spells no path a write takes", { skip: FOLDING_ONLY }, async (t) => {
+  const { workspace, dir, call } = await setup(t);
+  // What an earlier version stored for `work/Docs/`, a key with a trailing separator.
+  const store = (workspace as unknown as { getStore(): JsStore }).getStore();
+  const bytes = Buffer.from('stale\n');
+  store.treeSet('workspace/work/tree', 'Docs/', { blobHash: store.storeBlob(bytes, 'text/plain'), size: bytes.length, mode: 0o644 });
+  await call('write', { path: 'work/docs/new.txt', content: 'new\n' });
+  assert.deepEqual(readdirSync(dir).sort(), ['docs', 'src'], 'the directory takes the caller\'s spelling, not the stale key\'s');
+});
+
+test("past the innermost nested mount's directory a path stays as given, with two levels nested", { skip: FOLDING_ONLY }, async (t) => {
+  const { workspace } = await setup(t, (d) => {
+    mkdirSync(join(d, 'a', 'b'), { recursive: true });
+    return [
+      { name: 'work', path: d, mode: 'read-write', watch: 'never' },
+      { name: 'inner1', path: join(d, 'a'), mode: 'read-write', watch: 'never' },
+      { name: 'inner2', path: join(d, 'a', 'b'), mode: 'read-write', watch: 'never' },
+    ];
+  });
+  const read = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path: 'work/a/B/X.txt' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+  assert.equal(read.success, false);
+  assert.match(String(read.error), /use "inner2\/X\.txt"/);
+});
+
 // Past a nested mount's directory a path is that mount's, and its own include
 // decides what a tool may name there, so the outer mount's answers show the
 // rest of the path as given. The directory itself takes disk's spelling, as a

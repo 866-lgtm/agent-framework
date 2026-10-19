@@ -485,7 +485,7 @@ describe('mount include', () => {
     assert.match(uncovered, /"work\/gate\.json" is a symlink, which this mount does not follow/);
     assert.ok(!uncovered.includes('secret'), uncovered);
     assert.match(await refusal('work/x.md/y.md'), /"work\/x\.md" is a symlink to "work\/notes\.md", which this mount does not follow/);
-    assert.match(await refusal('work/dir.md/gate.json'), /"work\/dir\.md" is a symlink to "work\/real", which this mount does not follow; the mount's host can set followSymlinks: true/);
+    assert.match(await refusal('work/dir.md/gate.json'), /"work\/dir\.md" is a symlink to "work\/real", which this mount does not follow; the mount's host can set followSymlinks: true, for what the include covers where it leads/);
     // A link the include doesn't cover is outside the mount itself: its refusal tells nothing of where it leads.
     const outside = await refusal('work/lnk/gate.json');
     assert.match(outside, /"work\/lnk" is a symlink, which this mount does not follow$/);
@@ -910,6 +910,10 @@ describe('mount include', () => {
     }
     const created = await refused(m, 'write', { path: 'work/via/new.txt', content: 'x' });
     assert.ok(created.endsWith('Symlink escape detected: work/via/new.txt'), `a file it would create where the link leads: ${created}`);
+    // A covered directory where the link leads is a directory to the file tools, not a place that leaves the
+    // mount: the include judges files.
+    const directory = await refused(m, 'read', { path: 'work/via/sub' });
+    assert.ok(/directory/i.test(directory) && !directory.includes('escape'), directory);
     // A sync, named or not, stores none of it, grep matches none of it, and a listing from where a link leads
     // (`via/sub` is covered, so it's a directory) names none of it.
     await call(m, 'sync', {});
@@ -982,8 +986,40 @@ describe('mount include', () => {
     assert.equal(await coversLanding(view, rootReal, join(rootReal, 'docs', 'a.txt'), 'Docs/a.txt'), true);
     // Through a link, where it lands is judged, and the include doesn't cover `site/b.txt`.
     assert.equal(await coversLanding(view, rootReal, join(rootReal, 'site', 'b.txt'), 'via/b.txt'), false);
+    // A landing spelled otherwise than folding makes it, with no link left on the way, as after a link was
+    // swapped for a directory between the realpath and the walk, is judged where it lands too.
+    assert.equal(await coversLanding(view, rootReal, join(rootReal, 'site', 'b.txt'), 'Docs/a.txt'), false);
     // Without an include, every file is covered.
     assert.equal(await coversLanding({ root }, rootReal, join(rootReal, 'site', 'b.txt'), 'via/b.txt'), true);
+    // Spelled otherwise only as folding makes it, through a link, where disk tells case apart: a link `vx` to a
+    // directory `VX` the include leaves out is judged where it lands.
+    mkdirSync(join(root, 'VX'));
+    writeFileSync(join(root, 'VX', 'c.txt'), "not the mount's either\n");
+    if (!existsSync(join(root, 'vx'))) {
+      symlinkSync('VX', join(root, 'vx'));
+      assert.equal(await coversLanding({ root, include: ['vx/**'] }, rootReal, join(rootReal, 'VX', 'c.txt'), 'vx/c.txt'), false);
+    }
+  });
+
+  test("history the outer mount took in where a nested mount now holds the directory is no mount's where that mount's include leaves it out: no listing, sync or grep names it", async (t) => {
+    const env = new Env(t);
+    env.writeDisk('inner/secret.txt', "needle: not the inner mount's\n");
+    env.writeDisk('inner/k.json', '{}\n');
+    const before = await env.open();
+    await call(before, 'sync', {});
+    assert.ok(env.tree().includes('inner/secret.txt'), `taken in before the mount was nested: ${env.tree()}`);
+    await env.stop(before);
+    const m = await openNested(env, false);
+    try {
+      const listing = JSON.stringify(await call(m, 'ls', { path: 'work', recursive: true }));
+      assert.ok(!listing.includes('secret'), listing);
+      const synced = JSON.stringify(await call(m, 'sync', {}));
+      assert.ok(!synced.includes('secret'), synced);
+      assert.equal((await call(m, 'grep', { path: 'work', pattern: 'needle' })).totalMatches, 0);
+      assert.ok(env.tree().includes('inner/secret.txt'), 'history keeps it as it was');
+    } finally {
+      await m.stop();
+    }
   });
 
   test("on a mount that doesn't follow links, a link at the path itself is `symlink` however the path is spelled", async (t) => {
@@ -1261,6 +1297,7 @@ describe('mount include', () => {
         mounts: Map<string, { watcherReadyAt?: number }>;
         handleFsChanges(mount: string, changes: Array<{ path: string; op: string }>): Promise<void>;
         passUnlocked(mount: unknown, scope: { kind: string; paths?: string[] }): Promise<unknown>;
+        withMount(mount: unknown, run: () => Promise<unknown>): Promise<unknown>;
       };
       const until = async (done: () => boolean, what: string): Promise<void> => {
         for (const started = Date.now(); !done(); await new Promise((r) => setTimeout(r, 20))) {
@@ -1269,25 +1306,36 @@ describe('mount include', () => {
       };
       await until(() => !!internals.mounts.get('work')!.watcherReadyAt && env.store.treeGet(TREE, 'gate.json') !== null,
         'the watcher is ready and the catch-up scan took gate.json');
-      // Each batch the watcher hands over, and each pass of the mount from here on.
-      const batches: string[][] = [];
+      // Each batch the watcher hands over, with its handling, each turn of the mount taken, and each pass of
+      // the mount from here on.
+      const batches: Array<{ paths: string[]; handled: Promise<void> }> = [];
       const passes: string[][] = [];
+      let turns = 0;
       const handle = internals.handleFsChanges.bind(m);
-      internals.handleFsChanges = (mount, changes) => { batches.push(changes.map((c) => c.path)); return handle(mount, changes); };
+      internals.handleFsChanges = (mount, changes) => {
+        const handled = handle(mount, changes);
+        batches.push({ paths: changes.map((c) => c.path), handled });
+        return handled;
+      };
+      const withMount = internals.withMount.bind(m);
+      internals.withMount = (mount, run) => { turns++; return withMount(mount, run); };
       // A watcher's batch takes a pass of the paths it names; the catch-up scan after ready is the mount's.
       const pass = internals.passUnlocked.bind(m);
       internals.passUnlocked = (mount, scope) => { if (scope.kind === 'paths') passes.push(scope.paths ?? []); return pass(mount, scope); };
       const named = (path: string): boolean => events.some((e) => e.paths?.includes(path));
       events.length = 0;
+      turns = 0;
       env.writeDisk('notes.txt', 'outside the include\n');
-      await until(() => batches.flat().includes('notes.txt'), 'the watcher reports the uncovered file');
-      // Time for its batch's handling to finish, had it taken a pass.
-      await new Promise((r) => setTimeout(r, 300));
+      await until(() => batches.some((b) => b.paths.includes('notes.txt')), 'the watcher reports the uncovered file');
+      // Its batch's handling has ended, so whatever it would take, it has taken.
+      for (const b of batches.filter((b) => b.paths.includes('notes.txt'))) await b.handled;
+      assert.equal(turns, 0, 'no turn of the mount is taken for it');
       assert.equal(passes.length, 0, `no pass of the mount: ${JSON.stringify(passes)}`);
       assert.ok(!named('work/notes.txt'), `and no event: ${JSON.stringify(events)}`);
       // A covered change, as a control: the watcher reports it, a pass takes it in, and its event goes out.
       env.writeDisk('gate.json', '{"v":2}\n');
       await until(() => named('work/gate.json'), 'the covered change is taken in');
+      assert.ok(turns > 0, 'the covered change takes a turn of the mount, so the count sees one');
       assert.ok(passes.length > 0 && passes.every((paths) => !paths.includes('notes.txt')), JSON.stringify(passes));
       assert.equal(env.store.treeGet(TREE, 'notes.txt'), null);
     } finally {
@@ -1377,12 +1425,14 @@ describe('mount include', () => {
     const refusal = (include: unknown, ending: string): void => {
       assert.throws(() => new WorkspaceModule({ mounts: [mount(include)] }), (err: unknown) => err instanceof Error
         && err.message.startsWith('[workspace] Mount "work": include must be a non-empty list of names') && err.message.endsWith(ending),
-      JSON.stringify(include) ?? String(include));
+      ending);
     };
     for (const bad of [[], 42, 'gate.json']) refusal(bad, `, not ${JSON.stringify(bad)}`);
-    for (const entry of ['sub/file.txt', 'foo*', '*', '*.', 'a/*/**', '/**', '', '.', '..', './**', '../**', 'a/../**', undefined]) {
+    for (const entry of ['sub/file.txt', 'foo*', '*', '*.', '*.js*', 'a/*/**', '/**', '', '.', '..', './**', '../**', 'a/../**', undefined]) {
       refusal([entry], `; ${JSON.stringify(entry) ?? String(entry)} is none of these`);
     }
+    // A value JSON can't write is shown as JavaScript writes it, not thrown on.
+    refusal([1n], '; 1n is none of these');
     refusal(['gate.json', 'foo*'], '; "foo*" is none of these');
     for (const good of [['gate.json'], ['*.md', 'gate.js'], ['docs/**'], ['a/b/**']]) {
       assert.doesNotThrow(() => new WorkspaceModule({ mounts: [mount(good)] }), JSON.stringify(good));
@@ -1507,20 +1557,40 @@ describe("the checks where disk is acted on, called directly as a push and a rea
     symlinkSync(at('secret.txt'), at('cover.json'));
     mkdirSync(at('elsewhere'));
     symlinkSync(at('elsewhere'), at('box'));
+    writeFileSync(at('elsewhere/x.txt'), 'outside the outer include too');
     const own = { ...view, include: ['*.json', 'box/**'] } as MountView;
     assert.deepEqual(await readPath(own, rootReal, 'cover.json', 1 << 20), { kind: 'unobserved', reason: leaves });
-    // In place through the link, and a file the write would create where a covered directory's link leads.
-    for (const path of ['cover.json', 'box/new.txt']) {
-      const err = await writeContained(own, rootReal, path, Buffer.from('outer wrote'), { kind: 'any' }).then(() => null, (e: unknown) => e);
-      assert.ok(err instanceof EffectFailed, String(err));
-      assert.equal(err.message, leaves, path);
+    // In place through the link, and a file the write would create where a covered directory's link leads,
+    // forced or expecting other bytes: where it lands is asked before anything reads it for a hash.
+    for (const expect of [{ kind: 'any' }, { kind: 'content', hash: 'not its hash' }] as const) {
+      // Only a forced write creates a file it doesn't find.
+      for (const path of expect.kind === 'any' ? ['cover.json', 'box/new.txt'] : ['cover.json']) {
+        const err = await writeContained(own, rootReal, path, Buffer.from('outer wrote'), expect).then(() => null, (e: unknown) => e);
+        assert.ok(err instanceof EffectFailed, String(err));
+        assert.equal(err.message, leaves, `${path}, ${expect.kind}`);
+      }
+      // The link itself, and a regular file reached through a link among its directories.
+      for (const path of ['cover.json', 'box/x.txt']) {
+        const removed = await unlinkContained(own, rootReal, path, expect).then(() => null, (e: unknown) => e);
+        assert.ok(removed instanceof EffectFailed, String(removed));
+        assert.equal(removed.message, leaves, `${path}, ${expect.kind}`);
+      }
     }
-    const removed = await unlinkContained(own, rootReal, 'cover.json', { kind: 'any' }).then(() => null, (e: unknown) => e);
-    assert.ok(removed instanceof EffectFailed, String(removed));
-    assert.equal(removed.message, leaves);
     assert.equal(readFileSync(at('secret.txt'), 'utf8'), 'outside the outer include');
+    assert.equal(readFileSync(at('elsewhere/x.txt'), 'utf8'), 'outside the outer include too');
     assert.ok(lstatSync(at('cover.json')).isSymbolicLink(), 'the link stays');
     assert.equal(existsSync(at('elsewhere/new.txt')), false, 'nothing is made where the link leads');
+  });
+
+  test("a create judges where the file lands before anything is made, a nested mount's absent root included", async (t) => {
+    const { at, view, rootReal } = rig(t);
+    // A nested mount whose directory isn't there: a file the outer mount would create at its root is that
+    // mount's place, so nothing is made there.
+    const gone = { ...view, nested: [...(view.nested ?? []), { dir: 'gone', name: 'later', real: join(rootReal, 'gone'), include: ['*.json'] }] } as MountView;
+    const err = await writeContained(gone, rootReal, 'gone', Buffer.from('outer wrote'), { kind: 'absent' }).then(() => null, (e: unknown) => e);
+    assert.ok(err instanceof EffectFailed, String(err));
+    assert.equal(err.touched, false, 'nothing was touched');
+    assert.equal(existsSync(at('gone')), false, 'no file is left at the nested root');
   });
 
   test("the module's disk read judges the mount's own include where a covered path lands, past the parse that refuses first", async (t) => {

@@ -249,9 +249,12 @@ export async function linkRefusal(
 
 /**
  * Where a symlink the walk found leads, for its refusal: to a path inside
- * the mount (mount-relative, and whether it's a directory), outside the
- * mount, or nowhere it can be resolved to. One realpath and one stat, made
- * only when refusing.
+ * the mount (mount-relative, as disk spells it, and whether it's a
+ * directory), outside the mount, or nowhere it can be resolved to. One
+ * realpath, one stat and the respelling, made only when refusing. realpath
+ * keeps the spelling the link's target gives, which on a disk that folds
+ * names need not be disk's, so the target is respelled before anything
+ * judges or names it (diskSpelling).
  */
 export type LinkLeads = { kind: 'inside'; target: string; directory: boolean } | { kind: 'outside' } | { kind: 'nowhere' };
 
@@ -260,7 +263,7 @@ export async function linkLeads(root: string, rootReal: string, link: string): P
   if (leads === null) return { kind: 'nowhere' };
   if (!contained(rootReal, leads)) return { kind: 'outside' };
   const directory = await stat(leads).then((info) => info.isDirectory(), () => false);
-  return { kind: 'inside', target: relative(rootReal, leads).split(sep).join('/'), directory };
+  return { kind: 'inside', target: await diskSpelling(rootReal, relative(rootReal, leads).split(sep).join('/')), directory };
 }
 
 /**
@@ -309,17 +312,20 @@ export function namesNestedPlace(rest: string, include: readonly string[] | unde
  * content, so where a followed path lands is judged as where it's named, as
  * a nested mount's place is (namesNestedPlace). A path that meets no link
  * lands where it's named, and is judged as named. realpath can spell such a
- * path otherwise, with disk's stored names on macOS and Windows where the
- * parse kept a workspace entry's spelling, so where the spellings differ a
- * link is looked for on the way (linkOnTheWay's walk), and only one found,
- * or a directory on the way it couldn't ask, makes the landing the path
- * judged. That's judged as disk spells it, since realpath keeps the spelling
- * a link's target gives, which on a disk that folds names need not be disk's
- * (diskSpelling).
+ * path otherwise only as a disk that folds names does, with disk's stored
+ * names on macOS and Windows where a path keeps a workspace entry's
+ * spelling, so where the spellings differ only so, a link is looked for on
+ * the way (linkOnTheWay's walk); none found, the path is judged as named.
+ * Otherwise, or where a link or a directory it couldn't ask lies on the way,
+ * the landing is judged, as disk spells it, since realpath keeps the
+ * spelling a link's target gives, which on a disk that folds names need not
+ * be disk's (diskSpelling). So a link swapped for a directory between the
+ * realpath and the walk can only make the landing judged.
  */
 export async function judgedAt(root: string, rootReal: string, real: string, given: string): Promise<string> {
   const landed = relative(rootReal, real).split(sep).join('/');
-  if (landed === given || (await linkOnTheWay({ root, followSymlinks: false }, given)) === null) return given;
+  if (landed === given) return given;
+  if (foldedLoosely(landed) === foldedLoosely(given) && (await linkOnTheWay({ root, followSymlinks: false }, given)) === null) return given;
   return diskSpelling(rootReal, landed);
 }
 
@@ -368,7 +374,9 @@ export function linkWords(name: string, found: LinkFound, leads: LinkLeads | nul
       `nested in mount "${name}": use "${rest ? `${holder.name}/${rest}` : holder.name}" in place of ${spell(found.link)}`;
   }
   if (!leads.directory && !insideMount(leads.target, include)) return `${link}, which this mount does not follow`;
-  const setting = leads.directory ? "; the mount's host can set followSymlinks: true" : '';
+  // Following it serves only what the include covers where it leads (judgedAt).
+  const setting = !leads.directory ? '' : include === undefined ? "; the mount's host can set followSymlinks: true"
+    : "; the mount's host can set followSymlinks: true, for what the include covers where it leads";
   return `${link} to ${spell(leads.target)}, which this mount does not follow${setting}`;
 }
 
@@ -874,7 +882,7 @@ async function locateDir(view: MountView, rootReal: string, rel: string): Promis
     // as at any file (namesNestedPlace).
     const holder = nestedAtReal(real, view.nested);
     if (holder) {
-      const directory = await stat(real).then((info) => info.isDirectory(), () => false);
+      const directory = holder.include !== undefined && await stat(real).then((info) => info.isDirectory(), () => false);
       return namesNestedPlace(holder.rest, holder.include, directory) ? { kind: 'unobserved', reason: leadsInto(view.name, rel, holder) } : { kind: 'missing' };
     }
   }
@@ -1117,7 +1125,7 @@ async function parentPlacement(view: MountView, rootReal: string, relativePath: 
     if (!holder) return { inside: parent };
     // A place there that the nested mount's include leaves out is no mount's,
     // and holds nothing beneath it, as beneath any file (namesNestedPlace).
-    const directory = await stat(parent).then((info) => info.isDirectory(), () => false);
+    const directory = holder.include !== undefined && await stat(parent).then((info) => info.isDirectory(), () => false);
     return namesNestedPlace(holder.rest, holder.include, directory) ? { reason: leadsInto(view.name, parentOf(relativePath), holder) } : 'gone';
   } catch (err) {
     const code = errno(err);

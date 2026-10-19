@@ -94,6 +94,12 @@ export interface MountConfig {
    * On a disk that folds names, a path is judged as disk spells it, as the
    * walk judges what it lists, so a covered name whose file disk spells
    * otherwise is outside the mount, and its refusal shows the path as given.
+   * A path that names one of the workspace's entries exactly, or does once
+   * its directories take disk's spelling, keeps the entry's spelling, as the
+   * parse gives it, and a segment on a path's way that isn't a directory and
+   * that the include doesn't cover keeps the caller's spelling, so no
+   * refusal names it otherwise. Where a followed path lands is judged as
+   * disk spells it, and a path that meets no link as named.
    * `resolveAbsolutePath`, which is synchronous, judges the include on the
    * path as given and follows no link: on such a disk it returns the path to
    * a covered name's file that disk spells otherwise, and null for a covered
@@ -107,16 +113,21 @@ export interface MountConfig {
    * refused as leaving the mount. On a mount that doesn't follow links, a
    * link on a path's way is refused, as on any such mount (followSymlinks).
    * A nested mount's root is placed where disk has it at each start, and its
-   * directory is matched by spelling, so three cases fall outside this, as
+   * directory is matched by spelling, so four cases fall outside this, as
    * for any nested mount: on a disk that folds names, a mount configured
    * through a link that spells a directory otherwise than disk does isn't
    * found nested, and this mount holds its files as its own; on such a disk,
    * a path through a link that spells a nested mount's directory otherwise
-   * than disk does isn't found to lead there, and this mount reads, lists,
-   * searches and writes there as its own, creating files too, though a walk
-   * from its root passes over the directory; and a
-   * nested mount whose root moves while running, as
-   * `acceptRoot` takes, stays placed where it was until the next start.
+   * than that mount's configured path does, whether the link or the
+   * configured path is the one spelled otherwise than disk, isn't found to
+   * lead there, and this mount reads, lists, searches and writes there as
+   * its own, creating files too, though a walk from its root passes over the
+   * directory; on such a disk, a place in a nested mount's directory that a
+   * link does lead to is judged by that mount's include, and named, in the
+   * spelling the link's target gives, so a refusal can name a file disk
+   * spells outside that include, or leave a covered one unnamed; and a
+   * nested mount whose root moves while running, as `acceptRoot` takes,
+   * stays placed where it was until the next start.
    *
    * Text the host registers for a path (`registerGeneratedTextFile`) is
    * served there whatever the include says, since it isn't one of the

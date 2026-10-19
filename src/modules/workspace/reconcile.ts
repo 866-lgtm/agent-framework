@@ -65,6 +65,8 @@ import {
   inOtherMount,
   locateRoot,
   looksBinary,
+  namesNestedPlace,
+  nestedHolder,
   observePath,
   passedOverAt,
   passedOverBetween,
@@ -860,9 +862,15 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
   // track. The tracked ones are read synchronously, on this branch. A path
   // the mount's include doesn't cover is outside the mount, so no pass
   // decides it: the workspace's history may hold it from before the include,
-  // and it stays there as it is.
+  // and it stays there as it is. So is one in a nested mount's directory
+  // that mount's include leaves out, such as history taken in before the
+  // mount was nested there: it's no mount's (namesNestedPlace).
   const candidates = new Set<string>();
-  const inside = (p: string): boolean => insideMount(p, mount.view.include);
+  const inside = (p: string): boolean => {
+    if (!insideMount(p, mount.view.include)) return false;
+    const holder = nestedHolder(p, mount.view.nested ?? []);
+    return holder === undefined || p === holder.dir || namesNestedPlace(p.slice(holder.dir.length + 1), holder.include, false);
+  };
   let walk: Walk | null = null;
   if (scope.kind === 'paths') {
     for (const p of scope.paths) if (inside(p)) candidates.add(p);

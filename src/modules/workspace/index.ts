@@ -145,7 +145,9 @@ class WorkspaceImageReadError extends Error {
  * link's message names its target only where a tool could name it: a
  * directory, or a file the include covers. A link the include doesn't cover
  * is outside the mount, and its message tells nothing of where it leads, so
- * its code is `symlink` or `parent_symlink` wherever it leads.
+ * on a path's way its code is `parent_symlink` wherever it leads; named
+ * itself, it's refused as outside the include (`outside_include`), as any
+ * path the include doesn't cover is.
  * A `mount_unavailable` for a root whose realpath or stat fails otherwise
  * carries that errno, such as EACCES.
  */
@@ -330,7 +332,12 @@ async function linkReadError(
   }
   const rootReal = await realpath(mount.config.path).catch(() => resolve(mount.config.path));
   const leads = await shownLeads(mount.config.path, rootReal, found, mount.config.include);
-  const reason = `${mountPrefixedPath}: ${linkWords(mount.config.name, found, leads, nested, mount.config.include)}`;
+  // A link the include doesn't cover (no leads) is named as the path shown
+  // spells it, the caller's spelling (keptAsGiven): its segments line up
+  // with the parsed path's.
+  const shownPath = mountPrefixedPath.startsWith(`${mount.config.name}/`) ? mountPrefixedPath.slice(mount.config.name.length + 1) : '';
+  const named = leads === null && shownPath !== '' ? { link: shownPath.split('/').slice(0, found.link.split('/').length).join('/') } : found;
+  const reason = `${mountPrefixedPath}: ${linkWords(mount.config.name, named, leads, nested, mount.config.include)}`;
   const holder = leads?.kind === 'inside' ? nestedHolder(leads.target, nested) : undefined;
   const code = leads?.kind === 'outside' ? 'escape'
     : leads?.kind === 'inside' && holder && namesHolder(leads, holder) ? 'other_mount'
@@ -396,6 +403,22 @@ async function realBeneath(given: string, links = 0): Promise<string> {
     const target = await readlink(absolute).catch(() => null);
     if (target !== null) return realBeneath(isAbsolute(target) ? target : `${place}${sep}${target}`, links + 1);
     return join(place, basename(absolute));
+  }
+}
+
+/**
+ * A configured value as a refusal shows it: a number or a bigint as
+ * JavaScript writes it (JSON would say null for NaN, and throws for a
+ * bigint), anything else as JSON, or as String gives it where JSON can't,
+ * as for a list holding a bigint.
+ */
+function shownValue(value: unknown): string {
+  if (typeof value === 'number') return String(value);
+  if (typeof value === 'bigint') return `${value}n`;
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
   }
 }
 
@@ -868,10 +891,8 @@ export class WorkspaceModule implements Module {
     for (const mount of config.mounts) {
       const cap: unknown = mount.walkCap;
       if (cap !== undefined && !(Number.isSafeInteger(cap) && (cap as number) > 0)) {
-        // Numbers as JavaScript writes them (JSON would say null for NaN), anything else as JSON.
-        const shown = typeof cap === 'number' ? String(cap) : typeof cap === 'bigint' ? `${cap}n` : JSON.stringify(cap) ?? String(cap);
         throw new Error(
-          `[workspace] Mount "${mount.name}": walkCap must be a positive integer no larger than ${Number.MAX_SAFE_INTEGER}, not ${shown}`,
+          `[workspace] Mount "${mount.name}": walkCap must be a positive integer no larger than ${Number.MAX_SAFE_INTEGER}, not ${shownValue(cap)}`,
         );
       }
       const include: unknown = mount.include;
@@ -880,7 +901,7 @@ export class WorkspaceModule implements Module {
         // file out of the mount unsaid (includePatternReadable).
         if (!Array.isArray(include) || include.length === 0) {
           throw new Error(
-            `[workspace] Mount "${mount.name}": include must be a non-empty list of names, "*.ext" globs or "dir/**" globs, not ${JSON.stringify(include) ?? String(include)}`,
+            `[workspace] Mount "${mount.name}": include must be a non-empty list of names, "*.ext" globs or "dir/**" globs, not ${shownValue(include)}`,
           );
         }
         // By index: an entry that is itself undefined, or a hole, is unreadable too.
@@ -890,7 +911,7 @@ export class WorkspaceModule implements Module {
           throw new Error(
             `[workspace] Mount "${mount.name}": include must be a non-empty list of names, "*.ext" globs or "dir/**" globs, `
             + `with no "." or ".." segment${sep === '\\' ? ' and no "\\", which this platform reads as a separator' : ''}; `
-            + `${JSON.stringify(unreadable) ?? String(unreadable)} is none of these`,
+            + `${shownValue(unreadable)} is none of these`,
           );
         }
       }
@@ -2226,7 +2247,7 @@ export class WorkspaceModule implements Module {
     // a directory not there yet is.
     const onItsWay = holder.include === undefined
       || await stat(dirname(real)).then((info) => info.isDirectory(), (err: unknown) => errnoOf(err) === 'ENOENT');
-    const directory = await stat(real).then((info) => info.isDirectory(), () => false);
+    const directory = holder.include !== undefined && await stat(real).then((info) => info.isDirectory(), () => false);
     if (!onItsWay || !namesNestedPlace(holder.rest, holder.include, directory)) return new WorkspaceReadError('escape', `Symlink escape detected: ${path}`, 'realpath');
     return new NestedMountError(path, mount.config.name, holder.name, holder.use, 'leads into');
   }
@@ -2337,11 +2358,42 @@ export class WorkspaceModule implements Module {
     const depth = this.nestedDepth(given.mount.config.name, spelled);
     const relativePath = depth === undefined ? spelled
       : [...spelled.split('/').slice(0, depth), ...given.relativePath.split('/').slice(depth)].join('/');
+    // Every check judges the path as disk spells it; what an answer shows
+    // keeps the caller's spelling from an uncovered segment on its way that
+    // isn't a directory (keptAsGiven).
+    const shown = await this.keptAsGiven(given.mount, relativePath, given.relativePath);
     return {
       mount: given.mount,
       relativePath,
-      path: relativePath === given.relativePath ? path : `${given.mount.config.name}/${relativePath}`,
+      path: shown === given.relativePath ? path : `${given.mount.config.name}/${shown}`,
     };
+  }
+
+  /**
+   * The path an answer shows for `spelled`, a mount-relative path parsePath
+   * respelled from `given`: the caller's spelling from the first segment on
+   * its way that disk has as something other than a directory, such as a
+   * file or a link, and that the mount's include doesn't cover, and disk's
+   * before it. Disk's spelling of a name the include leaves out is a name
+   * the caller didn't give, so no answer names such a segment otherwise,
+   * while every check still judges `spelled`. Directories keep disk's
+   * spelling, as a listing shows them, and a mount without an include keeps
+   * every segment as disk spells it. The respelling keeps each segment's
+   * place, so the two paths' segments line up.
+   */
+  private async keptAsGiven(mount: MountState, spelled: string, given: string): Promise<string> {
+    if (mount.config.include === undefined || spelled === given) return spelled;
+    const segments = spelled.split('/');
+    const asGiven = given.split('/');
+    for (let i = 0; i < segments.length - 1; i++) {
+      if (segments[i] === asGiven[i]) continue;
+      const place = segments.slice(0, i + 1).join('/');
+      if (insideMount(place, mount.config.include)) continue;
+      const entry = await lstat(join(resolve(mount.config.path), ...segments.slice(0, i + 1))).catch(() => null);
+      if (entry === null || entry.isDirectory()) continue;
+      return [...segments.slice(0, i), ...asGiven.slice(i)].join('/');
+    }
+    return spelled;
   }
 
   /**
@@ -2376,7 +2428,9 @@ export class WorkspaceModule implements Module {
       // given yet or a conflict, is the workspace's own name for the file
       // there, as an entry is, so the calls that settle it reach it.
       has: (path) => store.treeGet(mount.treeStateId, path) !== null || store.treeGet(intents.treeStateId, path) !== null,
-      under: (prefix) => store.treeList(mount.treeStateId, prefix).map((entry) => entry.path),
+      // A key no spelling names, such as `c/` or `a//b.txt` from an earlier
+      // version, is outside the mount (parsedSpelling), so it spells nothing.
+      under: (prefix) => store.treeList(mount.treeStateId, prefix).map((entry) => entry.path).filter((path) => parsedSpelling(path)),
       holder: (path) => this.holderOf(mount.config.name, path)?.name,
       rootFoldsCase: this.rootFoldsCase.get(mount.config.name) ?? false,
     };
@@ -3064,11 +3118,21 @@ export class WorkspaceModule implements Module {
    * while a path in another mount's directory is refused before this, and
    * passed over by any pass. The caller holds the mount's turn.
    */
-  private async ensureSynced(mount: MountState, relativePath: string): Promise<PathReport | undefined> {
+  private async ensureSynced(mount: MountState, relativePath: string, path?: string): Promise<PathReport | undefined> {
     const store = this.getStore();
     if (store.treeGet(mount.treeStateId, relativePath)) return undefined;
     const pass = await this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] }, { named: true });
-    return pass.reports.get(relativePath);
+    return this.shownReport(mount, relativePath, path, pass.reports.get(relativePath));
+  }
+
+  /**
+   * A pass's report on a tool's path, `relativePath` as disk spells it, with
+   * what its note quotes of that path spelled as `path`, the path the answer
+   * shows, spells it (asShownIn).
+   */
+  private shownReport(mount: MountState, relativePath: string, path: string | undefined, report: PathReport | undefined): PathReport | undefined {
+    if (path === undefined || report?.note === undefined) return report;
+    return { ...report, note: asShownIn(report.note, mount.config.name, relativePath, this.parsePathAsGiven(path).relativePath) };
   }
 
   /** Why the workspace holds no entry at a path, when disk explains it. */
@@ -3110,7 +3174,7 @@ export class WorkspaceModule implements Module {
       input = { ...input, path };
       const store = this.getStore();
       const found = await this.withMount(mount, async (): Promise<{ text: string } | { error: string }> => {
-        const report = await this.ensureSynced(mount, relativePath);
+        const report = await this.ensureSynced(mount, relativePath, input.path);
         const entry = store.treeGet(mount.treeStateId, relativePath);
         if (!entry) return { error: this.notInWorkspace(input.path, report) };
         const blob = store.getBlob(entry.blobHash);
@@ -3335,7 +3399,7 @@ export class WorkspaceModule implements Module {
         // tool's pass does, it names the path it acts on, so a file the
         // mount passes over by design is observed (see PassOptions.named).
         const pass = await this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] }, { named: true });
-        const report = pass.reports.get(relativePath);
+        const report = this.shownReport(mount, relativePath, input.path, pass.reports.get(relativePath));
         // A mode taken in alone isn't a change to the text: it brings nothing
         // new to read, as it makes no event (emitFsEvents), and the edit then
         // writes at the mode disk has, so it leaves nothing to say.
@@ -3470,7 +3534,7 @@ export class WorkspaceModule implements Module {
     let committed = false;
     try {
       return await this.withMount(mount, async (): Promise<ToolResult> => {
-        const report = await this.ensureSynced(mount, relativePath);
+        const report = await this.ensureSynced(mount, relativePath, input.path);
         await this.settleBeforeMutation(mount, relativePath);
         const entry = store.treeGet(mount.treeStateId, relativePath);
         if (!entry) {
@@ -4133,16 +4197,16 @@ export class WorkspaceModule implements Module {
     }
 
     // A path names its own mount; otherwise the given mount, or every mount.
-    let targets: Array<{ name: string; mount: MountState; relativePath: string }>;
+    let targets: Array<{ name: string; mount: MountState; relativePath: string; shown?: string }>;
     if (input.path) {
-      const { mount, relativePath } = await this.parsePath(input.path);
+      const { mount, relativePath, path } = await this.parsePath(input.path);
       // A path outside the mount's include that's no scope (refusesAsOutside)
       // is refused; beneath a directory, the walk passes over what the include
       // doesn't cover.
       if (await this.refusesAsOutside(mount, relativePath)) {
         return { success: false, error: new OutsideIncludeError(input.path, mount.config).message, isError: true };
       }
-      targets = [{ name: mount.config.name, mount, relativePath }];
+      targets = [{ name: mount.config.name, mount, relativePath, shown: this.parsePathAsGiven(path).relativePath }];
     } else if (input.mount) {
       const m = this.mounts.get(input.mount);
       if (!m) {
@@ -4153,7 +4217,7 @@ export class WorkspaceModule implements Module {
       targets = [...this.mounts.entries()].map(([name, mount]) => ({ name, mount, relativePath: '' }));
     }
 
-    for (const { name, mount, relativePath } of targets) {
+    for (const { name, mount, relativePath, shown = relativePath } of targets) {
       const pass = await this.withMount(mount, async () => {
         if (input.acceptRoot && await this.acceptRootUnlocked(mount)) rootsAccepted.push(name);
         if (!relativePath) {
@@ -4212,11 +4276,14 @@ export class WorkspaceModule implements Module {
       }
       // Say why a path wasn't taken in, so "nothing synced" and "your file was
       // refused" don't look identical from the outside.
+      // A path the sync was asked for, and what a note quotes of it, are
+      // shown as its answer shows them (asShownPath).
       for (const r of pass.reports.values()) {
+        const path = asShownPath(r.path, relativePath, shown);
         if (r.state === 'unverified') {
-          allSkipped.push({ mount: name, path: r.path, reason: `disk could not be checked: ${r.note ?? 'not observed'}` });
+          allSkipped.push({ mount: name, path, reason: `disk could not be checked: ${asShownIn(r.note ?? 'not observed', name, relativePath, shown)}` });
         } else if (r.state === 'disk-only') {
-          allSkipped.push({ mount: name, path: r.path, reason: 'disk-only: binary or over the size limit, never stored' });
+          allSkipped.push({ mount: name, path, reason: 'disk-only: binary or over the size limit, never stored' });
         }
       }
       for (const region of pass.incomplete) allIncomplete.push({ mount: name, ...region });
@@ -4484,6 +4551,32 @@ function stateView(report: PathReport): Record<string, unknown> {
 
 /** A lone UTF-16 surrogate, which UTF-8 can't store: in `u` mode, a pair is one code point. */
 const LONE_SURROGATE = /\p{Cs}/u;
+
+/**
+ * `p`, a mount-relative path, with the leading segments it shares with
+ * `spelled`, a path as disk spells it, spelled as `shown`, the path an answer
+ * shows for it, spells them (keptAsGiven): an answer names a segment the
+ * include doesn't cover only as the agent spelled it. The two paths'
+ * segments line up, so each maps to the shown one's.
+ */
+function asShownPath(p: string, spelled: string, shown: string): string {
+  if (spelled === shown) return p;
+  const segments = p.split('/');
+  const disk = spelled.split('/');
+  let k = 0;
+  while (k < segments.length && k < disk.length && segments[k] === disk[k]) k++;
+  return k === 0 ? p : [...shown.split('/').slice(0, k), ...segments.slice(k)].join('/');
+}
+
+/**
+ * `text`, a pass's note, with each path of mount `name` it quotes, as
+ * linkWords quotes a link on a path's way, shown as asShownPath shows it.
+ */
+function asShownIn(text: string, name: string, spelled: string, shown: string): string {
+  if (spelled === shown) return text;
+  return text.replace(/"([^"]*)"/g, (quoted, inner: string) => inner.startsWith(`${name}/`)
+    ? `"${name}/${asShownPath(inner.slice(name.length + 1), spelled, shown)}"` : quoted);
+}
 
 /**
  * The answer to a write, edit or delete that the workspace stored but

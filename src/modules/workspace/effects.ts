@@ -244,10 +244,11 @@ export async function writeContained(
 
   let touched = false;
   const create = async (): Promise<FileHandle> => {
-    // Beneath a link the mount follows, a covered path can land where the
-    // mount's own include leaves a file out, which is no file of this
-    // mount's (coversLanding), so nothing is made there.
-    if (!(await coversLanding(view, rootReal, target, rel))) throw new EffectFailed(view.followSymlinks ? 'a symlink that leaves the mount' : NOT_FOLLOWED, false);
+    // Where the file would land is judged before anything is made there: a
+    // nested mount's place, or one the mount's own include leaves out
+    // beneath a link it follows, gets no file of this mount's.
+    const refused = await refusedLanding(view, rootReal, rel, target);
+    if (refused !== null) throw new EffectFailed(refused, false);
     try {
       // Exclusive: never follows a symlink, never takes over a file that
       // appeared since planning saw none. At the mode it's given, which the
@@ -376,6 +377,24 @@ export async function writeContained(
 }
 
 /**
+ * Why an effect may not act on the file at `real`, where the mount-relative
+ * `rel` lands, or null where it may: outside the mount; in a nested mount's
+ * directory, which names that mount only where it covers the place
+ * (namesNestedPlace); or a file the mount's own include leaves out where it
+ * lands (coversLanding). Reached through a link this mount doesn't follow,
+ * the link is what's refused. The opened file's check (checkOpened) asks
+ * it, and so does a create, before anything is made.
+ */
+async function refusedLanding(view: MountView, rootReal: string, rel: string, real: string): Promise<string | null> {
+  const leaves = view.followSymlinks ? 'a symlink that leaves the mount' : OUTSIDE_PARENT;
+  if (!contained(rootReal, real)) return leaves;
+  const holder = nestedAtReal(real, view.nested);
+  if (holder) return namesNestedPlace(holder.rest, holder.include, false) ? leadsInto(view.name, rel, holder) : view.followSymlinks ? leaves : NOT_FOLLOWED;
+  if (!(await coversLanding(view, rootReal, real, rel))) return view.followSymlinks ? leaves : NOT_FOLLOWED;
+  return null;
+}
+
+/**
  * Before an effect on an opened file: a regular file, and — unless forced —
  * still holding what was decided on. The hash reads the whole file, so
  * where the file lies (canonically inside the mount, in no nested mount's
@@ -402,17 +421,11 @@ async function checkOpened(
 ): Promise<void> {
   const info = await handle.stat({ bigint: true });
   if (!info.isFile()) throw new EffectFailed('not a regular file', touched);
-  const leaves = view.followSymlinks ? 'a symlink that leaves the mount' : OUTSIDE_PARENT;
   const located = async (): Promise<string> => {
     const real = await realpath(target).catch(() => null);
     if (real === null) throw new EffectFailed(CHANGED, touched);
-    if (!contained(rootReal, real)) throw new EffectFailed(leaves, touched);
-    const holder = nestedAtReal(real, view.nested);
-    // A place a nested mount's include leaves out is no mount's. Reached
-    // through a link this mount doesn't follow, the link is what's refused.
-    if (holder) throw new EffectFailed(namesNestedPlace(holder.rest, holder.include, false) ? leadsInto(view.name, rel, holder) : view.followSymlinks ? leaves : NOT_FOLLOWED, touched);
-    // So is a file this mount's own include leaves out (coversLanding).
-    if (!(await coversLanding(view, rootReal, real, rel))) throw new EffectFailed(view.followSymlinks ? leaves : NOT_FOLLOWED, touched);
+    const refused = await refusedLanding(view, rootReal, rel, real);
+    if (refused !== null) throw new EffectFailed(refused, touched);
     return real;
   };
   if (expect.kind === 'content') {
@@ -560,7 +573,7 @@ export async function unlinkContained(view: MountView, rootReal: string, rel: st
     // one (namesNestedPlace).
     const holder = nestedAtReal(real, view.nested);
     if (holder) {
-      const directory = await stat(real).then((s) => s.isDirectory(), () => false);
+      const directory = holder.include !== undefined && await stat(real).then((s) => s.isDirectory(), () => false);
       throw new EffectFailed(namesNestedPlace(holder.rest, holder.include, directory) ? leadsInto(view.name, rel, holder) : 'a symlink that leaves the mount', false);
     }
     const through = await stat(real, { bigint: true }).catch(() => null);
@@ -579,6 +592,11 @@ export async function unlinkContained(view: MountView, rootReal: string, rel: st
     throw new EffectFailed('a directory', false);
   } else if (!info.isFile()) {
     throw new EffectFailed('not a regular file', false);
+  } else if (!(await coversLanding(view, rootReal, target, rel))) {
+    // A regular file reached through a link among its directories lands
+    // where the mount's own include may leave it out, which is judged too,
+    // before anything reads it for a hash (coversLanding).
+    throw new EffectFailed(view.followSymlinks ? 'a symlink that leaves the mount' : NOT_FOLLOWED, false);
   }
   if (expect.kind === 'content' && (await hashAt(target, file, noFollowFlag(view))) !== expect.hash) throw new EffectFailed(CHANGED, false);
   const gone = await moved(root, parent);
