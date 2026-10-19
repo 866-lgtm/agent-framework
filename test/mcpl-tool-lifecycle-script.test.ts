@@ -1,6 +1,6 @@
 /**
  * RFC-007 for calls a code_execution script makes (issue #235, finding F4):
- * a real framework, a real python interpreter, real MCPL servers over stdio.
+ * a real framework, a real script in the isolate, real MCPL servers over stdio.
  *
  *   prov         offers `click` (classed `computer`) and `run` (unclassed,
  *                returns an error result); `delay_ms` delays an answer, and
@@ -171,10 +171,10 @@ describe('tool lifecycle for script-made calls (RFC-007, #235 F4)', () => {
 
   it("reports a script's calls under each inner tool's own name and class; model calls unchanged", async () => {
     const code = [
-      'await prov__click({"x": 1, "y": 2, "delay_ms": 250})',
-      'await prov__run({"cmd": "make"})',
-      'await test__send({"text": "hello"})',
-      'print("script done")',
+      'await tools["prov--click"]({ x: 1, y: 2, delay_ms: 250 });',
+      'await tools["prov--run"]({ cmd: "make" });',
+      'await tools["test--send"]({ text: "hello" });',
+      'text("script done");',
     ].join('\n');
     await runTurn([
       { type: 'tool_use', id: 'toolu_01SCRIPTAAAAAAAAAAAAAAAAA', name: 'code_execution', input: { code } },
@@ -272,14 +272,14 @@ describe('tool lifecycle for script-made calls (RFC-007, #235 F4)', () => {
         type: 'tool_use',
         id: 'toolu_01THROWSDDDDDDDDDDDDDDDDDD',
         name: 'code_execution',
-        input: { code: 'r = await test__send({"text": "x", "boom": True})\nprint("got:", r)' },
+        input: { code: 'const r = await tools["test--send"]({ text: "x", boom: true });\ntext("got: " + r.isError + " " + r.content[0].text);' },
       }]);
       await waitFor(() => lifecycle('obs-all').length >= before.all + 4, 'obs-all: both calls ended');
       await waitFor(() => lifecycle('obs-comms').length >= before.comms + 2, 'obs-comms: the call ended');
       await new Promise((r) => setTimeout(r, 300)); // a stray or duplicate would land here
 
       assert.equal(workDone, 1);
-      assert.match(JSON.stringify(membrane.lastStream!.receivedToolResults), /got: Error: Invalid time value/);
+      assert.match(JSON.stringify(membrane.lastStream!.receivedToolResults), /got: true Invalid time value/);
       const events = lifecycle('obs-all').slice(before.all);
       assert.deepEqual(events.map((p) => `${p.tool}:${p.phase}`), [
         'code_execution:started',
@@ -297,17 +297,25 @@ describe('tool lifecycle for script-made calls (RFC-007, #235 F4)', () => {
     }
   });
 
-  it('a call still running when its script is killed is reported completed when it finishes', async () => {
+  it('a call still running when its script is stopped is reported completed when it finishes', async () => {
     const before = lifecycle('obs-all').length;
     const release = join(tempDir, 'release-orphan');
     await runTurn([{
       type: 'tool_use',
       id: 'toolu_01ORPHANCCCCCCCCCCCCCCCCCC',
       name: 'code_execution',
-      input: { code: `await prov__click({"x": 1, "y": 1, "hold": ${JSON.stringify(release)}})`, time_limit_ms: 1000 },
+      input: { code: `await tools["prov--click"]({ x: 1, y: 1, hold: ${JSON.stringify(release)} });`, yield_time_ms: 500 },
     }]);
-    // The script was stopped and the turn's stream has ended (ending its open
-    // calls), while the provider still holds the inner call's reply.
+    // The script yielded and the turn's stream has ended (ending its open
+    // calls), while the provider still holds the inner call's reply. Then
+    // the agent stops the script.
+    const yielded = JSON.stringify(membrane.lastStream!.receivedToolResults);
+    const id = /Script (s\d+-[0-9a-z]{4}) is still running/.exec(yielded)?.[1];
+    assert.ok(id, yielded);
+    // The stop comes once the provider holds the call, however slow the child was to start.
+    await waitFor(() => lifecycle('obs-all').slice(before).some((p) => p.tool === 'prov--click' && p.phase === 'started'), 'the inner call to open');
+    const stopped = await framework.executeToolCall({ id: 'stop-orphan', name: 'code_execution', input: { action: 'stop', script_id: id }, callerAgentName: 'scout' });
+    assert.match((stopped.data as Array<{ text: string }>)[0]!.text, /was stopped, as you asked\.\n.*still running when the script ended, so it may or may not take effect: tools\["prov--click"\]/s);
     await waitFor(() => lifecycle('obs-all').length >= before + 3, 'the held call was reported');
     const whileHeld = lifecycle('obs-all').slice(before);
     assert.deepEqual(whileHeld.map((p) => `${p.tool}:${p.phase}`), [

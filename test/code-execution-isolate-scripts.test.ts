@@ -296,6 +296,17 @@ test("each call carries the script's origin, and the watching call's turn only w
   await scripts.dispose();
 });
 
+test("a script's code is read only by its own agent", async () => {
+  const { scripts } = setup({ config: { yieldMs: 100 } });
+  const code = `await tools.slow({ key: 'mine' });`;
+  const r = await scripts.run('alice', code);
+  assert.equal(scripts.codeOf('alice', r.scriptId), code);
+  // Another agent's wait on it is refused, and its round can't read the code either.
+  assert.equal(scripts.codeOf('bob', r.scriptId), undefined);
+  assert.equal(scripts.codeOf('alice', 'no-such-script'), undefined);
+  await scripts.dispose();
+});
+
 test('an agent gone, or the host stopping, stops its scripts quietly, and a gone agent keeps none', async () => {
   const { scripts, wakes } = setup({ config: { yieldMs: 100 } });
   const ended = await scripts.run('eph', `return 1;`, 30_000);
@@ -309,7 +320,8 @@ test('an agent gone, or the host stopping, stops its scripts quietly, and a gone
   assert.deepEqual(scripts.list('eph'), []);
   assert.equal(scripts.running('eph'), 0);
   assert.equal([...internals.scripts.values()].filter((s) => s.agentName === 'eph').length, 1, 'the stopping one is still held');
-  // While it's held, a later agent of the name can't wait on it or stop it.
+  // While it's held, a later agent of the name can't wait on it, stop it or read its code.
+  assert.equal(scripts.codeOf('eph', left.scriptId), undefined);
   await assert.rejects(scripts.wait('eph', left.scriptId, 0), (e: unknown) => e instanceof ScriptRefusal);
   await assert.rejects(scripts.stop('eph', left.scriptId), (e: unknown) => e instanceof ScriptRefusal);
   for (let i = 0; i < 200 && [...internals.scripts.values()].some((s) => s.agentName === 'eph'); i++) await new Promise((r) => setTimeout(r, 10));

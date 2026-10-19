@@ -29,7 +29,7 @@ function internals(framework: AgentFramework) {
     unackedDeferredWrites: unknown[];
     flushDeferredWrites(label: string): Promise<void>;
     landedDeferredWriteIds(ids: Set<string>, scanFrom: Map<string, number>): Set<string>;
-    injectScriptWake(record: { id: string; agentName: string }, envelope: string): void;
+    scriptWake(agentName: string, scriptId: string, text: string, label: string): Promise<void>;
     closingConversationAgents: Set<string>;
     activeStreams: Map<string, Promise<void>>;
     recordChannelAutoOpenNotice(agentName: string | undefined, channels: Array<{ channelId: string; label?: string }>, cause: 'subscription-policy' | 'opened-by-delivery' | 'opened-by-reply'): void;
@@ -486,32 +486,100 @@ describe('notices about an agent\'s own action', () => {
       assert.ok(!errors.some((e) => /not a registered agent/.test(e)), 'not dropped by addMessage instead');
     });
 
-    it('drops, logged once, a background-script wake for an agent no longer registered: no write, trace or wake', async (t) => {
+    it('drops, logged once, a script wake for an agent no longer registered: no write, trace or wake', async (t) => {
       const primary = t.mock.method(framework.getAgent('primary')!.getContextManager(), 'addMessage');
       const errors: string[] = [];
       t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
       const traces: string[] = [];
       framework.onTrace((event) => { if (event.type === 'message:added') traces.push(JSON.stringify(event)); });
 
-      internals(framework).injectScriptWake({ id: 's-2', agentName: 'released-run' }, '[background script s-2] Your background script DIED.');
+      // The script's wake_agent(), had it made the call, would be told it couldn't be delivered.
+      await assert.rejects(
+        internals(framework).scriptWake('released-run', 's2', '[script s2] Your script failed: Error: gone.', 's2-ended'),
+        /agent released-run has no context to wake/,
+      );
 
       assert.equal(primary.mock.callCount(), 0, 'the primary started no such script');
-      assert.deepEqual(errors, ['[notice] released-run is no longer registered, so its background-script s-2 wake notice is dropped']);
+      assert.deepEqual(errors, ['[notice] released-run is no longer registered, so its script s2 wake notice is dropped']);
       assert.deepEqual(traces, [], 'nothing was queued or stored');
       assert.equal(internals(framework).deferredMessages.length, 0);
       assert.equal(internals(framework).pendingRequests.length, 0, 'no wake for an agent that is gone');
     });
 
-    it('wakes a fork\'s background script into the fork\'s own window', async () => {
+    it('wakes a fork\'s script into the fork\'s own window', async () => {
       const fork = await spawnFork();
-      const envelope = '[background script s-1] Your background script DIED 0m after start.';
+      // Without quotes, which the count's JSON would escape.
+      const envelope = '[script s1] Your script failed: Error: boom.';
 
-      internals(framework).injectScriptWake({ id: 's-1', agentName: fork.name }, envelope);
+      await internals(framework).scriptWake(fork.name, 's1', envelope, 's1-ended');
 
       const { messages: forkMessages } = await fork.getContextManager().compile();
       const { messages: primaryMessages } = await framework.getAgent('primary')!.getContextManager().compile();
       assert.equal(count(forkMessages, envelope), 1);
       assert.equal(count(primaryMessages, envelope), 0);
+    });
+
+    it("drops a fork's script wake when the fork is released while its text is being spilled", async () => {
+      const fork = await spawnFork();
+      const envelope = '[script s3] Your script failed: Error: late.';
+      // The spill takes a while, as a workspace write can: the fork is released meanwhile.
+      const real = (framework as unknown as { spillOrTruncate: (...args: unknown[]) => Promise<unknown> }).spillOrTruncate.bind(framework);
+      let spilling!: () => void;
+      const spillStarted = new Promise<void>((resolve) => { spilling = resolve; });
+      let finish!: () => void;
+      const held = new Promise<void>((resolve) => { finish = resolve; });
+      (framework as unknown as { spillOrTruncate: (...args: unknown[]) => Promise<unknown> }).spillOrTruncate = async (...args: unknown[]) => {
+        spilling();
+        await held;
+        return real(...args);
+      };
+      const errors: string[] = [];
+      const error = console.error;
+      console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+      try {
+        const waking = internals(framework).scriptWake(fork.name, 's3', envelope, 's3-ended');
+        await spillStarted;
+        (framework as unknown as { disposeConversationAgent(name: string): void }).disposeConversationAgent(fork.name);
+        finish();
+        await assert.rejects(waking, new RegExp(`agent ${fork.name} has no context to wake`));
+      } finally {
+        console.error = error;
+        delete (framework as unknown as { spillOrTruncate?: unknown }).spillOrTruncate;
+      }
+      assert.ok(errors.includes(`[notice] ${fork.name} is no longer registered, so its script s3 wake notice is dropped`), errors.join('\n'));
+      assert.equal(internals(framework).pendingRequests.length, 0, 'no wake for a fork that is gone');
+    });
+
+    it('drops a script wake once the host has begun to stop: before its spill, and after a spill the stop began during', async () => {
+      const fork = await spawnFork();
+      const fw = framework as unknown as { stopPromise: Promise<void> | null; spillOrTruncate: (...args: unknown[]) => Promise<unknown> };
+      const real = fw.spillOrTruncate.bind(framework);
+      let spills = 0;
+      let spilling!: () => void;
+      const spillStarted = new Promise<void>((resolve) => { spilling = resolve; });
+      let finish!: () => void;
+      const held = new Promise<void>((resolve) => { finish = resolve; });
+      fw.spillOrTruncate = async (...args: unknown[]) => {
+        spills += 1;
+        spilling();
+        await held;
+        return real(...args);
+      };
+      try {
+        // A stop begun during the spill: the wake is dropped once the spill is done.
+        const waking = internals(framework).scriptWake(fork.name, 's4', '[script s4] Woke you.', 's4-wake1');
+        await spillStarted;
+        fw.stopPromise = new Promise(() => {});
+        finish();
+        await assert.rejects(waking, /this host is stopping/);
+        // Begun before the wake: nothing is spilled at all.
+        await assert.rejects(internals(framework).scriptWake(fork.name, 's5', '[script s5] Woke you.', 's5-wake1'), /this host is stopping/);
+        assert.equal(spills, 1);
+      } finally {
+        fw.stopPromise = null;
+        delete (framework as unknown as { spillOrTruncate?: unknown }).spillOrTruncate;
+      }
+      assert.equal(internals(framework).pendingRequests.length, 0, 'no wake once the host is stopping');
     });
 
     /** Run the fallback reaper over a closing fork, as a minute's sweep would. */

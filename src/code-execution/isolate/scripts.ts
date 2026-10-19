@@ -110,6 +110,8 @@ export interface ScriptListing {
 interface Script {
   id: string;
   agentName: string;
+  /** The code it runs. */
+  code: string;
   run: ScriptRun;
   context: { origin?: unknown };
   /** The turn its run call was made in, when one was: its agent's turns end it by that. */
@@ -198,6 +200,7 @@ export class AgentScripts {
     const script: Script = {
       id,
       agentName,
+      code,
       run: null as unknown as ScriptRun,
       context: options.origin === undefined ? {} : { origin: options.origin },
       turnId: options.watch?.turnId,
@@ -263,6 +266,12 @@ export class AgentScripts {
     script.watch = watch;
     await script.run.stop('agent');
     return this.observe(script, 0, watch);
+  }
+
+  /** The code of this agent's script by that id, as a wait or a stop would find the script; undefined when the agent has none by it. */
+  codeOf(agentName: string, scriptId: string): string | undefined {
+    const script = this.scripts.get(scriptId);
+    return script && script.agentName === agentName && !script.gone ? script.code : undefined;
   }
 
   list(agentName: string): ScriptListing[] {
