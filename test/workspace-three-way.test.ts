@@ -7476,3 +7476,20 @@ describe('the mount root', () => {
     assert.match(await refused(m, 'sync', { path: 'work/a.txt', acceptRoot: true }), /whole mount/);
   });
 });
+
+// anima-research/agent-framework#530 (slimepriestess): an outer mount's forced
+// materialize through a file link wrote into a nested mount's file. Her probe,
+// as the issue gives it.
+for (const autoMaterialize of [false, true]) test(`a forced materialize through a file link into a nested mount leaves the inner mount's file alone (autoMaterialize ${autoMaterialize})`, async (t) => {
+  const env = new Env(t);
+  env.writeDisk('a/b/x.txt', "the inner mount's");
+  const m = await env.open({}, { mounts: [
+    { name: 'work', path: env.dir, mode: 'read-write', watch: 'never', followSymlinks: true, autoMaterialize },
+    { name: 'deep', path: env.disk('a/b'), mode: 'read-write', watch: 'never' },
+  ] });
+  await m.handleToolCall({ id: 't', name: 'write', input: { path: 'work/flink.txt', content: 'outer wrote' } });
+  if (existsSync(env.disk('flink.txt'))) rmSync(env.disk('flink.txt'));
+  symlinkSync(env.disk('a/b/x.txt'), env.disk('flink.txt'));
+  await m.handleToolCall({ id: 't', name: 'materialize', input: { path: 'work/flink.txt', force: true } });
+  assert.equal(readFileSync(env.disk('a/b/x.txt'), 'utf8'), "the inner mount's");
+});
