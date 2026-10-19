@@ -1539,7 +1539,7 @@ export class WorkspaceModule implements Module {
           + '(recorded-disk). Disk versions it could not search are listed as skipped: disk-only files (binary or '
           + 'over the size limit), and a conflict\'s disk version that is binary, oversize, or newer than the one recorded. '
           + 'In a file with CRLF line ends, each line is matched and shown without its CR, as read shows it, '
-          + 'and the file\'s result says lineEndings.',
+          + 'and the file\'s result says lineEndings. A BOM isn\'t part of the first line.',
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -4374,9 +4374,9 @@ export class WorkspaceModule implements Module {
    * on disk (a shell command's files, a deletion) is in the workspace when the
    * agent next looks. On a mount over its walkCap, that holds for the first
    * walkCap entries in the walk's order, which every batch's scan takes; files
-   * past them come in through syncs and the listings that reach them, while a
-   * read takes in only a file the workspace doesn't hold yet. A scan that
-   * outlasts the deadline stops holding the round: the miss is recorded on
+   * past them come in through syncs, the listings that reach them, and a read
+   * of the path, which takes disk's change in first as a listing does. A scan
+   * that outlasts the deadline stops holding the round: the miss is recorded on
    * the mount's status and pushed as a `workspace:agent-action-scan-incomplete`
    * event, and the scan continues, deciding on the branch selected when it
    * applies.

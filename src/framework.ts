@@ -18256,9 +18256,10 @@ export class AgentFramework {
     }
 
     if (isPresentationTool(call.name)) return this.editToolPresentation(call.callerAgentName ?? '__ephemeral__', call);
-    // Client-side programmatic tool calling for promise-based callers
-    // (SubagentModule ephemerals). Keyed by callerAgentName so each ephemeral
-    // gets its own interpreter state.
+    // Client-side programmatic tool calling for callers that await a tool's
+    // result: the puppet and a host through executeToolCall, and a module
+    // through callTool. Keyed by callerAgentName so each agent gets its own
+    // interpreter state.
     if (call.name === CODE_EXECUTION_TOOL_NAME && this.codeExecutionConfig) {
       return this.runCodeExecution(call.callerAgentName ?? '__ephemeral__', call);
     }
