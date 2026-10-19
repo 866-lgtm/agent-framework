@@ -400,12 +400,9 @@ async function realBeneath(given: string, links = 0): Promise<string> {
 }
 
 function isContainedPath(root: string, candidate: string): boolean {
-  // resolve() drops a trailing separator from a resolved candidate, so the
-  // root is compared in the same form: a mount path given as `/data/ws/`
-  // holds its own root.
-  const base = resolve(root);
-  if (candidate === base) return true;
-  return candidate.startsWith(base.endsWith(sep) ? base : base + sep);
+  if (candidate === root) return true;
+  const normalizedRoot = root.endsWith(sep) ? root : root + sep;
+  return candidate.startsWith(normalizedRoot);
 }
 
 function invalidImage(format: string, mountPrefixedPath: string): never {
