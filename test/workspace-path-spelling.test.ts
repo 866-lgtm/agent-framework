@@ -1,16 +1,17 @@
 // On a disk that folds names (macOS's default folds case, and Unicode
 // normalization), a path spelled otherwise than disk spells it reaches disk's
 // file. The workspace's tools take such a path as disk spells it, unless it
-// names a workspace entry exactly, or does once its directories take disk's
-// spelling, so they name each file by one name and take nothing in twice. Most
-// of these tests need a temp directory that folds case, and skip, saying why,
-// where it doesn't, since a disk that tells spellings apart has nothing to
-// respell; one, and part of another, need it to fold normalization, and three
-// to fold ß with ss, ſ with s and ς with σ. A draft not yet on disk takes the
-// spelling of a workspace entry it equals in simple case folding, on a disk
-// that folds case. Neither applies where disk's spelling puts the path in a
-// nested mount's directory. Four run only where the disk tells case apart, and
-// those about starting and stopping run anywhere.
+// names a workspace entry exactly, or a deletion or conflict the workspace
+// records there, or does once its directories take disk's spelling, so they
+// name each file by one name and take nothing in twice. Most of these tests
+// need a temp directory that folds case, and skip, saying why, where it
+// doesn't, since a disk that tells spellings apart has nothing to respell;
+// one, and part of another, need it to fold normalization, and three to fold ß
+// with ss, ſ with s and ς with σ. A draft not yet on disk takes the spelling
+// of a workspace entry it equals in simple case folding, on a disk that folds
+// case. Neither applies where disk's spelling puts the path in a nested
+// mount's directory. Four run only where the disk tells case apart, and those
+// about starting and stopping run anywhere.
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import fs, { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -531,6 +532,45 @@ test('a draft in a directory disk comes to list in another case is still reached
   const deleted = await call('delete', { path: 'work/Docs/a.txt' });
   assert.equal((deleted.data as { path: string }).path, 'work/Docs/a.txt');
   assert.equal(readFileSync(join(dir, 'docs', 'x.txt'), 'utf8'), 'made on disk\n');
+});
+
+test('a file the workspace deleted, which disk comes to list in another case, is still reached by its own path', { skip: FOLDING_ONLY }, async (t) => {
+  // Greptile's case on the pull request: a file taken in from disk, which
+  // disk then lists in another case, deleted in the workspace with its disk
+  // copy kept.
+  const { workspace, dir, call } = await setup(t, drafts);
+  writeFileSync(join(dir, 'src', 'Name.txt'), 'taken in\n');
+  await call('sync', { path: 'work/src/Name.txt' });
+  rmSync(join(dir, 'src', 'Name.txt'));
+  writeFileSync(join(dir, 'src', 'NAME.txt'), 'taken in\n');
+  const deleted = await call('delete', { path: 'work/src/Name.txt' });
+  assert.equal((deleted.data as { path: string }).path, 'work/src/Name.txt');
+  const read = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path: 'work/src/Name.txt', offsetChars: 0, limitChars: 100 } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+  assert.equal(read.success, false, 'the read takes nothing in');
+  assert.match(String(read.error), /work\/src\/Name\.txt was deleted in the workspace/);
+  await call('materialize', { path: 'work/src/Name.txt', applyDeletions: true });
+  assert.deepEqual(readdirSync(join(dir, 'src')).sort(), ['a.ts'], 'the deletion reached disk\'s file');
+  const listed = await call('ls', { path: 'work', recursive: true });
+  assert.deepEqual((listed.data as { entries: Array<{ path: string }> }).entries.map((e) => e.path), ['src/a.ts']);
+});
+
+test('a file the workspace deleted, which disk then changed and lists in another case, is in conflict by its own path, and a sync of that path settles it with one entry', { skip: FOLDING_ONLY }, async (t) => {
+  const { workspace, dir, call } = await setup(t, drafts);
+  writeFileSync(join(dir, 'src', 'Name.txt'), 'taken in\n');
+  await call('sync', { path: 'work/src/Name.txt' });
+  await call('delete', { path: 'work/src/Name.txt' });
+  rmSync(join(dir, 'src', 'Name.txt'));
+  writeFileSync(join(dir, 'src', 'NAME.txt'), 'changed on disk\n');
+  const read = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path: 'work/src/Name.txt', offsetChars: 0, limitChars: 100 } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+  assert.equal(read.success, false, 'the read takes nothing in');
+  assert.match(String(read.error), /work\/src\/Name\.txt is in conflict/);
+  await call('sync', { path: 'work/src/Name.txt' });
+  const status = (await call('status', {})).data as { work: { conflicts: number; pendingWorkspaceDeletions: number } };
+  assert.deepEqual([status.work.conflicts, status.work.pendingWorkspaceDeletions], [0, 0], 'the sync settled the conflict and the deletion');
+  const again = await call('read', { path: 'work/src/Name.txt', offsetChars: 0, limitChars: 100 });
+  assert.equal((again.data as { content: string }).content, 'changed on disk\n');
+  const listed = await call('ls', { path: 'work', recursive: true });
+  assert.equal((listed.data as { entries: Array<{ path: string }> }).entries.filter((e) => e.path.toLowerCase() === 'src/name.txt').length, 1, 'one entry for the file');
 });
 
 test('the step takes an entry\'s name where disk has nothing, keeps an entry\'s own spelling, and normalizes nothing', { skip: FOLDING_ONLY }, async (t) => {

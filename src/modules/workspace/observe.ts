@@ -366,7 +366,10 @@ export const foldedLoosely = (name: string): string => name.normalize('NFC').toL
 
 /** What the workspace holds of a mount, as the spelling step reads it (diskSpelling). */
 export interface WorkspaceEntries {
-  /** Whether the workspace holds an entry at exactly this path. */
+  /**
+   * Whether the workspace holds an entry at exactly this path, or records an
+   * intent there, such as a deletion disk hasn't been given yet.
+   */
   has(path: string): boolean;
   /** The paths of the entries under `prefix`, a directory's path and `/`, or `''` for every entry. */
   under(prefix: string): string[];
@@ -562,19 +565,20 @@ async function listedName(dir: string, segment: string, given: BigIntStats | nul
  * spelling whole, and so does a last segment where the workspace holds an
  * entry at exactly that path once its directories have taken disk's
  * spelling, so an entry that disk lists in another spelling, or in a
- * directory disk lists in another, stays reachable by its own path. And
- * where the directory reached folds case, each segment disk has nothing for
- * takes the name of an entry it equals in simple case folding (entryName),
- * as the disk will once that entry is written: a second draft spelled in
- * another case is the first one. None of this applies where disk's spelling
- * puts the path in a nested mount's directory, by the nested-mount checks'
- * own reading (`holder`): there the path keeps disk's spelling, so they
- * refuse at least what they refuse without the entries. The root's folding
- * is read at start (`rootFoldsCase`), and a directory beneath it is taken to
- * fold as the directory holding it did when its name was looked up with its
- * case flipped, or, for a name with no letter to flip, as the nearest
- * directory above that told, so the step reads nothing more of disk for
- * this.
+ * directory disk lists in another, stays reachable by its own path. `has`
+ * counts a path the workspace records an intent at, such as a deletion disk
+ * hasn't been given yet, so that's reached by its own path too. And where
+ * the directory reached folds case, each segment disk has nothing for takes
+ * the name of an entry it equals in simple case folding (entryName), as the
+ * disk will once that entry is written: a second draft spelled in another
+ * case is the first one. None of this applies where disk's spelling puts the
+ * path in a nested mount's directory, by the nested-mount checks' own
+ * reading (`holder`): there the path keeps disk's spelling, so they refuse
+ * at least what they refuse without the entries. The root's folding is read
+ * at start (`rootFoldsCase`), and a directory beneath it is taken to fold as
+ * the directory holding it did when its name was looked up with its case
+ * flipped, or, for a name with no letter to flip, as the nearest directory
+ * above that told, so the step reads nothing more of disk for this.
  */
 export async function diskSpelling(root: string, relativePath: string, entries?: WorkspaceEntries): Promise<string> {
   if (relativePath === '' || isAbsolute(relativePath)) return relativePath;

@@ -2128,12 +2128,14 @@ export class WorkspaceModule implements Module {
    * disk spells it (diskSpelling), with `path` the mount-prefixed path so
    * spelled. On a disk that folds names, a path spelled otherwise reaches
    * disk's file, so every tool takes it by disk's name: one name per file,
-   * and the names its answers give are disk's, except that a path that
-   * names a workspace entry exactly, or does once its directories take
-   * disk's spelling, keeps the entry's spelling. The workspace's entries
-   * (entriesOf) stand in for disk where it has nothing yet, so a draft has
-   * one name too. Neither applies to a path that disk's spelling puts in a
-   * nested mount's directory.
+   * and the names its answers give are disk's, except that a path that names
+   * a workspace entry exactly, or does once its directories take disk's
+   * spelling, keeps the entry's spelling. A path the workspace records an
+   * intent at, such as a deletion disk hasn't been given yet, counts as an
+   * entry here, so the calls that settle it reach it. The workspace's
+   * entries (entriesOf) stand in for disk where it has nothing yet, so a
+   * draft has one name too. Neither applies to a path that disk's spelling
+   * puts in a nested mount's directory.
    * A handler that must read something at the moment it's asked, as
    * handleSync reads the branch a path sync adopts on, reads it before
    * calling this, since this awaits disk. The entries are read when the
@@ -2150,18 +2152,22 @@ export class WorkspaceModule implements Module {
   }
 
   /**
-   * A mount's entries on the current branch, as diskSpelling reads them when
-   * it does, whether its root folds case as the last start read it (false
-   * before the first), and which nested mount's directory holds a path, by
-   * holderOf, as the nested-mount checks read it. diskSpelling keeps disk's
-   * spelling of a path that lies in a nested mount's directory as disk
-   * spells it, so the checks refuse at least what they would refuse without
-   * the entries.
+   * A mount's entries on the current branch, and the paths it records an
+   * intent at there, as diskSpelling reads them when it does, whether its
+   * root folds case as the last start read it (false before the first), and
+   * which nested mount's directory holds a path, by holderOf, as the
+   * nested-mount checks read it. diskSpelling keeps disk's spelling of a
+   * path that lies in a nested mount's directory as disk spells it, so the
+   * checks refuse at least what they would refuse without the entries.
    */
   private entriesOf(mount: MountState): WorkspaceEntries {
     const store = this.getStore();
+    const intents = this.intents.get(mount.config.name)!;
     return {
-      has: (path) => store.treeGet(mount.treeStateId, path) !== null,
+      // An intent recorded at a path, such as a deletion disk hasn't been
+      // given yet or a conflict, is the workspace's own name for the file
+      // there, as an entry is, so the calls that settle it reach it.
+      has: (path) => store.treeGet(mount.treeStateId, path) !== null || store.treeGet(intents.treeStateId, path) !== null,
       under: (prefix) => store.treeList(mount.treeStateId, prefix).map((entry) => entry.path),
       holder: (path) => this.holderOf(mount.config.name, path)?.name,
       rootFoldsCase: this.rootFoldsCase.get(mount.config.name) ?? false,
