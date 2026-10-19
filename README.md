@@ -336,7 +336,8 @@ returns for a dial, goes as a `token` query parameter by default
 parameter, so it stays out of the url and of the access logs that record it;
 the provider still runs at every dial and reconnect. Switch a server to
 `'header'` once it reads the header. `tokenTransport` is refused on an
-http(s):// server, which always sends the header, and on a stdio server.
+http(s):// server, which always sends the header, and on a stdio server;
+`'header'` is refused with a url that carries a `token` parameter of its own.
 
 A modern server's tools get the same prefix, `enabledTools`/`disabledTools`,
 class overrides and dispatch as an MCPL server's, and `listMcplServers()`

@@ -25,7 +25,7 @@ import { StringDecoder } from 'node:string_decoder';
 import WebSocket from 'ws';
 
 import type { McplServerConfig } from './types.js';
-import { describeCredentialError, noteDialSent, redactUrl, resolveServerBinding, urlAsDialed } from './protocol-family.js';
+import { describeCredentialError, noteDialSent, redactUrl, resolveServerBinding, tokenTransportProblem, urlAsDialed } from './protocol-family.js';
 import { assertBooleanSetting } from '../config-checks.js';
 import { logDetail } from './log-value.js';
 
@@ -569,10 +569,22 @@ export class WebSocketTransport extends McplTransport {
     // get the endpoint, never the credential.
     const redacted = redactUrl(config.url);
     // In header mode the url carries no credential (buildWebSocketUrl): the
-    // upgrade request does.
-    const ws = config.tokenTransport === 'header' && token
-      ? new WebSocket(url, { headers: { Authorization: `Bearer ${token}` } })
-      : new WebSocket(url);
+    // upgrade request does. A control character can't go in a header, and a
+    // client's refusal of one can quote the value, so it is refused here,
+    // and the client's own refusal is never passed on as it reads.
+    let ws: WebSocket;
+    if (config.tokenTransport === 'header' && token) {
+      if (/[\u0000-\u0008\u000a-\u001f\u007f]/.test(token)) {
+        throw new Error(`MCPL server "${config.id}" WebSocket connect failed: its credential holds a control character, which can't be sent in a header (${redacted})`);
+      }
+      try {
+        ws = new WebSocket(url, { headers: { Authorization: `Bearer ${token}` } });
+      } catch {
+        throw new Error(`MCPL server "${config.id}" WebSocket connect failed: the WebSocket client refused the upgrade request (${redacted})`);
+      }
+    } else {
+      ws = new WebSocket(url);
+    }
 
     // A failed dial can emit 'error' MORE THAN ONCE on the raw socket (seen
     // live 2026-08-03: an HTTP 502 upgrade-reject emits the "Expected 101"
@@ -648,7 +660,9 @@ export class WebSocketTransport extends McplTransport {
  * which refuses one with a fragment, and append the auth token as a `token`
  * query param when provided (preserving any existing query). With
  * `tokenTransport: 'header'` no token is appended: the dial sends it as a
- * header.
+ * header, and a url that carries a `token` parameter of its own is refused,
+ * as is a `tokenTransport` that is neither mode, so a dial that skipped
+ * serverConfigProblems still can't fall back to the query.
  */
 export function buildWebSocketUrl(config: McplServerConfig, tokenOverride?: string | null): string {
   if (!config.url) {
@@ -669,6 +683,8 @@ export function buildWebSocketUrl(config: McplServerConfig, tokenOverride?: stri
   if (parsed.hash) {
     throw new Error(`MCPL server "${config.id}": websocket url must not have a fragment, got "${parsed.hash}"`);
   }
+  const problem = tokenTransportProblem(config, parsed);
+  if (problem) throw new Error(problem);
   const token = config.tokenTransport === 'header' ? null
     : tokenOverride !== undefined ? tokenOverride : config.token;
   return urlAsDialed(parsed, token).toString();

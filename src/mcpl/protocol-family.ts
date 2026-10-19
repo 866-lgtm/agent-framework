@@ -584,12 +584,13 @@ export function serverConfigProblems(config: McplServerConfig): string[] {
     }
   }
   if (config.tokenTransport !== undefined) {
-    if (config.tokenTransport !== 'query' && config.tokenTransport !== 'header') {
-      problems.push(`MCP server "${config.id}": tokenTransport must be 'query' or 'header', got ${JSON.stringify(config.tokenTransport)}`);
-    } else if (binding.transport !== 'websocket') {
+    if (binding.transport !== 'websocket') {
       problems.push(
         `MCP server "${config.id}": "tokenTransport" applies only to a ws(s):// server; an http(s):// server always sends its credential as a header, and a stdio server sends none`,
       );
+    } else {
+      const problem = tokenTransportProblem(config, new URL(config.url!));
+      if (problem) problems.push(problem);
     }
   }
   if (config.protocol !== undefined) {
@@ -627,6 +628,26 @@ export function serverConfigProblems(config: McplServerConfig): string[] {
     );
   }
   return problems;
+}
+
+/**
+ * What's wrong with a WebSocket server's `tokenTransport`, as a message, or
+ * undefined: a value that is neither mode, or `'header'` with a url that
+ * carries a `token` query parameter of its own, which would still put a
+ * credential in the url. Neither the value nor the url is quoted beyond the
+ * setting's own text.
+ */
+export function tokenTransportProblem(config: Pick<McplServerConfig, 'id' | 'tokenTransport'>, url: URL): string | undefined {
+  // A configuration read from JSON can hold anything here.
+  const mode: unknown = config.tokenTransport;
+  if (mode === undefined || mode === 'query') return undefined;
+  if (mode !== 'header') {
+    return `MCP server "${config.id}": tokenTransport must be 'query' or 'header', got ${typeof mode === 'string' && mode.length <= 16 ? JSON.stringify(mode) : `a ${typeof mode}`}`;
+  }
+  if (url.searchParams.has('token')) {
+    return `MCP server "${config.id}": with tokenTransport 'header' the url must not carry a "token" query parameter, which would still put a credential in it; give it as "token" or "accessProvider"`;
+  }
+  return undefined;
 }
 
 /** A host a connection to which never leaves this machine, as the WHATWG URL
