@@ -244,11 +244,16 @@ export function redactedData(value: unknown, redactor: ServerTextRedactor | Reda
     const entries = Object.entries(item);
     const names = entries.map(([key]) => redact(key));
     const taken = new Set(names.filter((name, n) => name === entries[n][0]));
+    // Each name's next number to try, so keys that redact alike don't search
+    // from 2 again: every number below it was taken, and stays taken.
+    const next = new Map<string, number>();
     return Object.fromEntries(entries.map(([key, entry], n) => {
       let name = names[n];
       if (name !== key) {
         const base = name;
-        for (let k = 2; taken.has(name); k++) name = `${base} (${k})`;
+        let k = next.get(base) ?? 2;
+        while (taken.has(name)) name = `${base} (${k++})`;
+        next.set(base, k);
         taken.add(name);
       }
       return [name, walk(entry, depth + 1)];

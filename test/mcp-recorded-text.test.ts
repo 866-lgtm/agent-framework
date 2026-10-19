@@ -918,6 +918,21 @@ test("an error answer's data is redacted through and through: its keys, keeping 
   }
 });
 
+test("an error answer's data with many keys that redact alike is numbered in time that grows with the keys, not with their square", () => {
+  // Every key that starts with "k" redacts to "x" here, so all of them come
+  // out as one name, as copies of one credential in a server's keys can.
+  const alike = (text: unknown) => (typeof text === 'string' && text.startsWith('k') ? 'x' : String(text));
+  const keys = 16_384;
+  const data = Object.fromEntries(Array.from({ length: keys }, (_, i) => [`k${i}`, i]));
+  const started = performance.now();
+  const names = Object.keys(redactedData(data, alike) as object);
+  const ms = performance.now() - started;
+  assert.deepEqual(names, ['x', ...Array.from({ length: keys - 1 }, (_, i) => `x (${i + 2})`)]);
+  // Numbering in one pass takes tens of milliseconds for this many keys;
+  // searching each name's numbers from 2 again takes seconds.
+  assert.ok(ms < 2_000, `${ms.toFixed(0)} ms`);
+});
+
 test("an error built from a server's words and data reads a configuration that can't be read once, in either engine", async (t) => {
   t.mock.method(console, 'error', () => {});
   let reads = 0;
