@@ -60,7 +60,32 @@ class ChannelLifecycleConvergenceError extends Error {}
 class ChannelOpenSubstitutionError extends Error {}
 /** An operation queued for a server's registrations that were removed. */
 class ChannelLifecycleCancelledError extends Error {}
+/** The failure of an open by speech or a reply after a decision made during
+ *  its round-trip, such as the agent's own close or channel_open, replaced
+ *  the one the open wrote. That decision stands, and nothing is put back. */
+class ChannelOpenOvertakenError extends Error {}
+/** The failure of an open by speech or a reply whose put-back couldn't be
+ *  recorded: the decision to open stays, so the channel stays selected for
+ *  opening, and reconciliation may open it later. */
+class ChannelOpenPutBackUnrecordedError extends Error {}
+/** The failure of an open by speech or a reply whose put-back restored a
+ *  pure default that the channel's current descriptor, or the subscription
+ *  policy, lifts: the channel is selected for opening again, and `by` says
+ *  which. */
+class ChannelOpenSelectedAgainError extends Error {
+  constructor(message: string, readonly by: Exclude<SelectedForOpening, 'unrecorded'>, options?: ErrorOptions) {
+    super(message, options);
+  }
+}
+/** Why a channel is selected for opening after a failed open by speech or a
+ *  reply: its put-back couldn't be recorded, or the server's latest
+ *  announcement or the subscription policy lifted the default it restored. */
+export type SelectedForOpening = 'unrecorded' | 'server-bootstrap' | 'subscription-policy';
 const CHANNEL_LIFECYCLE_LOG_ID = 'mcpl/channel-lifecycle';
+
+/** The sources of a decision the agent itself made: channel_open and
+ *  channel_close, and channel_decline. */
+const AGENT_DECISION_SOURCES: ReadonlySet<string> = new Set(['agent-tool', 'invitation-declined']);
 
 /**
  * What a channels/open answer says about which channel the server opened:
@@ -866,6 +891,10 @@ export class ChannelRegistry {
   // target before confirming anything. Unlike the tail, which settles a few
   // microtasks after its operation's last check, this drops at that check.
   private lifecycleOutstanding = new Map<string, number>();
+  // The removal count each channel's newest outstanding operation was queued
+  // under. Where it's older than its server's, every operation still
+  // outstanding for the channel cancels when it would run.
+  private lifecycleQueuedRemovals = new Map<string, number>();
   // Losing an open receipt does not confirm closure. Keep that distinction
   // private while preserving the public open:boolean availability projection.
   private unconfirmedChannelTargets = new WeakSet<ChannelEntry>();
@@ -878,7 +907,7 @@ export class ChannelRegistry {
   /** Whether the host directs this server's channel lifecycle (§14.1: its
    *  `channels.lifecycle` grant). Where it doesn't, the server opens and
    *  closes its own channels, and sends no receipt the host could wait for. */
-  private directsLifecycle(serverId: string): boolean {
+  directsLifecycle(serverId: string): boolean {
     return CapabilityGrant.of(this.serverRegistry.getServer(serverId)).has('channels.lifecycle');
   }
 
@@ -2254,7 +2283,20 @@ export class ChannelRegistry {
     source: string,
   ): void {
     const key = this.lifecycleKey(serverId, channelId);
-    if (this.desiredStates.get(key)?.state === desired) return;
+    const current = this.desiredStates.get(key);
+    // A decision that records the state already on record changes nothing,
+    // so it writes nothing, unless it's the agent's own (channel_open,
+    // channel_close or channel_decline) and the record isn't. The record
+    // then says the agent decided, which is all handleToolClose's
+    // explicit-open guard and ensureInitialDesiredState's lift of a default
+    // ask of it. openChannelNow depends on it too: a failed open by speech
+    // or a reply tells a decision made during its round-trip by the record
+    // no longer being the object it wrote, and the agent's channel_open,
+    // the only decision of the same state that can be made then, gets a new
+    // record here.
+    if (current?.state === desired && !(AGENT_DECISION_SOURCES.has(source) && !AGENT_DECISION_SOURCES.has(current.source))) {
+      return;
+    }
     this.appendLifecycleEvent({
       kind: 'desired-state',
       serverId,
@@ -2536,6 +2578,7 @@ export class ChannelRegistry {
     const removals = this.serverRemovals.get(serverId) ?? 0;
     const previous = this.channelLifecycleTails.get(lifecycleKey) ?? Promise.resolve();
     this.lifecycleOutstanding.set(lifecycleKey, (this.lifecycleOutstanding.get(lifecycleKey) ?? 0) + 1);
+    this.lifecycleQueuedRemovals.set(lifecycleKey, removals);
     const operation = previous.catch(() => {}).then(
       () => this.runLifecycleOperation(serverId, channelId, removals, options),
     );
@@ -2681,8 +2724,23 @@ export class ChannelRegistry {
       // on, nothing it does will open a new target.
       const left = (this.lifecycleOutstanding.get(lifecycleKey) ?? 1) - 1;
       if (left > 0) this.lifecycleOutstanding.set(lifecycleKey, left);
-      else this.lifecycleOutstanding.delete(lifecycleKey);
+      else {
+        this.lifecycleOutstanding.delete(lifecycleKey);
+        this.lifecycleQueuedRemovals.delete(lifecycleKey);
+      }
     }
+  }
+
+  /** Whether lifecycle work already outstanding for the channel will carry out
+   *  its current decision: some is, and the newest was queued since its
+   *  server's registrations were last removed, so it won't cancel when it
+   *  would run. Each operation reads the decision when it runs. It answers for
+   *  now: a removal after it cancels that work too, and takes the channel's
+   *  entry with it, so its next registration carries the decision out, where
+   *  this host directs the lifecycle then. */
+  private outstandingWorkCarriesOut(serverId: string, key: string): boolean {
+    return this.lifecycleOutstanding.has(key) &&
+      this.lifecycleQueuedRemovals.get(key) === (this.serverRemovals.get(serverId) ?? 0);
   }
 
   /**
@@ -2697,6 +2755,19 @@ export class ChannelRegistry {
   private closeSubstitutedChannel(serverId: string, channelId: string): void {
     if (!this.channels.has(`${serverId}:${channelId}`)) return;
     if (this.getDesiredState(serverId, channelId) !== 'closed') return;
+    this.applyThroughQueue(serverId, channelId);
+  }
+
+  /**
+   * Carry out a channel's decision through its lifecycle queue, for a
+   * transport the server may have opened without the host's knowing: one it
+   * opened for another channel's request (closeSubstitutedChannel), or one a
+   * failed open's request may have reached (openChannelNow). The decision is
+   * a closed one, except after a failed open whose put-back the server's
+   * latest announcement or the policy lifted. A failure is reported as a
+   * trace; the decision stands.
+   */
+  private applyThroughQueue(serverId: string, channelId: string): void {
     this.applyDesiredChannelState(serverId, channelId).catch((err) => {
       // Removal while queued is cancellation, as in reconcileChannels, and
       // exhausted convergence emitted its own diagnostic.
@@ -2705,7 +2776,7 @@ export class ChannelRegistry {
           err instanceof ChannelLifecycleConvergenceError) return;
       this.emitTraceFn({
         type: 'mcpl:channel-reconcile-failed',
-        serverId, channelId, desired: 'closed', error: (err as Error).message,
+        serverId, channelId, desired: this.getDesiredState(serverId, channelId), error: (err as Error).message,
       });
     });
   }
@@ -2955,10 +3026,25 @@ export class ChannelRegistry {
    * into a closed locus, an explicit send into a closed channel — comes
    * here. Reconciliation queues that work directly, as the closes do
    * (channel_close, a decline, and the close of a substituted channel).
-   * Desired state is recorded BEFORE the server round-trip: intent sticks
-   * even if the subscribe fails, and reconciliation retries later.
-   * Automatic delivery needs open transport, not a change of attention:
-   * preserve tune-out epochs both before and during the round-trip.
+   * Desired state is recorded BEFORE the server round-trip. The agent's own
+   * open is a decision about the channel: it sticks even if the subscribe
+   * fails, and reconciliation retries later. An open by speech or a reply is
+   * incidental to its words: when its round-trip fails, the decision it
+   * wrote goes back to the one it replaced, so the agent, told the channel
+   * is closed and the open failed, isn't later put into it by that decision.
+   * That holds only while the record is still the one it wrote: a decision
+   * made meanwhile stands, and the failure then comes as a
+   * ChannelOpenOvertakenError. Where the decision put back is a pure default,
+   * nobody had decided, so the channel then follows its server's latest
+   * announcement and the policy: a re-announcement during the round-trip
+   * found the open's own record and lifted nothing. If they select it for
+   * opening, the failure says so (ChannelOpenSelectedAgainError). And since
+   * a failed request may have reached the server, the decision that stands
+   * is carried out on the wire too. An open by speech or a reply that can't
+   * send its request, on a server without channels.lifecycle, writes
+   * nothing. Automatic delivery needs open transport, not a change of
+   * attention: preserve tune-out epochs both before and during the
+   * round-trip.
    *
    * `opened` says whether this call turned a closed channel open, which is
    * what the delivery and reply notices tell the resident. Reconfirming the
@@ -2970,17 +3056,98 @@ export class ChannelRegistry {
     history?: ChannelHistoryRequest,
   ): Promise<{ result: ChannelsOpenResult; opened: boolean }> {
     const transportOnly = source !== 'agent-tool';
+    const key = this.lifecycleKey(entry.serverId, entry.descriptor.id);
+    if (transportOnly) {
+      // Without channels.lifecycle the open fails before any request leaves
+      // (§14.1), as it does without the server, so an incidental open would
+      // only write a decision to put back. It writes none.
+      const server = this.serverRegistry.getServer(entry.serverId);
+      if (!server) throw new Error(`Server not found: ${entry.serverId}`);
+      if (!CapabilityGrant.of(server).has('channels.lifecycle')) {
+        throw new Error(`channels.lifecycle not in "${entry.serverId}"'s effective grant (§14.1)`);
+      }
+    }
+    // The decision this open replaces. A channel with none on record, as one
+    // registered from a push, was closed by default: nobody had decided.
+    const replaced = this.desiredStates.get(key) ?? { state: 'closed' as const, source: 'default-closed' };
     const before = this.getDesiredState(entry.serverId, entry.descriptor.id);
     const opened = before !== 'open' && before !== 'tuned-out';
     if (!transportOnly || before !== 'tuned-out') {
       this.setDesiredState(entry.serverId, entry.descriptor.id, 'open', source);
     }
-    const applied = await this.applyDesiredChannelState(entry.serverId, entry.descriptor.id, { history });
-    const desired = this.getDesiredState(entry.serverId, entry.descriptor.id);
-    if (!applied.open || (desired !== 'open' && !(transportOnly && desired === 'tuned-out'))) {
-      throw new Error('Channel open was superseded by a newer lifecycle decision');
+    // The record an incidental open wrote, to put back if its round-trip fails.
+    const wrote = transportOnly && opened ? this.desiredStates.get(key) : undefined;
+    try {
+      const applied = await this.applyDesiredChannelState(entry.serverId, entry.descriptor.id, { history });
+      const desired = this.getDesiredState(entry.serverId, entry.descriptor.id);
+      if (!applied.open || (desired !== 'open' && !(transportOnly && desired === 'tuned-out'))) {
+        throw new Error('Channel open was superseded by a newer lifecycle decision');
+      }
+      return { result: applied.result!, opened };
+    } catch (err) {
+      if (wrote && this.desiredStates.get(key) !== wrote) {
+        throw new ChannelOpenOvertakenError(err instanceof Error ? err.message : String(err), { cause: err });
+      }
+      if (wrote) {
+        try {
+          this.setDesiredState(entry.serverId, entry.descriptor.id, replaced.state, replaced.source);
+        } catch (putBackErr) {
+          // The caller reports both: the channel isn't open, but it stays
+          // selected for opening, so reconciliation may open it later.
+          throw new ChannelOpenPutBackUnrecordedError(
+            `${err instanceof Error ? err.message : String(err)}; the channel stays selected for opening, ` +
+              `as the host couldn't record undoing that: ${putBackErr instanceof Error ? putBackErr.message : String(putBackErr)}`,
+            { cause: err },
+          );
+        }
+        // The decision put back is a closed one: an open that turned the
+        // channel open replaced no open decision. Where it's a pure default,
+        // nobody had decided, so the channel follows its server's latest
+        // announcement and the policy, not the ones from before the open: a
+        // re-announcement during the round-trip found the open's own record
+        // and lifted nothing. The lift is ensureInitialDesiredState's own,
+        // which leaves every real decision alone. One that can't be recorded
+        // leaves the default, closed.
+        const current = this.channels.get(`${entry.serverId}:${entry.descriptor.id}`);
+        let selectedAgain: Exclude<SelectedForOpening, 'unrecorded'> | undefined;
+        if (current) {
+          try {
+            this.ensureInitialDesiredState(entry.serverId, current.descriptor);
+          } catch (liftErr) {
+            console.error(
+              `[channel] ${entry.serverId}:${logValue(entry.descriptor.id)}: the lift after a failed open couldn't be recorded:`,
+              liftErr,
+            );
+          }
+          const now = this.desiredStates.get(key);
+          if (now?.state === 'open' && (now.source === 'server-bootstrap' || now.source === 'subscription-policy')) {
+            selectedAgain = now.source;
+          }
+        }
+        // The failed request may have reached the server, so the decision
+        // that stands is carried out through the queue, as a decline's close
+        // is, unless other lifecycle work for the channel is queued that will
+        // carry it out anyway: work queued before its server's registrations
+        // were removed cancels instead. (An incidental open gets here only
+        // where the host directed the lifecycle when it opened: see the grant
+        // check above. Where the grant has lost channels.lifecycle since, as a
+        // transport drop clears it, the queued work fails for it, and the
+        // server's next registration carries the decision out, where this host
+        // directs the lifecycle then.)
+        if (current && !this.outstandingWorkCarriesOut(entry.serverId, key)) {
+          this.applyThroughQueue(entry.serverId, entry.descriptor.id);
+        }
+        if (selectedAgain) {
+          throw new ChannelOpenSelectedAgainError(
+            `${err instanceof Error ? err.message : String(err)}; the channel is selected for opening again, as ` +
+              (selectedAgain === 'server-bootstrap' ? 'its server announces it open' : 'the subscription policy admits it'),
+            selectedAgain,
+            { cause: err },
+          );
+        }
+      }
+      throw err;
     }
-    return { result: applied.result!, opened };
   }
 
   /**
@@ -3213,7 +3380,17 @@ export class ChannelRegistry {
    * engaging a channel opens it, so typing indicators, reaction machinery,
    * and inbound forwarding all come alive with the first outbound message.
    * Accepts composite MCPL ids or raw server-internal ids (explicit send
-   * tools receive whatever the agent typed).
+   * tools receive whatever the agent typed). An `open-failed` answer says
+   * whether the open that failed was one that would have opened a channel
+   * not selected open (`opening`), as opposed to one reconfirming the
+   * transport of a channel already selected open or tuned out. It isn't one
+   * either where a decision made during its round-trip replaced it
+   * (ChannelOpenOvertakenError), or where queued lifecycle work left the
+   * channel closed before any open was sent. `selectedForOpening` says the
+   * channel is selected for opening after the failure, and why: the put-back
+   * couldn't be recorded (ChannelOpenPutBackUnrecordedError), or the server's
+   * latest announcement or the policy lifted the default it restored
+   * (ChannelOpenSelectedAgainError).
    */
   async openIfClosedForSend(
     rawChannelId: string,
@@ -3222,6 +3399,8 @@ export class ChannelRegistry {
     status: 'opened' | 'already-open' | 'unknown-channel' | 'ambiguous' | 'open-failed';
     channelId?: string;
     label?: string;
+    opening?: boolean;
+    selectedForOpening?: SelectedForOpening;
   }> {
     let matches = [...this.channels.values()].filter(
       (e) => e.descriptor.id === rawChannelId && (!serverId || e.serverId === serverId),
@@ -3236,6 +3415,7 @@ export class ChannelRegistry {
     if (matches.length === 0) return { status: 'unknown-channel' };
     if (matches.length > 1) return { status: 'ambiguous' };
     let entry = matches[0]!;
+    let opening = false;
     try {
       if (this.hasPendingLifecycle(entry)) {
         entry = await this.waitForOpenChannel(entry);
@@ -3244,6 +3424,7 @@ export class ChannelRegistry {
       if (entry.open && (desired === 'open' || desired === 'tuned-out')) {
         return { status: 'already-open', channelId: entry.descriptor.id, label: entry.descriptor.label };
       }
+      opening = desired !== 'open' && desired !== 'tuned-out';
       const { opened } = await this.openChannelNow(entry, 'opened-by-reply');
       entry = await this.waitForOpenChannel(entry);
       if (opened) {
@@ -3255,6 +3436,10 @@ export class ChannelRegistry {
       }
       return { status: opened ? 'opened' : 'already-open', channelId: entry.descriptor.id, label: entry.descriptor.label };
     } catch (err) {
+      // Where a decision made during the open's round-trip replaced it, such
+      // as the agent's own close or channel_open, the channel is as that
+      // decision left it, and the agent isn't told the open failed.
+      if (err instanceof ChannelOpenOvertakenError) opening = false;
       this.emitTraceFn({
         type: 'mcpl:channel-open-failed',
         serverId: entry.serverId,
@@ -3262,7 +3447,11 @@ export class ChannelRegistry {
         error: (err as Error).message,
       });
       const current = this.channels.get(`${entry.serverId}:${entry.descriptor.id}`);
-      return { status: 'open-failed', channelId: entry.descriptor.id,
+      return { status: 'open-failed', channelId: entry.descriptor.id, opening,
+        // Where the channel is selected for opening after the failure, the
+        // agent is told so and why, as speech's failure says.
+        ...(err instanceof ChannelOpenPutBackUnrecordedError ? { selectedForOpening: 'unrecorded' as const } : {}),
+        ...(err instanceof ChannelOpenSelectedAgainError ? { selectedForOpening: err.by } : {}),
         ...(current ? { label: current.descriptor.label } : {}) };
     }
   }
@@ -3303,6 +3492,19 @@ export class ChannelRegistry {
 
     const alreadyDesiredOpen = this.getDesiredState(entry.serverId, input.channelId) === 'open';
     if (entry.open && alreadyDesiredOpen && !input.backscroll && !this.hasPendingLifecycle(entry)) {
+      // Open already, perhaps because speech, a reply, the server or a
+      // policy opened it: the agent's open is still its decision, and is
+      // recorded as one (setDesiredState), so the explicit-open guard of
+      // handleToolClose reads it.
+      try {
+        this.setDesiredState(entry.serverId, input.channelId, 'open', 'agent-tool');
+      } catch (err) {
+        return {
+          success: false,
+          error: `Channel ${input.channelId} is already open, but recording your decision to open it failed: ${(err as Error).message}`,
+          isError: true,
+        };
+      }
       return {
         success: true,
         data: { channelId: input.channelId, status: 'already open' },
@@ -3373,15 +3575,6 @@ export class ChannelRegistry {
       };
     }
 
-    const alreadyDesiredClosed = this.getDesiredState(entry.serverId, input.channelId) === 'closed';
-    if (!entry.open && alreadyDesiredClosed && !this.hasPendingLifecycle(entry) &&
-        !this.unconfirmedChannelTargets.has(entry)) {
-      return {
-        success: true,
-        data: { channelId: input.channelId, status: 'already closed' },
-      };
-    }
-
     // Provenance comes from trusted dispatch, not from self-description:
     // only module-origin calls may record a machine source, and only from
     // the closed vocabulary. Agent-origin (or origin-less — the safe
@@ -3400,6 +3593,27 @@ export class ChannelRegistry {
         };
       }
       closeSource = input.source;
+    }
+
+    const alreadyDesiredClosed = this.getDesiredState(entry.serverId, input.channelId) === 'closed';
+    if (!entry.open && alreadyDesiredClosed && !this.hasPendingLifecycle(entry) &&
+        !this.unconfirmedChannelTargets.has(entry)) {
+      // Closed already, perhaps only by default: the agent's close is still
+      // its decision, and is recorded as one (setDesiredState), so a later
+      // registration's lift of a default leaves the channel closed.
+      try {
+        this.setDesiredState(entry.serverId, input.channelId, 'closed', closeSource);
+      } catch (err) {
+        return {
+          success: false,
+          error: `Channel ${input.channelId} is already closed, but recording the decision to close it failed: ${(err as Error).message}`,
+          isError: true,
+        };
+      }
+      return {
+        success: true,
+        data: { channelId: input.channelId, status: 'already closed' },
+      };
     }
 
     // Housekeeping must not override stated intent (issue #5: GC closes wore

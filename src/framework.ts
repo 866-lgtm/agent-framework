@@ -102,7 +102,7 @@ import { isSilentHeartbeatMarker, isVisiblyEmptyContent, NON_STRING_TEXT_PLACEHO
 import { parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
-import { ChannelRegistry, connectorText, destinationKey, journalToolDescription, type ChannelToolOrigin, type PublishDestination, type PublishOutcome } from './mcpl/channel-registry.js';
+import { ChannelRegistry, connectorText, destinationKey, journalToolDescription, type ChannelToolOrigin, type PublishDestination, type PublishOutcome, type SelectedForOpening } from './mcpl/channel-registry.js';
 import { KEEP_IDLE_MS, KEEP_NEWEST, ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftAttempt, type DraftReason, type DraftState, type InheritedRisk } from './prose-drafts.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import { INBOUND_SOURCE_KEY, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
@@ -15046,6 +15046,114 @@ export class AgentFramework {
   }
 
   /**
+   * Window notice for a reply whose channel couldn't be opened: the reply
+   * went out through its send tool, but the open that engaging the channel
+   * asks for failed. Without it the agent would wait for a conversation it
+   * won't see. It goes to the agent whose reply it was, or, when no agent
+   * is named, where addMessage delivers an unrouted message (deliveryAgent:
+   * the primary, else the first registered agent), as the opened notice
+   * does, and its advice is judged for that agent. Where the channel stays
+   * closed, an agent that has ended is told nothing, and nor is anyone in
+   * its place: nothing follows from the failure. Where it's selected for
+   * opening, the primary is told by name in its place, if one is registered,
+   * as the opened notice tells it of an open by an agent that has ended, so
+   * an agent that could close the channel hears it may open. It names
+   * channel_open as the way to try again only to an agent that can call it:
+   * a conversation fork's channel_open is refused outright
+   * (dispatchChannelToolCall), and an agent's allowedTools can leave it out.
+   * Where the channel is selected for opening, it says so and why, as
+   * speech's failure does, and what that means: where the host couldn't
+   * record putting the channel's decision back, in channel_open's own
+   * failure's words, a later delivery or reconnect tries again; where the
+   * server's latest announcement or the subscription policy lifted the
+   * default put back, the host tries again itself, so channel_open isn't
+   * named. Either way channel_close withdraws that, named only to an agent
+   * that can call it here (a fork may close only its home channel). Where
+   * the reader can't, the primary is told by name too, if it's registered,
+   * isn't the reader and can close it. System message, as the opened notice
+   * is.
+   */
+  private recordReplyOpenFailedNotice(
+    agentName: string | undefined,
+    channel: { channelId: string; label?: string },
+    selectedForOpening?: SelectedForOpening,
+  ): void {
+    const shown = channel.label && channel.label !== channel.channelId
+      ? `${channel.label} (${channel.channelId})`
+      : channel.channelId;
+    const ended = !!agentName && !this.agents.has(agentName);
+    if (ended && !selectedForOpening) {
+      console.error(`[channel] ${agentName} has ended; not telling it that ${shown} couldn't be opened`);
+      return;
+    }
+    const primary = this.primaryAgentName ?? undefined;
+    if (ended && (!primary || !this.agents.has(primary))) {
+      console.error(`[channel] ${agentName} has ended, and there is no primary to tell that ${shown} couldn't be opened and is selected for opening`);
+      return;
+    }
+    const who = ended ? primary : agentName || this.deliveryAgent()?.name;
+    const canOpen = who !== undefined && !this.conversationAgentHomes.has(who) && this.canAgentUseTool(who, 'channel_open');
+    // A fork's channel_close is refused for any channel but its home, as
+    // dispatchChannelToolCall reads it.
+    const home = who !== undefined ? this.conversationAgentHomes.get(who) : undefined;
+    const canClose = who !== undefined && (!home || home === channel.channelId) &&
+      this.canAgentUseTool(who, 'channel_close');
+    const selected = selectedForOpening === 'unrecorded'
+      ? " It stays selected for opening, as the host couldn't record undoing that: a later delivery or reconnect tries again"
+      : selectedForOpening !== undefined
+        ? ` It's selected for opening again, as ${selectedForOpening === 'server-bootstrap' ? 'its server announces it open' : 'the subscription policy admits it'}: the host tries again`
+        : '';
+    const hostRetries = selectedForOpening === 'server-bootstrap' || selectedForOpening === 'subscription-policy';
+    const text = `[channels] Not open: ${shown}. ` +
+      (ended
+        ? `${agentName}'s reply there went out, but opening the channel failed; ${agentName} has ended.`
+        : 'Your reply there went out, but opening the channel failed.') +
+      (selected ? selected + (canClose ? ', and channel_close withdraws that.' : '.') : '') +
+      (canOpen && !hostRetries ? ' channel_open tries again.' : '');
+    try {
+      this.addMessage(
+        'user',
+        [{ type: 'text', text }],
+        (ended
+          ? { system: true, kind: 'channel-notice', speaker: agentName }
+          : { system: true, kind: 'channel-notice' }) as MessageMetadata,
+        agentName && !ended ? { forAgent: agentName } : undefined,
+      );
+      console.error(
+        `[channel] reply open-failed notice -> ${ended ? `the primary, by name (${agentName} has ended)` : who ?? 'no agent'}: ${shown}`,
+      );
+    } catch (err) {
+      console.error('recordReplyOpenFailedNotice failed:', err);
+    }
+    // Where the reader can't close a channel selected for opening, as a fork
+    // away from its home can't, or an agent whose allowedTools leave
+    // channel_close out, the primary is told by name too, where it's
+    // registered and can close it, so an agent that could close the channel
+    // hears it may open.
+    const primaryHome = primary !== undefined ? this.conversationAgentHomes.get(primary) : undefined;
+    if (
+      !ended && selectedForOpening !== undefined && who !== undefined && !canClose &&
+      primary !== undefined && primary !== who && this.agents.has(primary) &&
+      (!primaryHome || primaryHome === channel.channelId) && this.canAgentUseTool(primary, 'channel_close')
+    ) {
+      const primaryCanOpen = !this.conversationAgentHomes.has(primary) && this.canAgentUseTool(primary, 'channel_open');
+      const told = `[channels] Not open: ${shown}. ${who}'s reply there went out, but opening the channel failed, and ${who} can't close it.` +
+        selected + ', and channel_close withdraws that.' +
+        (primaryCanOpen && !hostRetries ? ' channel_open tries again.' : '');
+      try {
+        this.addMessage(
+          'user',
+          [{ type: 'text', text: told }],
+          { system: true, kind: 'channel-notice', speaker: who } as MessageMetadata,
+        );
+        console.error(`[channel] reply open-failed notice -> the primary, by name (${who} can't close it): ${shown}`);
+      } catch (err) {
+        console.error('recordReplyOpenFailedNotice failed:', err);
+      }
+    }
+  }
+
+  /**
    * A `!` continuation the turn asked for (`>>#x !`, `>>>#x !`): start another
    * turn now instead of pausing until the next external event. It reads the
    * logical turn of the stream that asked (shared with a retry or a
@@ -25688,12 +25796,13 @@ export class AgentFramework {
           }
         }
 
-        // INVARIANT: engaging a channel opens it. A successful explicit send
-        // into a channel the registry knows as closed drives the same open
-        // flow as channel_open (durable desired state, the server's
-        // channels/open), so there is no such thing as posting into a channel
-        // that stays half-alive (no typing, no reactions, no inbound
-        // forwarding).
+        // Engaging a channel opens it. A successful explicit send into a
+        // channel the registry knows as closed drives the open flow
+        // channel_open uses (the server's channels/open), so posting there
+        // doesn't leave the channel half-alive (no typing, no reactions, no
+        // inbound forwarding). If that open fails, the channel stays as it
+        // was, and where the host directs the server's lifecycle the agent
+        // is told, with how to try again.
         // Fire-and-forget: the send already succeeded; the open must not
         // delay or fail the tool result.
         if (
@@ -25705,9 +25814,14 @@ export class AgentFramework {
             extractChannelIdFromToolResult(result.content) ??
             (typeof args.channelId === 'string' ? (args.channelId as string) : undefined);
           if (target) {
+            // Whether the host directs the server's lifecycle is read before
+            // the open, not after its failure: a transport that drops while the
+            // open is out clears the grant before the failure arrives, and the
+            // notice below is for that failure too.
+            const directs = this.channelRegistry.directsLifecycle(serverId);
             this.channelRegistry
               .openIfClosedForSend(target, serverId)
-              .then(({ status, channelId, label }) => {
+              .then(({ status, channelId, label, opening, selectedForOpening }) => {
                 // Turn-scoped engagement record (mid-turn re-pin, 2026-07-31
                 // n=7): a human follow-up in a channel the agent explicitly
                 // sent into this turn counts as conversationally addressed.
@@ -25732,10 +25846,20 @@ export class AgentFramework {
                     'opened-by-reply',
                   );
                 } else if (status === 'open-failed') {
+                  // A reply's open that would have opened a channel not
+                  // selected open, and failed, is told to the agent, with how
+                  // to try again, where the host directs the server's
+                  // lifecycle. The opened notice would have told it of the
+                  // open. A failed reconfirm of a channel already selected
+                  // open changes nothing the agent was told. Without
+                  // channels.lifecycle the server opens and closes its own
+                  // channels, and channel_open can't open one either.
+                  const tell = opening === true && directs;
                   console.error(
-                    `[channel] ${agentName}: ${toolName} delivered to ${target} but the open-on-send failed; ` +
-                      'a later registration or delivery tries the open again',
+                    `[channel] ${agentName}: ${toolName} delivered to ${target} but the open-on-send failed` +
+                      (tell ? '; the agent is told' : ''),
                   );
+                  if (tell) this.recordReplyOpenFailedNotice(agentName, { channelId: channelId ?? target, label }, selectedForOpening);
                 }
               })
               .catch((err) => console.error('[channel] open-on-send error:', err));

@@ -1791,6 +1791,7 @@ describe('present while acting', () => {
     framework.checkpointManager = null;
     framework.channelRegistry = {
       openIfClosedForSend: () => new Promise((resolve) => { resolveOpen = resolve; }),
+      directsLifecycle: () => true,
     };
     framework.turnRouting = new Map([['assistant', sending]]);
     const results: unknown[] = [];
