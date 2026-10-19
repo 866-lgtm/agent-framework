@@ -6723,6 +6723,11 @@ describe('grep', () => {
     const data = await call(m, 'grep', { pattern: 'ALPHA$' });
     assert.deepEqual(data.results.map((r: { version: string; lineEndings?: string; matches: Array<{ text: string }> }) => [r.version, r.lineEndings, r.matches[0]!.text]),
       [['conflicting-disk', 'CRLF', 'disk says ALPHA']]);
+    // A CR pattern searched only the disk version's CRLF ends, and says why it
+    // finds no CR there.
+    const cr = await call(m, 'grep', { pattern: '\\r$' });
+    assert.deepEqual(cr.results, []);
+    assert.match(cr.note, /^The pattern names a CR, and a file searched has CRLF line ends\./);
   });
 
   test("once disk changes again, a conflict's stored disk version is labelled as recorded, and what disk holds now as not searched", async (t) => {

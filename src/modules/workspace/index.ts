@@ -3744,10 +3744,11 @@ export class WorkspaceModule implements Module {
     // `foo$` finds a CRLF file's line, as it does under ripgrep's --crlf, and
     // the line copies into an edit as read's do. ripgrep's --crlf still prints
     // the line with its CR.
-    let searchedCrlf = false;
+    let searchedCrlf = false, searchedBom = false;
     const search = (bytes: Buffer): Searched => {
-      const { lines, crlfEnds, lfEnds } = fileText(bytes);
+      const { lines, crlfEnds, lfEnds, bom } = fileText(bytes);
       if (crlfEnds > 0) searchedCrlf = true;
+      if (bom) searchedBom = true;
       const found: GrepMatch[] = [];
       for (let i = 0; i < lines.length; i++) {
         if (regex.test(lines[i])) {
@@ -3888,9 +3889,10 @@ export class WorkspaceModule implements Module {
         pattern: input.pattern,
         results,
         totalMatches: results.reduce((sum, r) => sum + r.matches.length, 0),
-        // A pattern written for a CR can't find a CRLF end's, which lines as
-        // read shows them leave out, so the answer says why it didn't.
-        ...(searchedCrlf && namesCr(input.pattern) ? { note: CRLF_CR_NOTE } : {}),
+        // A pattern written for a CR can't find a CRLF end's, nor one written
+        // for U+FEFF a BOM, which lines as read shows them leave out, so the
+        // answer says why it didn't.
+        ...leftOutNote(input.pattern, searchedCrlf, searchedBom),
         ...(skipped.length > 0 ? { skipped } : {}),
         ...(incomplete.length > 0 ? { incomplete } : {}),
       },
@@ -4768,22 +4770,40 @@ function inputProblem(
 }
 
 const CRLF_CR_NOTE = 'The pattern names a CR, and a file searched has CRLF line ends. Lines are matched as read shows them, '
-  + 'which leaves out a CRLF end\'s CR unless the line\'s own text ends in a CR. read with offsetChars shows every CR.';
+  + 'which leaves out a CRLF end\'s CR unless the line\'s own text ends in a CR. read with offsetChars shows every CR in the workspace\'s copy.';
+const BOM_NOTE = 'The pattern names U+FEFF, and a file searched starts with a BOM. Lines are matched as read shows them, '
+  + 'and a BOM isn\'t part of the first line. read with offsetChars shows it in the workspace\'s copy.';
+
+/** grep's note for a pattern that names a character its lines leave out, where a file it searched has one. */
+function leftOutNote(pattern: string, searchedCrlf: boolean, searchedBom: boolean): { note?: string } {
+  if (!searchedCrlf && !searchedBom) return {};
+  const named = namedLeftOut(pattern);
+  const notes = [named.cr && searchedCrlf ? CRLF_CR_NOTE : null, named.bom && searchedBom ? BOM_NOTE : null].filter((n) => n !== null);
+  return notes.length ? { note: notes.join(' ') } : {};
+}
 
 /**
- * Whether a grep pattern names a CR: a literal one, or an escape that a
- * pattern compiled without flags reads as one (`\r`, `\x0d`, `\u000d`, `\cM`,
- * `\015`) whose backslash isn't itself escaped.
+ * Which of the characters grep's lines leave out a pattern names: a CR, as a
+ * literal one or as `\r`, `\x0d`, `\u000d`, `\cM`, `\015` or a backslash
+ * before a literal CR; and U+FEFF, as a literal one, `\uFEFF` or a backslash
+ * before a literal one. An escape counts only where its backslash isn't itself
+ * escaped. A pattern compiled without flags can match a CR other ways too,
+ * such as `\15` in a pattern of fewer than 15 groups or a class range that
+ * spans U+000D, and those go unnoticed.
  */
-function namesCr(pattern: string): boolean {
+function namedLeftOut(pattern: string): { cr: boolean; bom: boolean } {
+  const named = { cr: false, bom: false };
   for (let i = 0; i < pattern.length; i++) {
-    if (pattern[i] === '\r') return true;
-    if (pattern[i] === '\\') {
-      if (/^(?:r|x0[dD]|u000[dD]|c[mM]|015)/.test(pattern.slice(i + 1, i + 6))) return true;
+    if (pattern[i] === '\r') named.cr = true;
+    else if (pattern[i] === '\uFEFF') named.bom = true;
+    else if (pattern[i] === '\\') {
+      const next = pattern.slice(i + 1, i + 6);
+      if (/^(?:r|\r|x0[dD]|u000[dD]|c[mM]|015)/.test(next)) named.cr = true;
+      else if (/^(?:u[fF][eE][fF][fF]|\uFEFF)/.test(next)) named.bom = true;
       i++;
     }
   }
-  return false;
+  return named;
 }
 
 /**
