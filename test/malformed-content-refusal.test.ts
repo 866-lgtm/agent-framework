@@ -130,21 +130,22 @@ test("channel: with conversation routing on, a malformed message that would bind
   t.after(x.close);
   const agents = () => x.framework.getAllAgents().length;
   const before = agents();
-  const message = (messageId: string, content: unknown[]) => (x.framework as any).handleMcplChannelIncoming({
+  const message = (messageId: string, content: unknown[], triggerInference: boolean) => (x.framework as any).handleMcplChannelIncoming({
     type: 'mcpl:channel-incoming', serverId: 'srv', channelId: 'slack:C1', messageId,
-    author: { id: 'U1', name: 'alice' }, content, timestamp: TS, triggerInference: false,
+    author: { id: 'U1', name: 'alice' }, content, timestamp: TS, triggerInference,
     metadata: { mentioned: true },
   });
   // Visible text beside a malformed block, so the empty-content check would
   // let it through and only the malformed-content check stops it.
-  const placement = await message('m2', [{ type: 'text', text: 'bot, help' }, { type: 'image', source: 'not-an-object' }]);
+  const placement = await message('m2', [{ type: 'text', text: 'bot, help' }, { type: 'image', source: 'not-an-object' }], true);
   await x.framework.runUntilIdle();
   assert.equal(placement, undefined, 'nothing was placed');
   assert.equal(agents(), before, 'no fork was spawned');
   assert.deepEqual(x.traces.filter((e) => String(e.type).startsWith('mcpl:conversation-')), [], 'nor bound');
   assert.deepEqual(x.added, [], 'no row traced');
   assert.equal(x.refused.length, 1, 'refused instead');
-  await message('m3', [{ type: 'text', text: 'bot, help' }]);
+  assert.equal(x.starts(), 0, 'and no wake');
+  await message('m3', [{ type: 'text', text: 'bot, help' }], false);
   await x.framework.runUntilIdle();
   assert.equal(agents(), before + 1, 'the same message well-formed spawns a fork');
 });
