@@ -31,6 +31,9 @@ FILES=(
 )
 here=$(cd "$(dirname "$0")" && pwd)
 dest=$here/quickjs-ng
+# The command that restores the committed copy, from any directory.
+top=$(git -C "$here" rev-parse --show-toplevel)
+restore="git -C $(printf '%q' "$top") checkout -- $(printf '%q' "${dest#"$top"/}")"
 changes=$(git -C "$here" status --porcelain --untracked-files=all --ignored -- quickjs-ng)
 if [ -n "$changes" ]; then
   echo "vendor.sh: engine/quickjs-ng holds changes or files not committed, which replacing it would erase; commit or remove them first:" >&2
@@ -42,7 +45,19 @@ tmp=$(mktemp -d)
 # is moved aside, the stage renamed into its place, and only then is the old one removed.
 stage=$(mktemp -d "$here/.quickjs-ng.XXXXXX")
 old=$stage.old
-trap 'rm -rf "$tmp" "$stage"' EXIT
+# However the script ends, a committed copy left moved aside goes back, unless the new one is in
+# its place, and what was staged goes.
+finish() {
+  if [ -e "$old" ]; then
+    if [ ! -e "$dest" ] && mv "$old" "$dest"; then
+      echo "vendor.sh: stopped while replacing the copy; the committed copy is back in place." >&2
+    elif [ -e "$dest" ]; then
+      rm -rf "$old"
+    fi
+  fi
+  rm -rf "$tmp" "$stage"
+}
+trap finish EXIT
 git -c advice.detachedHead=false clone --quiet --depth 1 --branch "$TAG" https://github.com/quickjs-ng/quickjs.git "$tmp/quickjs-ng"
 got=$(git -C "$tmp/quickjs-ng" rev-parse HEAD)
 if [ "$got" != "$COMMIT" ]; then
@@ -52,10 +67,15 @@ fi
 # Patches go into the clone's index, and files come from it, so each file's bytes are the
 # commit's with the patches, whatever the clone's checkout settings would make of them on disk.
 patched=0
-# Every entry, a dot-named one or a dangling link included, is a regular .patch file or refused.
+# Every entry, a dot-named one or a link included, is a regular .patch file or refused, and so is
+# an engine/patches that isn't a directory.
+if { [ -e "$here/patches" ] || [ -L "$here/patches" ]; } && { [ ! -d "$here/patches" ] || [ -L "$here/patches" ]; }; then
+  echo "vendor.sh: engine/patches isn't a directory; remove it, or make it one. engine/quickjs-ng is unchanged." >&2
+  exit 1
+fi
 shopt -s nullglob dotglob
 for patch in "$here"/patches/*; do
-  if [ "${patch%.patch}" = "$patch" ] || [ ! -f "$patch" ]; then
+  if [ "${patch%.patch}" = "$patch" ] || [ -L "$patch" ] || [ ! -f "$patch" ]; then
     echo "vendor.sh: engine/patches/$(basename "$patch") isn't a regular .patch file; rename or remove it. engine/quickjs-ng is unchanged." >&2
     exit 1
   fi
@@ -66,7 +86,7 @@ for patch in "$here"/patches/*; do
   patched=$((patched + 1))
 done
 # Only FILES are copied, so a patch's change to any other file would be applied and then dropped.
-# Each path the patches leave changed is checked whole, a rename's old and new paths both.
+# Each path the patches leave changed is checked by name, a rename's old and new paths both.
 git -C "$tmp/quickjs-ng" diff --cached --name-only --no-renames -z > "$tmp/changed"
 while IFS= read -r -d '' f; do
   listed=false
@@ -78,9 +98,17 @@ while IFS= read -r -d '' f; do
     exit 1
   fi
 done < "$tmp/changed"
+# The copy writes each file as a plain one, so a listed file that the patches leave executable, a
+# link or a submodule is refused rather than written as something else.
 for f in "${FILES[@]}"; do
   if ! git -C "$tmp/quickjs-ng" cat-file -e ":$f" 2>/dev/null; then
     echo "vendor.sh: quickjs-ng $TAG has no $f, or a patch removes it; update FILES or the patch. engine/quickjs-ng is unchanged." >&2
+    exit 1
+  fi
+  mode=$(git -C "$tmp/quickjs-ng" ls-files --stage -- ":(literal)$f")
+  mode=${mode%% *}
+  if [ "$mode" != 100644 ]; then
+    echo "vendor.sh: $f has mode $mode after the patches, which the copy can't keep, since it writes plain files; engine/quickjs-ng is unchanged." >&2
     exit 1
   fi
   if ! git -C "$tmp/quickjs-ng" show ":$f" > "$stage/$f"; then
@@ -97,7 +125,7 @@ if ! mv "$stage" "$dest"; then
   if [ -e "$old" ] && mv "$old" "$dest"; then
     echo "vendor.sh: couldn't move the new copy into $dest; the committed copy is back in place." >&2
   else
-    echo "vendor.sh: couldn't move the new copy into $dest, nor the committed copy back from $old; git checkout -- $dest restores it." >&2
+    echo "vendor.sh: couldn't move the new copy into $dest, nor the committed copy back from $old; $restore restores it." >&2
   fi
   exit 1
 fi
