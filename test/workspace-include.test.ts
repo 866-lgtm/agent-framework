@@ -490,6 +490,10 @@ describe('mount include', () => {
     const outside = await refusal('work/lnk/gate.json');
     assert.match(outside, /"work\/lnk" is a symlink, which this mount does not follow$/);
     assert.ok(!outside.includes('real'), outside);
+    // It's named as the parse reads the path, whatever empty, `.` or `..` segment the caller's text holds before it.
+    for (const given of ['work/./lnk/gate.json', 'work/sub/../lnk/gate.json', 'work/.//lnk/gate.json']) {
+      assert.match(await refusal(given), /"work\/lnk" is a symlink, which this mount does not follow$/, given);
+    }
     // Nor does a listing or a sync of the mount name the uncovered target.
     for (const [name, input] of [['ls', { path: 'work' }], ['ls', { path: 'work', recursive: true }], ['sync', {}]] as Array<[string, Record<string, unknown>]>) {
       const said = JSON.stringify(await call(m, name, input));
@@ -532,6 +536,7 @@ describe('mount include', () => {
       const uncovered = await refusal('work/d/a.json');
       assert.match(uncovered, /^parent_symlink: .*"work\/d" is a symlink, which this mount does not follow$/);
       assert.ok(!uncovered.includes('inner'), uncovered);
+      assert.match(await refusal('work/./x/../d/a.json'), /^parent_symlink: .*"work\/d" is a symlink, which this mount does not follow$/);
     } finally {
       await m.stop();
     }

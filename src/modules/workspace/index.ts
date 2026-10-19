@@ -326,6 +326,7 @@ async function linkReadError(
   mountPrefixedPath: string,
   relativePath: string,
   nested: readonly NestedMount[],
+  shown: string,
 ): Promise<WorkspaceReadError> {
   if (!('link' in found)) {
     return new WorkspaceReadError('not_found', `Unable to read file: ${mountPrefixedPath}: ${linkWords(mount.config.name, found, null)}`, 'readlink', found.code);
@@ -333,10 +334,11 @@ async function linkReadError(
   const rootReal = await realpath(mount.config.path).catch(() => resolve(mount.config.path));
   const leads = await shownLeads(mount.config.path, rootReal, found, mount.config.include);
   // A link the include doesn't cover (no leads) is named as the path shown
-  // spells it, the caller's spelling (keptAsGiven): its segments line up
-  // with the parsed path's.
-  const shownPath = mountPrefixedPath.startsWith(`${mount.config.name}/`) ? mountPrefixedPath.slice(mount.config.name.length + 1) : '';
-  const named = leads === null && shownPath !== '' ? { link: shownPath.split('/').slice(0, found.link.split('/').length).join('/') } : found;
+  // spells it, the caller's spelling (keptAsGiven). `shown` is that path's
+  // mount-relative part as the parse reads it (parsePathAsGiven), so its
+  // segments line up with the parsed path's, where the caller's own text
+  // may hold an empty, `.` or `..` segment before the link.
+  const named = leads === null && shown !== '' ? { link: shown.split('/').slice(0, found.link.split('/').length).join('/') } : found;
   const reason = `${mountPrefixedPath}: ${linkWords(mount.config.name, named, leads, nested, mount.config.include)}`;
   const holder = leads?.kind === 'inside' ? nestedHolder(leads.target, nested) : undefined;
   const code = leads?.kind === 'outside' ? 'escape'
@@ -2239,7 +2241,7 @@ export class WorkspaceModule implements Module {
     }
     if (mount.config.followSymlinks !== true) {
       const found = await linkOnTheWay({ root: mount.config.path, followSymlinks: false }, relativePath);
-      if (found !== null) return await linkReadError(mount, found, path, relativePath, nested);
+      if (found !== null) return await linkReadError(mount, found, path, relativePath, nested, this.parsePathAsGiven(path).relativePath);
     }
     // On a mount with an include, the path to use there names each directory
     // on the place's way as that mount's, so a place beneath anything else
@@ -2375,8 +2377,12 @@ export class WorkspaceModule implements Module {
    * its way that disk has as something other than a directory, such as a
    * file or a link, and that the mount's include doesn't cover, and disk's
    * before it. Disk's spelling of a name the include leaves out is a name
-   * the caller didn't give, so no answer names such a segment otherwise,
-   * while every check still judges `spelled`. Directories keep disk's
+   * the caller didn't give, so what an answer shows of the path asked about
+   * names such a segment only as given: the path a file tool shows, a file
+   * tool's refusal and its pass's note, and a sync's skipped entries. Lists
+   * of the workspace's entries, such as a sync's synced, conflicts and
+   * ignored, and `ls`, name each as it is stored. Every check still judges
+   * `spelled`. Directories keep disk's
    * spelling, as a listing shows them, and a mount without an include keeps
    * every segment as disk spells it. The respelling keeps each segment's
    * place, so the two paths' segments line up.
@@ -2673,7 +2679,7 @@ export class WorkspaceModule implements Module {
     // resolution after the open, below.
     const linkView = { root: mount.config.path, followSymlinks: follow };
     const onTheWay = await linkOnTheWay(linkView, relativePath, 'parents');
-    if (onTheWay !== null) throw await linkReadError(mount, onTheWay, mountPrefixedPath, relativePath, this.nestedOf(mount.config.name));
+    if (onTheWay !== null) throw await linkReadError(mount, onTheWay, mountPrefixedPath, relativePath, this.nestedOf(mount.config.name), this.parsePathAsGiven(mountPrefixedPath).relativePath);
 
     let fileInfo: Awaited<ReturnType<typeof lstat>>;
     try {
@@ -2762,7 +2768,7 @@ export class WorkspaceModule implements Module {
       // A directory swapped for a link since the walk above is caught here, by
       // what the path resolved to after the open.
       const resolvedThrough = await linkRefusal(linkView, realMountRoot, relativePath, realFilePath);
-      if (resolvedThrough !== null) throw await linkReadError(mount, resolvedThrough, mountPrefixedPath, relativePath, this.nestedOf(mount.config.name));
+      if (resolvedThrough !== null) throw await linkReadError(mount, resolvedThrough, mountPrefixedPath, relativePath, this.nestedOf(mount.config.name), this.parsePathAsGiven(mountPrefixedPath).relativePath);
 
       const inside = isContainedPath(realMountRoot, realFilePath);
       const holder = inside ? nestedAtReal(realFilePath, this.nestedOf(mount.config.name)) : undefined;
