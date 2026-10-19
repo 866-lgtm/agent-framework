@@ -1,6 +1,7 @@
 /**
- * The handshake a test of the native watcher makes before it writes what it
- * means to hear: changesFlow, and the probe files it writes (isProbe).
+ * The handshake a watcher test makes, on either of chokidar's backends, before
+ * it writes what it means to hear: changesFlow, and the probe files it writes
+ * (isProbe).
  */
 import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
@@ -29,10 +30,12 @@ export const isProbe = (path: string): boolean => basename(path).startsWith(PROB
  * one is added. So a file written in between isn't reported until a later
  * change in its directory, when chokidar reads the directory again, and a probe
  * reported in one directory can come from a stream made before another
- * directory's watch. Each attempt writes a new probe in each directory still
- * unreported and waits up to a second, since the next probe is that later
- * change. The probes stay in the batches, and a test's results leave them out
- * (isProbe).
+ * directory's watch. chokidar's polling backend starts a directory's poll just
+ * before `onReady` too, and the poll's first stat is what each later one is
+ * compared with, so a file written before that stat is never reported. Each
+ * attempt writes a new probe in each directory still unreported and waits up
+ * to a second, since the next probe is that later change. The probes stay in
+ * the batches, and a test's results leave them out (isProbe).
  */
 export async function changesFlow(root: string, batches: FsChange[][], dirs: readonly string[]): Promise<void> {
   const where = dirs.length ? dirs : [''];
