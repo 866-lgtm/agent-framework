@@ -3348,10 +3348,16 @@ export class AgentFramework {
             .filter((m) => (m.forAgent ?? framework.primaryAgentName) === framework.primaryAgentName)
             .sort(bySeq)
             .map((m) => ({ participant: m.participant, content: m.content, metadata: m.metadata as Record<string, unknown> | undefined })),
+          // Every reader of the shared slot compiles the dump with its own
+          // strategy, so the dump fits the smallest of their bounds.
           residentMessageChars: () => {
-            const primary = framework.primaryAgentName
-              ? framework.agents.get(framework.primaryAgentName) : undefined;
-            return primary ? framework.strategyDerivedToolResultChars(primary) : undefined;
+            let chars: number | undefined;
+            for (const reader of framework.sharedSlotAgents) {
+              if (framework.agents.get(reader.name) !== reader) continue;
+              const bound = framework.strategyDerivedToolResultChars(reader);
+              if (bound !== undefined && (chars === undefined || bound < chars)) chars = bound;
+            }
+            return chars;
           },
           currentSequence: () => framework.store.currentSequence(),
           setSubconsciousAnchor: (sequence) =>

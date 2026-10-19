@@ -53,7 +53,7 @@ export type ModuleMessage = StoredMessage & {
    * a resident in rows of their own, which aren't marked, such as the
    * cancel's `<tuned-out-backlog>` row, with the text of the tune-out's newest
    * messages, up to `backlogCap` of them and as many as fit in one of the
-   * resident's messages, the stored ones first and then those still held;
+   * residents' messages, the stored ones first and then those still held;
    * what the subconscious says of it, in its report or its note; and the
    * result of a tool that reads history on request, such as a
    * channel's `fetch_history` or the history module's `extract`. A module

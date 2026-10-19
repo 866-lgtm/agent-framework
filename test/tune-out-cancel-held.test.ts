@@ -2,11 +2,12 @@
  * What a tune-out's cancel makes of the messages still held when it ends.
  * The dump and the subconscious's report notice take the ended epoch's
  * messages only. After the notice come, each a row of its own with its own
- * content, the held ones the cap leaves out of the dump and the held ones
+ * content, the held ones the dump leaves out and the held ones
  * the dump shows whose media its text lines drop, since the subconscious's
  * view holds stored messages only. A cancel the subconscious makes itself gets that notice and
  * a report turn when some held message goes to it, or when it wrote no note
- * and the cap cut anything.
+ * and the dump left anything out. Here the cap does it; test/tune-out-dump-fit
+ * has the residents' per-message room do it too.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';

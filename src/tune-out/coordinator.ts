@@ -37,8 +37,8 @@ const WAKE_COALESCE_MS = 2_000;
 /** How long after an end time whose cancel threw the cancel is tried again. */
 const EXPIRY_RETRY_MS = 60_000;
 
-/** Ends a backlog line cut to fit in one of the resident's messages. */
-const CUT_MARK = ' [cut to fit; fetch_history has it whole]';
+/** Ends a backlog line cut to fit in one of the residents' messages. */
+const CUT_MARK = " [cut to fit; the whole message is in the channel's history]";
 
 /** The first `length` code units of `text`, one fewer where the last would be
  *  the first half of a surrogate pair. */
@@ -81,10 +81,11 @@ export interface TuneOutFrameworkHooks {
    */
   getDeferredMessages?: () => Array<Pick<StoredMessage, 'participant' | 'content' | 'metadata'>>;
   /**
-   * The most characters of text the primary resident is shown whole in one
-   * message: its strategy's per-message cap (`maxMessageTokens`) at four
-   * characters a token, or undefined when its strategy has no such cap. A
-   * cancel's dump is one message, so it holds as many backlog lines as fit.
+   * The most characters of text every reader of the residents' shared slot
+   * is shown whole in one message: the smallest of their strategies'
+   * per-message caps (`maxMessageTokens`) at four characters a token, or
+   * undefined when none has such a cap. A cancel's dump is one message in
+   * that slot, so it holds as many backlog lines as fit.
    */
   residentMessageChars?: () => number | undefined;
   /** Current chronicle head sequence (window anchor for new epochs). */
@@ -340,7 +341,9 @@ export class TuneOutCoordinator {
       ...this.hooks.getStoredMessages().filter(ofEpoch),
       ...held,
     ];
-    const cap = ended.params.backlogCap;
+    // Whole messages: a cap below one shows none, where slice(-0.5) would
+    // start at 0 and take them all.
+    const cap = Math.floor(ended.params.backlogCap);
     const authorOf = (m: Pick<StoredMessage, 'participant' | 'metadata'>): string =>
       (m.metadata as { author?: { name?: string } } | undefined)?.author?.name ?? m.participant;
     const lineOf = (m: Pick<StoredMessage, 'participant' | 'content' | 'metadata'>): string => {
@@ -360,34 +363,44 @@ export class TuneOutCoordinator {
       return `${lifecycle}\n\n<tuned-out-backlog ${attrs.join(' ')}>\n${lines.join('\n')}\n</tuned-out-backlog>`;
     };
 
-    // The dump is one message in the resident's window, so the resident's
-    // strategy cuts it as it cuts any message past its per-message cap:
-    // context-manager's strategies count a text block at a token per four
-    // characters, rounded up, and keep a message's first cap × 4 characters.
-    // Cut there, the dump would lose its newest lines, which would still
-    // count as shown. So it holds the newest lines that fit whole, and those
-    // it leaves out, the oldest, count as truncated along with those above
-    // backlogCap, so the report is told of them. A newest message too long to
-    // fit alone is shown cut to the room left and marked, so the resident
-    // still gets its head, as it would from a row of its own.
+    // The dump is one message in the residents' shared slot, so each
+    // resident's strategy cuts it as it cuts any message past its per-message
+    // cap: context-manager's AutobiographicalStrategy (which connectome-host's
+    // FrontdeskStrategy extends) and WindowedPassthroughStrategy count a text
+    // block at a token per four characters, rounded up, and keep a message's
+    // first cap × 4 characters. Cut there, the dump would lose its newest
+    // lines, which would still count as shown. So it holds the newest lines
+    // that fit whole in the smallest such room, and those it leaves out, the
+    // oldest, count as truncated along with those above backlogCap, so the
+    // report is told of them. A newest message too long to fit alone is shown
+    // cut to the room left and marked, so the residents still get its head,
+    // as they would from a row of its own. A room too small for the dump's
+    // frame, its header and tags, leaves it no line, and the frame is cut.
     let shown = cap > 0 ? backlog.slice(-cap) : [];
     let lines = shown.map(lineOf);
     let newestCut = false;
     const room = this.hooks.residentMessageChars?.();
     if (room !== undefined && render(lines, backlog.length - shown.length).length > room) {
-      // The lines' room, measured with the widest count `truncated=` can
-      // take, so the dump rendered with its own count fits too.
-      const left = room - render([], backlog.length).length;
+      // The dump's length with no line, for the count that showing k lines
+      // leaves out: truncated= takes that count's digits, and goes at 0. With
+      // the newest k lines whole, the dump is that and the lines, with a
+      // newline between each two. While a message is left out, each line kept
+      // makes it longer, and they don't all fit, so the fit keeps lines from
+      // the newest while the next one fits.
+      const frameShowing = (k: number): number => render([], backlog.length - k).length;
       let used = 0;
       let kept = 0;
-      for (let i = lines.length - 1; i >= 0; i--) {
-        const cost = lines[i]!.length + (kept > 0 ? 1 : 0); // and its newline
-        if (used + cost > left) break;
-        used += cost;
+      while (kept < lines.length) {
+        const next = used + lines[lines.length - 1 - kept]!.length + (kept > 0 ? 1 : 0);
+        if (frameShowing(kept + 1) + next > room) break;
+        used = next;
         kept++;
       }
-      if (kept === 0 && lines.length > 0 && left > CUT_MARK.length) {
-        lines = [prefixOf(lines[lines.length - 1]!, left - CUT_MARK.length) + CUT_MARK];
+      // What of the newest line's text fits beside the frame and the mark.
+      const cutRoom = room - frameShowing(1) - CUT_MARK.length;
+      const newest = lines.at(-1);
+      if (kept === 0 && newest !== undefined && cutRoom > 0) {
+        lines = [prefixOf(newest, cutRoom) + CUT_MARK];
         shown = shown.slice(-1);
         newestCut = true;
       } else {
