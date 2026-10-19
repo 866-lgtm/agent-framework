@@ -610,15 +610,19 @@ interface ChannelRegistryOptions {
   /** Callback to determine whether an incoming message should trigger inference. */
   shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean;
   /**
-   * Called when a text-only turn's speech could NOT be delivered to its
-   * conversational locus — no locus, an unregistered channel, a missing
-   * server, or the server reporting `delivered: false` — or the server
-   * answered its publish with an error, after which whether it was posted is
-   * unknown. Not called for an ephemeral run's speech with no locus, which is
-   * its caller's result (`takesGlobalFallback`). The host wires this to drop a
-   * `[discord-send-failed]` marker into chronicle so the failure is visible to
-   * the agent (and operator) rather than silently lost. Must not itself
-   * trigger inference (avoid wake loops).
+   * Called when a text-only turn's speech was not delivered to its
+   * conversational locus (`failed`), or may not have been (`unknown`), for
+   * whatever reason deliverSpeech gives, such as no locus, a channel that
+   * isn't registered or refuses speech, a missing server or grant, a failed
+   * open, the server reporting `delivered: false`, or a publish answered
+   * with an error, a timeout or a lost connection, after which whether it
+   * was posted is unknown. It isn't called for an ephemeral run's speech
+   * whose turn has no locus (a null locus), which is its caller's result
+   * (`takesGlobalFallback`), nor for a `failed` delivery whose caller holds
+   * its words with a notice of its own (deliverSpeech's `heldOnFailure`).
+   * The host wires this to drop a `[discord-send-failed]` marker into
+   * chronicle so the failure is visible to the agent (and operator) rather
+   * than silently lost. Must not itself trigger inference (avoid wake loops).
    */
   onRouteFailure?: (info: {
     conversationId: string;
@@ -3733,8 +3737,9 @@ export class ChannelRegistry {
    * (waitForOpenChannel); the check also catches one made after the last
    * wait, as the opening's notice can. Words refused after an open for a
    * declaration leave the channel open, and the agent gets the failure for
-   * the words. An open that turned a closed channel open also gives the
-   * notice that it's open, which says how to close it. One that only
+   * the words. An open by delivery (`openSource` 'opened-by-delivery', the
+   * default) that turned a closed channel open also gives the notice that
+   * it's open, which says how to close it. One that only
    * reconfirmed the transport of a channel already decided open or tuned out
    * changes no decision, and gives none. When the registration is gone, the
    * failure says the channel was removed.
@@ -3888,10 +3893,10 @@ export class ChannelRegistry {
    * Plain speech for one turn segment: publish `text` to the turn's frozen
    * locus and report the PublishOutcome. A failure (or an uncertain outcome)
    * is surfaced as a trace and through onRouteFailure, so the agent learns
-   * its words did not (or may not have) reached anyone. There are two
-   * exceptions: a `failed` one whose caller holds its words with a notice of
-   * its own (`heldOnFailure`), and an ephemeral run's speech with no locus,
-   * which is its caller's result, so it returns as not delivered and surfaces
+   * its words did not (or may not have) reached anyone. A `failed` one whose
+   * caller holds its words with a notice of its own (`heldOnFailure`) gets
+   * the trace but not onRouteFailure. An ephemeral run's speech with no locus
+   * (null) is its caller's result: it returns as not delivered and surfaces
    * nothing. This is host-owned output routing (see forking-knowledge-miner
    * LOCUS-ROUTING-DESIGN), which replaced the per-surface sticky auto-post
    * that used to live in discord-mcpl.

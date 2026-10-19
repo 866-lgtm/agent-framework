@@ -83,7 +83,7 @@ depends on the route:
 
 Explicit send tools (`send_message` etc.) are unchanged. Channel lifecycle
 invariants (send-opens-channel, subscribed⇒open) are unchanged — a `>>` send
-into a closed channel opens it, with the usual `[channels]` notice.
+into a channel decided closed opens it, with the usual `[channels]` notice.
 
 ## Teaching the grammar (teach-by-bounce)
 

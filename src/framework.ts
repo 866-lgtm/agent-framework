@@ -16314,9 +16314,11 @@ export class AgentFramework {
     // MCPL Spec 14.3 outgoing streaming: route text deltas to their
     // destination server AS THEY GENERATE (voice synthesis, live message
     // rendering). Pure observer surface — suppression is fail-closed (nothing
-    // streams that delivery would refuse), emission is capability-gated in
-    // the registry (`channels.streaming`), and delivery via deliverProse
-    // remains the sole authoritative send.
+    // streams whose destination delivery wouldn't choose, or to a channel
+    // the router's `speakable` refuses), emission is capability-gated in the
+    // registry (`channels.streaming`), and delivery via deliverProse remains
+    // the sole authoritative send. Delivery can still refuse text that has
+    // streamed, for what it learns later (ProseStreamRouter's header).
     const newOutgoingInferenceId = (): string =>
       `inf_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
     // NOT const: a membrane refusal retry abandons everything streamed so
@@ -16371,9 +16373,9 @@ export class AgentFramework {
             const r = this.channelRegistry!.resolveProseTarget(spec);
             return 'channelId' in r ? r.channelId : null;
           },
-          // A stream is a copy of speech, and nothing is published into a
-          // channel its server declared inbound-only: text routed there while
-          // it is one is never streamed or kept for the stream's end.
+          // Nothing is published into a channel its server declared
+          // inbound-only, so text routed there while it is one is never
+          // streamed or kept for the stream's end.
           speakable: (channelId) => !this.channelRegistry!.inboundOnlyServer(channelId),
         })
       : null;
