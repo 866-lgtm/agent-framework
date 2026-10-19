@@ -16,3 +16,5 @@
   userinfo's Basic one). A WebSocket dial refuses the first and the last
   of these again, so a dial that skipped the configuration check can't
   fall back to the query.
+  In header mode a dial puts nothing in the url's query, so the 0.23.0 note
+  on redacting the query a WebSocket dial writes applies only to query mode.
