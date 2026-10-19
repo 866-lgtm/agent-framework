@@ -1342,9 +1342,13 @@ describe('mount include', () => {
       assert.ok(passes.every((paths) => !paths.includes('notes.txt')), `no pass of the mount names it: ${JSON.stringify(passes)}; ${seen}`);
       assert.ok(!named('work/notes.txt'), `and no event: ${JSON.stringify(events)}`);
       // A covered change, as a control: the watcher reports it, a pass takes it in, and its event goes out.
+      const fromGate = batches.length;
       env.writeDisk('gate.json', '{"v":2}\n');
       await until(() => named('work/gate.json'), 'the covered change is taken in');
-      assert.ok(turns > 0, 'the covered change takes a turn of the mount, so the count sees one');
+      // Its batch's own count sees its turn. A handler that awaited before asking for its turn would leave every
+      // batch's count at 0, and the uncovered batch's assertion above would pass whatever the handler decided.
+      assert.ok(batches.slice(fromGate).some((b) => b.paths.includes('gate.json') && b.turns > 0),
+        `the covered change's batch takes a turn of the mount, and its own count sees it: ${JSON.stringify(batches.map((b) => ({ paths: b.paths, turns: b.turns })))}`);
       assert.ok(passes.length > 0 && passes.every((paths) => !paths.includes('notes.txt')), JSON.stringify(passes));
       assert.equal(env.store.treeGet(TREE, 'notes.txt'), null);
     } finally {
