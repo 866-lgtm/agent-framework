@@ -420,6 +420,11 @@ test("an oldString with the file's BOM at its start and a CR at its end is read 
   assert.match(errorOf(await call('edit', { path: 'work/e.txt', oldString: '\uFEFF\r', newString: '' })),
     /\nWhere it occurs with its BOM read as the file's own and its last CR as a CRLF line end's, the edit changes nothing, since the file keeps its BOM and line ends\.$/);
   assert.equal(await stored('e.txt'), '\uFEFF\r\nx\uFEFF\r\n');
+  // Made the BOM alone, the edit changes nothing in either reading, the one
+  // that leaves nothing among them, and the refusal says so of both.
+  assert.match(errorOf(await call('edit', { path: 'work/e.txt', oldString: '\uFEFF\r', newString: '\uFEFF' })),
+    /\nIt occurs with its last CR read as its CRLF line end's \(on line 2\) and with its BOM read as the file's own and its last CR as a CRLF line end's \(on line 1\)\.\nWhere it occurs with its last CR read as its CRLF line end's or with its BOM read as the file's own and its last CR as a CRLF line end's, the edit changes nothing, since the file keeps its BOM and line ends\.$/);
+  assert.equal(await stored('e.txt'), '\uFEFF\r\nx\uFEFF\r\n');
   // Where line 1 isn't empty, only line 2 holds it.
   await file('f.txt', '\uFEFFa\r\nx\uFEFF\r\n');
   dataOf(await call('edit', { path: 'work/f.txt', oldString: '\uFEFF\r', newString: 'Y' }));
@@ -450,6 +455,11 @@ test("a replaceAll whose oldString, read as ending in a CRLF end's CR, changes n
     /\nWhere it occurs with its last CR read as its CRLF line end's, the edit changes nothing, since the file keeps its line ends\.$/);
   dataOf(await call('edit', { path: 'work/x.txt', oldString: 'x\r', newString: 'x', replaceAll: true }));
   assert.equal(await stored('x.txt'), 'x\r\nx\r\n');
+  // Where no occurrence changes, a replaceAll has nothing to change.
+  await file('y.txt', 'x\r\ny\r\n');
+  assert.match(errorOf(await call('edit', { path: 'work/y.txt', oldString: 'x\r', newString: 'x', replaceAll: true })),
+    /^The edit did nothing: oldString and newString are the same once the BOM or the line end's CR that oldString carries is read as work\/y\.txt's own/);
+  assert.equal(await stored('y.txt'), 'x\r\ny\r\n');
 });
 
 test("an oldString found in two readings other than as given is refused, and one found in three names all three", async (t) => {

@@ -147,9 +147,10 @@ interface Found {
  * whatever order the files are planned in, and an edit's count in a call of
  * its own is exact, even in a file stored before its mount's limit was
  * lowered. planFile raises it to any text longer than it, for a caller that
- * sizes it smaller. Past it, a count is a floor. Without it, each of many edits of a text with millions of
- * occurrences counted them all, at a cost of the edits times the
- * occurrences. COUNT_MAX, the default limit's, serves a caller with none.
+ * sizes it smaller. Past it, a count is a floor. Without it, each of many
+ * edits of a text with millions of occurrences counted them all, at a cost
+ * of the edits times the occurrences. COUNT_MAX, the default limit's, serves
+ * a caller with none.
  */
 export interface CountBudget {
   left: number;
@@ -459,7 +460,8 @@ export type MatchProblem =
    * either or both (readingsOf), so which the edit means can't be told. Each
    * reading's occurrences as a count's are: how many, and the lines of the
    * first SHOWN_MATCHES; `same` where read that way the edit changes
-   * nothing, as the file keeps its BOM and line ends.
+   * nothing, as the file keeps the BOM or line end's CR that reading leaves
+   * out.
    */
   | {
     kind: 'readings';
@@ -614,8 +616,9 @@ export function planFile(
   const pastShown = specs.reduce((sum, spec) => sum + (spec.expected === 'all' ? 0 : Math.max(spec.expected - SHOWN_MATCHES, 0)), 0);
   const crowded = specs.length > 1 && pastShown > value.length;
   // The call's count budget holds as many as this text is long, at least:
-  // applyEdits sizes it to the largest file the call names, and a caller
-  // that sizes it smaller has it raised here.
+  // applyEdits sizes it to the larger of the mount's limit and the largest
+  // file the call names, and a caller that sizes it smaller has it raised
+  // here.
   if (value.length > counts.size) {
     counts.left += value.length - counts.size;
     counts.size = value.length;
