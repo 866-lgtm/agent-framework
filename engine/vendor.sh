@@ -32,25 +32,28 @@ FILES=(
 # Physical paths, as git gives the repository's, so the one can be taken from the other.
 here=$(cd "$(dirname "$0")" && pwd -P)
 dest=$here/quickjs-ng
-# The command that restores the committed copy, from any directory.
+# The command that puts back the committed copy's files, from the commit, from any directory.
 top=$(git -C "$here" rev-parse --show-toplevel)
-restore="git -C $(printf '%q' "$top") checkout -- $(printf '%q' "${dest#"$top"/}")"
+restore="git -C $(printf '%q' "$top") checkout HEAD -- $(printf '%q' "${dest#"$top"/}")"
 changes=$(git -C "$here" status --porcelain --untracked-files=all --ignored -- quickjs-ng)
 if [ -n "$changes" ]; then
-  echo "vendor.sh: engine/quickjs-ng holds changes or files not committed, which replacing it would erase; commit or remove what you made, or run $restore to put back what's committed:" >&2
+  echo "vendor.sh: engine/quickjs-ng holds changes or files not committed, which replacing it would erase; commit what you mean to keep, or run $restore to put back what's committed and remove any file listed below as untracked (??) or ignored (!!):" >&2
   echo "$changes" >&2
   exit 1
 fi
-# Whenever the script exits, short of being killed outright (SIGKILL), a committed copy left moved
-# aside goes back, unless the new one is in its place, and what was staged goes. A signal waits
-# for the command in progress, and one during this cleanup is ignored.
+# Whenever the script exits, a committed copy left moved aside goes back, unless the new one is in
+# its place, and what was staged goes. bash runs this on a signal that ends the shell too: INT,
+# TERM and HUP are trapped below, so they wait for the command in progress, and PIPE, ALRM, USR1,
+# USR2 and XCPU were checked to run it as well. Signals are ignored while it runs. SIGKILL, which
+# no trap sees, skips it. A signal ignored when the script started, as SIGINT is for a background
+# job of a non-interactive shell, stays ignored, and the script carries on.
 tmp= stage= old=
 finish() {
+  trap '' HUP INT PIPE ALRM TERM USR1 USR2 XCPU
   set +e
-  trap '' INT TERM HUP
   if [ -n "$old" ] && [ -e "$old" ]; then
     if [ -e "$dest" ]; then
-      rm -rf "$old"
+      rm -rf "$old" || echo "vendor.sh: the new copy is in place, but the committed copy moved aside to $old couldn't be removed; remove it." >&2
     elif mv "$old" "$dest"; then
       echo "vendor.sh: stopped while replacing the copy; the committed copy is back in place." >&2
     else
