@@ -4179,46 +4179,125 @@ export class ChannelRegistry {
 
     // Where the host directs the lifecycle, a decline goes through the
     // lifecycle queue like any closed decision, unless a receipt confirmed
-    // the transport closed with nothing pending: an unconfirmed transport may
-    // be open, and pending work must settle on this decision. A failed close
-    // is reported; the decision stands.
-    let closeError: string | undefined;
+    // the transport closed with nothing pending: an open or unconfirmed
+    // transport may be open, and pending work must settle on this decision.
+    // The decline refused an open channel before its acknowledgment, but
+    // traffic can show one open meanwhile where this host didn't direct the
+    // server's channels, before a grant that now lets it. A decline acts
+    // only on its own decision: one made meanwhile, to open the channel or
+    // tune it out, isn't the decline's to apply. A failed close is reported
+    // below; the decision stands.
+    let closeFailure: unknown;
+    let closeFailed = false;
     const current = this.channels.get(`${entry.serverId}:${input.channelId}`);
     if (current && this.directsLifecycle(entry.serverId) &&
-        (this.unconfirmedChannelTargets.has(current) || this.hasPendingLifecycle(current))) {
+        this.getDesiredState(entry.serverId, input.channelId) === 'closed' &&
+        (current.open || this.unconfirmedChannelTargets.has(current) || this.hasPendingLifecycle(current))) {
       try {
         await this.applyDesiredChannelState(entry.serverId, input.channelId);
       } catch (error) {
-        // Reconciling closes it when the server next registers the channel
-        // (for a push's placeholder, if it ever does), if this host directs
-        // their lifecycle then (§14.1). A registration that went while the
-        // close was out says so, since the server may have closed it first,
-        // and one that came back since says that.
-        const went = error instanceof ChannelLifecycleError && (error.kind === 'cancelled' || error.kind === 'unlisted');
-        closeError = withStop(
-          `The decline is recorded, and this host closes the channel ${laterClause(entry)}; ` +
-          (!went ? `closing it now didn't complete: ${lifecycleClause(error)}`
-            : this.channels.has(`${entry.serverId}:${input.channelId}`)
-              ? 'its registration went and came back while the close was out'
-              : `it isn't registered here any more: ${(error as ChannelLifecycleError).message}`),
-        );
+        closeFailure = error;
+        closeFailed = true;
       }
     }
     // A decision made while the decline ran, to open the channel or tune it
     // out, replaced it, and that is what stands.
     const decided = this.getDesiredState(entry.serverId, input.channelId);
     const stands = decided === 'closed';
+    // The channel as the decline leaves it: closed for certain only where
+    // it is registered, not open, its target confirmed, and no lifecycle
+    // work for it outstanding, as the in-effect texts read it. A close that
+    // didn't complete, a channel this host never confirmed closed, or a
+    // registration that went leaves that unknown. A server without
+    // channels.lifecycle keeps its channels as it chooses, and this host
+    // asks it to open or close none of them, so a channel there is confirmed
+    // closed only by the receipt of a request sent while the server had the
+    // grant, whether the channel was registered or known only from a push.
+    const after = this.channels.get(`${entry.serverId}:${input.channelId}`);
+    const closed = after !== undefined && !after.open && !this.unconfirmedChannelTargets.has(after) &&
+      !this.lifecycleOutstanding.has(this.lifecycleKey(entry.serverId, input.channelId));
+    // `closeError` is the result's sentence for the agent: what became of
+    // the channel, and what follows. Every status but `remained closed`
+    // carries one, and that one none, by this tree; `status` is the word a
+    // caller's code reads. Reconciling closes a channel decided closed when
+    // the server next registers it (for a push's placeholder, if it ever
+    // does), if this host directs their lifecycle then (§14.1), which
+    // laterClause says.
+    let closeError: string | undefined;
+    const reach = this.serverReach(entry.serverId);
+    const serverBack = reach === 'gone' ? ' If you need the server back, ask whoever runs this host.' : '';
+    // What helps now with a registered channel the decline didn't leave
+    // closed for certain, read from the state the reads above found, not
+    // from how it came to be: whom to ask where this host doesn't direct the
+    // server's channels, work still under way where some will carry the
+    // decision out (outstandingWorkCarriesOut, not work a removal cancels),
+    // and otherwise channel_close, which asks for the close now.
+    const stepNow = (): string => !this.directsLifecycle(entry.serverId)
+      ? (reach === 'up' ? ' If you need it closed sooner, ask whoever runs this host.' : serverBack)
+      : this.outstandingWorkCarriesOut(entry.serverId, this.lifecycleKey(entry.serverId, input.channelId))
+        ? ' Other work for it that\'s still under way applies the decline when its turn comes, so there\'s no need to ' +
+          'decline again to close it.'
+        : ' If you need it closed now, call channel_close.';
     if (!stands) {
+      // channel_close closes it after all, whichever decision it was, while
+      // the channel is registered; a server that's up without the grant
+      // keeps its channels as it chooses, as the decline's refusal says.
+      const step = after === undefined
+        ? `. It isn't registered here any more, so no channel tool can reach it until it's registered here again.${serverBack}`
+        : reach === 'up' && !this.directsLifecycle(entry.serverId)
+          ? `, and ${this.lifecycleRefusal(entry.serverId).message}; if you need it closed, ask whoever runs this host.`
+          : `. If you still want it closed, call channel_close.${serverBack}`;
       closeError = decided === 'tuned-out'
-        ? 'The decline is recorded, but the channel was tuned out meanwhile, and that decision stands: its messages go to ' +
-          'the subconscious.'
-        : 'The decline is recorded, but a later decision to open the channel replaced it, and that decision stands.';
+        ? `The decline is recorded, but the channel was tuned out meanwhile, and that decision stands: its messages go to ` +
+          `the subconscious${step}`
+        : `The decline is recorded, but a later decision to open the channel replaced it, and that decision stands${step}`;
+    } else if (closed) {
+      // Closed for certain, whatever became of the decline's own close: one
+      // refused for a grant that went after an earlier operation confirmed
+      // the close changes nothing the agent needs.
+    } else if (closeFailed) {
+      // What happened comes from the failure: a registration that went
+      // while the close was out says so, since the server may have closed it
+      // first, and one that came back since says that; a request that failed
+      // while the registration went says both. What helps comes from the
+      // state now.
+      const failure = closeFailure instanceof ChannelLifecycleError ? closeFailure : undefined;
+      const went = failure?.kind === 'cancelled' || failure?.kind === 'unlisted';
+      closeError = withStop(
+        `The decline is recorded, and this host closes the channel ${laterClause(entry)}; ` +
+        (!went ? `closing it now didn't complete: ${lifecycleClause(closeFailure)}`
+          : after !== undefined
+            ? 'its registration went and came back while the close was out'
+            : `it isn't registered here any more: ${failure!.message}`),
+      ) + (after === undefined ? (went ? '' : ' It isn\'t registered here any more.') + serverBack : stepNow());
+    } else if (after === undefined) {
+      // The registration went while the acknowledgment was out, so no close
+      // was tried.
+      closeError = withStop(
+        `The decline is recorded, and this host closes the channel ${laterClause(entry)}; it isn't registered here any more` +
+        (reach !== 'up' ? `: ${unreachableClause(entry.serverId, reach)}` : ''),
+      ) + serverBack;
+    } else if (!this.directsLifecycle(entry.serverId)) {
+      closeError = reach === 'up'
+        ? `The decline is recorded, but ${this.lifecycleRefusal(entry.serverId).message}, so the server keeps this one open ` +
+          `or closed as it chooses, and declining again won't change that. This host closes it ${laterClause(entry)}. If you ` +
+          'need it closed sooner, ask whoever runs this host.'
+        : `The decline is recorded, but ${unreachableClause(entry.serverId, reach)}, so the channel may not be closed there ` +
+          `yet. This host closes it ${laterClause(entry)}, so there's no need to decline again to close it.` + serverBack;
+    } else {
+      // This host directs the channel's lifecycle and its close didn't fail,
+      // so what remains is other work for it, or a change since that close's
+      // receipt that left it unconfirmed; the step says which.
+      closeError = 'The decline is recorded, but the channel isn\'t closed for certain yet.' + stepNow();
     }
     // Another decline is taken only where this one was: the channel
     // registered, not open, and not decided open.
-    const after = this.channels.get(`${entry.serverId}:${input.channelId}`);
     const again = stands && after !== undefined && !after.open;
     const acknowledgmentError = ackFailure?.(again ? 'call channel_decline again with the same arguments' : undefined);
+    // What the decline found, in a word: the channel remained closed, the
+    // decline stands though the channel may not be closed, or a later
+    // decision replaced it.
+    const status = !stands ? 'replaced' : closed ? 'remained closed' : 'declined';
 
     // An audit record nothing reads back: the decline took effect above, so
     // a log that refuses it is the operator's to hear about, not a failure
@@ -4242,7 +4321,7 @@ export class ChannelRegistry {
       success: true,
       data: {
         channelId: input.channelId,
-        status: 'remained closed',
+        status,
         acknowledged,
         ...(representation ? { representation } : {}),
         ...(acknowledgmentError ? { acknowledgmentError } : {}),
