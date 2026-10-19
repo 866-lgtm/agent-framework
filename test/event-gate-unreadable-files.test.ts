@@ -154,6 +154,25 @@ test('a gate.json that is JSON the gate refuses whole, for a default other than 
   ], 'once, though it was read three times');
 });
 
+test('a gate.json saved with a BOM loads, so a change edits it and keeps no copy', (t) => {
+  const dir = tempDir(t);
+  const { gate, configPath } = makeGate(dir, { config: RULES });
+  // UTF-8 with a leading U+FEFF, as some Windows editors save it, holding a rule its operator added by hand.
+  const byHand = { name: 'by-hand', match: { tagsAny: ['chat:dm'] }, behavior: 'always' as const };
+  writeFileSync(configPath, `\uFEFF${JSON.stringify({ ...RULES, policies: [...RULES.policies, byHand] }, null, 2)}`);
+
+  const kept: UnreadableConfigKept[] = [];
+  gate.addPolicy({ name: 'ambient', match: { tagsAny: ['chat:ambient'] }, behavior: 'defer' }, { onUnreadableKept: (k) => kept.push(k) });
+  assert.deepEqual(onDisk(configPath).policies.map((p) => p.name), ['mentions', 'by-hand', 'ambient'], 'the rule added by hand stays');
+  writeFileSync(configPath, `\uFEFF${readFileSync(configPath, 'utf-8')}`);
+  assert.equal(gate.removePolicy('ambient', { onUnreadableKept: (k) => kept.push(k) }), true);
+  assert.deepEqual(onDisk(configPath).policies.map((p) => p.name), ['mentions', 'by-hand']);
+
+  assert.deepEqual(kept, []);
+  assert.deepEqual(keptFiles(dir), []);
+  assert.deepEqual(gate.getStatus().errors, []);
+});
+
 test('a gate.json that is not UTF-8 is kept byte for byte', (t) => {
   const dir = tempDir(t);
   const { gate, configPath } = makeGate(dir, { config: RULES });

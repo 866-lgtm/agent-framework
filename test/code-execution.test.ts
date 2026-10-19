@@ -20,6 +20,7 @@ import type {
   ModuleContext,
   ProcessEvent,
   ProcessState,
+  ScriptToolResult,
   ToolCall,
   ToolDefinition,
   ToolResult,
@@ -131,6 +132,77 @@ describe('PyRunner (real python3)', () => {
       assert.strictEqual(result.returnCode, 0, result.stderr);
       assert.match(result.stdout, /echoed: alpha/);
       assert.deepStrictEqual(calls, [{ name: 'test--echo', args: { message: 'alpha' } }]);
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('gives a script each result as its string, with .is_error and .structured beside it', async () => {
+    const structured = JSON.stringify({ content: [], structuredContent: { rows: [1, 2] }, isError: false });
+    const oversized = JSON.stringify({ isError: true, oversized: { chars: 9, savedTo: null } });
+    const results: Record<string, string | ScriptToolResult> = {
+      failed: { text: 'Error: boom', isError: true },
+      // Text that merely starts like an error, the case .is_error is for.
+      textlike: { text: 'Error: a line of the file, not a failure', isError: false },
+      structured: { text: structured, isError: false, structuredJson: true },
+      oversized: { text: oversized, isError: true, structuredJson: true },
+      // A handler that returns a plain string says nothing about it.
+      plain: 'a string, nothing said',
+      // Unmarked text holding a structuredContent key is still text.
+      jsonlike: { text: '{"structuredContent": {"a": 1}}', isError: false },
+    };
+    const runner = new PyRunner({
+      onToolCall: async (_name, args) => {
+        if (args.kind === 'rejects') throw new Error('handler broke');
+        // A JS handler can resolve with what its type rules out; the call is
+        // still answered, as before this change.
+        if (args.kind === 'nothing') return undefined as unknown as string;
+        return results[String(args.kind)]!;
+      },
+    });
+    try {
+      const result = await runner.exec(
+        [
+          'import copy, json, pickle',
+          'out = {}',
+          'for kind in ["failed", "textlike", "structured", "oversized", "plain", "rejects", "jsonlike", "nothing"]:',
+          '    r = await test__echo({"kind": kind})',
+          '    out[kind] = {"text": str(r), "is_error": r.is_error, "structured": r.structured,',
+          '                 "type": type(r).__name__, "is_str": isinstance(r, str)}',
+          'r = await test__echo({"kind": "structured"})',
+          'out["parsed"] = json.loads(r)["structuredContent"]',
+          'out["copies"] = [[c.is_error, c.structured, c == r] for c in (copy.copy(r), pickle.loads(pickle.dumps(r)))]',
+          'key = await test__echo({"kind": "plain"})',
+          'try:',
+          '    await test__echo({key: 1}, extra=2)',
+          'except TypeError as e:',
+          '    out["refusal"] = str(e)',
+          'print(json.dumps(out))',
+        ].join('\n'),
+        ECHO_TOOLS,
+      );
+      assert.strictEqual(result.returnCode, 0, result.stderr);
+      const out = JSON.parse(result.stdout) as Record<string, unknown>;
+      const seen = (text: string, isError: boolean | null, value: unknown) =>
+        ({ text, is_error: isError, structured: value, type: 'ToolResult', is_str: true });
+      assert.deepStrictEqual(out.failed, seen('Error: boom', true, null));
+      assert.deepStrictEqual(out.textlike, seen('Error: a line of the file, not a failure', false, null));
+      assert.deepStrictEqual(out.structured, seen(structured, false, { rows: [1, 2] }));
+      // Marked as a structured result's object, but holding no
+      // structuredContent: none to read.
+      assert.deepStrictEqual(out.oversized, seen(oversized, true, null));
+      assert.deepStrictEqual(out.plain, seen('a string, nothing said', null, null));
+      // A handler that rejects reaches the script as an error, flagged.
+      assert.deepStrictEqual(out.rejects, seen('Error: handler broke', true, null));
+      // The string is unchanged for code that parses it itself.
+      assert.deepStrictEqual(out.parsed, { rows: [1, 2] });
+      // copy and pickle keep both attributes.
+      assert.deepStrictEqual(out.copies, [[false, { rows: [1, 2] }, true], [false, { rows: [1, 2] }, true]]);
+      assert.deepStrictEqual(out.jsonlike, seen('{"structuredContent": {"a": 1}}', false, null));
+      assert.deepStrictEqual(out.nothing, seen('', null, null));
+      // A refusal shows a key that is a tool's result as its text, the key the
+      // agent has to write, as it shows any str key.
+      assert.match(String(out.refusal), /\{'a string, nothing said': <int>, 'extra': <int>\}/);
     } finally {
       runner.dispose();
     }
@@ -300,7 +372,8 @@ describe('PyRunner (real python3)', () => {
       await new Promise((r) => setTimeout(r, 300));
       const second = await runner.exec('print("nope")', []);
       assert.strictEqual(second.returnCode, 1);
-      assert.match(second.stderr, /already running/);
+      assert.strictEqual(second.stderr, "script didn't run: another code_execution script of yours is already running, and they run one at a time. "
+        + 'Run this one again once that one has finished, or combine the two into one script.');
       runner.abort('cleanup');
       await first;
     } finally {
@@ -331,7 +404,7 @@ describe('PyRunner (real python3)', () => {
     }
   });
 
-  it('fails gracefully when the python binary is missing', async () => {
+  it('fails gracefully when the python binary is missing, and says code_execution can\'t run here', async () => {
     const runner = new PyRunner({
       pythonPath: '/definitely/not/a/python',
       onToolCall: async () => '',
@@ -339,7 +412,176 @@ describe('PyRunner (real python3)', () => {
     try {
       const result = await runner.exec('print(1)', []);
       assert.strictEqual(result.returnCode, 1);
-      assert.match(result.stderr, /Failed to start python runtime|exited before becoming ready/);
+      assert.strictEqual(result.stderr, "script didn't run: this host can't start its Python interpreter, /definitely/not/a/python (ENOENT), "
+        + "so code_execution can't run scripts here until whoever runs this host installs it or points this host at one. Calling it again before then fails the same way.");
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('an interpreter path that is no program, or that runs through a file, says which, and only the first rules out trying again', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pytc-start-'));
+    const notExecutable = join(dir, 'python3');
+    writeFileSync(notExecutable, '#!/bin/sh\n', { mode: 0o644 });
+    const noExec = new PyRunner({ pythonPath: notExecutable, onToolCall: async () => '' });
+    const throughFile = new PyRunner({ pythonPath: join(notExecutable, 'python3'), onToolCall: async () => '' });
+    try {
+      assert.strictEqual((await noExec.exec('print(1)', [])).stderr, `script didn't run: this host can't start its Python interpreter, ${notExecutable} (EACCES), `
+        + "so code_execution can't run scripts here until whoever runs this host makes it executable or points this host at another. Calling it again before then fails the same way.");
+      assert.strictEqual((await throughFile.exec('print(1)', [])).stderr, `script didn't run: the Python interpreter, ${join(notExecutable, 'python3')}, `
+        + "couldn't be started (ENOTDIR), so none of the script ran. Run it again; if it fails the same way, ask whoever runs this host.");
+    } finally {
+      noExec.dispose();
+      throughFile.dispose();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("a runtime whose files can't be written says so, with the error's path cut at 500 characters, not that the interpreter failed", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pytc-files-'));
+    // Nested past 500 characters, so Node's message, which quotes the path, is cut.
+    const missing = join(dir, ...Array.from({ length: 6 }, () => 'm'.repeat(90)));
+    const saved = process.env.TMPDIR;
+    process.env.TMPDIR = missing;
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      const result = await runner.exec('print(1)', []);
+      assert.strictEqual(result.returnCode, 1);
+      const message = `ENOENT: no such file or directory, mkdtemp '${join(missing, 'af-pytc-XXXXXX')}'`;
+      assert.ok(message.length > 500, 'the message is long enough to be cut');
+      assert.strictEqual(result.stderr, "script didn't run: this host couldn't create or write the files its Python runtime starts from ("
+        + `${message.slice(0, 500)}… (${message.length} characters)), so none of the script ran. Run it again; if it fails the same way, ask whoever runs this host.`);
+    } finally {
+      if (saved === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = saved;
+      runner.dispose();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('an interpreter that exits as it starts: nothing in the script ran, and one more try is worth it', async () => {
+    // Node, given the runtime's Python source, exits on its syntax at once.
+    const runner = new PyRunner({ pythonPath: process.execPath, onToolCall: async () => '' });
+    try {
+      const result = await runner.exec('print(1)', []);
+      assert.strictEqual(result.returnCode, 1);
+      assert.strictEqual(result.stderr, `script didn't run: the Python interpreter, ${process.execPath}, exited as it started, so none of the script ran. `
+        + 'Run it again; if it fails the same way, ask whoever runs this host.');
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('an interpreter that exits under a script says the rest didn\'t run and its state is gone', async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      assert.strictEqual((await runner.exec('x = 41', [])).returnCode, 0);
+      const result = await runner.exec('import os\nos._exit(3)', []);
+      assert.strictEqual(result.returnCode, 1);
+      assert.strictEqual(result.stderr, "script stopped: the Python interpreter exited with code 3 while it ran, so the rest of the script didn't run, "
+        + 'and variables from earlier scripts are gone. Tool calls it had already made keep their effects, so check them before you run it again in a new interpreter. '
+        + 'If it stops the same way, check whether the script itself ends the process, for example with os._exit(); if not, ask whoever runs this host.');
+      assert.match((await runner.exec('print(x)', [])).stderr, /NameError: name 'x' is not defined/);
+      const killed = await runner.exec('import os, signal\nos.kill(os.getpid(), signal.SIGKILL)', []);
+      assert.strictEqual(killed.stderr, "script stopped: the Python interpreter was ended by SIGKILL while it ran, so the rest of the script didn't run, "
+        + 'and variables from earlier scripts are gone. Tool calls it had already made keep their effects, so check them before you run it again in a new interpreter. '
+        + 'If it stops the same way, check whether the script itself ends the process, for example by using too much memory; if not, ask whoever runs this host.');
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('a tool function given keyword arguments or a non-dict is not called, and says the dict to write', async () => {
+    const calls: string[] = [];
+    const runner = new PyRunner({ onToolCall: async (name) => { calls.push(name); return ''; } });
+    try {
+      const result = await runner.exec(
+        [
+          'class Loud(str):',
+          '    def __repr__(self):',
+          '        raise RuntimeError("repr ran")',
+          'class Int(int):',
+          '    def __repr__(self):',
+          '        raise RuntimeError("repr ran")',
+          'class Meta(type):',
+          '    def __eq__(cls, other):',
+          '        raise RuntimeError("metaclass __eq__ ran")',
+          '    __hash__ = type.__hash__',
+          '    @property',
+          '    def __name__(cls):',
+          '        raise RuntimeError("metaclass __name__ ran")',
+          'class Odd(metaclass=Meta):',
+          '    def __repr__(self):',
+          '        raise RuntimeError("repr ran")',
+          'for call in (lambda: test__echo(message="alpha", limit=5, items=[1]), lambda: test__echo({"message": "alpha"}, limit=5), lambda: test__echo("alpha"),',
+          '             lambda: test__echo("alpha", limit=5),',
+          '             lambda: test__echo(text=Loud("x"), n=Int(3)), lambda: test__echo({Int(4): "a"}, n=1),',
+          '             lambda: test__echo({"k" * 61: 1, "j" * 60: 2}, n=1), lambda: test__echo(Odd(), n=1)):',
+          '    try:',
+          '        await call()',
+          '    except TypeError as e:',
+          '        print(e)',
+        ].join('\n'),
+        ECHO_TOOLS,
+      );
+      assert.strictEqual(result.returnCode, 0, result.stderr);
+      assert.deepStrictEqual(result.stdout.trimEnd().split('\n'), [
+        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, so write await test__echo({'message': <str>, 'limit': <int>, 'items': <list>})",
+        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, so write await test__echo({'message': <str>, 'limit': <int>})",
+        "test__echo wasn't called: a tool function takes one dict of arguments, such as await test__echo({...}), and this call gave it <str>",
+        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, and this call also gave it <str>, "
+          + 'so put every argument in one dict: await test__echo({...})',
+        // A value of a subclass is shown by its type: its own __repr__ never runs.
+        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, so write await test__echo({'text': <Loud>, 'n': <Int>})",
+        // A key that isn't a str is shown as a value is, so its __repr__ doesn't run either.
+        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, so write await test__echo({<Int>: <str>, 'n': <int>})",
+        // A str key is shown whole up to 60 characters, and past that by its type.
+        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, so write await test__echo("
+          + `{<str>: <int>, '${'j'.repeat(60)}': <int>, 'n': <int>})`,
+        // A class's metaclass code doesn't run either: its type is named through type's own descriptor.
+        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, and this call also gave it <Odd>, "
+          + 'so put every argument in one dict: await test__echo({...})',
+      ]);
+      assert.deepStrictEqual(calls, []);
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('a tool function takes args= on its own as the dict, and None either way as no arguments, as it always has', async () => {
+    const calls: unknown[] = [];
+    const runner = new PyRunner({ onToolCall: async (_name, args) => { calls.push(args); return 'ok'; } });
+    try {
+      const result = await runner.exec([
+        'await test__echo(None)',
+        'await test__echo(args=None)',
+        'await test__echo(args={"message": "a"})',
+        'await test__echo({"message": "b"})',
+      ].join('\n'), ECHO_TOOLS);
+      assert.strictEqual(result.returnCode, 0, result.stderr);
+      assert.deepStrictEqual(calls, [{}, {}, { message: 'a' }, { message: 'b' }]);
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('a keyword named args beside other keywords stays in the dict to write, and two positional arguments are refused', async () => {
+    const runner = new PyRunner({ onToolCall: async () => 'called' });
+    try {
+      const result = await runner.exec([
+        'for call in (lambda: test__echo(message="alpha", args={"limit": 5}), lambda: test__echo({"message": "alpha"}, args={"limit": 5}),',
+        '             lambda: test__echo(args="notes.md"), lambda: test__echo({"a": 1}, {"b": 2})):',
+        '    try:',
+        '        await call()',
+        '    except TypeError as e:',
+        '        print(e)',
+      ].join('\n'), ECHO_TOOLS);
+      assert.strictEqual(result.returnCode, 0, result.stderr);
+      assert.deepStrictEqual(result.stdout.trimEnd().split('\n'), [
+        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, so write await test__echo({'message': <str>, 'args': <dict>})",
+        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, so write await test__echo({'message': <str>, 'args': <dict>})",
+        "test__echo wasn't called: a tool function takes one dict of arguments, such as await test__echo({...}), and this call gave it <str>",
+        "test__echo wasn't called: a tool function takes one dict of arguments, such as await test__echo({...}), and this call gave it 2 positional arguments",
+      ]);
     } finally {
       runner.dispose();
     }
@@ -561,7 +803,8 @@ describe('PyRunner: an abort or dispose while the interpreter starts (real pytho
       assert.strictEqual(result.aborted, true);
       assert.strictEqual(
         result.stderr,
-        `Failed to start python runtime (${exits.path}): python runtime exited before becoming ready`,
+        `script didn't run: the Python interpreter, ${exits.path}, exited as it started, so none of the script ran. `
+          + 'Run it again; if it fails the same way, ask whoever runs this host.',
       );
     } finally {
       runner.dispose();
@@ -687,7 +930,95 @@ async function createFrameworkWithCodeExecution(storePath: string, membrane: Moc
   });
 }
 
+/** A host variable no allowlist names, and a declared one, for the env tests below. */
+const HOST_ONLY = 'AF_CODE_EXEC_TEST_HOST_ONLY';
+const DECLARED = 'AF_CODE_EXEC_TEST_DECLARED';
+
 describe('framework code_execution integration (real python3)', () => {
+  it("a script gets codeExecution.env and not a host variable outside the allowlist", async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-env-');
+    const membrane = new MockMembrane();
+    const code = `import os; print("declared:", os.environ.get("${DECLARED}"), "host:", repr(os.environ.get("${HOST_ONLY}")))`;
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'call_env_1', name: 'code_execution', input: { code } },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: [],
+      modules: [new ScriptToolModule()],
+      syncIntervalMs: 0,
+      codeExecution: { enabled: true, env: { [DECLARED]: 'from-config' } },
+    });
+    try {
+      process.env[HOST_ONLY] = 'host-value';
+      const created = await framework.createEphemeralAgent({
+        name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
+      });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+      const promise = framework.runEphemeralToCompletion(created.agent, created.contextManager);
+      framework.start();
+      await promise;
+      const wireResult = membrane.lastStream!.receivedToolResults[0][0] as { content: string };
+      assert.match(wireResult.content, /declared: from-config host: None/, wireResult.content);
+    } finally {
+      await framework.stop();
+      delete process.env[HOST_ONLY];
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("with codeExecution.inheritEnv: true, a script gets the host's variables beside codeExecution.env", async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-envinherit-');
+    const membrane = new MockMembrane();
+    const code = `import os; print("declared:", os.environ.get("${DECLARED}"), "host:", repr(os.environ.get("${HOST_ONLY}")))`;
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'call_env_2', name: 'code_execution', input: { code } },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: [],
+      modules: [new ScriptToolModule()],
+      syncIntervalMs: 0,
+      codeExecution: { enabled: true, env: { [DECLARED]: 'from-config' }, inheritEnv: true },
+    });
+    try {
+      process.env[HOST_ONLY] = 'host-value';
+      const created = await framework.createEphemeralAgent({
+        name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
+      });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+      const promise = framework.runEphemeralToCompletion(created.agent, created.contextManager);
+      framework.start();
+      await promise;
+      const wireResult = membrane.lastStream!.receivedToolResults[0][0] as { content: string };
+      assert.match(wireResult.content, /declared: from-config host: 'host-value'/, wireResult.content);
+    } finally {
+      await framework.stop();
+      delete process.env[HOST_ONLY];
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('create() refuses a codeExecution.inheritEnv that is not a boolean', async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-inherit-');
+    try {
+      await assert.rejects(AgentFramework.create({
+        storePath,
+        membrane: new MockMembrane().asMembrane(),
+        agents: [],
+        modules: [new ScriptToolModule()],
+        syncIntervalMs: 0,
+        codeExecution: { enabled: true, inheritEnv: 'false' as unknown as boolean },
+      }), /codeExecution\.inheritEnv must be true or false, unquoted, not a string: /);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('synthesizes the tool only when enabled', async () => {
     const { tempDir, storePath } = tempStorePath('pytc-tools-');
     const membrane = new MockMembrane();
@@ -727,10 +1058,14 @@ describe('framework code_execution integration (real python3)', () => {
     const code = [
       'import json',
       'names = []',
+      'flags = []',
       'for m in ["alpha", "beta"]:',
-      '    r = json.loads(await test__echo({"message": m}))',
+      '    raw = await test__echo({"message": m})',
+      '    flags.append(raw.is_error)',
+      '    r = json.loads(raw)',
       '    names.append(r["echoed"]["message"].upper())',
       'print("summary:", "+".join(names))',
+      'print("is_error:", flags)',
     ].join('\n');
 
     membrane.pushResponse(createMockResponse([
@@ -770,6 +1105,9 @@ describe('framework code_execution integration (real python3)', () => {
       const wireResult = stream.receivedToolResults[0][0] as { toolUseId: string; content: string };
       assert.strictEqual(wireResult.toolUseId, 'call_ce_1');
       assert.match(wireResult.content, /summary: ALPHA\+BETA/);
+      // Through the framework, each result says it isn't an error (a
+      // handler that passed on only the string would make it None).
+      assert.match(wireResult.content, /is_error: \[False, False\]/);
       assert.match(wireResult.content, /"return_code":\s*0/);
       // ...and NOT the intermediate tool results.
       assert.ok(
@@ -1021,7 +1359,8 @@ describe('framework background scripts + spill (real python3)', () => {
     const bgCode = [
       'import asyncio',
       'await asyncio.sleep(0.2)',
-      'await wake_agent({"found": "signal"})',
+      'r = await test__echo({"message": "bg"})',
+      'await wake_agent({"found": "signal", "is_error": r.is_error})',
     ].join('\\n');
 
     // Turn 1: spawn the background script, then finish the turn.
@@ -1056,12 +1395,81 @@ describe('framework background scripts + spill (real python3)', () => {
       assert.ok(wakeMessage, 'wake message should be injected');
       const text = (wakeMessage.content[0] as { text?: string }).text ?? '';
       assert.match(text, /\[background script bg-\d+\] Woke you/);
-      assert.match(text, /line 3 of your script/);
+      assert.match(text, /line 4 of your script/);
       assert.match(text, /"found": "signal"/);
+      // A background script's results carry the flag too (None if only the
+      // string were passed on).
+      assert.match(text, /"is_error": false/);
       assert.match(text, /workspace file files\/background-scripts\/bg-\d+\.log/);
       assert.match(text, /Script status: still running|Script status/);
     } finally {
       await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('a background script gets codeExecution.env and not a host variable outside the allowlist', async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-bgenv-');
+    const membrane = new MockMembrane();
+    const bgCode = `import os\nawait wake_agent({"declared": os.environ.get("${DECLARED}"), "host": os.environ.get("${HOST_ONLY}")})`;
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'call_bgenv', name: 'code_execution', input: { code: bgCode, background: true } },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Armed.' }]));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Woke.' }]));
+    const framework = await createBgFramework(storePath, membrane, { codeExecution: { env: { [DECLARED]: 'from-config' } } });
+    try {
+      process.env[HOST_ONLY] = 'host-value';
+      framework.start();
+      framework.pushEvent({
+        type: 'external-message', source: 'test', content: [{ type: 'text', text: 'arm it' }], metadata: {}, triggerInference: true,
+      } as unknown as ProcessEvent);
+      const deadline = Date.now() + 20_000;
+      let wakeText = '';
+      while (Date.now() < deadline && !wakeText) {
+        await new Promise((r) => setTimeout(r, 100));
+        const msgs = (framework.getAgent('prime')?.getContextManager().queryMessages({}).messages ?? []) as unknown as Array<{ content: ContentBlockLike[]; metadata?: { source?: string } }>;
+        const wake = msgs.find((m) => m.metadata?.source === 'background-script');
+        wakeText = (wake?.content[0] as { text?: string } | undefined)?.text ?? '';
+      }
+      assert.match(wakeText, /"declared": "from-config"/, wakeText);
+      assert.match(wakeText, /"host": null/, wakeText);
+    } finally {
+      await framework.stop();
+      delete process.env[HOST_ONLY];
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("with codeExecution.inheritEnv: true, a background script gets the host's variables beside codeExecution.env", async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-bgenvinherit-');
+    const membrane = new MockMembrane();
+    const bgCode = `import os\nawait wake_agent({"declared": os.environ.get("${DECLARED}"), "host": os.environ.get("${HOST_ONLY}")})`;
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'call_bgenv_inherit', name: 'code_execution', input: { code: bgCode, background: true } },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Armed.' }]));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Woke.' }]));
+    const framework = await createBgFramework(storePath, membrane, { codeExecution: { env: { [DECLARED]: 'from-config' }, inheritEnv: true } });
+    try {
+      process.env[HOST_ONLY] = 'host-value';
+      framework.start();
+      framework.pushEvent({
+        type: 'external-message', source: 'test', content: [{ type: 'text', text: 'arm it' }], metadata: {}, triggerInference: true,
+      } as unknown as ProcessEvent);
+      const deadline = Date.now() + 20_000;
+      let wakeText = '';
+      while (Date.now() < deadline && !wakeText) {
+        await new Promise((r) => setTimeout(r, 100));
+        const msgs = (framework.getAgent('prime')?.getContextManager().queryMessages({}).messages ?? []) as unknown as Array<{ content: ContentBlockLike[]; metadata?: { source?: string } }>;
+        const wake = msgs.find((m) => m.metadata?.source === 'background-script');
+        wakeText = (wake?.content[0] as { text?: string } | undefined)?.text ?? '';
+      }
+      assert.match(wakeText, /"declared": "from-config"/, wakeText);
+      assert.match(wakeText, /"host": "host-value"/, wakeText);
+    } finally {
+      await framework.stop();
+      delete process.env[HOST_ONLY];
       rmSync(tempDir, { recursive: true, force: true });
     }
   });
@@ -1133,6 +1541,83 @@ describe('framework background scripts + spill (real python3)', () => {
     } finally {
       await framework.stop();
       rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('a background script stopped at its lifetime is told that is the longest one runs here', async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-bglimit-');
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'noted' }]));
+    const framework = await createBgFramework(storePath, membrane, { codeExecution: { backgroundMaxLifetimeMs: 1000 } });
+    try {
+      framework.start();
+      const started = await framework.executeToolCall({
+        id: 'l1',
+        name: 'code_execution',
+        input: { code: 'import asyncio\nawait asyncio.sleep(60)', background: true },
+        callerAgentName: 'prime',
+      });
+      assert.strictEqual(started.success, true, JSON.stringify(started));
+      const deadline = Date.now() + 20_000;
+      let stopMessage: { content: ContentBlockLike[] } | null = null;
+      while (Date.now() < deadline && !stopMessage) {
+        await new Promise((r) => setTimeout(r, 100));
+        const cm = framework.getAgent('prime')?.getContextManager();
+        const msgs = (cm?.queryMessages({}).messages ?? []) as unknown as Array<{ content: ContentBlockLike[]; metadata?: { source?: string } }>;
+        stopMessage = msgs.find((m) => m.metadata?.source === 'background-script') ?? null;
+      }
+      assert.ok(stopMessage, 'the stop should wake the agent');
+      const text = (stopMessage.content[0] as { text?: string }).text ?? '';
+      assert.match(text, /script stopped: it reached its 1s time limit\./);
+      assert.match(text, /1s is the longest a background script runs here; starting it again runs it from the top\./, 'the background ceiling reaches the message');
+    } finally {
+      await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('a dead script\'s last output is cut at 2000 units without halving a surrogate pair', async () => {
+    // 1500 emoji, then the traceback. Whichever parity the cut 2000 units
+    // from the end has, one of the two runs (with or without one more unit
+    // after the emoji) puts it on a pair's second half.
+    for (const after of ['', 'x']) {
+      const { tempDir, storePath } = tempStorePath('pytc-bgpair-');
+      const membrane = new MockMembrane();
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'noted' }]));
+      const framework = await createBgFramework(storePath, membrane, {});
+      try {
+        framework.start();
+        const started = await framework.executeToolCall({
+          id: 'c1',
+          name: 'code_execution',
+          input: {
+            code: `import asyncio\nprint("\\U0001F600" * 1500 + "${after}", flush=True)\nawait asyncio.sleep(0.1)\nraise ValueError("done")`,
+            background: true,
+          },
+          callerAgentName: 'prime',
+        });
+        assert.strictEqual(started.success, true, JSON.stringify(started));
+
+        const deadline = Date.now() + 20_000;
+        let crashMessage: { content: ContentBlockLike[] } | null = null;
+        while (Date.now() < deadline && !crashMessage) {
+          await new Promise((r) => setTimeout(r, 100));
+          const cm = framework.getAgent('prime')?.getContextManager();
+          const msgs = (cm?.queryMessages({}).messages ?? []) as unknown as Array<{ content: ContentBlockLike[]; metadata?: { source?: string } }>;
+          crashMessage = msgs.find((m) => m.metadata?.source === 'background-script') ?? null;
+        }
+        assert.ok(crashMessage, 'crash wake should be injected');
+        const text = (crashMessage.content[0] as { text?: string }).text ?? '';
+        // A halved pair would be stored as U+FFFD, or kept as a lone surrogate.
+        const last = text.split('Last output:\n')[1] ?? '';
+        assert.ok(last.startsWith('\u{1F600}'),
+          `the last output starts on a whole emoji (after ${JSON.stringify(after)}): ${JSON.stringify(last.slice(0, 4))}`);
+        assert.ok(!text.includes('\ufffd') && !/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(text),
+          `no half of a pair (after ${JSON.stringify(after)})`);
+      } finally {
+        await framework.stop();
+        rmSync(tempDir, { recursive: true, force: true });
+      }
     }
   });
 
@@ -1259,6 +1744,37 @@ describe('code_execution per-call time limit (time_limit_ms)', () => {
     }
   });
 
+  // On a deployment without maxScriptTimeoutMs the ceiling is the default, and a
+  // larger time_limit_ms would only buy a second run that stops the same way.
+  it('PyRunner: a script stopped at its limit is offered a longer one only below the ceiling', async () => {
+    const code = 'import asyncio\nawait asyncio.sleep(60)';
+    const effects = 'Tool calls it had already made keep their effects, so check them before running it again.';
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    const background = new PyRunner({ onToolCall: async () => '', idleReclaimMs: 0 });
+    const backgroundBelow = new PyRunner({ onToolCall: async () => '', idleReclaimMs: 0 });
+    try {
+      const below = await runner.exec(code, [], undefined, { deadlineMs: 1000, ceilingMs: 5000 });
+      assert.ok(below.stderr.endsWith(`script stopped: it reached its 1s time limit. ${effects} To give it longer, pass time_limit_ms up to 5000 (5s).\n`), below.stderr);
+      const at = await runner.exec(code, [], undefined, { deadlineMs: 1000, ceilingMs: 1000 });
+      assert.ok(at.stderr.endsWith(`${effects} 1s is the longest a script can run here, so split the work across shorter scripts.\n`), at.stderr);
+      const longerInBackground = await runner.exec(code, [], undefined, { deadlineMs: 1000, ceilingMs: 1000, backgroundCeilingMs: 86_400_000 });
+      assert.ok(longerInBackground.stderr.endsWith(`${effects} 1s is the longest a script can run here, so split the work across shorter scripts, `
+        + 'or run it with background: true, where a script can run up to 24 h.\n'), longerInBackground.stderr);
+      const noLongerInBackground = await runner.exec(code, [], undefined, { deadlineMs: 1000, ceilingMs: 1000, backgroundCeilingMs: 1000 });
+      assert.ok(noLongerInBackground.stderr.endsWith('so split the work across shorter scripts.\n'), noLongerInBackground.stderr);
+      const unknown = await runner.exec(code, [], undefined, { deadlineMs: 1000 });
+      assert.ok(unknown.stderr.endsWith(`script stopped: it reached its 1s time limit. ${effects}\n`), unknown.stderr);
+      const watcher = await background.exec(code, [], { logPath: null, lifetimeMs: 1000, onWake: async () => null }, { ceilingMs: 1000 });
+      assert.ok(watcher.stderr.endsWith(`${effects} 1s is the longest a background script runs here; starting it again runs it from the top.\n`), watcher.stderr);
+      const shortWatcher = await backgroundBelow.exec(code, [], { logPath: null, lifetimeMs: 1000, onWake: async () => null }, { ceilingMs: 5000 });
+      assert.ok(shortWatcher.stderr.endsWith(`${effects} To give it longer, start it with time_limit_ms up to 5000 (5s).\n`), shortWatcher.stderr);
+    } finally {
+      runner.dispose();
+      background.dispose();
+      backgroundBelow.dispose();
+    }
+  });
+
   it('PyRunner: a script that catches the cancellation and finishes is not reported as stopped', async () => {
     const runner = new PyRunner({ onToolCall: async () => '' });
     try {
@@ -1302,15 +1818,90 @@ describe('code_execution per-call time limit (time_limit_ms)', () => {
     }
   });
 
+  const createWith = (storePath: string, codeExecution: unknown) =>
+    AgentFramework.create({
+      storePath,
+      membrane: new MockMembrane().asMembrane(),
+      agents: [],
+      modules: [],
+      syncIntervalMs: 0,
+      codeExecution: codeExecution as never,
+    });
+
+  /** create() refuses each config with exactly its message, before anything
+   *  opens: no store is left at storePath. */
+  async function assertRefused(cases: ReadonlyArray<readonly [unknown, string]>): Promise<void> {
+    const { tempDir, storePath } = tempStorePath('pytc-refused-');
+    try {
+      for (const [codeExecution, message] of cases) {
+        await assert.rejects(createWith(storePath, codeExecution), (error: Error) => {
+          assert.equal(error.message, message);
+          return true;
+        });
+        assert.equal(existsSync(storePath), false, 'the refused config opened no store');
+      }
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  }
+
+  it('create() refuses a codeExecution.enabled that is not true or false, a quoted "false" included', async () => {
+    // A quoted "false" is truthy, so it turned code execution on, and 0 is
+    // falsy, so it was read as off without a word. Each message names the
+    // value's kind, never the value, since a substituted value can be a
+    // credential.
+    const whatTrueDoes = 'true gives agents the code_execution tool, which runs their scripts in a python interpreter on the host, '
+      + 'and false or leaving it out doesn\'t';
+    await assertRefused([
+      [{ enabled: 'false' }, `codeExecution.enabled must be true or false, unquoted, not a string: ${whatTrueDoes}`],
+      [{ enabled: 'sk-secret-token' }, `codeExecution.enabled must be true or false, unquoted, not a string: ${whatTrueDoes}`],
+      [{ enabled: 0 }, `codeExecution.enabled must be true or false, not a number: ${whatTrueDoes}`],
+      [{ enabled: { on: true } }, `codeExecution.enabled must be true or false, not an object: ${whatTrueDoes}`],
+    ]);
+  });
+
+  it('create() refuses a codeExecution that is not an object, null or false, since it would read as off', async () => {
+    await assertRefused([
+      [true, 'codeExecution must be an object, such as { enabled: true }, not a boolean'],
+      ['true', 'codeExecution must be an object, such as { enabled: true }, not a string'],
+      [[], 'codeExecution must be an object, such as { enabled: true }, not an array'],
+    ]);
+  });
+
+  it('a null or false codeExecution, or a null or left-out codeExecution.enabled, counts as off, and a configuration that is off has nothing else checked', async () => {
+    // Contradictory limits, and an env or inheritEnv that would be refused,
+    // are checked only once code execution is on.
+    const contradictory = { scriptTimeoutMs: 600_000, maxScriptTimeoutMs: 60_000 };
+    for (const codeExecution of [
+      null,
+      false,
+      { enabled: null, ...contradictory },
+      { enabled: false, ...contradictory },
+      { ...contradictory },
+      { enabled: false, inheritEnv: 'true', env: 7 },
+    ]) {
+      const { tempDir, storePath } = tempStorePath('pytc-enabled-off-');
+      let framework: AgentFramework | undefined;
+      try {
+        framework = await createWith(storePath, codeExecution);
+        assert.equal(framework.getAllTools().some((tool) => tool.name === 'code_execution'), false);
+      } finally {
+        await framework?.stop();
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+  });
+
   async function withFramework(
     codeExecution: Record<string, unknown>,
     body: (framework: AgentFramework) => Promise<void>,
+    agents: Parameters<typeof AgentFramework.create>[0]['agents'] = [],
   ): Promise<void> {
     const { tempDir, storePath } = tempStorePath('pytc-timeout-');
     const framework = await AgentFramework.create({
       storePath,
       membrane: new MockMembrane().asMembrane(),
-      agents: [],
+      agents,
       modules: [new ScriptToolModule()],
       syncIntervalMs: 0,
       codeExecution: { enabled: true, ...codeExecution },
@@ -1341,6 +1932,7 @@ describe('code_execution per-call time limit (time_limit_ms)', () => {
       const short = dataOf(await run(framework, { code: 'import asyncio\nawait asyncio.sleep(60)', time_limit_ms: 1000 }));
       assert.strictEqual(short.return_code, 1);
       assert.match(short.stderr, /reached its 1s time limit/);
+      assert.match(short.stderr, /To give it longer, pass time_limit_ms up to 600000 \(10 min\)\.\n$/, 'the deployment ceiling reaches the message');
       const normal = dataOf(await run(framework, { code: 'import asyncio\nawait asyncio.sleep(1.5)\nprint("done")' }));
       assert.strictEqual(normal.return_code, 0);
       assert.match(normal.stdout, /done/);
@@ -1353,8 +1945,34 @@ describe('code_execution per-call time limit (time_limit_ms)', () => {
       const r = dataOf(await run(framework, { code: 'import asyncio\nawait asyncio.sleep(60)', time_limit_ms: 60_000 }));
       assert.strictEqual(r.return_code, 1);
       assert.strictEqual(r.time_limit_note, "time_limit_ms 60000 was capped at 1000, this deployment's maximum");
+      assert.match(r.stderr, /1s is the longest a script can run here, so split the work across shorter scripts, or run it with background: true, where a script can run up to 24 h\.\n$/,
+        "no larger limit is offered at the ceiling, and the deployment's background lifetime reaches the message");
       assert.ok(Date.now() - started < 15_000, 'the cap was not applied');
     });
+  });
+
+  it('at the ceiling, background mode is offered only to an agent that could start a background script', async () => {
+    const atCeiling = (framework: AgentFramework, callerAgentName?: string) => framework.executeToolCall({
+      id: `ce-${Math.random()}`, name: 'code_execution', input: { code: 'import asyncio\nawait asyncio.sleep(60)' }, ...(callerAgentName ? { callerAgentName } : {}),
+    });
+    const noOffer = /1s is the longest a script can run here, so split the work across shorter scripts\.\n$/;
+    // Background scripts are the primary agent's.
+    await withFramework({ scriptTimeoutMs: 1000 }, async (framework) => {
+      assert.match(dataOf(await atCeiling(framework, 'prime')).stderr, /, or run it with background: true, where a script can run up to 24 h\.\n$/);
+      assert.match(dataOf(await atCeiling(framework, 'other')).stderr, noOffer);
+    }, [{ name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all' }]);
+    // A deployment that allows none offers none.
+    await withFramework({ scriptTimeoutMs: 1000, maxBackgroundScripts: 0 }, async (framework) => {
+      assert.match(dataOf(await atCeiling(framework)).stderr, noOffer);
+    });
+    // Nor does an agent whose background slots are all taken.
+    await withFramework({ scriptTimeoutMs: 1000, maxBackgroundScripts: 1 }, async (framework) => {
+      const started = await framework.executeToolCall({
+        id: 'bg-1', name: 'code_execution', input: { code: 'import asyncio\nawait asyncio.sleep(60)', background: true }, callerAgentName: 'prime',
+      });
+      assert.strictEqual(started.success, true, JSON.stringify(started));
+      assert.match(dataOf(await atCeiling(framework, 'prime')).stderr, noOffer);
+    }, [{ name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all' }]);
   });
 
   it('maxScriptTimeoutMs lets an agent ask for longer than the default', async () => {
@@ -1615,17 +2233,47 @@ describe('code_execution time limit vs blocking code (real python3)', { skip: pr
       assert.strictEqual((await runner.exec('x = 41', [])).returnCode, 0);
       const code = 'import time\ntry:\n    time.sleep(60)\nexcept KeyboardInterrupt:\n    time.sleep(60)';
       const started = Date.now();
-      const killed = await runner.exec(code, [], undefined, { deadlineMs: 1000 });
+      const killed = await runner.exec(code, [], undefined, { deadlineMs: 1000, ceilingMs: 2000 });
       assert.strictEqual(killed.aborted, true);
       assert.strictEqual(killed.returnCode, 1);
-      assert.match(
+      assert.strictEqual(
         killed.stderr,
-        /script stopped: it reached its 1s time limit and did not respond, so it was killed and the interpreter restarted \(variables from earlier scripts are gone\)/,
+        'script stopped: it reached its 1s time limit and did not respond, so it was killed and the interpreter restarted (variables from earlier scripts are gone). '
+          + 'Tool calls it had already made keep their effects, so check them before running it again. To give it longer, pass time_limit_ms up to 2000 (2s).',
       );
       assert.ok(Date.now() - started < 5000, `killed after the grace (${Date.now() - started}ms)`);
       const after = await runner.exec('print(x)', []);
       assert.strictEqual(after.returnCode, 1);
       assert.match(after.stderr, /NameError: name 'x' is not defined/);
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('a background script killed at its lifetime is not told of an interpreter it never shared', async () => {
+    const runner = new PyRunner({ onToolCall: async () => '', cancelGraceMs: 500, idleReclaimMs: 0 });
+    try {
+      const code = 'import time\ntry:\n    time.sleep(60)\nexcept KeyboardInterrupt:\n    time.sleep(60)';
+      const killed = await runner.exec(code, [], { logPath: null, lifetimeMs: 1000, onWake: async () => null }, { ceilingMs: 1000 });
+      assert.strictEqual(killed.aborted, true);
+      assert.strictEqual(
+        killed.stderr,
+        'script stopped: it reached its 1s time limit and did not respond, so it was killed. Tool calls it had already made keep their effects, '
+          + 'so check them before running it again. 1s is the longest a background script runs here; starting it again runs it from the top.',
+      );
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('a background script whose interpreter exits under it is not told of earlier scripts\' variables', async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      const exited = await runner.exec('import os\nos._exit(3)', [], { logPath: null, lifetimeMs: 60_000, onWake: async () => null });
+      assert.strictEqual(exited.returnCode, 1);
+      assert.strictEqual(exited.stderr, "script stopped: the Python interpreter exited with code 3 while it ran, so the rest of the script didn't run. "
+        + 'Tool calls it had already made keep their effects, so check them before you run it again in a new interpreter. '
+        + 'If it stops the same way, check whether the script itself ends the process, for example with os._exit(); if not, ask whoever runs this host.');
     } finally {
       runner.dispose();
     }
@@ -1640,7 +2288,11 @@ describe('code_execution time limit vs blocking code (real python3)', { skip: pr
       assert.strictEqual(result.returnCode, 1);
       assert.strictEqual(
         result.stderr,
-        'python runtime exited unexpectedly (code=3, signal=none)\nscript stopped: it reached its 1s time limit\n',
+        "script stopped: the Python interpreter exited with code 3 while it ran, so the rest of the script didn't run, "
+          + 'and variables from earlier scripts are gone. Tool calls it had already made keep their effects, so check them before you run it again '
+          + 'in a new interpreter. If it stops the same way, check whether the script itself ends the process, for example with os._exit(); '
+          + 'if not, ask whoever runs this host.\n'
+          + 'script stopped: it reached its 1s time limit. Tool calls it had already made keep their effects, so check them before running it again.\n',
       );
     } finally {
       runner.dispose();
