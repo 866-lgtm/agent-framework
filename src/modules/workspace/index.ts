@@ -40,7 +40,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
-import { IGNORED, NONBLOCK, OTHER_MOUNT, OUTSIDE_INCLUDE, beginsWithDir, type LevelFolds, checkDir, diskSpelling, filesystemTrustsCtime, foldsAtEach, includePatternReadable, inOtherMount, insideMount, leadsInto, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, namesHolder, namesNestedPlace, nestedAtReal, nestedHolder, type NestedMount, parsedSpelling, passedOverAt, pathSegments, readPrefix, type LinkFound } from './observe.js';
+import { IGNORED, NONBLOCK, OTHER_MOUNT, OUTSIDE_INCLUDE, ROOT_REPLACED, ROOT_UNAVAILABLE, beginsWithDir, type LevelFolds, checkDir, checkRoot, diskSpelling, filesystemTrustsCtime, foldsAtEach, includePatternReadable, inOtherMount, insideMount, leadsInto, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, namesHolder, namesNestedPlace, nestedAtReal, nestedHolder, type CheckedDir, type MountView, type NestedMount, parsedSpelling, passedOverAt, pathSegments, readPrefix, type LinkFound } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
 import {
   type MountRuntime,
@@ -121,8 +121,11 @@ class WorkspaceImageReadError extends Error {
 /**
  * Why a workspace-owned filesystem read was refused. Distinguishes the cases a
  * peer needs to react to differently: a path that never resolved inside the
- * mount (`unknown_mount`, `traversal`), a mount whose root is gone
- * (`mount_unavailable`), an ordinary missing file (`not_found`), a directory
+ * mount (`unknown_mount`, `traversal`), a mount whose root is gone, isn't a
+ * directory, or isn't the directory the workspace was using
+ * (`mount_unavailable`: with errno ENOENT or ENOTDIR when no directory is
+ * there at all, with none for another directory), an ordinary missing file
+ * or one that isn't a regular file, such as a FIFO (`not_found`), a directory
  * (`directory`), a file that is itself a symlink, refused by the mount's
  * `followSymlinks` policy (`symlink`), a symlink among the path's directories
  * on a mount that doesn't follow symlinks, leading to a directory or a file
@@ -139,6 +142,8 @@ class WorkspaceImageReadError extends Error {
  * directory or a file that mount's include covers, and `parent_symlink`
  * otherwise. On a mount with an include, a link's message names its target
  * only where a tool could name it: a directory, or a file the include covers.
+ * A `mount_unavailable` for a root whose realpath or stat fails otherwise
+ * carries that errno, such as EACCES.
  */
 export type WorkspaceReadErrorCode =
   | 'unknown_mount'
@@ -156,6 +161,8 @@ export type WorkspaceReadErrorCode =
 /** Where in the open sequence a `WorkspaceReadError` originated (diagnostics). */
 export type WorkspaceReadStage =
   | 'parse'
+  /** The mount root's check: a directory, the one the workspace was using. */
+  | 'root'
   | 'readlink'
   | 'lstat'
   | 'realpath_root'
@@ -250,6 +257,20 @@ function errnoOf(err: unknown): string | undefined {
   return typeof err === 'object' && err !== null && 'code' in err && typeof (err as { code?: unknown }).code === 'string'
     ? (err as { code: string }).code
     : undefined;
+}
+
+/**
+ * What is at a mount root's path now, followed as the root is: for a
+ * directory, undefined; for anything else, ENOTDIR; and where the path
+ * can't be followed to anything, the errno its stat failed with, ENOENT
+ * when nothing is there.
+ */
+async function rootAbsence(root: string): Promise<string | undefined> {
+  try {
+    return (await stat(root)).isDirectory() ? undefined : 'ENOTDIR';
+  } catch (err) {
+    return errnoOf(err);
+  }
 }
 
 /** read_image's refusal of a file over the mount's size limit, wherever it's found to be. */
@@ -990,6 +1011,26 @@ export class WorkspaceModule implements Module {
     return this.agreement;
   }
 
+  /**
+   * A mount as observation reads it, with the root identity the workspace
+   * recorded for it, if any: what a pass reads beneath (runtime), with
+   * rootIdentity's, and what a disk read checks its root against (readRoot),
+   * with rootIdentityForRead's.
+   */
+  private viewOf(mount: MountState, rootIdentity: MountView['rootIdentity']): MountView {
+    return {
+      root: resolve(mount.config.path),
+      name: mount.config.name,
+      rootIdentity,
+      followSymlinks: mount.config.followSymlinks === true,
+      maxFileSize: mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE,
+      ignore: mount.config.ignore ?? [],
+      ...(mount.config.include ? { include: mount.config.include } : {}),
+      others: this.othersOf(mount.config.name),
+      nested: this.nestedOf(mount.config.name),
+    };
+  }
+
   /** The view reconciliation needs of a mount, refreshed per pass. */
   private async runtime(mount: MountState): Promise<MountRuntime> {
     const root = resolve(mount.config.path);
@@ -1002,17 +1043,7 @@ export class WorkspaceModule implements Module {
     }
     return {
       name: mount.config.name,
-      view: {
-        root,
-        name: mount.config.name,
-        rootIdentity: this.agreementOrThrow().rootIdentity(mount.config.name),
-        followSymlinks: mount.config.followSymlinks === true,
-        maxFileSize: mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE,
-        ignore: mount.config.ignore ?? [],
-        ...(mount.config.include ? { include: mount.config.include } : {}),
-        others: this.othersOf(mount.config.name),
-        nested: this.nestedOf(mount.config.name),
-      },
+      view: this.viewOf(mount, this.agreementOrThrow().rootIdentity(mount.config.name)),
       rootReal,
       ctimeTrustedDev: trustedDev,
       treeStateId: mount.treeStateId,
@@ -1959,6 +1990,11 @@ export class WorkspaceModule implements Module {
    * `followSymlinks` holds for the file and the directories on its way, and
    * what it reaches stays canonically inside the mount. Deliberately does NOT
    * sync, register, or hash anything — it reads and returns.
+   *
+   * `maxBytes` refuses a larger file as "File too large", having loaded at
+   * most `maxBytes` bytes and one more: the reads decide where the file ends,
+   * not the size fstat gave at the open, so the bound holds for a file that
+   * grows while it's read.
    */
   async readBinaryFromDisk(
     mountPrefixedPath: string,
@@ -1972,16 +2008,24 @@ export class WorkspaceModule implements Module {
       return { error: error instanceof Error ? error.message : String(error) };
     }
     const absolutePath = resolve(mount.config.path, relativePath);
+    const maxBytes = opts.maxBytes;
     let tooLarge: string | undefined;
     try {
-      const { handle } = await this.openContainedFile(mount, relativePath, mountPrefixedPath, (fileStat) => {
-        if (opts.maxBytes !== undefined && fileStat.size > opts.maxBytes) {
-          tooLarge = `File too large: ${fileStat.size} > ${opts.maxBytes} bytes`;
+      const { handle, fileStat } = await this.openContainedFile(mount, relativePath, mountPrefixedPath, (fileStat) => {
+        if (maxBytes !== undefined && fileStat.size > maxBytes) {
+          tooLarge = `File too large: ${fileStat.size} > ${maxBytes} bytes`;
           throw new Error(tooLarge);
         }
       });
       try {
-        return { data: await handle.readFile(), absolutePath };
+        if (maxBytes === undefined) return { data: await handle.readFile(), absolutePath };
+        // No more than maxBytes is loaded: a file grown past it since the
+        // fstat above is refused here, as one already over it was there. Its
+        // size is an fstat's after the read, and at least one more than the
+        // bytes kept, so the refusal's size is always past maxBytes.
+        const { bytes, more } = await readPrefix(handle, maxBytes, fileStat.size);
+        if (more) return { error: `File too large: ${Math.max((await handle.stat()).size, bytes.length + 1)} > ${maxBytes} bytes` };
+        return { data: bytes, absolutePath };
       } finally {
         await handle.close();
       }
@@ -2420,28 +2464,94 @@ export class WorkspaceModule implements Module {
   }
 
   /**
+   * The mount root a disk read reads beneath: resolved, then checked as
+   * observation checks it (checkRoot), so the read and the evidence agree on
+   * which directory the mount is. Once the workspace has recorded the root's
+   * identity, a root that resolves to any other directory is refused, in
+   * ROOT_REPLACED's words; with none recorded yet, it need only be a
+   * directory there. A refusal where no directory is at the root's path
+   * carries the errno that gives (rootAbsence: ENOENT when nothing is there
+   * and ENOTDIR when something else is, which a caller can read as no file,
+   * or the errno the root's stat failed with otherwise, such as EACCES). A
+   * root whose realpath fails carries realpath's errno, and one that is
+   * another directory carries none. The identity is rootIdentityForRead's,
+   * which answers while the evidence awaits reopening; where even it can't
+   * be read, as when the evidence was never read back whole, the read is
+   * refused too, with an errno only where no directory is at the root's path.
+   */
+  private async readRoot(mount: MountState): Promise<{ real: string; dir: CheckedDir }> {
+    const name = mount.config.name;
+    const root = resolve(mount.config.path);
+    let real: string;
+    try {
+      real = await realpath(root);
+    } catch (err) {
+      throw new WorkspaceReadError('mount_unavailable', `Mount unavailable: ${name}`, 'realpath_root', errnoOf(err));
+    }
+    let rootIdentity: MountView['rootIdentity'];
+    try {
+      rootIdentity = this.agreementOrThrow().rootIdentityForRead(name);
+    } catch (err) {
+      // The evidence can't be read back, so neither can the check be made.
+      // Where no directory is at the root's path, its errno still says so.
+      throw new WorkspaceReadError('mount_unavailable',
+        `Mount unavailable: ${name}: ${err instanceof Error ? err.message : String(err)}`, 'root', await rootAbsence(root));
+    }
+    const checked = await checkRoot(this.viewOf(mount, rootIdentity), real);
+    if ('dir' in checked) return { real, dir: checked.dir };
+    // Another directory is no absence. For any other refusal, what is at the
+    // root's path now decides: nothing, something that isn't a directory, or
+    // a directory the path has come to name since it was resolved (no errno).
+    const errno = checked.reason === ROOT_REPLACED ? undefined : await rootAbsence(root);
+    throw new WorkspaceReadError('mount_unavailable', `Mount unavailable: ${name}: ${checked.reason}`, 'root', errno);
+  }
+
+  /**
+   * The refusal for a root that stopped being the directory a read checked,
+   * with the code and errno readRoot gives what is at its path now (its stage
+   * and words are this check's): gone, or not a directory, with ENOENT or
+   * ENOTDIR, so a caller reads a root gone mid-read as one gone before it; or
+   * another directory, with none.
+   */
+  private async rootMoved(mount: MountState): Promise<WorkspaceReadError> {
+    const errno = await rootAbsence(resolve(mount.config.path));
+    const reason = errno === undefined ? ROOT_REPLACED : ROOT_UNAVAILABLE;
+    return new WorkspaceReadError('mount_unavailable', `Mount unavailable: ${mount.config.name}: ${reason}`, 'root', errno);
+  }
+
+  /**
    * Open a mount-relative file for reading with the mount boundary enforced on
    * the *filesystem*, not just the path string:
    *
-   * 0. On a mount that does not `followSymlinks`, refuse a path with a symlink
+   * 0. Check the root (readRoot) before anything beneath it: under a root
+   *    that isn't the mount's directory, no path says anything about the
+   *    mount's files, an absence included.
+   * 1. On a mount that does not `followSymlinks`, refuse a path with a symlink
    *    among the directories on its way beneath the mount's root, wherever it
    *    leads (linkOnTheWay), before anything resolves it: as `escape` for a
    *    link leading outside the mount, as `other_mount` for one into a nested
    *    mount's directory, and as `parent_symlink` for any other.
-   * 1. `lstat` the lexical path — refuse directories; refuse a final-component
+   * 2. `lstat` the lexical path — refuse directories; refuse a final-component
    *    symlink when the mount does not `followSymlinks`; refuse anything else
    *    that isn't a regular file, such as a FIFO, without opening it.
-   * 2. Open with `O_NOFOLLOW` where the platform has it (POSIX) so the refusal
+   * 3. Open with `O_NOFOLLOW` where the platform has it (POSIX) so the refusal
    *    holds against a symlink swapped in between lstat and open; where it
    *    doesn't (Windows), re-`lstat` after opening instead. `O_NONBLOCK`, so a
    *    FIFO swapped in meanwhile doesn't wait for a writer.
-   * 3. `realpath` both the mount root and the opened path. On a mount that
-   *    does not `followSymlinks`, refuse it again for a symlinked directory on
-   *    its way, which catches one swapped in since step 0 (linkRefusal). Then
-   *    require canonical containment — this is what catches an *intermediate*
-   *    symlinked directory escaping the mount, and a followed symlink whose
-   *    target lands outside, on every platform (junctions included).
-   * 4. Confirm the descriptor and the canonical path are the same inode.
+   * 4. `realpath` the opened path. On a mount that does not `followSymlinks`,
+   *    refuse it again for a symlinked directory on its way, which catches one
+   *    swapped in since step 1 (linkRefusal). Then require canonical
+   *    containment in the root step 0 resolved — this is what catches an
+   *    *intermediate* symlinked directory escaping the mount, and a followed
+   *    symlink whose target lands outside, on every platform (junctions
+   *    included).
+   * 5. Confirm the descriptor and the canonical path are the same inode, and
+   *    the root still the directory step 0 checked.
+   *
+   * Whatever steps 1 to 5 refuse, a missing file included, is said of the
+   * mount's files only while the root is still that directory. If it isn't,
+   * the read is refused with the code and errno step 0 gives what is at the
+   * root's path then (rootMoved), as step 5's own check of the root does.
    *
    * `inspect` runs last, after the boundary's checks, so a caller's own check
    * of the file, such as a size limit, never answers for a file the boundary
@@ -2449,6 +2559,25 @@ export class WorkspaceModule implements Module {
    */
   private async openContainedFile(
     mount: MountState,
+    relativePath: string,
+    mountPrefixedPath: string,
+    inspect?: (fileStat: Stats) => void,
+  ): Promise<{ handle: Awaited<ReturnType<typeof open>>; fileStat: Stats; realFilePath: string }> {
+    const root = await this.readRoot(mount);
+    try {
+      return await this.openBeneathRoot(mount, root, relativePath, mountPrefixedPath, inspect);
+    } catch (err) {
+      if (err instanceof WorkspaceReadError && err.code !== 'mount_unavailable' && !(await root.dir.stillHere())) {
+        throw await this.rootMoved(mount);
+      }
+      throw err;
+    }
+  }
+
+  /** Steps 1 to 5 of openContainedFile, beneath the root that step 0 checked. */
+  private async openBeneathRoot(
+    mount: MountState,
+    { real: realMountRoot, dir: rootDir }: { real: string; dir: CheckedDir },
     relativePath: string,
     mountPrefixedPath: string,
     inspect?: (fileStat: Stats) => void,
@@ -2484,13 +2613,6 @@ export class WorkspaceModule implements Module {
     if (!fileInfo.isFile() && !fileInfo.isSymbolicLink()) {
       // A FIFO, socket or device is never opened.
       throw new WorkspaceReadError('not_found', `Not a regular file: ${mountPrefixedPath}`, 'lstat');
-    }
-
-    let realMountRoot: string;
-    try {
-      realMountRoot = await realpath(mount.config.path);
-    } catch (err) {
-      throw new WorkspaceReadError('mount_unavailable', `Mount unavailable: ${mount.config.name}`, 'realpath_root', errnoOf(err));
     }
 
     let handle: Awaited<ReturnType<typeof open>>;
@@ -2583,6 +2705,12 @@ export class WorkspaceModule implements Module {
       if (pathStat.dev !== fileStat.dev || pathStat.ino !== fileStat.ino) {
         throw new WorkspaceReadError('changed', `File changed during read: ${mountPrefixedPath}`, 'stat');
       }
+      // Containment compares paths, so it can't see another directory put at
+      // the root's own path since step 0 (a drive unmounted mid-read): the
+      // root is asked again, as an effect asks it (effects.ts moved()). This
+      // sees the root as it is now, so a root replaced and put back before it
+      // isn't seen (observe.ts's header says why no check can be sure).
+      if (!(await rootDir.stillHere())) throw await this.rootMoved(mount);
 
       // The caller's checks of the file, such as a size limit, come after the
       // boundary's, so they never answer for a file the boundary refuses.
@@ -2610,13 +2738,23 @@ export class WorkspaceModule implements Module {
    *   (`truncated`). The reads decide where the file ends, not the size fstat
    *   gave at the open, so the bound holds for a file that grows while it's
    *   read.
+   * - Once the workspace has recorded the mount root's identity, with the
+   *   first evidence it gathers there, a root that is another directory is
+   *   an unavailable mount: a replaced directory, a link swapped in for it,
+   *   or an unmounted drive's mountpoint. In any mount, recorded or not, a
+   *   root that stops being the directory the read checked until the file
+   *   has been opened and checked is unavailable too: with ENOENT or
+   *   ENOTDIR where no directory is there, as before the read, and with no
+   *   errno for another directory. The file's bytes are then read through
+   *   the descriptor that was checked.
    *
    * Throws {@link WorkspaceReadError} with a `code` distinguishing unknown
    * mount, lexical traversal, a path the mount's include doesn't cover or, on
    * a mount with an include, any path with a `..` segment (`outside_include`),
    * a path in another mount's directory nested in the one named
-   * (`other_mount`), unavailable mount, missing file, directory,
-   * policy-denied symlink, outside-mount target, and file-changed-during-read.
+   * (`other_mount`), unavailable mount, missing or non-regular file,
+   * directory, policy-denied symlink, outside-mount target, and
+   * file-changed-during-read.
    */
   async readFileFromDisk(
     mountPrefixedPath: string,
@@ -2669,7 +2807,9 @@ export class WorkspaceModule implements Module {
     const p = mountPrefixedPath;
     switch (err.code) {
       case 'mount_unavailable':
-        return new WorkspaceImageReadError('mount_unavailable', `Mount unavailable: ${mount.config.name}`);
+        // With why, where the root's check says, such as a directory that
+        // isn't the mount's.
+        return new WorkspaceImageReadError('mount_unavailable', err.message);
       case 'directory':
         return new WorkspaceImageReadError('directory', `Path is a directory: ${p}`);
       case 'symlink':
