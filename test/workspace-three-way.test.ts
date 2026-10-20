@@ -728,9 +728,10 @@ describe('a sync says what it passed over (agent-framework #276)', () => {
 /** The walk's reason for an editor's swap or backup file. */
 const EDITOR = "an editor's swap or backup file";
 
-/** Waits, polling, until `ok` holds. */
+/** Waits, polling, until `ok` holds. It asks once more at its bound, so a process held past the bound fails only a wait whose condition still doesn't hold. */
 async function until(ok: () => boolean, what: string, ms = 5000): Promise<void> {
   for (const end = Date.now() + ms; Date.now() < end; await new Promise((r) => setTimeout(r, 25))) if (ok()) return;
+  if (ok()) return;
   assert.fail(what);
 }
 
@@ -1441,8 +1442,11 @@ describe("an editor's save by rename, with the watcher running", () => {
     unlinkSync(env.disk('gate.json~'));
     const named = (type: string, path: string) => env.events.some((e: any) => e.type === type && e.paths?.includes(path));
     await until(() => blob() !== v1 && named('workspace:modified', 'work/gate.json'), 'the save is taken in, as a change');
-    // Time for anything that shouldn't come to arrive.
-    await new Promise((r) => setTimeout(r, 400));
+    // The watcher passes over the backup by its name, and the until above has seen a batch carrying gate.json
+    // handled. A probe written now, and the mount's turn after it, cover any further batch delivered before the
+    // probe's and any pass queued before its own, so the checks below see what the save has led to by then.
+    await watchersFlow(m, { work: env.dir });
+    await (m as any).mountTurns.get('work');
     assert.ok(!named('workspace:deleted', 'work/gate.json'), 'no wake sees a deletion');
     assert.ok(!env.events.some((e: any) => e.paths?.includes('work/gate.json~')), 'nor the backup');
     assert.equal(env.store.treeGet(TREE, 'gate.json~'), null);
@@ -1486,6 +1490,16 @@ describe('the catch-up pass at start', () => {
     (m as any).initialScan = (name: string) => { counted.passes++; return initialScan(name); };
     return counted;
   };
+  /** For each catch-up pass `m` starts from now on, its mount's `watcherReadyAt` as the pass starts: null before any ready. */
+  const readyAtPasses = (m: WorkspaceModule) => {
+    const readyAt: Array<number | null> = [];
+    const initialScan = (m as any).initialScan.bind(m);
+    (m as any).initialScan = (name: string) => {
+      readyAt.push((m as any).mounts.get(name)?.watcherReadyAt ?? null);
+      return initialScan(name);
+    };
+    return readyAt;
+  };
   const ctxFor = (env: Env) => ({
     isRestart: false,
     getState: () => null,
@@ -1520,9 +1534,12 @@ describe('the catch-up pass at start', () => {
     // Each of chokidar's directory reads waits a second, so its scan reaches d0's files long after a pass started
     // beside it would have taken them in.
     await withChokidarReaddir(() => new Promise((r) => setTimeout(r, 1000)), async (reads) => {
-      await env.open({ watch: 'always', watchDebounceMs: 50 });
+      let readyAt: Array<number | null> = [];
+      await env.open({ watch: 'always', watchDebounceMs: 50 }, {}, (m) => { readyAt = readyAtPasses(m); });
       await until(() => storedText(env, 'd0/f0.txt') === 'v1', 'the catch-up pass took d0/f0.txt in', 15_000);
       assert.ok(reads.delayed > 0, "chokidar's directory reads waited");
+      assert.ok(readyAt.length > 0 && readyAt.every((at) => at !== null),
+        `each catch-up pass started once the watcher was ready (its watcherReadyAt as each started: ${JSON.stringify(readyAt)})`);
       env.writeDisk('d0/f0.txt', 'v2');
       await until(() => storedText(env, 'd0/f0.txt') === 'v2', 'the change made after the pass reached the store', 10_000);
     });
@@ -1535,6 +1552,8 @@ describe('the catch-up pass at start', () => {
     const m = await env.open({ watch: 'always', watchDebounceMs: 50, watchRootPollMs: 60_000 });
     const mount = (m as any).mounts.get('work');
     await until(() => !!mount.watcherReadyAt && storedText(env, 'gate.json') === 'v1', 'the first pass took gate.json in');
+    const firstReadyAt: number = mount.watcherReadyAt;
+    const readyAt = readyAtPasses(m);
     // The watcher re-attaches to the same directory, which the module still agrees with, as it does at a rename
     // named like a root it can't hold open. gate.json changes once the old chokidar instance has begun to close, which
     // takes its listeners first, so no watcher reports the change. chokidar's directory reads each wait a second
@@ -1546,6 +1565,9 @@ describe('the catch-up pass at start', () => {
       await reattaching;
       await until(() => reattached(env), 'the watcher re-attached');
       await until(() => storedText(env, 'gate.json') === 'v2', 'gate.json\'s v2 was taken in', 15_000);
+      // The re-attach leaves watcherReadyAt as the first ready set it, until the re-attached watcher's own ready.
+      assert.ok(readyAt.length > 0 && readyAt.every((at) => at !== null && at !== firstReadyAt),
+        `the re-attached watcher's pass started at its own ready (first ready ${firstReadyAt}; watcherReadyAt as each pass started: ${JSON.stringify(readyAt)})`);
       env.writeDisk('gate.json', 'v3');
       await until(() => storedText(env, 'gate.json') === 'v3', "the change made after the re-attach reached the store", 15_000);
       assert.ok(reads.delayed > 0, "chokidar's directory reads waited");
@@ -6881,26 +6903,38 @@ describe('on-agent-action', () => {
     let passes = 0;
     const pass = mod.passUnlocked.bind(mod);
     mod.passUnlocked = (...args: unknown[]) => { passes++; return pass(...args); };
-    const held = mod.withMount(mount, () => sleep(400));
+    // Another pass holds the mount until the test lets it go.
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const held = mod.withMount(mount, () => gate);
 
-    await m.onToolBatchComplete('agent'); // held to its deadline
-    env.writeDisk('later.txt', 'from the second batch');
-    const started = Date.now();
-    await m.onToolBatchComplete('agent');
-    assert.ok(Date.now() - started < 40, 'the second batch was not held');
-    let scan = (await call(m, 'status', {})).work.lastAgentActionScan;
-    assert.match(scan.reason, /an earlier scan is still running past its deadline/);
+    let scan: any;
+    try {
+      await m.onToolBatchComplete('agent'); // held to its deadline
+      // A batch held for its scan would now wait out 20 s, with the mount still held: far past until's bound.
+      mod.config.agentActionScanDeadlineMs = 20_000;
+      env.writeDisk('later.txt', 'from the second batch');
+      let returned = false;
+      const second = m.onToolBatchComplete('agent').then(() => { returned = true; });
+      await until(() => returned, 'the second batch returned while the earlier scan still held the mount');
+      await second;
+      scan = (await call(m, 'status', {})).work.lastAgentActionScan;
+      assert.match(scan.reason, /an earlier scan is still running past its deadline/);
+    } finally {
+      release();
+    }
 
     await held;
     await mod.mountTurns.get('work');
     assert.equal(passes, 1, 'the second batch shared the scan still waiting');
     assert.notEqual(env.store.treeGet(TREE, 'later.txt'), null, "the second batch's change was scanned");
     // The late scan is over (its bookkeeping settles a few ticks after the
-    // mount's turn), so the next batch is held for its own scan again, which
-    // may itself miss 50 ms on a loaded machine: that's its own miss.
+    // mount's turn), so the next batch is held for its own scan again.
     await new Promise((resolve) => setImmediate(resolve));
     await m.onToolBatchComplete('agent');
     scan = (await call(m, 'status', {})).work.lastAgentActionScan;
+    assert.deepEqual({ complete: scan.complete, withinDeadline: scan.withinDeadline }, { complete: true, withinDeadline: true },
+      'the next batch returned once its own scan had finished, within its deadline');
     assert.doesNotMatch(scan.reason ?? '', /an earlier scan is still running/);
   });
 
@@ -6929,7 +6963,7 @@ describe('on-agent-action', () => {
       const status = async () => (await call(m, 'status', {})).work.lastAgentActionScan;
       assert.match((await status()).reason, /an earlier scan is still running past its deadline/);
       gates[0]!.open();
-      for (let i = 0; i < 100 && passes < 2; i++) await sleep(10);
+      await until(() => passes >= 2, 'the second scan started');
       await new Promise((resolve) => setImmediate(resolve));
       // The first scan is done and the second runs: the first's outcome is not
       // the second batch's.
@@ -6967,13 +7001,15 @@ describe('on-agent-action', () => {
       await m.onToolBatchComplete('agent'); // its scan runs past the deadline
       await m.onToolBatchComplete('agent'); // not held: its scan is queued behind the first, late from the start
       gates[0]!.open(); // the first scan finishes, and the second starts
-      for (let i = 0; i < 100 && passes < 2; i++) await sleep(10);
+      await until(() => passes >= 2, 'the second scan started');
       await new Promise((resolve) => setImmediate(resolve));
       assert.equal(passes, 2, 'the second scan runs');
-      const started = Date.now();
-      await m.onToolBatchComplete('agent'); // while the late second scan still runs
-      const held = Date.now() - started;
-      assert.ok(held < 150, `the third batch was not held (${held} ms, deadline 300 ms)`);
+      // A batch held for its scan would now wait out 20 s, with the second scan still held: far past until's bound.
+      mod.config.agentActionScanDeadlineMs = 20_000;
+      let returned = false;
+      const third = m.onToolBatchComplete('agent').then(() => { returned = true; }); // while the late second scan still runs
+      await until(() => returned, 'the third batch returned while the late second scan still ran');
+      await third;
       assert.match((await call(m, 'status', {})).work.lastAgentActionScan.reason, /an earlier scan is still running past its deadline/);
     } finally {
       for (const gate of gates) gate.open();
@@ -7255,15 +7291,19 @@ describe('materialize, status and shutdown', () => {
     const env = new Env(t);
     const m = await env.open();
     const mount = (m as any).mounts.get('work');
-    void (m as any).withMount(mount, () => sleep(100));
+    // What's in flight holds the mount until the later work is queued behind it.
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    void (m as any).withMount(mount, () => gate);
+    // With no watcher to stop, stop takes the mount's tail before it first waits.
     const stopping = m.stop();
-    await sleep(10);
     let finished = false;
     // Appended after stop began, as a watcher callback or a late scan would be.
     void (m as any).withMount(mount, async () => {
       await sleep(100);
       finished = true;
     });
+    release();
     await stopping;
     assert.equal(finished, true, 'nothing still runs once stop returns');
   });
