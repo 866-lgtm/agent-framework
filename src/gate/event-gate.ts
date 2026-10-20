@@ -1735,7 +1735,8 @@ export class EventGate {
     this.sleepSuppressed = 0;
     // Arm the self-wake: when the window elapses, clear sleep and request an
     // inference so the agent resumes on its own (not dependent on a heartbeat
-    // tick or an incoming message). Cancelled by clearSleep()/`wake`.
+    // tick or an incoming message). Cancelled by clearSleep()/`wake`, and by
+    // dispose(), after which start() arms it again (resumeSleep).
     this.armSleepWake(ms);
     this.reloadPrivilegedIfChanged();
     this.emitTrace({

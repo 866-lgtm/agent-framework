@@ -3554,10 +3554,11 @@ export class AgentFramework {
     // and withheld spills, closed for the generation a stop ended, are open
     // for this one.
     this.lifecycleGeneration++;
-    this.loopPromise = this.runLoop();
     // A sleep kept through a stop() wakes this lifecycle at its end, or now
-    // if it ended while stopped.
+    // if it ended while stopped. Before the loop's first pass, so that a wake
+    // owed now joins the requests already pending in one turn.
     this.eventGate?.resumeSleep();
+    this.loopPromise = this.runLoop();
 
     // Start periodic sync timer (if enabled)
     if (this.syncIntervalMs > 0) {

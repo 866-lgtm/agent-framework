@@ -47,8 +47,12 @@ describe('EventGate sleep across a stop', () => {
 
   it('dispose() keeps the sleep and lets nothing fire', async () => {
     const { gate, inferenceRequests, traces } = makeGate();
+    const timeouts = () => process.getActiveResourcesInfo().filter((r) => r === 'Timeout').length;
+    const before = timeouts();
     gate.setSleep(0.2, 'resting', 'agent');
+    assert.strictEqual(timeouts(), before + 1, 'the sleep arms one timer');
     gate.dispose();
+    assert.strictEqual(timeouts(), before, 'dispose() leaves no timer to hold the process');
     await wait(400);
     assert.deepStrictEqual(inferenceRequests, [], 'no wake after dispose()');
     assert.ok(!traces.includes('sleep:expired'), 'no expiry after dispose()');
@@ -115,6 +119,35 @@ describe('EventGate sleep across a stop', () => {
       while (membrane.calls.length === 0 && Date.now() < deadline) await wait(25);
       assert.strictEqual(membrane.calls.length, 1, 'the start wakes the agent once');
       assert.deepStrictEqual(expiries, ['sleep:expired']);
+    } finally {
+      await framework.stop();
+      store.close();
+    }
+  });
+
+  it('a sleep that ended while stopped wakes the agent in one turn with a request already pending at start', async () => {
+    const store = JsStore.openOrCreate({ path: join(TMP_DIR, 'store') });
+    const membrane = new MockMembrane();
+    for (let i = 0; i < 2; i++) membrane.pushResponse(createMockResponse([{ type: 'text', text: 'awake' }]));
+    const framework = await AgentFramework.create({
+      store,
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
+      gate: { config: { policies: [], default: 'always' } },
+      modules: [],
+    });
+    const gate = (framework as unknown as { eventGate: EventGate }).eventGate;
+    try {
+      framework.start();
+      gate.setSleep(0.1, 'resting', 'agent');
+      await framework.stop();
+      await wait(250);
+      assert.strictEqual(framework.nudgeAgent('agent', 'test').ok, true);
+      framework.start();
+      const deadline = Date.now() + 3_000;
+      while (membrane.calls.length === 0 && Date.now() < deadline) await wait(25);
+      await wait(600);
+      assert.strictEqual(membrane.calls.length, 1, 'the owed wake and the pending request make one turn');
     } finally {
       await framework.stop();
       store.close();
