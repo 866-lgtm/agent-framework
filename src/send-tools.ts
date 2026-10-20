@@ -3,7 +3,7 @@
  * by bare name (an MCPL server's `<prefix>--` stripped). The framework reads
  * a call of one as an explicit send that silences the round's auto-routed
  * prose; the history module's semantic index reads its message argument as
- * what the resident said, which with prose routing disabled is all it says.
+ * what the resident wrote to someone, whether or not it was delivered.
  */
 export const SEND_TOOLS = new Set(['channel_publish', 'send_message', 'reply_message', 'send_dm']);
 

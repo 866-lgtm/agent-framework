@@ -18,8 +18,9 @@
  * arguments of the agent's private-prose tools (think / journal / skip_reply
  * / private_note) labelled `[think] …` — that is the resident's own diary and
  * is exactly what "what did I think about X" should find. The message
- * argument of the send tools and edit_message, labelled `[send_message] …`,
- * since with prose routing disabled that is everything the resident says.
+ * argument of the send tools and edit_message, labelled by tool, such as
+ * `[send_message] …`, since with prose routing disabled the resident speaks
+ * through them.
  * tool_result payloads, other tool arguments, thinking blocks and media are
  * skipped.
  *
@@ -113,7 +114,7 @@ const PRIVATE_PROSE_TOOLS = new Set(['think', 'journal', 'skip_reply', 'private_
 /**
  * Tools whose message argument is what the resident said: the send tools,
  * and edit_message, whose argument is the new text of a message it sent.
- * With prose routing disabled these hold every word it says in a channel.
+ * With prose routing disabled the resident speaks through these.
  */
 const SPEECH_TOOLS = new Set([...SEND_TOOLS, 'edit_message']);
 
