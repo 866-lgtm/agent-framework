@@ -4168,6 +4168,21 @@ export class ChannelRegistry {
     if (!entry) {
       return { success: false, error: resolved.error, isError: true };
     }
+    // A tuned-out channel's decision is the tune-out, whatever its transport,
+    // and a decline recorded over it would end it without its cancel, so the
+    // backlog it diverted would never reach the agent. Its cancel is what ends
+    // it, as channel_open's refusal of a tuned-out channel says.
+    if (this.getDesiredState(entry.serverId, input.channelId) === 'tuned-out') {
+      return {
+        success: false,
+        isError: true,
+        error:
+          `Channel "${input.channelId}" is tuned out: its messages go to the subconscious, and channel_decline doesn't ` +
+          `change that. Call tune_out with channelId "${input.channelId}" and mode "cancel" for it to resume normal ` +
+          'attention; cancelling delivers the diverted backlog.',
+        data: { refusal: 'tuned-out', channelId: input.channelId },
+      };
+    }
     if (entry.open || this.getDesiredState(entry.serverId, input.channelId) === 'open') {
       // channel_close is the call that closes it: its own answer says when,
       // as for a server that isn't up. A server that's up without that grant

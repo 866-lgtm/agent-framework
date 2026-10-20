@@ -6,7 +6,10 @@
  * of its own there, so the tune-out stands whatever becomes of the open.
  * Where the transport doesn't end open, tune_out's answer is still a success,
  * since the tune-out is recorded, and its openError says why none of the
- * channel's messages reach the subconscious yet and when they will.
+ * channel's messages reach the subconscious yet and when they will. A decline
+ * of a tuned-out channel is refused, whatever its transport, since a decline
+ * recorded over the tune-out would end it without its cancel, and lose the
+ * backlog the cancel delivers.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -24,7 +27,7 @@ import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 import type { ChannelDescriptor } from '../src/mcpl/types.js';
 import { TUNE_OUT_DEFAULTS } from '../src/tune-out/coordinator.js';
-import { MockMembrane } from './helpers/mock-membrane.js';
+import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 function descriptor(id: string): ChannelDescriptor {
   return { id, type: 'test', label: id, direction: 'bidirectional', address: { value: id } };
@@ -43,6 +46,7 @@ interface Server {
   sent: string[];
   sendChannelsOpen(params: { channelId: string }): Promise<unknown>;
   sendChannelsClose(params: { channelId: string }): Promise<unknown>;
+  sendChannelsAcknowledge(params: { channelId: string }): Promise<{ acknowledged: boolean }>;
 }
 
 function up(without: string[] = []): Server {
@@ -52,6 +56,7 @@ function up(without: string[] = []): Server {
     sent,
     sendChannelsOpen: async ({ channelId }) => { sent.push(`open ${channelId}`); return { channel: descriptor(channelId) }; },
     sendChannelsClose: async ({ channelId }) => { sent.push(`close ${channelId}`); return {}; },
+    sendChannelsAcknowledge: async ({ channelId }) => { sent.push(`ack ${channelId}`); return { acknowledged: true }; },
   };
 }
 
@@ -232,6 +237,61 @@ test('a tune-out whose open fails after a later decision replaced it says that d
   await closing;
 });
 
+test('a tune-out made while a decline\'s acknowledgment is out opens the channel once, by the tune-out', async () => {
+  // A registration whose close timed out leaves the transport unconfirmed,
+  // so the decline would queue work for it, but its decision is replaced
+  // before then, and a decline acts only on its own decision.
+  const timedOut = 'The "a" server didn\'t answer within 30 seconds, so whether the request took effect is unknown.';
+  const servers = new Map<string, Server>();
+  const server = up();
+  servers.set('a', server);
+  const registry = new ChannelRegistry(
+    { getServer: (id: string) => servers.get(id) } as unknown as McplServerRegistry,
+    {} as FeatureSetManager, () => {}, () => {},
+  );
+  server.sendChannelsClose = async () => { throw new McplRequestError(timedOut, 'no-response'); };
+  await registry.handleRegister('a', { channels: [descriptor('y')] });
+  for (let i = 0; i < 5; i++) await tick();
+  server.sendChannelsClose = async ({ channelId }) => { server.sent.push(`close ${channelId}`); return {}; };
+  server.sent.length = 0;
+  const acks: Array<() => void> = [];
+  server.sendChannelsAcknowledge = () => new Promise((resolve) => { acks.push(() => resolve({ acknowledged: true })); });
+  const declining = registry.handleChannelToolCall('channel_decline', { channelId: 'y', messageId: 'm1', acknowledge: '👀' });
+  for (let i = 0; i < 50 && acks.length === 0; i++) await tick();
+  assert.equal(acks.length, 1, 'the acknowledgment is out');
+  registry.enterTuneOut('a', 'y', PARAMS, 'agent-tool');
+  const opening = registry.openForTuneOut('a', 'y');
+  acks.shift()!();
+  const declined = await declining;
+  assert.equal(await opening, undefined);
+  for (let i = 0; i < 5; i++) await tick();
+  assert.deepEqual(server.sent, ['open y'], 'one open, the tune-out\'s');
+  assert.equal((declined.data as { status?: string } | undefined)?.status, 'replaced');
+  assert.equal((registry as unknown as { channels: Map<string, { open: boolean }> }).channels.get('a:y')?.open, true);
+});
+
+test('a decline of a tuned-out channel is refused, open or not, and changes nothing', async () => {
+  const f = await closedChannel();
+  f.registry.enterTuneOut('a', 'y', PARAMS, 'agent-tool');
+  const refusal = {
+    success: false,
+    isError: true,
+    error: 'Channel "y" is tuned out: its messages go to the subconscious, and channel_decline doesn\'t change that. Call ' +
+      'tune_out with channelId "y" and mode "cancel" for it to resume normal attention; cancelling delivers the diverted ' +
+      'backlog.',
+    data: { refusal: 'tuned-out', channelId: 'y' },
+  };
+  assert.equal(f.isOpen(), false, 'its transport isn\'t open');
+  assert.deepEqual(await f.registry.handleChannelToolCall('channel_decline', { channelId: 'y', messageId: 'm1', acknowledge: '👀' }), refusal);
+  assert.deepEqual(f.server.sent, [], 'no acknowledgment, and nothing for the transport');
+  assert.equal(f.registry.getDesiredState('a', 'y'), 'tuned-out');
+  assert.equal(f.registry.getTuneOutState('a', 'y')?.params.epochId, 'e1', 'the tune-out stands');
+  assert.equal(await f.registry.openForTuneOut('a', 'y'), undefined);
+  f.server.sent.length = 0;
+  assert.deepEqual(await f.registry.handleChannelToolCall('channel_decline', { channelId: 'y', messageId: 'm1' }), refusal, 'open');
+  assert.deepEqual(f.server.sent, []);
+});
+
 // --- tune_out itself, through the framework ---------------------------------
 
 const FIXTURE = join(import.meta.dirname, 'fixtures/tune-out-mcpl-server.mjs');
@@ -242,9 +302,10 @@ async function framework(t: { after(fn: () => Promise<void>): void }) {
   const statusPath = join(tempDir, 'status.jsonl');
   const commandPath = join(tempDir, 'commands.txt');
   writeFileSync(commandPath, '');
+  const membrane = new MockMembrane();
   const fw = await AgentFramework.create({
     storePath: join(tempDir, 'test.chronicle'),
-    membrane: new MockMembrane().asMembrane(),
+    membrane: membrane.asMembrane(),
     agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
     subconscious: { enabled: true, systemPrompt: 'You are the Subconscious.' },
     mcplServers: [{ id: 'disc', command: process.execPath, args: [FIXTURE], env: { STATUS_PATH: statusPath, COMMAND_PATH: commandPath } }],
@@ -262,13 +323,15 @@ async function framework(t: { after(fn: () => Promise<void>): void }) {
     if (Date.now() > deadline) throw new Error('timed out waiting for registration');
     await new Promise((r) => setTimeout(r, 20));
   }
+  let emitted = 0;
   const events = () => existsSync(statusPath)
     ? readFileSync(statusPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l) as { event: string })
     : [];
   return {
     i,
+    membrane,
     events,
-    emit: (text: string) => appendFileSync(commandPath, `ambient ${Date.now()} ${text}\n`),
+    emit: (text: string) => appendFileSync(commandPath, `ambient m${++emitted} ${text}\n`),
     script: (tool: string, input: Record<string, unknown>) => i.handleScriptToolCall('scout', tool, input),
   };
 }
@@ -313,4 +376,36 @@ test('tune_out whose open throws answers a success that says opening its channel
     }),
     isError: false,
   });
+});
+
+test('a decline of a tuned-out channel whose transport isn\'t open is refused, and the backlog survives to the cancel', async (t) => {
+  const f = await framework(t);
+  const scout = f.i.agents.get('scout')!.getContextManager();
+  const diverted = () => scout.getAllMessages().filter((m) => (m.metadata as { tuneOut?: unknown } | undefined)?.tuneOut).length;
+  assert.equal((await f.script('tune_out', { channelId: CHANNEL })).isError, false);
+  f.emit('backlog one');
+  f.emit('backlog two');
+  const deadline = Date.now() + 10_000;
+  while (diverted() < 2) {
+    if (Date.now() > deadline) throw new Error('timed out waiting for two diverted messages');
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  // A transport that isn't confirmed open, as a failed open, a retarget or a
+  // dropped connection leaves it, while the tune-out stands.
+  (f.i.channelRegistry as unknown as { channels: Map<string, { open: boolean }> }).channels.get(`disc:${CHANNEL}`)!.open = false;
+  const declined = await f.script('channel_decline', { channelId: CHANNEL, messageId: 'backlog-one' });
+  assert.equal(declined.isError, true);
+  assert.match(declined.text, /is tuned out: its messages go to the subconscious, and channel_decline doesn't change that/);
+  f.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Read the backlog.' }]));
+  assert.deepEqual(await f.script('tune_out', { channelId: CHANNEL, mode: 'cancel' }),
+    { text: JSON.stringify({ cancelled: CHANNEL }), isError: false });
+  const dumped = () => scout.getAllMessages().find((m) => m.content.some((b) => (b.text ?? '').includes('<tuned-out-backlog')));
+  const until = Date.now() + 10_000;
+  while (!dumped()) {
+    if (Date.now() > until) throw new Error('timed out waiting for the backlog to reach scout');
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  const dump = dumped()!;
+  const text = dump.content.map((b) => b.text ?? '').join('');
+  assert.ok(text.includes('backlog one') && text.includes('backlog two'), text);
 });
