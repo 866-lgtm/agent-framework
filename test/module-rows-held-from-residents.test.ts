@@ -512,6 +512,8 @@ describe("a message a tune-out holds stays out of what the residents are shown, 
       let held: string[];
       try { held = hooks.getDeferredMessages().map(textOf); } finally { console.error = error; }
       assert.ok(!held.includes('T7-LANDED'), 'not among the held writes');
+      const stored = internals.agents.get('scout')!.getContextManager().getAllMessages().filter((m) => textOf(m) === 'T7-LANDED');
+      assert.equal(stored.length, 1, 'in the stored rows, once');
       assert.ok(!(internals.deferredMessages as unknown as Array<{ id: string }>).some((m) => m.id === 'w-tune'), 'and no longer queued');
     } finally {
       await close();

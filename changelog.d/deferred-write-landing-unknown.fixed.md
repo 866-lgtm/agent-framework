@@ -21,5 +21,5 @@
   - A conversation fork's or ephemeral run's queue, stored when it's
     released, looks such an entry up the same way: found, it's neither
     stored again nor passed to the primary as a failed reply; where the
-    store can't be searched, it's stored anyway, and the log says it may now
-    be stored twice.
+    store can't be searched, it's stored anyway where the store takes it,
+    and the log says it may now be stored twice.
