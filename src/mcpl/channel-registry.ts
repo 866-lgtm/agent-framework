@@ -2748,14 +2748,12 @@ export class ChannelRegistry {
    * already queued for the channel goes first, since each operation reads
    * the decision when it runs and so opens a channel tuned out meanwhile;
    * its own failure, such as a close the server refused, isn't this open's.
-   * Then the channel's state is read as the registry reads it everywhere: a
-   * failed request leaves the open flag as it was, and the unconfirmed mark
-   * counts only while the channel isn't open (runLifecycleOperation). Where
-   * this host directs the lifecycle and the transport isn't open, the
-   * channel's lifecycle queue opens it once (applyDesiredChannelState reads
-   * a tune-out as open), and the answer waits for work queued meanwhile too,
-   * such as a registration that came back, and comes from the state that
-   * work leaves. Returns nothing where the transport is open, or, for
+   * Then the state is read. Where this host directs the lifecycle and the
+   * transport isn't confirmed open, the channel's lifecycle queue opens it
+   * once (applyDesiredChannelState reads a tune-out as open), and the answer
+   * waits for the work queued while that open was out too, such as a
+   * registration that came back, and comes from the state that work leaves.
+   * Returns nothing where the transport is open, or, for
    * tune_out's answer, why the channel's messages don't or may not reach the
    * subconscious yet and when they will, or that the tune-out isn't in
    * effect any more.
@@ -2769,7 +2767,7 @@ export class ChannelRegistry {
     const inEffect = () =>
       epochId !== undefined && this.getTuneOutState(serverId, channelId)?.params.epochId === epochId;
     const replaced = "The tune-out was recorded, but it isn't in effect any more: it ended, or a later decision about the " +
-      'channel replaced it, while its transport was being opened.';
+      'channel or a later tune-out replaced it, while its transport was being opened.';
     // "May not": a failed request leaves its outcome unknown, and an open
     // that took effect would have its traffic diverted.
     const notYet = (later: string, why: string): string => withStop(
@@ -2813,7 +2811,14 @@ export class ChannelRegistry {
             'subconscious only as that server sends them.';
       }
       if (!entry) return missing;
-      return entry.open ? undefined : null;
+      // Only a confirmed open flag needs nothing. The other readers take a
+      // flag a failed request left as it was (runLifecycleOperation), since
+      // a send through it fails where it can be seen, and channel_open
+      // sends an open after a failed close anyway, its decision having been
+      // closed. A tune-out's success says traffic will arrive, nothing would
+      // show it doesn't, and the decision it replaced isn't known here, so
+      // a flag a close that may have taken effect left gets an open.
+      return entry.open && !this.unconfirmedChannelTargets.has(entry) ? undefined : null;
     };
     await settle();
     const before = answered(this.channels.get(channelKey), notYet(nextRegistration, "it isn't registered here now"));
@@ -2825,10 +2830,12 @@ export class ChannelRegistry {
       failure = error;
     }
     // A registration that came back while the open was out queued its own
-    // reconcile, which the answer waits for too. That work's failure is the
-    // reason only where this open didn't fail itself.
+    // reconcile, which the answer waits for too. The answer says why the
+    // channel isn't open now, so where that work failed, its failure, the
+    // last attempt's, is the reason: this open's may concern a registration
+    // that work replaced.
     const later = await settle();
-    if (failure === undefined) failure = later;
+    failure = later ?? failure;
     const clause = failure !== undefined ? `: ${lifecycleClause(failure)}` : '';
     const after = this.channels.get(channelKey);
     const settled = answered(after, notYet(nextRegistration, `it isn't registered here any more${clause}`));
@@ -3242,9 +3249,9 @@ export class ChannelRegistry {
    *  one rethrows, since its retry covers only a retarget of its own entry.
    *  This answers true meanwhile, so a channels/changed update that retargets
    *  the push's entry is left to that operation, and stays undone after a
-   *  failed RPC until channel_open, speech, a tune-out's open or a
-   *  registration. No server we know of sends `updated` for a channel it has
-   *  removed. */
+   *  failed RPC until lifecycle work is queued for the channel again
+   *  (applyDesiredChannelState). No server we know of sends `updated` for a
+   *  channel it has removed. */
   private outstandingWorkCarriesOut(serverId: string, key: string): boolean {
     return this.lifecycleOutstanding.has(key) &&
       this.lifecycleQueuedRemovals.get(key) === (this.serverRemovals.get(serverId) ?? 0);
