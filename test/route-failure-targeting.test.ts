@@ -757,13 +757,13 @@ describe('notices about an agent\'s own action', () => {
     });
 
     it('counts as read, across branches, only what an agent\'s window shares with the branch it read up to the point they part', async () => {
-      const state = internals(framework) as unknown as { unreadFailedReplies(agent: unknown): Array<{ tag?: unknown }> };
+      const state = internals(framework) as unknown as { releasedWindow(agent: unknown, held: Set<string>): { unread: Array<{ tag?: unknown }> } | null };
       const agent = framework.getAgent('secondary')!;
       const cm = agent.getContextManager();
       const store = framework.getStore();
       const notice = (tag: string) => cm.getMessage(cm.addMessage('user', [{ type: 'text', text: `[discord-send-failed] ${tag}` }],
         { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', tag } as never))!;
-      const tags = () => state.unreadFailedReplies(agent).map((m) => m.tag);
+      const tags = () => state.releasedWindow(agent, new Set())!.unread.map((m) => m.tag);
 
       const read = notice('read');
       agent.markContextConsumed();
@@ -783,13 +783,13 @@ describe('notices about an agent\'s own action', () => {
     });
 
     it('counts as unread a notice stored on a branch after the agent read past the point where it parts from another', async () => {
-      const state = internals(framework) as unknown as { unreadFailedReplies(agent: unknown): Array<{ tag?: unknown }> };
+      const state = internals(framework) as unknown as { releasedWindow(agent: unknown, held: Set<string>): { unread: Array<{ tag?: unknown }> } | null };
       const agent = framework.getAgent('secondary')!;
       const cm = agent.getContextManager();
       const store = framework.getStore();
       const notice = (tag: string) => cm.getMessage(cm.addMessage('user', [{ type: 'text', text: `[discord-send-failed] ${tag}` }],
         { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', tag } as never))!;
-      const tags = () => state.unreadFailedReplies(agent).map((m) => m.tag);
+      const tags = () => state.releasedWindow(agent, new Set())!.unread.map((m) => m.tag);
 
       notice('before the branch');
       const home = store.currentBranch().name;
@@ -807,13 +807,13 @@ describe('notices about an agent\'s own action', () => {
     });
 
     it('counts as unread what the current branch has from a branch between it and the one the agent read on', async () => {
-      const state = internals(framework) as unknown as { unreadFailedReplies(agent: unknown): Array<{ tag?: unknown }> };
+      const state = internals(framework) as unknown as { releasedWindow(agent: unknown, held: Set<string>): { unread: Array<{ tag?: unknown }> } | null };
       const agent = framework.getAgent('secondary')!;
       const cm = agent.getContextManager();
       const store = framework.getStore();
       const notice = (tag: string) => cm.getMessage(cm.addMessage('user', [{ type: 'text', text: `[discord-send-failed] ${tag}` }],
         { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', tag } as never))!;
-      const tags = () => state.unreadFailedReplies(agent).map((m) => m.tag);
+      const tags = () => state.releasedWindow(agent, new Set())!.unread.map((m) => m.tag);
 
       notice('read at home');
       const home = store.currentBranch().name;
@@ -834,13 +834,13 @@ describe('notices about an agent\'s own action', () => {
     });
 
     it('counts as unread, across a branch made after the agent read, what was stored after its watermark', async () => {
-      const state = internals(framework) as unknown as { unreadFailedReplies(agent: unknown): Array<{ tag?: unknown }> };
+      const state = internals(framework) as unknown as { releasedWindow(agent: unknown, held: Set<string>): { unread: Array<{ tag?: unknown }> } | null };
       const agent = framework.getAgent('secondary')!;
       const cm = agent.getContextManager();
       const store = framework.getStore();
       const notice = (tag: string) => cm.getMessage(cm.addMessage('user', [{ type: 'text', text: `[discord-send-failed] ${tag}` }],
         { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', tag } as never))!;
-      const tags = () => state.unreadFailedReplies(agent).map((m) => m.tag);
+      const tags = () => state.releasedWindow(agent, new Set())!.unread.map((m) => m.tag);
 
       notice('read');
       agent.markContextConsumed();
@@ -1280,6 +1280,160 @@ describe('notices about an agent\'s own action', () => {
       assert.deepEqual(held!.yielded, ['tool-calls'], 'it yielded the late tool call, and nothing after it');
       assert.equal(calls.mock.callCount(), 0, 'its late tool call is not dispatched');
       await runFramework.resume({ force: true });
+    });
+
+    describe('a failed reply whose earlier write may have landed reaches the primary once', () => {
+      // A failed reply queued for the run, marked as one whose earlier write
+      // threw and whose landing couldn't be read back (`landing: 'unknown'`).
+      // Where that write landed, a copy under the entry's id is in the run's
+      // window, as the write left it.
+      const FAILED = { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', reason: 'no registered channel', textLen: 5 };
+      const SPEAKERS_NOTICE = `${SEND_FAILED} Your previous reply (5 chars) could not be delivered to missing-channel (no registered channel).`;
+      type LandingState = ReturnType<typeof internals> & {
+        releasesAfterResume: Map<string, unknown>;
+        agents: Map<string, unknown>;
+        persistDeferredWrites(): void;
+        settleUnknownLandings(which: (msg: { id: string }) => boolean): void;
+      };
+      const state = () => internals(runFramework) as unknown as LandingState;
+      // Each restart's framework, stopped before the run's directory goes.
+      const restarts: AgentFramework[] = [];
+      afterEach(async () => { for (const framework of restarts.splice(0)) await framework.stop(); });
+      /** The primary's by-name notices of the run's failed reply, stored or queued for it. */
+      const told = (framework: AgentFramework): number =>
+        count(framework.getAgent('primary')!.getContextManager().getAllMessages(), 'A reply by worker') +
+        count(internals(framework).deferredMessages.filter((m) => m.forAgent === undefined) as Array<{ content: unknown }>, 'A reply by worker');
+
+      async function queued(landed: boolean) {
+        const created = await runFramework.createEphemeralAgent({
+          name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all', proseRouting: 'explicit',
+        });
+        created.contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
+        if (landed) created.contextManager.addMessage('user', [{ type: 'text', text: SPEAKERS_NOTICE }], { ...FAILED, deferredWriteId: 'w-e' } as never);
+        (state().deferredMessages as unknown as Array<Record<string, unknown>>).push({
+          id: 'w-e', seq: 1_000_000, participant: 'user', forAgent: 'worker',
+          content: [{ type: 'text', text: SPEAKERS_NOTICE }], metadata: FAILED, heldAt: Date.now(), landing: 'unknown',
+        });
+        return created;
+      }
+
+      /** Not started, so its startup watchdog ends it. */
+      const ending = (created: Awaited<ReturnType<typeof queued>>) =>
+        runFramework.runEphemeralToCompletion(created.agent, created.contextManager, { startupTimeoutMs: 150 });
+
+      /** The framework on the same store after this one stops: a restart, which replays what the persisted queue holds. */
+      async function restarted(): Promise<AgentFramework> {
+        await runFramework.stop();
+        const framework = await AgentFramework.create({
+          storePath: join(runDir, 'test.chronicle'),
+          membrane: new MockMembrane().asMembrane(),
+          agents: [{ name: 'primary', model: 'test-model', systemPrompt: 'Primary.', proseRouting: 'locus' }],
+          modules: [new SenderModule()],
+        });
+        restarts.push(framework);
+        await internals(framework).initializeMcpl([]);
+        return framework;
+      }
+
+      for (const landed of [true, false]) {
+        it(`once across a crash between its release's sync and its queue's rewrite (${landed ? 'its earlier write landed' : 'a control: nothing landed'})`, async (t) => {
+          t.mock.method(console, 'error', () => {});
+          state().deferredWritesPersisted = true;
+          const created = await queued(landed);
+          state().persistDeferredWrites();
+          // The crash: the release's ack syncs the store, and the queue is never rewritten after it.
+          state().persistDeferredWrites = () => {};
+          await assert.rejects(ending(created), /failed to start inference/);
+          assert.equal(told(runFramework), 1, 'told once at the release');
+
+          const reopened = await restarted();
+          assert.equal(told(reopened), 1, 'and once after the restart replays the queue');
+        });
+
+        it(`once across stop() and a restart when a quiesce postponed its release (${landed ? 'its earlier write landed' : 'a control: nothing landed'})`, async (t) => {
+          t.mock.method(console, 'error', () => {});
+          const created = await queued(landed);
+          const done = ending(created);
+          state().quiesced = true;
+          // quiesce() writes the queue to its record as it sets the flag.
+          state().persistDeferredWrites();
+          await assert.rejects(done, /failed to start inference/);
+          assert.ok(state().releasesAfterResume.has('worker'), "its window's release waits for resume");
+
+          const reopened = await restarted();
+          assert.equal(told(reopened), 1);
+        });
+      }
+
+      it('once, by its own id, when its earlier write landed and the run\'s window can\'t be read', async (t) => {
+        t.mock.method(console, 'error', () => {});
+        const created = await queued(true);
+        t.mock.method(created.contextManager, 'getAllMessages', () => { throw new Error('window unreadable'); });
+        await assert.rejects(ending(created), /failed to start inference/);
+        const notices = runFramework.getAgent('primary')!.getContextManager().getAllMessages()
+          .filter((m) => JSON.stringify(m.content).includes('A reply by worker'));
+        assert.deepEqual(notices.map((m) => (m.metadata as { deferredWriteId?: unknown } | undefined)?.deferredWriteId), ['w-e']);
+      });
+
+      for (const read of [false, true]) {
+        it(`${read ? 'not at all, where the run read the copy' : 'once'}, stored once, when its store can't be searched and the window's read finds the copy`, async (t) => {
+          t.mock.method(console, 'error', () => {});
+          const created = await queued(true);
+          if (read) created.agent.markContextConsumed();
+          t.mock.method(created.contextManager, 'queryMessages', () => { throw new Error('search failed'); });
+          await assert.rejects(ending(created), /failed to start inference/);
+          assert.equal(told(runFramework), read ? 0 : 1);
+          assert.equal(count(await archived(), 'Your previous reply (5 chars)'), 1, 'not stored a second time');
+        });
+      }
+
+      it('once across a crash before any ack, when a lookup found its earlier write landed and it waits for an ack', async (t) => {
+        t.mock.method(console, 'error', () => {});
+        state().deferredWritesPersisted = true;
+        const created = await queued(true);
+        const done = ending(created);
+        for (let i = 0; i < 100 && !state().agents.has('worker'); i++) await new Promise((r) => setImmediate(r));
+        // Found by a path that reads held writes (settleFound): un-acked until the next ack.
+        state().settleUnknownLandings((m) => m.id === 'w-e');
+        assert.deepEqual((state().unackedDeferredWrites as Array<{ id: string }>).map((m) => m.id), ['w-e']);
+        state().persistDeferredWrites();
+        // The crash: nothing rewrites the queue after this.
+        state().persistDeferredWrites = () => {};
+        await assert.rejects(done, /failed to start inference/);
+        assert.equal(told(runFramework), 1, 'told once at the release');
+
+        const reopened = await restarted();
+        assert.equal(told(reopened), 1, 'and once after the restart replays the queue');
+      });
+
+      it("once across stop() and a restart when a quiesce postponed its release and it's still un-acked there (a control)", async (t) => {
+        t.mock.method(console, 'error', () => {});
+        const created = await queued(true);
+        const done = ending(created);
+        for (let i = 0; i < 100 && !state().agents.has('worker'); i++) await new Promise((r) => setImmediate(r));
+        state().settleUnknownLandings((m) => m.id === 'w-e');
+        assert.deepEqual((state().unackedDeferredWrites as Array<{ id: string }>).map((m) => m.id), ['w-e']);
+        // A write queued for the primary, so stop()'s last flush acks what's un-acked.
+        (state().deferredMessages as unknown as Array<Record<string, unknown>>).push({
+          id: 'w-p', seq: 1, participant: 'user', content: [{ type: 'text', text: 'an ordinary write' }], heldAt: Date.now(),
+        });
+        state().quiesced = true;
+        state().persistDeferredWrites();
+        await assert.rejects(done, /failed to start inference/);
+        assert.ok(state().releasesAfterResume.has('worker'), "its window's release waits for resume");
+        // stop()'s first ack fails to sync, so the entry is still un-acked at
+        // the pass for postponed releases, and the last flush's ack takes it.
+        const store = runFramework.getStore();
+        const sync = store.sync.bind(store);
+        let failNext = true;
+        t.mock.method(store, 'sync', () => {
+          if (failNext) { failNext = false; throw new Error('sync failed'); }
+          return sync();
+        });
+
+        const reopened = await restarted();
+        assert.equal(told(reopened), 1);
+      });
     });
   });
 });

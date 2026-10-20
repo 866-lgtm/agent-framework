@@ -798,6 +798,13 @@ type StoredCopy = { id: MessageId; content: ContentBlock[]; bodyGroupId?: string
 const storedCopy = (m: { id: MessageId; content: ContentBlock[]; bodyGroupId?: string }): StoredCopy =>
   ({ id: m.id, content: m.content, ...(m.bodyGroupId !== undefined ? { bodyGroupId: m.bodyGroupId } : {}) });
 
+/** A released agent's window as its pass to the primary reads it
+ *  (AgentFramework.releasedWindow). */
+type ReleasedWindow = {
+  unread: MessageMetadata[];
+  held: Map<string, { copies: StoredCopy[]; unread: boolean }>;
+};
+
 /** Stamp a deferred write's durable id into the metadata it is stored with
  *  (boot recovery dedups replays by it). Idempotent for an already-stamped
  *  message. */
@@ -3986,15 +3993,20 @@ export class AgentFramework {
     // later stop() takes what that leaves. Until then a persisted queue keeps
     // them for boot, and a memory-only one loses them at exit.
     // A window release the quiesce postponed (releasesAfterResume) never runs
-    // once the host stops, so its unread pass runs here: each failed reply
-    // stored unread in that window goes to the primary now, deferred while
-    // quiesced like any write, so it waits in the queue with the rest. What
-    // was queued for that agent stays queued, as a gone agent's. Each
+    // once the host stops, so its pass to the primary runs here
+    // (passOnFromReleasedWindow), deferred while quiesced like any write, so
+    // it waits in the queue with the rest: each failed reply stored unread in
+    // that window, and each un-acked one queued for it whose copy it didn't
+    // read, which the ack below would otherwise drop. What is still pending
+    // for that agent stays queued, as a gone agent's, and the boot or resume
+    // flush that meets it passes each failed reply among it on once, under
+    // its own id, so a copy of one in the window isn't passed as stored. Each
     // release's pass is a step of its own: one that throws fails the stop()
     // and leaves the others, and the flush below, to run.
     for (const agent of this.releasesAfterResume.values()) {
       step(() => {
-        for (const metadata of this.unreadFailedReplies(agent)) this.passFailedReplyToPrimary(agent.name, metadata);
+        const { forPrimary } = this.passOnFromReleasedWindow(agent);
+        if (forPrimary.length > 0) this.readdDrained(forPrimary, `stop: release of ${agent.name}`);
       });
     }
     this.releasesAfterResume.clear();
@@ -6501,11 +6513,13 @@ export class AgentFramework {
     this.deferredMessages = keep;
     this.handOffDeferredWrites(flush);
     // A target no longer registered (a fork or a run gone before a crash
-    // that left this write to boot recovery) has no window to land in. A
-    // failed reply it never read becomes the primary's by-name notice, under
-    // the entry's own id and place in the queue (queuedFailedReplyForPrimary),
-    // and is written with the rest; any other write is dropped, logged, by
-    // addMessage.
+    // that left this write to boot recovery, or one whose release stop()
+    // left it to) has no window to land in. A failed reply queued for it
+    // becomes the primary's by-name notice, under the entry's own id and
+    // place in the queue (queuedFailedReplyForPrimary), and is written with
+    // the rest; any other write is dropped, logged, by addMessage. Nothing
+    // here can read the gone agent's window, so a failed reply an earlier
+    // write of which landed there, and which the agent read, goes on too.
     let passed = 0;
     const batch = flush.flatMap((msg) => {
       if (msg.forAgent === undefined || this.agents.has(msg.forAgent)) return [msg];
@@ -21556,19 +21570,23 @@ export class AgentFramework {
    * (releaseWindowNowOrAfterResume), since a write could land mid-surgery.
    *
    * The agent never reads its window again, so every failed-reply notice it
-   * never read is passed to the primary, by name, once: each one stored in
-   * its window above its consumed watermark (flushed there at its turn's end,
-   * or stored while it was idle) and not heard at a tool boundary, and each
-   * one still queued for it. Writes still
-   * queued would wait for a boundary it never reaches, and the flush that
-   * finds it gone would drop them, so they land in its own window now, which
-   * Chronicle keeps for investigation. One whose earlier write may have
-   * landed (`landing` unknown) is looked up there by its id first: found,
-   * it's neither stored again nor passed to the primary; where the store
-   * can't be searched, it's stored anyway, with a line saying it may now be
-   * stored twice, or, where storing it fails too, that it may be stored
-   * once, twice or not at all. Its stream is over or cancelled, so it
-   * compiles nothing more. One path still stores after these writes: a
+   * never read is passed to the primary, by name, once
+   * (passOnFromReleasedWindow): each one stored in its window above its
+   * consumed watermark (flushed there at its turn's end, or stored while it
+   * was idle) and not heard at a tool boundary, and each one still queued
+   * for it, pending or un-acked. One with an entry still in the durable
+   * queue goes on only as that entry, under its own id and seq, so a crash
+   * before the ack below replays it once; a copy of it in the window decides
+   * only whether the agent read it. Writes still queued would wait for a
+   * boundary it never reaches, and the flush that finds it gone would drop
+   * them, so they land in its own window now, which Chronicle keeps for
+   * investigation. One whose earlier write may have landed (`landing`
+   * unknown) is looked up there by its id first, or, where the store can't
+   * be searched, in the window's own read: found, it isn't stored again;
+   * where neither can see the store, it's stored anyway, with a line saying
+   * it may now be stored twice, or, where storing it fails too, that it may
+   * be stored once, twice or not at all. Its stream is over or cancelled, so
+   * it compiles nothing more. One path still stores after these writes: a
    * `complete` that arrived while the agent still waited for tools awaits
    * the spill of its last tool results, and stores them once that resolves,
    * even if a watchdog has ended the run meanwhile. A tool boundary stores
@@ -21576,25 +21594,26 @@ export class AgentFramework {
    * prepared.
    */
   private releaseWindow(agent: Agent): void {
-    for (const metadata of this.unreadFailedReplies(agent)) this.passFailedReplyToPrimary(agent.name, metadata);
+    const { window, passOn, forPrimary, unacked } = this.passOnFromReleasedWindow(agent);
     const queued = this.drainDeferredFor(agent.name);
-    if (queued.length === 0) return;
+    // Nothing of its in the durable queue: nothing to store, pass on or ack.
+    if (queued.length === 0 && unacked === 0) return;
     const cm = agent.getContextManager();
-    const forPrimary: DeferredWrite[] = [];
     for (const msg of queued) {
       // An entry whose earlier write may have landed (landing unknown) is
       // looked up by its id, as settleUnknownLandings looks one up
-      // elsewhere, but in the released agent's own store. Found, it landed:
-      // it's neither stored again nor passed on below, since the loop above
-      // has passed its stored copy if it's a failed reply the agent hadn't
-      // read, by its window as that loop reads it. When the store can't be
-      // searched, it's stored anyway where the store takes it, since no
-      // later flush will try again, and a copy its deferredWriteId tells
-      // apart costs less than a write lost without a trace.
-      const found = msg.landing === 'unknown' ? this.landedCopiesById(agent, msg.id) : [];
+      // elsewhere, but in the released agent's own store. Where the store
+      // can't be searched, a copy the window's read saw tells the same.
+      // Found, it landed, and it isn't stored again. When neither can see
+      // it, it's stored anyway where the store takes it, since no later
+      // flush will try again, and a copy its deferredWriteId tells apart
+      // costs less than a write lost without a trace.
+      const lookedUp = msg.landing === 'unknown' ? this.landedCopiesById(agent, msg.id) : [];
+      const found = lookedUp ?? window?.held.get(msg.id)?.copies;
       if (found && found.length > 0) {
         this.logDeferredWriteError(msg, `release of ${agent.name}`, undefined,
           { count: found.length, sharded: found[0]!.bodyGroupId !== undefined, foundLater: true });
+        passOn(msg);
         continue;
       }
       try {
@@ -21616,45 +21635,92 @@ export class AgentFramework {
           err,
         );
       }
-      // A failed reply, now in a window no one reads: the entry itself goes
-      // on to the primary as its by-name notice, under its own id and seq, so
-      // a crash before the ack below replays it once, not twice.
-      if ((msg.metadata as { kind?: unknown } | undefined)?.kind !== 'discord-send-failed') continue;
-      const passed = this.queuedFailedReplyForPrimary(agent.name, msg);
-      if (passed) forPrimary.push(passed);
+      passOn(msg);
     }
     if (forPrimary.length > 0) this.readdDrained(forPrimary, `release of ${agent.name}`);
     this.ackDeferredWrites();
   }
 
   /**
-   * The failed-reply notices stored in `agent`'s window that it never read:
-   * those above the lower of its consumed watermark and the point where the
-   * watermark's branch and the current one part (branchesPartAt), or every
-   * one, when it never compiled. The watermark moves at a compile, and at a
-   * tool boundary whose
+   * The part of a released agent's pass to the primary that its release and
+   * stop() share (stop() runs it for a release the quiesce postponed). Each
+   * failed-reply notice stored in its window that it never read goes on as
+   * stored, by name (passFailedReplyToPrimary), except a copy of an entry
+   * for it still in the durable queue, pending or un-acked: that entry is
+   * the notice's one identity until its ack, the one boot's check for landed
+   * writes knows, so it's the entry that goes on, as the primary's by-name
+   * notice under its own id and seq (`passOn`, queuedFailedReplyForPrimary),
+   * and a crash before the ack replays it once, not twice. A queued failed
+   * reply goes on unless the agent read a copy of it that landed in its
+   * window; where the window can't be read, it goes on, since telling the
+   * primary of a failure the agent may have read costs less than telling no
+   * one. The un-acked entries for the agent have all landed (their write
+   * went through, or a lookup found it: settleFound), so they go on here;
+   * the pending ones are the caller's. Returns the window's read, `passOn`,
+   * what it has queued so far for the primary, and how many un-acked entries
+   * the agent had.
+   */
+  private passOnFromReleasedWindow(agent: Agent): {
+    window: ReleasedWindow | null;
+    passOn: (msg: DeferredWrite) => void;
+    forPrimary: DeferredWrite[];
+    unacked: number;
+  } {
+    const mine = (msg: DeferredWrite): boolean => (msg.forAgent ?? this.primaryAgentName) === agent.name;
+    const unacked = this.unackedDeferredWrites.filter(mine);
+    const window = this.releasedWindow(agent, new Set([...this.deferredMessages.filter(mine), ...unacked].map((m) => m.id)));
+    for (const metadata of window?.unread ?? []) this.passFailedReplyToPrimary(agent.name, metadata);
+    const forPrimary: DeferredWrite[] = [];
+    const passOn = (msg: DeferredWrite): void => {
+      if ((msg.metadata as { kind?: unknown } | undefined)?.kind !== 'discord-send-failed') return;
+      if (window?.held.get(msg.id)?.unread === false) return;
+      const passed = this.queuedFailedReplyForPrimary(agent.name, msg);
+      if (passed) forPrimary.push(passed);
+    };
+    for (const msg of unacked) passOn(msg);
+    return { window, passOn, forPrimary, unacked: unacked.length };
+  }
+
+  /**
+   * What a released agent's window holds that its pass to the primary reads
+   * (passOnFromReleasedWindow): `unread`, the failed-reply notices stored
+   * there that it never read, other than copies of the entries `held` names;
+   * and `held`, for each of those entries with a copy there, its copies and
+   * whether the agent read them. A notice is read below the lower of its
+   * consumed watermark and the point where the watermark's branch and the
+   * current one part (branchesPartAt), and unread everywhere when it never
+   * compiled. The watermark moves at a compile, and at a tool boundary whose
    * stream declares it carries the messages injected there
    * (markContextConsumed), so a notice the live stream heard is under it, and
    * one a boundary stored without sending (a turn a tool ended, a budget
-   * restart, a stream that may drop injections) is above it.
+   * restart, a stream that may drop injections) is above it. null when the
+   * window can't be read, which is logged.
    */
-  private unreadFailedReplies(agent: Agent): MessageMetadata[] {
+  private releasedWindow(agent: Agent, held: ReadonlySet<string>): ReleasedWindow | null {
     try {
       const cm = agent.getContextManager();
       const watermark = agent.getConsumedWatermark();
       const floor = watermark
         ? Math.min(watermark.sequence, this.branchesPartAt(watermark.branch, cm.currentBranch().name))
         : Number.NEGATIVE_INFINITY;
-      return cm.getAllMessages()
-        .filter((m) => {
-          const metadata = m.metadata as { kind?: unknown } | undefined;
-          return m.sequence > floor && metadata?.kind === 'discord-send-failed';
-        })
-        .map((m) => m.metadata as MessageMetadata);
+      const read: ReleasedWindow = { unread: [], held: new Map() };
+      for (const m of cm.getAllMessages()) {
+        const metadata = m.metadata as { kind?: unknown; deferredWriteId?: unknown } | undefined;
+        const id = metadata?.deferredWriteId;
+        if (typeof id === 'string' && held.has(id)) {
+          const copies = read.held.get(id) ?? { copies: [], unread: false };
+          copies.copies.push(storedCopy(m));
+          copies.unread ||= m.sequence > floor;
+          read.held.set(id, copies);
+        } else if (m.sequence > floor && metadata?.kind === 'discord-send-failed') {
+          read.unread.push(m.metadata as MessageMetadata);
+        }
+      }
+      return read;
     } catch (err) {
       // A release must complete whatever its window's read meets.
       console.error(`[route-failure] ${agent.name}: could not read its window for unread failed replies:`, err);
-      return [];
+      return null;
     }
   }
 

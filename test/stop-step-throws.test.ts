@@ -178,14 +178,14 @@ const ROWS: Row[] = [
       // Other agents, such as the run whose end releases its window, read
       // their unread replies as usual.
       const owner = fw as unknown as Record<string, unknown>;
-      const usual = (owner.unreadFailedReplies as (agent: unknown) => unknown[]).bind(fw);
-      owner.unreadFailedReplies = (agent: { name: string }) => {
+      const usual = (owner.releasedWindow as (agent: unknown, held: Set<string>) => unknown).bind(fw);
+      owner.releasedWindow = (agent: { name: string }, held: Set<string>) => {
         if (agent.name === 'first') throw e;
-        if (agent.name !== 'second') return usual(agent);
+        if (agent.name !== 'second') return usual(agent, held);
         unreadPassed.push(agent.name);
-        return [];
+        return { unread: [], held: new Map() };
       };
-      return () => { delete owner.unreadFailedReplies; };
+      return () => { delete owner.releasedWindow; };
     },
     check: (fw) => {
       assert.deepEqual(unreadPassed, ['second'], "the other release's unread pass still ran");

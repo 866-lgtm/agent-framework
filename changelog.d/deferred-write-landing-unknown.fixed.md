@@ -24,7 +24,12 @@
     nothing was changed. It's refused the same way while the store can't be
     searched; the host log names the store's error".
   - A conversation fork's or ephemeral run's queue, stored when it's
-    released, looks such an entry up the same way: found, it's neither
-    stored again nor passed to the primary as a failed reply; where the
-    store can't be searched, it's stored anyway where the store takes it,
-    and the log says it may now be stored twice.
+    released, looks such an entry up the same way, and, where the store
+    can't be searched, in the window the release reads: found, it isn't
+    stored again; where neither can see the store, it's stored anyway where
+    the store takes it, and the log says it may now be stored twice. A
+    failed reply among such entries reaches the primary once, as the entry
+    itself under its own id, so a crash or a restart doesn't tell it twice.
+    It isn't passed on where the release finds the fork or run had read the
+    copy that landed. Where a `stop()` or a crash leaves the entry to the
+    next boot, boot passes it on anyway, since it can't read that window.
