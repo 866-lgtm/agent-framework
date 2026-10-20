@@ -2712,7 +2712,9 @@ export class ChannelRegistry {
    * Enter (or re-enter with fresh params) the tuned-out state for a channel.
    * Re-entering under a new epochId replaces the active epoch; the previous
    * epoch's stamped messages stay excluded (stamps are permanent) and its
-   * wake count is superseded. Transport stays open (see reconcile).
+   * wake count is superseded. Its transport is kept open: tune_out opens a
+   * closed one (openForTuneOut), and reconcile opens it at the channel's
+   * registration.
    */
   enterTuneOut(
     serverId: string,
@@ -2745,43 +2747,37 @@ export class ChannelRegistry {
    * so the tune-out stands whatever becomes of the open. Lifecycle work
    * already queued for the channel goes first, since each operation reads
    * the decision when it runs and so opens a channel tuned out meanwhile;
-   * its own failure, such as a close the server refused, says nothing of
-   * this open. Then the transport is looked at, and where it isn't confirmed
-   * open, the channel's lifecycle queue opens it once (applyDesiredChannelState
-   * reads a tune-out as open), and the answer comes from the state that
-   * work leaves. Returns nothing where the transport ends open, or, for
-   * tune_out's answer, why the channel's messages may not reach the
+   * its own failure, such as a close the server refused, isn't this open's.
+   * Then the channel's state is read as the registry reads it everywhere: a
+   * failed request leaves the open flag as it was, and the unconfirmed mark
+   * counts only while the channel isn't open (runLifecycleOperation). Where
+   * this host directs the lifecycle and the transport isn't open, the
+   * channel's lifecycle queue opens it once (applyDesiredChannelState reads
+   * a tune-out as open), and the answer waits for work queued meanwhile too,
+   * such as a registration that came back, and comes from the state that
+   * work leaves. Returns nothing where the transport is open, or, for
+   * tune_out's answer, why the channel's messages don't or may not reach the
    * subconscious yet and when they will, or that the tune-out isn't in
    * effect any more.
    */
   async openForTuneOut(serverId: string, channelId: string): Promise<string | undefined> {
     const channelKey = `${serverId}:${channelId}`;
     const lifecycleKey = this.lifecycleKey(serverId, channelId);
-    const registered = this.channels.get(channelKey);
-    if (!registered) {
-      return `The tune-out is recorded, but the channel isn't registered here now, so its messages don't reach the ` +
-        `subconscious until the "${serverId}" server registers it again.`;
-    }
-    // `certain` where nothing can arrive: an open whose outcome is unknown
-    // may have taken effect, and its traffic would be diverted.
-    const notYet = (certain: boolean, why: string): string => withStop(
-      `The tune-out is recorded, but its messages ${certain ? "don't" : 'may not'} reach the subconscious until this ` +
-      `host opens the channel, which it does ${laterClause(this.channels.get(channelKey) ?? registered)}; ${why}`,
-    );
+    // The tune-out this answer is for, by its epoch: one that ended, or that
+    // a later decision or a later tune-out replaced, isn't this one.
+    const epochId = this.getTuneOutState(serverId, channelId)?.params.epochId;
+    const inEffect = () =>
+      epochId !== undefined && this.getTuneOutState(serverId, channelId)?.params.epochId === epochId;
     const replaced = "The tune-out was recorded, but it isn't in effect any more: it ended, or a later decision about the " +
       'channel replaced it, while its transport was being opened.';
-    // A connection that dropped keeps its entries' open flags, so the
-    // server's state is read before the transport's.
-    const reach = this.serverReach(serverId);
-    if (reach !== 'up') {
-      return notYet(true, `it can't open it now: ${unreachableClause(serverId, reach)}` +
-        (reach === 'gone' ? unreachableRemedy(reach) : ''));
-    }
-    if (!this.directsLifecycle(serverId)) {
-      return registered.open ? undefined
-        : `The tune-out is recorded, but ${this.lifecycleRefusal(serverId).message}, so its messages reach the ` +
-          'subconscious only as that server sends them.';
-    }
+    // "May not": a failed request leaves its outcome unknown, and an open
+    // that took effect would have its traffic diverted.
+    const notYet = (later: string, why: string): string => withStop(
+      `The tune-out is recorded, but its messages may not reach the subconscious until this host opens the channel, ` +
+      `which it does ${later}; ${why}`,
+    );
+    const nextRegistration = `when the "${serverId}" server next registers this channel, if this host may open and ` +
+      'close its channels then';
     // Work queued for the channel, as of a moment: the tail chains on all of
     // it. Its failure is its own, so it isn't the answer.
     const settle = async (): Promise<unknown> => {
@@ -2794,14 +2790,34 @@ export class ChannelRegistry {
         return error;
       }
     };
-    // An open flag a failed request left unconfirmed may not be the
-    // server's state, so only a confirmed one needs nothing.
-    const confirmedOpen = (entry: ChannelEntry) => entry.open && !this.unconfirmedChannelTargets.has(entry);
+    // What the state answers now, or null where this host is to open the
+    // transport itself. `missing` answers for a channel that isn't
+    // registered here, where this host directs the lifecycle.
+    const answered = (entry: ChannelEntry | undefined, missing: string): string | undefined | null => {
+      if (!inEffect()) return replaced;
+      // A connection that dropped keeps its entries' open flags, and whether
+      // this host or the server opens the channel isn't known until it's
+      // back, since a reconnect empties the grant until the new one is
+      // established.
+      const reach = this.serverReach(serverId);
+      if (reach !== 'up') {
+        return withStop(
+          `The tune-out is recorded, but its messages don't reach the subconscious until the "${serverId}" server is ` +
+          `connected and the channel is open; it can't be opened now: ${unreachableClause(serverId, reach)}` +
+          (reach === 'gone' ? unreachableRemedy(reach) : ''),
+        );
+      }
+      if (!this.directsLifecycle(serverId)) {
+        return entry?.open ? undefined
+          : `The tune-out is recorded, but ${this.lifecycleRefusal(serverId).message}, so its messages reach the ` +
+            'subconscious only as that server sends them.';
+      }
+      if (!entry) return missing;
+      return entry.open ? undefined : null;
+    };
     await settle();
-    if (this.getDesiredState(serverId, channelId) !== 'tuned-out') return replaced;
-    const before = this.channels.get(channelKey);
-    if (!before) return notYet(false, "it isn't registered here any more");
-    if (confirmedOpen(before)) return undefined;
+    const before = answered(this.channels.get(channelKey), notYet(nextRegistration, "it isn't registered here now"));
+    if (before !== null) return before;
     let failure: unknown;
     try {
       await this.applyDesiredChannelState(serverId, channelId);
@@ -2809,16 +2825,15 @@ export class ChannelRegistry {
       failure = error;
     }
     // A registration that came back while the open was out queued its own
-    // reconcile, which the answer waits for too.
-    failure = (await settle()) ?? failure;
-    if (this.getDesiredState(serverId, channelId) !== 'tuned-out') return replaced;
+    // reconcile, which the answer waits for too. That work's failure is the
+    // reason only where this open didn't fail itself.
+    const later = await settle();
+    if (failure === undefined) failure = later;
+    const clause = failure !== undefined ? `: ${lifecycleClause(failure)}` : '';
     const after = this.channels.get(channelKey);
-    if (!after) {
-      return notYet(false, "it isn't registered here any more" + (failure !== undefined ? `: ${lifecycleClause(failure)}` : ''));
-    }
-    if (confirmedOpen(after)) return undefined;
-    return notYet(false, failure !== undefined ? `opening it now didn't complete: ${lifecycleClause(failure)}`
-      : "this host hasn't confirmed it open");
+    const settled = answered(after, notYet(nextRegistration, `it isn't registered here any more${clause}`));
+    if (settled !== null) return settled;
+    return notYet(laterClause(after!), failure !== undefined ? `opening it now didn't complete${clause}` : "it isn't open now");
   }
 
   /**
@@ -3227,8 +3242,9 @@ export class ChannelRegistry {
    *  one rethrows, since its retry covers only a retarget of its own entry.
    *  This answers true meanwhile, so a channels/changed update that retargets
    *  the push's entry is left to that operation, and stays undone after a
-   *  failed RPC until channel_open, speech or a registration. No server we
-   *  know of sends `updated` for a channel it has removed. */
+   *  failed RPC until channel_open, speech, a tune-out's open or a
+   *  registration. No server we know of sends `updated` for a channel it has
+   *  removed. */
   private outstandingWorkCarriesOut(serverId: string, key: string): boolean {
     return this.lifecycleOutstanding.has(key) &&
       this.lifecycleQueuedRemovals.get(key) === (this.serverRemovals.get(serverId) ?? 0);

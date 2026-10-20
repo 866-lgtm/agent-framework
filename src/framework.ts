@@ -26597,14 +26597,15 @@ export class AgentFramework {
         // A tuned-out channel's traffic must keep arriving for the
         // subconscious, so the answer waits for its transport (openForTuneOut).
         // The tune-out is recorded either way, so it's a success, and where
-        // the transport isn't open, openError says when its messages will
-        // reach the subconscious. A rejection is answered the same way, never
-        // left unhandled, and the result goes through pushEvent, as every
-        // other tool's does.
+        // the transport isn't open, openError says why its messages don't or
+        // may not reach the subconscious, and when they will where that's
+        // known, or that the tune-out isn't in effect any more. A rejection is
+        // answered too, never left unhandled, and the result goes through
+        // pushEvent, as every other tool's does.
         void this.channelRegistry!.openForTuneOut(entry.serverId, channelId)
           .catch((err): string =>
-            `The tune-out is recorded, but its messages may not reach the subconscious until the "${entry.serverId}" ` +
-            `server next registers the channel, since opening it failed: ${thrownText(err)}`)
+            'The tune-out is recorded, but its messages may not reach the subconscious, since opening its channel ' +
+            `failed: ${thrownText(err)}`)
           .then((openError) => {
             this.pushEvent({
               type: 'tool-result',
