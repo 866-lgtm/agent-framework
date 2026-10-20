@@ -49,7 +49,7 @@ import type { ToolDefinition, ToolCall, ToolResult, ProcessEvent } from '../../t
 import type { EventResponse, ProcessState } from '../../types/module.js';
 import type { SearchWorkerMessage, SearchWorkerMatch } from './search-regex-worker.js';
 import type { ChannelRegistry } from '../../mcpl/channel-registry.js';
-import { EmbedServiceError, SemanticIndexClient, SemanticIndexer, messageIndexText, type SearchResponse, type SemanticIndexConfig, type SyncReport, type PendingChanges } from './semantic.js';
+import { EmbedServiceError, SemanticIndexClient, SemanticIndexer, messageIndexText, summaryIndexText, type SearchResponse, type SemanticIndexConfig, type SyncReport, type PendingChanges } from './semantic.js';
 import { unknownToolMessage } from '../unknown-tool.js';
 import { safeSlice } from '../../safe-slice.js';
 
@@ -1614,6 +1614,9 @@ export class HistoryModule implements Module {
       try { sync = await this.indexer.catchUp(this.semanticCfg.maxSyncBeforeSearch ?? 256); } catch { /* reported via indexer.lastError */ }
     }
 
+    // A message's or summary's snippet is built here, from the local text.
+    // `snippet` still bounds what a service that keeps text sends with each
+    // hit, since what it sends without one isn't specified here.
     const runSearch = (k: number) => this.semanticClient!.search({
       query: input.query, k,
       ts_from: fromMs === undefined ? undefined : fromMs / 1000,
@@ -1669,8 +1672,8 @@ export class HistoryModule implements Module {
     // to the model — getMessage/getSummary rebuild on branch switch, so an
     // undone message, or a summary this branch doesn't hold, answers null.
     // A branch made from an earlier point, as an undo makes one, can mint a
-    // summary id another branch already used, so a summary hit can still be
-    // ranked by that other summary's text.
+    // summary id another branch already used, so a summary hit's score,
+    // timestamp and date filtering can still be that other summary's.
     // k is small, so this is at most `limit` local lookups.
     // A message hit whose current text has nothing left to index (edited
     // blank, delete not yet applied) is dropped too, so its stale snippet is
@@ -1684,8 +1687,8 @@ export class HistoryModule implements Module {
     // must not leak a passage the edit removed. Only the ranking can be stale.
     // A summary hit's snippet is rebuilt from the local summary too: a
     // service that keeps only vectors and ids (no text) still yields one, and
-    // a summary whose id another branch also minted never shows that
-    // branch's text.
+    // a summary whose id another branch also minted shows this branch's text
+    // in its snippet and chars.
     const currentText = new Map<string, string>();
     const keep = (h: { id: string }): 'ok' | 'offBranch' | 'stale' => {
       const msgId = /^msg:(.+)$/.exec(h.id)?.[1];
@@ -1701,11 +1704,12 @@ export class HistoryModule implements Module {
       if (sumId !== undefined) {
         const s = cm.getSummary(sumId);
         if (!s) return 'offBranch';
-        // Cut as summaryToItem cuts the text it indexes.
-        const text = safeSlice(s.content.trim(), 0, this.semanticCfg!.maxChars ?? 32_000);
-        // Nothing to index, so the index's text for this id is another
-        // summary's, such as one another branch minted under the same id,
-        // and the hit is dropped rather than show it.
+        const text = summaryIndexText(s, this.semanticCfg!);
+        // An empty text here is mostly defensive: context-manager drops a
+        // summary that's empty after trimming when it loads, and refuses to
+        // store one. Short of that, only a maxChars that cuts the text to
+        // nothing gives one. The hit is dropped rather than show the index's
+        // text.
         if (!text) return 'stale';
         currentText.set(h.id, text);
         return 'ok';
@@ -1798,7 +1802,7 @@ export class HistoryModule implements Module {
           lastError: this.indexer?.lastError ?? null,
           /** Hits the index returned for messages/summaries not on the current branch (undone, checked out past). */
           droppedOffBranch,
-          /** Hits for messages or summaries whose current text has nothing indexable (a message edited blank, which the index keeps until its delete goes through, and on a service without /delete it never does; a summary empty after trimming, whose id another branch's summary holds in the index). */
+          /** Hits for messages whose current text has nothing indexable (edited blank; the index keeps such a message until its delete goes through, and on a service without /delete it never does). */
           droppedStale,
           /** When too few hits were on this branch and searching again for more failed: why, and whether calling again can help. */
           searchAgainError,

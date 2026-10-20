@@ -222,11 +222,11 @@ describe('HistoryModule semantic_search', () => {
     }
   });
 
-  it('a summary hit shows the local summary even when the index holds another summary\'s text under its id', async () => {
+  it('a summary hit shows the local summary even when the index holds another summary\'s text under its id, with the index\'s score and timestamp', async () => {
     // A branch made from an earlier point, as an undo makes one, can mint a
     // summary id another branch already used, so the index can hold another
-    // summary's text under it. No catch-up before the search, which would
-    // send this summary again.
+    // summary's text and start under it. No catch-up before the search,
+    // which would send this summary again.
     const svc2 = new FakeService(); await svc2.start();
     try {
       const local = [{ ...summaries[0] }];
@@ -234,12 +234,14 @@ describe('HistoryModule semantic_search', () => {
       mod.bind(stubCm(messages, local));
       await mod.syncSemanticIndex()!;
       local[0]!.content = 'Summary of a morning on this branch';
+      local[0]!.startMs = T0 + 86_400_000;
       const res = await mod.handleToolCall({ id: 'n', name: 'semantic_search', input: { query: 'evening', level: 1 } });
       assert.equal(res.success, true, JSON.stringify(res));
-      const hit = (res.data as { hits: Array<{ id: string; snippet: string; chars: number; score: number }> }).hits.find((h) => h.id === 'sum:s1');
+      const hit = (res.data as { hits: Array<{ id: string; snippet: string; chars: number; score: number; timestamp: string | null }> }).hits.find((h) => h.id === 'sum:s1');
       assert.ok(hit, JSON.stringify(res.data));
       assert.equal(svc2.items.get('sum:s1')?.text, 'Summary of the evening', 'the index still holds the other text');
       assert.equal(hit.score, 0.9, 'the hit is still ranked by the text the index holds, the only one with "evening"');
+      assert.equal(hit.timestamp, new Date(T0).toISOString(), 'and dated by the start the index holds');
       assert.equal(hit.snippet, 'Summary of a morning on this branch');
       assert.equal(hit.chars, 'Summary of a morning on this branch'.length);
       await mod.stop();
@@ -247,9 +249,9 @@ describe('HistoryModule semantic_search', () => {
   });
 
   it('a summary hit whose local summary is empty is dropped as stale, never shown with the index\'s text', async () => {
-    // A branch made from an earlier point, as an undo makes one, can mint a
-    // summary id another branch already used, so the index can hold another
-    // summary's text under an id whose summary here is empty.
+    // context-manager drops a summary that's empty after trimming when it
+    // loads, so getSummary doesn't return one. The drop is defensive, against
+    // a store that did, while the index holds another summary's text.
     const svc2 = new FakeService(); await svc2.start();
     try {
       const local = [{ ...summaries[0] }];
