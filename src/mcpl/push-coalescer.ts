@@ -257,7 +257,11 @@ export interface CoalescingReceiptRecord {
 }
 
 export interface CoalescerHost<E> {
-  /** True iff the placement still exists and no model request has included it. */
+  /** True iff the placement still exists and, as far as the host can tell,
+   *  no model request has included it. The host can't always tell: a
+   *  message injected into a stream that didn't say whether it carries
+   *  injections, as no membrane 0.5.x stream does, counts as unread though
+   *  a request may have included it. */
   isUnread(placement: CoalescingPlacement): boolean;
   /** True iff nothing may have shown the placement to the agent: it is still
    *  in the deferred queue, or stored where no committing compile has begun
@@ -639,10 +643,10 @@ export class PushCoalescer<E = unknown> {
   }
 
   /**
-   * Re-check the occupant against the host, member by member: a member a
-   * request has read, or that is gone (isUnread is false either way), becomes
-   * history, and the run keeps the members still unread. Returns whether any
-   * are.
+   * Re-check the occupant against the host, member by member: a member the
+   * host counts as read, or that is gone (isUnread is false either way),
+   * becomes history, and the run keeps the members still unread. Returns
+   * whether any are.
    */
   private refreshOccupant(state: SubjectState<E>): boolean {
     const occupant = state.occupant;
