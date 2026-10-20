@@ -1,6 +1,6 @@
 /*
- * code_execution's engine: agent-framework's interface to QuickJS-ng, compiled with the vendored
- * engine (engine/quickjs-ng) into one WebAssembly module, src/code-execution/quickjs.wasm.
+ * code_execution's engine: agent-framework's interface to QuickJS-ng, compiled with the release
+ * engine/build.sh pins into one WebAssembly module, src/code-execution/quickjs.wasm.
  *
  * It is held to what code_execution's bridge needs: limits, evaluating the prelude and a script,
  * one host function whose calls the host settles by id, running jobs, the interrupt, and output.

@@ -1,6 +1,6 @@
 /**
  * code_execution's engine binding: QuickJS-ng compiled to WebAssembly (`quickjs.wasm`, built by
- * `engine/build.sh` from `engine/quickjs-ng` and `engine/interface.c`), loaded into the child
+ * `engine/build.sh` from the quickjs-ng release it pins and `engine/interface.c`), loaded into the child
  * process that runs one script.
  *
  * The guest reaches nothing outside JavaScript except three slots the child fills: a host call,

@@ -1,9 +1,9 @@
 quickjs.wasm, code_execution's engine, is built by engine/build.sh from agent-framework's own
 engine/interface.c and the works below, whose notices it carries.
 
-============================================================================================================================================
-QuickJS-ng v0.17.0 (engine/quickjs-ng: the release's files, with any patch in engine/patches applied), https://github.com/quickjs-ng/quickjs
-============================================================================================================================================
+=====================================================================================================================================================
+QuickJS-ng v0.17.0 (commit 6d46d07d04041b40f4f49eaa7fdebe44c314c699, with any patch in engine/patches applied), https://github.com/quickjs-ng/quickjs
+=====================================================================================================================================================
 
 The MIT License (MIT)
 

@@ -1,13 +1,11 @@
 name: Engine
 
-# code_execution's engine module, src/code-execution/quickjs.wasm, is committed beside the sources
-# it's built from: the vendored quickjs-ng and engine/interface.c, built by engine/build.sh with a
-# pinned toolchain. This first copies the pinned quickjs-ng release, with the patches in
-# engine/patches, with engine/vendor.sh and fails unless that's the committed source, so the
-# vendored copy is the release it names with those patches. Then it
-# rebuilds the module and fails unless the bytes are the committed ones, so the module can't drift
-# from its sources in either direction. It runs only when one of them changes, since the toolchain
-# is a 143 MB download.
+# code_execution's engine module, src/code-execution/quickjs.wasm, is committed beside what it's
+# built from: engine/build.sh, which fetches the pinned quickjs-ng release and applies the patches
+# in engine/patches, and engine/interface.c, built with a pinned toolchain. This rebuilds the
+# module and fails unless the bytes are the committed ones, so the module can't drift from its
+# sources in either direction. It runs only when one of them changes, since the toolchain is a
+# 143 MB download.
 on:
   push:
     branches:
@@ -35,19 +33,6 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
-
-      # vendor.sh copies the pinned release's files, with the patches applied, over
-      # engine/quickjs-ng, so any difference from what's committed (an ignored or untracked file
-      # included) is an edit to the vendored source, a patch not committed, or a pin it doesn't match.
-      - name: Copy the pinned quickjs-ng release and compare it with the committed source
-        run: |
-          engine/vendor.sh
-          changes=$(git status --porcelain --untracked-files=all --ignored -- engine/quickjs-ng)
-          if [ -n "$changes" ]; then
-            echo "$changes"
-            echo "::error::engine/quickjs-ng isn't the release engine/vendor.sh pins, with the patches in engine/patches. Change the engine through vendor.sh's pin or a patch, run vendor.sh, and commit what it copies."
-            exit 1
-          fi
 
       # binaryen's wasm-opt comes from npm and runs under Node.
       - name: Setup Node.js
