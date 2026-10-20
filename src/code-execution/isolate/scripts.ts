@@ -264,6 +264,10 @@ export class AgentScripts {
   async stop(agentName: string, scriptId: string, watch: ScriptWatch = { endTurn: false }): Promise<ScriptReturn> {
     const script = this.unwatched(this.own(agentName, scriptId));
     script.watch = watch;
+    // A run that has ended returns its ending to this stop: marked before the
+    // stop yields, as observe marks a wait's, so a notice whose turn comes
+    // first doesn't repeat it.
+    if (script.run.ended) script.endingReturned = true;
     await script.run.stop('agent');
     return this.observe(script, 0, watch);
   }
@@ -380,8 +384,9 @@ export class AgentScripts {
   private async observe(script: Script, ms: number, watch: ScriptWatch): Promise<ScriptReturn> {
     // A run that has ended returns its ending at once: marked now, so a notice
     // whose turn comes before this return does doesn't repeat it. One that ends
-    // while this call watches it gives no notice at all (ended), so this is the
-    // only mark a returned ending needs.
+    // while this call watches it gives no notice at all (ended), so this and a
+    // stop's own, made before its stop yields, are the only marks a returned
+    // ending needs.
     if (script.run.ended && script.watch === watch) script.endingReturned = true;
     const snap = await script.run.wait(ms);
     // A call whose turn was abandoned no longer watches the script: its

@@ -701,3 +701,22 @@ test("a wait started on an ended script takes its ending at once, so a notice wh
   await new Promise((res) => setTimeout(res, 100));
   assert.equal(held.wakes.length, 1, 'only the script\'s own wake, and no notice');
 });
+
+test("a stop started on an ended script takes its ending at once, so a notice whose turn comes before the stop returns doesn't repeat it", async () => {
+  const held = heldWake();
+  const { scripts } = setup({ config: { yieldMs: 0 }, host: { wake: held.wake } });
+  const r = await scripts.run('alice', WAKE_THEN_SPIN, 0);
+  for (let i = 0; i < 500 && !held.state.entered; i++) await new Promise((res) => setTimeout(res, 10));
+  const internals = scripts as unknown as { scripts: Map<string, { run: { stop(reason: 'limit'): Promise<unknown> }; delivering: Promise<void> | null }> };
+  // A reaction to the delivery, ordered before the notice's: it starts the
+  // stop, whose own stop of the ended run yields before the notice runs.
+  let stopping: Promise<{ ending: { how: string } | null }> | undefined;
+  void internals.scripts.get(r.scriptId)!.delivering!.then(() => { stopping = scripts.stop('alice', r.scriptId); });
+  await internals.scripts.get(r.scriptId)!.run.stop('limit');
+  held.deliver();
+  for (let i = 0; i < 500 && !stopping; i++) await new Promise((res) => setTimeout(res, 10));
+  assert.ok(stopping, 'the stop started, before the notice ran');
+  assert.equal((await stopping).ending?.how, 'stopped');
+  await new Promise((res) => setTimeout(res, 100));
+  assert.equal(held.wakes.length, 1, 'only the script\'s own wake, and no notice');
+});
