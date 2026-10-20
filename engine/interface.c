@@ -550,17 +550,33 @@ int engine_settle(uint32_t id, int ok, char *json, uint32_t json_len, char *unfi
     return st;
 }
 
+/* What a read or a conversion that ran the script's code gave, once a stop has come: dropped,
+   with its exception, if it threw. A stop that lands in a stack hook or an iterator's return, which
+   QuickJS drops, lets that code go on and give a part after the stop, which isn't kept. */
+static JSValue drop_late(JSValue p) {
+    if (JS_IsException(p))
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    else
+        JS_FreeValue(ctx, p);
+    return JS_UNDEFINED;
+}
+
 /* One part of an object, for error_json: read, and made a string at once, so a stop in a later
-   part's read can't take it. Nothing is read once a stop has come. A part that isn't there, or
-   whose read throws, is undefined; one with no string form is null, which error_json leaves out
-   with no stand-in, as it does a stack that isn't a string. */
+   part's read can't take it. Nothing is read once a stop has come, and a part whose read or
+   string form ends after a stop is left out. A part that isn't there, or whose read throws, is
+   undefined; one with no string form is null, which error_json leaves out with no stand-in, as it
+   does a stack that isn't a string. */
 static JSValue error_part(JSValue v, const char *key, bool any) {
     if (interrupted)
         return JS_UNDEFINED;
     JSValue p = JS_GetPropertyStr(ctx, v, key);
+    if (interrupted)
+        return drop_late(p);
     if (any && !JS_IsException(p) && !JS_IsUndefined(p) && !JS_IsString(p)) {
         JSValue s = JS_ToString(ctx, p);
         JS_FreeValue(ctx, p);
+        if (interrupted)
+            return drop_late(s);
         if (JS_IsException(s)) {
             JS_FreeValue(ctx, JS_GetException(ctx));
             return JS_NULL;
@@ -581,8 +597,9 @@ static JSValue error_part(JSValue v, const char *key, bool any) {
 /* The text of a value or an error, for engine_result. Takes v. Returns a JS string, undefined,
    or an exception. Reading an object's parts can run the script's own code (a getter, a toJSON, a
    toString), and a stop ends the read: what was read before it stays, and nothing more is read,
-   neither a part nor a stand-in for a missing message. The message is read first, as the part
-   most worth keeping, and each part is a string before the next is read. */
+   neither a part nor a stand-in for a missing message, and what such code gives after a stop
+   that QuickJS dropped is left out. The message is read first, as the part most worth keeping,
+   and each part is a string before the next is read. */
 static JSValue error_json(JSValue v) {
     /* No prototype, so a toJSON the script put on Object.prototype doesn't serialize it. */
     JSValue o = JS_NewObjectProto(ctx, JS_NULL);
@@ -600,15 +617,22 @@ static JSValue error_json(JSValue v) {
            rather than left blank. */
         if (JS_IsUndefined(message) && !interrupted) {
             message = JS_JSONStringify(ctx, v, JS_UNDEFINED, JS_UNDEFINED);
-            if (JS_IsException(message)) {
+            if (interrupted) {
+                message = drop_late(message);
+            } else if (JS_IsException(message)) {
                 JS_FreeValue(ctx, JS_GetException(ctx));
                 message = JS_UNDEFINED;
             }
-            if (JS_IsUndefined(message) && !interrupted)
+            if (JS_IsUndefined(message) && !interrupted) {
                 message = JS_ToString(ctx, v);
+                if (interrupted)
+                    message = drop_late(message);
+            }
         }
     } else {
-        /* A primitive's string form runs no script code (a Symbol has none, and is left out). */
+        /* A primitive's string form runs no script code, but a Symbol has none: its conversion
+           throws a TypeError, whose backtrace can run the script's stack hook, and the error is left
+           out with nothing the hook gave. */
         message = JS_ToString(ctx, v);
     }
     /* A stand-in that throws, or a primitive with no string form, such as a Symbol, is left out. */

@@ -468,6 +468,9 @@ test('what a thrown object holds is read as text, and a part that can\'t be read
     ['throw { big: 1n, toString() { return "told by its string form" } }', '', 'told by its string form', false],
     // A message that's there but has no string form is left out, with no stand-in for it.
     ['throw Object.assign(new Error(), { message: Symbol("m") })', 'Error', '', true],
+    // A Symbol thrown bare has none either: its conversion's TypeError, whose backtrace runs the
+    // script's stack hook, is left out with what the hook gave.
+    ['Error.prepareStackTrace = () => "hooked"; throw Symbol("bare")', '', '', false],
     // A toJSON the script puts on Object.prototype doesn't reach the engine's own record of it.
     ['Object.prototype.toJSON = () => { throw new Error("not this") }; throw new RangeError("this")', 'RangeError', 'this', true],
   ] as const) {
@@ -660,6 +663,41 @@ test('a stop ends a failure\'s read: nothing after it is read, a part or a part\
   b.e.dispose();
 });
 
+test('a part whose read or string form ends after a stop QuickJS dropped is left out', async () => {
+  // The slot says stop once, as the name's getter, or its toString, spins in a stack hook, where
+  // QuickJS drops the stop and puts back the TypeError it was building: the code goes on and gives
+  // "late" after the stop, or throws, and neither is kept, the throw's exception freed. The message,
+  // read before the stop, is.
+  const late = `Error.prepareStackTrace = () => { for (let i = 0; i < 3e6; i++) {} };
+      try { null.x } catch {}
+      return "late";`;
+  const lateThrow = late.replace('return "late";', 'throw { late: 1 };');
+  for (const name of [`get name() { ${late} }`, `name: { toString() { ${late} } }`, `get name() { ${lateThrow} }`, `name: { toString() { ${lateThrow} } }`]) {
+    let checks = 0;
+    const { e } = await engine({ interrupt: () => ++checks === 101 });
+    const s = e.start(PRELUDE, `queueMicrotask(() => { throw { message: "m", ${name} } }); 1`, 's.js');
+    assert.deepEqual(s, { kind: 'failed', name: '', message: 'm' }, name);
+    assert.equal(checks, 101, `${name}: the stop came while the name was read`);
+    e.dispose();
+  }
+});
+
+test("a stack that isn't a string is left out, its string form never made, and a string stack is kept", async () => {
+  // The continuation of the call in flight, which isn't part of the read, says how many times the
+  // stack's string form was made while the ending was read.
+  const { e, rec } = await engine();
+  const s = e.start(PRELUDE, `let made = 0;
+    tool("in flight").then(() => __output(1, "made " + made));
+    throw { message: "m", stack: { toString() { made += 1; return "made up"; } } }`, 's.js');
+  assert.deepEqual(s, { kind: 'rejected', name: '', message: 'm' });
+  e.settle(1, true, '1', UNFIT);
+  assert.deepEqual(rec.output, [[1, 'made 0']]);
+  e.dispose();
+  const b = await engine();
+  assert.deepEqual(b.e.start(PRELUDE, 'throw { message: "m", stack: "plain" }', 's.js'), { kind: 'rejected', name: '', message: 'm', stack: 'plain' });
+  b.e.dispose();
+});
+
 test('each part read before a stop keeps its string form, a number\'s or an object\'s', async () => {
   // The slot says stop once only, as the name getter spins. The message, read first, isn't a
   // string: its string form is made before the name is read.
@@ -694,6 +732,26 @@ test('once a stop has come, a failure with no message gets no stand-in for one',
     const s = e.start(PRELUDE, `queueMicrotask(() => { throw ${thrown} }); 1`, 's.js');
     assert.deepEqual(s, { kind: 'failed', name: '', message: '' }, thrown);
     assert.ok(checks > 100, `${thrown}: the stop came while it was read`);
+    e.dispose();
+  }
+});
+
+test('a stand-in for a missing message that ends after a stop QuickJS dropped is left out', async () => {
+  // As for a part read late: the slot says stop once, as the toJSON, or the toString, spins in a
+  // stack hook, where QuickJS drops the stop, so the code goes on and gives "late" after it, or throws.
+  const late = `Error.prepareStackTrace = () => { for (let i = 0; i < 3e6; i++) {} };
+      try { null.x } catch {}
+      return "late";`;
+  const lateThrow = late.replace('return "late";', 'throw { late: 1 };');
+  for (const thrown of [
+    `{ code: 5, toJSON() { ${late} } }`, `{ toJSON() { return undefined }, toString() { ${late} } }`,
+    `{ code: 5, toJSON() { ${lateThrow} } }`, `{ toJSON() { return undefined }, toString() { ${lateThrow} } }`,
+  ]) {
+    let checks = 0;
+    const { e } = await engine({ interrupt: () => ++checks === 101 });
+    const s = e.start(PRELUDE, `queueMicrotask(() => { throw ${thrown} }); 1`, 's.js');
+    assert.deepEqual(s, { kind: 'failed', name: '', message: '' }, thrown);
+    assert.equal(checks, 101, `${thrown}: the stop came while the stand-in was made`);
     e.dispose();
   }
 });
