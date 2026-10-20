@@ -3,12 +3,12 @@
  *
  * Plain speech is held back for reasons that are right in themselves: an
  * explicit send in the same round suppresses the round's prose (so a "sent
- * it" postscript is not posted twice), a turn may have no destination, two
- * conversations may compete for an unaddressed reply, and a malformed or
- * unresolvable routing prefix bounces. Before drafts, the held words were
+ * it" postscript is not posted twice), a turn may have no destination, and a
+ * malformed or unresolvable routing prefix bounces. Before drafts, the held words were
  * kept only as a count (or, in explicit mode, as one in-memory latest-wins
  * clipboard): the law was right, and the penalty was amnesia. A draft keeps
- * the exact words until the resident resends or dismisses them.
+ * the exact words until the resident resends or dismisses them, or the
+ * retention below lets it go.
  *
  * The boundary is publication and agency, not visibility: a draft is never
  * published except by its resident's explicit resend (or `{{unsent}}`), and
@@ -21,26 +21,26 @@
  * typed Chronicle records, which do not follow branch switches: undo,
  * rollback, suppression and branch moves never touch them. A draft written
  * in a turn that is later undone stays usable (the words were genuinely
- * written and held back), and a delivered draft stays delivered. Its
- * originating branch is recorded as provenance only. The notices that name
- * a draft are conversation, so they do follow the branch: a draft counts as
+ * written and held back), and a delivered draft stays delivered. The
+ * notices that name a draft are conversation, so they do follow the branch: a draft counts as
  * named while a message naming it is on the current branch, and one a
  * rollback or branch move has left unnamed is named again.
  *
  * Drafts are kept, not hoarded. Each resident's KEEP_NEWEST newest drafts
- * are always kept; an older one is let go once nothing has happened to it
- * (held, named, attempted, answered, dismissed) for KEEP_IDLE_MS. The words
- * stay in the resident's history either way. The journal checkpoints what
- * it keeps every CHECKPOINT_EVERY entries, so opening it replays only what
- * came after.
+ * are always kept; an older one, in any state, is let go at the journal's
+ * next checkpoint once nothing has happened to it (held, named, attempted,
+ * answered, dismissed) for KEEP_IDLE_MS. The journal checkpoints what it
+ * keeps every CHECKPOINT_EVERY entries, so opening it replays only what came
+ * after, and a resident whose drafts change rarely keeps its older ones
+ * until then. The words stay in the resident's history either way.
  *
  * A delivery attempt is journaled durably BEFORE its request leaves the
  * host, and its outcome after: an attempt with no recorded outcome (a crash
  * mid-send) reads as unknown, never as unsent. A delivered draft carries a
  * historical receipt — confirmed at a time, to a destination, with the
- * connector's message id — not a claim that the message still exists.
- * Nothing here publishes anything: every send is the resident's explicit
- * resend, and nothing replays at boot or on a branch move.
+ * connector's message id when it names one — not a claim that the message
+ * still exists. A draft is sent only by its resident's explicit resend or
+ * an envelope's {{unsent}}; nothing replays at boot or on a branch move.
  */
 
 import { randomInt } from 'node:crypto';
@@ -57,21 +57,8 @@ export type DraftReason =
   | 'explicit-send'
   /** The speech had no destination (no route this turn, or a failed envelope). */
   | 'no-destination'
-  /** Two conversations competed for an unaddressed reply. */
-  | 'ambiguous'
   /** An explicit/hybrid routing prefix was missing, malformed or unresolvable. */
   | 'bounced';
-
-/** Where a draft's words were written. Provenance only: nothing routes by it. */
-export interface DraftSource {
-  /** Chronicle branch current when the words were held. */
-  branch: string;
-  /** The resident's logical turn (process-local counter) and the round in it. */
-  turn: number;
-  round: number;
-  /** Position of the segment within its round's speech. */
-  segment: number;
-}
 
 export interface DraftAttemptOutcome {
   status: PublishOutcome['status'];
@@ -85,7 +72,7 @@ export interface DraftAttempt {
   attemptId: string;
   at: number;
   destination: PublishDestination;
-  /** How the words went out: the drafts tool, or explicit mode's `{{unsent}}`. */
+  /** How the words went out: the drafts tool, or a `{{unsent}}` envelope (explicit or hybrid). */
   via: 'resend' | 'unsent-token';
   /** The resident resent knowing an earlier attempt may have been posted. */
   confirmedDuplicate?: true;
@@ -126,7 +113,6 @@ export interface Draft {
   /** Short context for the resident: the bounce reason, or the competing conversations. */
   note?: string;
   heldAt: number;
-  source: DraftSource;
   attempts: DraftAttempt[];
   dismissedAt?: number;
   /** The messages whose notices named this draft, by id. It counts as named
@@ -137,9 +123,11 @@ export interface Draft {
 }
 
 /**
- * - `held`: never attempted, or every attempt definitely failed — resend freely;
- * - `unconfirmed`: some attempt's outcome is unknown (or was never
- *   recorded), and none was confirmed: it may have been posted, so a resend
+ * - `held`: no inherited risk, and never attempted or every attempt
+ *   definitely failed — resend freely;
+ * - `unconfirmed`: no attempt was confirmed and the draft is not dismissed;
+ *   either an attempt's outcome is unknown (or was never recorded), or the
+ *   words carry inherited risk regardless of their own attempts. A resend
  *   needs explicit confirmation. A later attempt that fails does not resolve
  *   an earlier one that may have landed — the uncertainty stays;
  * - `delivered`: an attempt was confirmed — its receipt is historical;
@@ -184,6 +172,12 @@ interface DraftSnapshot {
 
 /** Unambiguous lowercase alphabet for short ids (no i/l/o/0/1). */
 const ID_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789';
+/**
+ * Characters after `d-` in a draft's id: 31^7, about 2.75 × 10^10 ids, so a
+ * mistyped id almost never names a real draft, and an id retention let go is
+ * given again only rarely (see newId).
+ */
+const ID_LENGTH = 7;
 
 /** Each resident's newest drafts, by hold order, that are always kept. */
 export const KEEP_NEWEST = 100;
@@ -307,9 +301,13 @@ export class ProseDraftStore {
   }
 
   /**
-   * Journal and apply one entry. A write that fails after reaching the store
-   * leaves the journal unreconciled: rebuild from it before rethrowing, so
-   * the projection never disagrees with what the journal holds.
+   * Journal and apply one entry. A write that fails after the store's append
+   * returned leaves the journal unreconciled: rebuild from it before
+   * rethrowing, so the projection never disagrees with what the journal
+   * holds. An append that fails inside the store can't be read back until
+   * the store is reopened: the journal then refuses every write until the
+   * next start, which replays that entry, so until then each write throws,
+   * no new draft is kept, and the projection lacks that entry.
    */
   private write(entry: DraftEntry, durable: boolean, afterCommittedState = false): void {
     try {
@@ -332,14 +330,16 @@ export class ProseDraftStore {
   }
 
   /** A new id, unique among the resident's kept drafts and never its latest
-   *  bounce's. One let go can be given again: the notices that named it are
-   *  by then at least KEEP_IDLE_MS old and KEEP_NEWEST drafts back. */
+   *  bounce's. One that retention let go can be given again: after N more
+   *  of its resident's drafts, a given let-go id has come back with a
+   *  probability of about N in 2.75 × 10^10 (ID_LENGTH), and a request naming
+   *  it then reaches the newer draft rather than being refused. */
   private newId(agent: string): string {
     const existing = this.agentDrafts(agent);
     const latestBounce = this.latestBounces.get(agent);
     for (;;) {
       let id = 'd-';
-      for (let i = 0; i < 5; i++) id += ID_ALPHABET[randomInt(ID_ALPHABET.length)];
+      for (let i = 0; i < ID_LENGTH; i++) id += ID_ALPHABET[randomInt(ID_ALPHABET.length)];
       if (!existing.has(id) && id !== latestBounce) return id;
     }
   }
@@ -350,11 +350,14 @@ export class ProseDraftStore {
    * already written stand and the rest are reported as not held: their words
    * remain in the resident's history only. A draft whose record reached the
    * store before its write failed (its sync did) is in the reconciled
-   * journal, so it is held, and counted so.
+   * journal, so it is held, and counted so. When the store's append itself
+   * threw, the record may still be in its log: the draft is reported as not
+   * held, and the journal refuses further writes until a reload, which
+   * replays it as held if it is there.
    */
   hold(
     agent: string,
-    segments: Array<{ text: string; source: DraftSource; note?: string; inheritedRisk?: InheritedRisk }>,
+    segments: Array<{ text: string; note?: string; inheritedRisk?: InheritedRisk }>,
     reason: DraftReason,
     note?: string,
   ): { held: Draft[]; notHeld?: { count: number; error: string } } {
@@ -370,7 +373,6 @@ export class ProseDraftStore {
         ...(segmentNote ? { note: segmentNote } : {}),
         ...(segment.inheritedRisk ? { inheritedRisk: segment.inheritedRisk } : {}),
         heldAt: Date.now(),
-        source: segment.source,
       };
       try {
         this.write({ op: 'held', draft }, true);

@@ -92,6 +92,10 @@ export interface ToolResultEvent {
   agentName: string;
   /** Module that handled the call */
   moduleName: string;
+  /** The tool's name, as its call named it. The framework's own
+   *  producers set it, so a result nothing can take any more (one arriving
+   *  after stop()) is still logged by tool. */
+  toolName?: string;
   /** Result of the tool call */
   result: ToolResult;
 }
@@ -189,12 +193,35 @@ export interface ToolResult {
   /** Whether this was an error (for LLM) */
   isError?: boolean;
   /**
+   * The result's machine-readable form, beside `data`. Programs read it: a
+   * script gets it in its result object, and a host in the tool result
+   * event. The model never reads this field: it sees the value only where an
+   * MCP conversion put it in the content as JSON, which happens only when the
+   * server sent no text. An MCP tool's is its `structuredContent`, present
+   * exactly when the server sent one, so `false`, `0` and `null` are values
+   * here, not absence. Any other tool can set one too, as `code_execution`
+   * does with its script's stdout, stderr, exit code and any time-limit note.
+   */
+  structured?: unknown;
+  /**
    * When true, the framework saves tool_use + tool_result messages to context,
    * cancels the active stream, and resets the agent to idle.
    * This is a "sleep until next event" primitive — the LLM expects the call to block.
    * Adapted from Anarchid/agent-framework@mcpl-module-proto.
    */
   endTurn?: boolean;
+  /**
+   * Fields of `data` that say what the tool acted on, such as the paths a
+   * write wrote, removed or took from disk, the path it deleted, or a mount
+   * whose root it accepted, in the order they should be kept. When the
+   * tool-result guard withholds this result, these fields stay in its stub,
+   * so the agent still sees what the tool did; the result as stored goes
+   * where every withheld original goes (agent-framework #277). Past the
+   * inline cap they're cut, in this order, so a later field can be cut away
+   * entirely; put the short, telling ones first. Only data's own fields can
+   * be kept, and a failed result (success false) keeps nothing.
+   */
+  keepWhenWithheld?: string[];
 }
 
 /**
@@ -209,6 +236,42 @@ export interface ToolCall {
   input: unknown;
   /** The agent that made this tool call. Set by the framework dispatch layer. */
   callerAgentName?: string;
+  /**
+   * The turn the call was made in, the same id as that turn's
+   * `SpeechContext.turnId`. Set by the framework dispatch layer, beside
+   * `callerAgentName`: a model's call carries the turn whose stream made it, a
+   * foreground script's inner call the turn of the code_execution call whose
+   * script is running when the call arrives, and a utility run its `utils`
+   * call's. A background script runs apart from any turn, so its calls carry
+   * none. Ids increase, so a later turn's is larger, and they're unique only
+   * within one run of the process. A call made with `executeToolCall` or a
+   * module's `callTool` skips that layer and carries whatever turn its caller
+   * put on the call, usually none.
+   */
+  callerTurnId?: number;
+  /**
+   * How long this call's result may be and still reach its caller whole,
+   * measured as the framework stores it: an error's text, or a success's data
+   * as JSON (a content array as its text). For a model's call it is the
+   * agent's inline cap, past which the framework spills the result to a
+   * workspace file and sends a preview. For a call from a running
+   * code_execution script it is the script's limit, past which a success's
+   * result is cut; an error reaches the script whole, after "Error: ". A
+   * result that carries `structured` reaches a script instead as one JSON
+   * object of its content, structured content and error, measured whole; one
+   * past the limit is saved to a workspace file in its place, or, where it
+   * can't be, isn't delivered. A tool
+   * that pages or budgets its answer can stay under it. The framework sets it
+   * on a model's, a script's and the operator's puppet's call to a module, a
+   * utility run through `utils` included. A call made in process with
+   * ModuleContext.callTool or executeToolCall carries what its caller put on
+   * it, as the puppet's does; the framework's own read_image tool passes a
+   * model's call to the workspace without it; and a utility run through
+   * `utils` carries what its `utils` call carried. Without it, a module holds
+   * its answer to a bound of its own, if any: the workspace's is the house
+   * default, 24,000.
+   */
+  resultMaxChars?: number;
 }
 
 // ============================================================================

@@ -19,7 +19,6 @@ import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 const ROOM = 'discord:g1:room';
 const GENERAL = 'discord:g1:general';
-const source = { branch: 'main', turn: 1, round: 1, segment: 0 };
 const dest = (channelId = ROOM) => ({ serverId: 'discord', channelId, label: '#room (Guild One)' });
 
 describe('ProseDraftStore', () => {
@@ -32,9 +31,9 @@ describe('ProseDraftStore', () => {
   it('holds exact words in order, with stable ids, per resident', () => {
     const { dir, store, drafts } = open();
     try {
-      const { held } = drafts.hold('a', [{ text: ' one\n', source }, { text: 'two  ', source: { ...source, segment: 1 } }], 'explicit-send');
+      const { held } = drafts.hold('a', [{ text: ' one\n' }, { text: 'two  ' }], 'explicit-send');
       assert.equal(held.length, 2);
-      assert.match(held[0]!.id, /^d-[a-z2-9]{5}$/);
+      assert.match(held[0]!.id, /^d-[a-z2-9]{7}$/);
       assert.notEqual(held[0]!.id, held[1]!.id);
       assert.deepEqual(drafts.open('a').map((d) => d.text), ['two  ', ' one\n'], 'newest first, bytes exact');
       assert.deepEqual(drafts.open('b'), [], 'another resident sees none of them');
@@ -46,10 +45,18 @@ describe('ProseDraftStore', () => {
     }
   });
 
+  it("the drafts tool's example id has the form newId issues", () => {
+    const tool = (AgentFramework as unknown as {
+      DRAFTS_TOOL: { inputSchema: { properties: { draftIds: { description: string } } } };
+    }).DRAFTS_TOOL;
+    const example = /"(d-[^"]*)"/.exec(tool.inputSchema.properties.draftIds.description)?.[1];
+    assert.match(example ?? '(none)', /^d-[a-z2-9]{7}$/);
+  });
+
   it('replays the journal at reopen: an attempt with no recorded outcome reads as unconfirmed', () => {
     const { dir, store, drafts } = open();
     const path = join(dir, 'store');
-    const { held } = drafts.hold('a', [{ text: 'words', source }, { text: 'more', source }], 'explicit-send');
+    const { held } = drafts.hold('a', [{ text: 'words' }, { text: 'more' }], 'explicit-send');
     drafts.beginAttempt('a', held[0]!.id, dest(), 'resend', false); // the process "dies" here
     const second = drafts.beginAttempt('a', held[1]!.id, dest(), 'resend', false);
     drafts.recordOutcome('a', held[1]!.id, second, { status: 'delivered', messageId: 'm-9', at: 5, destination: dest() });
@@ -70,7 +77,7 @@ describe('ProseDraftStore', () => {
     const { dir, store, drafts } = open();
     try {
       const main = store.currentBranch().name;
-      const { held } = drafts.hold('a', [{ text: 'kept', source }, { text: 'set aside', source }], 'explicit-send');
+      const { held } = drafts.hold('a', [{ text: 'kept' }, { text: 'set aside' }], 'explicit-send');
       const attempt = drafts.beginAttempt('a', held[0]!.id, dest(), 'resend', false);
       drafts.recordOutcome('a', held[0]!.id, attempt, { status: 'delivered', at: 7, destination: dest() });
       drafts.dismiss('a', held[1]!.id);
@@ -79,7 +86,7 @@ describe('ProseDraftStore', () => {
       drafts.reload();
       assert.equal(draftState(drafts.get('a', held[0]!.id)!), 'delivered', 'a delivered draft stays delivered');
       assert.equal(draftState(drafts.get('a', held[1]!.id)!), 'dismissed', 'a dismissed draft stays dismissed');
-      const later = drafts.hold('a', [{ text: 'held on another branch', source }], 'explicit-send').held[0]!;
+      const later = drafts.hold('a', [{ text: 'held on another branch' }], 'explicit-send').held[0]!;
       store.switchBranch(main);
       drafts.reload();
       assert.equal(draftState(drafts.get('a', later.id)!), 'held', 'a draft is usable from any branch');
@@ -97,7 +104,7 @@ describe('ProseDraftStore', () => {
       let fail = true;
       (store as unknown as { sync: () => void }).sync = () => { if (fail) throw new Error('EIO'); real(); };
       t.mock.method(console, 'error', () => {});
-      const result = drafts.hold('a', [{ text: 'x', source }, { text: 'y', source }], 'explicit-send');
+      const result = drafts.hold('a', [{ text: 'x' }, { text: 'y' }], 'explicit-send');
       // The first record reached the store before its barrier failed: the
       // journal was reconciled, so the projection holds it, and so does the
       // answer. Only the second is reported not held.
@@ -105,7 +112,7 @@ describe('ProseDraftStore', () => {
       assert.deepEqual(result.notHeld, { count: 1, error: 'EIO' });
       assert.deepEqual(drafts.open('a').map((d) => d.text), ['x']);
       fail = false;
-      assert.equal(drafts.hold('a', [{ text: 'z', source }], 'explicit-send').held.length, 1);
+      assert.equal(drafts.hold('a', [{ text: 'z' }], 'explicit-send').held.length, 1);
     } finally {
       store.close();
       rmSync(dir, { recursive: true, force: true });
@@ -115,7 +122,7 @@ describe('ProseDraftStore', () => {
   it('a draft counts as named while a message that named it is on the branch, newest first', () => {
     const { dir, store, drafts } = open();
     try {
-      const { held } = drafts.hold('a', [{ text: 'one', source }, { text: 'two', source }, { text: 'three', source }], 'explicit-send');
+      const { held } = drafts.hold('a', [{ text: 'one' }, { text: 'two' }, { text: 'three' }], 'explicit-send');
       const [one, two, three] = held;
       drafts.markNoticed('a', [one!.id, two!.id], 'm-1');
       drafts.markNoticed('a', [two!.id], 'm-2');
@@ -143,16 +150,16 @@ describe('ProseDraftStore', () => {
     const retention = { keepNewest: 2, keepIdleMs: hour, checkpointEvery: 9 };
     let drafts = new ProseDraftStore(store, retention);
     try {
-      const [older] = drafts.hold('a', [{ text: 'an older bounce', source }], 'bounced').held;
-      const [latest] = drafts.hold('a', [{ text: 'the latest bounce', source }], 'bounced').held;
-      const [settled] = drafts.hold('a', [{ text: 'resent long ago', source }], 'explicit-send').held;
+      const [older] = drafts.hold('a', [{ text: 'an older bounce' }], 'bounced').held;
+      const [latest] = drafts.hold('a', [{ text: 'the latest bounce' }], 'bounced').held;
+      const [settled] = drafts.hold('a', [{ text: 'resent long ago' }], 'explicit-send').held;
       const attempt = drafts.beginAttempt('a', settled!.id, dest(), 'resend', false);
       drafts.recordOutcome('a', settled!.id, attempt, { status: 'delivered', messageId: 'm-1', at: Date.now(), destination: dest() });
-      drafts.hold('b', [{ text: "another resident's", source }], 'explicit-send');
+      drafts.hold('b', [{ text: "another resident's" }], 'explicit-send');
       t.mock.timers.tick(2 * hour);
       // Something happens to the older bounce now: it isn't idle.
       drafts.beginAttempt('a', older!.id, dest(), 'resend', false);
-      const newest = drafts.hold('a', [{ text: 'new one', source }, { text: 'new two', source }], 'explicit-send').held;
+      const newest = drafts.hold('a', [{ text: 'new one' }, { text: 'new two' }], 'explicit-send').held;
       // That was the ninth entry: the checkpoint let go of 'a''s idle
       // drafts outside its two newest, the latest bounce among them.
       const kept = () => drafts.open('a').map((d) => d.text);
@@ -183,7 +190,7 @@ describe('ProseDraftStore', () => {
   it('records a notice only after the history holding it is synced (afterCommittedState)', () => {
     const { dir, store, drafts } = open();
     try {
-      const { held } = drafts.hold('a', [{ text: 'x', source }], 'explicit-send');
+      const { held } = drafts.hold('a', [{ text: 'x' }], 'explicit-send');
       const calls: string[] = [];
       const real = { sync: store.sync.bind(store), appendJson: store.appendJson.bind(store) };
       (store as unknown as { sync: () => void }).sync = () => { calls.push('sync'); real.sync(); };
@@ -201,7 +208,7 @@ describe('ProseDraftStore', () => {
     const { dir, store, drafts } = open();
     try {
       const risky = { draftId: 'd-zzzzz', destination: dest(), at: 1, reason: 'no valid receipt' };
-      const [copy] = drafts.hold('a', [{ text: 'risky words and more', source, inheritedRisk: risky }], 'bounced').held;
+      const [copy] = drafts.hold('a', [{ text: 'risky words and more', inheritedRisk: risky }], 'bounced').held;
       assert.equal(draftState(copy!), 'unconfirmed');
       const failed = drafts.beginAttempt('a', copy!.id, dest(), 'resend', true);
       drafts.recordOutcome('a', copy!.id, failed, { status: 'failed', at: 2, destination: dest() });
@@ -218,9 +225,9 @@ describe('ProseDraftStore', () => {
   it('{{unsent}} is the latest bounce while it is open, latest-wins', () => {
     const { dir, store, drafts } = open();
     try {
-      const first = drafts.hold('a', [{ text: 'first', source }], 'bounced').held[0]!;
-      const second = drafts.hold('a', [{ text: 'second', source }], 'bounced').held[0]!;
-      drafts.hold('a', [{ text: 'not a bounce', source }], 'explicit-send');
+      const first = drafts.hold('a', [{ text: 'first' }], 'bounced').held[0]!;
+      const second = drafts.hold('a', [{ text: 'second' }], 'bounced').held[0]!;
+      drafts.hold('a', [{ text: 'not a bounce' }], 'explicit-send');
       assert.equal(drafts.latestBounce('a')?.id, second.id);
       drafts.dismiss('a', second.id);
       assert.equal(drafts.latestBounce('a'), undefined, 'an older bounce is not substituted');
@@ -465,13 +472,78 @@ describe('held prose drafts, end to end', () => {
         createMockResponse([]),
       ]);
       assert.deepEqual(h.drafts(), []);
-      assert.ok(h.texts().some((t) => t === '[delivered] nothing — 1 plain-speech segment(s) kept private (skip_reply)'));
+      assert.ok(h.texts().some((t) => t === '[delivered] nothing — 1 plain-speech segment(s) kept private (skip_reply or a private think)'));
       await h.turn([
         createMockResponse([text('Prose beside a private think.'), call('t1', 'think', { thought: 'hmm' }), explicitSend('s1')], 'tool_use'),
         createMockResponse([]),
       ]);
       assert.deepEqual(h.drafts(), [], 'a same-round private think keeps its prose private, even beside a send');
       assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note elsewhere']);
+      assert.equal(h.texts().filter((t) => t.startsWith('[delivered]')).at(-1),
+        '[delivered] nothing — 1 plain-speech segment(s) kept private (skip_reply or a private think)',
+        'the receipt counts it, and says a private think may be why');
+    } finally {
+      await h.close();
+    }
+  });
+
+  for (const xml of [false, true]) {
+    it(`${xml ? 'XML tool mode' : 'native tool mode'}: a refused wake keeps only its own round private, so a later send's prose is held as drafts`, async () => {
+      // With no EventGate, skip_reply's wake_in_seconds is refused and the
+      // turn goes on: the silence before the refusal comes back at the next
+      // round, with why it silences, so the send's round is an explicit send's.
+      const h = await harness({ xml });
+      try {
+        const wake = call('w1', 'skip_reply', { reason: 'later', wake_in_seconds: 60 });
+        const done = (id: string) => ({ type: 'tool_result', toolUseId: id, content: 'done', isError: false }) as ContentBlock;
+        await h.turn([
+          createMockResponse([text('Private, beside the refused wake.'), wake], 'tool_use'),
+          createMockResponse([text('Beside the send.'), explicitSend('s1')], 'tool_use'),
+          // XML mode completes with the turn's whole content, as membrane
+          // parses it: each round's calls and then their results.
+          xml
+            ? { ...createMockResponse([text('Private, beside the refused wake.'), wake, done('w1'), text('Beside the send.'), explicitSend('s1'), done('s1'), text('After the send.')]), toolCalls: [] }
+            : createMockResponse([text('After the send.')]),
+        ]);
+        assert.match(h.toolResults()[0]!, /no wake was set/, 'the wake was refused, and the turn went on');
+        assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note elsewhere'], 'only the explicit send went out');
+        const held = h.drafts().reverse();
+        assert.deepEqual(held.map((d) => d.text), ['Beside the send.', 'After the send.'],
+          'the refused round stays private; the send\'s rounds are held, not kept private');
+        assert.ok(held.every((d) => d.reason === 'explicit-send'));
+        assert.ok(h.texts().some((t) => t.startsWith('[delivered] nothing — 2 plain-speech segment(s) held as drafts ')));
+      } finally {
+        await h.close();
+      }
+    });
+  }
+
+  it("native tool mode: beside a refused wake, a module's skip_reply after a send keeps the later prose private", async () => {
+    // An unrefused plain skip_reply ends the turn, so the saved silence's
+    // 'private' over 'send' decides something only for a call whose bare name
+    // is skip_reply but whose full name isn't, here one named like a module's
+    // tool: it silences by that name, as main reads any `--skip_reply`, and
+    // neither ends the turn nor is refused. In XML tool mode the turn-end scan
+    // reads the whole turn's calls, so this case doesn't turn on the saved
+    // silence there.
+    const h = await harness();
+    try {
+      await h.turn([
+        createMockResponse([text('Beside the send.'), explicitSend('s1')], 'tool_use'),
+        createMockResponse([
+          text('Private, beside the refused wake.'),
+          call('w1', 'skip_reply', { reason: 'later', wake_in_seconds: 60 }),
+          call('m1', 'tools--skip_reply', {}),
+        ], 'tool_use'),
+        createMockResponse([text('After the wake.')]),
+      ]);
+      assert.ok(h.toolResults().some((r) => /no wake was set/.test(r)), 'the wake was refused, and the turn went on');
+      assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note elsewhere'], 'only the explicit send went out');
+      const held = h.drafts();
+      assert.deepEqual(held.map((d) => d.text), ['Beside the send.'], "only the send's own round is held");
+      assert.equal(h.texts().find((t) => t.startsWith('[delivered]')),
+        `[delivered] nothing — 1 plain-speech segment(s) held as draft ${held[0]!.id} (not sent — drafts can resend them unchanged, or dismiss them) · 2 plain-speech segment(s) kept private (skip_reply or a private think)`,
+        'the refused round and the round after it stay private');
     } finally {
       await h.close();
     }
@@ -485,7 +557,7 @@ describe('held prose drafts, end to end', () => {
         createMockResponse([text('More of it.')]),
       ]);
       assert.deepEqual(h.drafts(), []);
-      assert.ok(h.texts().some((t) => t.startsWith('[delivered] nothing — 2 plain-speech segment(s) suppressed (proseRouting=disabled')));
+      assert.ok(h.texts().some((t) => t.startsWith('[delivered] plain speech → no channel — 2 plain-speech segment(s) kept in the transcript (proseRouting=disabled')));
     } finally {
       await h.close();
     }
@@ -512,7 +584,9 @@ describe('held prose drafts, end to end', () => {
       assert.equal(h.publishes().filter((p) => p.text === 'scout words').length, 0);
       // Residents of one framework share a message slot (#197), so the
       // notice is visible there too; it names whose drafts it means.
-      assert.ok(h.texts('scout').some((t) => t.startsWith(`[drafts] scout: not sent — a plain-speech segment held as draft ${mine.id}`)));
+      const held = h.texts('scout').find((t) => t.startsWith(`[drafts] scout: not sent — a plain-speech segment held as draft ${mine.id}`));
+      assert.ok(held);
+      assert.ok(!held!.includes('scout words'), `the held-draft notice quotes none of the draft's words: ${held}`);
     } finally {
       await h.close();
     }
@@ -541,7 +615,7 @@ describe('held prose drafts, end to end', () => {
 
       h.command({ op: 'publish-mode', mode: 'delivered' });
       await h.turn([createMockResponse([resend('r3')], 'tool_use'), createMockResponse([])]);
-      assert.match(h.toolResults()[0]!, /may already have been posted.*confirmDuplicate: true\. Nothing was sent/);
+      assert.match(h.toolResults()[0]!, /may already have been posted: .*, so sending it again could post it twice\. To send it anyway, resend with confirmDuplicate: true\. Nothing was sent/);
       const before = h.publishes().length;
       await h.turn([createMockResponse([resend('r4', true)], 'tool_use'), createMockResponse([])]);
       assert.match(h.toolResults()[0]!, /delivered to/);
@@ -563,7 +637,7 @@ describe('held prose drafts, end to end', () => {
       assert.equal(h.publishes().filter((p) => p.event === 'publish-error').length, 1, 'the request reached the server');
       await h.until(() => h.texts().some((t) => t.startsWith('[discord-send-failed]')), 'the marker');
       const marker = h.texts().find((t) => t.startsWith('[discord-send-failed]'))!;
-      assert.match(marker, /was not confirmed \(.*connector exploded.*\(delivery uncertain\)\)\. It may or may not have been posted; check the channel/);
+      assert.match(marker, /was not confirmed \(.*connector exploded.*\(delivery uncertain\)\)\. It may or may not have been posted, so sending it again could post it twice/);
       // A resend of a held draft records the same outcome.
       await h.turn([
         createMockResponse([text('held beside a send'), explicitSend('s1')], 'tool_use'),
@@ -583,6 +657,111 @@ describe('held prose drafts, end to end', () => {
     }
   });
 
+  it('through the real connection, failed locus speech keeps its failure marker, since nothing holds it', async () => {
+    const h = await harness();
+    try {
+      h.command({ op: 'publish-mode', mode: 'not-delivered' });
+      await h.turn([createMockResponse([text('words a refusing connector drops')])]);
+      await h.until(() => h.texts().some((t) => t.startsWith('[discord-send-failed]')), 'the marker');
+      const marker = h.texts().find((t) => t.startsWith('[discord-send-failed]'))!;
+      assert.match(marker, /could not be delivered to .* Nothing was posted/);
+      assert.deepEqual(h.drafts(), [], 'locus speech is not held');
+    } finally {
+      await h.close();
+    }
+  });
+
+  for (const mode of ['explicit', 'hybrid'] as const) {
+    it('through the real connection, failed ' + mode + ' speech is held as a bounce draft with one notice, not a second marker', async () => {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting: mode }] });
+      try {
+        h.command({ op: 'publish-mode', mode: 'not-delivered' });
+        await h.turn([createMockResponse([text((mode === 'explicit' ? '>>' : '>>>') + ROOM + ' refused words')])]);
+        assert.deepEqual(h.publishes().map((p) => p.text), ['refused words']);
+        const [draft] = h.drafts();
+        assert.ok(draft, 'the words are held');
+        assert.equal(draft!.text, 'refused words');
+        assert.ok(h.texts().some((t) => t.startsWith('[prose-routing]') && t.includes(`It is held as draft ${draft!.id}`)), 'the bounce notice names it');
+        assert.deepEqual(h.texts().filter((t) => t.startsWith('[discord-send-failed]')), [], 'no second notice for the same failure');
+      } finally {
+        await h.close();
+      }
+    });
+  }
+
+  for (const mode of ['explicit', 'hybrid'] as const) {
+    it('through the real connection, unknown ' + mode + ' speech is marked but not held for an ordinary resend', async () => {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting: mode }] });
+      try {
+        h.command({ op: 'publish-mode', mode: 'no-receipt' });
+        await h.turn([createMockResponse([text((mode === 'explicit' ? '>>' : '>>>') + ROOM + ' uncertain words')])]);
+        assert.deepEqual(h.publishes().map((p) => p.text), ['uncertain words'], 'one request may already have posted');
+        assert.deepEqual(h.drafts(), [], 'uncertainty is not a fresh resendable bounce');
+        const markers = h.texts().filter((t) => t.startsWith('[discord-send-failed]'));
+        assert.equal(markers.length, 1);
+        assert.match(markers[0]!, /was not confirmed.*may or may not have been posted/);
+        assert.ok(!h.messages().some((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'prose-bounce'), 'no bounce notice offers a retry');
+      } finally {
+        await h.close();
+      }
+    });
+  }
+
+  for (const privateThink of [false, true]) {
+    it('hybrid skip_reply unsent ' + (privateThink ? 'stays uninterpreted beside a private think' : 'dismisses the bounce while keeping the round private'), async () => {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid', sameRoundThinkTextPolicy: 'private' }] });
+      try {
+        const original = h.store().hold('scout', [{ text: 'held bounce' }], 'bounced').held[0]!;
+        assert.equal(draftState(original), 'held');
+        const blocks = [text('>>>skip_reply {{unsent}}'), call('skip1', 'skip_reply', {})];
+        if (privateThink) blocks.push(call('think1', 'think', { thought: 'private reasoning' }));
+        await h.turn([createMockResponse(blocks, 'tool_use'), createMockResponse([])]);
+        assert.equal(draftState(h.store().get('scout', original.id)!), privateThink ? 'held' : 'dismissed');
+        assert.deepEqual(h.publishes(), [], 'deliberate privacy posts nothing');
+        assert.equal(h.store().open('scout').length, privateThink ? 1 : 0, 'no fresh draft was made from private words');
+      } finally {
+        await h.close();
+      }
+    });
+  }
+
+  it('an empty completion waits for earlier queued speech and holds before writing their receipt', async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    let release: (() => void) | undefined;
+    try {
+      const registry = (h.framework as unknown as { channelRegistry: { deliverSpeech: (...args: unknown[]) => Promise<unknown> } }).channelRegistry;
+      const deliver = registry.deliverSpeech.bind(registry);
+      let entered = false;
+      registry.deliverSpeech = async (...args: unknown[]) => {
+        if (args[1] === 'slow queued words') {
+          entered = true;
+          await new Promise<void>((resolve) => { release = resolve; });
+        }
+        return deliver(...args);
+      };
+      // Deliberately not rounds(): the last response has no prior content.
+      const running = h.turn([
+        createMockResponse([text('>>>' + ROOM + ' slow queued words'), call('list1', 'channel_list', {})], 'tool_use'),
+        createMockResponse([text('held behind the slow delivery'), explicitSend('send1')], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      await h.until(() => entered && (h.membrane.lastStream?.receivedToolResults.length ?? 0) >= 2, 'both tool rounds behind the pending delivery');
+      assert.deepEqual(h.drafts(), [], 'the hold is still queued');
+      release!();
+      await running;
+      await h.until(() => h.publishes().some((p) => p.text === 'slow queued words') && h.drafts().length === 1, 'the earlier delivery and queued hold');
+      const draft = h.drafts()[0]!;
+      assert.equal(draft.text, 'held behind the slow delivery');
+      const receipt = h.texts().find((t) => t.startsWith('[delivered]'));
+      assert.ok(receipt, 'the completed turn receipts the queued work');
+      assert.ok(receipt.includes(ROOM), 'the delayed delivery is in the receipt');
+      assert.ok(receipt.includes(draft.id), 'so is the hold settled behind it');
+    } finally {
+      release?.();
+      await h.close();
+    }
+  });
+
   it('through the real connection, a server that never answers is unconfirmed once the request times out', async () => {
     const h = await harness({ requestTimeoutMs: 1_000 });
     try {
@@ -591,13 +770,13 @@ describe('held prose drafts, end to end', () => {
       await h.until(() => h.texts().some((t) => t.startsWith('[discord-send-failed]')), 'the marker');
       assert.equal(h.publishes().length, 0);
       const marker = h.texts().find((t) => t.startsWith('[discord-send-failed]'))!;
-      assert.match(marker, /was not confirmed \(MCPL server "discord" did not respond to channels\/publish .*within 1000ms.*\(delivery uncertain\)\)\. It may or may not have been posted/);
+      assert.match(marker, /was not confirmed \(The "discord" server didn't answer within 1 second, so whether the request took effect is unknown: .*may do it twice \(delivery uncertain\)\)\. It may or may not have been posted/);
     } finally {
       await h.close();
     }
   });
 
-  it("a silent turn's prose stays private beside a send: counted, never held or named", async () => {
+  it("a silent turn's prose stays private beside a send: never held, named or receipted", async () => {
     const h = await harness();
     try {
       await h.turn([
@@ -607,6 +786,7 @@ describe('held prose drafts, end to end', () => {
       assert.deepEqual(h.drafts(), [], 'nothing was held as a draft');
       assert.ok(!h.texts().some((t) => t.includes('held as draft')), 'and no notice names one');
       assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note elsewhere'], 'only the explicit send went out');
+      assert.ok(!h.texts().some((t) => t.startsWith('[delivered]')), 'a silent turn receives no plain-speech receipt');
     } finally {
       await h.close();
     }
@@ -626,7 +806,7 @@ describe('held prose drafts, end to end', () => {
       await h.turn([createMockResponse([resend('r1')], 'tool_use'), createMockResponse([])]);
       h.command({ op: 'publish-mode', mode: 'not-delivered' });
       await h.turn([createMockResponse([resend('r2', true)], 'tool_use'), createMockResponse([])]);
-      assert.match(h.toolResults()[0]!, /Nothing was posted by this attempt\. The draft stays unconfirmed: d-[a-z2-9]{5}'s attempt to .* may already have been posted: .*delivery uncertain/);
+      assert.match(h.toolResults()[0]!, /Nothing was posted by this attempt\. The draft stays unconfirmed: d-[a-z2-9]{7}'s attempt to .* may already have been posted: .*delivery uncertain/);
       assert.equal(draftState(h.store().get('scout', draft!.id)!), 'unconfirmed');
       h.command({ op: 'publish-mode', mode: 'delivered' });
       const before = h.publishes().length;
@@ -698,15 +878,16 @@ describe('held prose drafts, end to end', () => {
     try {
       // Held directly, as if the turn that held it died before its receipt;
       // the second also died mid-send, its attempt never resolved.
-      h.store().hold('scout', [{ text: 'orphaned words', source }], 'explicit-send');
-      const midSend = h.store().hold('scout', [{ text: 'half-sent words', source }], 'explicit-send').held[0]!;
+      h.store().hold('scout', [{ text: 'orphaned words' }], 'explicit-send');
+      const midSend = h.store().hold('scout', [{ text: 'half-sent words' }], 'explicit-send').held[0]!;
       h.store().beginAttempt('scout', midSend.id, dest(), 'resend', false);
       await h.turn([createMockResponse([])]);
       const notice = h.texts().find((t) => t.startsWith('[drafts]'))!;
-      assert.match(notice, /^\[drafts\] scout: 2 held drafts of yours are unnamed on this branch of your history: /);
-      assert.match(notice, /d-[a-z2-9]{5} \(held \(not sent\); held .*"orphaned words"\)/);
-      assert.match(notice, new RegExp(`${midSend.id} \\(UNCONFIRMED — an attempt to #room \\(Guild One\\) \\(${ROOM}\\) at .* may have been posted; .*"half-sent words"`));
+      assert.match(notice, /^\[drafts\] scout: 2 open drafts of yours that no recent notice on this branch names: /);
+      assert.match(notice, /d-[a-z2-9]{7} \(held \(not sent\); explicit send in the same round\)/);
+      assert.match(notice, new RegExp(`${midSend.id} \\(UNCONFIRMED — an attempt to #room \\(Guild One\\) \\(${ROOM}\\) at .* may have been posted; .*explicit send in the same round\\)`));
       assert.doesNotMatch(notice, /They were not sent/);
+      assert.ok(!notice.includes('orphaned words') && !notice.includes('half-sent words'), `the notice quotes no draft's words: ${notice}`);
       await h.turn([createMockResponse([])]);
       assert.equal(h.texts().filter((t) => t.startsWith('[drafts]')).length, 1, 'named once');
     } finally {
@@ -714,18 +895,19 @@ describe('held prose drafts, end to end', () => {
     }
   });
 
-  it('the catch-up names every draft it marks: the newest eight with previews, the rest by id', async () => {
+  it('the catch-up names every draft it marks: the newest eight with their state, the rest by id, and no words', async () => {
     const h = await harness();
     try {
-      const held = Array.from({ length: 10 }, (_, i) => h.store().hold('scout', [{ text: `orphan ${i}`, source }], 'explicit-send').held[0]!);
+      const held = Array.from({ length: 10 }, (_, i) => h.store().hold('scout', [{ text: `orphan ${i}` }], 'explicit-send').held[0]!);
       await h.turn([createMockResponse([])]);
       const notice = h.texts().find((t) => t.startsWith('[drafts]'))!;
-      assert.match(notice, /^\[drafts\] scout: 10 held drafts of yours are unnamed on this branch of your history: /);
-      // Newest first: orphan 9 down to orphan 2 with their previews, then the
-      // two oldest by id alone.
-      const previews = [...notice.matchAll(/"(orphan \d)"/g)].map((m) => m[1]);
-      assert.deepEqual(previews, [9, 8, 7, 6, 5, 4, 3, 2].map((i) => `orphan ${i}`));
+      assert.match(notice, /^\[drafts\] scout: 10 open drafts of yours that no recent notice on this branch names: /);
+      // Newest first: the eight newest with their state, then the two oldest
+      // by id alone. No draft's words appear.
+      const named = [...notice.matchAll(/(d-[a-z2-9]{7}) \(held \(not sent\); explicit send in the same round\)/g)].map((m) => m[1]);
+      assert.deepEqual(named, [9, 8, 7, 6, 5, 4, 3, 2].map((i) => held[i]!.id));
       assert.ok(notice.includes(` · and 2 more: ${held[1]!.id}, ${held[0]!.id}.`), notice);
+      assert.ok(!/orphan \d/.test(notice), `the notice quotes no draft's words: ${notice}`);
       await h.turn([createMockResponse([])]);
       assert.equal(h.texts().filter((t) => t.startsWith('[drafts]')).length, 1, 'all ten named, so none is named again');
     } finally {
@@ -744,7 +926,7 @@ describe('held prose drafts, end to end', () => {
       ]);
       const [draft] = h.drafts();
       assert.ok(h.texts().some((t) => t.includes(`held as draft ${draft!.id}`)), 'the turn-end receipt names it');
-      const catchUps = () => h.texts().filter((t) => t.includes('unnamed on this branch of your history'));
+      const catchUps = () => h.texts().filter((t) => t.includes('that no recent notice on this branch names'));
       assert.deepEqual(catchUps(), []);
       // The rollback takes the turn, and its notices, off the branch; the
       // draft stays, as drafts do.
@@ -752,7 +934,8 @@ describe('held prose drafts, end to end', () => {
       assert.ok(!h.texts().some((t) => t.includes(draft!.id)), 'nothing on the branch names it now');
       await h.turn([createMockResponse([])]);
       assert.equal(catchUps().length, 1);
-      assert.match(catchUps()[0]!, new RegExp(`a held draft of yours is unnamed on this branch of your history: ${draft!.id} \\(held \\(not sent\\);.*"words a send held back"`));
+      assert.match(catchUps()[0]!, new RegExp(`an open draft of yours that no recent notice on this branch names: ${draft!.id} \\(held \\(not sent\\); explicit send in the same round\\)`));
+      assert.ok(!catchUps()[0]!.includes('words a send held back'), "the notice quotes none of the draft's words");
       await h.turn([createMockResponse([])]);
       assert.equal(catchUps().length, 1, 'named once on this branch');
     } finally {
@@ -854,15 +1037,39 @@ describe('held prose drafts, end to end', () => {
       assert.equal(fresh.text, 'risky words and a postscript', 'nothing substituted or truncated');
       assert.equal(fresh.inheritedRisk?.draftId, risky!.id);
       assert.equal(draftState(fresh), 'unconfirmed');
-      assert.ok(h.texts().some((t) => t.includes(`It includes the words of draft ${risky!.id}, which may already have been posted, so ${fresh.id} can be resent only with the drafts tool and confirmDuplicate: true`)));
+      assert.ok(h.texts().some((t) => t.includes(`It includes the words of draft ${risky!.id}, which may already have been posted, so ${fresh.id} can be resent only with the drafts tool and confirmDuplicate: true.`)));
       // {{unsent}} now means the fresh draft, and it is refused unconfirmed.
       const before = h.publishes().length;
       await h.turn([createMockResponse([text(`>>${ROOM} {{unsent}}`)])]);
       assert.equal(h.publishes().length, before, 'neither draft goes out without confirmation');
-      assert.ok(h.texts().some((t) => t.startsWith(`[prose-routing] {{unsent}} is draft ${fresh.id}, and ${fresh.id} includes the words of ${risky!.id}`)));
+      assert.ok(h.texts().some((t) => t.startsWith(`[prose-routing] {{unsent}} is draft ${fresh.id}, and ${fresh.id} includes the words of ${risky!.id}`) &&
+        t.includes(`Nothing was sent; sending that draft again could post it twice. To send it anyway, use drafts(action: "resend", draftIds: ["${fresh.id}"], destination: "#channel", confirmDuplicate: true).`)));
       await h.turn([createMockResponse([drafts('r1', { action: 'resend', draftIds: [fresh.id], destination: ROOM, confirmDuplicate: true })], 'tool_use'), createMockResponse([])]);
       assert.deepEqual(h.publishes().slice(before).map((p) => p.text), ['risky words and a postscript']);
       assert.equal(draftState(h.store().get('scout', risky!.id)!), 'unconfirmed', 'the original still needs its own confirmation');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('explicit mode: {{unsent}} of a possibly-posted bounce holds the envelope\'s words, with nothing to wait for', async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'explicit' }] });
+    try {
+      await h.turn([createMockResponse([text('risky words')])]);
+      const [risky] = h.drafts();
+      h.command({ op: 'publish-mode', mode: 'no-receipt' });
+      await h.turn([createMockResponse([text(`>>${ROOM} {{unsent}}`)])]);
+      assert.equal(draftState(h.store().get('scout', risky!.id)!), 'unconfirmed');
+      h.command({ op: 'publish-mode', mode: 'delivered' });
+      const before = h.publishes().length;
+      await h.turn([createMockResponse([text(`>>${ROOM} {{unsent}} and more`)])]);
+      assert.equal(h.publishes().length, before, 'nothing goes out without confirmation');
+      const copy = h.drafts().find((d) => d.id !== risky!.id)!;
+      assert.equal(copy.text, 'risky words and more');
+      // No attempt is out, so the notice gives the copy's condition and no wait.
+      const notice = h.texts().find((t) => t.startsWith(`[prose-routing] {{unsent}} is draft ${risky!.id}`))!;
+      assert.ok(notice.endsWith(`Your message is held as draft ${copy.id}, with {{unsent}} written out; since it includes ` +
+        `${risky!.id}'s words, it can be resent only with confirmDuplicate: true.`), notice);
     } finally {
       await h.close();
     }
@@ -934,7 +1141,7 @@ describe('held prose drafts, end to end', () => {
       await h.turn([createMockResponse(raced(unsure.id), 'tool_use'), createMockResponse([])]);
       [resent, dismissal] = h.toolResults();
       assert.match(dismissal!, waits(unsure.id));
-      assert.match(resent!, /NOT confirmed .* Check the channel before sending it again \(that needs confirmDuplicate: true\)/,
+      assert.match(resent!, /NOT confirmed .* Sending it again could post it twice, so a resend needs confirmDuplicate: true/,
         'the resend\'s advice holds: the draft is still open');
       assert.equal(draftState(h.store().get('scout', unsure.id)!), 'unconfirmed');
 
@@ -962,15 +1169,17 @@ describe('held prose drafts, end to end', () => {
           drafts('c', { action: 'list', draftIds: [draft!.id] }),
           drafts('d', { action: 'read', draftIds: ['d-zzzzz'] }),
           drafts('e', { action: 'shout' }),
+          drafts('f', { action: 'read', draftIds: [''] }),
         ], 'tool_use'),
         createMockResponse([]),
       ]);
-      const [noDest, badDest, unused, unknown, badAction] = h.toolResults();
+      const [noDest, badDest, unused, unknown, badAction, badIds] = h.toolResults();
       assert.match(noDest!, /resend needs a destination/);
       assert.match(badDest!, /Destination "#nowhere" did not resolve.*Nothing was sent/);
       assert.match(unused!, /draftIds is not used by action "list"/);
       assert.match(unknown!, /No draft of yours with id d-zzzzz/);
       assert.match(badAction!, /action must be one of/);
+      assert.match(badIds!, /draftIds must be a list of draft ids such as "d-[a-z2-9]{7}", or null/, 'its example has the form newId issues');
       assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note elsewhere']);
     } finally {
       await h.close();
@@ -995,16 +1204,18 @@ describe('draft notices and turn-end settlement', () => {
     try {
       const internals = framework as unknown as {
         proseDrafts: ProseDraftStore;
-        turnDrafts: Map<string, unknown[]>;
-        settleTurnDrafts(agent: unknown): void;
+        routingOf(name: string): { drafts: unknown[] };
+        settleTurnDrafts(agent: unknown, logical: unknown): void;
       };
       const agent = framework.getAgent('scout')!;
-      const [named, lost] = internals.proseDrafts.hold('scout', [{ text: 'named', source }, { text: 'lost', source }], 'explicit-send').held;
+      const [named, lost] = internals.proseDrafts.hold('scout', [{ text: 'named' }, { text: 'lost' }], 'explicit-send').held;
       // Only the first draft's notice reached the history.
       const cm = agent.getContextManager();
       const notice = cm.addMessage('user', [{ type: 'text', text: '[drafts] …' }], { system: true, kind: 'prose-drafts', draftOwner: 'scout', draftIds: [named!.id] } as never);
-      internals.turnDrafts.set('scout', [named, lost]);
-      internals.settleTurnDrafts(agent);
+      const logical = internals.routingOf('scout');
+      logical.drafts.push(named, lost);
+      internals.settleTurnDrafts(agent, logical);
+      assert.deepEqual(logical.drafts, [], "the turn's draft tally is spent");
       assert.deepEqual(internals.proseDrafts.get('scout', named!.id)!.noticedIn, [String(notice)], 'recorded with the message that names it');
       assert.equal(internals.proseDrafts.get('scout', lost!.id)!.noticedIn, undefined, 'left for the catch-up');
       const onBranch = (id: string) => cm.getMessage(id as never) !== null;
@@ -1012,6 +1223,144 @@ describe('draft notices and turn-end settlement', () => {
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  const catchUpFixture = async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'prose-drafts-catchup-'));
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      modules: [],
+    });
+    const internals = framework as unknown as {
+      proseDrafts: ProseDraftStore;
+      routingOf(name: string): { drafts: unknown[] };
+      openLogical: Map<string, unknown>;
+      noticeUnnoticedDrafts(agent: unknown): void;
+    };
+    const agent = framework.getAgent('scout')!;
+    const cm = agent.getContextManager();
+    const catchUps = () => cm.getAllMessages()
+      .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => (b as { text: string }).text)
+      .filter((t) => t.includes('that no recent notice on this branch names'));
+    return { framework, internals, agent, cm, catchUps, close: async () => { await framework.stop(); rmSync(dir, { recursive: true, force: true }); } };
+  };
+
+  it("the catch-up records a draft a notice already names, rather than naming it again", async () => {
+    const t = await catchUpFixture();
+    try {
+      const [late, lost] = t.internals.proseDrafts.hold('scout', [{ text: 'late' }, { text: 'lost' }], 'bounced').held;
+      // A bounce notice reached the history after its turn's drafts were
+      // settled, so nothing recorded it.
+      const notice = t.cm.addMessage('user', [{ type: 'text', text: '[prose-routing] …' }], { system: true, kind: 'prose-bounce', draftOwner: 'scout', draftIds: [late!.id] } as never);
+      t.internals.noticeUnnoticedDrafts(t.agent);
+      assert.deepEqual(t.internals.proseDrafts.get('scout', late!.id)!.noticedIn, [String(notice)], 'recorded with the notice that names it');
+      const [catchUp] = t.catchUps();
+      assert.ok(catchUp?.includes(lost!.id), 'the draft no notice names is named');
+      assert.ok(!catchUp!.includes(late!.id), `the one its notice names is not: ${catchUp}`);
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('the catch-up reads notices among the newest 500 messages, and names a draft whose only notice is further back', async () => {
+    const t = await catchUpFixture();
+    try {
+      const [old, recent] = t.internals.proseDrafts.hold('scout', [{ text: 'old' }, { text: 'recent' }], 'bounced').held;
+      // Neither notice was recorded: one now sits 500 messages back, the
+      // other among the newest.
+      t.cm.addMessage('user', [{ type: 'text', text: '[prose-routing] …' }], { system: true, kind: 'prose-bounce', draftOwner: 'scout', draftIds: [old!.id] } as never);
+      for (let i = 0; i < 500; i++) t.cm.addMessage('user', [{ type: 'text', text: `filler ${i}` }]);
+      const notice = t.cm.addMessage('user', [{ type: 'text', text: '[prose-routing] …' }], { system: true, kind: 'prose-bounce', draftOwner: 'scout', draftIds: [recent!.id] } as never);
+      t.internals.noticeUnnoticedDrafts(t.agent);
+      assert.deepEqual(t.internals.proseDrafts.get('scout', recent!.id)!.noticedIn, [String(notice)], 'the recent notice is found and recorded');
+      const [catchUp] = t.catchUps();
+      assert.ok(catchUp?.includes(old!.id), `the draft whose notice is past the window is named: ${catchUp}`);
+      assert.ok(!catchUp!.includes(recent!.id), 'the recently named one is not');
+    } finally {
+      await t.close();
+    }
+  });
+
+  // Arthur-2378's probe: with retention shortened, the journal lets the
+  // turn's older draft go before the receipt is written.
+  it('the receipt reports a draft that retention let go during the turn as let go, not as held', async (t) => {
+    const h = await catchUpFixture();
+    t.mock.timers.enable({ apis: ['Date'], now: 1_000_000 });
+    const drafts = new ProseDraftStore(h.framework.getStore(), { keepNewest: 1, keepIdleMs: 1, checkpointEvery: 1 });
+    const f = h.framework as unknown as {
+      proseDrafts: ProseDraftStore;
+      holdProseDrafts(agent: unknown, texts: Array<{ text: string }>, reason: string, options: unknown): Array<{ id: string }>;
+      appendProseDeliveryReceipt(agent: unknown, routing: unknown): void;
+    };
+    f.proseDrafts = drafts;
+    const routing = h.internals.routingOf('scout');
+    try {
+      const old = f.holdProseDrafts(h.agent, [{ text: 'earlier words' }], 'explicit-send', { routing, notice: 'later' })[0]!;
+      // An attempt whose outcome is unknown (Arthur-2378's second probe): once
+      // the draft is let go, nothing says whether it was posted.
+      const attempt = drafts.beginAttempt('scout', old.id, dest(), 'resend', false);
+      drafts.recordOutcome('scout', old.id, attempt, { status: 'unknown', reason: 'connection lost', at: Date.now(), destination: dest() });
+      assert.equal(draftState(drafts.get('scout', old.id)!), 'unconfirmed');
+      t.mock.timers.tick(2);
+      const newer = f.holdProseDrafts(h.agent, [{ text: 'later words' }], 'explicit-send', { routing, notice: 'later' })[0]!;
+      assert.equal(drafts.get('scout', old.id), undefined, 'the journal let the older draft go');
+      f.appendProseDeliveryReceipt(h.agent, routing);
+      const receipt = h.cm.getAllMessages().flatMap((m) => m.content)
+        .filter((b) => b.type === 'text').map((b) => (b as { text: string }).text)
+        .find((text) => text.startsWith('[delivered]'))!;
+      const held = receipt.match(/held as drafts? ([^(]+)\(not sent/)?.[1] ?? '';
+      assert.ok(held.includes(newer.id), `the draft still held is reported as held: ${receipt}`);
+      assert.ok(!held.includes(old.id), `the let-go draft is not offered as held: ${receipt}`);
+      assert.ok(receipt.includes(`draft ${old.id} held this turn and since let go by retention (no longer held, so not resendable)`), receipt);
+      assert.ok(receipt.startsWith('[delivered] nothing confirmed —'), `a let-go draft's unknown state makes no claim of non-delivery: ${receipt}`);
+    } finally {
+      t.mock.timers.reset();
+      await h.close();
+    }
+  });
+
+  it('the catch-up leaves out a draft that a notice still waiting to be written names', async () => {
+    const t = await catchUpFixture();
+    const queue = (t.framework as unknown as { deferredMessages: Array<Record<string, unknown>> }).deferredMessages;
+    try {
+      const [waiting, lost] = t.internals.proseDrafts.hold('scout', [{ text: 'waiting' }, { text: 'lost' }], 'bounced').held;
+      // A bounce notice deferred while a turn is alive: not in the history
+      // yet, but on its way.
+      queue.push({
+        id: 'deferred-notice', seq: 1, participant: 'user',
+        content: [{ type: 'text', text: '[prose-routing] …' }],
+        metadata: { system: true, kind: 'prose-bounce', draftOwner: 'scout', draftIds: [waiting!.id] },
+        forAgent: 'scout',
+      });
+      t.internals.noticeUnnoticedDrafts(t.agent);
+      const [catchUp] = t.catchUps();
+      assert.ok(catchUp?.includes(lost!.id), 'the draft no notice names is named');
+      assert.ok(!catchUp!.includes(waiting!.id), `the one a waiting notice names is not: ${catchUp}`);
+    } finally {
+      queue.length = 0;
+      await t.close();
+    }
+  });
+
+  it("the catch-up leaves the open logical turn's own drafts to its receipt", async () => {
+    const t = await catchUpFixture();
+    try {
+      const [own, other] = t.internals.proseDrafts.hold('scout', [{ text: 'own' }, { text: 'other' }], 'explicit-send').held;
+      // A later start continues this logical turn, whose receipt names its
+      // drafts at the turn's end.
+      const logical = t.internals.routingOf('scout');
+      logical.drafts.push(own);
+      t.internals.openLogical.set('scout', logical);
+      t.internals.noticeUnnoticedDrafts(t.agent);
+      const [catchUp] = t.catchUps();
+      assert.ok(catchUp?.includes(other!.id), "another turn's unnamed draft is named");
+      assert.ok(!catchUp!.includes(own!.id), `the open turn's own draft is not: ${catchUp}`);
+      assert.equal(t.internals.proseDrafts.get('scout', own!.id)!.noticedIn, undefined, 'and stays for its settlement');
+    } finally {
+      await t.close();
     }
   });
 });
@@ -1027,9 +1376,9 @@ describe('draft identity and risk evidence', () => {
     });
     const internals = framework as unknown as {
       proseDrafts: ProseDraftStore;
-      turnDrafts: Map<string, unknown[]>;
-      settleTurnDrafts(agent: unknown): void;
-      bounceProse(agent: unknown, text: string, reason: string): void;
+      routingOf(name: string): { drafts: unknown[] };
+      settleTurnDrafts(agent: unknown, logical: unknown): void;
+      bounceProse(agent: unknown, text: string, reason: string, candidates: undefined, prefix: '>>', round: { routing: unknown; notice: 'later' }): void;
       riskText(draft: unknown): string;
     };
     return { dir, framework, internals, close: async () => { await framework.stop(); rmSync(dir, { recursive: true, force: true }); } };
@@ -1039,13 +1388,14 @@ describe('draft identity and risk evidence', () => {
     const t = await setupFramework();
     try {
       (t.internals.proseDrafts as unknown as { newId: (agent: string) => string }).newId = () => 'd-same2';
-      const [mine] = t.internals.proseDrafts.hold('scout', [{ text: 'scout words', source }], 'explicit-send').held;
-      t.internals.proseDrafts.hold('other', [{ text: 'other words', source }], 'explicit-send');
+      const [mine] = t.internals.proseDrafts.hold('scout', [{ text: 'scout words' }], 'explicit-send').held;
+      t.internals.proseDrafts.hold('other', [{ text: 'other words' }], 'explicit-send');
       // Only the OTHER resident's notice for "d-same2" is in the shared history.
       t.framework.getAgent('other')!.getContextManager().addMessage('user', [{ type: 'text', text: '[drafts] other: …' }],
         { system: true, kind: 'prose-drafts', draftOwner: 'other', draftIds: ['d-same2'] } as never);
-      t.internals.turnDrafts.set('scout', [mine]);
-      t.internals.settleTurnDrafts(t.framework.getAgent('scout')!);
+      const logical = t.internals.routingOf('scout');
+      logical.drafts.push(mine);
+      t.internals.settleTurnDrafts(t.framework.getAgent('scout')!, logical);
       assert.equal(t.internals.proseDrafts.get('scout', 'd-same2')!.noticedIn, undefined);
     } finally {
       await t.close();
@@ -1056,12 +1406,13 @@ describe('draft identity and risk evidence', () => {
     const t = await setupFramework();
     try {
       const agent = t.framework.getAgent('scout')!;
-      const [original] = t.internals.proseDrafts.hold('scout', [{ text: 'first', source }], 'bounced').held;
+      const [original] = t.internals.proseDrafts.hold('scout', [{ text: 'first' }], 'bounced').held;
       t.internals.proseDrafts.beginAttempt('scout', original!.id, dest(), 'unsent-token', false); // never resolved
-      t.internals.bounceProse(agent, '{{unsent}} second', 'no such channel');
+      const round = { routing: t.internals.routingOf('scout'), notice: 'later' as const };
+      t.internals.bounceProse(agent, '{{unsent}} second', 'no such channel', undefined, '>>', round);
       const copy = t.internals.proseDrafts.open('scout').find((d) => d.text === 'first second')!;
       assert.equal(copy.inheritedRisk?.draftId, original!.id);
-      t.internals.bounceProse(agent, '{{unsent}} third', 'no such channel');
+      t.internals.bounceProse(agent, '{{unsent}} third', 'no such channel', undefined, '>>', round);
       const again = t.internals.proseDrafts.open('scout').find((d) => d.text === 'first second third')!;
       assert.equal(again.inheritedRisk?.draftId, copy.id);
       assert.equal(again.inheritedRisk?.sourceDraftId, original!.id);
@@ -1105,7 +1456,8 @@ describe('drafts resend ownership', () => {
     const internals = framework as unknown as {
       proseDrafts: ProseDraftStore;
       handleDraftsTool(agent: string, input: unknown): Promise<{ success: boolean; data?: Array<{ text: string }>; error?: string }>;
-      deliverProseEnvelope(agent: unknown, text: string, hold: { notice: 'later' }): Promise<void>;
+      // The explicit gateway's entry: it admits the text's envelopes, then delivers each.
+      deliverProse(agent: unknown, text: string, hold: { notice: 'later' }): Promise<void>;
     };
     const say = (r: { success: boolean; data?: Array<{ text: string }>; error?: string }) =>
       r.success ? r.data!.map((b) => b.text).join('') : r.error!;
@@ -1118,7 +1470,7 @@ describe('drafts resend ownership', () => {
         await new Promise((r) => setTimeout(r, 2));
       }
     };
-    const [a, b] = internals.proseDrafts.hold('scout', [{ text: 'A words', source }, { text: 'B words', source }], 'explicit-send').held;
+    const [a, b] = internals.proseDrafts.hold('scout', [{ text: 'A words' }, { text: 'B words' }], 'explicit-send').held;
     return {
       dir, framework, internals, pending, say, untilPublishing, a: a!, b: b!,
       close: async () => { await framework.stop(); rmSync(dir, { recursive: true, force: true }); },
@@ -1205,6 +1557,48 @@ describe('drafts resend ownership', () => {
     }
   });
 
+  it("what the connector says was posted reaches an unconfirmed resend's reply and the draft's read", async () => {
+    const t = await setup();
+    try {
+      const sending = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id], destination: 'chan' });
+      await t.untilPublishing();
+      t.pending.shift()!.resolve({ status: 'unknown', reason: 'part 2 failed (delivery uncertain)', detail: { posted: ['111'] } });
+      const reply = t.say(await sending);
+      assert.match(reply, new RegExp(`${t.a.id}: delivery to .+ NOT confirmed`));
+      assert.ok(reply.endsWith(' Connector detail: {"posted":["111"]}'), reply);
+      // The notices send the resident to read before a confirmDuplicate
+      // resend, so the attempt's line there carries it too.
+      const read = t.say(await t.internals.handleDraftsTool('scout', { action: 'read', draftIds: [t.a.id] }));
+      assert.match(read, /UNKNOWN — may have been posted: part 2 failed \(delivery uncertain\); connector detail: \{"posted":\["111"\]\}/);
+      // A long string comes through as itself, bounded, in both places.
+      const long = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.b.id], destination: 'chan' });
+      await t.untilPublishing();
+      t.pending.shift()!.resolve({ status: 'unknown', reason: 'timed out (delivery uncertain)', detail: 'p'.repeat(3000) });
+      const longReply = t.say(await long);
+      assert.ok(longReply.endsWith(` Connector detail: ${'p'.repeat(1987)}… [truncated]`), longReply.slice(-80));
+      const longRead = t.say(await t.internals.handleDraftsTool('scout', { action: 'read', draftIds: [t.b.id] }));
+      assert.ok(longRead.includes(`; connector detail: ${'p'.repeat(1987)}… [truncated]`), longRead.slice(0, 400));
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('a resend that provably posted nothing shows no connector detail', async () => {
+    const t = await setup();
+    try {
+      const sending = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id], destination: 'chan' });
+      await t.untilPublishing();
+      t.pending.shift()!.resolve({ status: 'failed', reason: 'refused before dispatch', detail: { posted: [] } });
+      const reply = t.say(await sending);
+      assert.match(reply, new RegExp(`${t.a.id}: not sent to .+ Nothing was posted by this attempt`));
+      assert.ok(!reply.includes('onnector detail'), reply);
+      const read = t.say(await t.internals.handleDraftsTool('scout', { action: 'read', draftIds: [t.a.id] }));
+      assert.ok(!read.includes('onnector detail'), read);
+    } finally {
+      await t.close();
+    }
+  });
+
   it("a draft whose own result is in isn't being sent any more, though the rest of its batch is", async () => {
     const t = await setup();
     try {
@@ -1247,7 +1641,7 @@ describe('drafts resend ownership', () => {
   it('a batch that stops says why for each draft after the stop', async () => {
     const t = await setup();
     try {
-      const [c] = t.internals.proseDrafts.hold('scout', [{ text: 'C words', source }], 'explicit-send').held;
+      const [c] = t.internals.proseDrafts.hold('scout', [{ text: 'C words' }], 'explicit-send').held;
       const batch = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id, t.b.id, c!.id], destination: 'chan' });
       await t.untilPublishing();
       t.say(await t.internals.handleDraftsTool('scout', { action: 'dismiss', draftIds: [t.b.id] }));
@@ -1255,7 +1649,7 @@ describe('drafts resend ownership', () => {
       const result = t.say(await batch);
       assert.match(result, new RegExp(`${c!.id}: not attempted \\(${t.b.id} was dismissed while it waited\\)\\.`));
 
-      const [d] = t.internals.proseDrafts.hold('scout', [{ text: 'D words', source }], 'explicit-send').held;
+      const [d] = t.internals.proseDrafts.hold('scout', [{ text: 'D words' }], 'explicit-send').held;
       const again = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [c!.id, d!.id], destination: 'chan' });
       await t.untilPublishing();
       t.pending.shift()!.resolve({ status: 'unknown', reason: 'no receipt' });
@@ -1282,11 +1676,11 @@ describe('drafts resend ownership', () => {
   it('{{unsent}} of a bounce queued in a resend says so, and holds the envelope\'s words with the risk', async () => {
     const t = await setup();
     try {
-      const [bounce] = t.internals.proseDrafts.hold('scout', [{ text: 'bounced words', source }], 'bounced').held;
+      const [bounce] = t.internals.proseDrafts.hold('scout', [{ text: 'bounced words' }], 'bounced').held;
       const batch = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id, bounce!.id], destination: 'chan' });
       await t.untilPublishing();
       const agent = t.framework.getAgent('scout')!;
-      await t.internals.deliverProseEnvelope(agent, '>>chan {{unsent}} and a postscript', { notice: 'later' });
+      await t.internals.deliverProse(agent, '>>chan {{unsent}} and a postscript', { notice: 'later' });
       assert.deepEqual(t.pending.map((p) => p.text), ['A words'], 'nothing more was sent');
       const fresh = t.internals.proseDrafts.latestBounce('scout')!;
       assert.notEqual(fresh.id, bounce!.id);
@@ -1296,7 +1690,7 @@ describe('drafts resend ownership', () => {
       const words = agent.getContextManager().getAllMessages().flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '');
       assert.ok(words.includes(`[prose-routing] {{unsent}} is draft ${bounce!.id}, which is queued in a resend in progress. Nothing was sent; ` +
         `wait for that result. Your message is held as draft ${fresh.id}, with {{unsent}} written out; since it includes ` +
-        `${bounce!.id}'s words, it can be resent only with confirmDuplicate: true, after that.`), words.join('\n'));
+        `${bounce!.id}'s words, it can be resent only with confirmDuplicate: true, once that result is in.`), words.join('\n'));
       t.pending.shift()!.resolve({ status: 'delivered', messageId: 'm-a' });
       await t.untilPublishing();
       t.pending.shift()!.resolve({ status: 'delivered', messageId: 'm-b' });
@@ -1311,7 +1705,7 @@ describe('drafts resend ownership', () => {
     try {
       const agent = t.framework.getAgent('scout')!;
       const words = () => agent.getContextManager().getAllMessages().flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '');
-      const [bounce] = t.internals.proseDrafts.hold('scout', [{ text: 'bounced words', source }], 'bounced').held;
+      const [bounce] = t.internals.proseDrafts.hold('scout', [{ text: 'bounced words' }], 'bounced').held;
       const sending = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [bounce!.id], destination: 'chan' });
       await t.untilPublishing();
       t.pending.shift()!.resolve({ status: 'unknown', reason: 'no receipt' });
@@ -1319,12 +1713,12 @@ describe('drafts resend ownership', () => {
       // The journal refuses the dismissal: the bounce stays, and the resident is told.
       const dismiss = t.internals.proseDrafts.dismiss.bind(t.internals.proseDrafts);
       t.internals.proseDrafts.dismiss = () => { throw new Error('EIO'); };
-      await t.internals.deliverProseEnvelope(agent, '>>skip_reply {{unsent}}', { notice: 'later' });
-      assert.ok(words().includes(`[prose-routing] {{unsent}} is draft ${bounce!.id}, which could not be set aside (EIO): ` +
-        'it is still held, and {{unsent}} still names it.'), words().join('\n'));
+      await t.internals.deliverProse(agent, '>>skip_reply {{unsent}}', { notice: 'later' });
+      assert.ok(words().includes(`[prose-routing] Recording setting aside draft ${bounce!.id}, which {{unsent}} named, failed (EIO): ` +
+        'it reads as unconfirmed now, and {{unsent}} still names it.'), words().join('\n'));
       assert.equal(t.internals.proseDrafts.latestBounce('scout')?.id, bounce!.id);
       t.internals.proseDrafts.dismiss = dismiss;
-      await t.internals.deliverProseEnvelope(agent, '>>skip_reply {{unsent}}', { notice: 'later' });
+      await t.internals.deliverProse(agent, '>>skip_reply {{unsent}}', { notice: 'later' });
       assert.equal(draftState(t.internals.proseDrafts.get('scout', bounce!.id)!), 'dismissed');
       assert.ok(words().some((w) => w.startsWith(`[prose-routing] Draft ${bounce!.id} is set aside. Note that ${bounce!.id}'s attempt to (chan) at `) &&
         w.endsWith('may already have been posted: no receipt.')), words().join('\n'));
@@ -1333,14 +1727,218 @@ describe('drafts resend ownership', () => {
     }
   });
 
+  /** The framework's store fails the sync after the next drafts entry with
+   *  this op reaches it, as a disk can: the journal reconciles, so the entry
+   *  stands though recording it threw. */
+  const failSyncAfter = (framework: AgentFramework, op: string): (() => void) => {
+    const store = (framework as unknown as { store: { sync(): void; appendJson(t: string, p: unknown): unknown } }).store;
+    const real = { sync: store.sync.bind(store), appendJson: store.appendJson.bind(store) };
+    let armed = false;
+    store.appendJson = (type, payload) => {
+      const record = real.appendJson(type, payload);
+      if ((payload as { op?: string }).op === op) armed = true;
+      return record;
+    };
+    store.sync = () => {
+      if (armed) { armed = false; throw new Error('EIO'); }
+      real.sync();
+    };
+    return () => { store.sync = real.sync; store.appendJson = real.appendJson; };
+  };
+
+  it('a dismissal whose recording fails after it reached the journal is reported as it reads: dismissed', async (t0) => {
+    const t = await setup();
+    t0.mock.method(console, 'error', () => {});
+    try {
+      const restore = failSyncAfter(t.framework, 'dismissed');
+      const answer = await t.internals.handleDraftsTool('scout', { action: 'dismiss', draftIds: [t.a.id] });
+      restore();
+      assert.equal(answer.success, false);
+      assert.equal(t.say(answer), `Recording the dismissal of ${t.a.id} failed (EIO): it reads as dismissed now.`);
+      assert.equal(draftState(t.internals.proseDrafts.get('scout', t.a.id)!), 'dismissed');
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('a dismissal of a possibly-posted draft that stands after its recording failed says so, with the risk, and is traced', async (t0) => {
+    const t = await setup();
+    t0.mock.method(console, 'error', () => {});
+    try {
+      const traced: string[][] = [];
+      t.framework.onTrace((e) => {
+        const ev = e as { type: string; draftIds?: string[] };
+        if (ev.type === 'prose:drafts-dismissed') traced.push(ev.draftIds ?? []);
+      });
+      const sending = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id], destination: 'chan' });
+      await t.untilPublishing();
+      t.pending.shift()!.resolve({ status: 'unknown', reason: 'no receipt' });
+      await sending;
+      const restore = failSyncAfter(t.framework, 'dismissed');
+      const answer = await t.internals.handleDraftsTool('scout', { action: 'dismiss', draftIds: [t.a.id] });
+      restore();
+      const text = t.say(answer);
+      assert.ok(text.startsWith(`Recording the dismissal of ${t.a.id} failed (EIO): it reads as dismissed now. Note that ${t.a.id}'s attempt to (chan) at `), text);
+      assert.ok(text.endsWith('may already have been posted: no receipt.'), text);
+      assert.deepEqual(traced, [[t.a.id]], 'the dismissal that stands is traced');
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('the dismissal trace names the drafts the call dismissed, not ones already dismissed', async () => {
+    const t = await setup();
+    try {
+      const traced: string[][] = [];
+      t.framework.onTrace((e) => {
+        const ev = e as { type: string; draftIds?: string[] };
+        if (ev.type === 'prose:drafts-dismissed') traced.push(ev.draftIds ?? []);
+      });
+      await t.internals.handleDraftsTool('scout', { action: 'dismiss', draftIds: [t.b.id] });
+      const answer = await t.internals.handleDraftsTool('scout', { action: 'dismiss', draftIds: [t.a.id, t.b.id] });
+      assert.equal(t.say(answer), `${t.a.id}: dismissed (your history keeps the words).\n${t.b.id}: already dismissed.`);
+      assert.deepEqual(traced, [[t.b.id], [t.a.id]]);
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('a dismissal that never reached the journal says the draft reads as it did, and traces nothing', async () => {
+    const t = await setup();
+    try {
+      const traced: string[][] = [];
+      t.framework.onTrace((e) => {
+        const ev = e as { type: string; draftIds?: string[] };
+        if (ev.type === 'prose:drafts-dismissed') traced.push(ev.draftIds ?? []);
+      });
+      const dismiss = t.internals.proseDrafts.dismiss.bind(t.internals.proseDrafts);
+      t.internals.proseDrafts.dismiss = (agent: string, id: string) => {
+        if (id === t.b.id) throw new Error('EIO');
+        dismiss(agent, id);
+      };
+      const answer = await t.internals.handleDraftsTool('scout', { action: 'dismiss', draftIds: [t.a.id, t.b.id] });
+      t.internals.proseDrafts.dismiss = dismiss;
+      assert.equal(t.say(answer),
+        `${t.a.id}: dismissed (your history keeps the words).\nRecording the dismissal of ${t.b.id} failed (EIO): it reads as held now.`);
+      assert.deepEqual(traced, [[t.a.id]], 'the dismissal before the failure is traced; the one that failed is not');
+    } finally {
+      await t.close();
+    }
+  });
+
+  it(">>skip_reply {{unsent}} whose recording fails after it reached the journal says the bounce is set aside, and that {{unsent}} names nothing", async (t0) => {
+    const t = await setup();
+    t0.mock.method(console, 'error', () => {});
+    try {
+      const agent = t.framework.getAgent('scout')!;
+      const words = () => agent.getContextManager().getAllMessages().flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '');
+      const [bounce] = t.internals.proseDrafts.hold('scout', [{ text: 'bounced words' }], 'bounced').held;
+      const restore = failSyncAfter(t.framework, 'dismissed');
+      await t.internals.deliverProse(agent, '>>skip_reply {{unsent}}', { notice: 'later' });
+      restore();
+      assert.ok(words().includes(`[prose-routing] Recording setting aside draft ${bounce!.id}, which {{unsent}} named, failed (EIO): ` +
+        'it reads as dismissed now, and {{unsent}} names nothing.'), words().join('\n'));
+      assert.equal(t.internals.proseDrafts.latestBounce('scout'), undefined);
+    } finally {
+      await t.close();
+    }
+  });
+
+  it(">>skip_reply {{unsent}} of a possibly-posted bounce that stands after its recording failed says so, with the risk", async (t0) => {
+    const t = await setup();
+    t0.mock.method(console, 'error', () => {});
+    try {
+      const agent = t.framework.getAgent('scout')!;
+      const words = () => agent.getContextManager().getAllMessages().flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '');
+      const [bounce] = t.internals.proseDrafts.hold('scout', [{ text: 'bounced words' }], 'bounced').held;
+      const sending = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [bounce!.id], destination: 'chan' });
+      await t.untilPublishing();
+      t.pending.shift()!.resolve({ status: 'unknown', reason: 'no receipt' });
+      await sending;
+      const traced: string[][] = [];
+      t.framework.onTrace((e) => {
+        const ev = e as { type: string; draftIds?: string[] };
+        if (ev.type === 'prose:drafts-dismissed') traced.push(ev.draftIds ?? []);
+      });
+      const restore = failSyncAfter(t.framework, 'dismissed');
+      await t.internals.deliverProse(agent, '>>skip_reply {{unsent}}', { notice: 'later' });
+      restore();
+      assert.deepEqual(traced, [[bounce!.id]], 'the dismissal that stands is traced');
+      assert.ok(words().some((w) => w.startsWith(`[prose-routing] Recording setting aside draft ${bounce!.id}, which {{unsent}} named, failed (EIO): ` +
+        `it reads as dismissed now, and {{unsent}} names nothing. Note that ${bounce!.id}'s attempt to (chan) at `) &&
+        w.endsWith('may already have been posted: no receipt.')), words().join('\n'));
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('a resend whose attempt reached the journal before its recording failed is not sent, and says the draft reads as unconfirmed', async (t0) => {
+    const t = await setup();
+    t0.mock.method(console, 'error', () => {});
+    try {
+      const restore = failSyncAfter(t.framework, 'attempt');
+      const answer = await t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id], destination: 'chan' });
+      restore();
+      assert.equal(t.pending.length, 0, 'nothing was sent');
+      assert.match(t.say(answer), new RegExp(`${t.a.id}: not sent — the attempt could not be recorded durably \\(EIO\\), and the draft reads as unconfirmed now\\.`));
+    } finally {
+      await t.close();
+    }
+  });
+
+  it("{{unsent}} whose attempt reached the journal before its recording failed bounces, saying the draft reads as unconfirmed", async (t0) => {
+    const t = await setup();
+    t0.mock.method(console, 'error', () => {});
+    try {
+      const agent = t.framework.getAgent('scout')!;
+      const words = () => agent.getContextManager().getAllMessages().flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '');
+      const [bounce] = t.internals.proseDrafts.hold('scout', [{ text: 'bounced words' }], 'bounced').held;
+      const restore = failSyncAfter(t.framework, 'attempt');
+      await t.internals.deliverProse(agent, '>>chan {{unsent}}', { notice: 'later' });
+      restore();
+      assert.equal(t.pending.length, 0, 'nothing was sent');
+      assert.ok(words().some((w) => w.includes(`the attempt for draft ${bounce!.id} could not be recorded durably (EIO), and the draft reads as unconfirmed now`)),
+        words().join('\n'));
+    } finally {
+      await t.close();
+    }
+  });
+
+  it("a puppeted drafts call whose handler throws is answered as a failure", async () => {
+    const t = await setup();
+    try {
+      (t.framework as unknown as { handleDraftsTool: () => Promise<unknown> }).handleDraftsTool = async () => { throw new Error('boom'); };
+      const { result } = await t.framework.puppetToolCall('scout', 'drafts', {
+        action: 'list', draftIds: null, destination: null, confirmDuplicate: null, offset: null,
+      });
+      assert.equal(result.success, false);
+      assert.equal(result.error, 'drafts failed: boom');
+    } finally {
+      await t.close();
+    }
+  });
+
+  it("a puppeted drafts call reaches the drafts tool and acts as the resident", async () => {
+    const t = await setup();
+    try {
+      const { result } = await t.framework.puppetToolCall('scout', 'drafts', {
+        action: 'read', draftIds: [t.a.id], destination: null, confirmDuplicate: null, offset: null,
+      });
+      assert.equal(result.success, true, JSON.stringify(result));
+      assert.match(JSON.stringify(result.data), /A words/);
+    } finally {
+      await t.close();
+    }
+  });
+
   it('>>skip_reply {{unsent}} leaves the latest bounce alone while it is being sent, and tells the resident', async () => {
     const t = await setup();
     try {
-      const [bounce] = t.internals.proseDrafts.hold('scout', [{ text: 'bounced words', source }], 'bounced').held;
+      const [bounce] = t.internals.proseDrafts.hold('scout', [{ text: 'bounced words' }], 'bounced').held;
       const sending = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [bounce!.id], destination: 'chan' });
       await t.untilPublishing();
       const agent = t.framework.getAgent('scout')!;
-      const envelope = (text: string) => t.internals.deliverProseEnvelope(agent, text, { notice: 'later' });
+      const envelope = (text: string) => t.internals.deliverProse(agent, text, { notice: 'later' });
       await envelope('>>skip_reply {{unsent}}');
       assert.equal(t.internals.proseDrafts.get('scout', bounce!.id)!.dismissedAt, undefined);
       const words = agent.getContextManager().getAllMessages().flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '');
@@ -1358,9 +1956,9 @@ describe('drafts resend ownership', () => {
   it('a dismissal is refused while an {{unsent}} delivery of that draft is out', async () => {
     const t = await setup();
     try {
-      const [bounce] = t.internals.proseDrafts.hold('scout', [{ text: 'bounced words', source }], 'bounced').held;
+      const [bounce] = t.internals.proseDrafts.hold('scout', [{ text: 'bounced words' }], 'bounced').held;
       const agent = t.framework.getAgent('scout')!;
-      const delivering = t.internals.deliverProseEnvelope(agent, '>>chan {{unsent}}', { notice: 'later' });
+      const delivering = t.internals.deliverProse(agent, '>>chan {{unsent}}', { notice: 'later' });
       await t.untilPublishing();
       assert.deepEqual(t.pending.map((p) => p.text), ['bounced words'], 'the bounce is out through {{unsent}}');
       const refused = t.say(await t.internals.handleDraftsTool('scout', { action: 'dismiss', draftIds: [bounce!.id] }));
@@ -1424,9 +2022,9 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
         ['words for the room', `written for >>>${ROOM}`],
         ['more for the room', undefined],
       ]);
-      assert.equal((h.framework as unknown as { proseTargetPins: Map<string, string> }).proseTargetPins.get('scout'), ROOM,
+      assert.equal((h.framework as unknown as { turnRouting: Map<string, { pin?: string }> }).turnRouting.get('scout')?.pin, ROOM,
         'the named destination is the sticky target again, as live routing would leave it');
-      assert.match(h.texts().find((t) => t.startsWith('[delivered]'))!, / · 3 plain-speech segment\(s\) kept private \(skip_reply\)$/);
+      assert.match(h.texts().find((t) => t.startsWith('[delivered]'))!, / · 3 plain-speech segment\(s\) kept private \(skip_reply or a private think\)$/);
 
       // A live `>>>skip_reply` in an earlier round binds a later silenced one.
       const before = h.drafts().length;
@@ -1437,7 +2035,7 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       assert.equal(h.drafts().length, before, 'nothing private was drafted');
       // "still thinking" is the one kept private (live routing does not count
       // the `>>>skip_reply` envelope itself).
-      assert.equal(h.texts().filter((t) => t.startsWith('[delivered]')).at(-1), '[delivered] nothing — 1 plain-speech segment(s) kept private (skip_reply)');
+      assert.equal(h.texts().filter((t) => t.startsWith('[delivered]')).at(-1), '[delivered] nothing — 1 plain-speech segment(s) kept private (skip_reply or a private think)');
     } finally {
       await h.close();
     }
@@ -1505,7 +2103,7 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       ]);
       assert.match(h.texts().filter((t) => t.startsWith('[delivered]')).at(-1)!, new RegExp(
         `^\\[delivered\\] nothing confirmed — draft ${ids[3]} is unconfirmed: ${ids[3]}'s attempt to #room \\(Guild One\\) \\(${ROOM}\\) at .+ ` +
-        'may already have been posted: .+ — check that channel before sending it again \\(resend needs confirmDuplicate: true\\)$'));
+        'may already have been posted: .+ — sending it again could post it twice \\(resend needs confirmDuplicate: true\\)$'));
 
       // Dismissed knowingly after an unknown resend: the dismissal sets it
       // aside, and the receipt still says its attempt may have been posted.
@@ -1559,7 +2157,7 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
   it('hybrid: the held-draft notice gives a copied, possibly-posted draft its risk and the confirmation it needs', async () => {
     const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
     try {
-      const original = h.store().hold('scout', [{ text: 'possibly sent', source }], 'bounced').held[0]!;
+      const original = h.store().hold('scout', [{ text: 'possibly sent' }], 'bounced').held[0]!;
       h.store().beginAttempt('scout', original.id, dest(), 'unsent-token', false); // its outcome never recorded
       await h.turn(rounds([text(`plain words\n>>>${ROOM} {{unsent}} and a new line`), explicitSend('s1')]));
       const free = h.drafts().find((d) => d.text === 'plain words')!;
@@ -1572,7 +2170,7 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       assert.ok(words.startsWith(`[drafts] scout: 2 plain-speech segments held as drafts ${free.id}, ${copy.id} — `), `no "not sent" over words that may be out: ${words}`);
       assert.ok(words.includes(`drafts(action: "resend", draftIds: ["${free.id}"], destination: "#channel") delivers it unchanged`), words);
       assert.ok(words.includes(`${copy.id} includes the words of ${original.id}, and ${original.id}'s attempt to #room (Guild One) (${ROOM})`), words);
-      assert.ok(words.includes(`so check that channel before resending ${copy.id} (drafts(action: "resend", draftIds: ["${copy.id}"], destination: "#channel", confirmDuplicate: true))`), words);
+      assert.ok(words.includes(`so resending ${copy.id} could post it twice (to send it anyway: drafts(action: "resend", draftIds: ["${copy.id}"], destination: "#channel", confirmDuplicate: true))`), words);
       assert.ok(!words.includes(`draftIds: ["${free.id}", "${copy.id}"], destination`), 'no plain resend offered for the copy');
     } finally {
       await h.close();

@@ -624,6 +624,32 @@ describe('inbound source envelope under RFC-006 coalescing', () => {
     assert.equal(router.getBinding('chat'), undefined, 'no fresh fork was spawned for the correction');
     check('fork_correction', fork);
   });
+
+  it("a channel-scoped push edit that names no message takes its subject's message and thread, as its delivery does", async (t) => {
+    const f = await fixture(); t.after(f.close);
+    await f.register();
+    await f.send('channels/incoming', { messages: [{ ...f.channel('c', 'first_version', { initial: true }), threadId: 'thread' }] });
+    await f.send('push/event', f.params('e', 'second_version', { channelId: 'chat', key: 'message:m' }));
+    await eventually(() => !!sourceOf(f, 'second_version'), 'the edit stored');
+    const stored = sourceOf(f, 'second_version');
+    assert.ok(stored && stored.kind === 'channel');
+    assert.equal(stored.lane, 'push/event');
+    assert.equal(stored.messageId, 'm');
+    assert.equal(stored.threadId, 'thread');
+  });
+
+  it("a channel-scoped push edit that names its own message and thread keeps them over its subject's", async (t) => {
+    const f = await fixture(); t.after(f.close);
+    await f.register();
+    await f.send('channels/incoming', { messages: [{ ...f.channel('c', 'first_version', { initial: true }), threadId: 'thread' }] });
+    const edit = f.params('e', 'second_version', { channelId: 'chat', key: 'message:m' });
+    await f.send('push/event', { ...edit, origin: { ...(edit as { origin?: object }).origin, messageId: 'm2', threadId: 'thread2' } });
+    await eventually(() => !!sourceOf(f, 'second_version'), 'the edit stored');
+    const stored = sourceOf(f, 'second_version');
+    assert.ok(stored && stored.kind === 'channel');
+    assert.equal(stored.messageId, 'm2');
+    assert.equal(stored.threadId, 'thread2');
+  });
 });
 
 describe('sourceBodyDigest hashes a body as the store keeps it', () => {

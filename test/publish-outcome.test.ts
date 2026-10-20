@@ -27,6 +27,7 @@ type Publish = (params: { channelId: string }) => Promise<unknown>;
 function registryWith(
   servers: Record<string, { publish: Publish; grant?: boolean | { without: string[] }; open?: () => Promise<unknown> }>,
   failures: unknown[] = [],
+  traces: Array<{ type: string; [key: string]: unknown }> = [],
 ) {
   const published: Array<{ serverId: string; channelId: string }> = [];
   const opened: Array<{ serverId: string; channelId: string }> = [];
@@ -51,7 +52,7 @@ function registryWith(
     { getServer: (id: string) => mocks.get(id) } as unknown as McplServerRegistry,
     {} as FeatureSetManager,
     () => {},
-    () => {},
+    (event) => { traces.push(event); },
     { onRouteFailure: (info) => { failures.push(info); } },
   );
   const channels = (registry as unknown as {
@@ -86,9 +87,31 @@ describe('ChannelRegistry.publish outcomes', () => {
     fails.seed('discord', 'c', '#c', false);
     const outcome = await fails.registry.publish('agent', 'x', { channelId: 'c' });
     assert.equal(outcome.status, 'failed');
-    assert.equal(outcome.reason, 'channel is closed and open failed: no such channel');
+    assert.equal(outcome.reason, 'opening the channel for these words didn\'t complete: no such channel');
     assert.deepEqual(fails.opened, [{ serverId: 'discord', channelId: 'c' }]);
     assert.deepEqual(fails.published, [], 'nothing dispatched after a failed open');
+  });
+
+  it('prints speech routing\'s open line only for speech routing\'s publishes', async (t) => {
+    const lines: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+    const { registry, seed, opened } = registryWith({ discord: { publish: ok } });
+    seed('discord', 'c', '#c', false);
+    seed('discord', 'd', '#d', false);
+    // A draft resend isn't speech routing's: the channel opens, and no
+    // [routeSpeech] line is printed for it.
+    assert.equal((await registry.publish('agent', 'x', { serverId: 'discord', channelId: 'c' })).status, 'delivered');
+    assert.deepEqual(lines.filter((l) => l.startsWith('[routeSpeech]')), []);
+    await registry.publish('agent', 'x', { channelId: 'd', routed: true });
+    assert.deepEqual(opened, [{ serverId: 'discord', channelId: 'c' }, { serverId: 'discord', channelId: 'd' }]);
+    assert.deepEqual(lines.filter((l) => l.startsWith('[routeSpeech]')), [
+      '[routeSpeech] agent: locus d was closed — opened by delivery (speech implies engagement)',
+    ]);
+    // Speech into a channel that's already open opens nothing and says so nowhere.
+    seed('discord', 'e', '#e');
+    assert.equal((await registry.publish('agent', 'x', { channelId: 'e', routed: true })).status, 'delivered');
+    assert.equal(opened.length, 2);
+    assert.equal(lines.filter((l) => l.includes('was closed')).length, 1, 'no open line for an open channel');
   });
 
   it('refuses a send the grant forbids before opening anything', async () => {
@@ -97,7 +120,8 @@ describe('ChannelRegistry.publish outcomes', () => {
     seed('discord', 'c', '#c', false);
     const outcome = await registry.publish('agent', 'x', { channelId: 'c' });
     assert.equal(outcome.status, 'failed');
-    assert.match(outcome.reason!, /channels\.publish not in "discord"'s effective grant/);
+    assert.equal(outcome.reason, 'this host isn\'t permitted to post to the "discord" server\'s channels, and trying again ' +
+      'won\'t change that; if you need it, ask whoever runs this host');
     assert.deepEqual(opened, [], 'a refused send opens nothing');
     assert.deepEqual(published, []);
   });
@@ -115,7 +139,7 @@ describe('ChannelRegistry.publish outcomes', () => {
       seed('discord', 'c', '#c');
       const outcome = await registry.publish('agent', 'x', { channelId: 'c' });
       assert.equal(outcome.status, 'unknown');
-      assert.match(outcome.reason ?? '', /contradictory receipt/);
+      assert.match(outcome.reason ?? '', /^the "discord" server said it didn't post the message, along with a message id that isn't valid \(.*\) \(delivery uncertain\)$/);
       assert.equal(outcome.messageId, undefined);
     });
   }
@@ -166,7 +190,7 @@ describe('ChannelRegistry.publish outcomes', () => {
   it('treats an error response as unknown, keeping the connector\'s words and data (a partial post may precede it)', async () => {
     const partial = 'Send partially completed. POSTED: part 1 of 2 (message id 111). IN FLIGHT: part 2 of 2.';
     const { registry, seed } = registryWith({
-      discord: { publish: async () => { throw new McplRequestError(`MCPL server "discord" returned error for channels/publish: [-32000] ${partial}`, 'error-response', -32000, { posted: ['111'] }); } },
+      discord: { publish: async () => { throw new McplRequestError(`MCPL server "discord" returned error for channels/publish: [-32000] ${partial}`, 'error-response', { posted: ['111'] }); } },
     });
     seed('discord', 'c', '#c');
     const outcome = await registry.publish('agent', 'x', { channelId: 'c' });
@@ -174,6 +198,51 @@ describe('ChannelRegistry.publish outcomes', () => {
     assert.ok(outcome.reason?.includes(partial), 'the connector\'s account is kept verbatim');
     assert.deepEqual(outcome.detail, { posted: ['111'] });
     assert.equal(outcome.destination?.channelId, 'c');
+  });
+
+  for (const id of ['message-' + 'x'.repeat(10_000), { malformed: 'x'.repeat(10_000) }]) {
+    it('bounds a contradictory ' + (typeof id === 'string' ? 'string' : 'object') + ' message id in the reason, preserving the receipt', async () => {
+      const { registry, seed } = registryWith({ discord: { publish: async () => ({ delivered: false, messageId: id }) } });
+      seed('discord', 'c', '#c');
+      const outcome = await registry.publish('agent', 'x', { channelId: 'c' });
+      assert.equal(outcome.status, 'unknown');
+      assert.ok(outcome.reason!.length < 2300, 'the diagnostic is bounded');
+      assert.match(outcome.reason!, /\[truncated\]/);
+      assert.match(outcome.reason!, /delivery uncertain/);
+      assert.equal(outcome.messageId, typeof id === 'string' ? id : undefined, 'diagnostic clipping does not rewrite a connector id');
+    });
+  }
+
+  it('speech failure forwards bounded connector data to both notice and trace, preserving the original outcome', async () => {
+    const data = { posted: ['111'], note: 'x'.repeat(10_000) };
+    const failures: unknown[] = [];
+    const traces: Array<{ type: string; [key: string]: unknown }> = [];
+    const { registry, seed } = registryWith({
+      discord: { publish: async () => { throw new McplRequestError('part 2 failed', 'error-response', data); } },
+    }, failures, traces);
+    seed('discord', 'c', '#c');
+    const outcome = await registry.deliverSpeech('agent', 'words', 'c');
+    assert.equal(outcome.status, 'unknown');
+    assert.deepEqual(outcome.detail, data, 'the outcome still carries the complete structured data');
+    const info = failures[0] as { detail?: string };
+    assert.ok(info.detail && info.detail.length <= 2000);
+    assert.match(info.detail, /"posted":\["111"\]/);
+    assert.match(info.detail, /\[truncated\]$/);
+    assert.equal(traces.find((e) => e.type === 'mcpl:speech-route-failed')?.detail, info.detail);
+  });
+
+  it('unrenderable connector data keeps an unknown speech failure visible rather than throwing', async () => {
+    const data: Record<string, unknown> = { posted: ['111'] };
+    data.self = data;
+    const failures: unknown[] = [];
+    const { registry, seed } = registryWith({
+      discord: { publish: async () => { throw new McplRequestError('part 2 failed', 'error-response', data); } },
+    }, failures);
+    seed('discord', 'c', '#c');
+    const outcome = await registry.deliverSpeech('agent', 'words', 'c');
+    assert.equal(outcome.status, 'unknown');
+    assert.equal(outcome.detail, data, 'the formatter does not change the source value');
+    assert.equal((failures[0] as { detail?: string }).detail, '[unserializable connector value]');
   });
 
   it('treats a timeout or a lost connection as unknown', async () => {
@@ -208,7 +277,8 @@ describe('ChannelRegistry.publish outcomes', () => {
     seed('beta', 'discord:g1:room', '#room (Beta)');
     const shared = await registry.publish('agent', 'x', { channelId: 'discord:g1:room' });
     assert.equal(shared.status, 'failed');
-    assert.match(shared.reason ?? '', /more than one MCPL server/);
+    assert.equal(shared.reason, 'channel id "discord:g1:room" is on more than one server, and no server was named for these ' +
+      'words; if you need them there, ask whoever runs this host');
     assert.equal(published.length, 0, 'never routed through whichever server came first');
     const exact = await registry.publish('agent', 'x', { serverId: 'beta', channelId: 'discord:g1:room' });
     assert.equal(exact.status, 'delivered');
@@ -232,6 +302,91 @@ describe('ChannelRegistry.publish outcomes', () => {
     assert.equal(await registry.routeSpeech('agent', 'x', 'c'), null);
     assert.equal(await registry.routeSpeech('agent', 'x', 'd'), null);
     assert.deepEqual(failures.map((f) => f.outcome), ['unknown', 'failed']);
+  });
+});
+
+describe('channel_publish answers by the receipt rule', () => {
+  // Ada-1017's item for #163's rule (agent-framework#163): the tool and the
+  // subconscious's speak_in_channel, which shares its path, count only a
+  // connector's delivered:true as posted, as plain speech does.
+  const publishWith = async (publish: Publish) => {
+    const { registry, seed } = registryWith({ discord: { publish } });
+    seed('discord', 'c', '#c');
+    return registry.handleChannelToolCall('channel_publish', { channelId: 'c', content: 'words' }) as Promise<{
+      success: boolean; data?: unknown; error?: string; isError?: boolean;
+    }>;
+  };
+
+  it('answers delivered:true with success and the connector receipt', async () => {
+    const result = await publishWith(ok);
+    assert.equal(result.success, true);
+    assert.deepEqual(result.data, { delivered: true, messageId: 'posted-1' });
+  });
+
+  for (const [what, receipt] of [['a missing receipt', undefined], ['an empty receipt', {}], ['a malformed delivered field', { delivered: 'yes' }]] as const) {
+    it(`answers ${what} as unconfirmed, never as success`, async () => {
+      const result = await publishWith(async () => receipt);
+      assert.equal(result.success, false);
+      assert.equal(result.isError, true);
+      assert.equal(result.error, 'Posting to channel "c" wasn\'t confirmed: the "discord" server\'s answer didn\'t say whether it posted ' +
+        'the message (delivery uncertain). It may or may not have been posted, so sending it again could post it twice.');
+    });
+  }
+
+  it('answers delivered:false with no message id as failed: nothing was posted', async () => {
+    const result = await publishWith(async () => ({ delivered: false }));
+    assert.equal(result.success, false);
+    assert.equal(result.error, 'Nothing was posted to channel "c": the "discord" server said it didn\'t post the message.');
+  });
+
+  it('answers delivered:false beside a message id as unconfirmed', async () => {
+    const result = await publishWith(async () => ({ delivered: false, messageId: 'part-1' }));
+    assert.equal(result.success, false);
+    assert.match(result.error ?? '', /^Posting to channel "c" wasn't confirmed: the "discord" server said it didn't post the message, yet named message part-1 as posted \(delivery uncertain\)\. /);
+  });
+
+  it('answers a request refused before it was written as failed, and an error response or a plain throw as unconfirmed', async () => {
+    const notSent = await publishWith(async () => { throw new McplRequestError('Cannot send request: connection to "discord" is closed', 'not-sent'); });
+    assert.equal(notSent.error, 'Nothing was posted to channel "c": Cannot send request: connection to "discord" is closed.');
+    // The connection's messages are sentences, and the answer adds its own ending.
+    const sentence = await publishWith(async () => {
+      throw new McplRequestError('The request wasn\'t sent: the connection to the "discord" server is closed, so nothing ran. This host is reconnecting to it; try again later.', 'not-sent');
+    });
+    assert.equal(sentence.error, 'Nothing was posted to channel "c": The request wasn\'t sent: the connection to the "discord" server is closed, ' +
+      'so nothing ran. This host is reconnecting to it; try again later.');
+    // A server's own words keep their final period, since they're its words.
+    const ended = await publishWith(async () => {
+      throw new McplRequestError('The "discord" server answered with an error: Part 2 failed.', 'error-response');
+    });
+    assert.match(ended.error ?? '', /^Posting to channel "c" wasn't confirmed: The "discord" server answered with an error: Part 2 failed\. \(delivery uncertain\)\. /);
+    const answered = await publishWith(async () => { throw new McplRequestError('MCPL server "discord" returned error for channels/publish: [-32000] part 2 failed', 'error-response', { posted: ['111'] }); });
+    assert.match(answered.error ?? '', /^Posting to channel "c" wasn't confirmed: .*part 2 failed \(delivery uncertain\)\. It may or may not have been posted/);
+    // What the connector says was posted reaches the answer, as it does the marker.
+    assert.ok(answered.error?.endsWith(' could post it twice. Connector detail: {"posted":["111"]}'), answered.error);
+    const thrown = await publishWith(async () => { throw new Error('connector exploded'); });
+    assert.match(thrown.error ?? '', /^Posting to channel "c" wasn't confirmed: connector exploded \(delivery uncertain\)\./);
+    assert.ok(!thrown.error?.includes('Connector detail'), 'no data, no detail');
+    // A long string comes through as itself, bounded.
+    const long = await publishWith(async () => { throw new McplRequestError('timed out', 'no-response', 'q'.repeat(3000)); });
+    assert.ok(long.error?.endsWith(` Connector detail: ${'q'.repeat(1987)}… [truncated]`), long.error?.slice(-80));
+    // A request that never left posted nothing, whatever data rides on it.
+    const refused = await publishWith(async () => { throw new McplRequestError('Cannot send request: connection to "discord" is closed', 'not-sent', { posted: [] }); });
+    assert.match(refused.error ?? '', /^Nothing was posted to channel "c": /);
+  });
+
+  it('publishForAgent, the subconscious\'s speak_in_channel path, answers by the same rule', async () => {
+    const answers: Array<[unknown, RegExp]> = [
+      [{ delivered: true, messageId: 'posted-1' }, /^$/],
+      [{ delivered: false }, /^Nothing was posted to channel "c": the "discord" server said it didn't post the message\.$/],
+      [undefined, /^Posting to channel "c" wasn't confirmed: .*didn't say whether it posted the message.*could post it twice\.$/],
+    ];
+    for (const [receipt, pattern] of answers) {
+      const { registry, seed } = registryWith({ discord: { publish: async () => receipt } });
+      seed('discord', 'c', '#c');
+      const result = await registry.publishForAgent('c', 'words', 'scout');
+      assert.equal(result.success, receipt !== undefined && (receipt as { delivered?: boolean }).delivered === true, JSON.stringify(receipt));
+      assert.match(result.error ?? '', pattern, JSON.stringify(receipt));
+    }
   });
 });
 
@@ -263,8 +418,10 @@ test('the resident\'s failure marker never claims an uncertain delivery did not 
     const markers = () => framework.getAgent('scout')!.getContextManager().getAllMessages()
       .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'discord-send-failed')
       .map((m) => (m.content[0] as { text: string }).text);
-    const turn = async (mode: string, n: number) => {
-      appendFileSync(commandPath, JSON.stringify({ op: 'publish-mode', mode }) + '\n');
+    const traces: Array<{ type: string; detail?: unknown }> = [];
+    framework.onTrace((event) => traces.push(event));
+    const turn = async (mode: string, n: number, detail?: unknown) => {
+      appendFileSync(commandPath, JSON.stringify({ op: 'publish-mode', mode, detail }) + '\n');
       membrane.pushResponse(createMockResponse([{ type: 'text', text: `reply ${n}` }]));
       appendFileSync(commandPath, JSON.stringify({ op: 'incoming', channelId: 'discord:g1:room', messageId: `m-${n}`, mode: 'addressed', text: 'hello?' }) + '\n');
       await until(() => markers().length === n, `marker ${n}`);
@@ -278,6 +435,16 @@ test('the resident\'s failure marker never claims an uncertain delivery did not 
     assert.doesNotMatch(uncertain!, /did not receive|Nothing was posted/);
     assert.match(failed!, /could not be delivered/);
     assert.match(failed!, /Nothing was posted/);
+    await turn('error', 3, { posted: ['111'], note: 'x'.repeat(10_000) });
+    const partial = markers()[2]!;
+    assert.match(partial, /was not confirmed/);
+    assert.match(partial, /Connector detail:.*"posted":\["111"\]/);
+    assert.match(partial, /\[truncated\]$/);
+    assert.ok(partial.length < 2500, 'the resident receives a bounded display, not the whole error object');
+    const trace = traces.find((event) => event.type === 'mcpl:speech-route-failed' && event.detail !== undefined);
+    assert.ok(trace?.detail, 'the same connector account reaches the failure trace');
+    const marker = framework.getAgent('scout')!.getContextManager().getAllMessages().find((m) => (m.content[0] as { text: string }).text === partial);
+    assert.equal((marker?.metadata as { detail?: unknown } | undefined)?.detail, trace?.detail, 'the persisted marker metadata carries the same bounded display');
   } finally {
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
