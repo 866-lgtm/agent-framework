@@ -308,6 +308,22 @@ const changesRouting = (
 const ROUTING_TOOLS = [...SILENCING_TOOLS, ...WORLD_PUBLICATION_TOOLS, 'drafts', 'think'];
 
 /**
+ * The keys of a stored message's metadata that only the host writes, each
+ * one a reader takes on its own as what the message is: `system` and `kind`
+ * make it a host notice of that kind, `draftOwner` and `draftIds` one that
+ * names those drafts, `tuneOut` a message a tune-out holds from the
+ * residents, `coalescingSubject` (beside the server's own `eventId`) the
+ * delivery of a coalesced occurrence, and `firstView` the coalescer's mark
+ * that no version of the message was shown. A server's metadata, a channel
+ * message's `metadata` or a push event's `origin`, is stored without them,
+ * and the host writes its own after it: MCPL SPEC §16.6 makes metadata the
+ * producer's untrusted claims, which a host may disbelieve. A notice's other
+ * inputs, such as `passOn` or `reason`, are read only on a message of its
+ * kind, so a server's copy of one is read by nothing.
+ */
+const HOST_METADATA_KEYS = ['system', 'kind', 'draftOwner', 'draftIds', 'tuneOut', 'coalescingSubject', 'firstView'] as const;
+
+/**
  * True when an injected message is real conversational input — something the
  * agent might actually be replying to — rather than ambient machinery.
  * System markers (`system: true` — send-failed notices, routing notices) and
@@ -11911,6 +11927,31 @@ export class AgentFramework {
   // Built-in MCPL event → context message conversion
   // ==========================================================================
 
+  /** The servers and keys whose drop withoutHostKeys has logged, each as
+   *  `${serverId}\u0000${key}`. */
+  private readonly hostKeysDropped = new Set<string>();
+
+  /**
+   * A server's metadata as it is stored: a copy without HOST_METADATA_KEYS.
+   * A server may use one of those names for something of its own, so the
+   * first drop of each key from each server is logged.
+   */
+  private withoutHostKeys(serverId: string, field: 'metadata' | 'origin', given: Record<string, unknown> | undefined): Record<string, unknown> {
+    const kept: Record<string, unknown> = { ...given };
+    for (const key of HOST_METADATA_KEYS) {
+      if (!Object.hasOwn(kept, key)) continue;
+      delete kept[key];
+      const logged = `${serverId}\u0000${key}`;
+      if (this.hostKeysDropped.has(logged)) continue;
+      this.hostKeysDropped.add(logged);
+      console.error(
+        `[mcpl] ${serverId}: dropped "${key}" from a message's ${field}, since only the host writes that key ` +
+        `(logged once for each server and key)`,
+      );
+    }
+    return kept;
+  }
+
   /**
    * Convert an incoming MCPL channel message to a context message.
    * This replaces the old MCPLModule.onProcess() message conversion.
@@ -11948,7 +11989,7 @@ export class AgentFramework {
       return undefined;
     }
     const metadata: Record<string, unknown> = {
-      ...event.metadata,
+      ...this.withoutHostKeys(event.serverId, 'metadata', event.metadata),
       ...(event.eventId ? { eventId: event.eventId } : {}),
       ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
       channelId: event.channelId,
@@ -11959,9 +12000,8 @@ export class AgentFramework {
     };
     if (event.threadId) metadata.threadId = event.threadId;
     if (event.tags) metadata.tags = event.tags;
-    // The coalescer's mark is the host's alone: a server's own is dropped.
+    // The coalescer's mark (a server's own was dropped with the other host keys).
     if (event.firstView === true) metadata.firstView = true;
-    else delete metadata.firstView;
     // The inbound source envelope (mcpl/inbound-source.ts): frozen at the
     // occurrence's acceptance when the coalescer delivers, else stamped now
     // from this event. Written after the adapter's metadata, so an adapter
@@ -13441,7 +13481,7 @@ export class AgentFramework {
     }
 
     const metadata: Record<string, unknown> = {
-      ...event.origin,
+      ...this.withoutHostKeys(event.serverId, 'origin', event.origin),
       serverId: event.serverId,
       featureSet: event.featureSet,
       eventId: event.eventId,
@@ -13449,9 +13489,8 @@ export class AgentFramework {
       ...(event.tags ? { tags: event.tags } : {}),
       ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
     };
-    // The coalescer's mark is the host's alone: a server's own is dropped.
+    // The coalescer's mark (a server's own was dropped with the other host keys).
     if (event.firstView === true) metadata.firstView = true;
-    else delete metadata.firstView;
     // `origin.channelId` is the server-internal raw id (a bare Discord
     // snowflake) — unroutable as a locus and unresolvable by the agent. Store
     // the composite MCPL id instead wherever we can derive it, so anything
