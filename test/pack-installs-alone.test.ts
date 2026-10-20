@@ -549,13 +549,15 @@ test("npm pack, npm install and the tests' own npm pack each take the npm their 
 
 test("each load, each bin's load, a CommonJS bin's --check and a JavaScript npm start under --single-threaded, and they are all the Nodes the script starts", async () => {
   // A preload that notes each Node's flags and main file: NODE_OPTIONS reaches
-  // every Node the script starts, and a preload runs under --check too. Its
-  // directory's name has a space, so NODE_OPTIONS takes its path quoted.
+  // every Node the script starts, and a preload runs under --check too. It
+  // notes on the main thread alone, since a thread of the process runs it
+  // too, as the load hook's does where Node lacks registerHooks (Node 20).
+  // Its directory's name has a space, so NODE_OPTIONS takes its path quoted.
   const dir = mkdtempSync(join(tmpdir(), "pack-installs-alone flags-"));
   made.push(dir);
   const notes = join(dir, "flags");
   const noter = join(dir, "note.cjs");
-  writeFileSync(noter, `require("node:fs").appendFileSync(${JSON.stringify(notes)}, JSON.stringify({ flags: process.execArgv, main: process.argv[1] ?? "" }) + "\\n");\n`);
+  writeFileSync(noter, `if (require("node:worker_threads").isMainThread) require("node:fs").appendFileSync(${JSON.stringify(notes)}, JSON.stringify({ flags: process.execArgv, main: process.argv[1] ?? "" }) + "\\n");\n`);
   // A JavaScript npm first on PATH, as an npm installed with Node is, that
   // hands each call to the real npm without NODE_OPTIONS, so each npm start
   // is noted once, whatever the host's own npm is.
