@@ -1694,10 +1694,19 @@ export class WorkspaceModule implements Module {
   // Tool Definitions
   // ==========================================================================
 
+  /**
+   * Whether any of this host's mounts runs direct. The tools' descriptions
+   * and grep's notes mention direct mounts only on such a host, so both ask
+   * this one question.
+   */
+  private anyRunsDirect(): boolean {
+    return [...this.mounts.values()].some((m) => m.direct);
+  }
+
   getTools(): ToolDefinition[] {
     // Where a mount runs direct, four descriptions say what that changes.
     // A host with none keeps them as they were, and its residents' caches.
-    const direct = [...this.mounts.values()].some((m) => m.direct);
+    const direct = this.anyRunsDirect();
     const lsDirect = direct
       ? ' A direct mount (ls without a path says which, with its ignore list) lists disk\'s files as they are now: each with '
         + 'its size and no state, or a note where the mount doesn\'t take it. A path its ignore list covers is listed when you name it.'
@@ -4687,7 +4696,7 @@ export class WorkspaceModule implements Module {
         // A pattern written for a CR can't find a CRLF end's, nor one written
         // for U+FEFF a BOM, which lines as read shows them leave out, so the
         // answer says why it didn't.
-        ...leftOutNote(input.pattern, searchedCrlf, searchedBom, [...this.mounts.values()].some((m) => m.direct)),
+        ...leftOutNote(input.pattern, searchedCrlf, searchedBom, this.anyRunsDirect()),
         ...(skipped.length > 0 ? { skipped } : {}),
         ...(incomplete.length > 0 ? { incomplete } : {}),
       },
