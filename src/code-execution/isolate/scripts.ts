@@ -28,7 +28,7 @@
 
 import { ChildCapacity, ScriptRun, type CallAnswer, type Ending, type ScriptRunOptions, type ToolAnswer } from './runner.js';
 import type { CallSummary } from './calls.js';
-import type { OutputBounds } from './output.js';
+import type { OutputBounds, OutputWindow } from './output.js';
 import type { PreludeTool } from './prelude.js';
 import { glimpse } from './render.js';
 
@@ -87,7 +87,7 @@ export interface ScriptReturn {
   /** Still running past the bound, or ended. */
   running: boolean;
   /** The output since this script's previous return. */
-  output: string;
+  output: OutputWindow;
   /** True for the script's first return. */
   first: boolean;
   calls: CallSummary;
@@ -392,7 +392,7 @@ export class AgentScripts {
     return {
       scriptId: script.id,
       running: snap.ending === null,
-      output: current ? script.run.takeOutput() : snap.output,
+      output: current ? script.run.takeOutput() : script.run.outputWindow(),
       first: script.returns <= 1,
       calls: snap.calls,
       ending: snap.ending,

@@ -246,6 +246,64 @@ describe('ToolCall.resultMaxChars', () => {
     }
   });
 
+  it("a code_execution return is held to its agent's inline cap, its output's first and last parts kept", async () => {
+    const { framework, done } = await makeFramework(new MockMembrane(), { enabled: true, memoryMaxBytes: 64 * 1024 * 1024 });
+    try {
+      const result = await framework.executeToolCall({
+        id: 'script', name: 'code_execution', callerAgentName: 'prime', input: { code: [
+          'text("FIRST" + "a".repeat(20000));',
+          'text("b".repeat(20000) + "LAST");',
+          'return "x".repeat(3000);',
+        ].join('\n') },
+      });
+      const text = result.isError ? result.error ?? '' : (result.data as Array<{ text?: string }>)[0]?.text ?? '';
+      // The strategy's bound beneath the residence's cap is the agent's cap.
+      assert.ok(text.length <= BOUNDED, `${text.length} characters, against the agent's cap of ${BOUNDED}`);
+      assert.ok(text.includes(`It returned: "${'x'.repeat(3000)}"`), 'the value whole');
+      assert.match(text, /Its output:\nFIRST/);
+      assert.match(text, /characters of output dropped here/);
+      assert.match(text, /LAST\n?$/, "the output's tail ends the return");
+    } finally {
+      await done();
+    }
+  });
+
+  it("a model's code_execution return is stored whole under its agent's cap, its output's last characters ending it", async () => {
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'call_script', name: 'code_execution', input: { code: 'text("FIRST" + "a".repeat(20000)); text("b".repeat(20000) + "LAST"); return 1;' } },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+    const { framework, done } = await makeFramework(membrane, { enabled: true, memoryMaxBytes: 64 * 1024 * 1024 });
+    try {
+      framework.pushEvent({
+        type: 'external-message', source: 'test', content: [{ type: 'text', text: 'run it' }], metadata: {}, triggerInference: true,
+      } as unknown as ProcessEvent);
+      const stored = await until('the stored return', () => storedResults(framework).get('call_script'));
+      assert.ok(stored.length <= BOUNDED, `${stored.length} characters stored, against the agent's cap of ${BOUNDED}`);
+      assert.doesNotMatch(stored, /\[truncated/, 'the store had nothing to cut');
+      assert.match(stored, /Its output:\nFIRST/);
+      assert.match(stored, /LAST\n?$/);
+    } finally {
+      await done();
+    }
+  });
+
+  it("an in-process call's own resultMaxChars holds its code_execution return", async () => {
+    const { framework, done } = await makeFramework(new MockMembrane(), { enabled: true, memoryMaxBytes: 64 * 1024 * 1024 });
+    try {
+      const result = await framework.executeToolCall({
+        id: 'script', name: 'code_execution', callerAgentName: 'prime', resultMaxChars: 1_500,
+        input: { code: 'text("FIRST" + "a".repeat(20000)); text("b".repeat(20000) + "LAST"); return 1;' },
+      });
+      const text = result.isError ? result.error ?? '' : (result.data as Array<{ text?: string }>)[0]?.text ?? '';
+      assert.ok(text.length <= 1_500, `${text.length} characters, against the caller's 1,500`);
+      assert.match(text, /LAST\n?$/);
+    } finally {
+      await done();
+    }
+  });
+
   it('a call made in process carries what its caller put on it, and so does a utility it runs', async () => {
     const { framework, probe, done } = await makeFramework();
     try {

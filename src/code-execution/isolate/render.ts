@@ -8,6 +8,7 @@
 import { fresh, toolRef, type CallSummary, type NamedCall } from './calls.js';
 import type { Ending } from './runner.js';
 import type { ScriptListing, ScriptReturn } from './scripts.js';
+import { renderOutput } from './output.js';
 
 /**
  * The most of a script's return value, or of a failure's message or stack,
@@ -151,6 +152,12 @@ export interface RenderOptions {
   /** The bound the return was made at, for a yield's line. */
   boundMs: number;
   lifetimeMs: number;
+  /**
+   * The agent's inline cap for tool results, which the return is stored
+   * under: the output is cut to the room the rest of the return leaves in
+   * it. None when left out.
+   */
+  maxChars?: number;
 }
 
 /** The text a return gives the model. */
@@ -173,7 +180,17 @@ export function renderReturn(r: ScriptReturn, options: RenderOptions): string {
   lines.push(callsLines(r.calls, r.ending === null));
   // The run keeps the value cut to VALUE_CHARS, with room for the cut's marker.
   if (r.ending?.how === 'finished' && r.ending.value !== undefined) lines.push(`It returned: ${r.ending.value}`);
-  lines.push(r.output.length > 0 ? `${r.first ? 'Its output' : 'Its output since the last return'}:\n${r.output}` : r.first ? 'No output.' : 'No output since the last return.');
+  const { head, tail, dropped } = r.output;
+  if (head.length + tail.length + dropped === 0) {
+    lines.push(r.first ? 'No output.' : 'No output since the last return.');
+    return lines.join('\n');
+  }
+  // The output comes last, and past the agent's inline cap the framework's
+  // cut would take its tail first: it gets the room the rest leaves, its head
+  // and tail cut alike.
+  const label = `${r.first ? 'Its output' : 'Its output since the last return'}:\n`;
+  const rest = lines.join('\n').length + 1 + label.length;
+  lines.push(label + renderOutput(r.output, (options.maxChars ?? Infinity) - rest));
   return lines.join('\n');
 }
 

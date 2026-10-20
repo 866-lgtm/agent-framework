@@ -67,6 +67,42 @@ export class OutputBatch {
   }
 }
 
+/** A return's stretch of output: its head and tail, and the count dropped between them. */
+export interface OutputWindow {
+  head: string;
+  tail: string;
+  dropped: number;
+}
+
+/** The line naming what was dropped, at its longest, as renderOutput puts it between the head and the tail. */
+const DROPPED_LINE_CHARS = `\n[… ${Number.MAX_SAFE_INTEGER} characters of output dropped here …]\n`.length;
+
+/**
+ * The stretch as the model sees it: the head, a line naming what was dropped
+ * if anything was, and the tail. Past `max`, its start and its end are cut
+ * alike to fit it, each taking the room the other doesn't need, and the count
+ * takes in what they gave up, so a return held to its agent's inline cap
+ * still shows both ends. A `max` that leaves no room for that line gets the
+ * line alone, which passes it.
+ */
+export function renderOutput(w: OutputWindow, max = Infinity): string {
+  const whole = w.dropped === 0 ? w.head + w.tail : `${w.head}\n[… ${w.dropped} characters of output dropped here …]\n${w.tail}`;
+  if (whole.length <= max) return whole;
+  const room = Math.max(0, Math.floor(max) - DROPPED_LINE_CHARS);
+  // With nothing dropped yet, the head and the tail are one stretch, whose end
+  // lies in the head while the tail is short or empty: it's cut as one.
+  const [first, last] = w.dropped === 0 ? [whole, whole] : [w.head, w.tail];
+  const lastKeep = Math.min(last.length, Math.max(Math.floor(room / 2), room - first.length));
+  const head = first.slice(0, safeCut(first, Math.min(first.length, room - lastKeep)));
+  // Kept from the end, never starting on a pair's second half.
+  let from = last.length - lastKeep;
+  const at = last.charCodeAt(from);
+  if (from > 0 && at >= 0xdc00 && at <= 0xdfff) from += 1;
+  const tail = last.slice(from);
+  const dropped = w.dropped === 0 ? whole.length - head.length - tail.length : w.dropped + (first.length - head.length) + from;
+  return `${head}\n[… ${dropped} characters of output dropped here …]\n${tail}`;
+}
+
 /** The parent's side: the head and tail of what arrived since the last return, and the count dropped between. */
 export class WindowOutput {
   private head = '';
@@ -104,18 +140,22 @@ export class WindowOutput {
     return this.dropped;
   }
 
-  /** The stretch as the model sees it: the head, a line naming what was dropped if anything was, and the tail. */
-  render(): string {
-    if (this.dropped === 0) return this.head + this.tail;
-    return `${this.head}\n[… ${this.dropped} characters of output dropped here …]\n${this.tail}`;
+  /** The stretch as it stands. */
+  window(): OutputWindow {
+    return { head: this.head, tail: this.tail, dropped: this.dropped };
   }
 
-  /** The stretch as the model sees it, and a fresh one from here. */
-  take(): string {
-    const text = this.render();
+  /** The stretch as the model sees it, whole (renderOutput). */
+  render(): string {
+    return renderOutput(this.window());
+  }
+
+  /** The stretch, and a fresh one from here. */
+  take(): OutputWindow {
+    const window = this.window();
     this.head = '';
     this.tail = '';
     this.dropped = 0;
-    return text;
+    return window;
   }
 }

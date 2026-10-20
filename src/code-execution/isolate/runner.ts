@@ -27,7 +27,7 @@ import { extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Readable, Writable } from 'node:stream';
 import { encodeFrame, encodeResultFrame, FrameDecoder, FrameError, RESULT_FRAME_OVERHEAD } from './frames.js';
-import { MAX_BATCH_CHARS, WindowOutput, type OutputBounds } from './output.js';
+import { MAX_BATCH_CHARS, WindowOutput, type OutputBounds, type OutputWindow } from './output.js';
 import { WAKE_CALL_NAME, type PreludeTool } from './prelude.js';
 import { CallLog, callBrief, type CallEntry, type CallOutcome, type CallSummary } from './calls.js';
 import {
@@ -422,8 +422,13 @@ export class ScriptRun {
     return { output: this.output.render(), calls: this.log.summary(this.dispatchWaiting.size + this.wakesWaiting), ending: this.ending };
   }
 
-  /** The output since the last return, as the model sees it, starting a fresh stretch from here. */
-  takeOutput(): string {
+  /** The output since the last return, as it stands. */
+  outputWindow(): OutputWindow {
+    return this.output.window();
+  }
+
+  /** The output since the last return, starting a fresh stretch from here. */
+  takeOutput(): OutputWindow {
     return this.output.take();
   }
 

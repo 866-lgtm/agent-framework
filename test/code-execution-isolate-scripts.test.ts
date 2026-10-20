@@ -11,6 +11,7 @@ import { extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ChildCapacity, type CallAnswer } from '../src/code-execution/isolate/runner.js';
 import { AgentScripts, ScriptRefusal, type ScriptCallContext, type ScriptsConfig, type ScriptsHost } from '../src/code-execution/isolate/scripts.js';
+import { renderOutput } from '../src/code-execution/isolate/output.js';
 
 // With this file's own extension, as the runner names its entry, so the runtime runs a file that exists.
 const FAKE_CHILD = fileURLToPath(new URL(`./helpers/fake-child-entry${extname(fileURLToPath(import.meta.url))}`, import.meta.url));
@@ -80,7 +81,7 @@ test('a script that ends within its bound returns whole', async () => {
   const r = await scripts.run('alice', `const a = await tools.echo({ x: 1 }); text(a.content[0].text); return 7;`);
   assert.equal(r.running, false);
   assert.deepEqual(r.ending, { how: 'finished', value: '7' });
-  assert.equal(r.output, 'echo {"x":1}\n');
+  assert.equal(renderOutput(r.output), 'echo {"x":1}\n');
   assert.equal(r.stopsAtTurnEnd, false);
 });
 
@@ -94,11 +95,11 @@ test('past its bound a script yields what it wrote, and each wait returns only w
   await release();
   const second = await waiting;
   assert.equal(second.running, false);
-  assert.equal(first.output + second.output, 'one\ntwo\n');
+  assert.equal(renderOutput(first.output) + renderOutput(second.output), 'one\ntwo\n');
   assert.deepEqual(second.ending, { how: 'finished', value: '"end"' });
   // A return after the end has nothing new.
   const third = await scripts.wait('alice', first.scriptId);
-  assert.equal(third.output, '');
+  assert.equal(renderOutput(third.output), '');
 });
 
 test("a non-primary agent's yield says its turn's end will stop it, and that stop wakes no one", async () => {
@@ -230,7 +231,7 @@ test("an abandoned turn stops a script that hadn't returned, quietly, and its pe
   assert.deepEqual(r.ending, { how: 'stopped', reason: 'limit', why: 'its turn ended before the script returned' });
   assert.deepEqual(wakes, []);
   // The return no one will read left the output for the next one.
-  assert.equal((await scripts.wait('alice', r.scriptId)).output, 'hi\n');
+  assert.equal(renderOutput((await scripts.wait('alice', r.scriptId)).output), 'hi\n');
 });
 
 test('only the newest ended scripts are kept, newest by when each ended, from each ending on', async () => {

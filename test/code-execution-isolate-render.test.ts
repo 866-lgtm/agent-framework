@@ -5,12 +5,13 @@ import { strict as assert } from 'node:assert';
 import { bounded, formatMs, glimpse, renderList, renderReturn, VALUE_CHARS } from '../src/code-execution/isolate/render.js';
 import type { CallSummary } from '../src/code-execution/isolate/calls.js';
 import type { ScriptReturn } from '../src/code-execution/isolate/scripts.js';
+import { renderOutput } from '../src/code-execution/isolate/output.js';
 
 const noCalls: CallSummary = { made: 0, answered: 0, failed: 0, refused: 0, unsent: 0, running: 0, waiting: 0, named: [], more: {} };
 const ret = (over: Partial<ScriptReturn>): ScriptReturn => ({
   scriptId: 's1-test',
   running: false,
-  output: '',
+  output: { head: '', tail: '', dropped: 0 },
   first: true,
   calls: noCalls,
   ending: { how: 'finished' },
@@ -165,4 +166,37 @@ test("bounded's cut, from the text's first and last halves (cutOf), is its cut a
     const text = Array.from({ length: next(120) }, () => alphabet[next(alphabet.length)]).join('');
     assert.equal(bounded(text, max), whole(text, max), JSON.stringify({ max, text }));
   }
+});
+
+test("a return held to its agent's inline cap gives its output the room the rest leaves, both its ends kept", () => {
+  const output = { head: `H${'h'.repeat(7_999)}`, tail: `${'t'.repeat(7_999)}T`, dropped: 20_000 };
+  const value = bounded(JSON.stringify('v'.repeat(20_000)), VALUE_CHARS);
+  const ending = { how: 'finished' as const, value };
+  assert.ok(renderReturn(ret({ output, ending }), options).length > 24_000, 'past the default cap, left to itself');
+  for (const maxChars of [24_000, 12_000]) {
+    const text = renderReturn(ret({ output, ending }), { ...options, maxChars });
+    assert.ok(text.length <= maxChars, `${text.length} characters at a cap of ${maxChars}`);
+    // The output fills the room the rest leaves, but for the slack of the count's longest line.
+    assert.ok(text.length >= maxChars - 16, `${text.length} characters fill a cap of ${maxChars}`);
+    assert.ok(text.includes(`It returned: ${value}\n`), 'the value stays as the run kept it');
+    assert.match(text, /Its output:\nHhh/);
+    assert.ok(text.endsWith('ttT'), "the output's last character is the return's last");
+  }
+  // A cap the rest of the return passes on its own leaves the output its count.
+  const tight = renderReturn(ret({ output, ending }), { ...options, maxChars: 4_000 });
+  assert.ok(tight.endsWith('Its output:\n\n[… 36000 characters of output dropped here …]\n'), tight.slice(-120));
+  // A cap the rest fits, with less room than the count's line, leaves the output that line alone, past the cap.
+  const uncut = renderReturn(ret({ output, ending }), options);
+  const rest = uncut.length - renderOutput(output).length;
+  const narrow = renderReturn(ret({ output, ending }), { ...options, maxChars: rest + 20 });
+  assert.equal(narrow, `${uncut.slice(0, rest)}\n[… 36000 characters of output dropped here …]\n`);
+  // With no cap, the output comes as the run kept it.
+  assert.ok(renderReturn(ret({ output, ending }), options).endsWith(`[… 20000 characters of output dropped here …]\n${output.tail}`));
+});
+
+test('a return with no output says so, at its first return and after one', () => {
+  assert.ok(renderReturn(ret({}), options).endsWith('\nNo output.'));
+  assert.ok(renderReturn(ret({ first: false }), options).endsWith('\nNo output since the last return.'));
+  // A cap takes nothing from a return that has no output.
+  assert.ok(renderReturn(ret({}), { ...options, maxChars: 10 }).endsWith('\nNo output.'));
 });

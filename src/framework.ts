@@ -19525,7 +19525,13 @@ export class AgentFramework {
       if (error instanceof ScriptRefusal) return refuse(error.message);
       throw error;
     }
-    const text = renderReturn(r, { boundMs: ce.scripts.bound(yieldMs), lifetimeMs: ce.settings.scriptLifetimeMs });
+    const text = renderReturn(r, {
+      boundMs: ce.scripts.bound(yieldMs),
+      lifetimeMs: ce.settings.scriptLifetimeMs,
+      // The cap its result is held to, which would cut it from its end: an
+      // in-process caller's own (ToolCall.resultMaxChars), or its agent's.
+      maxChars: call.resultMaxChars ?? this.resultMaxCharsFor(agentName, call.id),
+    });
     // A script's call whose result ends the turn ends it at this result, the
     // one watching the script (scriptToolCall).
     const endTurn = watch.endTurn ? { endTurn: true } : {};
