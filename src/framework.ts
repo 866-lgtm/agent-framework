@@ -108,6 +108,7 @@ import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './m
 import { INBOUND_SOURCE_KEY, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
 import type { IncomingMessageFacts, RoutingDecision } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
+import { SEND_TOOLS, bareToolName } from './send-tools.js';
 import { boundedErrorMessage, errorMessage } from './error-message.js';
 import { ProviderWaits, EVERY_MODEL, isReleaseModel, withoutControls, type ProviderWait } from './provider-waits.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
@@ -229,9 +230,7 @@ function sniffImageMediaType(data: Buffer): string | undefined {
  * isn't a number of seconds): then the turn goes on, and only its own round
  * stays silent.
  */
-const SILENCING_TOOLS = new Set([
-  'skip_reply', 'channel_publish', 'send_message', 'reply_message', 'send_dm',
-]);
+const SILENCING_TOOLS = new Set(['skip_reply', ...SEND_TOOLS]);
 
 /**
  * World-surface publication tools (Eidoverse `say` / `whisper`). An explicit
@@ -588,8 +587,6 @@ const PROSE_HELP_TOOL: import('./types/index.js').ToolDefinition = {
   description: 'Show the plain-text output routing syntax (destination prefixes, resend token, skip).',
   inputSchema: { type: 'object' as const, properties: {} },
 };
-/** Strip the `server--` MCPL prefix from a tool name. */
-const bareToolName = (n: string): string => n.split('--').pop()!;
 
 /** "1 registered utility", "2 registered utilities". */
 const registeredUtilities = (n: number): string => `${n} registered ${n === 1 ? 'utility' : 'utilities'}`;
