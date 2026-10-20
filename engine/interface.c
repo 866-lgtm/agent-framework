@@ -526,7 +526,7 @@ static int settle(uint32_t id, int ok, char **json, uint32_t json_len, char **un
    the host couldn't copy in, or a parse that fails, for want of memory or stack (or because it
    isn't JSON, which a host's result never is). Any of these took effect without reaching the
    script, which an error at the call's await would hide. A result nested deeper than the
-   binding's MAX_RESULT_DEPTH never gets here: under Node, a parse nested about 10,000 deep (5,000
+   binding's MAX_RESULT_DEPTH never gets here: under Node, a parse nested about 8,000 deep (5,000
    with V8's optimizing tier alone) overflows the host's stack before QuickJS's own check sees the
    recursion, and the binding refuses results well short of that. When the run had been stopped
    or had failed before this settle, or the call of the promise's resolve or reject function is

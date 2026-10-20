@@ -151,7 +151,7 @@ test('a failed call rejects with its fields, and the prelude makes an Error of t
 test('a result the guest can\'t parse, nested too deeply or not JSON, rejects the call with the child\'s own error', async () => {
   // The call took effect either way, and a RangeError or SyntaxError at its await, or a crash,
   // would read as a failed call. The binding refuses a result nested past MAX_RESULT_DEPTH before
-  // the guest parses it, since under Node a parse nested about 10,000 deep overflows the host's
+  // the guest parses it, since under Node a parse nested about 8,000 deep overflows the host's
   // stack before QuickJS's own check sees it. One that isn't JSON fails the guest's parse.
   const nested = (depth: number) => `${'['.repeat(depth)}"x"${']'.repeat(depth)}`;
   const objects = (depth: number) => `${'{"a":'.repeat(depth)}1${'}'.repeat(depth)}`;

@@ -156,10 +156,13 @@ export const MAX_MEMORY_BYTES = 2048 * 1024 * 1024;
  *
  * Recursion in C that the check barely sees isn't held to it, and under Node crashes the run, the
  * host's stack running out: a script's text nesting function expressions 300 deep or brackets 700
- * deep (the parser), a chain of 3,000 iterator helpers, and the script's own JSON nested about
- * 10,000 deep (5,000 with V8's optimizing tier alone; see MAX_RESULT_DEPTH). Each iterator helper's
- * next calls the one before directly, past QuickJS's checks, so under Bun, whose stack is larger,
- * a chain of 30,000 runs the module's own 1 MiB stack out instead, and the module traps: the stack
+ * deep (the parser), a chain of 3,000 iterator helpers, and the script's own data nested about
+ * 5,000 deep in JSON.stringify (4,000 with V8's optimizing tier alone), as a call's arguments
+ * are, or about 8,000 deep in JSON.parse (5,000; see MAX_RESULT_DEPTH). Under Bun, whose stack
+ * is larger, QuickJS's check ends JSON's recursion first, with a RangeError the script can catch,
+ * from about 15,000 deep, though a parse nested 22,000 deep still runs Bun's stack out. Each
+ * iterator helper's next calls the one before directly, past QuickJS's checks, so under Bun a
+ * chain of 30,000 runs the module's own 1 MiB stack out instead, and the module traps: the stack
  * sits first in its memory, so an overflow wraps below address 0 to past the memory's end.
  */
 export const MAX_STACK_BYTES = 192 * 1024;
@@ -167,10 +170,10 @@ export const DEFAULT_STACK_BYTES = MAX_STACK_BYTES;
 /**
  * The deepest nesting of arrays and objects a result may have. QuickJS's stack check measures the
  * module's own stack, which the C recursion of JSON's parse and stringify barely uses, so under
- * Node nesting about 10,000 deep (5,000 with V8's optimizing tier alone) overflows the host's
- * stack first, and the engine crashes (under Bun, QuickJS's check comes first). A deeper result
- * is unfit, since the call took effect. A script's own data isn't held to this, and nested that
- * deep, it crashes its own run under Node.
+ * Node a parse nested about 8,000 deep (5,000 with V8's optimizing tier alone) overflows the
+ * host's stack first, and the engine crashes (under Bun, QuickJS's check comes first). A deeper
+ * result is unfit, since the call took effect. A script's own data isn't held to this, and nested
+ * thousands deep, it can crash its own run (see MAX_STACK_BYTES).
  */
 export const MAX_RESULT_DEPTH = 2000;
 /** The most of the engine's own stdio a crash's message keeps. */
