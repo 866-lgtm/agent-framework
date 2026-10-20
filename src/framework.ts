@@ -21889,7 +21889,9 @@ export class AgentFramework {
    * told it could act on and never read: its builder, called again now that
    * `speaker` has ended, gives the words it gives an agent that has ended,
    * judged for the primary, or nothing, logged, with no primary to tell.
-   * They speak of the open or the failure as it was, as the notice did, and
+   * They speak of the open or the failure as it was, as the notice did, a
+   * failed one's reason for its selection included, which an agent's
+   * channel_open since replaces in the record and not in the words, and
    * only of what still holds by each channel's durable decision on its own
    * server: the registry's (getDesiredState), or before there is one, as at
    * a serving boot's flush, the lifecycle log's (desiredStateInLog). An
