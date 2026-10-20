@@ -2378,7 +2378,8 @@ test("a direct mount's grep matches lines as read shows them, as a 'chronicle' m
     { pattern: '\\r', path: 'ref/lf.txt' },
   ];
   // A 'chronicle' mount labels each result with its path's state and the
-  // workspace's copy, a direct mount's with disk's file: the rest is the same.
+  // workspace's copy, a direct mount's with disk's file: the rest is the same,
+  // but for where the notes say read shows what lines leave out.
   const answers = async (m: WorkspaceModule): Promise<Array<[Record<string, unknown>, Array<Record<string, unknown>>, string | null]>> => {
     const out: Array<[Record<string, unknown>, Array<Record<string, unknown>>, string | null]> = [];
     for (const input of calls) {
@@ -2395,12 +2396,19 @@ test("a direct mount's grep matches lines as read shows them, as a 'chronicle' m
   assert.deepEqual(byFile['ref/bom.txt'], { file: 'ref/bom.txt', matches: [{ line: 1, text: 'foo' }] });
   assert.deepEqual(byFile['ref/lf.txt'], { file: 'ref/lf.txt', matches: [{ line: 1, text: 'foo' }] });
   const cr = "The pattern names a CR, and a file searched has CRLF line ends. Lines are matched as read shows them, "
-    + "which leaves out a CRLF end's CR unless the line's own text ends in a CR. read with offsetChars shows every CR in the workspace's copy.";
+    + "which leaves out a CRLF end's CR unless the line's own text ends in a CR. read with offsetChars shows every CR in the workspace's copy";
   const bom = "The pattern names U+FEFF, and a file searched starts with a BOM. Lines are matched as read shows them, "
-    + "and a BOM isn't part of the first line. read with offsetChars shows any BOM the workspace's copy has.";
-  assert.deepEqual(fromDisk.slice(1).map(([, results, note]) => [results.length, note]), [[0, cr], [0, bom], [0, `${cr} ${bom}`], [0, null]]);
+    + "and a BOM isn't part of the first line. read with offsetChars shows any BOM";
+  // On a host with a direct mount, which keeps no workspace copy, the notes
+  // name disk's file too; on a host with none, the workspace's copy alone.
+  const crDirect = `${cr}, or in disk's file on a direct mount.`;
+  const bomDirect = `${bom} in the workspace's copy, or in disk's file on a direct mount.`;
+  const notes = (crNote: string, bomNote: string) => [crNote, bomNote, `${crNote} ${bomNote}`, null];
+  assert.deepEqual(fromDisk.slice(1).map(([, results, note]) => [results.length, note]), notes(crDirect, bomDirect).map((n) => [0, n]));
   await env.close(direct);
-  assert.deepEqual(fromDisk, await answers(await env.openChronicle()));
+  const fromStore = await answers(await env.openChronicle());
+  assert.deepEqual(fromStore.map(([input, results]) => [input, results]), fromDisk.map(([input, results]) => [input, results]));
+  assert.deepEqual(fromStore.slice(1).map(([, , note]) => note), notes(`${cr}.`, `${bom} the workspace's copy has.`));
 });
 
 test('inOrder hands each result on in order, at most `width` at once', async () => {

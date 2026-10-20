@@ -4687,7 +4687,7 @@ export class WorkspaceModule implements Module {
         // A pattern written for a CR can't find a CRLF end's, nor one written
         // for U+FEFF a BOM, which lines as read shows them leave out, so the
         // answer says why it didn't.
-        ...leftOutNote(input.pattern, searchedCrlf, searchedBom),
+        ...leftOutNote(input.pattern, searchedCrlf, searchedBom, [...this.mounts.values()].some((m) => m.direct)),
         ...(skipped.length > 0 ? { skipped } : {}),
         ...(incomplete.length > 0 ? { incomplete } : {}),
       },
@@ -5916,16 +5916,29 @@ function inputProblem(
   return null;
 }
 
-const CRLF_CR_NOTE = 'The pattern names a CR, and a file searched has CRLF line ends. Lines are matched as read shows them, '
-  + 'which leaves out a CRLF end\'s CR unless the line\'s own text ends in a CR. read with offsetChars shows every CR in the workspace\'s copy.';
-const BOM_NOTE = 'The pattern names U+FEFF, and a file searched starts with a BOM. Lines are matched as read shows them, '
-  + 'and a BOM isn\'t part of the first line. read with offsetChars shows any BOM the workspace\'s copy has.';
+const CRLF_CR_MATCHED = 'The pattern names a CR, and a file searched has CRLF line ends. Lines are matched as read shows them, '
+  + 'which leaves out a CRLF end\'s CR unless the line\'s own text ends in a CR.';
+const BOM_MATCHED = 'The pattern names U+FEFF, and a file searched starts with a BOM. Lines are matched as read shows them, '
+  + 'and a BOM isn\'t part of the first line.';
 
-/** grep's note for a pattern that names a character its lines leave out, where a file it searched has one. */
-function leftOutNote(pattern: string, searchedCrlf: boolean, searchedBom: boolean): { note?: string } {
+/**
+ * grep's note for a pattern that names a character its lines leave out, where
+ * a file it searched has one. The note says a character read shows it in the
+ * workspace's copy, since grep also searches a conflict's disk version, which
+ * read doesn't show. A direct mount keeps no workspace copy, and its read
+ * shows disk's file, so on a host with one (`direct`) the note names that
+ * too, as the tools' descriptions mention direct mounts only on such a host.
+ */
+function leftOutNote(pattern: string, searchedCrlf: boolean, searchedBom: boolean, direct: boolean): { note?: string } {
   if (!searchedCrlf && !searchedBom) return {};
   const named = namedLeftOut(pattern);
-  const notes = [named.cr && searchedCrlf ? CRLF_CR_NOTE : null, named.bom && searchedBom ? BOM_NOTE : null].filter((n) => n !== null);
+  const onDisk = direct ? ', or in disk\'s file on a direct mount' : '';
+  const notes = [
+    named.cr && searchedCrlf ? `${CRLF_CR_MATCHED} read with offsetChars shows every CR in the workspace's copy${onDisk}.` : null,
+    named.bom && searchedBom
+      ? `${BOM_MATCHED} read with offsetChars shows any BOM ${direct ? `in the workspace's copy${onDisk}` : 'the workspace\'s copy has'}.`
+      : null,
+  ].filter((n) => n !== null);
   return notes.length ? { note: notes.join(' ') } : {};
 }
 
