@@ -46,14 +46,137 @@ export interface MountConfig {
    */
   ignore?: string[];
   /**
+   * The files this mount holds, when it holds only some of what is under its
+   * path: the same pattern forms as `ignore`, read for files. A name or an
+   * extension glob covers a file by its own name, at any depth, and a directory
+   * glob (`dir/**`) covers what lies beneath that directory, and not a file
+   * named like it. Unlike `ignore`, a pattern that matches a directory's name
+   * covers nothing beneath it, since each file is covered by its own name:
+   * `["gate.json"]` holds every file named `gate.json`, and no other file
+   * beneath a directory of that name. A subtree is named with `dir/**`.
+   *
+   * It's the mount's boundary for content: no workspace path reads, stores,
+   * serves or writes back a file it doesn't cover, and no tool lists,
+   * matches or names one, beyond echoing a path it was given, which it may
+   * spell as disk does. A walk passes over one and counts it under
+   * `passedOver`, and passes over a link its names don't cover with the
+   * reason a mount without an include gives a link it doesn't enter, "a
+   * symlink, not walked", where the link leads to a directory, and wherever
+   * it leads on a mount that doesn't follow links. No pass decides a change
+   * the watcher reports there, and a materialize doesn't write it back even
+   * when the workspace's history holds it. A materialize that names a
+   * directory inside the mount counts each such entry beneath it under
+   * `passedOver`,
+   * with the reason and without its path, a deletion or conflict held there
+   * included; one of the whole mount takes none of them up. The file
+   * operations (read, write, edit, delete, and the module's binary and disk
+   * reads and writes) refuse a path it doesn't cover as outside the mount's
+   * include, a directory's included, and `resolveAbsolutePath` returns null
+   * for one; the mount's root is inside. Whether a name is taken isn't
+   * withheld: a refusal may show that something occupies a path the caller
+   * named. On a mount that follows links, a path is judged where it lands as
+   * well as where it's named, as disk spells it there: a covered path that
+   * reaches a file the include doesn't cover, through a link at the path or
+   * on its way, is refused as one that leaves the mount (the file operations
+   * refuse it before anything is stored), and a listing from where a link
+   * leads passes over such a file. A covered path whose landing realpath
+   * can't resolve, as for a loop or a directory this process can't search,
+   * is refused too, by every file operation, a delete included, since
+   * where it lands can't be judged.
+   *
+   * A sync, materialize, grep, glob or ls that names a path the include
+   * doesn't cover takes it as a directory, its scope, exactly where a listing
+   * names one: where disk has a directory reached from the mount's root
+   * through directories, with no link among them, or the workspace's history
+   * holds an entry beneath it that the include covers, and that a nested
+   * mount's include covers too where it lies in that mount's directory. A
+   * directory `ignore` covers is a scope too when it's named, though a
+   * listing passes over it. Each refuses any other path the include doesn't
+   * cover. A covered path is a file to a sync, materialize or grep when disk
+   * or history has a file there, and otherwise a directory; a glob takes its
+   * path as a directory. Beneath a directory, each passes over what the
+   * include doesn't cover, and a listing that isn't recursive names each
+   * directory directly beneath its path that disk has, and each that a
+   * covered entry in history implies, with only the files the include
+   * covers. `ignore` still applies to what `include` covers.
+   *
+   * On a disk that folds names, the parse reads a path in disk's spelling,
+   * as the walk names what it lists, so a covered name whose file disk
+   * spells otherwise is outside the mount, and the include's refusal shows
+   * the path as given. A path that names one of the workspace's entries
+   * exactly, or does once its directories take disk's spelling, keeps the
+   * entry's spelling, as the parse gives it, and what lies past a link on
+   * the way keeps the caller's spelling, since the parse reads nothing past
+   * a link. Other answers name a path as the parse spells it, a name the
+   * include leaves out included, since how disk spells a name the caller
+   * gave is no content of that file. Where a
+   * followed path lands is judged as disk spells it there, and a path that
+   * meets no link where the parse names it.
+   * `resolveAbsolutePath`, which is synchronous, judges the include on the
+   * path as given and follows no link: on such a disk it returns the path to
+   * a covered name's file that disk spells otherwise, and null for a covered
+   * file named in another case.
+   *
+   * A path in a nested mount's directory is that mount's, whatever this
+   * include covers: every tool gives the answer that names the mount holding
+   * it and the path to use there. Through a link a mount follows, a place in
+   * that directory is named only where it's a directory, or a file that
+   * mount's own include covers with no file on its way, and is otherwise
+   * refused as leaving the mount. On a mount that doesn't follow links, a
+   * link on a path's way is refused, as on any such mount (followSymlinks).
+   * A nested mount's root is placed where disk has it at each start, and its
+   * directory is matched by spelling, so four cases fall outside this, as
+   * for any nested mount: on a disk that folds names, a mount configured
+   * through a link that spells a directory otherwise than disk does isn't
+   * found nested, and this mount holds its files as its own; on such a disk,
+   * a path through a link that spells a nested mount's directory otherwise
+   * than that mount's configured path does, whether the link or the
+   * configured path is the one spelled otherwise than disk, isn't found to
+   * lead there, and this mount reads, lists, searches and writes there as
+   * its own, creating files too, though a walk from its root passes over the
+   * directory; on such a disk, a place in a nested mount's directory that a
+   * link does lead to is judged by that mount's include, and named, in the
+   * spelling the link's target gives, so a refusal can name a file disk
+   * spells outside that include, or leave a covered one unnamed; and a
+   * nested mount whose root moves while running, as `acceptRoot` takes,
+   * stays placed where it was until the next start.
+   *
+   * Text the host registers for a path (`registerGeneratedTextFile`) is
+   * served there whatever the include says, since it isn't one of the
+   * mount's files: it's matched by the path a spelling resolves to, before
+   * anything else checks the path, so every spelling that resolves to its
+   * registered path reads it, and none writes it. On a disk that folds names,
+   * a spelling in another case isn't its path, and reaches whatever file disk
+   * has there. The framework keeps its own files (`tool-results/`, `refs/`,
+   * `background-scripts/`) only in a writable mount without an include, and
+   * what it kept in a mount before the mount had one is outside the mount
+   * once it has one, unless the include covers it.
+   *
+   * Left out, the mount holds everything under its path. Given, it's a list
+   * of at least one string, each a name, an `*.ext` glob or a `dir/**` glob,
+   * whose directory may be nested (`a/b/**`). The module refuses a pattern
+   * with a `/` that isn't such a glob, a `*` anywhere but a leading `*.` or
+   * that trailing `/**`, an empty, `.` or `..` segment, and, where `\` is the
+   * platform's separator, a `\`. Any other pattern is a file name, matched
+   * literally, so `[id].tsx` names the file of that name.
+   */
+  include?: string[];
+  /**
    * Whether to follow symlinks (default: false). Without it, no symlink on a
    * path is followed: not one at the path itself, and not one among the
    * directories on its way beneath the mount's root, wherever it leads. A path
    * with a symlink among its directories is refused naming the link, and for
-   * a link inside the mount, its target. A mount root that is
-   * itself a symlink is still the root. With it, a symlink on a path is
-   * followed while what it reaches stays inside the mount. Either way, a
-   * listing or a sync's walk descends into no symlinked directory.
+   * a link inside the mount, its target where a tool could name it: a
+   * directory, or a file the include of the mount it lies in covers, where
+   * that mount has one. On a mount with an include, a link the include
+   * doesn't cover is outside the mount itself, and its refusal tells nothing
+   * of where it leads. A mount root that is itself a symlink is still the
+   * root. With it, a symlink on a path is followed while what it reaches
+   * stays inside the mount, which on a mount with an include means a
+   * directory or a file the include covers. Either way, a listing or a
+   * sync's walk descends
+   * into no symlinked directory beneath its scope; with it, a scope named
+   * through a link is listed from where the link leads.
    */
   followSymlinks?: boolean;
   /** Maximum file size in bytes (default: 5MB) */
@@ -255,6 +378,20 @@ export interface EditInput {
   newString: string;
   /** Replace all occurrences (default: false) */
   replaceAll?: boolean;
+}
+
+export interface EditManyInput {
+  /** The edits, each matched in its file as the call reads it, all in one mount's files. */
+  edits: Array<{
+    /** File path (mount-prefixed) */
+    path: string;
+    /** Exact text to replace */
+    oldString: string;
+    /** Text to replace it with */
+    newString: string;
+    /** How many times oldString occurs in the file (default: 1); every one is replaced. */
+    occurrences?: number;
+  }>;
 }
 
 export interface DeleteInput {

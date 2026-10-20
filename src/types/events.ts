@@ -193,11 +193,14 @@ export interface ToolResult {
   /** Whether this was an error (for LLM) */
   isError?: boolean;
   /**
-   * An MCP tool's `structuredContent`: its machine-readable result, beside
-   * `data`, which is the content view. Present exactly when the server sent
-   * one, so `false`, `0` and `null` are values here, not absence. Programs
-   * read it (scripts get it in their result object); the model sees content,
-   * and sees this rendered as JSON only when the content carries no text.
+   * The result's machine-readable form, beside `data`. Programs read it: a
+   * script gets it in its result object, and a host in the tool result
+   * event. The model never reads this field: it sees the value only where an
+   * MCP conversion put it in the content as JSON, which happens only when the
+   * server sent no text. An MCP tool's is its `structuredContent`, present
+   * exactly when the server sent one, so `false`, `0` and `null` are values
+   * here, not absence. Any other tool can set one too, as `code_execution`
+   * does with its script's stdout, stderr, exit code and any time-limit note.
    */
   structured?: unknown;
   /**
@@ -246,6 +249,29 @@ export interface ToolCall {
    * put on the call, usually none.
    */
   callerTurnId?: number;
+  /**
+   * How long this call's result may be and still reach its caller whole,
+   * measured as the framework stores it: an error's text, or a success's data
+   * as JSON (a content array as its text). For a model's call it is the
+   * agent's inline cap, past which the framework spills the result to a
+   * workspace file and sends a preview. For a call from a running
+   * code_execution script it is the script's limit, past which a success's
+   * result is cut; an error reaches the script whole, after "Error: ". A
+   * result that carries `structured` reaches a script instead as one JSON
+   * object of its content, structured content and error, measured whole; one
+   * past the limit is saved to a workspace file in its place, or, where it
+   * can't be, isn't delivered. A tool
+   * that pages or budgets its answer can stay under it. The framework sets it
+   * on a model's, a script's and the operator's puppet's call to a module, a
+   * utility run through `utils` included. A call made in process with
+   * ModuleContext.callTool or executeToolCall carries what its caller put on
+   * it, as the puppet's does; the framework's own read_image tool passes a
+   * model's call to the workspace without it; and a utility run through
+   * `utils` carries what its `utils` call carried. Without it, a module holds
+   * its answer to a bound of its own, if any: the workspace's is the house
+   * default, 24,000.
+   */
+  resultMaxChars?: number;
 }
 
 // ============================================================================

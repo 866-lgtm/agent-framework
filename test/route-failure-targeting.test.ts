@@ -8,9 +8,10 @@ import { ContextManager, PassthroughStrategy } from '@animalabs/context-manager'
 import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { ProcessEvent, Module, ModuleContext, ToolDefinition, ToolCall, ToolResult, EventResponse } from '../src/index.js';
-import type { ContentBlock } from '@animalabs/membrane';
+import type { ContentBlock, NormalizedResponse } from '@animalabs/membrane';
 import type { ChannelRegistry } from '../src/mcpl/channel-registry.js';
 import { HeldStream, MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { UNREACHED_WATCHDOG, silenceRun } from './helpers/run-watchdog.js';
 
 function internals(framework: AgentFramework) {
   return framework as unknown as {
@@ -36,16 +37,16 @@ function internals(framework: AgentFramework) {
   };
 }
 
-/** A HeldStream that says when the framework has taken its events: how many it
+/** A HeldStream that says when the framework has taken its events: which it
  *  yielded, and when it was left, by a consumer's break or at its end. */
 class WatchedHeldStream extends HeldStream {
-  yielded = 0;
+  readonly yielded: string[] = [];
   private finish!: () => void;
   readonly finished = new Promise<void>((resolve) => { this.finish = resolve; });
   override async *[Symbol.asyncIterator](): ReturnType<HeldStream[typeof Symbol.asyncIterator]> {
     try {
       for await (const event of super[Symbol.asyncIterator]()) {
-        this.yielded++;
+        this.yielded.push(event.type);
         yield event;
       }
     } finally {
@@ -83,6 +84,8 @@ class SenderModule implements Module {
 }
 
 const SEND_FAILED = '[discord-send-failed]';
+// What a turn with no locus is told instead.
+const UNDELIVERABLE = '[send-undeliverable]';
 const BOUNCED = 'was not delivered —';
 const count = (messages: Array<{ content: unknown }>, needle: string) =>
   messages.filter((m) => JSON.stringify(m.content).includes(needle)).length;
@@ -169,7 +172,7 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(metadata?.system, true);
       assert.equal(metadata?.kind, 'discord-send-failed');
       assert.equal(metadata?.channelId, 'missing-channel');
-      assert.match(String(metadata?.reason), /no registered channel/);
+      assert.equal(metadata?.reason, 'no channel "missing-channel" is registered here');
       assert.equal(metadata?.textLen, 5);
       t.mock.restoreAll();
       const { messages } = await framework.getAgent('secondary')!.getContextManager().compile();
@@ -262,7 +265,7 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(primary.mock.callCount(), 1);
       const [, content, metadata] = primary.mock.calls[0]!.arguments;
       assert.match(JSON.stringify(content),
-        /\[discord-send-failed\] A reply by released-conversation \(5 chars\) could not be delivered to missing-channel \(no registered channel[^)]*\)\. Nothing was posted\. released-conversation has ended\./);
+        /\[discord-send-failed\] A reply by released-conversation \(5 chars\) could not be delivered to missing-channel \(no channel \\"missing-channel\\" is registered here\)\. Nothing was posted\. released-conversation has ended\./);
       assert.equal(metadata?.speaker, 'released-conversation');
       assert.equal(metadata?.textLen, 5);
       assert.equal(internals(framework).pendingRequests.length, 0, 'context only: the primary is not woken');
@@ -302,35 +305,48 @@ describe('notices about an agent\'s own action', () => {
       assert.ok(errors.some((e) => e.includes('[route-failure] released-conversation has ended, and its reply had no channel to reach')));
     });
 
-    it('tells no one, logged, when an ephemeral run\'s final reply had no channel to reach, before or after its release', async (t) => {
+    it('treats an ephemeral run\'s final reply with no channel of its own as its caller\'s result: no failure, logged or told', async (t) => {
       const errors: string[] = [];
       t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
       const speech = 'Worker speech with no channel to go to.';
 
       const archived = await runEphemeral('locus', speech);
 
-      // The run settles before its final reply is routed, so its release and
-      // the reply's failure can come in either order: the notice lands in its
-      // window and is read at its release, or the failure finds it gone. Either
-      // way, a reply that had no channel to reach is passed on to no one.
+      // The run's prose is its caller's result (#551): with no channel of its
+      // own it is undelivered, not a failed delivery, before or after its
+      // release, so nothing is written, logged or passed on.
       assert.ok(archived.some((m) => m.participant === 'worker' && JSON.stringify(m.content).includes(speech)), 'the run\'s reply is archived');
+      assert.equal(count(archived, UNDELIVERABLE), 0, 'no no-locus notice in its own window');
       const { messages } = await framework.getAgent('primary')!.getContextManager().compile();
       assert.equal(count(messages, 'Your previous reply'), 0, 'the primary did not write that reply');
       assert.equal(count(messages, 'A reply by worker'), 0);
       assert.ok(!errors.some((e) => /not a registered agent/.test(e)));
-      assert.ok(errors.some((e) => e.includes('[route-failure] worker has ended, and its reply had no channel to reach')));
+      assert.ok(!errors.some((e) => e.includes('[route-failure] worker')), 'no route failure is logged');
+      assert.ok(!errors.some((e) => e.includes('[routeSpeech] worker')), 'no "NOT routed" line');
       assert.equal(internals(framework).deferredMessages.length, 0);
     });
 
-    it('passes an ephemeral run\'s failed delivery to a channel on to the primary, by name', async () => {
+    it('never sends an ephemeral run\'s reply to the default channel, so nothing fails there', async (t) => {
       (internals(framework).channelRegistry as unknown as { defaultPublishChannel: string | null }).defaultPublishChannel = 'missing-channel';
-      const speech = 'Worker speech for a channel that is not registered.';
+      const errors: string[] = [];
+      t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
 
-      await runEphemeral('locus', speech);
+      await runEphemeral('locus', 'Worker speech that the default channel never gets.');
 
-      // Whether the delivery fails before the run's release (its window's
-      // notice is passed on at release) or after it (the failure finds it
-      // gone), the primary is told once, by name.
+      // The latest inbound channel is nobody's choice for a subagent (#551).
+      const { messages } = await framework.getAgent('primary')!.getContextManager().compile();
+      assert.equal(count(messages, SEND_FAILED), 0, 'the primary is told of no failure');
+      assert.ok(!errors.some((e) => e.includes('missing-channel')), 'no delivery to the default channel was attempted');
+      assert.equal(internals(framework).deferredMessages.length, 0);
+    });
+
+    it('passes an ended ephemeral run\'s failed delivery to a channel it was given on to the primary, by name', async () => {
+      await runEphemeral('locus', 'Worker speech.');
+      // After the run's release, its speech is routed to a channel given
+      // directly, as a channel the run opened or named would be; the channel
+      // isn't registered, so the delivery fails.
+      await internals(framework).channelRegistry.routeSpeech('worker', 'Worker speech for a channel that is not registered.', 'missing-channel');
+
       const { messages } = await framework.getAgent('primary')!.getContextManager().compile();
       const named = messages.filter((m) => JSON.stringify(m.content).includes(SEND_FAILED));
       assert.equal(named.length, 1);
@@ -338,8 +354,7 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(internals(framework).deferredMessages.length, 0);
     });
 
-    it('still releases an ephemeral run when the primary cannot be told, logged', async (t) => {
-      (internals(framework).channelRegistry as unknown as { defaultPublishChannel: string | null }).defaultPublishChannel = 'missing-channel';
+    it('logs it when the primary cannot be told of an ended ephemeral run\'s failed delivery', async (t) => {
       const primaryCm = framework.getAgent('primary')!.getContextManager();
       const store = primaryCm.addMessage.bind(primaryCm);
       t.mock.method(primaryCm, 'addMessage', (...args: Parameters<typeof primaryCm.addMessage>) => {
@@ -349,9 +364,10 @@ describe('notices about an agent\'s own action', () => {
       const errors: string[] = [];
       t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
 
-      await runEphemeral('locus', 'Worker speech for a channel that is not registered.');
-
+      await runEphemeral('locus', 'Worker speech.');
       assert.equal(framework.getAgent('worker'), null, 'the run is released');
+      await internals(framework).channelRegistry.routeSpeech('worker', 'Worker speech for a channel that is not registered.', 'missing-channel');
+
       assert.ok(errors.some((e) => e.includes('[route-failure] failed to tell the primary that worker\'s reply to missing-channel failed')));
     });
 
@@ -362,7 +378,6 @@ describe('notices about an agent\'s own action', () => {
       });
       try {
         await internals(bare).initializeMcpl([]);
-        (internals(bare).channelRegistry as unknown as { defaultPublishChannel: string | null }).defaultPublishChannel = 'missing-channel';
         const errors: string[] = [];
         t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
         const created = await bare.createEphemeralAgent({
@@ -374,6 +389,9 @@ describe('notices about an agent\'s own action', () => {
         bare.start();
         await run;
         await bare.runUntilIdle();
+        // After the run's release, its speech is routed to a channel given
+        // directly, as a channel of its own would be, and the delivery fails.
+        await internals(bare).channelRegistry.routeSpeech('worker', 'Worker speech with nobody to tell.', 'missing-channel');
 
         const archive = await ContextManager.open({
           store: bare.getStore(), namespace: 'subagent/worker', isolate: true, strategy: new PassthroughStrategy(),
@@ -516,7 +534,7 @@ describe('notices about an agent\'s own action', () => {
       const told = messages.filter((m) => JSON.stringify(m.content).includes(SEND_FAILED));
       assert.equal(told.length, 1);
       assert.match(JSON.stringify(told[0]!.content),
-        new RegExp(`A reply by ${fork.name} \\(${reply.length} chars\\) could not be delivered to missing-channel \\(no registered channel[^)]*\\)\\. Nothing was posted\\. ${fork.name} has ended\\.`));
+        new RegExp(`A reply by ${fork.name} \\(${reply.length} chars\\) could not be delivered to missing-channel \\(no channel \\\\"missing-channel\\\\" is registered here\\)\\. Nothing was posted\\. ${fork.name} has ended\\.`));
     });
 
     it('passes on only what a fork never read: a notice its later turn compiled stays its own', async () => {
@@ -623,7 +641,7 @@ describe('notices about an agent\'s own action', () => {
       state.recordChannelAutoOpenNotice(fork.name, [{ channelId: 'c-1', label: '#one' }], 'opened-by-reply');
       assert.equal(forkCm.mock.callCount(), 1);
       assert.equal(primary.mock.callCount(), 0);
-      assert.match(JSON.stringify(forkCm.mock.calls[0]!.arguments[1]), /Now open: #one \(c-1\) — your own message into the closed channel engaged it/);
+      assert.match(JSON.stringify(forkCm.mock.calls[0]!.arguments[1]), /Now open: #one \(c-1\): your own message into the closed channel opened it/);
 
       state.recordChannelAutoOpenNotice(undefined, [{ channelId: 'c-2' }], 'subscription-policy');
       assert.equal(primary.mock.callCount(), 1, 'no agent caused a policy open');
@@ -921,7 +939,7 @@ describe('notices about an agent\'s own action', () => {
           const noticeIndex = messages.findIndex((m) => JSON.stringify(m.content).includes(SEND_FAILED));
           assert.ok(noticeIndex > replyIndex, 'the archived failure notice follows the closure reply');
           assert.equal(count(messages, SEND_FAILED), 1);
-          assert.match(JSON.stringify(messages[noticeIndex]!.content), /Your previous reply.*delivered:false/);
+          assert.match(JSON.stringify(messages[noticeIndex]!.content), /Your previous reply.*server said it didn't post the message/);
           // Every write of a drained entry carries its durable id (drainDeferredFor).
           const stored = archive.getAllMessages().find((m) => JSON.stringify(m.content).includes(SEND_FAILED));
           const id = (stored?.metadata as { deferredWriteId?: unknown } | undefined)?.deferredWriteId;
@@ -941,7 +959,7 @@ describe('notices about an agent\'s own action', () => {
         const told = primary.messages.filter((m) => JSON.stringify(m.content).includes(SEND_FAILED));
         assert.equal(told.length, 1);
         assert.match(JSON.stringify(told[0]!.content),
-          new RegExp(`A reply by ${fork.name} \\(${finalReply.length} chars\\) could not be delivered to #closure test \\(closure-channel\\) \\(.*delivered:false.*\\)\\. Nothing was posted\\. ${fork.name} has ended\\.`));
+          new RegExp(`A reply by ${fork.name} \\(${finalReply.length} chars\\) could not be delivered to #closure test \\(closure-channel\\) \\(.*server said it didn't post the message\\)\\. Nothing was posted\\. ${fork.name} has ended\\.`));
         assert.equal(membrane.calls.length, 2, 'only the initial and closure turns ran');
         assert.equal(state.pendingRequests.length, 0, 'a failed closure reply does not wake another turn');
       });
@@ -1095,7 +1113,8 @@ describe('notices about an agent\'s own action', () => {
       created.contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
       const state = internals(runFramework);
       runFramework.start();
-      const done = runFramework.runEphemeralToCompletion(created.agent, created.contextManager, { idleTimeoutMs: 300, idlePollMs: 50 });
+      const done = runFramework.runEphemeralToCompletion(created.agent, created.contextManager, UNREACHED_WATCHDOG);
+      const ended = done.then(() => null, (error: unknown) => error);
       for (let i = 0; i < 400 && !state.activeStreams.has('worker'); i++) await new Promise((resolve) => setTimeout(resolve, 5));
       assert.ok(state.activeStreams.has('worker'), 'the run\'s stream started');
       // A failed reply queued for the run's turn end, which the run's stall
@@ -1105,7 +1124,8 @@ describe('notices about an agent\'s own action', () => {
         content: [{ type: 'text', text: `${SEND_FAILED} Your previous reply (5 chars) could not be delivered to #x (missing-channel).` }],
         metadata: { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', reason: 'no registered channel', textLen: 5 },
       });
-      await assert.rejects(done, /stalled/);
+      silenceRun(runFramework, 'worker');
+      assert.match(String(await ended), /stalled/, 'the idle watchdog ended the run');
       release();
       for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve));
 
@@ -1227,7 +1247,10 @@ describe('notices about an agent\'s own action', () => {
       runMembrane.streamYielding = (request) => {
         runMembrane.calls.push(request);
         // Yields nothing, cancel included, until released; then a tool call.
-        held = new WatchedHeldStream(released, [createMockResponse([{ type: 'tool_use', id: 'late-1', name: 'sender--noop', input: {} }], 'tool_use')]);
+        // The response has no usage, which the mock would yield before it.
+        const late: Partial<NormalizedResponse> = createMockResponse([{ type: 'tool_use', id: 'late-1', name: 'sender--noop', input: {} }], 'tool_use');
+        delete late.usage;
+        held = new WatchedHeldStream(released, [late as NormalizedResponse]);
         return held;
       };
       const calls = t.mock.method(sender, 'handleToolCall');
@@ -1237,11 +1260,13 @@ describe('notices about an agent\'s own action', () => {
       created.contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
       const state = internals(runFramework);
       runFramework.start();
-      const done = runFramework.runEphemeralToCompletion(created.agent, created.contextManager, { idleTimeoutMs: 1000, idlePollMs: 50 });
+      const done = runFramework.runEphemeralToCompletion(created.agent, created.contextManager, UNREACHED_WATCHDOG);
+      const ended = done.then(() => null, (error: unknown) => error);
       for (let i = 0; i < 400 && !state.activeStreams.has('worker'); i++) await new Promise((resolve) => setTimeout(resolve, 5));
       assert.ok(state.activeStreams.has('worker'), 'the run\'s stream started');
       state.quiesced = true;
-      await assert.rejects(done, /stalled/);
+      silenceRun(runFramework, 'worker');
+      assert.match(String(await ended), /stalled/, 'the idle watchdog ended the run');
       assert.equal(runFramework.getAgent('worker'), null, 'the ended run is deregistered at once, quiesced or not');
       assert.ok((state as unknown as { releasesAfterResume: Map<string, unknown> }).releasesAfterResume.has('worker'), 'it ended while quiesced');
 
@@ -1252,7 +1277,7 @@ describe('notices about an agent\'s own action', () => {
       ]);
 
       assert.ok(left, 'its stream was left, before the 5 s bound');
-      assert.equal(held!.yielded, 1, 'it yielded the late tool call first');
+      assert.deepEqual(held!.yielded, ['tool-calls'], 'it yielded the late tool call, and nothing after it');
       assert.equal(calls.mock.callCount(), 0, 'its late tool call is not dispatched');
       await runFramework.resume({ force: true });
     });

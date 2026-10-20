@@ -35,7 +35,9 @@ function makeGate(config: GateConfig) {
 function makeRegistry(shouldTriggerInference?: (c: string, m: Record<string, unknown>) => boolean) {
   const pushed: ProcessEvent[] = [];
   const registry = new ChannelRegistry(
-    {} as never,
+    // No server connection: the host directs no channel lifecycle here, so
+    // traffic is what marks a channel open.
+    { getServer: () => undefined } as never,
     {} as never,
     (ev) => pushed.push(ev),
     () => {},
@@ -309,7 +311,7 @@ describe('ChannelRegistry durable lifecycle', () => {
 
     const ambiguous = await registry.handleChannelToolCall('channel_open', { channelId: 'shared' });
     assert.strictEqual(ambiguous.success, false);
-    assert.match(ambiguous.error ?? '', /ambiguous/);
+    assert.match(ambiguous.error ?? '', /^Channel "shared" is on more than one server \("alpha", "beta"\), so nothing ran\./);
 
     const exact = await registry.handleChannelToolCall('channel_open', {
       channelId: 'shared', serverId: 'beta',
