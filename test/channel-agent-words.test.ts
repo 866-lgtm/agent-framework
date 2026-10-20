@@ -16,6 +16,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { AgentFramework } from '../src/index.js';
+import type { PublishRefusalReason } from '../src/index.js';
 import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
 import { McplRequestError } from '../src/mcpl/server-connection.js';
@@ -399,31 +400,60 @@ test('channel_publish and speak_in_channel say what they need, and where to find
     'Nothing was posted: channelId is empty. channel_list shows the channel ids.');
   assert.equal((await f.call('channel_publish', { channelId: 'nope', content: 'hi' })).error,
     'No channel has the id "nope", so nothing was posted. channel_list shows the channel ids.');
-  // The subconscious isn't offered channel_list.
-  assert.equal((await f.registry.publishForAgent('', 'hi', 'subconscious')).error,
+  // The subconscious isn't offered channel_list. A refusal of the caller's
+  // own input carries no reason; one of the destination does.
+  const noId = await f.registry.publishForAgent('', 'hi', 'subconscious');
+  assert.equal(noId.error,
     'Nothing was posted: speak_in_channel needs a `channelId`. Use the id of a tuned-out channel whose messages you are reading.');
-  assert.equal((await f.registry.publishForAgent('nope', 'hi', 'subconscious')).error,
+  assert.equal('reason' in noId, false, 'no reason for the caller\'s own input');
+  const noText = await f.registry.publishForAgent('nope', '', 'subconscious');
+  // The no-text refusal, which speak_in_channel's own caller words first.
+  assert.match(String(noText.error), /^Nothing was posted: .* needs the message/);
+  assert.equal('reason' in noText, false, 'no reason for the caller\'s own input, checked before the destination');
+  const unknown = await f.registry.publishForAgent('nope', 'hi', 'subconscious');
+  assert.equal(unknown.error,
     'No channel has the id "nope", so nothing was posted. Use the id of a tuned-out channel whose messages you are reading.');
+  const refusal: PublishRefusalReason | undefined = unknown.reason;
+  assert.equal(refusal, 'channel-not-registered');
 });
 
 test('a send to a server that isn\'t up, or isn\'t permitted, says why in the same words on every send path', async () => {
   const f = await fixture({ a: ['x'] });
-  const cases: Array<[Server | undefined, boolean, string]> = [
-    [down(true), false, 'the "a" server isn\'t connected, and this host is reconnecting to it, so try again later'],
-    [undefined, true, 'this host is connecting to the "a" server, so try again in a moment'],
-    [undefined, false, 'the "a" server isn\'t connected, and this host won\'t reconnect to it on its own; if you need it, ask whoever runs this host'],
+  // publishForAgent's reason names the state its words come from.
+  const gone = 'the "a" server isn\'t connected, and this host won\'t reconnect to it on its own; if you need it, ask whoever runs this host';
+  const cases: Array<[Server | undefined, boolean, string, string]> = [
+    [down(true), false, 'the "a" server isn\'t connected, and this host is reconnecting to it, so try again later', 'server-down'],
+    [undefined, true, 'this host is connecting to the "a" server, so try again in a moment', 'server-connecting'],
+    [undefined, false, gone, 'server-gone'],
+    [down(false), false, gone, 'server-gone'],
     [up(['channels.publish']), false,
-      'this host isn\'t permitted to post to the "a" server\'s channels, and trying again won\'t change that; if you need it, ask whoever runs this host'],
+      'this host isn\'t permitted to post to the "a" server\'s channels, and trying again won\'t change that; if you need it, ask whoever runs this host',
+      'not-permitted'],
   ];
-  for (const [server, connecting, reason] of cases) {
+  for (const [server, connecting, reason, refusal] of cases) {
     f.servers.set('a', server);
     if (connecting) f.connecting.add('a'); else f.connecting.delete('a');
-    assert.equal((await f.call('channel_publish', { channelId: 'x', content: 'hi' })).error, `Nothing was posted to channel "x": ${reason}.`);
-    assert.equal((await f.registry.publishForAgent('x', 'hi', 'subconscious')).error, `Nothing was posted to channel "x": ${reason}.`);
+    const published = await f.call('channel_publish', { channelId: 'x', content: 'hi' });
+    assert.equal(published.error, `Nothing was posted to channel "x": ${reason}.`);
+    assert.equal('reason' in published, false, 'channel_publish\'s answer to the agent carries no reason');
+    const forAgent = await f.registry.publishForAgent('x', 'hi', 'subconscious');
+    assert.equal(forAgent.error, `Nothing was posted to channel "x": ${reason}.`);
+    assert.equal(forAgent.reason, refusal, reason);
     f.failures.length = 0;
     assert.equal(await f.registry.routeSpeech('agent', 'hello', 'x'), null);
     assert.deepEqual(f.failures.map((failure) => failure.reason), [reason], 'speech gives the same reason');
   }
+});
+
+test("publishForAgent's reason for an inbound-only channel is inbound-only, whatever its server's state", async () => {
+  const f = await fixture({ a: ['x'] });
+  await f.registry.handleChanged('a', { added: [{ id: 'in', type: 'chat', label: 'in', direction: 'inbound' }] } as never);
+  // The channel takes no posts, which a reconnect won't change, so that's
+  // what a host is told rather than that the server is reconnecting.
+  f.servers.set('a', down(true));
+  const answer = await f.registry.publishForAgent('in', 'hi', 'subconscious');
+  assert.match(String(answer.error), /^Channel in is inbound-only: server "a" declared/);
+  assert.equal(answer.reason, 'inbound-only');
 });
 
 test('speech that has to open its channel says why the open didn\'t happen, and what helps where it was refused', async () => {

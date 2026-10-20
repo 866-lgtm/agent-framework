@@ -618,6 +618,26 @@ export interface PublishOutcome {
 }
 
 /**
+ * Why the destination refused a publishForAgent before anything went out.
+ * Its words say the same, since both come from one check: the channel isn't
+ * registered here, it takes no posts, or its server is gone, this host is
+ * connecting to it, it's reconnecting, or it's up without channels.publish
+ * (serverReach); or the request wasn't sent, as its connection refused it
+ * before anything was written (McplRequestError's `not-sent`). A refusal of
+ * the caller's own input, such as no text or no channel id, carries none,
+ * and so does a publish that went out, whatever became of it: its words say
+ * whether it may have been posted.
+ */
+export type PublishRefusalReason =
+  | 'channel-not-registered'
+  | 'inbound-only'
+  | 'server-gone'
+  | 'server-connecting'
+  | 'server-down'
+  | 'not-permitted'
+  | 'not-sent';
+
+/**
  * A failed request's words, bounded, for a reason that a caller composes.
  * This host's own words, for a request that wasn't sent or wasn't answered
  * or for an error of its own, such as its store's, are sentences, and every
@@ -2810,25 +2830,27 @@ export class ChannelRegistry {
 
   /**
    * Publish into a channel on behalf of a named non-resident agent (the
-   * subconscious's speak_in_channel). Same delivery path, and the same result,
-   * as the channel_publish tool. Its traces carry the agent's name and follow
+   * subconscious's speak_in_channel). Same delivery path, and the same result
+   * as the channel_publish tool apart from `reason` below. Its traces carry the agent's name and follow
    * the publish's outcome as deliverSpeech's do: speech-routed after a
    * confirmed delivery, and speech-route-failed otherwise, `unknown` when the
    * words may have been posted and `failed` when nothing was, a refusal before
    * the publish included. The routed trace carries no message id, as before:
    * nothing here reads one, and a consumer that edits the newest traced
    * message in a channel would have this post to edit when an interruption of
-   * the resident matches none.
+   * the resident matches none. A refusal of the destination before anything
+   * went out carries its `reason` (PublishRefusalReason), so a caller can act
+   * on why nothing was posted without reading the words.
    */
   async publishForAgent(
     channelId: string,
     text: string,
     agentName: string,
-  ): Promise<{ success: boolean; data?: unknown; error?: string; isError?: boolean }> {
+  ): Promise<{ success: boolean; data?: unknown; error?: string; isError?: boolean; reason?: PublishRefusalReason }> {
     // The server the publish goes to, as handleToolPublish finds it before
     // it awaits: the channel may be removed while the reply is pending.
     const serverId = this.findChannelEntry(channelId)?.serverId ?? '';
-    const seen: { outcome?: PublishOutcome } = {};
+    const seen: { outcome?: PublishOutcome; refusal?: PublishRefusalReason } = {};
     const result = await this.handleToolPublish({ channelId, content: text }, undefined, seen, 'speak_in_channel');
     if (seen.outcome?.status === 'delivered') {
       this.emitTraceFn({
@@ -2853,7 +2875,7 @@ export class ChannelRegistry {
         ...(seen.outcome?.detail !== undefined ? { detail: connectorText(seen.outcome.detail) } : {}),
       });
     }
-    return result;
+    return seen.refusal !== undefined ? { ...result, reason: seen.refusal } : result;
   }
 
   /**
@@ -4845,9 +4867,10 @@ export class ChannelRegistry {
   private async handleToolPublish(
     input: { channelId?: string; content?: string; text?: string },
     origin?: ChannelToolOrigin,
-    /** Filled with the publish's outcome once a request is attempted, for
-     *  publishForAgent's trace. */
-    seen?: { outcome?: PublishOutcome },
+    /** Filled for publishForAgent: the publish's outcome once a request is
+     *  attempted, for its trace, or which check of the destination refused
+     *  it before anything went out, for its answer. */
+    seen?: { outcome?: PublishOutcome; refusal?: PublishRefusalReason },
     tool: 'channel_publish' | 'speak_in_channel' = 'channel_publish',
   ): Promise<ToolResult> {
     const findIds = tool === 'channel_publish'
@@ -4889,9 +4912,11 @@ export class ChannelRegistry {
 
     const entry = this.findChannelEntry(channelId);
     if (!entry) {
+      if (seen) seen.refusal = 'channel-not-registered';
       return { success: false, error: `No channel has the id "${channelId}", so nothing was posted. ${findIds}`, isError: true };
     }
     if (isInboundOnly(entry)) {
+      if (seen) seen.refusal = 'inbound-only';
       return {
         success: false,
         error: `Channel ${channelId} is ${inboundOnlyReason(entry)}`,
@@ -4899,9 +4924,14 @@ export class ChannelRegistry {
       };
     }
 
-    // The same refusal, in the same words, as plain speech's (sendRefusal).
+    // The same refusal, in the same words, as plain speech's (sendRefusal),
+    // whose server state is the reason's: nothing awaits between the two.
     const server = this.serverRegistry.getServer(entry.serverId);
     if (!server || !CapabilityGrant.of(server).has('channels.publish')) {
+      if (seen) {
+        const reach = this.serverReach(entry.serverId);
+        seen.refusal = reach === 'up' ? 'not-permitted' : `server-${reach}`;
+      }
       return { success: false, error: `Nothing was posted to channel "${channelId}": ${this.sendRefusal(entry.serverId)}.`, isError: true };
     }
     const publishParams: ChannelsPublishParams = {
@@ -4924,6 +4954,9 @@ export class ChannelRegistry {
       outcome = publishReceiptOutcome(result, destination, Date.now());
     } catch (err) {
       outcome = publishErrorOutcome(err, destination, Date.now());
+      // Refused before anything was written: nothing went out, as its words
+      // say, so it's a refusal of the destination like the checks above.
+      if (seen && err instanceof McplRequestError && err.outcome === 'not-sent') seen.refusal = 'not-sent';
     }
     if (seen) seen.outcome = outcome;
     if (outcome.status === 'delivered') return { success: true, data: result };
