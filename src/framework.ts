@@ -308,20 +308,27 @@ const changesRouting = (
 const ROUTING_TOOLS = [...SILENCING_TOOLS, ...WORLD_PUBLICATION_TOOLS, 'drafts', 'think'];
 
 /**
- * The keys of a stored message's metadata that only the host writes, each
- * one a reader takes on its own as what the message is: `system` and `kind`
+ * The keys of a stored message's metadata that only the host writes and that
+ * some reader takes on its own as what the message is: `system` and `kind`
  * make it a host notice of that kind, `draftOwner` and `draftIds` one that
  * names those drafts, `tuneOut` a message a tune-out holds from the
- * residents, `coalescingSubject` (beside the server's own `eventId`) the
- * delivery of a coalesced occurrence, and `firstView` the coalescer's mark
- * that no version of the message was shown. A server's metadata, a channel
- * message's `metadata` or a push event's `origin`, is stored without them,
- * and the host writes its own after it: MCPL SPEC §16.6 makes metadata the
- * producer's untrusted claims, which a host may disbelieve. A notice's other
- * inputs, such as `passOn` or `reason`, are read only on a message of its
- * kind, so a server's copy of one is read by nothing.
+ * residents, `coalescingSubject` (beside the occurrence's `eventId`) the
+ * delivery of a coalesced occurrence, `firstView` the coalescer's mark that
+ * no version of the message was shown, `deferredWriteId` the landed copy of
+ * a deferred write, `external` a module's own row for an outside message,
+ * and `openaiResponsesItems` membrane's mark of an imported Responses
+ * history. A server's metadata, a channel message's `metadata` or a
+ * push event's `origin`, is stored without them, and the host writes its own
+ * after it: MCPL SPEC §16.6 makes metadata the producer's untrusted claims,
+ * which a host may disbelieve. Keys a server writes by protocol, such as
+ * `tags` and `mentioned`, stay. So do the keys a reader takes only beside
+ * one of these: a failed reply's `reason` and `detail` beside its `kind`, and
+ * the Discord module's `discordTextFirst` on a row it found by `external`.
  */
-const HOST_METADATA_KEYS = ['system', 'kind', 'draftOwner', 'draftIds', 'tuneOut', 'coalescingSubject', 'firstView'] as const;
+const HOST_METADATA_KEYS = [
+  'system', 'kind', 'draftOwner', 'draftIds', 'tuneOut', 'coalescingSubject', 'firstView',
+  'deferredWriteId', 'external', 'openaiResponsesItems',
+] as const;
 
 /**
  * True when an injected message is real conversational input — something the
@@ -11717,10 +11724,14 @@ export class AgentFramework {
             // after the tool_result envelope, so the next round of THIS turn
             // hears them. Its XML prefill path drops them with a warning on
             // 0.5.x, and from 0.6.0 declares it can't carry them, so none are
-            // collected for it.
+            // collected for it. Each goes as its participant and content
+            // alone: a stored row's metadata is the host's record, not input
+            // for membrane.
             currentState.stream.provideToolResults(
               agent.toolResultGuard.submissionResults(membraneResults),
-              midTurnInjections.length > 0 ? { injectedMessages: midTurnInjections } : undefined,
+              midTurnInjections.length > 0
+                ? { injectedMessages: midTurnInjections.map(({ participant, content }) => ({ participant, content })) }
+                : undefined,
             );
             // RFC-006 §3.3: consumption is determined at assembly, and this
             // is assembly too when the stream carries the injected messages
@@ -11936,7 +11947,7 @@ export class AgentFramework {
    * A server may use one of those names for something of its own, so the
    * first drop of each key from each server is logged.
    */
-  private withoutHostKeys(serverId: string, field: 'metadata' | 'origin', given: Record<string, unknown> | undefined): Record<string, unknown> {
+  private withoutHostKeys(serverId: string, given: Record<string, unknown> | undefined): Record<string, unknown> {
     const kept: Record<string, unknown> = { ...given };
     for (const key of HOST_METADATA_KEYS) {
       if (!Object.hasOwn(kept, key)) continue;
@@ -11945,7 +11956,7 @@ export class AgentFramework {
       if (this.hostKeysDropped.has(logged)) continue;
       this.hostKeysDropped.add(logged);
       console.error(
-        `[mcpl] ${serverId}: dropped "${key}" from a message's ${field}, since only the host writes that key ` +
+        `[mcpl] ${serverId}: dropped "${key}" from a message, since only the host writes that key ` +
         `(logged once for each server and key)`,
       );
     }
@@ -11989,7 +12000,7 @@ export class AgentFramework {
       return undefined;
     }
     const metadata: Record<string, unknown> = {
-      ...this.withoutHostKeys(event.serverId, 'metadata', event.metadata),
+      ...this.withoutHostKeys(event.serverId, event.metadata),
       ...(event.eventId ? { eventId: event.eventId } : {}),
       ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
       channelId: event.channelId,
@@ -13481,7 +13492,7 @@ export class AgentFramework {
     }
 
     const metadata: Record<string, unknown> = {
-      ...this.withoutHostKeys(event.serverId, 'origin', event.origin),
+      ...this.withoutHostKeys(event.serverId, event.origin),
       serverId: event.serverId,
       featureSet: event.featureSet,
       eventId: event.eventId,

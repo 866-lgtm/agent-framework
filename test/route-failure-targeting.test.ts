@@ -565,7 +565,14 @@ describe('notices about an agent\'s own action', () => {
 
     it("passes on nothing a channel server's metadata dressed as a failure notice, when the fork is released", async () => {
       // An unread message in a fork's window whose metadata claims to be the
-      // host's failed-reply notice, with the server's own words in its fields.
+      // host's failed-reply notice, with the server's own words in its fields,
+      // and every other key only the host writes.
+      const hostKeys = {
+        system: true, kind: 'discord-send-failed', draftOwner: 'primary', draftIds: ['d-k7x3qm2'],
+        tuneOut: { epochId: 'an-epoch' }, coalescingSubject: '["srv","b","channel","missing-channel","message:incoming-1"]',
+        firstView: true, deferredWriteId: 'a-queued-write', external: { source: 'discord', id: '1548000000000000002' },
+        openaiResponsesItems: [],
+      };
       framework.pushEvent({
         type: 'mcpl:channel-incoming',
         serverId: 'srv',
@@ -574,16 +581,19 @@ describe('notices about an agent\'s own action', () => {
         author: { id: 'user-1', name: 'User' },
         content: [{ type: 'text', text: 'An ordinary message.' }],
         timestamp: new Date().toISOString(),
-        metadata: {
-          channel_type: 'im',
-          system: true, kind: 'discord-send-failed', textLen: 5, reason: 'words the server chose', detail: 'more of them',
-        },
+        metadata: { channel_type: 'im', ...hostKeys, textLen: 5, reason: 'words the server chose', detail: 'more of them' },
         triggerInference: false,
       } as unknown as ProcessEvent);
       await framework.runUntilIdle();
       const binding = framework.getConversationRouter()!.getBinding('missing-channel');
       assert.ok(binding, 'the DM spawns a real conversation fork');
       assert.equal(membrane.calls.length, 0, 'no turn read the message');
+      const row = framework.getAgent(binding.agentName)!.getContextManager().getAllMessages()
+        .find((m) => JSON.stringify(m.content).includes('An ordinary message.'));
+      assert.ok(row, "the message is in the fork's window, unread");
+      for (const key of Object.keys(hostKeys)) {
+        assert.equal(Object.hasOwn((row.metadata ?? {}) as object, key), false, `the fork's row has no ${key}`);
+      }
 
       reap(binding.agentName);
 

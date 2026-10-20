@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { AgentFramework } from '../src/index.js';
+import { AgentFramework, type ProcessEvent } from '../src/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
 const FIXTURE = join(import.meta.dirname, 'fixtures/speech-route-mcpl-server.mjs');
@@ -25,6 +25,9 @@ const HOST_KEYS: Record<string, unknown> = {
   tuneOut: { epochId: 'an-epoch' },
   coalescingSubject: JSON.stringify(['discord', 'binding', 'channel', ROOM, 'message:m-1']),
   firstView: true,
+  deferredWriteId: 'a-queued-write',
+  external: { source: 'discord', id: '1548000000000000002' },
+  openaiResponsesItems: [],
 };
 
 async function waitFor(cond: () => boolean, what: string, timeoutMs = 15_000): Promise<void> {
@@ -108,9 +111,17 @@ describe("a server's metadata, stored without the keys only the host writes", ()
     command({ op: 'incoming', channelId: ROOM, messageId: 'm-2', mode: 'ambient', text: 'two', metadata: { kind: 'secret-kind-2', system: true } });
     command({ op: 'push', eventId: 'tick-1', origin: { kind: 'secret-kind-3' }, text: 'three' });
     await waitFor(() => !!storedWith((m) => m.eventId === 'tick-1') && !!storedWith((m) => m.messageId === 'm-2'), 'the other two stored');
+    // Another server's first `kind` is its own first drop of that key.
+    framework.pushEvent({
+      type: 'mcpl:channel-incoming', serverId: 'other', channelId: 'other:room', messageId: 'o-1',
+      author: { id: 'U-other', name: 'someone' }, content: [{ type: 'text', text: 'four' }],
+      timestamp: new Date().toISOString(), metadata: { kind: 'secret-kind-4' },
+    } as unknown as ProcessEvent);
+    await waitFor(() => !!storedWith((m) => m.messageId === 'o-1'), 'the other server\'s message stored');
     assert.deepEqual(drops(), [
-      '[mcpl] discord: dropped "kind" from a message\'s metadata, since only the host writes that key (logged once for each server and key)',
-      '[mcpl] discord: dropped "system" from a message\'s metadata, since only the host writes that key (logged once for each server and key)',
+      '[mcpl] discord: dropped "kind" from a message, since only the host writes that key (logged once for each server and key)',
+      '[mcpl] discord: dropped "system" from a message, since only the host writes that key (logged once for each server and key)',
+      '[mcpl] other: dropped "kind" from a message, since only the host writes that key (logged once for each server and key)',
     ]);
   });
 });
