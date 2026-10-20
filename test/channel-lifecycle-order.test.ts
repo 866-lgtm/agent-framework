@@ -2647,3 +2647,134 @@ test("the agent's channel_open over a channel speech opened is the agent's decis
   assert.match(housekeeping.error ?? '', /was explicitly opened \(source: agent-tool\)/);
   assert.equal(f.isOpen(), true);
 });
+
+// A channel only a push has registered (ensureChannelRegistered) starts with
+// its transport unknown, as a registration's does: after a restart the server
+// may still hold a channel an earlier process opened. Its traffic shows it
+// open when it's decided open or tuned out, since it has no target a retarget
+// could have left behind. In each test below the server holds it open.
+
+test('a close of a channel only a push has registered, decided closed before a restart, is sent to the server, not answered as already closed', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'push-registered-close-'));
+  const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+  try {
+    const earlier = fixture(undefined, store);
+    earlier.registry.ensureChannelRegistered('test', 'x', 'x');
+    assert.equal((await earlier.tool('close')).success, true);
+
+    // A decision kept from an earlier process says nothing about the transport.
+    const f = fixture(undefined, store);
+    f.actual.set('x', true);
+    f.registry.ensureChannelRegistered('test', 'x', 'x');
+    assert.equal(f.registry.getDesiredState('test', 'x'), 'closed');
+    const result = await f.tool('close');
+    assert.equal(result.success, true);
+    assert.equal(dataOf(result).status, 'closed');
+    assert.deepEqual(f.calls.map((c) => [c.kind, c.id]), [['close', 'x']]);
+    assert.equal(f.actual.get('x'), false);
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a decline in a channel only a push has registered, after its traffic, sends its close through the lifecycle queue', async () => {
+  const f = fixture();
+  f.actual.set('x', true);
+  f.registry.ensureChannelRegistered('test', 'x', 'x');
+  // With nothing decided, its traffic doesn't show it open.
+  await f.registry.handleIncoming('test', { messages: [message()] });
+  assert.equal(f.isOpen(), false);
+  const result = await f.registry.handleChannelToolCall('channel_decline', { serverId: 'test', channelId: 'x', messageId: 'm1' });
+  assert.equal(result.success, true);
+  assert.equal(dataOf(result).status, 'remained closed');
+  assert.equal(dataOf(result).closeError, undefined);
+  assert.deepEqual(f.calls.map((c) => [c.kind, c.id]), [['close', 'x']]);
+  assert.equal(f.actual.get('x'), false);
+});
+
+test("a close refused for the grant, in a channel only a push has registered, doesn't say the channel is closed, nor once the close is recorded", async () => {
+  const f = fixture();
+  f.actual.set('x', true);
+  f.setGrant(ALL_CAPABILITY_PATHS.filter((path) => path !== 'channels.lifecycle'));
+  f.registry.ensureChannelRegistered('test', 'x', 'x');
+  // The second close finds the first one's decision recorded.
+  for (const attempt of [1, 2]) {
+    const result = await f.tool('close');
+    assert.equal(result.success, false, `close ${attempt}`);
+    assert.equal(result.error,
+      'This host isn\'t permitted to open or close the "test" server\'s channels, so this close of channel "x" didn\'t ' +
+      'go through, and calling channel_close again won\'t change that. The close stays recorded, and happens if the ' +
+      '"test" server registers this channel at a time this host may open and close its channels. If you need it, ask ' +
+      'whoever runs this host.', `close ${attempt}`);
+    assert.equal(f.registry.getDesiredState('test', 'x'), 'closed', `close ${attempt}`);
+  }
+  assert.deepEqual(f.calls, []);
+});
+
+test('traffic in a tuned-out channel only a push has registered shows it open, whether or not this host directs its lifecycle, so a decline leaves the tune-out', async () => {
+  for (const directs of [true, false]) {
+    const f = fixture();
+    f.actual.set('x', true);
+    if (!directs) f.setGrant(ALL_CAPABILITY_PATHS.filter((path) => path !== 'channels.lifecycle'));
+    f.registry.ensureChannelRegistered('test', 'x', 'x');
+    f.registry.enterTuneOut('test', 'x', {
+      epochId: 'e1', cadenceSeconds: 60, backlogCap: 20, maxWakes: 3, startedAtSequence: 1,
+    }, 'agent-tool');
+    await f.registry.handleIncoming('test', { messages: [message()] });
+    // An entry made from a push has no target a retarget could have left
+    // behind, so its traffic shows the transport open even where this host
+    // directs the lifecycle.
+    assert.equal(f.isOpen(), true, `directs: ${directs}`);
+    const declined = await f.registry.handleChannelToolCall('channel_decline', { serverId: 'test', channelId: 'x', messageId: 'm1' });
+    assert.equal(declined.success, false, `directs: ${directs}`);
+    assert.equal(f.registry.getDesiredState('test', 'x'), 'tuned-out', `directs: ${directs}`);
+    assert.deepEqual(f.calls, [], `directs: ${directs}`);
+  }
+});
+
+test("a registration, over a push's entry or carrying the push's placeholder metadata, still waits for a receipt before its traffic shows it open", async () => {
+  for (const registration of ['over a push', 'with the placeholder key'] as const) {
+    const f = fixture();
+    f.actual.set('x', true);
+    f.held.add('x');
+    if (registration === 'over a push') f.registry.ensureChannelRegistered('test', 'x', 'x');
+    f.registry.enterTuneOut('test', 'x', {
+      epochId: 'e1', cadenceSeconds: 60, backlogCap: 20, maxWakes: 3, startedAtSequence: 1,
+    }, 'agent-tool');
+    // channels/register over the push's entry; channels/changed's added for
+    // the descriptor with the key.
+    const registering = registration === 'over a push'
+      ? f.registry.handleRegister('test', { channels: [descriptor('x', true)] })
+      : f.registry.handleChanged('test', { added: [{ ...descriptor('x', true), metadata: { lazyRegistered: true } }] });
+    await tick();
+    await f.registry.handleIncoming('test', { messages: [message()] });
+    assert.equal(f.isOpen(), false, `${registration}: its traffic is no receipt`);
+    f.held.delete('x');
+    await f.drain(registering);
+    assert.equal(f.isOpen(), true, `${registration}: the reconcile's receipt confirms it`);
+  }
+});
+
+test('an update that keeps the target of a channel only a push has registered leaves its traffic showing it open; one that gives it a target waits for a receipt', async () => {
+  for (const retarget of [false, true]) {
+    const f = fixture();
+    f.actual.set('x', true);
+    f.held.add('x');
+    f.registry.ensureChannelRegistered('test', 'x', 'x');
+    f.registry.enterTuneOut('test', 'x', {
+      epochId: 'e1', cadenceSeconds: 60, backlogCap: 20, maxWakes: 3, startedAtSequence: 1,
+    }, 'agent-tool');
+    // The push's entry has the server id as its type and no address.
+    const update: ChannelDescriptor = retarget
+      ? descriptor('x', false, 'B')
+      : { id: 'x', type: 'test', label: 'x, renamed', direction: 'bidirectional' };
+    const updating = f.registry.handleChanged('test', { updated: [update] });
+    await tick();
+    await f.registry.handleIncoming('test', { messages: [message()] });
+    assert.equal(f.isOpen(), !retarget, `retarget: ${retarget}`);
+    f.held.delete('x');
+    await f.drain(updating);
+    assert.equal(f.isOpen(), true, `retarget: ${retarget}`);
+  }
+});

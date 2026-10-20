@@ -66,24 +66,33 @@ const alive = (pid: number): boolean => {
 };
 
 /** What a script's result says when its interpreter exits under it (py-runner's
- *  interpreterExit), for `how` such as "exited with code 3" or "was ended by SIGKILL". */
-const exitedUnder = (how: string, background = false): string =>
+ *  interpreterExit), for `how` such as "exited with code 3" or "was ended by SIGKILL",
+ *  with `check` for the advice's first step after a crash's signal. */
+const exitedUnder = (how: string, background = false, check?: string): string =>
   `script stopped: the Python interpreter ${how} while it ran, so the rest of the script didn't run`
   + `${background ? '' : ', and variables from earlier scripts are gone'}. Tool calls it had already made keep their effects, `
-  + 'so check them before you run it again in a new interpreter. If it stops the same way, check whether the script itself '
-  + `ends the process, for example ${how.startsWith('was ended by') ? 'by using too much memory' : 'with os._exit()'}; if not, ask whoever runs this host.`;
+  + `so check them before you run it again in a new interpreter. If it stops the same way, ${check ?? 'check whether the script itself '
+  + `ends the process, for example ${
+    how === 'was ended by SIGKILL' ? 'by using too much memory' : how.startsWith('was ended by') ? 'with os.kill()' : 'with os._exit()'}`
+  }; if not, ask whoever runs this host.`;
+
+/** The advice's first step after a crash's signal, with faulthandler's traceback above it, and without. */
+const NATIVE_CRASH = 'check the traceback above for the call that crashed in native code, such as an extension module the script uses';
+const NATIVE_CRASH_UNSEEN = 'check whether native code the script calls crashes, such as an extension module it uses';
 
 /**
  * What a script's result says when its interpreter exits after the script's own
  * result came, before all of its output arrived (py-runner's interpreterExit,
- * ended), with the advice for a runtime that ended itself over `taken`, if given.
+ * ended), with the advice for a runtime that ended itself over `taken`, if given,
+ * and `check` for the advice's first step after a crash's signal, as exitedUnder's.
  */
-const exitedAfterEnd = (how: string, taken?: string, background = false): string =>
+const exitedAfterEnd = (how: string, taken?: string, background = false, check?: string): string =>
   `script ended, but the Python interpreter ${how} before all of its output reached the host, so some of it may be missing`
   + `${background ? '' : ', and variables from earlier scripts are gone'}. If it happens again, `
   + (taken
     ? `check whether the script closes, shuts down or replaces ${taken}, as the runtime's line above says`
-    : `check whether the script itself ends the process, for example ${how.startsWith('was ended by') ? 'by using too much memory' : 'with os._exit()'}`)
+    : check ?? `check whether the script itself ends the process, for example ${
+      how === 'was ended by SIGKILL' ? 'by using too much memory' : how.startsWith('was ended by') ? 'with os.kill()' : 'with os._exit()'}`)
   + '; if not, ask whoever runs this host.';
 
 /** The result's text after the runtime ended itself because a script took one of its file descriptors. */
@@ -1455,6 +1464,38 @@ describe("PyRunner: a script's output, read by the host (real python3)", { skip:
           runner.dispose();
         }
       });
+    }
+  });
+
+  it("a signal's advice fits it: the traceback's call after a crash's signal, native code when no traceback came, the script's own os.kill() after another", async () => {
+    // Each with where faulthandler's traceback begins in the result, above the advice, or null where none came.
+    const header = /^Fatal Python error: /m;
+    const cases: [string, string, RegExp | null, string][] = [
+      ['a segfault', 'import ctypes\nctypes.string_at(0)', header, exitedUnder('was ended by SIGSEGV', false, NATIVE_CRASH)],
+      ['a fatal error', 'import ctypes\nctypes.pythonapi.Py_FatalError(b"probe reason")', header, exitedUnder('was ended by SIGABRT', false, NATIVE_CRASH)],
+      ...['SIGBUS', 'SIGFPE', 'SIGILL'].map((sig): [string, string, RegExp, string] =>
+        [sig, `import os, signal\nos.kill(os.getpid(), signal.${sig})`, header, exitedUnder(`was ended by ${sig}`, false, NATIVE_CRASH)]),
+      // faulthandler doesn't start a line: after a progress bar's, which doesn't end, its first words follow on it.
+      ["a segfault after a line the script didn't end", 'import sys, ctypes\nsys.stderr.write("\\r 45%|####      | 45/100")\nsys.stderr.flush()\nctypes.string_at(0)',
+        /45\/100Fatal Python error: /, exitedUnder('was ended by SIGSEGV', false, NATIVE_CRASH)],
+      ['a segfault with faulthandler disabled', 'import ctypes, faulthandler\nfaulthandler.disable()\nctypes.string_at(0)', null,
+        exitedUnder('was ended by SIGSEGV', false, NATIVE_CRASH_UNSEEN)],
+      ['SIGTERM', 'import os, signal\nos.kill(os.getpid(), signal.SIGTERM)', null, exitedUnder('was ended by SIGTERM')],
+    ];
+    for (const [what, code, traceback, says] of cases) {
+      const runner = new PyRunner({ onToolCall: async () => '' });
+      try {
+        const result = await within(runner.exec(code, []), what);
+        assert.strictEqual(result.aborted, true, what);
+        if (traceback) {
+          assert.match(result.stderr, traceback, what);
+          assert.ok(result.stderr.endsWith(`\n${says}`), `${what}: ${JSON.stringify(result.stderr.slice(-600))}`);
+        } else {
+          assert.strictEqual(result.stderr, says, what);
+        }
+      } finally {
+        runner.dispose();
+      }
     }
   });
 
@@ -3006,7 +3047,7 @@ describe('framework code_execution integration (real python3)', () => {
       // Through the framework, each result says it isn't an error (a
       // handler that passed on only the string would make it None).
       assert.match(wireResult.content, /is_error: \[False, False\]/);
-      assert.match(wireResult.content, /"return_code":\s*0/);
+      assert.match(wireResult.content, /^exit code: 0\n/);
       // ...and NOT the intermediate tool results.
       assert.ok(
         !wireResult.content.includes('"echoed"'),
@@ -3127,7 +3168,7 @@ describe('framework code_execution integration (real python3)', () => {
       // The first script is stopped at its time limit while its call that ends the turn is running.
       const stopped = await run({ code: 'await test__finish({})', time_limit_ms: 1000 });
       assert.ok(finishStarted);
-      assert.match((stopped.data as { stderr: string }).stderr, /reached its 1s time limit/);
+      assert.match((stopped.structured as { stderr: string }).stderr, /reached its 1s time limit/);
       assert.ok(!stopped.endTurn);
 
       // The call finishes while the next script runs; its request belonged to the stopped script.
@@ -3135,7 +3176,7 @@ describe('framework code_execution integration (real python3)', () => {
       await new Promise((r) => setTimeout(r, 300));
       releaseFinish();
       const result = await next;
-      assert.strictEqual((result.data as { stdout: string }).stdout, 'next done\n');
+      assert.strictEqual((result.structured as { stdout: string }).stdout, 'next done\n');
       assert.ok(!result.endTurn, "the stopped script's request ended the next script's turn");
     } finally {
       await framework.stop();
@@ -5263,7 +5304,7 @@ describe('code_execution per-call time limit (time_limit_ms)', () => {
 
   const run = (framework: AgentFramework, input: Record<string, unknown>) =>
     framework.executeToolCall({ id: `ce-${Math.random()}`, name: 'code_execution', input });
-  const dataOf = (r: ToolResult) => r.data as { stdout: string; stderr: string; return_code: number; time_limit_note?: string };
+  const dataOf = (r: ToolResult) => r.structured as { stdout: string; stderr: string; return_code: number; time_limit_note?: string };
 
   it('the tool tells the agent its time limit and offers time_limit_ms', async () => {
     await withFramework({ scriptTimeoutMs: 300_000, maxScriptTimeoutMs: 1_800_000 }, async (framework) => {
