@@ -8,7 +8,7 @@
 import { test } from 'node:test';
 import { strict as assert } from 'node:assert';
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -113,10 +113,15 @@ test("a stop that a script's stack hook keeps QuickJS from taking ends the run a
   await r.exited;
 });
 
-test("an orphan whose script's stack hook keeps QuickJS from taking a stop ends its process", async () => {
+/**
+ * The child the runner starts, under a parent that names itself, running a script whose stack hook
+ * keeps QuickJS from taking any stop: it says it's running, from inside its run, and then, if
+ * `stopFirst`, the parent asks it to stop and it runs on; then its parent goes. Nothing tells the
+ * child but its parent pid changing, and no one is left to kill it.
+ */
+async function orphanEnds(stopFirst: boolean): Promise<void> {
   const parentEntry = fileURLToPath(new URL(`./helpers/orphan-parent-entry${extname(fileURLToPath(import.meta.url))}`, import.meta.url));
   const dir = mkdtempSync(join(tmpdir(), 'af-orphan-'));
-  // The child the runner starts, under a parent that names itself: it says it's running, from inside its run, and its parent goes only after that.
   const message = { t: 'start', script: DROPS_EVERY_STOP, tools: TOOLS, memoryMaxBytes: 16 * 1024 * 1024, stopFile: join(dir, 'stop'), flushMs: 0, maxWakes: 100 };
   const parent = spawn(process.execPath, [parentEntry, CHILD], { stdio: ['ignore', 'pipe', 'inherit'], env: { ...process.env, CHILD_DIR: dir, START: JSON.stringify(message) } });
   let childPid = 0;
@@ -137,7 +142,12 @@ test("an orphan whose script's stack hook keeps QuickJS from taking a stop ends 
       }
     };
     assert.equal(alive(), true, 'the child is running');
-    // Its parent goes; nothing tells the child but its parent pid changing, and no one is left to kill it.
+    if (stopFirst) {
+      // The stop file, as the parent makes it: the guest takes the stop and keeps it from landing.
+      writeFileSync(join(dir, 'stop'), '');
+      await new Promise((r) => setTimeout(r, 300));
+      assert.equal(alive(), true, 'the guest runs on past its stop');
+    }
     parent.kill('SIGKILL');
     const deadline = performance.now() + 10_000;
     while (alive() && performance.now() < deadline) await new Promise((r) => setTimeout(r, 20));
@@ -147,7 +157,11 @@ test("an orphan whose script's stack hook keeps QuickJS from taking a stop ends 
     if (childPid) try { process.kill(childPid, 'SIGKILL'); } catch { /* gone */ }
     rmSync(dir, { recursive: true, force: true });
   }
-});
+}
+
+test("an orphan whose script's stack hook keeps QuickJS from taking a stop ends its process", () => orphanEnds(false));
+
+test('an orphan whose script keeps a stop it took before its parent went from landing ends its process', () => orphanEnds(true));
 
 test('a script that fills its memory gets a catchable out-of-memory error, and the child lives on', async () => {
   const r = run();

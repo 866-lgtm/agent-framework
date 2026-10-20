@@ -38,6 +38,7 @@ async function engine(over: Partial<EngineSlots> = {}, limits: Partial<EngineLim
   const slots: EngineSlots = {
     hostCall: (id, name, args) => { rec.calls.push({ id, name, args }); },
     interrupt: () => false,
+    supervise: () => {},
     output: (stream, text) => { rec.output.push([stream, text]); },
     ...over,
   };
@@ -314,6 +315,53 @@ test('a stop that lands in the script\'s stack hook holds, though QuickJS puts b
   e.dispose();
 });
 
+test('supervision runs at every check, after a stop and after a slot fails, though interrupt() is asked no more', async () => {
+  // The stack hook keeps each stop from landing for a while, so the guest runs on after it.
+  const hook = `Error.prepareStackTrace = () => { for (let i = 0; i < 3e6; i++) {} };
+    for (let k = 0; k < 5; k++) { try { null.x } catch {} }
+    "went on"`;
+  let checks = 0;
+  let afterStop = 0;
+  const a = await engine({ interrupt: () => ++checks === 101, supervise: () => { if (checks >= 101) afterStop += 1; } });
+  assert.deepEqual(a.e.start(PRELUDE, hook, 's.js'), { kind: 'interrupted' });
+  assert.equal(checks, 101, 'interrupt() was asked no more once it said stop');
+  assert.ok(afterStop > 1, `supervised ${afterStop} times after the stop`);
+  a.e.dispose();
+  // A slot's failure stops the guest at its next check, and supervision goes on all the same.
+  let failed = false;
+  let afterFailure = 0;
+  const b = await engine({
+    output: () => { failed = true; throw new Error('the output pipe is gone'); },
+    supervise: () => { if (failed) afterFailure += 1; },
+  });
+  assert.throws(() => b.e.start(PRELUDE, `try { __output(1, "x") } catch {}\n${hook}`, 's.js'), EngineError);
+  assert.ok(afterFailure > 1, `supervised ${afterFailure} times after the failure`);
+  b.e.dispose();
+});
+
+test("a supervise() that throws ends the run as a slot's failure, and a failure before it stays the run's", async () => {
+  const watch = new Error('the watch failed');
+  // Were a throw not the run's failure, these interrupts would stop the guest, so the test fails rather than spins.
+  // And it's a slot's failure, not a crash: a throw that escaped the binding would end the run with the same cause.
+  const slotFailed = (cause: Error) => (err: unknown) => err instanceof EngineError && err.cause === cause && err.message.startsWith('a slot threw');
+  let n = 0, checks = 0;
+  const a = await engine({ supervise: () => { if (++n === 50) throw watch; }, interrupt: () => ++checks > 1000 });
+  assert.throws(() => a.e.start(PRELUDE, 'for (;;) {}', 's.js'), slotFailed(watch));
+  a.e.dispose();
+  // An output failure first: a later supervise() that throws doesn't take its place.
+  const pipe = new Error('the output pipe is gone');
+  let failed = false, thrownAfter = 0;
+  checks = 0;
+  const b = await engine({
+    output: () => { failed = true; throw pipe; },
+    supervise: () => { if (failed) { thrownAfter++; throw watch; } },
+    interrupt: () => ++checks > 1000,
+  });
+  assert.throws(() => b.e.start(PRELUDE, 'try { __output(1, "x") } catch {}\nfor (;;) {}', 's.js'), slotFailed(pipe));
+  assert.ok(thrownAfter > 0, `supervise() threw ${thrownAfter} times after the output failure`);
+  b.e.dispose();
+});
+
 test('the interrupt reaches a script spinning in jobs, and later settles answer interrupted, their results dropped', async () => {
   let stop = false;
   const { e } = await engine({ interrupt: () => stop }, { memoryMaxBytes: 8 * MiB });
@@ -363,14 +411,16 @@ test('a slot failure is an EngineError, not a stop, when the interrupt is what e
   b.e.dispose();
 });
 
-test('a slot that throws undefined still ends the run, and no slot is called after it', async () => {
-  let calls = 0, checks = 0, checksAtFailure = -1;
+test('a slot that throws undefined still ends the run, and no slot but supervise() is called after it', async () => {
+  let calls = 0, checks = 0, checksAtFailure = -1, supervisedAfter = 0;
   const { e } = await engine({
     hostCall: () => { calls++; checksAtFailure = checks; throw undefined; },
     interrupt: () => ++checks > 1000,
+    supervise: () => { if (calls > 0) supervisedAfter++; },
   });
   assert.throws(() => e.start(PRELUDE, 'try { __host("a", "{}") } catch {}\ntry { __host("b", "{}") } catch {}\nfor (;;) {}', 's.js'), EngineError);
   assert.deepEqual([calls, checks], [1, checksAtFailure]);
+  assert.ok(supervisedAfter > 0, `supervise() was called ${supervisedAfter} times after the failure`);
   e.dispose();
 });
 
@@ -1011,7 +1061,7 @@ test('recursion through getters, proxy traps and built-ins that call back gets t
 });
 
 test('limits outside their range are refused before anything loads', async () => {
-  const slots: EngineSlots = { hostCall: () => {}, interrupt: () => false, output: () => {} };
+  const slots: EngineSlots = { hostCall: () => {}, interrupt: () => false, supervise: () => {}, output: () => {} };
   await assert.rejects(loadEngine({ memoryMaxBytes: 32 * MiB + 1 }, slots), RangeError);
   await assert.rejects(loadEngine({ memoryMaxBytes: MIN_MEMORY_BYTES - 65536 }, slots), RangeError);
   await assert.rejects(loadEngine({ memoryMaxBytes: MAX_MEMORY_BYTES + 65536 }, slots), RangeError);

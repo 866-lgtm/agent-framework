@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { extname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runChild, type ChildIo } from '../src/code-execution/isolate/child.js';
+import { runChild, STOP_CHECK_MS, type ChildIo } from '../src/code-execution/isolate/child.js';
 import type { ParentMessage, StartMessage } from '../src/code-execution/isolate/protocol.js';
 import { loadFakeEngine } from './helpers/fake-engine.js';
 import type { Engine, EngineSlots, RunState, SettleState } from '../src/code-execution/engine.js';
@@ -224,22 +224,28 @@ test('a spinning guest whose io has no orphaned hook stops once its parent has g
   assert.deepEqual(ends(sent), [{ t: 'end', how: 'stopped' }]);
 });
 
+test('the child looks for its parent at most once a stop check, however often the engine checks', async () => {
+  const { io, sent } = channel(echo);
+  // The clock stands still, so every check after the first falls within one stop check.
+  io.now = () => 0;
+  let looks = 0;
+  io.parentGone = () => { looks += 1; return false; };
+  await runChild(io, start(`for (let i = 0; i < 1e4; i++) __tick(); return 'ran';`), loadFakeEngine);
+  assert.equal(looks, 1);
+  assert.deepEqual(ends(sent), [{ t: 'end', how: 'finished', value: '"ran"' }]);
+});
+
 test('an orphan ends before it sends the output waiting to go, when the two fall due at one check', async () => {
   const { io, sent } = channel(echo);
-  // The clock stands still until the first look for the parent, then jumps
-  // past flushMs: at the next check, the parent is gone and the output written
-  // before it is due, and the parent is looked for first.
-  let clock = 0;
-  io.now = () => clock;
+  // The clock stands still through the first check, its look for the parent
+  // and then its interrupt, and jumps past flushMs for the next: at that
+  // check, the parent is gone and the output written before it is due, and
+  // the parent is looked for first.
   let looks = 0;
+  let readsAfterFirstLook = 0;
+  io.now = () => (looks === 0 || ++readsAfterFirstLook <= 1 ? 0 : 100);
   let sentBeforeOrphaned: string[] | undefined;
-  io.parentGone = () => {
-    if (++looks === 1) {
-      clock = 100;
-      return false;
-    }
-    return true;
-  };
+  io.parentGone = () => ++looks > 1;
   io.orphaned = (() => {
     sentBeforeOrphaned = sent.map((m) => m.t as string);
   }) as () => never;
@@ -247,6 +253,29 @@ test('an orphan ends before it sends the output waiting to go, when the two fall
   assert.deepEqual(sentBeforeOrphaned, [], 'nothing went out before the orphan ended');
   // This io's orphaned returns, so the guest is stopped, and the output then goes with the ending.
   assert.deepEqual(sent.map((m) => m.t), ['out', 'end']);
+});
+
+test('an orphan whose guest runs on past a stop it took before its parent went still ends its process', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'isolate-stop-'));
+  try {
+    const stopFile = join(dir, 'stop');
+    writeFileSync(stopFile, '');
+    const { io, sent } = channel(echo);
+    // Each look a stop check apart. The guest has its stop at once and keeps it from ending it, as
+    // a script can keep QuickJS from taking one; its parent goes only after that.
+    let clock = 0;
+    io.now = () => (clock += STOP_CHECK_MS);
+    let looks = 0;
+    io.parentGone = () => ++looks > 20;
+    let orphaned = 0;
+    io.orphaned = (() => { orphaned += 1; }) as () => never;
+    await runChild(io, start(`for (let i = 0; i < 1e5; i++) { try { __tick() } catch {} } return 'ran on';`, { stopFile }), loadFakeEngine);
+    assert.ok(looks > 20, `the child looked for its parent ${looks} times, its stop taken`);
+    assert.equal(orphaned, 1);
+    assert.deepEqual(ends(sent), [{ t: 'end', how: 'stopped' }]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('an orphan whose stop file is there too ends its process rather than stop its guest', async () => {

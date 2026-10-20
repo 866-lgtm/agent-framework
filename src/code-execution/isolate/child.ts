@@ -1,6 +1,6 @@
 /**
  * A script's child: one process per script, which runs it in the engine and
- * answers the engine's three imports. It takes its start from the parent's
+ * answers the engine's four imports. It takes its start from the parent's
  * first frame, sends each tool call to the parent and settles it with the
  * parent's answer, flushes the output in bounded batches, and reports how the
  * script ended. A crash it can't report: the parent sees that the child ended
@@ -49,9 +49,9 @@ export interface ChildIo {
    * End the child's process at once, its parent having gone: nothing it does
    * reaches anyone, its unsent output included, and nothing is left to kill
    * it if its guest keeps a stop from ending it. The child looks for its
-   * parent only until it has a stop, since the engine asks it nothing after
-   * one, so a stop taken before the parent went is ended by the parent's kill
-   * or not at all. Without this, the child stops its guest instead.
+   * parent at the engine's interrupt checks, at most once a stop check
+   * (`STOP_CHECK_MS`), after a stop as before one. Without this, the child
+   * stops its guest instead.
    */
   orphaned?(): never;
 }
@@ -88,6 +88,9 @@ export async function runChild(io: ChildIo, start: StartMessage, loadEngine: Loa
   let stopped = false;
   let lastFlush = io.now();
   let lastStopCheck = -Infinity;
+  let lastParentCheck = -Infinity;
+  /** Its parent has been seen gone, so the child has ended its process, or stopped its guest. */
+  let orphan = false;
 
   const flush = (): void => {
     lastFlush = io.now();
@@ -133,22 +136,28 @@ export async function runChild(io: ChildIo, start: StartMessage, loadEngine: Loa
       const t = io.now();
       if (!stopped && t - lastStopCheck >= STOP_CHECK_MS) {
         lastStopCheck = t;
-        // A guest that computes doesn't let the child see its parent go, so
-        // that's checked here too. An orphan ends its process at once rather
-        // than stop its guest: a guest can keep a stop from ending it, since
-        // QuickJS drops a stop it takes inside a stack hook or an iterator's
-        // return, and only the parent kills a child that runs on. The engine
-        // asks no more once it has a stop, so a stop the guest keeps from
-        // landing, taken before the parent went, isn't checked again. Output
-        // waiting to be sent goes with the process: the parent that would
-        // read it is gone, and a write to it could fail or block.
-        if (io.parentGone?.()) {
-          io.orphaned?.();
-          stopped = true;
-        } else stopped = existsSync(start.stopFile);
+        stopped = existsSync(start.stopFile);
       }
       if (batch.unflushed > 0 && t - lastFlush >= start.flushMs) flush();
       return stopped;
+    },
+    supervise() {
+      // A guest that computes doesn't let the child see its parent go, so
+      // that's checked at the engine's interrupt checks, at most once a stop
+      // check, a stop's included: a guest can keep a stop from ending it,
+      // since QuickJS drops a stop it takes inside a stack hook or an
+      // iterator's return, and only the parent kills a child that runs on.
+      // The engine calls this first, so an orphan ends its process at once
+      // rather than stop its guest. Output waiting to be sent goes with the
+      // process: the parent that would read it is gone, and a write to it
+      // could fail or block.
+      const t = io.now();
+      if (orphan || t - lastParentCheck < STOP_CHECK_MS) return;
+      lastParentCheck = t;
+      if (!io.parentGone?.()) return;
+      orphan = true;
+      io.orphaned?.();
+      stopped = true;
     },
     output(_stream, text) {
       if (batch.write(text) || io.now() - lastFlush >= start.flushMs) flush();

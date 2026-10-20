@@ -3,8 +3,9 @@
  * `engine/build.sh` from the quickjs-ng release it pins and `engine/interface.c`), loaded into the child
  * process that runs one script.
  *
- * The guest reaches nothing outside JavaScript except three slots the child fills: a host call,
- * the interrupt check and output. Only text crosses them: a tool's name and its arguments as
+ * The guest reaches nothing outside JavaScript except three of the slots the child fills: a host
+ * call, the interrupt check and output. The fourth, supervision, the guest can't reach: the engine
+ * calls it at each interrupt check. Only text crosses them: a tool's name and its arguments as
  * JSON, output, and each result's JSON on the way back in. The module's memory is made here, with
  * the maximum the child is given, so that maximum bounds everything the guest holds.
  */
@@ -25,10 +26,10 @@ export interface EngineLimits {
 }
 
 /**
- * The three imports, as slots the child fills. Each is called synchronously from inside the
+ * The four imports, as slots the child fills. Each is called synchronously from inside the
  * engine, so none may await, and none may call back into the engine: a call into it from a slot
  * throws an `EngineError`. A slot that throws ends the run: the call in progress throws that
- * error, wrapped as an `EngineError`, and no slot is called again.
+ * error, wrapped as an `EngineError`, and no slot is called again but `supervise()`.
  */
 export interface EngineSlots {
   /**
@@ -46,6 +47,14 @@ export interface EngineSlots {
    * a stop while it's read turns into `interrupted`, as for any rejection.
    */
   interrupt(): boolean;
+  /**
+   * Called at every interrupt check, before `interrupt()` is asked, and after it has said stop or a
+   * slot has failed, when it's asked no more: the child's watch over its own process, such as its
+   * parent going, which no stop or failure ends, since a script can keep a stop from landing. It
+   * returns nothing: a stop it calls for comes through `interrupt()`. One that throws ends the run
+   * as any slot's failure, and is still called at the checks after.
+   */
+  supervise(): void;
   /** The guest called `__output(stream, text)`: stream 1 is out, 2 is err. */
   output(stream: 1 | 2, text: string): void;
 }
@@ -307,6 +316,18 @@ export async function loadEngine(limits: EngineLimits, slots: EngineSlots): Prom
     },
     host_output: (stream: number, ptr: number, len: number) =>
       guard(() => slots.output(stream === 2 ? 2 : 1, text(ptr, len))),
+    // Not an ordinary slot: a slot's failure doesn't end it, so a guest that keeps its stop from
+    // landing is still watched.
+    host_supervise: () => {
+      try {
+        slots.supervise();
+      } catch (err) {
+        if (!slotFailed) {
+          slotFailed = true;
+          slotError = err;
+        }
+      }
+    },
   };
   // The few WASI calls libc makes: the clocks (the real-time one for Date.now and the seed QuickJS
   // gives Math.random, the monotonic one for performance.now), four random bytes libc asks for

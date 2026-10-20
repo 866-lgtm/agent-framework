@@ -4,11 +4,12 @@
  *
  * It is held to what code_execution's bridge needs: limits, evaluating the prelude and a script,
  * one host function whose calls the host settles by id, running jobs, the interrupt, and output.
- * The guest reaches nothing outside JavaScript except the three imports below, which only JSON
- * text and output text cross, and the clocks: Date.now and performance.now read WASI's
- * clock_time_get. libc's other WASI calls, four random bytes as the module loads and stdio for
- * the engine's own diagnostics, aren't reachable from guest code. The host's side is
- * src/code-execution/engine.ts.
+ * The guest reaches nothing outside JavaScript except three of the imports below, a host call,
+ * the interrupt and output, which only JSON text and output text cross, and the clocks: Date.now
+ * and performance.now read WASI's clock_time_get. The fourth import, host_supervise, only the
+ * interrupt handler calls, and nothing crosses it. libc's other WASI calls, four random bytes as
+ * the module loads and stdio for the engine's own diagnostics, aren't reachable from guest code.
+ * The host's side is src/code-execution/engine.ts.
  *
  * One runtime and one context per module instance, made by engine_init. A child process holds
  * one instance for one script, so nothing here is reentrant or thread-safe.
@@ -34,6 +35,13 @@ extern int host_call(uint32_t id, const char *name, uint32_t name_len,
 /* QuickJS's interrupt handler, called while the guest runs. Nonzero stops the guest for good. */
 IMPORT("host_interrupt")
 extern int host_interrupt(void);
+
+/* Called at every interrupt check, before host_interrupt is asked and after it has said stop, a
+   failed import's stop included: the host's watch over its own process, such as its parent
+   going, which no stop or failure ends. It answers nothing itself: a stop it calls for, as an
+   orphan with no way to end its process does, comes through host_interrupt. */
+IMPORT("host_supervise")
+extern void host_supervise(void);
 
 /* The guest called __output(stream, text), stream 1 for out and 2 for err. Returns 0, or
    nonzero when the host failed. */
@@ -195,17 +203,21 @@ static const JSMallocFunctions limited_malloc_funcs = {
 };
 
 /* Once the host has stopped the guest, every later check stops it too, without asking again, so
-   a stop holds for good even if the host would say otherwise later. The engine runs none of the
-   script's code after a stop: every entry point checks the flag first, and error_json ends its
-   read at one. QuickJS does: building an error's backtrace converts Error.stackTraceLimit, which
-   can call a valueOf, and calls Error.prepareStackTrace, for the error a stop throws as for any
-   other. A stop that lands in that code is lost when QuickJS puts back the error it was
-   building, and the script goes on from there. This ends such code at its next check, and
-   __host and __output refuse it, so none of it reaches the host. QuickJS checks at its first
-   poll and once in 10,000 after, so a check ends the code running then, not at once. */
+   a stop holds for good even if the host would say otherwise later. Its supervision runs at every
+   check all the same: a stop the script keeps from landing, as below, leaves the guest running,
+   and the host still has to see its own process's life, such as its parent going. The engine
+   runs none of the script's code after a stop: every entry point checks the flag first, and
+   error_json ends its read at one. QuickJS does: building an error's backtrace converts
+   Error.stackTraceLimit, which can call a valueOf, and calls Error.prepareStackTrace, for the
+   error a stop throws as for any other. A stop that lands in that code is lost when QuickJS puts
+   back the error it was building, and the script goes on from there. This ends such code at its
+   next check, and __host and __output refuse it, so none of it reaches the host. QuickJS checks
+   at its first poll and once in 10,000 after, so a check ends the code running then, not at
+   once. */
 static int interrupt_handler(JSRuntime *r, void *opaque) {
     (void)r;
     (void)opaque;
+    host_supervise();
     if (interrupted || host_interrupt()) {
         interrupted = true;
         return 1;

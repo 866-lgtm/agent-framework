@@ -1,8 +1,8 @@
 /**
  * A stand-in for the engine binding, on `node:vm`, for testing the host's side
  * of the isolate without the engine. It keeps the binding's contract: the
- * three slots, `start` and `settle` answering a RunState once their jobs have
- * run, and a stop through `interrupt()`. It's no boundary, and its interrupt
+ * four slots, `start` and `settle` answering a RunState once their jobs have
+ * run, and a stop through `interrupt()`, with `supervise()` at every check. It's no boundary, and its interrupt
  * is cooperative: a guest that spins calls `__tick()` in its loop, which asks
  * `interrupt()` as the real engine's handler would. `__crash()` ends the
  * child's process, as a crash would, and `__exists(path)` lets a test hold a
@@ -45,8 +45,11 @@ export const loadFakeEngine: LoadEngine = async (_limits, slots: EngineSlots): P
         return id;
       },
       __outputCall: (stream: 1 | 2, text: string) => slots.output(stream === 2 ? 2 : 1, String(text)),
+      // As the real engine's interrupt check: supervision first, at every check, and once it
+      // has a stop, interrupt() is asked no more.
       __interruptCall: () => {
-        if (slots.interrupt()) interrupted = true;
+        slots.supervise();
+        if (!interrupted && slots.interrupt()) interrupted = true;
         return interrupted;
       },
       // The child's process ending mid-script, as a crash of the real engine would.
