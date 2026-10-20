@@ -317,12 +317,12 @@ describe('tool lifecycle for script-made calls (RFC-007, #235 F4)', () => {
     const stopped = await framework.executeToolCall({ id: 'stop-orphan', name: 'code_execution', input: { action: 'stop', script_id: id }, callerAgentName: 'scout' });
     assert.match((stopped.data as Array<{ text: string }>)[0]!.text, /was stopped, as you asked\.\n.*still running when the script ended, so it may or may not take effect: tools\["prov--click"\]/s);
     await waitFor(() => lifecycle('obs-all').length >= before + 3, 'the held call was reported');
+    // The run call completes when its script yields, which races the inner call's start: a child
+    // slow to start can yield before its call reaches the provider. So those two come either way.
+    const phases = (events: ReturnType<typeof lifecycle>) => events.map((p) => `${p.tool}:${p.phase}`);
     const whileHeld = lifecycle('obs-all').slice(before);
-    assert.deepEqual(whileHeld.map((p) => `${p.tool}:${p.phase}`), [
-      'code_execution:started',
-      'prov--click:started',
-      'code_execution:completed',
-    ]);
+    assert.equal(phases(whileHeld)[0], 'code_execution:started');
+    assert.deepEqual(phases(whileHeld).slice(1).sort(), ['code_execution:completed', 'prov--click:started']);
 
     // Held for at least 200ms more, after the call had already started.
     await new Promise((r) => setTimeout(r, 200));
@@ -330,12 +330,10 @@ describe('tool lifecycle for script-made calls (RFC-007, #235 F4)', () => {
     await waitFor(() => lifecycle('obs-all').length >= before + 4, 'the orphaned call finished');
     await new Promise((r) => setTimeout(r, 300)); // a stray or duplicate would land here
     const events = lifecycle('obs-all').slice(before);
-    assert.deepEqual(events.map((p) => `${p.tool}:${p.phase}`), [
-      'code_execution:started',
-      'prov--click:started',
-      'code_execution:completed',
-      'prov--click:completed',
-    ]);
+    assert.equal(events.length, 4, phases(events).join(', '));
+    assert.equal(phases(events)[0], 'code_execution:started');
+    assert.deepEqual(phases(events).slice(1, 3).sort(), ['code_execution:completed', 'prov--click:started']);
+    assert.equal(phases(events)[3], 'prov--click:completed');
     const end = events[3];
     assert.equal(end.isError, false);
     assert.ok((end.durationMs as number) >= 200, `durationMs ${String(end.durationMs)} covers the hold`);
