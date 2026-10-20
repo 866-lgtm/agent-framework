@@ -2805,20 +2805,21 @@ export class ChannelRegistry {
           (reach === 'gone' ? unreachableRemedy(reach) : ''),
         );
       }
+      // Only a confirmed open flag is taken as open. The other readers take
+      // a flag a failed request left as it was (runLifecycleOperation),
+      // since a send through it fails where it can be seen, and channel_open
+      // sends an open after a failed close anyway, its decision having been
+      // closed. A tune-out's success says traffic will arrive, nothing would
+      // show it doesn't, and the decision it replaced isn't known here.
+      const confirmedOpen = entry !== undefined && entry.open && !this.unconfirmedChannelTargets.has(entry);
       if (!this.directsLifecycle(serverId)) {
-        return entry?.open ? undefined
+        return confirmedOpen ? undefined
           : `The tune-out is recorded, but ${this.lifecycleRefusal(serverId).message}, so its messages reach the ` +
             'subconscious only as that server sends them.';
       }
       if (!entry) return missing;
-      // Only a confirmed open flag needs nothing. The other readers take a
-      // flag a failed request left as it was (runLifecycleOperation), since
-      // a send through it fails where it can be seen, and channel_open
-      // sends an open after a failed close anyway, its decision having been
-      // closed. A tune-out's success says traffic will arrive, nothing would
-      // show it doesn't, and the decision it replaced isn't known here, so
-      // a flag a close that may have taken effect left gets an open.
-      return entry.open && !this.unconfirmedChannelTargets.has(entry) ? undefined : null;
+      // A flag a close that may have taken effect left gets an open.
+      return confirmedOpen ? undefined : null;
     };
     await settle();
     const before = answered(this.channels.get(channelKey), notYet(nextRegistration, "it isn't registered here now"));

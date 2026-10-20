@@ -229,6 +229,25 @@ test('a tune-out on a server whose grant lapsed while a close was out waits for 
   assert.deepEqual(f.server.sent, ['close y']);
 });
 
+test('a tune-out on a server whose grant lapsed after a close timed out doesn\'t take the flag the timeout left as open', async () => {
+  const f = await closedChannel();
+  await f.registry.handleChannelToolCall('channel_open', { channelId: 'y' });
+  f.server.sent.length = 0;
+  const timedOut = 'The "a" server didn\'t answer within 30 seconds, so whether the request took effect is unknown.';
+  f.server.sendChannelsClose = async ({ channelId }) => {
+    f.server.sent.push(`close ${channelId}`);
+    throw new McplRequestError(timedOut, 'no-response');
+  };
+  await f.registry.handleChannelToolCall('channel_close', { channelId: 'y' });
+  assert.equal(f.isOpen(), true, 'the flag the timed-out close left');
+  f.server.grant = grant(['channels.lifecycle']);
+  f.registry.enterTuneOut('a', 'y', PARAMS, 'agent-tool');
+  assert.equal(await f.registry.openForTuneOut('a', 'y'),
+    'The tune-out is recorded, but this host isn\'t permitted to open or close the "a" server\'s channels, so its ' +
+    'messages reach the subconscious only as that server sends them.');
+  assert.deepEqual(f.server.sent, ['close y']);
+});
+
 test('a tune-out while its server isn\'t up says its messages wait for it and the channel, whatever the open flag kept', async () => {
   for (const wasOpen of [false, true]) {
     const f = await closedChannel();
