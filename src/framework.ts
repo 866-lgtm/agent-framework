@@ -2653,7 +2653,10 @@ export class AgentFramework {
    */
   private readonly sharedSlotAgents = new Set<Agent>();
   /** The windows of forks and runs deregistered while the host was quiesced,
-   *  by agent name; resume() releases them (releaseWindowNowOrAfterResume). */
+   *  by agent name (releaseWindowNowOrAfterResume); resume() releases them
+   *  (runReleasesAfterResume), or stop() passes on what they left, unread or
+   *  queued, and clears them. While a name is here, no other flush drains
+   *  its queue (drainDeferredFor). */
   private readonly releasesAfterResume = new Map<string, Agent>();
   /** The coalescing commit in flight, if any (see commitCoalescingDurable). */
   private coalescingCommit: Promise<void> | null = null;
@@ -3555,6 +3558,13 @@ export class AgentFramework {
    *   iteration.
    * - a later stop() waits again, within its own budget, for any stream or
    *   loop this one left running, so the store never closes under it.
+   *
+   * Each conversation fork still live ends, as a closing fork's end does,
+   * whatever its stream is doing, as each run does: its channel unbinds, and
+   * its window's release passes on to the primary the failed replies it left,
+   * unread in its window or still queued for it. Its end settles a
+   * tool-result batch its stream still held and removes the stream's
+   * entries, and once it has left, its stream's late events are dropped.
    */
   stop(teardownTimeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS): Promise<void> {
     try { validateShutdownTimeout(teardownTimeoutMs); }
@@ -3893,6 +3903,65 @@ export class AgentFramework {
     // ephemeral's, may still be finishing.
     for (const complete of [...this.pendingOutgoingCompletes]) step(complete);
 
+    // A restart ends every conversation fork still live: the router's
+    // bindings are in memory, and its generation counters are persisted so
+    // that no name is used twice, so the next qualifying message spawns a new
+    // generation and nothing reads the old fork's window again. So each live
+    // fork ends here as a closing fork's end disposes it, and its release
+    // passes on what it left unread, as any release does. Its channel unbinds
+    // first, as the idle sweep's does: a start() after this stop() would
+    // otherwise route a message still queued for it to a name that's gone. A
+    // fork whose spawn is still waiting for its creation to return has no
+    // binding yet, and its spawn binds nothing once it has ended
+    // (spawnConversationAgent).
+    // Each is a step of its own, and each fork ends whatever its stream or
+    // turn is doing, as each run does above: its end settles a tool-result
+    // batch its stream still held and removes the stream's entries
+    // (disposeConversationAgent), its stream's late events are dropped once
+    // it has left (driveStream), a reply of its that fails then is passed on
+    // by name (onRouteFailure), and its release, or the pass below, passes on
+    // what it left, unread or queued. A turn of its that hasn't streamed yet
+    // can still record its checkpoint before it drops, a key nothing reads,
+    // since the name is never used again. These releases, and the pass after
+    // them, come before the registry forgets its channels, since a notice
+    // names its channel by the label the registry holds (channelForNotice).
+    for (const name of [...this.conversationAgentHomes.keys()]) {
+      step(() => {
+        const home = this.conversationAgentHomes.get(name)!;
+        if (this.conversationRouter?.getBinding(home)?.agentName === name) this.conversationRouter.unbind(home);
+        this.disposeConversationAgent(name);
+      });
+    }
+    // A window release the quiesce postponed (releasesAfterResume) never runs
+    // once the host stops, so its unread pass runs here: each failed reply
+    // stored unread in that window goes to the primary now, deferred while
+    // quiesced like any write, so it waits in the queue with the rest. What
+    // was queued for that agent goes as boot would send it (readdDrained): a
+    // failed reply to the primary, deferred again under its own id, and
+    // anything else dropped, logged, since nothing lands while quiesced. So
+    // no flush that comes later meets a failed reply of an agent that has
+    // gone, not even one that writes into that agent's own window, as a turn
+    // of the fork's still assembling or at a tool boundary does
+    // (flushForStart). Each release's pass is a step of its own, and so is
+    // the drain: one that throws fails the stop() and leaves the others, and
+    // the final flush, to run. It runs again after the waits below, for a
+    // release an end they let settle postpones.
+    const passPostponedReleases = () => {
+      for (const agent of this.releasesAfterResume.values()) {
+        step(() => {
+          for (const metadata of this.unreadFailedReplies(agent)) this.passFailedReplyToPrimary(agent.name, metadata);
+        });
+      }
+      const released = [...this.releasesAfterResume.keys()];
+      this.releasesAfterResume.clear();
+      if (released.length === 0) return;
+      step(() => {
+        this.readdDrained(released.flatMap((name) => this.drainDeferredFor(name)), 'stop: postponed releases');
+        this.ackDeferredWrites();
+      });
+    };
+    passPostponedReleases();
+
     // Stop typing indicators, and forget the registry's channels
     step(() => this.channelRegistry?.stopAll());
 
@@ -3970,6 +4039,12 @@ export class AgentFramework {
       }
     }
 
+    // A release postponed since the pass above, by an end the waits since let
+    // settle (a run the sweep above ended, a stream that outlasted its wait),
+    // is passed on now. The registry has forgotten its channels, so these
+    // notices name a channel by its bare id.
+    passPostponedReleases();
+
     // No stream is left, unless its wait above ran out or its cancel threw:
     // from the start of stop() none registers and no agent turn starts
     // (providerAdmissionClosed, checked for every agent), and every stream
@@ -3995,10 +4070,12 @@ export class AgentFramework {
     // A quiesced host defers each entry again instead, into the persisted
     // queue, for boot recovery. Past the deferral, a write that throws stays
     // queued with what follows it for its target, and a memory-only queue
-    // still loses it at exit. An entry for a target no longer registered (a
-    // disposed fork) is left: dropped with a memory-only queue at exit, and
-    // from a persisted one, by the boot or resume flush that meets it, passed
-    // to the primary if it's a failed reply, and otherwise dropped, logged.
+    // still loses it at exit. An entry for a target no longer registered,
+    // such as one a release postponed after the pass above leaves, or one a
+    // quiesced boot restored for an agent gone before a crash, is left for
+    // the flush that meets it, which passes a failed reply on to the primary
+    // and drops anything else, logged (readdDrained): with a persisted queue,
+    // the boot or resume flush. A memory-only queue loses it at exit.
     //
     // A registered agent's stream that outlasted its wait, or whose cancel
     // threw, may still write, so that agent's entries stay queued, said once
@@ -4008,19 +4085,6 @@ export class AgentFramework {
     // lives on, its own turn-end flush takes them, as at any turn's end, and a
     // later stop() takes what that leaves. Until then a persisted queue keeps
     // them for boot, and a memory-only one loses them at exit.
-    // A window release the quiesce postponed (releasesAfterResume) never runs
-    // once the host stops, so its unread pass runs here: each failed reply
-    // stored unread in that window goes to the primary now, deferred while
-    // quiesced like any write, so it waits in the queue with the rest. What
-    // was queued for that agent stays queued, as a gone agent's. Each
-    // release's pass is a step of its own: one that throws fails the stop()
-    // and leaves the others, and the flush below, to run.
-    for (const agent of this.releasesAfterResume.values()) {
-      step(() => {
-        for (const metadata of this.unreadFailedReplies(agent)) this.passFailedReplyToPrimary(agent.name, metadata);
-      });
-    }
-    this.releasesAfterResume.clear();
     // Like a guard's storage work above and the final sync below, this flush
     // comes once everything else has stopped (teardownSucceeded): if it throws,
     // stop() fails with that, the final sync still runs, and an owned store
@@ -6523,28 +6587,15 @@ export class AgentFramework {
     flush.sort(bySeq);
     this.deferredMessages = keep;
     this.handOffDeferredWrites(flush);
-    // A target no longer registered (a fork or a run gone before a crash
-    // that left this write to boot recovery) has no window to land in. A
-    // failed reply it never read becomes the primary's by-name notice, under
-    // the entry's own id and place in the queue (queuedFailedReplyForPrimary),
-    // and is written with the rest; any other write is dropped, logged, by
-    // addMessage.
-    let passed = 0;
-    const batch = flush.flatMap((msg) => {
-      if (msg.forAgent === undefined || this.agents.has(msg.forAgent)) return [msg];
-      if ((msg.metadata as { kind?: unknown } | undefined)?.kind !== 'discord-send-failed') return [msg];
-      const forPrimary = this.queuedFailedReplyForPrimary(msg.forAgent, msg);
-      if (!forPrimary) return [];
-      passed++;
-      return [forPrimary];
-    });
-    const stored = this.readdDrained(batch, `host-mode ${label}`).length;
+    // A write for a target no longer registered, such as a fork or a run gone
+    // before a crash that left it to boot recovery, goes as readdDrained
+    // sends it: a failed reply to the primary, anything else dropped, logged.
+    const stored = this.readdDrained(flush, `host-mode ${label}`).length;
     // Ack = sync the chronicle FIRST, then rewrite the durable queue without
     // the batch. Never the other way round.
     this.ackDeferredWrites();
     console.error(
       `[host-mode] ${label}: flushed ${stored}/${flush.length} deferred context write(s)` +
-      (passed > 0 ? `, ${passed} failed repl${passed === 1 ? 'y' : 'ies'} of a released agent passed to the primary` : '') +
       (keep.length > 0 ? `, ${keep.length} kept for a still-alive turn` : ''),
     );
   }
@@ -8306,7 +8357,8 @@ export class AgentFramework {
         // comes between the entry and the primary's notice.
         // Exact-generation disposal owns these name-keyed entries. Remove them
         // before deregistration; the late driveStream finally will see the
-        // generation mismatch and leave any future owner untouched.
+        // generation mismatch and leave any future owner untouched. A fork's
+        // end does the same (disposeConversationAgent).
         this.activeStreams.delete(agent.name);
         this.pendingAssistantBlocks.delete(agent.name);
         this.turnRouting.delete(agent.name);
@@ -12394,11 +12446,24 @@ export class AgentFramework {
    * in flight for the channel, and only this spawn's settlement removes it,
    * so the entry it removes is its own. It's removed before anyone waiting
    * on it resumes, so a waiter that decides again doesn't find it.
+   *
+   * It binds only while the fork it created is still the agent registered
+   * under its name. stop() ends each live fork and unbinds the channels
+   * bound to them, so a fork it ends while this spawn waits for the creation
+   * to return has no binding yet, and binding it then would route the
+   * channel to a name that's gone. The spawn rejects instead, as a failed
+   * spawn does. Its fork's name stays used, so the router's counter for the
+   * channel first moves to the spawn's generation, which the store already
+   * holds, and the channel's next qualifying message spawns the next one.
    */
   private spawnConversationAgent(channelId: string, decision: { agentName: string; generation: number }): Promise<Agent> {
     const spawn = (async () => {
       this.storeConversationGeneration(channelId, decision.generation);
       const agent = await this.createConversationAgent(decision.agentName, channelId);
+      if (this.agents.get(decision.agentName) !== agent) {
+        this.conversationRouter!.hydrateGenerations({ [channelId]: decision.generation });
+        throw new Error(`conversation fork "${decision.agentName}" ended before its channel was bound`);
+      }
       this.conversationRouter!.bind(channelId, decision.agentName, decision.generation);
       return agent;
     })();
@@ -12453,15 +12518,39 @@ export class AgentFramework {
   }
 
   /**
-   * Remove a closed conversation fork from the framework: its closure turn
-   * has finished, so the home mapping has served its purpose and keeping the
-   * agent registered would just grow every agent scan and broadcast filter
-   * forever. The fork's context stays in Chronicle for investigation.
+   * Remove a conversation fork from the framework, once its closure turn has
+   * finished or when stop() ends it: the home mapping has served its purpose,
+   * and keeping the agent registered would just grow every agent scan and
+   * broadcast filter forever. Its window is released now, or, while the host
+   * is quiesced, at resume (releaseWindowNowOrAfterResume); when stop() ends
+   * it then, stop()'s pass for postponed releases passes on the failed
+   * replies it left unread instead. No binding names it
+   * by then: the idle sweep unbinds its channel as the closure begins,
+   * stop() unbinds it just before it ends the fork, and a spawn whose fork
+   * stop() has ended binds nothing (spawnConversationAgent). The fork's
+   * context stays in Chronicle for investigation.
    */
   private disposeConversationAgent(agentName: string): void {
     this.closingConversationAgents.delete(agentName);
     const channelId = this.conversationAgentHomes.get(agentName);
     const agent = this.agents.get(agentName);
+    // A fork stop() ends can still be running: its stream, its tool round.
+    // Its name is never used again, so its end takes the stream's
+    // activeStreams and pendingAssistantBlocks entries, as a run's end does
+    // (runEphemeralToCompletion), and settles a batch its guard still holds,
+    // withheld as `aborted`: the stream's own finally does neither once the
+    // fork has gone. A fork the idle sweep ends has no stream entries left,
+    // and a batch still pending there is one whose successor never ran,
+    // which a run's end settles too.
+    if (agent?.toolResultGuard.hasPending) {
+      try {
+        agent.toolResultGuard.abandon('aborted');
+      } catch (error) {
+        console.error(`[tool-result-guard] agent=${agentName} failed to record a batch the fork left:`, error);
+      }
+    }
+    this.activeStreams.delete(agentName);
+    this.pendingAssistantBlocks.delete(agentName);
     this.agents.delete(agentName);
     if (agent) this.releaseWindowNowOrAfterResume(agent);
     this.turnRouting.delete(agentName);
@@ -21264,8 +21353,10 @@ export class AgentFramework {
     if (this.deferredMessages.length === 0) return [];
     // A fork or run deregistered while the host is quiesced leaves its queue
     // to its window's release at resume (runReleasesAfterResume, which clears
-    // the name first): drained by any other flush, its entries would meet no
-    // registered agent, be dropped, and be acked.
+    // the name first), which stores its writes in that window, or to stop()'s
+    // pass for postponed releases, which clears the name and sends them as
+    // boot would. Drained by any other flush meanwhile, they would meet no
+    // registered agent and be dropped, or written into a window no one reads.
     if (this.releasesAfterResume.has(agentName)) return [];
     const mine: typeof this.deferredMessages = [];
     const rest: typeof this.deferredMessages = [];
@@ -21560,8 +21651,26 @@ export class AgentFramework {
    *  write that threw after storing missed the notes addMessage takes after a
    *  store, so they're taken for what landed as soon as it's found, before
    *  the writes after it: an open turn's arrivals keep the order the writes
-   *  landed in, and its newest stays the newest (remainingArrival). */
-  private readdDrained(entries: DeferredWrite[], where: string, opts?: { bypassDeferral?: boolean }): DeferredWrite[] {
+   *  landed in, and its newest stays the newest (remainingArrival).
+   *
+   *  A target no longer registered (a fork or a run that has ended, here or
+   *  before a crash) has no window to land in: a failed reply it never read
+   *  becomes the primary's by-name notice, under the entry's own id and
+   *  place in the queue (queuedFailedReplyForPrimary), and is written with
+   *  the rest; any other write is dropped, logged, by addMessage. */
+  private readdDrained(drained: DeferredWrite[], where: string, opts?: { bypassDeferral?: boolean }): DeferredWrite[] {
+    let passed = 0;
+    const entries = drained.flatMap((msg) => {
+      if (msg.forAgent === undefined || this.agents.has(msg.forAgent)) return [msg];
+      if ((msg.metadata as { kind?: unknown } | undefined)?.kind !== 'discord-send-failed') return [msg];
+      const forPrimary = this.queuedFailedReplyForPrimary(msg.forAgent, msg);
+      if (!forPrimary) return [];
+      passed++;
+      return [forPrimary];
+    });
+    if (passed > 0) {
+      console.error(`[deferred-flush] ${where}: ${passed} failed repl${passed === 1 ? 'y' : 'ies'} of an agent that has ended passed to the primary`);
+    }
     const bypassFor = (msg: DeferredWrite): string | undefined =>
       opts?.bypassDeferral ? this.deliveryAgent(msg.forAgent)?.name : undefined;
     const written = this.writeDrainedInOrder(entries, where, (msg) =>
@@ -21610,19 +21719,22 @@ export class AgentFramework {
    * its window above its consumed watermark (flushed there at its turn's end,
    * or stored while it was idle) and not heard at a tool boundary, and each
    * one still queued for it. Writes still
-   * queued would wait for a boundary it never reaches, and the flush that
-   * finds it gone would drop them, so they land in its own window now, which
-   * Chronicle keeps for investigation. One whose earlier write may have
-   * landed (`landing` unknown) is looked up there by its id first: found,
-   * it's neither stored again nor passed to the primary; where the store
-   * can't be searched, it's stored anyway, with a line saying it may now be
-   * stored twice, or, where storing it fails too, that it may be stored
-   * once, twice or not at all. Its stream is over or cancelled, so it
-   * compiles nothing more. One path still stores after these writes: a
-   * `complete` that arrived while the agent still waited for tools awaits
-   * the spill of its last tool results, and stores them once that resolves,
-   * even if a watchdog has ended the run meanwhile. A tool boundary stores
-   * nothing for a round whose turn was stopped while its results were
+   * queued would wait for a boundary it never reaches, and a flush that
+   * finds it gone would drop all but its failed replies, so they land in its
+   * own window now, which Chronicle keeps for investigation. One whose
+   * earlier write may have landed (`landing` unknown) is looked up there by
+   * its id first: found, it's neither stored again nor passed to the
+   * primary; where the store can't be searched, it's stored anyway, with a
+   * line saying it may now be stored twice, or, where storing it fails too,
+   * that it may be stored once, twice or not at all. Its stream is over or
+   * cancelled, or, when stop() ends it, may still run past its cancel, and
+   * then drops each event that comes after the agent has left (driveStream);
+   * a turn of its still assembling or compiling, as when stop() ends it,
+   * drops before it sends anything. One path still stores after these
+   * writes: a `complete` that arrived while the agent still waited for tools
+   * awaits the spill of its last tool results, and stores them once that
+   * resolves, even if a watchdog has ended the run meanwhile. A tool boundary
+   * stores nothing for a round whose turn was stopped while its results were
    * prepared.
    */
   private releaseWindow(agent: Agent): void {
@@ -21799,13 +21911,21 @@ export class AgentFramework {
    * its own id and seq, now addressed to the primary. Written through the
    * drain, it lands stamped with that id, or waits in the queue under it, so
    * boot's exactly-once holds for it: a crash before the original's ack
-   * replays one entry, never the original and a separate notice. null when no
-   * one is told (logged): a reply that had no channel to reach, or no primary.
+   * replays one entry, never the original and a separate notice. An entry
+   * marked as one whose earlier write may have landed (`landing`) keeps the
+   * mark, so before it's written it's looked up by its id in the primary's
+   * window, where it would land now (writeDrainedInOrder). A release has
+   * looked in the speaker's own window first (releaseWindow). null when no
+   * one is told (logged): a reply that had no channel to reach, or no
+   * primary.
    */
   private queuedFailedReplyForPrimary(speaker: string, msg: DeferredWrite): DeferredWrite | null {
     const notice = this.failedReplyNoticeForPrimary(speaker, msg.metadata);
     if (!notice) return null;
-    return { id: msg.id, seq: msg.seq, participant: 'user', content: notice.content, metadata: notice.metadata, heldAt: msg.heldAt };
+    return {
+      id: msg.id, seq: msg.seq, participant: 'user', content: notice.content, metadata: notice.metadata, heldAt: msg.heldAt,
+      ...(msg.landing ? { landing: msg.landing } : {}),
+    };
   }
 
   /** The primary's by-name notice of `speaker`'s failed reply, or null when no
