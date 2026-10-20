@@ -289,6 +289,30 @@ describe('ToolCall.resultMaxChars', () => {
     }
   });
 
+  it("the puppet stores a code_execution return under the cap its call carried, though the script lowers the agent's cap", async () => {
+    const { framework, probe, done } = await makeFramework(new MockMembrane(), { enabled: true, memoryMaxBytes: 64 * 1024 * 1024 });
+    try {
+      // The script's own call lowers its agent's cap while the puppeted call runs.
+      const overrides = (framework as unknown as { toolResultInlineMaxCharsOverride: Map<string, number> }).toolResultInlineMaxCharsOverride;
+      const handle = probe.handleToolCall.bind(probe);
+      probe.handleToolCall = async (call) => {
+        if (call.name === 'look') overrides.set('prime', 1_000);
+        return handle(call);
+      };
+      const { toolUseId } = await framework.puppetToolCall('prime', 'code_execution', {
+        code: 'await tools["probe--look"]({}); text("FIRST" + "a".repeat(20000)); text("b".repeat(20000) + "LAST"); return 1;',
+      });
+      const stored = storedResults(framework).get(toolUseId);
+      assert.ok(stored, 'the pair was stored');
+      assert.ok(probe.calls.some((call) => call.name === 'look'), "the script's call ran");
+      assert.ok(stored.length > 1_000, `${stored.length} characters: the return was cut under the cap its call carried, not the lowered 1,000`);
+      assert.doesNotMatch(stored, /\[truncated/, 'the store had nothing to cut');
+      assert.match(stored, /LAST\n?$/);
+    } finally {
+      await done();
+    }
+  });
+
   it("an in-process call's own resultMaxChars holds its code_execution return", async () => {
     const { framework, done } = await makeFramework(new MockMembrane(), { enabled: true, memoryMaxBytes: 64 * 1024 * 1024 });
     try {

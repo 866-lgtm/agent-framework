@@ -19045,8 +19045,9 @@ export class AgentFramework {
 
   /**
    * Admin puppet: execute ONE tool call AS an agent and persist the
-   * tool_use + tool_result pair in that agent's window exactly as a
-   * model-initiated call is stored.
+   * tool_use + tool_result pair in that agent's window as a
+   * model-initiated call is stored, but under the inline cap its call
+   * carried, whereas a model's call takes the cap at the store.
    *
    * Born from the princess exemplar surgery (2026-08-23). Her folded
    * narrative said "I have no tools"; every past tool_use/tool_result pair
@@ -19143,7 +19144,8 @@ export class AgentFramework {
     let ownedToEnd = false;
     try {
       const started = Date.now();
-      // The pair is stored under the agent's inline cap, as a model's call is.
+      // The pair is stored under the cap its call carried, the agent's inline cap at the call: a call
+      // that changes the cap, as a script may, is stored as it was shaped.
       const call = { id: toolUseId, name: toolName, input, callerAgentName: agentName, resultMaxChars: this.resolveToolResultInlineCap(agent).cap };
       const returned = await this.executeToolCall(call);
       const durationMs = Date.now() - started;
@@ -19163,7 +19165,7 @@ export class AgentFramework {
       const { blocks } = await this.buildStoredToolResultContent(
         agentName,
         [{ id: toolUseId, name: toolName, input, result, durationMs }],
-        this.resolveToolResultInlineCap(agent).cap,
+        call.resultMaxChars,
       );
       const toolUse: ContentBlock[] = [
         { type: 'tool_use', id: toolUseId, name: toolName, input } as ContentBlock,
