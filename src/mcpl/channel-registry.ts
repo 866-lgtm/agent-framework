@@ -2745,15 +2745,15 @@ export class ChannelRegistry {
    * open so its traffic reaches the subconscious (TuneOutParams). The
    * tune-out is recorded first (enterTuneOut), and this writes no decision,
    * so the tune-out stands whatever becomes of the open. Lifecycle work
-   * already queued for the channel goes first, since each operation reads
-   * the decision when it runs and so opens a channel tuned out meanwhile;
-   * its own failure, such as a close the server refused, isn't this open's.
-   * Then the state is read. Where this host directs the lifecycle and the
-   * transport isn't confirmed open, the channel's lifecycle queue opens it
-   * once (applyDesiredChannelState reads a tune-out as open), and the answer
-   * waits for the work queued while that open was out too, such as a
-   * registration that came back, and comes from the state that work leaves.
-   * Returns nothing where the transport is open, or, for
+   * queued for the channel goes first, until none is left, since each
+   * operation reads the decision when it runs and so opens a channel tuned
+   * out meanwhile; its own failure, such as a close the server refused,
+   * isn't this open's. Then the state is read. Where this host directs the
+   * lifecycle and the transport isn't confirmed open, the channel's
+   * lifecycle queue opens it once (applyDesiredChannelState reads a
+   * tune-out as open), and the answer waits for the work queued after it
+   * too, such as a registration that came back, and comes from the state
+   * that work leaves. Returns nothing where the transport is open, or, for
    * tune_out's answer, why the channel's messages don't or may not reach the
    * subconscious yet and when they will, or that the tune-out isn't in
    * effect any more.
@@ -2776,16 +2776,24 @@ export class ChannelRegistry {
     );
     const nextRegistration = `when the "${serverId}" server next registers this channel, if this host may open and ` +
       'close its channels then';
-    // Work queued for the channel, as of a moment: the tail chains on all of
-    // it. Its failure is its own, so it isn't the answer.
+    // The work queued for the channel, waited for until none is left, as a
+    // delivery's wait does (waitForOpenChannel): work queued while earlier
+    // work ran, such as a registration that came back, goes first too.
+    // Returns the last work's failure, if it failed.
     const settle = async (): Promise<unknown> => {
-      const pending = this.channelLifecycleTails.get(lifecycleKey);
-      if (!pending) return undefined;
-      try {
-        await pending;
-        return undefined;
-      } catch (error) {
-        return error;
+      let failed: unknown;
+      for (;;) {
+        const pending = this.channelLifecycleTails.get(lifecycleKey);
+        if (!pending) return failed;
+        try {
+          await pending;
+          failed = undefined;
+        } catch (error) {
+          failed = error;
+        }
+        // A settled tail releases its own key: one still current after it
+        // settled would be awaited again without yielding, so stop.
+        if (this.channelLifecycleTails.get(lifecycleKey) === pending) return failed;
       }
     };
     // What the state answers now, or null where this host is to open the
@@ -2832,9 +2840,9 @@ export class ChannelRegistry {
     }
     // A registration that came back while the open was out queued its own
     // reconcile, which the answer waits for too. The answer says why the
-    // channel isn't open now, so where that work failed, its failure, the
-    // last attempt's, is the reason: this open's may concern a registration
-    // that work replaced.
+    // channel isn't open now, so where the last work failed, its failure,
+    // the last attempt's, is the reason: this open's may concern a
+    // registration that work replaced.
     const later = await settle();
     failure = later ?? failure;
     const clause = failure !== undefined ? `: ${lifecycleClause(failure)}` : '';

@@ -383,6 +383,33 @@ test('a tune-out whose channel\'s registration goes while the open is out says s
   }
 });
 
+test('a tune-out waits for a registration that came back while the work before it ran, and sends no open of its own', async () => {
+  const f = await closedChannel();
+  await f.registry.handleChannelToolCall('channel_open', { channelId: 'y' });
+  f.server.sent.length = 0;
+  let refuse!: () => void;
+  f.server.sendChannelsClose = async ({ channelId }) => {
+    f.server.sent.push(`close ${channelId}`);
+    await new Promise<void>((resolve) => { refuse = resolve; });
+    throw new McplRequestError('The "a" server refused the request.', 'error-response');
+  };
+  const closing = f.registry.handleChannelToolCall('channel_close', { channelId: 'y' }).catch(() => undefined);
+  for (let i = 0; i < 20 && !refuse; i++) await tick();
+  f.registry.enterTuneOut('a', 'y', PARAMS, 'agent-tool');
+  const opening = f.registry.openForTuneOut('a', 'y');
+  // The registration comes back while the close is out, and queues its
+  // reconcile, an open, behind it.
+  f.registry.removeServer('a');
+  const registering = f.registry.handleRegister('a', { channels: [descriptor('y')] }).catch(() => undefined);
+  for (let i = 0; i < 20 && f.registry.listChannelsRaw().length === 0; i++) await tick();
+  refuse();
+  assert.equal(await opening, undefined);
+  await registering;
+  await closing;
+  assert.deepEqual(f.server.sent, ['close y', 'open y'], 'one open, the registration\'s');
+  assert.equal(f.isOpen(), true);
+});
+
 test('a tune-out whose registration came back while its open was out names the failure that keeps the new one closed', async () => {
   const f = await closedChannel();
   let fail!: () => void;
