@@ -2350,10 +2350,11 @@ test("a direct mount's read shows a file's text as a 'chronicle' mount's does: l
   assert.match(page('bad.txt', 24000).note, /isn't valid UTF-8/);
   assert.equal(page('mixed.txt', 24000).content, '     1\ta\n     2\tb\n     3\tc\r\r\n     4\td');
   assert.equal(page('long.txt', 24000).content, `     1\t${'x'.repeat(2000)} [… read the rest with offsetChars=2000 and limitChars=58000]\n     2\ty`);
-  // Every page a call with a result limit asked for fits it.
+  // Every page a call with a result limit asked for is a page, and fits it.
   for (const [input, cap, d] of fromDisk) {
-    const length = JSON.stringify(d).length;
-    if (cap !== undefined) assert.ok(length <= cap, `${String(input.path)}${'offsetChars' in input ? ' in characters' : ''} at ${cap}: ${length}`);
+    const label = `${String(input.path)}${'offsetChars' in input ? ' in characters' : ''} at ${cap}`;
+    assert.equal(typeof d.content, 'string', `${label}: ${JSON.stringify(d).slice(0, 200)}`);
+    if (cap !== undefined) assert.ok(JSON.stringify(d).length <= cap, `${label}: ${JSON.stringify(d).length}`);
   }
   assert.ok(page('big.txt', 24000).toLine < 3000);
   assert.equal(page('long.txt', undefined).content.length, '     1\t'.length + 60000 + '\n     2\ty'.length);
@@ -2409,6 +2410,24 @@ test("a direct mount's grep matches lines as read shows them, as a 'chronicle' m
   const fromStore = await answers(await env.openChronicle());
   assert.deepEqual(fromStore.map(([input, results]) => [input, results]), fromDisk.map(([input, results]) => [input, results]));
   assert.deepEqual(fromStore.slice(1).map(([, , note]) => note), notes(`${cr}.`, `${bom} the workspace's copy has.`));
+});
+
+test("on a host with a direct mount, grep's notes name disk's file too where the search was of a 'chronicle' mount beside it", async (t) => {
+  const env = new Env(t);
+  const work = join(env.root, 'work');
+  mkdirSync(work);
+  writeFileSync(join(work, 'crlf.txt'), 'alpha\r\nomega\r\n');
+  writeFileSync(join(work, 'bom.txt'), Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('foo\n')]));
+  // The tools' descriptions mention direct mounts on this host, and so do
+  // the notes, whichever of its mounts a grep searched.
+  const m = await env.open({}, [{ name: 'work', path: work, mode: 'read-write', watch: 'never' }]);
+  const onDisk = ", or in disk's file on a direct mount.";
+  const cr = await data<{ results: unknown[]; note?: string }>(m, 'grep', { pattern: '\\r$', path: 'work/crlf.txt' });
+  assert.deepEqual(cr.results, []);
+  assert.ok(cr.note?.endsWith(`read with offsetChars shows every CR in the workspace's copy${onDisk}`), cr.note);
+  const bom = await data<{ results: unknown[]; note?: string }>(m, 'grep', { pattern: '^\\uFEFF', path: 'work/bom.txt' });
+  assert.deepEqual(bom.results, []);
+  assert.ok(bom.note?.endsWith(`read with offsetChars shows any BOM in the workspace's copy${onDisk}`), bom.note);
 });
 
 test('inOrder hands each result on in order, at most `width` at once', async () => {
