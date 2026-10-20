@@ -725,7 +725,11 @@ const DEFERRED_WRITES_PERSIST_CAP_CHARS = 4 * 1024 * 1024;
  *  with no stream). */
 /** One entry of the deferred-write queue (see AgentFramework.deferredMessages). */
 interface DeferredWrite {
+  /** Durable identity, stamped on the stored message as its
+   *  deferredWriteId: a flush interrupted by a crash replays its batch at
+   *  the next boot, which skips each entry that already landed by it. */
   id: string;
+  /** Order stamp (see deferredSeq). */
   seq: number;
   participant: string;
   content: ContentBlock[];
@@ -736,6 +740,13 @@ interface DeferredWrite {
   /** When the framework first held the write, in ms since the epoch: a
    *  module reads it as the held row's timestamp (heldRows). */
   heldAt: number;
+  /** Set when a write of this entry threw and its store couldn't be read
+   *  to tell whether it landed (writeDrainedInOrder): before it's
+   *  written again, the store is searched for its id, and a path that reads
+   *  or changes held writes settles it first (settleUnknownLandings).
+   *  Persisted with the entry, so after a restart it's still looked up
+   *  first. */
+  landing?: 'unknown';
 }
 const bySeq = (a: { seq: number }, b: { seq: number }): number => a.seq - b.seq;
 
@@ -781,6 +792,12 @@ function asCompiled(landed: ReadonlyArray<{ content: ContentBlock[] }>): Content
   const text = blocks.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('');
   return [...blocks.filter((b) => b.type !== 'text'), { type: 'text', text } as ContentBlock];
 }
+/** One stored copy of a deferred write, as the drain reads it back: a
+ *  sharded body's copies carry its `bodyGroupId`. */
+type StoredCopy = { id: MessageId; content: ContentBlock[]; bodyGroupId?: string };
+const storedCopy = (m: { id: MessageId; content: ContentBlock[]; bodyGroupId?: string }): StoredCopy =>
+  ({ id: m.id, content: m.content, ...(m.bodyGroupId !== undefined ? { bodyGroupId: m.bodyGroupId } : {}) });
+
 /** Stamp a deferred write's durable id into the metadata it is stored with
  *  (boot recovery dedups replays by it). Idempotent for an already-stamped
  *  message. */
@@ -2493,22 +2510,7 @@ export class AgentFramework {
    * could occupy and dedups against all of it — never a fixed tail.
    */
   private deferredScanFrom = new Map<string, number>();
-  private deferredMessages: Array<{
-    /** Durable identity, stamped on the stored message as its
-     *  deferredWriteId: a flush interrupted by a crash replays its batch at
-     *  the next boot, which skips each entry that already landed by it. */
-    id: string;
-    /** Order stamp (see deferredSeq). */
-    seq: number;
-    participant: string;
-    content: ContentBlock[];
-    metadata?: MessageMetadata;
-    /** Delivery target (registry name). Absent = the primary agent —
-     *  the historical behavior of every existing caller. */
-    forAgent?: string;
-    /** When the framework first held the write (DeferredWrite.heldAt). */
-    heldAt: number;
-  }> = [];
+  private deferredMessages: DeferredWrite[] = [];
 
   // Turn-alive markers (2026-07-31 Mythos phantom-skip incident): agentName →
   // token of the turn currently in progress. Set at startAgentStream ENTRY —
@@ -3345,10 +3347,15 @@ export class AgentFramework {
               ? framework.agents.get(framework.primaryAgentName) : undefined;
             return primary ? primary.getContextManager().getAllMessages() : [];
           },
-          getDeferredMessages: () => framework.deferredMessages
-            .filter((m) => (m.forAgent ?? framework.primaryAgentName) === framework.primaryAgentName)
-            .sort(bySeq)
-            .map((m) => ({ participant: m.participant, content: m.content, metadata: m.metadata as Record<string, unknown> | undefined })),
+          getDeferredMessages: () => {
+            const forPrimary = (m: DeferredWrite): boolean => (m.forAgent ?? framework.primaryAgentName) === framework.primaryAgentName;
+            // Settled first, so a write that landed is in the stored rows
+            // alone (settleUnknownLandings).
+            framework.settleUnknownLandings(forPrimary);
+            return framework.deferredMessages.filter(forPrimary)
+              .sort(bySeq)
+              .map((m) => ({ participant: m.participant, content: m.content, metadata: m.metadata as Record<string, unknown> | undefined }));
+          },
           // Every reader of the shared slot compiles the dump with its own
           // strategy, so the dump fits the smallest of their bounds.
           residentMessageChars: () => {
@@ -11414,7 +11421,11 @@ export class AgentFramework {
           // them in the live conversation — same participant, same content
           // blocks, same metadata, and compile() emits recent messages
           // verbatim, so the next turn's compiled prefix byte-matches the
-          // live request (prompt-cache safe).
+          // live request (prompt-cache safe). A write that threw after it was
+          // stored, whose landing couldn't be read, is the exception: it's
+          // carried at the flush that finds it, after what was stored since,
+          // so there the store and the live request differ
+          // (writeDrainedInOrder).
           //
           // The queue is drained ONLY at the target agent's own boundary:
           // draining at another agent's boundary would store the messages
@@ -13319,10 +13330,13 @@ export class AgentFramework {
 
   /** Unread (the coalescer's isUnread) by the consumed watermark, or, by the
    *  shown watermark, never possibly shown (its isUnshown). A placement still
-   *  in the deferred queue is both. */
+   *  in the deferred queue is both, once settled (settleUnknownLandings): one
+   *  whose write may already be stored, its store unsearchable, is a doubt,
+   *  which counts as read and as shown. */
   private isUnreadPlacement(p: CoalescingPlacement, by: 'consumed' | 'shown' = 'consumed'): boolean {
+    if (p.deferredId) this.settleUnknownLandings((m) => m.id === p.deferredId);
     this.resolvePlacement(p);
-    if (p.deferredId) return this.deferredMessages.some((m) => m.id === p.deferredId);
+    if (p.deferredId) return this.deferredMessages.some((m) => m.id === p.deferredId && m.landing !== 'unknown');
     if (!p.messageId) return false;
     const agent = this.agents.get(p.agent);
     return !!agent && this.isUnreadStoredMessage(agent, p.messageId, by);
@@ -13377,11 +13391,15 @@ export class AgentFramework {
   }
 
   private removePlacement(p: CoalescingPlacement): boolean {
+    // Settled first, so a write that landed is removed as the stored
+    // placement it is; one still a doubt, its store unsearchable, isn't
+    // removed, since it may already be stored.
+    if (p.deferredId) this.settleUnknownLandings((m) => m.id === p.deferredId);
     this.resolvePlacement(p);
     if (p.deferredId) {
-      const before = this.deferredMessages.length;
-      this.deferredMessages = this.deferredMessages.filter((m) => m.id !== p.deferredId);
-      if (this.deferredMessages.length === before) return false;
+      const held = this.deferredMessages.find((m) => m.id === p.deferredId);
+      if (!held || held.landing === 'unknown') return false;
+      this.deferredMessages = this.deferredMessages.filter((m) => m !== held);
       if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
       return true;
     }
@@ -14240,6 +14258,9 @@ export class AgentFramework {
   private noticeUnnoticedDrafts(agent: Agent): void {
     const cm = agent.getContextManager();
     const leftOut = new Set(this.openLogical.get(agent.name)?.drafts.map((d) => d.id));
+    // A queued notice still waiting names its drafts; one whose write landed
+    // is settled first, so its drafts are judged by its stored row.
+    this.settleUnknownLandings((m) => this.deliveryAgent(m.forAgent) === agent);
     for (const msg of this.deferredMessages) {
       const meta = msg.metadata as { draftOwner?: unknown; draftIds?: unknown } | undefined;
       if (meta?.draftOwner !== agent.name || !Array.isArray(meta.draftIds)) continue;
@@ -21279,9 +21300,12 @@ export class AgentFramework {
    * landed shards would be stored twice, and only the rest could not be
    * appended later without splitting the body.) Boot's scan for landed
    * writes counts a landed shard the same way. When the store can't be read
-   * back (storedCopiesOf logs it), nothing is found, and the entry is put
-   * back as one that couldn't be stored: if it had landed, a later flush
-   * stores it again.
+   * back (storedCopiesOf logs it), or couldn't say how many messages it held
+   * before the write, whether the entry landed is unknown: it's put back
+   * marked so (`landing`), and before it's written again the store is
+   * searched for its id (landedCopiesById). Found, it counts as written, as
+   * above, at the flush that finds it; not found, it's written; and while
+   * the store can't be searched, it stays queued, holding what's behind it.
    *
    * Returns what was written (stored, or deferred again by addMessage, whose
    * id is then empty), in queue order: for one target, a prefix of its
@@ -21309,28 +21333,58 @@ export class AgentFramework {
       const target = targetOf(msg);
       if (cut.has(target)) continue;
       const agent = this.deliveryAgent(msg.forAgent);
+      // An earlier write of this entry threw, and its store couldn't be read
+      // back to tell whether it landed. It's looked up by its id before it's
+      // written again: found, it counts as written, as when the readback
+      // works; not found, it's written; and while the store can't be
+      // searched, it stays queued, holding what's behind it. An entry whose
+      // agent isn't registered has no store to look in: it's written, and
+      // addMessage drops it, as it does an unmarked one.
+      if (msg.landing === 'unknown' && agent) {
+        const found = this.landedCopiesById(agent, msg.id);
+        if (found === undefined) {
+          cut.add(target);
+          this.requeueDrained(ordered.slice(i).filter((m) => targetOf(m) === target));
+          this.logDeferredWriteError(msg, where, undefined, 'still-unknown');
+          continue;
+        }
+        if (found.length > 0) {
+          written.set(msg, { id: found[0]!.id, content: asCompiled(found) });
+          this.logDeferredWriteError(msg, where, undefined, { count: found.length, sharded: found[0]!.bodyGroupId !== undefined, foundLater: true });
+          onLanded?.(msg, found[0]!.id);
+          continue;
+        }
+        delete msg.landing;
+      }
       const before = agent ? this.storedCountOf(agent) : undefined;
       try {
         const id = write(msg);
         // A body the store took as more than one message (a sharded body) is
         // returned as later compiles render it: its copies, joined
         // (asCompiled). The store is read for them only when it grew by more
-        // than one message.
+        // than one message. One that can't be read back is carried as given.
         const copies = agent && before !== undefined && (this.storedCountOf(agent) ?? before) - before > 1
-          ? this.storedCopiesOf(agent, before, msg.id)
+          ? this.storedCopiesOf(agent, before, msg.id) ?? []
           : [];
         written.set(msg, { id, content: copies.length > 1 ? asCompiled(copies) : msg.content });
       } catch (error) {
-        const landed = agent && before !== undefined ? this.storedCopiesOf(agent, before, msg.id) : [];
-        if (landed.length > 0) {
+        // What landed, read back from where the store stood before the
+        // write; undefined when the store couldn't say, before the write or
+        // after it. With no agent there's no store it could have landed in.
+        const landed = !agent ? [] : before === undefined ? undefined : this.storedCopiesOf(agent, before, msg.id);
+        if (landed && landed.length > 0) {
           written.set(msg, { id: landed[0]!.id, content: asCompiled(landed) });
           this.logDeferredWriteError(msg, where, error, { count: landed.length, sharded: landed[0]!.bodyGroupId !== undefined });
           onLanded?.(msg, landed[0]!.id);
           continue;
         }
+        // Requeued as unstored, a write that had landed would be stored a
+        // second time; so one whose landing is unknown is marked, and looked
+        // up by its id before it's written again (above).
+        if (landed === undefined) msg.landing = 'unknown';
         cut.add(target);
         this.requeueDrained(ordered.slice(i).filter((m) => targetOf(m) === target));
-        this.logDeferredWriteError(msg, where, error);
+        this.logDeferredWriteError(msg, where, error, landed === undefined ? 'unknown' : undefined);
       }
     }
     return written;
@@ -21349,29 +21403,47 @@ export class AgentFramework {
   /** The messages carrying `deferredWriteId` among those the agent's store
    *  gained from position `from` on, in store order, with their blobs
    *  resolved, as a request carries them. A sharded body's carry its
-   *  `bodyGroupId`. */
-  private storedCopiesOf(agent: Agent, from: number, deferredWriteId: string): Array<{ id: MessageId; content: ContentBlock[]; bodyGroupId?: string }> {
+   *  `bodyGroupId`. Undefined when the store can't be read back, which is
+   *  logged: not the same as nothing found. */
+  private storedCopiesOf(agent: Agent, from: number, deferredWriteId: string): StoredCopy[] | undefined {
     try {
       const cm = agent.getContextManager();
       return cm.getMessageWindow(from, Math.max(0, cm.getMessageCount() - from)).messages
         .filter((m) => m.metadata?.deferredWriteId === deferredWriteId)
-        .map((m) => ({ id: m.id, content: m.content, ...(m.bodyGroupId !== undefined ? { bodyGroupId: m.bodyGroupId } : {}) }));
+        .map(storedCopy);
     } catch (error) {
       console.error(`[deferral] could not read back what deferred write ${deferredWriteId} stored in ${agent.name}'s store:`, error);
-      return [];
+      return undefined;
+    }
+  }
+
+  /** The messages carrying `deferredWriteId` anywhere in the agent's store,
+   *  found by their id (queryMessages, as landedRow finds a held write's),
+   *  so no position is needed. Undefined when the store can't be searched,
+   *  which is logged. */
+  private landedCopiesById(agent: Agent, deferredWriteId: string): StoredCopy[] | undefined {
+    try {
+      return agent.getContextManager().queryMessages({ metadata: { deferredWriteId } }).messages.map(storedCopy);
+    } catch (error) {
+      console.error(`[deferral] could not search ${agent.name}'s store for deferred write ${deferredWriteId}:`, error);
+      return undefined;
     }
   }
 
   /** The line naming a drained write that threw: one that couldn't be stored,
-   *  which is already back in the queue, or, with `landed`, one stored before
-   *  the throw (for a sharded body, how many of its shards). Logging mustn't
-   *  fail the flush that met it, so a thrown value that has no text is named
-   *  as such. */
+   *  which is already back in the queue; with a count, one stored before the
+   *  throw (for a sharded body, how many of its shards), or, with
+   *  `foundLater`, one an earlier write of which landed and was found by its
+   *  id; with `'unknown'`, one whose store couldn't be read to tell
+   *  whether it landed, back in the queue to be looked up first; and with
+   *  `'still-unknown'`, one that still can't be looked up. Logging mustn't
+   *  fail the flush that met it, so a thrown value that has no text is
+   *  named as such. */
   private logDeferredWriteError(
     msg: DeferredWrite,
     where: string,
     error: unknown,
-    landed?: { count: number; sharded: boolean },
+    outcome?: { count: number; sharded: boolean; foundLater?: boolean } | 'unknown' | 'still-unknown',
   ): void {
     let reason: string;
     try {
@@ -21379,15 +21451,27 @@ export class AgentFramework {
     } catch {
       reason = 'a thrown value that has no text';
     }
+    const held = 'it stays queued, holding what is queued behind it for that agent';
+    const stored = (landed: { count: number; sharded: boolean }): string => landed.sharded
+      ? `${landed.count} shard${landed.count === 1 ? '' : 's'} of its body ${landed.count === 1 ? 'was' : 'were'} stored`
+      : 'it was stored';
+    let what: string;
+    if (outcome === 'unknown') {
+      what = `threw, and its store couldn't be read to tell whether it was stored; ${held}, and is looked up ` +
+        `by its id before it's written again: ${reason}`;
+    } else if (outcome === 'still-unknown') {
+      what = `still can't be looked up by its id, to tell whether an earlier write of it was stored; ${held}`;
+    } else if (outcome?.foundLater) {
+      what = `was found by its id: ${stored(outcome)} by an earlier write whose landing was unknown; what ` +
+        `was stored counts as written and isn't stored again`;
+    } else if (outcome) {
+      what = `threw after ${stored(outcome)}; what was stored counts as written and isn't stored again: ${reason}`;
+    } else {
+      what = `could not be stored; ${held}: ${reason}`;
+    }
     console.error(
       `[deferral] ${where}: deferred write ${describeDeferredWrite(msg)} for ` +
-      `${msg.forAgent ?? this.primaryAgentName ?? 'the primary'} ` +
-      (landed
-        ? `threw after ${landed.sharded
-          ? `${landed.count} shard${landed.count === 1 ? '' : 's'} of its body ${landed.count === 1 ? 'was' : 'were'} stored`
-          : 'it was stored'}; what was stored counts as written and isn't stored again: `
-        : `could not be stored; it stays queued, holding what is queued behind it for that agent: `) +
-      reason,
+      `${msg.forAgent ?? this.primaryAgentName ?? 'the primary'} ${what}`,
     );
   }
 
@@ -21478,7 +21562,12 @@ export class AgentFramework {
    * one still queued for it. Writes still
    * queued would wait for a boundary it never reaches, and the flush that
    * finds it gone would drop them, so they land in its own window now, which
-   * Chronicle keeps for investigation. Its stream is over or cancelled, so it
+   * Chronicle keeps for investigation. One whose earlier write may have
+   * landed (`landing` unknown) is looked up there by its id first: found,
+   * it's neither stored again nor passed to the primary; where the store
+   * can't be searched, it's stored anyway, with a line saying it may now be
+   * stored twice, or, where storing it fails too, that it may be stored
+   * once, twice or not at all. Its stream is over or cancelled, so it
    * compiles nothing more. One path still stores after these writes: a
    * `complete` that arrived while the agent still waited for tools awaits
    * the spill of its last tool results, and stores them once that resolves,
@@ -21493,12 +21582,37 @@ export class AgentFramework {
     const cm = agent.getContextManager();
     const forPrimary: DeferredWrite[] = [];
     for (const msg of queued) {
+      // An entry whose earlier write may have landed (landing unknown) is
+      // looked up by its id, as settleUnknownLandings looks one up
+      // elsewhere, but in the released agent's own store. Found, it landed:
+      // it's neither stored again nor passed on below, since the loop above
+      // has passed its stored copy if it's a failed reply the agent hadn't
+      // read, by its window as that loop reads it. When the store can't be
+      // searched, it's stored anyway where the store takes it, since no
+      // later flush will try again, and a copy its deferredWriteId tells
+      // apart costs less than a write lost without a trace.
+      const found = msg.landing === 'unknown' ? this.landedCopiesById(agent, msg.id) : [];
+      if (found && found.length > 0) {
+        this.logDeferredWriteError(msg, `release of ${agent.name}`, undefined,
+          { count: found.length, sharded: found[0]!.bodyGroupId !== undefined, foundLater: true });
+        continue;
+      }
       try {
         cm.addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id));
+        if (found === undefined) {
+          console.error(
+            `[deferral] release of ${agent.name}: deferred write ${describeDeferredWrite(msg)} was stored though its ` +
+            `store couldn't be searched for an earlier copy, so it may now be stored twice`,
+          );
+        }
       } catch (err) {
         console.error(
           `[deferred-flush] ${agent.name}: failed to store a queued write before release ` +
-          `(participant=${msg.participant}):`,
+          `(participant=${msg.participant})` +
+          (found === undefined
+            ? `; its store couldn't be searched for an earlier copy of deferred write ${describeDeferredWrite(msg)} either, ` +
+              `so it may be stored once, twice or not at all:`
+            : ':'),
           err,
         );
       }
@@ -21727,12 +21841,12 @@ export class AgentFramework {
    * (queuedFailedReplyForPrimary).
    */
   private heldWritesFor(reader: Agent): DeferredWrite[] {
-    return this.deferredMessages
-      .filter((m) => {
-        const target = this.deliveryAgent(m.forAgent);
-        return !!target && (target === reader || (this.isOrdinaryResident(reader) && this.isOrdinaryResident(target)));
-      })
-      .sort(bySeq);
+    const heldFor = (m: DeferredWrite): boolean => {
+      const target = this.deliveryAgent(m.forAgent);
+      return !!target && (target === reader || (this.isOrdinaryResident(reader) && this.isOrdinaryResident(target)));
+    };
+    this.settleUnknownLandings(heldFor);
+    return this.deferredMessages.filter(heldFor).sort(bySeq);
   }
 
   /**
@@ -21769,6 +21883,82 @@ export class AgentFramework {
     return cm.queryMessages({ metadata: { deferredWriteId: writeId } }).messages[0] ?? null;
   }
 
+  /**
+   * Settle held writes whose landing is unknown (DeferredWrite.landing),
+   * among those `which` picks, before a path reads or changes held writes:
+   * each is looked up by its id in its target's store (landedCopiesById).
+   * Found, the write landed (settleFound). Not found, the mark goes, and
+   * it's an ordinary held write, which is persisted as an edit is. Where the
+   * store can't be searched, it stays marked, a doubt each path reads by its
+   * own rule.
+   */
+  private settleUnknownLandings(which: (msg: DeferredWrite) => boolean): void {
+    let unmarked = false;
+    for (const msg of this.deferredMessages.filter((m) => m.landing === 'unknown' && which(m))) {
+      // No registered agent: no store it could have landed in. A flush
+      // writes it, and addMessage drops it.
+      const agent = this.deliveryAgent(msg.forAgent);
+      if (!agent) continue;
+      const found = this.landedCopiesById(agent, msg.id);
+      if (found === undefined) continue;
+      if (found.length > 0) {
+        this.settleFound(msg, agent, found[0]!.id, { count: found.length, sharded: found[0]!.bodyGroupId !== undefined });
+      } else {
+        delete msg.landing;
+        unmarked = true;
+      }
+    }
+    if (unmarked && (this.quiesced || this.deferredWritesPersisted)) this.persistDeferredWrites();
+  }
+
+  /**
+   * A marked held write found to have landed, as `stored`: it leaves the
+   * pending queue for the un-acked set, as a drained write does, so it stays
+   * in the durable queue until the next ack has synced the store that holds
+   * it, and it's a stored write from then on, so the paths for a landed
+   * write apply to it. It takes the notes a store takes (noteStored), which
+   * its first write missed when it threw, as a flush that finds such a write
+   * takes them (readdDrained), and is logged by its id. It isn't carried
+   * into a turn, as a flush that finds it carries it: the agent reads it at
+   * its next compile, where the store holds it.
+   */
+  private settleFound(msg: DeferredWrite, agent: Agent, stored: MessageId, landed: { count: number; sharded: boolean }): void {
+    this.deferredMessages = this.deferredMessages.filter((m) => m !== msg);
+    this.unackedDeferredWrites.push(msg);
+    this.noteStored(agent, msg.metadata, stored);
+    this.logDeferredWriteError(msg, `held writes for ${agent.name}`, undefined, { ...landed, foundLater: true });
+  }
+
+  /**
+   * A stored row a module names by its id: where it carries the
+   * deferredWriteId of a marked held write the reader's store holds, it's
+   * that write's copy, so the write landed, and it's settled as found
+   * (settleFound) before the row is read or changed. A lookup by the id
+   * can't be needed then, so this holds where the store can't be searched
+   * too.
+   */
+  private settleByCopy(reader: Agent, row: { id: MessageId; metadata?: unknown } | null): void {
+    const writeId = (row?.metadata as { deferredWriteId?: unknown } | undefined)?.deferredWriteId;
+    if (!row || typeof writeId !== 'string') return;
+    const msg = this.deferredMessages.find((m) => m.id === writeId && m.landing === 'unknown');
+    const target = msg ? this.deliveryAgent(msg.forAgent) : undefined;
+    if (!msg || !target || !(target === reader || (this.isOrdinaryResident(reader) && this.isOrdinaryResident(target)))) return;
+    this.settleFound(msg, target, row.id, { count: 1, sharded: false });
+  }
+
+  /** A held write whose landing stays unknown after settling, its store
+   *  unsearchable, can't be edited or removed: it may already be stored, and
+   *  changing only the queued entry could leave its stored copy as it was.
+   *  Throws with nothing changed. */
+  private refuseUnsettled(msg: DeferredWrite): void {
+    if (msg.landing !== 'unknown') return;
+    throw new Error(
+      `held write ${heldHandle(msg.id)} may already be stored, and its store can't be searched to tell, so ` +
+      `nothing was changed. It's refused the same way while the store can't be searched; the host log names ` +
+      `the store's error`,
+    );
+  }
+
   /** Whether the agent has nothing left to read of a deferred write, on
    *  evidence only: the row it landed as is at or below the agent's consumed
    *  watermark on its current branch, or it's in neither the queue (drained
@@ -21781,6 +21971,9 @@ export class AgentFramework {
    *  finds nothing new costs less than a write no wake brings the agent to
    *  read. */
   private deferredWriteReadOrGone(agent: Agent, writeId: string): boolean {
+    // Settled first, so a write that landed is judged by its stored row; one
+    // still a doubt stays queued, which reads as unread.
+    this.settleUnknownLandings((m) => m.id === writeId);
     if (this.deferredMessages.some((m) => m.id === writeId)) return false;
     try {
       const cm = agent.getContextManager();
@@ -21808,14 +22001,17 @@ export class AgentFramework {
     if (!agent) {
       throw new Error('No agents configured');
     }
+    // The held writes are settled first (heldWritesFor), and by a stored id
+    // the row it names too (settleByCopy): a held write that landed is a
+    // stored row from then on, and the edit reaches it as one.
     const writeId = heldWriteId(id);
-    if (writeId !== undefined) {
-      const held = this.heldWritesFor(agent).find((m) => m.id === writeId);
-      if (held) {
-        held.content = content;
-        if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
-        return;
-      }
+    const held = this.heldWritesFor(agent).find((m) => writeId !== undefined && m.id === writeId);
+    if (writeId === undefined) this.settleByCopy(agent, agent.getContextManager().getMessage(id));
+    if (held) {
+      this.refuseUnsettled(held);
+      held.content = content;
+      if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
+      return;
     }
     const landed = writeId !== undefined ? this.landedRow(agent.getContextManager(), writeId) : null;
     agent.getContextManager().editMessage(landed?.id ?? id, content);
@@ -21826,8 +22022,15 @@ export class AgentFramework {
     if (!agent) {
       throw new Error('No agents configured');
     }
+    // The held writes are settled first (heldWritesFor), and by a stored id
+    // the row it names too (settleByCopy), so a held write that landed is
+    // removed as the stored row it is, and isn't written again at the next
+    // flush.
     const writeId = heldWriteId(id);
-    if (writeId !== undefined && this.heldWritesFor(agent).some((m) => m.id === writeId)) {
+    const held = this.heldWritesFor(agent).find((m) => writeId !== undefined && m.id === writeId);
+    if (writeId === undefined) this.settleByCopy(agent, agent.getContextManager().getMessage(id));
+    if (held) {
+      this.refuseUnsettled(held);
       this.deferredMessages = this.deferredMessages.filter((m) => m.id !== writeId);
       if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
       return;
@@ -21842,8 +22045,12 @@ export class AgentFramework {
       return null;
     }
     const writeId = heldWriteId(id);
+    // By a handle, heldRows settles the held writes first; by a stored id,
+    // the row's own write is settled by it (settleByCopy).
+    const stored = writeId === undefined ? agent.getContextManager().getMessage(id) : null;
+    if (writeId === undefined) this.settleByCopy(agent, stored);
     const row = writeId === undefined
-      ? agent.getContextManager().getMessage(id)
+      ? stored
       : this.heldRows(agent).find((held) => held.id === id) ?? this.landedRow(agent.getContextManager(), writeId);
     return row ? asModuleRow(row) : null;
   }
