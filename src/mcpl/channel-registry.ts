@@ -2053,10 +2053,13 @@ export class ChannelRegistry {
 
   /** Whether `channelId`'s transport is open: on `serverId` where the caller
    *  knows the channel's server, and otherwise on the first server found to
-   *  register that id (findChannelEntry). */
+   *  register that id (findChannelEntry). The map's key joins the two ids
+   *  with a colon, so another server's entry can sit under a key: it has to
+   *  be this server's (as in streamingServerAt). */
   isChannelOpen(channelId: string, serverId?: string): boolean {
-    const entry = serverId ? this.channels.get(`${serverId}:${channelId}`) : this.findChannelEntry(channelId);
-    return entry?.open === true;
+    if (serverId === undefined) return this.findChannelEntry(channelId)?.open === true;
+    const entry = this.channels.get(`${serverId}:${channelId}`);
+    return entry?.serverId === serverId && entry.open === true;
   }
 
   getDesiredState(serverId: string, channelId: string): DesiredChannelState | undefined {

@@ -657,6 +657,17 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(forkCm.mock.callCount(), 1);
     });
 
+    it("keeps the server the registry names for an open a delivery forced, as the framework's callback writes the notice's inputs", async () => {
+      const fork = await spawnFork();
+      const registry = internals(framework).channelRegistry as unknown as {
+        onChannelAutoOpened(info: { conversationId?: string; serverId: string; source: string; channels: Array<{ channelId: string; label?: string }> }): void;
+      };
+      registry.onChannelAutoOpened({ conversationId: fork.name, serverId: 'other-server', source: 'opened-by-delivery', channels: [{ channelId: 'missing-channel', label: '#home' }] });
+      const notice = fork.getContextManager().getAllMessages()
+        .find((m) => (m.metadata as { kind?: unknown } | undefined)?.kind === 'channel-notice');
+      assert.equal((notice?.metadata as { passOn?: { serverId?: unknown } } | undefined)?.passOn?.serverId, 'other-server');
+    });
+
     it("tells a fork whose send opened a channel away from its home that it opened, without channel_close, which it can't call there, and tells the primary by name, which can", async (t) => {
       const fork = await spawnFork();
       const state = internals(framework);
@@ -731,6 +742,8 @@ describe('notices about an agent\'s own action', () => {
     it("passes on no channel notice its reader couldn't act on: the primary was told then, once", async () => {
       const fork = await spawnFork();
       const state = internals(framework);
+      // Decided open, so only the notice's missing inputs keep it back.
+      decide('c-1', 'open');
       state.recordChannelAutoOpenNotice(fork.name, 'srv', [{ channelId: 'c-1', label: '#one' }], 'opened-by-reply');
 
       reap(fork.name);
@@ -874,7 +887,7 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(state.deferredMessages.length, 0);
     });
 
-    it('passes on, of a restored channel notice, only what still holds: the channels still open, and a failed one still waiting to open', async (t) => {
+    it('passes on, of a restored channel notice, only what still holds: the channels still decided open or tuned out, and a failed one still decided open and not open', async (t) => {
       const state = internals(framework);
       const errors: string[] = [];
       t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
@@ -901,8 +914,8 @@ describe('notices about an agent\'s own action', () => {
       // server's decision.
       decide('c-14', 'open');
       decide('c-14', 'closed', 'agent-tool', framework, 'other');
-      // Selected for opening, and tuned out since, not open yet: a tune-out
-      // keeps it selected for opening.
+      // Selected for opening, and tuned out since: a newer decision, by the
+      // agent that tuned it out, so its failed notice is left out.
       decide('c-15', 'open', 'server-bootstrap');
       state.channelRegistry.enterTuneOut('srv', 'c-15',
         { epochId: 'e-15', cadenceSeconds: 60, backlogCap: 10, maxWakes: 3, startedAtSequence: 0 }, 'agent-tool');
@@ -939,16 +952,15 @@ describe('notices about an agent\'s own action', () => {
           "If you don't want it, use channel_close; your choice outranks policy.",
         '[channels] Now open: #fourteen (c-14): a message from conversation-gone into the closed channel opened it; conversation-gone has ended. ' +
           "If you don't want it, use channel_close; your choice outranks policy.",
-        "[channels] Not open: #fifteen (c-15). A reply from conversation-gone went out there, but opening the channel failed; conversation-gone has ended. " +
-          "It's selected for opening again, because its server lists it as open by default: the host tries again, and channel_close withdraws that.",
         "[channels] Not open: #twenty-two (c-22). A reply from conversation-gone went out there, but opening the channel failed; conversation-gone has ended. " +
           "It's selected for opening again, because its server lists it as open by default: the host tries again, and channel_close withdraws that.",
       ]);
-      assert.deepEqual(told.map((m) => (m.metadata as { deferredWriteId?: unknown }).deferredWriteId), ['w-7', 'w-13', 'w-14', 'w-15', 'w-22']);
+      assert.deepEqual(told.map((m) => (m.metadata as { deferredWriteId?: unknown }).deferredWriteId), ['w-7', 'w-13', 'w-14', 'w-22']);
       for (const line of [
         '[channel] conversation-gone has ended, and no channel its notice said opened is decided open or tuned out now (#eight (c-8)): no one is told',
-        '[channel] conversation-gone has ended, and #nine (c-9), which its notice said was not open and selected for opening, is open now or no longer selected: no one is told',
-        '[channel] conversation-gone has ended, and #ten (c-10), which its notice said was not open and selected for opening, is open now or no longer selected: no one is told',
+        '[channel] conversation-gone has ended, and #nine (c-9), which its notice said was not open and selected for opening, is open now or no longer decided open: no one is told',
+        '[channel] conversation-gone has ended, and #ten (c-10), which its notice said was not open and selected for opening, is open now or no longer decided open: no one is told',
+        '[channel] conversation-gone has ended, and #fifteen (c-15), which its notice said was not open and selected for opening, is open now or no longer decided open: no one is told',
         '[channel] conversation-gone has ended, and no channel its notice said opened is decided open or tuned out now (#fourteen (c-14)): no one is told',
       ]) assert.ok(errors.includes(line), line);
       assert.equal(state.deferredMessages.length, 0);
@@ -1019,7 +1031,7 @@ describe('notices about an agent\'s own action', () => {
       assert.match(texts[3]!, /^\[channels\] Now open: #twenty \(c-20\): a message from conversation-gone/);
       for (const line of [
         '[channel] conversation-gone has ended, and no channel its notice said opened is decided open or tuned out now (#twelve (c-12)): no one is told',
-        '[channel] conversation-gone has ended, and #eighteen (c-18), which its notice said was not open and selected for opening, is open now or no longer selected: no one is told',
+        '[channel] conversation-gone has ended, and #eighteen (c-18), which its notice said was not open and selected for opening, is open now or no longer decided open: no one is told',
         '[channel] conversation-gone has ended, and no channel its notice said opened is decided open or tuned out now (#twenty (c-20)): no one is told',
       ]) assert.ok(errors.includes(line), line);
     });

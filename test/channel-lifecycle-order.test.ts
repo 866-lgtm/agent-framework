@@ -2260,12 +2260,15 @@ test("channel_open and channel_close on a channel already so say what failed whe
 async function replyOpenFailedNotices(opts: {
   opening: boolean; directs: boolean; agentName?: string; live?: string[]; homes?: Array<[string, string]>; denied?: string[];
   selectedForOpening?: 'unrecorded' | 'server-bootstrap' | 'subscription-policy'; primary?: string; dropsDuring?: true;
+  opened?: true;
 }) {
   const agentName = opts.agentName ?? 'agent';
   const told: Array<{ text: string; metadata: unknown; forAgent?: string }> = [];
   const logged: string[] = [];
+  // The server's id isn't its tool prefix, so the notice's inputs can't take
+  // one for the other.
   const server = {
-    id: 'srv',
+    id: 'chat-server',
     isConnected: true,
     async sendToolsList() { return { tools: [{ name: 'send_message', inputSchema: { type: 'object' } }] }; },
     async sendToolsCall() { return { content: [{ type: 'text', text: 'sent' }] }; },
@@ -2273,8 +2276,8 @@ async function replyOpenFailedNotices(opts: {
   const framework = Object.create(AgentFramework.prototype) as any;
   framework.mcplTools = [];
   framework.mcplToolFeatureSets = new Map();
-  framework.mcplServerConfigs = new Map([['srv', { id: 'srv', toolPrefix: 'srv' }]]);
-  framework.mcplServerRegistry = { getAllServers: () => [server], getServer: (id: string) => (id === 'srv' ? server : null) };
+  framework.mcplServerConfigs = new Map([['chat-server', { id: 'chat-server', toolPrefix: 'srv' }]]);
+  framework.mcplServerRegistry = { getAllServers: () => [server], getServer: (id: string) => (id === 'chat-server' ? server : null) };
   framework.checkpointManager = null;
   framework.turnRouting = new Map();
   framework.agents = new Map((opts.live ?? [agentName]).map((name) => [name, { canUseTool: (tool: string) => !(opts.denied ?? []).includes(tool) }]));
@@ -2292,11 +2295,13 @@ async function replyOpenFailedNotices(opts: {
   framework.channelRegistry = {
     openIfClosedForSend: async () => {
       opened = true;
+      if (opts.opened) return { status: 'opened', channelId: 'x', label: '#x' };
       return { status: 'open-failed', channelId: 'x', label: '#x', opening: opts.opening,
         ...(opts.selectedForOpening ? { selectedForOpening: opts.selectedForOpening } : {}) };
     },
     directsLifecycle: () => opts.directs && !(opts.dropsDuring && opened),
   };
+  const handled = (l: string) => l.includes('open-on-send failed') || l.includes('opened (send implies engagement)');
   const error = console.error;
   console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
   try {
@@ -2305,15 +2310,15 @@ async function replyOpenFailedNotices(opts: {
       framework.pushEvent = (event: { type: string; result: { success?: boolean; error?: string } }) => {
         if (event.type === 'tool-result') resolve(event.result);
       };
-      framework.dispatchMcplToolCall(agentName, { id: 'c1', name: 'srv--send_message', input: { channelId: 'x' } }, 'srv', 'srv');
+      framework.dispatchMcplToolCall(agentName, { id: 'c1', name: 'srv--send_message', input: { channelId: 'x' } }, 'chat-server', 'srv');
     });
     assert.equal(sent.success, true, `the send went out: ${sent.error ?? ''}`);
     // The open's answer is handled once its console line is written.
-    for (let i = 0; i < 50 && !logged.some((l) => l.includes('open-on-send failed')); i++) await tick();
+    for (let i = 0; i < 50 && !logged.some(handled); i++) await tick();
   } finally {
     console.error = error;
   }
-  assert.ok(logged.some((l) => l.includes('open-on-send failed')), 'the failed open was handled');
+  assert.ok(logged.some(handled), 'the open was handled');
   return { told, logged };
 }
 
@@ -2353,6 +2358,13 @@ test("the reply notice names channel_open and channel_close only where the agent
   const forkHome = await replyOpenFailedNotices({ opening: true, directs: true, homes: [['agent', 'x']], selectedForOpening: 'unrecorded' });
   assert.deepEqual(forkHome.told.map((t) => t.text), [facts + stays + ', and channel_close withdraws that.'],
     'a fork may close its home channel, though not open it');
+  assert.equal((forkHome.told[0]!.metadata as { passOn?: { serverId?: unknown } }).passOn?.serverId, 'chat-server',
+    "its inputs name the send's server, not its tool prefix");
+  // A send that opens its channel tells the agent, and its inputs name the
+  // send's server too.
+  const sendOpened = await replyOpenFailedNotices({ opening: true, directs: true, homes: [['agent', 'x']], opened: true });
+  assert.match(sendOpened.told[0]?.text ?? '', /^\[channels\] Now open: #x \(x\): your own message into the closed channel opened it\./);
+  assert.equal((sendOpened.told[0]!.metadata as { passOn?: { serverId?: unknown } }).passOn?.serverId, 'chat-server');
   const forkElsewhere = await replyOpenFailedNotices({ opening: true, directs: true, homes: [['agent', 'y']], selectedForOpening: 'unrecorded' });
   assert.deepEqual(forkElsewhere.told.map((t) => t.text), [facts + stays + '.'],
     "a fork's channel_close is refused for a channel that isn't its home");

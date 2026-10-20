@@ -21892,12 +21892,16 @@ export class AgentFramework {
    * They speak of the open or the failure as it was, as the notice did, and
    * only of what still holds by each channel's durable decision on its own
    * server: the registry's (getDesiredState), or before there is one, as at
-   * a serving boot's flush, the lifecycle log's (desiredStateInLog). That's
-   * the decision, not the transport at that moment: it's what channel_close
+   * a serving boot's flush, the lifecycle log's (desiredStateInLog). An
+   * opened channel is kept while it's decided open or tuned out, whatever its
+   * transport is doing at that moment: the decision is what channel_close
    * changes and what the host carries out once the transport is back, and at
-   * a serving boot no transport is up yet. An opened channel no longer
-   * decided open or tuned out is left out, and so is a failed one no longer
-   * selected for opening, or open since. With nothing left, no one is told,
+   * a serving boot no transport is up yet. A failed one is kept only while
+   * it's still decided open and its transport isn't open, since "Not open"
+   * would misstate an open one. One tuned out since is left out too: the
+   * tune-out is a newer decision, by an agent that knows the channel, and
+   * the notice's reason and its channel_open advice, which a tuned-out
+   * channel refuses, would misstate it. With nothing left, no one is told,
    * logged here.
    */
   private channelNoticeForPrimary(
@@ -21906,15 +21910,15 @@ export class AgentFramework {
   ): { content: ContentBlock[]; metadata: MessageMetadata } | null {
     const registry = this.channelRegistry;
     const { serverId } = passOn;
-    // A tune-out leaves a channel open, its traffic held, and keeps a channel
-    // not open yet selected for opening (reconcile opens it).
-    const decidedOpen = (channelId: string) => {
-      const desired = registry ? registry.getDesiredState(serverId, channelId) : desiredStateInLog(this.store, serverId, channelId);
-      return desired === 'open' || desired === 'tuned-out';
-    };
+    const desiredState = (channelId: string) =>
+      (registry ? registry.getDesiredState(serverId, channelId) : desiredStateInLog(this.store, serverId, channelId));
     let notice: ChannelNotice | undefined;
     if (passOn.notice === 'channel-opened') {
-      const channels = passOn.channels.filter((c) => decidedOpen(c.channelId));
+      // A tune-out leaves a channel open, its traffic held.
+      const channels = passOn.channels.filter((c) => {
+        const desired = desiredState(c.channelId);
+        return desired === 'open' || desired === 'tuned-out';
+      });
       if (channels.length === 0) {
         console.error(`[channel] ${speaker} has ended, and no channel its notice said opened is decided open or tuned out now (${passOn.channels.map(shownChannel).join(', ')}): no one is told`);
         return null;
@@ -21922,8 +21926,8 @@ export class AgentFramework {
       [notice] = this.channelOpenedNotices(speaker, serverId, channels, passOn.cause);
     } else {
       const { channelId } = passOn.channel;
-      if (!decidedOpen(channelId) || registry?.isChannelOpen(channelId, serverId)) {
-        console.error(`[channel] ${speaker} has ended, and ${shownChannel(passOn.channel)}, which its notice said was not open and selected for opening, is open now or no longer selected: no one is told`);
+      if (desiredState(channelId) !== 'open' || registry?.isChannelOpen(channelId, serverId)) {
+        console.error(`[channel] ${speaker} has ended, and ${shownChannel(passOn.channel)}, which its notice said was not open and selected for opening, is open now or no longer decided open: no one is told`);
         return null;
       }
       [notice] = this.replyOpenFailedNotices(speaker, serverId, passOn.channel, passOn.selectedForOpening);
