@@ -26602,7 +26602,9 @@ export class AgentFramework {
         // left unhandled, and the result goes through pushEvent, as every
         // other tool's does.
         void this.channelRegistry!.openForTuneOut(entry.serverId, channelId)
-          .catch((err): string => `The tune-out is recorded, but opening its channel failed: ${thrownText(err)}`)
+          .catch((err): string =>
+            `The tune-out is recorded, but its messages may not reach the subconscious until the "${entry.serverId}" ` +
+            `server next registers the channel, since opening it failed: ${thrownText(err)}`)
           .then((openError) => {
             this.pushEvent({
               type: 'tool-result',
