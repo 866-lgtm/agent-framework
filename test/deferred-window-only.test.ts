@@ -981,7 +981,8 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
     try { internals.queryMessages({}); } finally { console.error = error; }
     assert.deepEqual(internals.deferredMessages.map((m) => m.id), [], 'no longer held');
-    assert.deepEqual(internals.unackedDeferredWrites.map((m) => m.id), ['w-found'], 'un-acked, as a drained write is');
+    assert.deepEqual(internals.unackedDeferredWrites.map((m) => [m.id, m.landing]), [['w-found', 'unknown']],
+      'un-acked, as a drained write is, and still marked, so a restart before the ack looks it up');
     assert.deepEqual(internals.durableDeferredWrites().map((m) => m.id), ['w-found'], 'so the durable queue keeps it until the next ack');
     assert.deepEqual(noted, [copy!.id], 'the notes a store takes, for the copy');
     assert.ok(errors.some((e) => e.includes('w-found') && e.includes('was found by its id')), errors.join('\n'));
@@ -1059,6 +1060,24 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
         .map((m) => `${m.held ? 'held' : 'stored'}: ${m.content.map((b) => (b as { text?: string }).text).join('')}`);
     } finally { console.error = error; }
     assert.deepEqual(rows, ['stored: look right', 'stored: look left']);
+    await framework.stop();
+  });
+
+  it("a stored row settles only the held write whose id it carries", async () => {
+    const framework = await createFramework();
+    const internals = drainInternals(framework);
+    heldAndStored(framework, 'w-theirs', 'look right');
+    heldAndStored(framework, 'w-mine', 'look left');
+    const cm = framework.getAgent('assistant')!.getContextManager() as unknown as {
+      queryMessages: (...args: unknown[]) => { messages: Array<{ id: string }> };
+    };
+    const [mine] = cm.queryMessages({ metadata: { deferredWriteId: 'w-mine' } }).messages;
+    const query = cm.queryMessages;
+    cm.queryMessages = () => { throw new Error('search failed'); };
+    const error = console.error;
+    console.error = () => {};
+    try { internals.getMessage(mine!.id); } finally { cm.queryMessages = query; console.error = error; }
+    assert.deepEqual(internals.deferredMessages.map((m) => [m.id, m.landing]), [['w-theirs', 'unknown']], "the other write stays marked");
     await framework.stop();
   });
 

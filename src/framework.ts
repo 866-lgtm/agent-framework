@@ -21505,7 +21505,8 @@ export class AgentFramework {
    * landed (`landing` unknown) is looked up there by its id first: found,
    * it's neither stored again nor passed to the primary; where the store
    * can't be searched, it's stored anyway, with a line saying it may now be
-   * stored twice. Its stream is over or cancelled, so it
+   * stored twice, or, where storing it fails too, that it may be stored
+   * once, twice or not at all. Its stream is over or cancelled, so it
    * compiles nothing more. One path still stores after these writes: a
    * `complete` that arrived while the agent still waited for tools awaits
    * the spill of its last tool results, and stores them once that resolves,

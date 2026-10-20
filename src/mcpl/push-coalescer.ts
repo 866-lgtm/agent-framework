@@ -260,9 +260,9 @@ export interface CoalescerHost<E> {
   /** True iff the placement still exists and no model request has included it. */
   isUnread(placement: CoalescingPlacement): boolean;
   /** True iff nothing may have shown the placement to the agent: it is still
-   *  in the deferred queue and not already stored, or it is stored where no
-   *  committing compile has begun to assemble it and no tool boundary has
-   *  injected past it. Unlike
+   *  in the deferred queue and known not to be stored already, or it is
+   *  stored where no committing compile has begun to assemble it and no tool
+   *  boundary has injected past it. Unlike
    *  isUnread, a compile counts from its start, and a boundary counts
    *  whether or not its stream says it carries injected messages: a doubt
    *  counts as shown. */
