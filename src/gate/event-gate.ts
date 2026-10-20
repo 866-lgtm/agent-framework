@@ -1736,8 +1736,7 @@ export class EventGate {
     // Arm the self-wake: when the window elapses, clear sleep and request an
     // inference so the agent resumes on its own (not dependent on a heartbeat
     // tick or an incoming message). Cancelled by clearSleep()/`wake`.
-    if (this.sleepTimer) clearTimeout(this.sleepTimer);
-    this.sleepTimer = setTimeout(() => this.wakeFromSleep('sleep-expired'), ms);
+    this.armSleepWake(ms);
     this.reloadPrivilegedIfChanged();
     this.emitTrace({
       type: 'gate:decision',
@@ -1748,6 +1747,23 @@ export class EventGate {
       timestamp: this.now(),
     });
     return { until: this.sleepUntil };
+  }
+
+  /**
+   * Arm the sleep's wake for a lifecycle that starts after a stop(): dispose()
+   * clears its timer and keeps the sleep. A sleep still ahead wakes the agent
+   * at its end; one that ended while stopped wakes it now, since that wake is
+   * what the agent asked for. With no sleep, wakeFromSleep does nothing.
+   */
+  resumeSleep(): void {
+    const remaining = this.sleepUntil - this.now();
+    if (remaining > 0) this.armSleepWake(remaining);
+    else this.wakeFromSleep('sleep-expired');
+  }
+
+  private armSleepWake(ms: number): void {
+    if (this.sleepTimer) clearTimeout(this.sleepTimer);
+    this.sleepTimer = setTimeout(() => this.wakeFromSleep('sleep-expired'), ms);
   }
 
   // =========================================================================
@@ -2003,6 +2019,11 @@ export class EventGate {
       clearTimeout(timer);
     }
     this.selfWakeTimers.clear();
+    // The sleep stays, with its note and agent, and its timer goes: fired
+    // after a stop(), its wake reached a framework that had stopped, and the
+    // timer held the process until the sleep's end. The next start() arms it
+    // again (resumeSleep).
+    if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
     this.rateLimitBuckets.clear();
     this.passiveSampleCounters.clear();
     this.rateLimitDenied.clear();

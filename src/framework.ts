@@ -3555,6 +3555,9 @@ export class AgentFramework {
     // for this one.
     this.lifecycleGeneration++;
     this.loopPromise = this.runLoop();
+    // A sleep kept through a stop() wakes this lifecycle at its end, or now
+    // if it ended while stopped.
+    this.eventGate?.resumeSleep();
 
     // Start periodic sync timer (if enabled)
     if (this.syncIntervalMs > 0) {
