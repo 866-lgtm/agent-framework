@@ -231,7 +231,7 @@ static int interrupt_handler(JSRuntime *r, void *opaque) {
 static JSValue js_host(JSContext *c, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val;
     if (reading || interrupted)
-        return JS_ThrowInternalError(c, "the script has ended, so its calls no longer reach the host");
+        return JS_ThrowInternalError(c, "the script's calls no longer reach the host");
     if (argc < 2 || !JS_IsString(argv[0]) || !JS_IsString(argv[1]))
         return JS_ThrowTypeError(c, "__host takes a tool name and its arguments as JSON text");
     if (next_id == UINT32_MAX)
@@ -291,7 +291,7 @@ static JSValue js_host(JSContext *c, JSValueConst this_val, int argc, JSValueCon
 static JSValue js_output(JSContext *c, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val;
     if (reading || interrupted)
-        return JS_ThrowInternalError(c, "the script has ended, so its output no longer reaches the host");
+        return JS_ThrowInternalError(c, "the script's output no longer reaches the host");
     int32_t stream;
     if (argc < 2 || !JS_IsNumber(argv[0]) || !JS_IsString(argv[1]))
         return JS_ThrowTypeError(c, "__output takes a stream, 1 or 2, and a string");

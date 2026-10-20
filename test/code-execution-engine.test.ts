@@ -698,6 +698,18 @@ test("a stack that isn't a string is left out, its string form never made, and a
   b.e.dispose();
 });
 
+test('a call or output tried while the ending is read is refused in words that say the host is closed to it', async () => {
+  const { e } = await engine();
+  const s = e.start(PRELUDE, `throw Object.defineProperty({}, "message", { get() {
+      const why = [];
+      try { __host("late", "{}") } catch (err) { why.push(err.message) }
+      try { __output(1, "late") } catch (err) { why.push(err.message) }
+      return why.join(" | ");
+    } })`, 's.js');
+  assert.deepEqual(s, { kind: 'rejected', name: '', message: "the script's calls no longer reach the host | the script's output no longer reaches the host" });
+  e.dispose();
+});
+
 test('each part read before a stop keeps its string form, a number\'s or an object\'s', async () => {
   // The slot says stop once only, as the name getter spins. The message, read first, isn't a
   // string: its string form is made before the name is read.
