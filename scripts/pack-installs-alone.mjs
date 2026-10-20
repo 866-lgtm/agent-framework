@@ -30,11 +30,15 @@
 // fault. The publish workflow runs it after its build and before
 // `npm publish` (which builds again from the same sources first); to check
 // by hand, run `npm run build` and then this, from the repository root.
+// It starts npm, where PATH names a JavaScript npm, and each Node of its own
+// with --single-threaded, so that V8 has no background job for Node 24's
+// exit to wait on (./single-threaded.mjs says why).
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { pathToFileURL } from "node:url";
+import { npmCommand, SINGLE_THREADED } from "./single-threaded.mjs";
 
 // The limits of npm pack and npm install, and of each load, which
 // PACK_INSTALLS_ALONE_INSTALL_TIMEOUT_MS and
@@ -184,9 +188,11 @@ function main() {
   try {
     let out = "";
     try {
+      // Each npm is the one its child finds on PATH from its own directory.
+      const pack = npmCommand();
       // Lifecycle scripts' output would land ahead of the JSON in the
       // foreground, so they run in the background.
-      out = execFileSync("npm", ["pack", "--json", "--foreground-scripts=false", "--pack-destination", work], {
+      out = execFileSync(pack.file, [...pack.args, "pack", "--json", "--foreground-scripts=false", "--pack-destination", work], {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "inherit"],
         maxBuffer: 64 * 1024 * 1024,
@@ -217,9 +223,10 @@ function main() {
     const dir = join(work, "install");
     mkdirSync(dir);
     writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "pack-installs-alone", private: true }));
+    const install = npmCommand(dir);
     run(
-      "npm",
-      ["install", "--no-audit", "--no-fund", "--no-package-lock", "--install-strategy=linked", tarball],
+      install.file,
+      [...install.args, "install", "--no-audit", "--no-fund", "--no-package-lock", "--install-strategy=linked", tarball],
       { cwd: dir, timeout: installTimeoutMs },
       `${packed.filename} didn't install on its own into an empty directory (npm's output is above). A dependency ` +
         "that isn't on the registry does that, or a registry or network error, which a re-run gets past.",
@@ -287,7 +294,7 @@ function main() {
           : `await import(${JSON.stringify(specifier)}${how === "import json" ? ', { with: { type: "json" } }' : ""}); process.exit(0);`;
       run(
         process.execPath,
-        how === "require" ? ["-e", code] : ["--input-type=module", "-e", code],
+        [SINGLE_THREADED, ...(how === "require" ? ["-e", code] : ["--input-type=module", "-e", code])],
         { cwd: dir, timeout: loadTimeoutMs },
         `loading '${specifier}' (${how}) from the installed ${packed.filename} failed (above). A dependency only ` +
           "devDependencies supplied does that, as does a file it imports that the package leaves out, or a " +
@@ -337,7 +344,7 @@ function main() {
       const register = join(work, "bin-register.mjs");
       writeFileSync(hook, HOOK);
       writeFileSync(register, REGISTER(pathToFileURL(hook).href));
-      const loaded = spawnSync(process.execPath, ["--import", pathToFileURL(register).href, file], {
+      const loaded = spawnSync(process.execPath, [SINGLE_THREADED, "--import", pathToFileURL(register).href, file], {
         cwd: dir,
         encoding: "utf8",
         timeout: loadTimeoutMs,
@@ -350,7 +357,7 @@ function main() {
         continue;
       }
       if (stderr.includes(NOT_MODULE)) {
-        run(process.execPath, ["--check", file], {}, `bin '${bin}' (${path}) in ${packed.filename} doesn't parse (above).`);
+        run(process.execPath, [SINGLE_THREADED, "--check", file], {}, `bin '${bin}' (${path}) in ${packed.filename} doesn't parse (above).`);
         binsParsed.push(bin);
         continue;
       }

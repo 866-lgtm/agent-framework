@@ -3,16 +3,21 @@
 // tarballs, so npm packs and installs it offline, with its own cache and
 // user config. A `bun` shim in front of PATH decides whether bun is there:
 // by default it isn't; BUN_BY_NODE stands bun in with Node under the `bun`
-// condition, so a bun target loads as bun would load it.
+// condition, so a bun target loads as bun would load it, with --single-threaded
+// as the script's own loads run. The tests start the real npm as the script
+// does (scripts/single-threaded.mjs).
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const SCRIPT = fileURLToPath(new URL("../../scripts/pack-installs-alone.mjs", import.meta.url));
+const { npmCommand } = (await import(new URL("../../scripts/single-threaded.mjs", import.meta.url).href)) as {
+  npmCommand: (cwd?: string, path?: string) => { file: string; args: string[] };
+};
 
 const made: string[] = [];
 after(() => {
@@ -41,16 +46,30 @@ function shim(name: string, text: string): string {
 const NO_BUN = shim("bun", "#!/bin/sh\nexit 127\n");
 const BUN_BY_NODE = shim(
   "bun",
-  `#!/bin/sh\n[ "$1" = --version ] && { echo 0.0.0-node; exit 0; }\n[ "$1" = -e ] && exec ${JSON.stringify(process.execPath)} --conditions=bun --input-type=module -e "$2"\nexit 2\n`,
+  `#!/bin/sh\n[ "$1" = --version ] && { echo 0.0.0-node; exit 0; }\n[ "$1" = -e ] && exec ${JSON.stringify(process.execPath)} --single-threaded --conditions=bun --input-type=module -e "$2"\nexit 2\n`,
 );
+
+/** The npm on PATH, as the script starts it, for a shim to hand calls to: an
+ *  npm started by name goes by its absolute path, so a shim in front of it on
+ *  PATH doesn't find itself, and a shim in another directory finds it. */
+function realNpm(): { file: string; args: string[] } {
+  const npm = npmCommand();
+  return npm.file === "npm" ? { file: resolvePath(execFileSync("sh", ["-c", "command -v npm"], { encoding: "utf8" }).trim()), args: [] } : npm;
+}
+
+/** An npm's source that runs `prelude`, then hands the call to the real npm. */
+function npmHandingOn(prelude: string): string {
+  const real = realNpm();
+  return `#!/usr/bin/env node\n${prelude}const { execFileSync } = require("node:child_process");\ntry { process.stdout.write(execFileSync(${JSON.stringify(real.file)}, [...${JSON.stringify(real.args)}, ...process.argv.slice(2)], { encoding: "utf8", stdio: ["inherit", "pipe", "inherit"] })); } catch (error) { process.stdout.write(error.stdout ?? ""); process.exit(error.status ?? 1); }\n`;
+}
 
 /** A directory holding an `npm` that runs `body`, in which `pass()` hands
  *  the call to the npm on PATH. */
 function npmShim(body: string): string {
-  const real = execFileSync("sh", ["-c", "command -v npm"], { encoding: "utf8" }).trim();
+  const real = realNpm();
   return shim(
     "npm",
-    `#!/usr/bin/env node\nconst { execFileSync } = require("node:child_process");\nconst args = process.argv.slice(2);\nconst pass = () => { try { process.stdout.write(execFileSync(${JSON.stringify(real)}, args, { encoding: "utf8", stdio: ["inherit", "pipe", "inherit"] })); } catch (error) { process.stdout.write(error.stdout ?? ""); process.exit(error.status ?? 1); } };\n${body}\n`,
+    `#!/usr/bin/env node\nconst { execFileSync } = require("node:child_process");\nconst args = process.argv.slice(2);\nconst pass = () => { try { process.stdout.write(execFileSync(${JSON.stringify(real.file)}, [...${JSON.stringify(real.args)}, ...args], { encoding: "utf8", stdio: ["inherit", "pipe", "inherit"] })); } catch (error) { process.stdout.write(error.stdout ?? ""); process.exit(error.status ?? 1); } };\n${body}\n`,
   );
 }
 
@@ -67,6 +86,35 @@ function isolated(): Record<string, string> {
     npm_config_offline: "true",
     npm_config_update_notifier: "false",
   };
+}
+
+/** How long the tests' own npm pack may take: past its second or two on a
+ *  loaded host, and short of the runner's ten-minute timeout, so a hang in
+ *  npm says which command it was. npm is killed at the limit, not asked to
+ *  stop. What it started itself isn't killed with it, and, as with the
+ *  script's own npm pack, the call waits on any of that still holding npm's
+ *  output open. */
+const PACK_LIMIT_MS = 120_000;
+
+/** Packs the package in `dir` into `tarballs`, offline, starting the npm
+ *  `path` names as the script does, and returns the tarball's path. */
+function packInto(dir: string, tarballs: string, path = process.env.PATH ?? "", limitMs = PACK_LIMIT_MS): string {
+  const npm = npmCommand(dir, path);
+  let out: string;
+  try {
+    out = execFileSync(npm.file, [...npm.args, "pack", "--json", "--pack-destination", tarballs], {
+      cwd: dir,
+      encoding: "utf8",
+      env: { ...isolated(), PATH: path },
+      timeout: limitMs,
+      killSignal: "SIGKILL",
+    });
+  } catch (error) {
+    if ((error as { code?: string }).code === "ETIMEDOUT") throw new Error(`npm pack in ${dir} didn't finish within ${limitMs / 1000} s`);
+    throw error;
+  }
+  const parsed = JSON.parse(out);
+  return join(tarballs, (Array.isArray(parsed) ? parsed[0] : Object.values(parsed)[0] as { filename: string }).filename);
 }
 
 function check(dir: string, bun = NO_BUN, extraPath = "", extraEnv: Record<string, string> = {}): Promise<{ code: number; stdout: string; stderr: string }> {
@@ -295,12 +343,7 @@ test("a package imported only through another dependency's copy, or a dependency
   // it only in devDependencies, so a hoisted install would hand it zz-cm's.
   const tarballs = mkdtempSync(join(tmpdir(), "pack-installs-alone-deps-"));
   made.push(tarballs);
-  const pack = (pkg: Record<string, unknown>, files: Record<string, string>) => {
-    const dir = fixture(pkg, files);
-    const out = execFileSync("npm", ["pack", "--json", "--pack-destination", tarballs], { cwd: dir, encoding: "utf8", env: isolated() });
-    const parsed = JSON.parse(out);
-    return join(tarballs, (Array.isArray(parsed) ? parsed[0] : Object.values(parsed)[0] as { filename: string }).filename);
-  };
+  const pack = (pkg: Record<string, unknown>, files: Record<string, string>) => packInto(fixture(pkg, files), tarballs);
   const chronicle = pack({ name: "zz-chronicle", main: "./index.js" }, { "index.js": "export const chronicle = true;\n" });
   const cm = pack({ name: "zz-cm", main: "./index.js", dependencies: { "zz-chronicle": `file:${chronicle}` } }, { "index.js": "import 'zz-chronicle';\nexport const cm = true;\n" });
   const imports = { "dist/index.js": "import 'zz-cm';\nimport 'zz-chronicle';\nexport const ok = true;\n" };
@@ -397,6 +440,187 @@ test("npm pack or npm install that outlives its limit fails at the limit even wh
   assert.ok(Date.now() - start < 40_000, `took ${Date.now() - start} ms`);
   assert.equal(pack.code, 1);
   assert.match(pack.stderr, /pack-installs-alone: npm pack didn't finish within 2 s\.\n$/);
+});
+
+/** A file each Node that loads `noteFlags` adds the flags it started with to,
+ *  one JSON array a line, and its reader. */
+function flagNotes(): { path: string; read: () => string[][]; noteFlags: string } {
+  const dir = mkdtempSync(join(tmpdir(), "pack-installs-alone-flags-"));
+  made.push(dir);
+  const path = join(dir, "flags");
+  return {
+    path,
+    read: () => readFileSync(path, "utf8").trim().split("\n").map((line) => JSON.parse(line) as string[]),
+    noteFlags: `require("node:fs").appendFileSync(${JSON.stringify(path)}, JSON.stringify(process.execArgv) + "\\n");\n`,
+  };
+}
+
+test("npmCommand takes the first executable npm on PATH, read from the child's directory, under this Node where it's JavaScript, and goes by name otherwise", () => {
+  const dirWith = (name: string, mode = 0o755): string => {
+    const dir = mkdtempSync(join(tmpdir(), "pack-installs-alone-path-"));
+    made.push(dir);
+    writeFileSync(join(dir, name), "", { mode });
+    return dir;
+  };
+  /** A directory whose `npm` links to `target`, as bin/npm links to npm-cli.js. */
+  const linkTo = (target: string): string => {
+    const dir = mkdtempSync(join(tmpdir(), "pack-installs-alone-path-"));
+    made.push(dir);
+    symlinkSync(target, join(dir, "npm"));
+    return dir;
+  };
+  const byName = { file: "npm", args: [] };
+  // By the path it was found at, not its real path, as a start by name runs it.
+  const underNode = (dir: string) => ({ file: process.execPath, args: ["--single-threaded", join(dir, "npm")] });
+  const cwd = mkdtempSync(join(tmpdir(), "pack-installs-alone-cwd-"));
+  made.push(cwd);
+  for (const name of ["npm-cli.js", "npm-cli.cjs", "npm-cli.mjs"]) {
+    const dir = linkTo(join(dirWith(name), name));
+    assert.deepEqual(npmCommand(cwd, dir), underNode(dir), name);
+  }
+  const cli = join(dirWith("npm-cli.js"), "npm-cli.js");
+  const js = linkTo(cli);
+  // An npm that can't be run, and a directory named npm, are passed over, as a shell passes them.
+  const directory = mkdtempSync(join(tmpdir(), "pack-installs-alone-path-"));
+  made.push(directory);
+  mkdirSync(join(directory, "npm"));
+  assert.deepEqual(npmCommand(cwd, [dirWith("npm", 0o644), directory, js].join(delimiter)), underNode(js));
+  // The first npm that runs decides: one that isn't JavaScript goes by name.
+  assert.deepEqual(npmCommand(cwd, [dirWith("npm"), js].join(delimiter)), byName);
+  // A relative or empty entry is read from the child's directory: passed over
+  // where it holds no npm, and taken where it does.
+  mkdirSync(join(cwd, "tools"));
+  assert.deepEqual(npmCommand(cwd, ["tools", js].join(delimiter)), underNode(js));
+  assert.deepEqual(npmCommand(cwd, ["", js].join(delimiter)), underNode(js));
+  symlinkSync(cli, join(cwd, "tools", "npm"));
+  assert.deepEqual(npmCommand(cwd, ["tools", js].join(delimiter)), underNode(join(cwd, "tools")));
+  symlinkSync(cli, join(cwd, "npm"));
+  assert.deepEqual(npmCommand(cwd, ["", js].join(delimiter)), underNode(cwd));
+  // A PATH with no npm goes by name, and so does an unset PATH, which the
+  // child reads as its default path, even where its directory holds an npm.
+  assert.deepEqual(npmCommand(cwd, dirWith("not-npm")), byName);
+  const saved = process.env.PATH;
+  delete process.env.PATH;
+  try {
+    assert.deepEqual(npmCommand(cwd), byName);
+  } finally {
+    if (saved !== undefined) process.env.PATH = saved;
+  }
+});
+
+test("npm starts under this Node with --single-threaded where PATH's npm is a JavaScript file, and by name otherwise, in the script and in the tests' own pack", async () => {
+  const notes = flagNotes();
+  const noting = npmHandingOn(notes.noteFlags);
+  // As an npm installed with Node is: bin/npm links to a JavaScript file.
+  const cli = shim("npm-cli.cjs", noting);
+  const linked = mkdtempSync(join(tmpdir(), "pack-installs-alone-shim-"));
+  made.push(linked);
+  symlinkSync(join(cli, "npm-cli.cjs"), join(linked, "npm"));
+  // Any other npm, here the same source not named as JavaScript.
+  const other = shim("npm", noting);
+  const tarballs = mkdtempSync(join(tmpdir(), "pack-installs-alone-deps-"));
+  made.push(tarballs);
+  for (const [npmDir, flags] of [[linked, ["--single-threaded"]], [other, []]] as const) {
+    rmSync(notes.path, { force: true });
+    const result = await check(fixture({ files: ["dist"], main: "./dist/index.js" }, ENTRY), NO_BUN, `${npmDir}:`);
+    assert.equal(result.code, 0, result.stderr);
+    packInto(fixture({ files: ["dist"], main: "./dist/index.js" }, ENTRY), tarballs, `${npmDir}${delimiter}${process.env.PATH ?? ""}`);
+    assert.deepEqual(notes.read(), [flags, flags, flags], `${npmDir === linked ? "a JavaScript npm" : "another npm"}: the script's npm pack and npm install, then the tests' own npm pack`);
+  }
+});
+
+test("npm pack, npm install and the tests' own npm pack each take the npm their child finds on PATH from its own directory", async () => {
+  const notes = flagNotes();
+  // The script runs npm pack in the package's directory, which holds a
+  // JavaScript npm under tools/, and npm install in a new one, which doesn't.
+  const dir = fixture({ files: ["dist"], main: "./dist/index.js" }, ENTRY);
+  mkdirSync(join(dir, "tools"));
+  writeFileSync(join(dir, "tools", "npm-cli.cjs"), npmHandingOn(notes.noteFlags), { mode: 0o755 });
+  symlinkSync("npm-cli.cjs", join(dir, "tools", "npm"));
+  const result = await check(dir, NO_BUN, "tools:");
+  assert.equal(result.code, 0, result.stderr);
+  assert.deepEqual(notes.read(), [["--single-threaded"]], "npm pack ran tools/npm under the flag, and npm install the npm further on PATH");
+  // The tests' own npm pack, run in the package's directory, takes it too.
+  const tarballs = mkdtempSync(join(tmpdir(), "pack-installs-alone-deps-"));
+  made.push(tarballs);
+  packInto(dir, tarballs, `tools${delimiter}${process.env.PATH ?? ""}`);
+  assert.deepEqual(notes.read(), [["--single-threaded"], ["--single-threaded"]], "the tests' own npm pack ran tools/npm under the flag");
+});
+
+test("each load, each bin's load, a CommonJS bin's --check and a JavaScript npm start under --single-threaded, and they are all the Nodes the script starts", async () => {
+  // A preload that notes each Node's flags and main file: NODE_OPTIONS reaches
+  // every Node the script starts, and a preload runs under --check too. Its
+  // directory's name has a space, so NODE_OPTIONS takes its path quoted.
+  const dir = mkdtempSync(join(tmpdir(), "pack-installs-alone flags-"));
+  made.push(dir);
+  const notes = join(dir, "flags");
+  const noter = join(dir, "note.cjs");
+  writeFileSync(noter, `require("node:fs").appendFileSync(${JSON.stringify(notes)}, JSON.stringify({ flags: process.execArgv, main: process.argv[1] ?? "" }) + "\\n");\n`);
+  // A JavaScript npm first on PATH, as an npm installed with Node is, that
+  // hands each call to the real npm without NODE_OPTIONS, so each npm start
+  // is noted once, whatever the host's own npm is.
+  const cli = shim("npm-cli.cjs", npmHandingOn("delete process.env.NODE_OPTIONS;\n"));
+  const linked = mkdtempSync(join(tmpdir(), "pack-installs-alone-shim-"));
+  made.push(linked);
+  symlinkSync(join(cli, "npm-cli.cjs"), join(linked, "npm"));
+  const pkg = fixture(
+    {
+      files: ["dist"],
+      exports: { ".": { import: "./dist/index.js", require: "./dist/index.cjs" } },
+      bin: { "zz-serve": "./dist/serve.js", "zz-old": "./dist/old.cjs" },
+    },
+    {
+      "dist/index.js": "export const ok = true;\n",
+      "dist/index.cjs": "module.exports = { ok: true };\n",
+      "dist/serve.js": NODE_BIN,
+      "dist/old.cjs": "#!/usr/bin/env node\nmodule.exports = 1;\n",
+    },
+  );
+  const result = await check(pkg, NO_BUN, `${linked}:`, { NODE_OPTIONS: `--require ${JSON.stringify(noter)}` });
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /loaded '@zz\/fixture' \(import\), '@zz\/fixture' \(require\).*ES module bins' static imports load: zz-serve; CommonJS bins parse, not loaded: zz-old/);
+  type Start = { flags: string[]; main: string };
+  const [script, ...children] = readFileSync(notes, "utf8").trim().split("\n").map((line) => JSON.parse(line) as Start);
+  // The first note is the script's own, which check() starts as CI does, without the flag.
+  assert.ok(script.main.endsWith("pack-installs-alone.mjs"), JSON.stringify(script));
+  const kinds: Array<[string, (one: Start) => boolean, number]> = [
+    ["the import load", (one) => one.flags.includes("--input-type=module"), 1],
+    ["the require load", (one) => one.flags.includes("-e") && !one.flags.includes("--input-type=module"), 1],
+    ["each bin's load", (one) => one.flags.includes("--import"), 2],
+    ["the CommonJS bin's --check", (one) => one.flags.includes("--check"), 1],
+    ["npm pack and npm install", (one) => one.main === join(linked, "npm"), 2],
+  ];
+  for (const [name, is, count] of kinds) {
+    const ofKind = children.filter(is);
+    assert.equal(ofKind.length, count, name);
+    for (const one of ofKind) assert.ok(one.flags.includes("--single-threaded"), `${name}: ${JSON.stringify(one)}`);
+  }
+  // Each Node the script starts for this package, each with the script's
+  // environment and so the preload, is of exactly one kind, so the counts
+  // above are all of them.
+  for (const one of children) assert.equal(kinds.filter(([, is]) => is(one)).length, 1, JSON.stringify(one));
+});
+
+test("the tests' own npm pack fails at its limit, naming the command and its directory, and other failures stay npm's", () => {
+  const notes = mkdtempSync(join(tmpdir(), "pack-installs-alone-ready-"));
+  made.push(notes);
+  const ready = join(notes, "ready");
+  const hangs = npmShim(`if (args[0] === "pack") { process.on("SIGTERM", () => {}); require("node:fs").writeFileSync(${JSON.stringify(ready)}, ""); setTimeout(() => {}, 60_000); }\nelse pass();`);
+  const dir = fixture({ files: ["dist"], main: "./dist/index.js" }, ENTRY);
+  const tarballs = mkdtempSync(join(tmpdir(), "pack-installs-alone-deps-"));
+  made.push(tarballs);
+  const start = Date.now();
+  assert.throws(() => packInto(dir, tarballs, `${hangs}${delimiter}${process.env.PATH ?? ""}`, 5000), { message: `npm pack in ${dir} didn't finish within 5 s` });
+  // It was ignoring SIGTERM when the limit came, so only the limit's SIGKILL
+  // could stop it short of its own minute.
+  assert.ok(existsSync(ready), "the npm was hanging, ignoring SIGTERM, when the limit came");
+  assert.ok(Date.now() - start < 30_000, `took ${Date.now() - start} ms`);
+  // An npm pack that fails is npm's failure, not a time limit's.
+  const fails = npmShim(`if (args[0] === "pack") process.exit(3);\nelse pass();`);
+  assert.throws(
+    () => packInto(dir, tarballs, `${fails}${delimiter}${process.env.PATH ?? ""}`),
+    (error: { status?: number; message: string }) => error.status === 3 && !error.message.includes("didn't finish"),
+  );
 });
 
 test("a null in an exports array gives way to the next item, and a target only node-addons or module-sync names is loaded on a Node that matches it", async () => {
@@ -519,10 +743,10 @@ test("npm pack output that isn't one record with a filename and its files fails,
 test("npm pack's JSON is read in npm 12's shape too, and a prepack's output doesn't break it", async () => {
   // npm 12 prints an object keyed by package name: a shim in front of the
   // real npm rewrites npm 11's array that way, and passes npm 12's through.
-  const realNpm = execFileSync("sh", ["-c", "command -v npm"], { encoding: "utf8" }).trim();
+  const real = realNpm();
   const npm12 = shim(
     "npm",
-    `#!/usr/bin/env node\nconst { execFileSync } = require("node:child_process");\nconst args = process.argv.slice(2);\ntry {\n  const out = execFileSync(${JSON.stringify(realNpm)}, args, { encoding: "utf8", stdio: ["inherit", "pipe", "inherit"] });\n  if (args[0] === "pack" && args.includes("--json")) {\n    const parsed = JSON.parse(out);\n    // npm 12 prints the object already; npm 11's array is rewritten.\n    process.stdout.write(Array.isArray(parsed) ? JSON.stringify({ [parsed[0].name]: parsed[0] }) : out);\n  } else process.stdout.write(out);\n} catch (error) { process.stdout.write(error.stdout ?? ""); process.exit(error.status ?? 1); }\n`,
+    `#!/usr/bin/env node\nconst { execFileSync } = require("node:child_process");\nconst args = process.argv.slice(2);\ntry {\n  const out = execFileSync(${JSON.stringify(real.file)}, [...${JSON.stringify(real.args)}, ...args], { encoding: "utf8", stdio: ["inherit", "pipe", "inherit"] });\n  if (args[0] === "pack" && args.includes("--json")) {\n    const parsed = JSON.parse(out);\n    // npm 12 prints the object already; npm 11's array is rewritten.\n    process.stdout.write(Array.isArray(parsed) ? JSON.stringify({ [parsed[0].name]: parsed[0] }) : out);\n  } else process.stdout.write(out);\n} catch (error) { process.stdout.write(error.stdout ?? ""); process.exit(error.status ?? 1); }\n`,
   );
   const twelve = await check(fixture({ files: ["dist"], main: "./dist/index.js" }, ENTRY), NO_BUN, `${npm12}:`);
   assert.equal(twelve.code, 0, twelve.stderr);
