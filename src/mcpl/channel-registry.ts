@@ -2739,6 +2739,57 @@ export class ChannelRegistry {
   }
 
   /**
+   * Make a tuned-out channel's transport match its tune-out, which keeps it
+   * open so its traffic reaches the subconscious (TuneOutParams). The
+   * tune-out is recorded first (enterTuneOut), and this writes no decision,
+   * so the tune-out stands whatever becomes of the open. A transport that's
+   * open with no lifecycle work pending needs nothing. Where outstanding
+   * work will carry the decision out (outstandingWorkCarriesOut), this waits
+   * for it rather than queue a second open; otherwise the channel's
+   * lifecycle queue opens it, since applyDesiredChannelState reads a
+   * tune-out as open. That work settles only once a receipt has confirmed
+   * the transport as the decision it read when it finished, so a tune-out
+   * that still stands then has an open transport. Returns nothing where the
+   * transport ends open, or, for tune_out's answer, why none of the
+   * channel's messages reach the subconscious yet and when they will.
+   */
+  async openForTuneOut(serverId: string, channelId: string): Promise<string | undefined> {
+    const channelKey = `${serverId}:${channelId}`;
+    const lifecycleKey = this.lifecycleKey(serverId, channelId);
+    const entry = this.channels.get(channelKey);
+    if (!entry || (entry.open && !this.hasPendingLifecycle(entry))) return undefined;
+    const notYet = (why: string): string => withStop(
+      'The tune-out is recorded, but its messages don\'t reach the subconscious until this host opens the channel, ' +
+      `which it does ${laterClause(this.channels.get(channelKey) ?? entry)}; ${why}`,
+    );
+    const replaced = 'The tune-out was recorded, but a later decision about the channel replaced it while its transport ' +
+      'was being opened, and that decision stands.';
+    if (!this.directsLifecycle(serverId)) {
+      const refusal = this.lifecycleRefusal(serverId);
+      return refusal.kind === 'not-permitted'
+        ? `The tune-out is recorded, but ${refusal.message}, so its messages reach the subconscious only as that server ` +
+          'sends them.'
+        : notYet(`it can't open it now: ${refusal.message}`);
+    }
+    try {
+      const pending = this.channelLifecycleTails.get(lifecycleKey);
+      if (pending && this.outstandingWorkCarriesOut(serverId, lifecycleKey)) await pending;
+      else await this.applyDesiredChannelState(serverId, channelId);
+    } catch (error) {
+      if (this.getDesiredState(serverId, channelId) !== 'tuned-out') return replaced;
+      // A registration that went while the open was out says so, as a
+      // decline's close does, and one that came back since says that.
+      const went = error instanceof ChannelLifecycleError && (error.kind === 'cancelled' || error.kind === 'unlisted');
+      return notYet(
+        !went ? `opening it now didn't complete: ${lifecycleClause(error)}`
+          : this.channels.has(channelKey) ? 'its registration went and came back while the open was out'
+            : `it isn't registered here any more: ${(error as ChannelLifecycleError).message}`,
+      );
+    }
+    return this.getDesiredState(serverId, channelId) === 'tuned-out' ? undefined : replaced;
+  }
+
+  /**
    * End the active tune-out, returning the channel to `nextState`.
    * The caller (tune-out coordinator) owns the dump/notice flow; this is
    * only the durable state flip. No-op returning null if the channel is
@@ -3137,7 +3188,15 @@ export class ChannelRegistry {
    *  entry with it, so the channel's next registration by channels/register,
    *  or as added by channels/changed, carries the decision out, where this
    *  host directs the lifecycle then. A push's registration
-   *  (ensureChannelRegistered) queues no lifecycle work. */
+   *  (ensureChannelRegistered) queues no lifecycle work. So where a push
+   *  re-makes an entry that a channels/changed removal took while an RPC for
+   *  the old entry was out, the operation running that RPC carries the
+   *  decision out for the push's entry only if the RPC is answered: a failed
+   *  one rethrows, since its retry covers only a retarget of its own entry.
+   *  This answers true meanwhile, so a channels/changed update that retargets
+   *  the push's entry is left to that operation, and stays undone after a
+   *  failed RPC until channel_open, speech or a registration. No server we
+   *  know of sends `updated` for a channel it has removed. */
   private outstandingWorkCarriesOut(serverId: string, key: string): boolean {
     return this.lifecycleOutstanding.has(key) &&
       this.lifecycleQueuedRemovals.get(key) === (this.serverRemovals.get(serverId) ?? 0);
