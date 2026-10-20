@@ -512,7 +512,7 @@ test("a crash's detail has the stderr that comes after its process exits", async
   await r.exited;
 });
 
-test("the child's environment is empty, with a .env file where the host runs", async () => {
+test("the child gets nothing of the host's environment, with a .env file where the host runs", async () => {
   // Bun reads a .env file from the directory a process starts in: the child starts in its own.
   const hostDir = mkdtempSync(join(tmpdir(), 'af-host-'));
   writeFileSync(join(hostDir, '.env'), 'FROM_THE_HOSTS_DOTENV=1\n');
@@ -523,7 +523,15 @@ test("the child's environment is empty, with a .env file where the host runs", a
     r.start('return 1;', TOOLS);
     const snap = await r.wait(10_000);
     assert.equal(snap.ending?.how, 'crashed');
-    assert.match((snap.ending as { detail: string }).detail, /exited with code 3 before the script ended: \[\]$/);
+    const detail = (snap.ending as { detail: string }).detail;
+    const names = /exited with code 3 before the script ended: (\[.*\])$/.exec(detail);
+    assert.ok(names, detail);
+    // On macOS a Node child that was given no environment still has
+    // __CF_USER_TEXT_ENCODING, which, by our reading, the system sets in the
+    // child itself (CI's macOS jobs show the child with it, and Bun's child
+    // there without it), so that one name is allowed there.
+    const own = process.platform === 'darwin' ? ['__CF_USER_TEXT_ENCODING'] : [];
+    assert.deepEqual((JSON.parse(names[1]!) as string[]).filter((name) => !own.includes(name)), []);
     await r.exited;
   } finally {
     process.chdir(was);
