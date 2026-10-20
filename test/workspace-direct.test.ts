@@ -2349,11 +2349,11 @@ test("a direct mount's read shows a file's text as a 'chronicle' mount's does: l
   assert.match(page('bom.txt', 24000).note, /BOM/);
   assert.match(page('bad.txt', 24000).note, /isn't valid UTF-8/);
   assert.equal(page('mixed.txt', 24000).content, '     1\ta\n     2\tb\n     3\tc\r\r\n     4\td');
-  const long = page('long.txt', 24000);
-  assert.ok(JSON.stringify(long).length <= 24000, `${JSON.stringify(long).length}`);
-  assert.equal(long.content, `     1\t${'x'.repeat(2000)} [… read the rest with offsetChars=2000 and limitChars=58000]\n     2\ty`);
-  for (const cap of [24000, 1000]) {
-    for (const chars of [false, true]) assert.ok(JSON.stringify(page('big.txt', cap, chars)).length <= cap, `${cap} ${chars}`);
+  assert.equal(page('long.txt', 24000).content, `     1\t${'x'.repeat(2000)} [… read the rest with offsetChars=2000 and limitChars=58000]\n     2\ty`);
+  // Every page a call with a result limit asked for fits it.
+  for (const [input, cap, d] of fromDisk) {
+    const length = JSON.stringify(d).length;
+    if (cap !== undefined) assert.ok(length <= cap, `${String(input.path)}${'offsetChars' in input ? ' in characters' : ''} at ${cap}: ${length}`);
   }
   assert.ok(page('big.txt', 24000).toLine < 3000);
   assert.equal(page('long.txt', undefined).content.length, '     1\t'.length + 60000 + '\n     2\ty'.length);
