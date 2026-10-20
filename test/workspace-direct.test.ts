@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
 import { runInNewContext } from 'node:vm';
 import { JsStore } from '@animalabs/chronicle';
@@ -456,10 +456,13 @@ test('a file gone between the walk that listed it and its read is neither listed
     () => data<{ results: Array<{ file: string }>; skipped?: unknown }>(m, 'grep', { pattern: 'needle' }));
   assert.deepEqual(grep.results.map((r) => r.file), left.map((name) => `ref/${name}`));
   assert.equal(grep.skipped, undefined);
-  // A listing looks at each file by its path, where this one is removed first.
+  // A listing looks at each file by its path, where this one is removed
+  // first. The look is known by the file's name, since the listing reads
+  // beneath the root it resolved, which on macOS isn't spelled as `env.ref`
+  // is (/var there is a link to /private/var).
   env.file('f30.txt', 'needle\n');
   const listed = await withFsPromise('lstat', (lstat) => async (...args: any[]) => {
-    if (args[0] === gone) rmSync(gone, { force: true });
+    if (basename(String(args[0])) === 'f30.txt') rmSync(gone, { force: true });
     return lstat(...args);
   }, () => data<{ entries: Array<{ path: string }> }>(m, 'ls', { path: 'ref', recursive: true }));
   assert.deepEqual(listed.entries.map((e) => e.path), left);
