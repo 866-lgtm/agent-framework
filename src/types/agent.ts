@@ -371,6 +371,10 @@ export interface InferenceRequest {
    *  all of them without materializing content, the turn has no cause left
    *  and does not run. */
   coalescingBatchSubjects?: string[];
+  /** Host-owned: this wake's sole cause is reading this deferred write, a
+   *  coalesced render placed in its agent's queue (wakeToRead). Once the
+   *  agent has read the write, or it was removed, the wake starts no turn. */
+  readsDeferredWrite?: string;
   agentName: string;
   reason: string;
   source: string;
@@ -382,7 +386,8 @@ export interface InferenceRequest {
    * replies in the channel it is answering — not the process-global most-recent-
    * inbound locus, which a concurrent message elsewhere can hijack (item-3
    * redux). Undefined for non-channel wakes (heartbeat, timers, module events),
-   * which correctly fall back to the global default channel.
+   * which correctly fall back to the global default channel, except an
+   * ephemeral run's (a subagent's), which takes no global fallback.
    */
   channelId?: string;
   /**
