@@ -11442,12 +11442,12 @@ export class AgentFramework {
           // turn ends. The window stores them here, right after the
           // tool_result message, which is exactly where the membrane appends
           // them in the live conversation — same participant, same content
-          // blocks, same metadata, and compile() emits recent messages
-          // verbatim, so the next turn's compiled prefix byte-matches the
-          // live request (prompt-cache safe). A write that threw after it was
-          // stored, whose landing couldn't be read, is the exception: it's
-          // carried at the flush that finds it, after what was stored since,
-          // so there the store and the live request differ
+          // blocks, and neither carries the row's metadata — and compile()
+          // emits recent messages verbatim, so the next turn's compiled prefix
+          // byte-matches the live request (prompt-cache safe). A write that
+          // threw after it was stored, whose landing couldn't be read, is the
+          // exception: it's carried at the flush that finds it, after what was
+          // stored since, so there the store and the live request differ
           // (writeDrainedInOrder).
           //
           // The queue is drained ONLY at the target agent's own boundary:

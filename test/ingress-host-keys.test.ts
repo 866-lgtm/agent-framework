@@ -106,11 +106,13 @@ describe("a server's metadata, stored without the keys only the host writes", ()
   it('logs the first drop of each key from a server, naming the server and the key but not the value', async () => {
     command({ op: 'incoming', channelId: ROOM, messageId: 'm-1', mode: 'ambient', text: 'one', metadata: { kind: 'secret-kind-1' } });
     await waitFor(() => !!storedWith((m) => m.messageId === 'm-1'), 'the first stored');
-    // The second message's `kind` and the push's are each the same server's
-    // second drop of that key; the second message's `system` is its first.
+    // A later drop of a key the server already lost isn't logged again, in
+    // either lane: the second message's `kind`, and the push's. The second
+    // message's `system` and the push's `tuneOut` are each that server's first.
     command({ op: 'incoming', channelId: ROOM, messageId: 'm-2', mode: 'ambient', text: 'two', metadata: { kind: 'secret-kind-2', system: true } });
-    command({ op: 'push', eventId: 'tick-1', origin: { kind: 'secret-kind-3' }, text: 'three' });
-    await waitFor(() => !!storedWith((m) => m.eventId === 'tick-1') && !!storedWith((m) => m.messageId === 'm-2'), 'the other two stored');
+    await waitFor(() => !!storedWith((m) => m.messageId === 'm-2'), 'the second stored');
+    command({ op: 'push', eventId: 'tick-1', origin: { kind: 'secret-kind-3', tuneOut: { epochId: 'secret-epoch' } }, text: 'three' });
+    await waitFor(() => !!storedWith((m) => m.eventId === 'tick-1'), 'the push stored');
     // Another server's first `kind` is its own first drop of that key.
     framework.pushEvent({
       type: 'mcpl:channel-incoming', serverId: 'other', channelId: 'other:room', messageId: 'o-1',
@@ -121,6 +123,7 @@ describe("a server's metadata, stored without the keys only the host writes", ()
     assert.deepEqual(drops(), [
       '[mcpl] discord: dropped "kind" from a message, since only the host writes that key (logged once for each server and key)',
       '[mcpl] discord: dropped "system" from a message, since only the host writes that key (logged once for each server and key)',
+      '[mcpl] discord: dropped "tuneOut" from a message, since only the host writes that key (logged once for each server and key)',
       '[mcpl] other: dropped "kind" from a message, since only the host writes that key (logged once for each server and key)',
     ]);
   });
