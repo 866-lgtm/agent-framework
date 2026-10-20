@@ -15,9 +15,14 @@
     coalescer, a wake's check or a tune-out's backlog, such a write is
     looked up first. One that landed is a stored message from then on, read
     and changed as one, and isn't carried into the turn; one that didn't is
-    an ordinary held write. Where the store can't be searched, a module's
-    edit or removal of it throws with nothing changed, and the coalescer
-    reads it as possibly read and shown.
+    an ordinary held write. Where the store can't be searched, the
+    coalescer reads it as possibly read and shown.
+  - A module context's `editMessage` and `removeMessage` can now throw for
+    such a held write: where its store can't be searched to tell whether
+    it landed, nothing is changed, and the error reads "held write held:…
+    may already be stored, and its store can't be searched to tell, so
+    nothing was changed. It's refused the same way while the store can't be
+    searched; the host log names the store's error".
   - A conversation fork's or ephemeral run's queue, stored when it's
     released, looks such an entry up the same way: found, it's neither
     stored again nor passed to the primary as a failed reply; where the
