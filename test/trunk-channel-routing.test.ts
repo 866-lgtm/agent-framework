@@ -456,6 +456,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     const notice = internals(framework) as unknown as {
       recordChannelAutoOpenNotice(
         agentName: string | undefined,
+        serverId: string,
         channels: Array<{ channelId: string; label?: string }>,
         cause: 'subscription-policy' | 'opened-by-delivery' | 'opened-by-reply',
       ): void;
@@ -468,7 +469,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
 
     // Each form an agent can read: a delivery or a send opens one channel, and
     // only the subscription policy opens several at once.
-    notice.recordChannelAutoOpenNotice('scout', [{ channelId: 'slack:C1', label: '#general (acme)' }], 'opened-by-delivery');
+    notice.recordChannelAutoOpenNotice('scout', 'slack', [{ channelId: 'slack:C1', label: '#general (acme)' }], 'opened-by-delivery');
     const one = lastText();
     assert.match(
       one,
@@ -476,7 +477,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     );
     assert.doesNotMatch(one, /will reach you/);
 
-    notice.recordChannelAutoOpenNotice('scout', [{ channelId: 'slack:C1' }, { channelId: 'slack:C2' }], 'subscription-policy');
+    notice.recordChannelAutoOpenNotice('scout', 'slack', [{ channelId: 'slack:C1' }, { channelId: 'slack:C2' }], 'subscription-policy');
     const two = lastText();
     assert.match(
       two,

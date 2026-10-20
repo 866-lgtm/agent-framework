@@ -32,7 +32,7 @@ function internals(framework: AgentFramework) {
     injectScriptWake(record: { id: string; agentName: string }, envelope: string): void;
     closingConversationAgents: Set<string>;
     activeStreams: Map<string, Promise<void>>;
-    recordChannelAutoOpenNotice(agentName: string | undefined, channels: Array<{ channelId: string; label?: string }>, cause: 'subscription-policy' | 'opened-by-delivery' | 'opened-by-reply'): void;
+    recordChannelAutoOpenNotice(agentName: string | undefined, serverId: string, channels: Array<{ channelId: string; label?: string }>, cause: 'subscription-policy' | 'opened-by-delivery' | 'opened-by-reply'): void;
     addMessage(participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, opts?: { forAgent?: string }): string;
   };
 }
@@ -140,11 +140,11 @@ describe('notices about an agent\'s own action', () => {
     return framework.getAgent(binding.agentName)!;
   }
 
-  /** A durable decision for `channel`, as an open or a close records it in
-   *  the registry's lifecycle log. */
-  function decide(channel: string, desired: 'open' | 'closed', source = 'opened-by-reply', on = framework) {
+  /** A durable decision for `channel` on `server`, as an open or a close
+   *  records it in the registry's lifecycle log. */
+  function decide(channel: string, desired: 'open' | 'closed', source = 'opened-by-reply', on = framework, server = 'srv') {
     (internals(on).channelRegistry as unknown as { setDesiredState(serverId: string, channelId: string, desired: string, source: string): void })
-      .setDesiredState('srv', channel, desired, source);
+      .setDesiredState(server, channel, desired, source);
   }
 
   async function runEphemeral(proseRouting: 'locus' | 'explicit', speech: string) {
@@ -646,13 +646,13 @@ describe('notices about an agent\'s own action', () => {
       const forkCm = t.mock.method(fork.getContextManager(), 'addMessage');
 
       // The fork's own home channel, which it can close.
-      state.recordChannelAutoOpenNotice(fork.name, [{ channelId: 'missing-channel', label: '#home' }], 'opened-by-reply');
+      state.recordChannelAutoOpenNotice(fork.name, 'srv', [{ channelId: 'missing-channel', label: '#home' }], 'opened-by-reply');
       assert.equal(forkCm.mock.callCount(), 1);
       assert.equal(primary.mock.callCount(), 0);
       assert.match(JSON.stringify(forkCm.mock.calls[0]!.arguments[1]),
         /Now open: #home \(missing-channel\): your own message into the closed channel opened it\. .*use channel_close/);
 
-      state.recordChannelAutoOpenNotice(undefined, [{ channelId: 'c-2' }], 'subscription-policy');
+      state.recordChannelAutoOpenNotice(undefined, 'srv', [{ channelId: 'c-2' }], 'subscription-policy');
       assert.equal(primary.mock.callCount(), 1, 'no agent caused a policy open');
       assert.equal(forkCm.mock.callCount(), 1);
     });
@@ -663,7 +663,7 @@ describe('notices about an agent\'s own action', () => {
       const primary = t.mock.method(framework.getAgent('primary')!.getContextManager(), 'addMessage');
       const forkCm = t.mock.method(fork.getContextManager(), 'addMessage');
 
-      state.recordChannelAutoOpenNotice(fork.name, [{ channelId: 'c-1', label: '#one' }], 'opened-by-reply');
+      state.recordChannelAutoOpenNotice(fork.name, 'srv', [{ channelId: 'c-1', label: '#one' }], 'opened-by-reply');
 
       assert.equal(forkCm.mock.callCount(), 1);
       assert.equal(JSON.stringify(forkCm.mock.calls[0]!.arguments[1]), JSON.stringify([{ type: 'text', text:
@@ -696,7 +696,7 @@ describe('notices about an agent\'s own action', () => {
       const fork = await spawnFork();
       const state = internals(framework);
       decide('missing-channel', 'open');
-      state.recordChannelAutoOpenNotice(fork.name, [{ channelId: 'missing-channel', label: '#home' }], 'opened-by-reply');
+      state.recordChannelAutoOpenNotice(fork.name, 'srv', [{ channelId: 'missing-channel', label: '#home' }], 'opened-by-reply');
 
       reap(fork.name);
 
@@ -715,7 +715,7 @@ describe('notices about an agent\'s own action', () => {
       t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
       const fork = await spawnFork();
       decide('missing-channel', 'open');
-      internals(framework).recordChannelAutoOpenNotice(fork.name, [{ channelId: 'missing-channel', label: '#home' }], 'opened-by-reply');
+      internals(framework).recordChannelAutoOpenNotice(fork.name, 'srv', [{ channelId: 'missing-channel', label: '#home' }], 'opened-by-reply');
       decide('missing-channel', 'closed', 'agent-tool');
 
       reap(fork.name);
@@ -725,13 +725,13 @@ describe('notices about an agent\'s own action', () => {
         .filter((m) => JSON.stringify(m.content).includes('#home'));
       assert.equal(told.length, 0, 'the primary is told nothing');
       assert.ok(errors.includes(
-        `[channel] ${fork.name} has ended, and what its notice said opened is closed now (#home (missing-channel)): no one is told`));
+        `[channel] ${fork.name} has ended, and no channel its notice said opened is decided open or tuned out now (#home (missing-channel)): no one is told`));
     });
 
     it("passes on no channel notice its reader couldn't act on: the primary was told then, once", async () => {
       const fork = await spawnFork();
       const state = internals(framework);
-      state.recordChannelAutoOpenNotice(fork.name, [{ channelId: 'c-1', label: '#one' }], 'opened-by-reply');
+      state.recordChannelAutoOpenNotice(fork.name, 'srv', [{ channelId: 'c-1', label: '#one' }], 'opened-by-reply');
 
       reap(fork.name);
 
@@ -755,7 +755,7 @@ describe('notices about an agent\'s own action', () => {
       };
       t.mock.method(state.mcplServerRegistry, 'getServer', () => server as never);
 
-      state.recordChannelAutoOpenNotice('released-run', [{ channelId: 'opened-1', label: '#opened' }], 'opened-by-delivery');
+      state.recordChannelAutoOpenNotice('released-run', 'srv', [{ channelId: 'opened-1', label: '#opened' }], 'opened-by-delivery');
 
       const told = framework.getAgent('primary')!.getContextManager().getAllMessages()
         .filter((m) => JSON.stringify(m.content).includes('Now open: #opened (opened-1)'));
@@ -780,7 +780,7 @@ describe('notices about an agent\'s own action', () => {
       const name = state.primaryAgentName;
       state.primaryAgentName = null;
       try {
-        state.recordChannelAutoOpenNotice('released-run', [{ channelId: 'opened-2' }], 'opened-by-delivery');
+        state.recordChannelAutoOpenNotice('released-run', 'srv', [{ channelId: 'opened-2' }], 'opened-by-delivery');
       } finally {
         state.primaryAgentName = name;
       }
@@ -841,12 +841,12 @@ describe('notices about an agent\'s own action', () => {
         {
           id: 'w-4', seq: 4, participant: 'user', forAgent: 'conversation-gone',
           content: [{ type: 'text', text: '[channels] Now open: #four (c-4): your own message into the closed channel opened it.' }],
-          metadata: { system: true, kind: 'channel-notice', passOn: { notice: 'channel-opened', cause: 'opened-by-reply', channels: [{ channelId: 'c-4', label: '#four' }] } },
+          metadata: { system: true, kind: 'channel-notice', passOn: { notice: 'channel-opened', serverId: 'srv', cause: 'opened-by-reply', channels: [{ channelId: 'c-4', label: '#four' }] } },
         },
         {
           id: 'w-5', seq: 5, participant: 'user', forAgent: 'conversation-gone',
           content: [{ type: 'text', text: '[channels] Not open: #five (c-5). Your reply there went out, but opening the channel failed.' }],
-          metadata: { system: true, kind: 'channel-notice', passOn: { notice: 'reply-open-failed', channel: { channelId: 'c-5', label: '#five' }, selectedForOpening: 'server-bootstrap' } },
+          metadata: { system: true, kind: 'channel-notice', passOn: { notice: 'reply-open-failed', serverId: 'srv', channel: { channelId: 'c-5', label: '#five' }, selectedForOpening: 'server-bootstrap' } },
         },
         {
           // Its reader couldn't act on it, or an earlier build stored it: no inputs.
@@ -885,6 +885,11 @@ describe('notices about an agent\'s own action', () => {
       decide('c-9', 'open', 'server-bootstrap');
       (state.channelRegistry as unknown as { channels: Map<string, unknown> }).channels
         .set('srv:c-9', { serverId: 'srv', descriptor: { id: 'c-9', type: 'srv', label: '#nine' }, open: true });
+      // Selected for opening on its own server, where it isn't open, while
+      // another server's channel with the same id is.
+      decide('c-22', 'open', 'server-bootstrap');
+      (state.channelRegistry as unknown as { channels: Map<string, unknown> }).channels
+        .set('other:c-22', { serverId: 'other', descriptor: { id: 'c-22', type: 'other', label: '#twenty-two' }, open: true });
       // Selected for opening, and closed since.
       decide('c-10', 'open', 'server-bootstrap');
       decide('c-10', 'closed', 'agent-tool');
@@ -892,15 +897,24 @@ describe('notices about an agent\'s own action', () => {
       decide('c-13', 'open');
       state.channelRegistry.enterTuneOut('srv', 'c-13',
         { epochId: 'e-13', cadenceSeconds: 60, backlogCap: 10, maxWakes: 3, startedAtSequence: 0 }, 'agent-tool');
-      const opened = (id: string, channels: Array<{ channelId: string; label: string }>) => ({
+      // One channel id on two servers: each notice is checked by its own
+      // server's decision.
+      decide('c-14', 'open');
+      decide('c-14', 'closed', 'agent-tool', framework, 'other');
+      // Selected for opening, and tuned out since, not open yet: a tune-out
+      // keeps it selected for opening.
+      decide('c-15', 'open', 'server-bootstrap');
+      state.channelRegistry.enterTuneOut('srv', 'c-15',
+        { epochId: 'e-15', cadenceSeconds: 60, backlogCap: 10, maxWakes: 3, startedAtSequence: 0 }, 'agent-tool');
+      const opened = (id: string, channels: Array<{ channelId: string; label: string }>, serverId = 'srv') => ({
         id, seq: Number(id.slice(2)), participant: 'user', forAgent: 'conversation-gone',
         content: [{ type: 'text', text: '[channels] Now open: your own message into the closed channel opened it.' }],
-        metadata: { system: true, kind: 'channel-notice', passOn: { notice: 'channel-opened', cause: 'opened-by-delivery', channels } },
+        metadata: { system: true, kind: 'channel-notice', passOn: { notice: 'channel-opened', serverId, cause: 'opened-by-delivery', channels } },
       });
       const failed = (id: string, channel: { channelId: string; label: string }) => ({
         id, seq: Number(id.slice(2)), participant: 'user', forAgent: 'conversation-gone',
         content: [{ type: 'text', text: '[channels] Not open. Your reply there went out, but opening the channel failed.' }],
-        metadata: { system: true, kind: 'channel-notice', passOn: { notice: 'reply-open-failed', channel, selectedForOpening: 'server-bootstrap' } },
+        metadata: { system: true, kind: 'channel-notice', passOn: { notice: 'reply-open-failed', serverId: 'srv', channel, selectedForOpening: 'server-bootstrap' } },
       });
       (state.deferredMessages as unknown as Array<Record<string, unknown>>).push(
         opened('w-7', [{ channelId: 'c-7', label: '#seven' }, { channelId: 'c-8', label: '#eight' }]),
@@ -908,6 +922,10 @@ describe('notices about an agent\'s own action', () => {
         failed('w-9', { channelId: 'c-9', label: '#nine' }),
         failed('w-10', { channelId: 'c-10', label: '#ten' }),
         opened('w-13', [{ channelId: 'c-13', label: '#thirteen' }]),
+        opened('w-14', [{ channelId: 'c-14', label: '#fourteen' }]),
+        failed('w-15', { channelId: 'c-15', label: '#fifteen' }),
+        opened('w-16', [{ channelId: 'c-14', label: '#fourteen' }], 'other'),
+        failed('w-22', { channelId: 'c-22', label: '#twenty-two' }),
       );
 
       await state.flushDeferredWrites('boot-recovery');
@@ -919,12 +937,19 @@ describe('notices about an agent\'s own action', () => {
           "If you don't want it, use channel_close; your choice outranks policy.",
         '[channels] Now open: #thirteen (c-13): a message from conversation-gone into the closed channel opened it; conversation-gone has ended. ' +
           "If you don't want it, use channel_close; your choice outranks policy.",
+        '[channels] Now open: #fourteen (c-14): a message from conversation-gone into the closed channel opened it; conversation-gone has ended. ' +
+          "If you don't want it, use channel_close; your choice outranks policy.",
+        "[channels] Not open: #fifteen (c-15). A reply from conversation-gone went out there, but opening the channel failed; conversation-gone has ended. " +
+          "It's selected for opening again, because its server lists it as open by default: the host tries again, and channel_close withdraws that.",
+        "[channels] Not open: #twenty-two (c-22). A reply from conversation-gone went out there, but opening the channel failed; conversation-gone has ended. " +
+          "It's selected for opening again, because its server lists it as open by default: the host tries again, and channel_close withdraws that.",
       ]);
-      assert.deepEqual(told.map((m) => (m.metadata as { deferredWriteId?: unknown }).deferredWriteId), ['w-7', 'w-13']);
+      assert.deepEqual(told.map((m) => (m.metadata as { deferredWriteId?: unknown }).deferredWriteId), ['w-7', 'w-13', 'w-14', 'w-15', 'w-22']);
       for (const line of [
-        '[channel] conversation-gone has ended, and what its notice said opened is closed now (#eight (c-8)): no one is told',
-        '[channel] conversation-gone has ended, and #nine (c-9) is no longer waiting to open, as its notice said: no one is told',
-        '[channel] conversation-gone has ended, and #ten (c-10) is no longer waiting to open, as its notice said: no one is told',
+        '[channel] conversation-gone has ended, and no channel its notice said opened is decided open or tuned out now (#eight (c-8)): no one is told',
+        '[channel] conversation-gone has ended, and #nine (c-9), which its notice said was not open and selected for opening, is open now or no longer selected: no one is told',
+        '[channel] conversation-gone has ended, and #ten (c-10), which its notice said was not open and selected for opening, is open now or no longer selected: no one is told',
+        '[channel] conversation-gone has ended, and no channel its notice said opened is decided open or tuned out now (#fourteen (c-14)): no one is told',
       ]) assert.ok(errors.includes(line), line);
       assert.equal(state.deferredMessages.length, 0);
     });
@@ -933,19 +958,41 @@ describe('notices about an agent\'s own action', () => {
       decide('c-11', 'open');
       decide('c-12', 'open');
       decide('c-12', 'closed', 'agent-tool');
+      // A failed reply's channel, selected for opening still, and one closed
+      // since.
+      decide('c-17', 'open', 'server-bootstrap');
+      decide('c-18', 'open', 'server-bootstrap');
+      decide('c-18', 'closed', 'agent-tool');
+      // Opened, and tuned out since, which the log records with its params.
+      decide('c-19', 'open');
+      internals(framework).channelRegistry.enterTuneOut('srv', 'c-19',
+        { epochId: 'e-19', cadenceSeconds: 60, backlogCap: 10, maxWakes: 3, startedAtSequence: 0 }, 'agent-tool');
+      // One channel id on two servers, each with its own decision.
+      decide('c-20', 'open');
+      decide('c-20', 'closed', 'agent-tool', framework, 'other');
       await framework.stop();
       const storePath = join(tempDir, 'test.chronicle');
-      const notice = (id: string, channelId: string, label: string) => ({
+      const notice = (id: string, channelId: string, label: string, serverId = 'srv') => ({
         id, seq: Number(id.slice(2)), participant: 'user', forAgent: 'conversation-gone',
         content: [{ type: 'text', text: `[channels] Now open: ${label} (${channelId}): your own message into the closed channel opened it.` }],
-        metadata: { system: true, kind: 'channel-notice', passOn: { notice: 'channel-opened', cause: 'opened-by-reply', channels: [{ channelId, label }] } },
+        metadata: { system: true, kind: 'channel-notice', passOn: { notice: 'channel-opened', serverId, cause: 'opened-by-reply', channels: [{ channelId, label }] } },
+      });
+      const failed = (id: string, channelId: string, label: string) => ({
+        id, seq: Number(id.slice(2)), participant: 'user', forAgent: 'conversation-gone',
+        content: [{ type: 'text', text: `[channels] Not open: ${label} (${channelId}). Your reply there went out, but opening the channel failed.` }],
+        metadata: { system: true, kind: 'channel-notice', passOn: { notice: 'reply-open-failed', serverId: 'srv', channel: { channelId, label }, selectedForOpening: 'server-bootstrap' } },
       });
       // A resume that didn't finish its flush leaves the flag cleared and the
       // queue behind, which a serving boot lands before MCPL is brought up.
       mkdirSync(join(storePath, 'recovery'), { recursive: true });
       writeFileSync(join(storePath, 'recovery', 'host-mode.json'), JSON.stringify({ version: 1, quiesced: false }));
       writeFileSync(join(storePath, 'recovery', 'deferred-writes.json'), JSON.stringify({
-        version: 1, pending: [notice('w-11', 'c-11', '#eleven'), notice('w-12', 'c-12', '#twelve')],
+        version: 1, pending: [
+          notice('w-11', 'c-11', '#eleven'), notice('w-12', 'c-12', '#twelve'),
+          failed('w-17', 'c-17', '#seventeen'), failed('w-18', 'c-18', '#eighteen'),
+          notice('w-19', 'c-19', '#nineteen'),
+          notice('w-20', 'c-20', '#twenty'), notice('w-21', 'c-20', '#twenty', 'other'),
+        ],
       }));
       const errors: string[] = [];
       t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
@@ -963,11 +1010,18 @@ describe('notices about an agent\'s own action', () => {
 
       assert.equal(internals(framework).channelRegistry, null, 'the boot landed them with no registry');
       const told = framework.getAgent('primary')!.getContextManager().getAllMessages()
-        .map((m) => JSON.stringify(m.content))
-        .filter((c) => c.includes('conversation-gone'));
-      assert.equal(told.length, 1);
-      assert.match(told[0]!, /Now open: #eleven \(c-11\): a message from conversation-gone into the closed channel opened it; conversation-gone has ended\./);
-      assert.ok(errors.includes('[channel] conversation-gone has ended, and what its notice said opened is closed now (#twelve (c-12)): no one is told'));
+        .filter((m) => JSON.stringify(m.content).includes('conversation-gone'));
+      assert.deepEqual(told.map((m) => (m.metadata as { deferredWriteId?: unknown }).deferredWriteId), ['w-11', 'w-17', 'w-19', 'w-20']);
+      const texts = told.map((m) => (m.content[0] as { text: string }).text);
+      assert.match(texts[0]!, /^\[channels\] Now open: #eleven \(c-11\): a message from conversation-gone into the closed channel opened it; conversation-gone has ended\./);
+      assert.match(texts[1]!, /^\[channels\] Not open: #seventeen \(c-17\)\. A reply from conversation-gone went out there, but opening the channel failed; conversation-gone has ended\. It's selected for opening again/);
+      assert.match(texts[2]!, /^\[channels\] Now open: #nineteen \(c-19\): a message from conversation-gone/);
+      assert.match(texts[3]!, /^\[channels\] Now open: #twenty \(c-20\): a message from conversation-gone/);
+      for (const line of [
+        '[channel] conversation-gone has ended, and no channel its notice said opened is decided open or tuned out now (#twelve (c-12)): no one is told',
+        '[channel] conversation-gone has ended, and #eighteen (c-18), which its notice said was not open and selected for opening, is open now or no longer selected: no one is told',
+        '[channel] conversation-gone has ended, and no channel its notice said opened is decided open or tuned out now (#twenty (c-20)): no one is told',
+      ]) assert.ok(errors.includes(line), line);
     });
 
     it('passes a restored failure notice on as the same queue entry while the primary is mid-turn: it waits under its own id', async () => {
@@ -1374,7 +1428,7 @@ describe('notices about an agent\'s own action', () => {
       {
         what: 'a channel notice the run could act on',
         content: [{ type: 'text', text: '[channels] Now open: #seven (c-7): your own message into the closed channel opened it.' }],
-        metadata: { system: true, kind: 'channel-notice', passOn: { notice: 'channel-opened', cause: 'opened-by-delivery', channels: [{ channelId: 'c-7', label: '#seven' }] } },
+        metadata: { system: true, kind: 'channel-notice', passOn: { notice: 'channel-opened', serverId: 'srv', cause: 'opened-by-delivery', channels: [{ channelId: 'c-7', label: '#seven' }] } },
         inRun: 'Now open: #seven',
         toPrimary: "a message from worker into the closed channel opened it; worker has ended",
         opened: 'c-7',
@@ -1460,7 +1514,7 @@ describe('notices about an agent\'s own action', () => {
       {
         what: 'a channel notice the run could act on',
         content: [{ type: 'text' as const, text: '[channels] Now open: #eight (c-8): your own message into the closed channel opened it.' }],
-        metadata: { system: true, kind: 'channel-notice', passOn: { notice: 'channel-opened', cause: 'opened-by-reply', channels: [{ channelId: 'c-8', label: '#eight' }] } },
+        metadata: { system: true, kind: 'channel-notice', passOn: { notice: 'channel-opened', serverId: 'srv', cause: 'opened-by-reply', channels: [{ channelId: 'c-8', label: '#eight' }] } },
         toPrimary: "a message from worker into the closed channel opened it; worker has ended",
         opened: 'c-8',
       },

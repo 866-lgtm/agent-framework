@@ -2187,16 +2187,19 @@ interface ChannelNotice {
 
 /**
  * A channel notice's inputs, kept in its metadata (`passOn`) where its reader
- * was told it could act: a release that finds the notice unread tells the
+ * was told it could act: the server its channels are on, and what its
+ * builder was given. A release that finds the notice unread tells the
  * primary in its place, by calling the notice's builder again for the reader
- * then gone (channelNoticeForPrimary). A notice whose reader couldn't act
- * carries none: the primary was told then, where it could act.
+ * then gone, and checks each channel against that server's decision
+ * (channelNoticeForPrimary). A notice whose reader couldn't act carries none:
+ * the primary was told then, where it could act.
  */
 type ChannelNoticePassOn =
-  | { notice: 'channel-opened'; cause: ChannelOpenedCause; channels: Array<{ channelId: string; label?: string }> }
-  | { notice: 'reply-open-failed'; channel: { channelId: string; label?: string }; selectedForOpening: SelectedForOpening };
+  | { notice: 'channel-opened'; serverId: string; cause: ChannelOpenedCause; channels: Array<{ channelId: string; label?: string }> }
+  | { notice: 'reply-open-failed'; serverId: string; channel: { channelId: string; label?: string }; selectedForOpening: SelectedForOpening };
 
-/** A channel as a notice shows it: its label beside its id, or its id alone. */
+/** A channel as the channel notices show it (the opened and reply notices,
+ *  and the lines that log them): its label beside its id, or its id alone. */
 function shownChannel(channel: { channelId: string; label?: string }): string {
   return channel.label && channel.label !== channel.channelId ? `${channel.label} (${channel.channelId})` : channel.channelId;
 }
@@ -2215,9 +2218,11 @@ function channelNoticePassOn(metadata: unknown): ChannelNoticePassOn | null {
   const meta = metadata as { kind?: unknown; passOn?: unknown } | null | undefined;
   if (meta?.kind !== 'channel-notice') return null;
   const passOn = meta.passOn as {
-    notice?: unknown; cause?: unknown; channels?: unknown; channel?: unknown; selectedForOpening?: unknown;
+    notice?: unknown; serverId?: unknown; cause?: unknown; channels?: unknown; channel?: unknown; selectedForOpening?: unknown;
   } | null | undefined;
-  if (passOn?.notice === 'channel-opened') {
+  if (typeof passOn?.serverId !== 'string' || passOn.serverId === '') return null;
+  const serverId = passOn.serverId;
+  if (passOn.notice === 'channel-opened') {
     // A policy admission's notice is addressed to no agent of its own and
     // carries no inputs (channelOpenedNotices), so only an agent's send reads
     // back.
@@ -2225,13 +2230,13 @@ function channelNoticePassOn(metadata: unknown): ChannelNoticePassOn | null {
     if (!causes.includes(passOn.cause) || !Array.isArray(passOn.channels) || passOn.channels.length === 0) return null;
     const channels = passOn.channels.map(noticeChannel);
     if (channels.some((c) => c === null)) return null;
-    return { notice: 'channel-opened', cause: passOn.cause as ChannelOpenedCause, channels: channels as Array<{ channelId: string; label?: string }> };
+    return { notice: 'channel-opened', serverId, cause: passOn.cause as ChannelOpenedCause, channels: channels as Array<{ channelId: string; label?: string }> };
   }
-  if (passOn?.notice === 'reply-open-failed') {
+  if (passOn.notice === 'reply-open-failed') {
     const selected: readonly unknown[] = ['unrecorded', 'server-bootstrap', 'subscription-policy'];
     const channel = noticeChannel(passOn.channel);
     if (!channel || !selected.includes(passOn.selectedForOpening)) return null;
-    return { notice: 'reply-open-failed', channel, selectedForOpening: passOn.selectedForOpening as SelectedForOpening };
+    return { notice: 'reply-open-failed', serverId, channel, selectedForOpening: passOn.selectedForOpening as SelectedForOpening };
   }
   return null;
 }
@@ -15082,9 +15087,12 @@ export class AgentFramework {
    * transport state), or an open that the agent's own delivery or reply
    * caused (`opened-by-delivery`, `opened-by-reply`), once its transport is
    * confirmed. It names `channel_close` as the opt-out (their decision
-   * outranks policy) only to a reader that can call it for every channel it
-   * names (canCloseChannels): a conversation fork may close only its home
-   * channel, and an agent's allowedTools can leave channel_close out. Where an
+   * outranks policy) only where the agent it's addressed to can call it for
+   * every channel it names (canCloseChannels): a conversation fork may close
+   * only its home channel, and an agent's allowedTools can leave
+   * channel_close out. Others can read it too: the other residents, where
+   * several share one slot (#291), and forks spawned from the primary
+   * afterwards, from its window (#235). Where an
    * agent's own send opened a channel it can't close, the primary is told by
    * name too, if it's registered and can close it, and the agent is told
    * that it was. What an open channel delivers is its server's to say (#406),
@@ -15095,11 +15103,12 @@ export class AgentFramework {
    */
   private recordChannelAutoOpenNotice(
     agentName: string | undefined,
+    serverId: string,
     channels: Array<{ channelId: string; label?: string }>,
     cause: ChannelOpenedCause,
   ): void {
     if (channels.length === 0) return;
-    this.writeChannelNotices(this.channelOpenedNotices(agentName, channels, cause), `auto-open notice (${cause})`, 'recordChannelAutoOpenNotice');
+    this.writeChannelNotices(this.channelOpenedNotices(agentName, serverId, channels, cause), `auto-open notice (${cause})`, 'recordChannelAutoOpenNotice');
   }
 
   /**
@@ -15135,15 +15144,16 @@ export class AgentFramework {
    * which then says the primary was told (`untold`: its words where that
    * didn't land). None, logged, for an agent that has ended when there's no
    * primary to tell.
-   * The reader's carries its inputs (`passOn`) where it's addressed to the
-   * agent whose send opened the channels and that agent was told it can close
-   * them, so a release that finds it unread can tell the primary in its place
-   * (channelNoticeForPrimary), which calls this again for the agent then gone.
-   * A policy admission's goes where addMessage delivers it, to no agent of its
-   * own, and carries none.
+   * The reader's carries its inputs (`passOn`), the channels' server among
+   * them, where it's addressed to the agent whose send opened the channels
+   * and that agent was told it can close them, so a release that finds it
+   * unread can tell the primary in its place (channelNoticeForPrimary), which
+   * calls this again for the agent then gone. A policy admission's goes where
+   * addMessage delivers it, to no agent of its own, and carries none.
    */
   private channelOpenedNotices(
     agentName: string | undefined,
+    serverId: string,
     channels: Array<{ channelId: string; label?: string }>,
     cause: ChannelOpenedCause,
   ): ChannelNotice[] {
@@ -15201,7 +15211,7 @@ export class AgentFramework {
       ...(tellPrimary ? { untold: readerText('') } : {}),
       metadata: {
         system: true, kind: 'channel-notice',
-        ...(agentName && canClose ? { passOn: { notice: 'channel-opened', cause, channels } satisfies ChannelNoticePassOn } : {}),
+        ...(agentName && canClose ? { passOn: { notice: 'channel-opened', serverId, cause, channels } satisfies ChannelNoticePassOn } : {}),
       } as MessageMetadata,
       ...(agentName ? { target: { forAgent: agentName } } : {}),
       told: agentName ?? 'primary',
@@ -15239,8 +15249,10 @@ export class AgentFramework {
    * what an open channel delivers is in its window. Where conversations are
    * routed, an incoming message goes to the fork its channel is bound to, or
    * nowhere, and never to the primary (handleMcplChannelIncoming), so a fork
-   * holds only its home's, and only while the router binds its home to it: a
-   * fork whose binding has expired, closing, holds none. Elsewhere an
+   * holds only its home's, and only while the router binds its home to it.
+   * An idle expiry's sweep unbinds the home before the fork's closure turn
+   * (ConversationRouter.expired), and from then the closing fork holds none;
+   * a newer fork the home is bound to holds it instead. Elsewhere an
    * incoming message is stored with no forAgent, in deliveryAgent()'s store,
    * and where that's the residents' shared slot, every agent that reads the
    * slot holds it (sharedSlotAgents: the ordinary residents, and the
@@ -15311,9 +15323,12 @@ export class AgentFramework {
    * opening, the primary is told by name in its place, if one is registered,
    * as the opened notice tells it of an open by an agent that has ended, so
    * an agent that could close the channel hears it may open. It names
-   * channel_open as the way to try again only to an agent that can call it:
-   * a conversation fork's channel_open is refused outright
+   * channel_open as the way to try again only where the agent it's addressed
+   * to can call it: a conversation fork's channel_open is refused outright
    * (dispatchChannelToolCall), and an agent's allowedTools can leave it out.
+   * Others can read it too: the other residents, where several share one
+   * slot (#291), and forks spawned from the primary afterwards, from its
+   * window (#235).
    * Where the channel is selected for opening, it says so and why, as
    * speech's failure does, and what that means: where the host couldn't
    * record putting the channel's decision back, a later delivery or
@@ -15328,10 +15343,11 @@ export class AgentFramework {
    */
   private recordReplyOpenFailedNotice(
     agentName: string | undefined,
+    serverId: string,
     channel: { channelId: string; label?: string },
     selectedForOpening?: SelectedForOpening,
   ): void {
-    this.writeChannelNotices(this.replyOpenFailedNotices(agentName, channel, selectedForOpening), 'reply open-failed notice', 'recordReplyOpenFailedNotice');
+    this.writeChannelNotices(this.replyOpenFailedNotices(agentName, serverId, channel, selectedForOpening), 'reply open-failed notice', 'recordReplyOpenFailedNotice');
   }
 
   /**
@@ -15340,13 +15356,14 @@ export class AgentFramework {
    * then the reader's, which then says the primary was told (`untold`: its
    * words where that didn't land). None, logged, where the agent has ended and the channel
    * stays closed, or there's no primary to tell. The reader's carries its
-   * inputs (`passOn`) where it's addressed to the agent whose reply it was,
-   * the channel is selected for opening and that agent was told it can close
-   * it, so a release that finds it unread can tell the primary in its place
-   * (channelNoticeForPrimary).
+   * inputs (`passOn`), the channel's server among them, where it's addressed
+   * to the agent whose reply it was, the channel is selected for opening and
+   * that agent was told it can close it, so a release that finds it unread
+   * can tell the primary in its place (channelNoticeForPrimary).
    */
   private replyOpenFailedNotices(
     agentName: string | undefined,
+    serverId: string,
     channel: { channelId: string; label?: string },
     selectedForOpening?: SelectedForOpening,
   ): ChannelNotice[] {
@@ -15395,7 +15412,7 @@ export class AgentFramework {
         : {
           system: true, kind: 'channel-notice',
           ...(agentName && selectedForOpening !== undefined && canClose
-            ? { passOn: { notice: 'reply-open-failed', channel, selectedForOpening } satisfies ChannelNoticePassOn }
+            ? { passOn: { notice: 'reply-open-failed', serverId, channel, selectedForOpening } satisfies ChannelNoticePassOn }
             : {}),
         }) as MessageMetadata,
       ...(agentName && !ended ? { target: { forAgent: agentName } } : {}),
@@ -21873,38 +21890,43 @@ export class AgentFramework {
    * `speaker` has ended, gives the words it gives an agent that has ended,
    * judged for the primary, or nothing, logged, with no primary to tell.
    * They speak of the open or the failure as it was, as the notice did, and
-   * only of what still holds by each channel's durable desired state: the
-   * registry's (desiredStateOf), or before there is one, as at a serving
-   * boot's flush, the lifecycle log's (desiredStateInLog). An opened channel
-   * since closed is left out, and so is a failed one no longer selected for
-   * opening, or open since. With nothing left, no one is told, logged here.
+   * only of what still holds by each channel's durable decision on its own
+   * server: the registry's (getDesiredState), or before there is one, as at
+   * a serving boot's flush, the lifecycle log's (desiredStateInLog). That's
+   * the decision, not the transport at that moment: it's what channel_close
+   * changes and what the host carries out once the transport is back, and at
+   * a serving boot no transport is up yet. An opened channel no longer
+   * decided open or tuned out is left out, and so is a failed one no longer
+   * selected for opening, or open since. With nothing left, no one is told,
+   * logged here.
    */
   private channelNoticeForPrimary(
     speaker: string,
     passOn: ChannelNoticePassOn,
   ): { content: ContentBlock[]; metadata: MessageMetadata } | null {
     const registry = this.channelRegistry;
-    const desiredState = (channelId: string) =>
-      (registry ? registry.desiredStateOf(channelId) : desiredStateInLog(this.store, channelId));
+    const { serverId } = passOn;
+    // A tune-out leaves a channel open, its traffic held, and keeps a channel
+    // not open yet selected for opening (reconcile opens it).
+    const decidedOpen = (channelId: string) => {
+      const desired = registry ? registry.getDesiredState(serverId, channelId) : desiredStateInLog(this.store, serverId, channelId);
+      return desired === 'open' || desired === 'tuned-out';
+    };
     let notice: ChannelNotice | undefined;
     if (passOn.notice === 'channel-opened') {
-      // A tune-out leaves a channel open, its traffic held.
-      const channels = passOn.channels.filter((c) => {
-        const desired = desiredState(c.channelId);
-        return desired === 'open' || desired === 'tuned-out';
-      });
+      const channels = passOn.channels.filter((c) => decidedOpen(c.channelId));
       if (channels.length === 0) {
-        console.error(`[channel] ${speaker} has ended, and what its notice said opened is closed now (${passOn.channels.map(shownChannel).join(', ')}): no one is told`);
+        console.error(`[channel] ${speaker} has ended, and no channel its notice said opened is decided open or tuned out now (${passOn.channels.map(shownChannel).join(', ')}): no one is told`);
         return null;
       }
-      [notice] = this.channelOpenedNotices(speaker, channels, passOn.cause);
+      [notice] = this.channelOpenedNotices(speaker, serverId, channels, passOn.cause);
     } else {
       const { channelId } = passOn.channel;
-      if (desiredState(channelId) !== 'open' || registry?.isChannelOpen(channelId)) {
-        console.error(`[channel] ${speaker} has ended, and ${shownChannel(passOn.channel)} is no longer waiting to open, as its notice said: no one is told`);
+      if (!decidedOpen(channelId) || registry?.isChannelOpen(channelId, serverId)) {
+        console.error(`[channel] ${speaker} has ended, and ${shownChannel(passOn.channel)}, which its notice said was not open and selected for opening, is open now or no longer selected: no one is told`);
         return null;
       }
-      [notice] = this.replyOpenFailedNotices(speaker, passOn.channel, passOn.selectedForOpening);
+      [notice] = this.replyOpenFailedNotices(speaker, serverId, passOn.channel, passOn.selectedForOpening);
     }
     return notice ? { content: [{ type: 'text', text: notice.text }], metadata: notice.metadata } : null;
   }
@@ -22955,8 +22977,8 @@ export class AgentFramework {
         // opt-out named to a reader that can use it. Routed here so
         // registry-driven opens and framework-driven opens produce the same
         // durable notice.
-        onChannelAutoOpened: ({ conversationId, source, channels }) => {
-          this.recordChannelAutoOpenNotice(conversationId, channels, source);
+        onChannelAutoOpened: ({ conversationId, serverId, source, channels }) => {
+          this.recordChannelAutoOpenNotice(conversationId, serverId, channels, source);
         },
       },
     );
@@ -26206,6 +26228,7 @@ export class AgentFramework {
                   );
                   this.recordChannelAutoOpenNotice(
                     agentName,
+                    serverId,
                     [{ channelId: channelId ?? target, label }],
                     'opened-by-reply',
                   );
@@ -26223,7 +26246,7 @@ export class AgentFramework {
                     `[channel] ${agentName}: ${toolName} delivered to ${target} but the open-on-send failed` +
                       (tell ? '; the agent is told' : ''),
                   );
-                  if (tell) this.recordReplyOpenFailedNotice(agentName, { channelId: channelId ?? target, label }, selectedForOpening);
+                  if (tell) this.recordReplyOpenFailedNotice(agentName, serverId, { channelId: channelId ?? target, label }, selectedForOpening);
                 }
               })
               .catch((err) => console.error('[channel] open-on-send error:', err));

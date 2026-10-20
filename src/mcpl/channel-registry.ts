@@ -257,23 +257,22 @@ function desiredStateRecord(item: unknown): {
 }
 
 /**
- * The desired state `store`'s lifecycle log records for `channelId`, found
- * by its id alone, for a reader with no registry yet, as a serving boot's
+ * The desired state `store`'s lifecycle log records for `channelId` on
+ * `serverId`, for a reader with no registry yet, as a serving boot's
  * deferred-write flush is, before initializeMcpl: the last decision wins, as
- * the registry's replay reads it (desiredStateOf answers once there is a
- * registry). undefined when no decision names it, or decisions on more than
- * one server do.
+ * the registry's replay reads it (getDesiredState answers once there is a
+ * registry). undefined when no decision names it.
  */
-export function desiredStateInLog(store: JsStore, channelId: string): DesiredChannelState | undefined {
+export function desiredStateInLog(store: JsStore, serverId: string, channelId: string): DesiredChannelState | undefined {
   ensureStateRegistered(store, { id: CHANNEL_LIFECYCLE_LOG_ID, strategy: 'append_log' });
   const raw = store.getStateJson(CHANNEL_LIFECYCLE_LOG_ID);
   if (!Array.isArray(raw)) return undefined;
-  const byServer = new Map<string, DesiredChannelState>();
+  let state: DesiredChannelState | undefined;
   for (const item of raw) {
     const decision = desiredStateRecord(item);
-    if (decision?.channelId === channelId) byServer.set(decision.serverId, decision.state);
+    if (decision?.serverId === serverId && decision.channelId === channelId) state = decision.state;
   }
-  return byServer.size === 1 ? [...byServer.values()][0] : undefined;
+  return state;
 }
 
 /** One append-log record in `CHANNEL_LABEL_HISTORY_LOG_ID`: "at `ts`, this
@@ -2052,28 +2051,16 @@ export class ChannelRegistry {
     return typeof label === 'string' && label.length > 0 ? label : undefined;
   }
 
-  isChannelOpen(channelId: string): boolean {
-    return this.findChannelEntry(channelId)?.open === true;
+  /** Whether `channelId`'s transport is open: on `serverId` where the caller
+   *  knows the channel's server, and otherwise on the first server found to
+   *  register that id (findChannelEntry). */
+  isChannelOpen(channelId: string, serverId?: string): boolean {
+    const entry = serverId ? this.channels.get(`${serverId}:${channelId}`) : this.findChannelEntry(channelId);
+    return entry?.open === true;
   }
 
   getDesiredState(serverId: string, channelId: string): DesiredChannelState | undefined {
     return this.desiredStates.get(this.lifecycleKey(serverId, channelId))?.state;
-  }
-
-  /**
-   * The durable desired state of `channelId`, for a reader that knows only
-   * the channel: its server's record where the channel is registered, and
-   * otherwise the lifecycle log's record for that id, which is all boot has
-   * before the servers reconnect. undefined when no record names it, or
-   * records on more than one server do.
-   */
-  desiredStateOf(channelId: string): DesiredChannelState | undefined {
-    const serverId = this.getChannelServerId(channelId);
-    if (serverId !== null) return this.getDesiredState(serverId, channelId);
-    const states = [...this.desiredStates]
-      .filter(([key]) => key.slice(key.indexOf('\u0000') + 1) === channelId)
-      .map(([, record]) => record.state);
-    return states.length === 1 ? states[0] : undefined;
   }
 
   /**
