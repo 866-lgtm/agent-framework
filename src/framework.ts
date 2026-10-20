@@ -102,7 +102,7 @@ import { isSilentHeartbeatMarker, isVisiblyEmptyContent, NON_STRING_TEXT_PLACEHO
 import { parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
-import { ChannelRegistry, connectorText, destinationKey, journalToolDescription, type ChannelToolOrigin, type PublishDestination, type PublishOutcome, type SelectedForOpening } from './mcpl/channel-registry.js';
+import { ChannelRegistry, connectorText, desiredStateInLog, destinationKey, journalToolDescription, type ChannelToolOrigin, type PublishDestination, type PublishOutcome, type SelectedForOpening } from './mcpl/channel-registry.js';
 import { KEEP_IDLE_MS, KEEP_NEWEST, ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftAttempt, type DraftReason, type DraftState, type InheritedRisk } from './prose-drafts.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import { INBOUND_SOURCE_KEY, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
@@ -2195,6 +2195,11 @@ interface ChannelNotice {
 type ChannelNoticePassOn =
   | { notice: 'channel-opened'; cause: ChannelOpenedCause; channels: Array<{ channelId: string; label?: string }> }
   | { notice: 'reply-open-failed'; channel: { channelId: string; label?: string }; selectedForOpening: SelectedForOpening };
+
+/** A channel as a notice shows it: its label beside its id, or its id alone. */
+function shownChannel(channel: { channelId: string; label?: string }): string {
+  return channel.label && channel.label !== channel.channelId ? `${channel.label} (${channel.channelId})` : channel.channelId;
+}
 
 /** A channel as a notice's inputs carry it, read back from stored metadata. */
 function noticeChannel(value: unknown): { channelId: string; label?: string } | null {
@@ -15142,9 +15147,7 @@ export class AgentFramework {
     channels: Array<{ channelId: string; label?: string }>,
     cause: ChannelOpenedCause,
   ): ChannelNotice[] {
-    const shown = channels
-      .map((c) => (c.label && c.label !== c.channelId ? `${c.label} (${c.channelId})` : c.channelId))
-      .join(', ');
+    const shown = channels.map(shownChannel).join(', ');
     const ids = channels.map((c) => c.channelId);
     const plural = channels.length > 1;
     // What the channels deliver is said only to an agent that holds their
@@ -15347,9 +15350,7 @@ export class AgentFramework {
     channel: { channelId: string; label?: string },
     selectedForOpening?: SelectedForOpening,
   ): ChannelNotice[] {
-    const shown = channel.label && channel.label !== channel.channelId
-      ? `${channel.label} (${channel.channelId})`
-      : channel.channelId;
+    const shown = shownChannel(channel);
     const ended = !!agentName && !this.agents.has(agentName);
     if (ended && !selectedForOpening) {
       console.error(`[channel] ${agentName} has ended; not telling it that ${shown} couldn't be opened`);
@@ -21868,19 +21869,43 @@ export class AgentFramework {
 
   /**
    * The primary's by-name notice in place of a channel notice `speaker` was
-   * told it could act on and never read: its builder, called again with the
-   * same inputs now that `speaker` has ended, gives the words it gives an
-   * agent that has ended, judged for the primary, or nothing, logged, with no
-   * primary to tell. They speak of the open or the failure as it was, as the
-   * notice did.
+   * told it could act on and never read: its builder, called again now that
+   * `speaker` has ended, gives the words it gives an agent that has ended,
+   * judged for the primary, or nothing, logged, with no primary to tell.
+   * They speak of the open or the failure as it was, as the notice did, and
+   * only of what still holds by each channel's durable desired state: the
+   * registry's (desiredStateOf), or before there is one, as at a serving
+   * boot's flush, the lifecycle log's (desiredStateInLog). An opened channel
+   * since closed is left out, and so is a failed one no longer selected for
+   * opening, or open since. With nothing left, no one is told, logged here.
    */
   private channelNoticeForPrimary(
     speaker: string,
     passOn: ChannelNoticePassOn,
   ): { content: ContentBlock[]; metadata: MessageMetadata } | null {
-    const [notice] = passOn.notice === 'channel-opened'
-      ? this.channelOpenedNotices(speaker, passOn.channels, passOn.cause)
-      : this.replyOpenFailedNotices(speaker, passOn.channel, passOn.selectedForOpening);
+    const registry = this.channelRegistry;
+    const desiredState = (channelId: string) =>
+      (registry ? registry.desiredStateOf(channelId) : desiredStateInLog(this.store, channelId));
+    let notice: ChannelNotice | undefined;
+    if (passOn.notice === 'channel-opened') {
+      // A tune-out leaves a channel open, its traffic held.
+      const channels = passOn.channels.filter((c) => {
+        const desired = desiredState(c.channelId);
+        return desired === 'open' || desired === 'tuned-out';
+      });
+      if (channels.length === 0) {
+        console.error(`[channel] ${speaker} has ended, and what its notice said opened is closed now (${passOn.channels.map(shownChannel).join(', ')}): no one is told`);
+        return null;
+      }
+      [notice] = this.channelOpenedNotices(speaker, channels, passOn.cause);
+    } else {
+      const { channelId } = passOn.channel;
+      if (desiredState(channelId) !== 'open' || registry?.isChannelOpen(channelId)) {
+        console.error(`[channel] ${speaker} has ended, and ${shownChannel(passOn.channel)} is no longer waiting to open, as its notice said: no one is told`);
+        return null;
+      }
+      [notice] = this.replyOpenFailedNotices(speaker, passOn.channel, passOn.selectedForOpening);
+    }
     return notice ? { content: [{ type: 'text', text: notice.text }], metadata: notice.metadata } : null;
   }
 

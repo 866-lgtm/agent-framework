@@ -2708,6 +2708,8 @@ test("a channel notice's inputs give the primary's by-name notice once its reade
   framework.primaryAgentName = 'primary';
   framework.usedEphemeralAgentNames = new Set();
   framework.conversationAgentHomes = new Map();
+  // Every channel still as the notice says: open, or still waiting to open.
+  framework.channelRegistry = { desiredStateOf: () => 'open', isChannelOpen: () => false };
   const error = console.error;
   console.error = () => {};
   try {

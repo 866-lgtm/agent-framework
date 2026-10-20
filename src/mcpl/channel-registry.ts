@@ -238,6 +238,44 @@ interface ChannelLifecycleEvent {
   acknowledgment?: string;
 }
 
+/** A lifecycle-log item as a desired-state decision, or null when it isn't
+ *  one this build reads: the one rule the registry's replay
+ *  (initializeLifecycleStore) and desiredStateInLog read the log by. */
+function desiredStateRecord(item: unknown): {
+  serverId: string; channelId: string; state: DesiredChannelState; source: string; tuneOut?: TuneOutParams;
+} | null {
+  const event = item as Partial<ChannelLifecycleEvent> | null | undefined;
+  if (event?.kind !== 'desired-state' || typeof event.serverId !== 'string' || typeof event.channelId !== 'string') return null;
+  if (!(event.desired === 'open' || event.desired === 'closed' || (event.desired === 'tuned-out' && event.tuneOut))) return null;
+  return {
+    serverId: event.serverId,
+    channelId: event.channelId,
+    state: event.desired,
+    source: typeof event.source === 'string' ? event.source : 'unknown',
+    ...(event.desired === 'tuned-out' ? { tuneOut: event.tuneOut } : {}),
+  };
+}
+
+/**
+ * The desired state `store`'s lifecycle log records for `channelId`, found
+ * by its id alone, for a reader with no registry yet, as a serving boot's
+ * deferred-write flush is, before initializeMcpl: the last decision wins, as
+ * the registry's replay reads it (desiredStateOf answers once there is a
+ * registry). undefined when no decision names it, or decisions on more than
+ * one server do.
+ */
+export function desiredStateInLog(store: JsStore, channelId: string): DesiredChannelState | undefined {
+  ensureStateRegistered(store, { id: CHANNEL_LIFECYCLE_LOG_ID, strategy: 'append_log' });
+  const raw = store.getStateJson(CHANNEL_LIFECYCLE_LOG_ID);
+  if (!Array.isArray(raw)) return undefined;
+  const byServer = new Map<string, DesiredChannelState>();
+  for (const item of raw) {
+    const decision = desiredStateRecord(item);
+    if (decision?.channelId === channelId) byServer.set(decision.serverId, decision.state);
+  }
+  return byServer.size === 1 ? [...byServer.values()][0] : undefined;
+}
+
 /** One append-log record in `CHANNEL_LABEL_HISTORY_LOG_ID`: "at `ts`, this
  *  channelId's label was observed to be `label`". See `labelHistory`. */
 interface ChannelLabelSightingEvent {
@@ -2023,6 +2061,22 @@ export class ChannelRegistry {
   }
 
   /**
+   * The durable desired state of `channelId`, for a reader that knows only
+   * the channel: its server's record where the channel is registered, and
+   * otherwise the lifecycle log's record for that id, which is all boot has
+   * before the servers reconnect. undefined when no record names it, or
+   * records on more than one server do.
+   */
+  desiredStateOf(channelId: string): DesiredChannelState | undefined {
+    const serverId = this.getChannelServerId(channelId);
+    if (serverId !== null) return this.getDesiredState(serverId, channelId);
+    const states = [...this.desiredStates]
+      .filter(([key]) => key.slice(key.indexOf('\u0000') + 1) === channelId)
+      .map(([, record]) => record.state);
+    return states.length === 1 ? states[0] : undefined;
+  }
+
+  /**
    * Get all open channels.
    */
   getOpenChannels(): ChannelEntry[] {
@@ -2250,20 +2304,11 @@ export class ChannelRegistry {
       if (!item || typeof item !== 'object') continue;
       const event = item as Partial<ChannelLifecycleEvent>;
       if (typeof event.serverId !== 'string') continue;
-      if (
-        event.kind === 'desired-state' &&
-        typeof event.channelId === 'string' &&
-        (event.desired === 'open' || event.desired === 'closed' ||
-          (event.desired === 'tuned-out' && event.tuneOut))
-      ) {
+      const decision = desiredStateRecord(item);
+      if (decision) {
         this.desiredStates.set(
-          this.lifecycleKey(event.serverId, event.channelId),
-          {
-            state: event.desired,
-            source: typeof event.source === "string" ? event.source : "unknown",
-            tuneOut: event.desired === 'tuned-out' ? event.tuneOut : undefined,
-            wakeCount: 0,
-          },
+          this.lifecycleKey(decision.serverId, decision.channelId),
+          { state: decision.state, source: decision.source, tuneOut: decision.tuneOut, wakeCount: 0 },
         );
       } else if (
         event.kind === 'tune-out-wake' &&
