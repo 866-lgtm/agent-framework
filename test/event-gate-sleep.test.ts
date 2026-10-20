@@ -49,8 +49,12 @@ describe('EventGate sleep across a stop', () => {
     const { gate, inferenceRequests, traces } = makeGate();
     const timeouts = () => process.getActiveResourcesInfo().filter((r) => r === 'Timeout').length;
     const before = timeouts();
+    // The first sleep is short too: if setting a sleep again stopped
+    // replacing its timer, the first sleep's timer would hold this file's
+    // process until it fired.
+    gate.setSleep(2, 'resting', 'agent');
     gate.setSleep(0.2, 'resting', 'agent');
-    assert.strictEqual(timeouts(), before + 1, 'the sleep arms one timer');
+    assert.strictEqual(timeouts(), before + 1, 'a sleep set again replaces its timer');
     gate.dispose();
     assert.strictEqual(timeouts(), before, 'dispose() leaves no timer to hold the process');
     await wait(400);
@@ -96,7 +100,7 @@ describe('EventGate sleep across a stop', () => {
       store,
       membrane: membrane.asMembrane(),
       agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
-      gate: { config: { policies: [], default: 'always' } },
+      gate: { config: { policies: [], default: 'always' }, configPath: join(TMP_DIR, 'gate-stopped.json') },
       modules: [],
     });
     const internals = framework as unknown as {
@@ -109,9 +113,11 @@ describe('EventGate sleep across a stop', () => {
     });
     try {
       framework.start();
-      internals.eventGate.setSleep(0.2, 'resting', 'agent');
+      // Long enough for stop() to dispose the gate first even on a loaded
+      // host: a sleep that ends during stop()'s own teardown still fires.
+      internals.eventGate.setSleep(1, 'resting', 'agent');
       await framework.stop();
-      await wait(400);
+      await wait(1_500);
       assert.deepStrictEqual(expiries, [], 'nothing expires while stopped');
       assert.ok(!internals.pendingRequests.some((r) => r.source === 'sleep'), 'no wake is queued while stopped');
       framework.start();
@@ -133,15 +139,17 @@ describe('EventGate sleep across a stop', () => {
       store,
       membrane: membrane.asMembrane(),
       agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
-      gate: { config: { policies: [], default: 'always' } },
+      gate: { config: { policies: [], default: 'always' }, configPath: join(TMP_DIR, 'gate-one-turn.json') },
       modules: [],
     });
     const gate = (framework as unknown as { eventGate: EventGate }).eventGate;
     try {
       framework.start();
-      gate.setSleep(0.1, 'resting', 'agent');
+      // As above: the sleep ends after stop() has disposed the gate, so its
+      // wake is owed at start rather than queued during the teardown.
+      gate.setSleep(1, 'resting', 'agent');
       await framework.stop();
-      await wait(250);
+      await wait(1_500);
       assert.strictEqual(framework.nudgeAgent('agent', 'test').ok, true);
       framework.start();
       const deadline = Date.now() + 3_000;
