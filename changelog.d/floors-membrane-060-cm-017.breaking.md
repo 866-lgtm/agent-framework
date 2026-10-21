@@ -1,6 +1,6 @@
 - **Hosts:** agent-framework now depends on membrane `^0.6.0` and
   context-manager `^0.17.1`, where it depended on `^0.5.87` and `^0.14.1`.
-  context-manager 0.16.0 requires membrane `^0.6.0` itself, so the two
+  context-manager 0.17.1 requires membrane `^0.6.0` itself, so the two
   install one membrane between them. What reaches a host through
   agent-framework, from those releases' notes:
   - **Your own membrane:** a host that builds its own `Membrane` and hands it
@@ -37,5 +37,17 @@
     upgrading carries the new text wherever it renders such a note, so a
     provider's prompt cache misses once, from the first such note on
     (membrane 0.6.0).
+  - **Caller-supplied blob references:** context-manager 0.17.1 refuses
+    `blob_ref` writes with `MalformedContentError`; these references are
+    store-internal. Read with blobs resolved (the default) before copying a
+    body into a new write. An unresolved read is not a write-ready payload.
+  - **Compression quarantine status:** callers that inspect or compare
+    `getCompressionQuarantineStatus()` must account for its `spans` field,
+    including an empty array when no spans are quarantined.
+  - **kv-unified policy:** context-manager 0.17 adds age bands, joint latent
+    demand and the subtree engine. Explicit recipe overrides remain important:
+    `policy.ageBandSteps: 0` requests exact ages, `latentDemandMode: 'individual'`
+    chooses independent ranking, and `engine: 'dag'` selects the DAG engine.
+    Hosts must type/validate these controls rather than silently accept typos.
   - The rest is in membrane 0.6.0's notes and context-manager 0.15.0's and
-    0.16.0's.
+    0.16.0's and 0.17.x's.

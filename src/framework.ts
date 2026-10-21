@@ -21525,9 +21525,11 @@ export class AgentFramework {
    * them land out of order.
    *
    * An entry context-manager refuses as malformed (MalformedContentError) is
-   * the exception. The store refuses its content before storing any of it,
-   * and would refuse it at every flush, so requeued it would hold its
-   * target's later writes for good. It's logged and dropped instead, and its
+   * the exception once readback confirms that nothing landed. An unknown
+   * landing remains queued for ID reconciliation before retry; a known landed
+   * copy counts as written. A confirmed-empty malformed refusal would fail
+   * every flush and hold its target's later writes for good, so it's logged
+   * and dropped instead, and its
    * target isn't cut: left in the un-acked set, the next ack drops it from
    * the durable queue. A tool_use dropped this way leaves a tool_result
    * queued behind it to be stored alone. context-manager mends a tool_use

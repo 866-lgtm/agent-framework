@@ -47,7 +47,7 @@ import type {
 } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
 import { heldHandle } from '../src/held-writes.js';
-import { AutobiographicalStrategy } from '@animalabs/context-manager';
+import { AutobiographicalStrategy, MalformedContentError } from '@animalabs/context-manager';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
@@ -741,6 +741,67 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     assert.ok(!errors.some((e) => e.includes("still can't be looked up by its id")), errors.join('\n'));
     await framework.stop();
   });
+
+  for (const landed of [true, false]) {
+    it(`malformed refusal with unreadable landing persists unknown and reconciles in a real reopened store (${landed ? 'landed' : 'refused before write'})`, async () => {
+      const framework = await createFramework();
+      const internals = drainInternals(framework);
+      internals.deferredWritesPersisted = true;
+      const cm = framework.getAgent('assistant')!.getContextManager();
+      const first = entry('w-malformed-real', 'first');
+      if (!landed) first.content = [{ type: 'text', text: 42 }] as unknown as ContentBlock[];
+      const second = { ...entry('w-after-malformed', 'after'), seq: 2 };
+      const count = cm.getMessageCount.bind(cm);
+      const query = cm.queryMessages;
+      let failReadback = false;
+      cm.getMessageCount = () => {
+        if (failReadback) { failReadback = false; throw new Error('injected post-refusal readback failure'); }
+        return count();
+      };
+      const errors: string[] = [];
+      const error = console.error;
+      console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+      let reopened: AgentFramework | undefined;
+      try {
+        internals.writeDrainedInOrder([first, second], 'test-real-store', (m) => {
+          try {
+            const id = cm.addMessage(m.participant, m.content, { deferredWriteId: m.id } as never);
+            // Models a listener/later shard refusing after a copy landed.
+            if (m === first) throw new MalformedContentError('injected post-store refusal', ['content[0]']);
+            return id;
+          } catch (e) {
+            assert.ok(e instanceof MalformedContentError);
+            failReadback = true;
+            throw e;
+          }
+        });
+        assert.deepEqual(internals.deferredMessages.map(m => [m.id, m.landing]), [
+          ['w-malformed-real', 'unknown'], ['w-after-malformed', undefined],
+        ], 'real readback failure requeues the ordered suffix with the unknown marker');
+        assert.equal(cm.queryMessages({ metadata: { deferredWriteId: first.id } } as never).messages.length, landed ? 1 : 0);
+        assert.equal(cm.queryMessages({ metadata: { deferredWriteId: second.id } } as never).messages.length, 0, 'successor stays held');
+        cm.getMessageCount = count;
+        // Keep the ambiguity through stop so the actual durable queue must
+        // restore the marker; do not stub framework readback/requeue helpers.
+        cm.queryMessages = () => { throw new Error('injected search failure until reopen'); };
+        await framework.stop();
+        assert.equal(internals.deferredMessages[0]?.landing, 'unknown');
+        reopened = await createFramework();
+        const restored = reopened.getAgent('assistant')!.getContextManager();
+        assert.equal(restored.queryMessages({ metadata: { deferredWriteId: first.id } } as never).messages.length, landed ? 1 : 0, 'landed copy is never duplicated; refused content is never stored');
+        assert.equal(restored.queryMessages({ metadata: { deferredWriteId: second.id } } as never).messages.length, 1, 'successor eventually lands exactly once');
+        assert.deepEqual(drainInternals(reopened).deferredMessages, [], 'queue drained after real ID reconciliation');
+        assert.ok(errors.some(e => e.includes("store couldn't be read")), errors.join('\n'));
+        assert.ok(errors.some(e => e.includes(landed ? 'was found by its id' : 'dropped')), errors.join('\n'));
+      } finally {
+        console.error = error;
+        cm.getMessageCount = count;
+        cm.queryMessages = query;
+        if (reopened) await reopened.stop();
+        else await framework.stop();
+      }
+    });
+  }
 
   for (const landed of [true, false]) {
     it(`a write whose landing is unknown keeps its mark across a restart, so it's stored once after it (${landed ? 'its first write landed' : 'nothing landed'})`, async () => {
