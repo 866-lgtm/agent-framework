@@ -953,48 +953,57 @@ test('a tune-out\'s open that throws is asked for anew by the next call, not ans
   await assert.rejects(opening!, /tune-out couldn't be read/);
 });
 
-test('a tune-out waits for work queued after its waits\' last look at the queue, before the turn that acts', async () => {
-  for (const wait of ['before its open', 'after its open'] as const) {
-    const f = await closedChannel();
-    const tails = (f.registry as unknown as { channelLifecycleTails: Map<string, Promise<void>> }).channelLifecycleTails;
-    const lookUp = tails.get.bind(tails);
-    let armed = wait === 'before its open';
-    let answerQueued!: () => void;
-    let opens = 0;
-    f.server.sendChannelsOpen = async ({ channelId }) => {
-      f.server.sent.push(`open ${channelId}`);
-      opens++;
-      // The tune-out's own open arms the second case; the open queued in the
-      // gap is held there.
-      if (wait === 'after its open' && opens === 1) armed = true;
-      if (wait === 'after its open' && opens === 2) await new Promise<void>((resolve) => { answerQueued = resolve; });
-      return { channel: descriptor(channelId) };
-    };
-    tails.get = (key: string) => {
-      const tail = lookUp(key);
-      // A wait has looked and found nothing queued: work is queued now, in
-      // the gap before the wait's caller resumes.
-      if (tail === undefined && armed) {
-        armed = false;
-        void (f.registry as unknown as { applyDesiredChannelState(s: string, c: string): Promise<unknown> })
-          .applyDesiredChannelState('a', 'y').catch(() => undefined);
-      }
-      return tail;
-    };
-    f.registry.enterTuneOut('a', 'y', PARAMS, 'agent-tool');
-    let answered = false;
-    const opening = f.registry.openForTuneOut('a', 'y').finally(() => { answered = true; });
-    if (wait === 'after its open') {
-      for (let i = 0; i < 40 && !answerQueued; i++) await tick();
-      assert.ok(answerQueued, 'the work queued in the gap sends its open');
-      for (let i = 0; i < 10; i++) await tick();
-      assert.equal(answered, false, 'the answer waits for the work queued after its wait last looked');
-      answerQueued();
+test('a tune-out waits for work queued after its first wait\'s last look at the queue, before the turn that reads the state', async () => {
+  const f = await closedChannel();
+  const tails = (f.registry as unknown as { channelLifecycleTails: Map<string, Promise<void>> }).channelLifecycleTails;
+  const lookUp = tails.get.bind(tails);
+  let armed = true;
+  tails.get = (key: string) => {
+    const tail = lookUp(key);
+    // The wait has looked and found nothing queued: work is queued now, in
+    // the gap before the wait's caller resumes.
+    if (tail === undefined && armed) {
+      armed = false;
+      void (f.registry as unknown as { applyDesiredChannelState(s: string, c: string): Promise<unknown> })
+        .applyDesiredChannelState('a', 'y').catch(() => undefined);
     }
-    assert.equal(await opening, undefined, wait);
-    assert.deepEqual(f.server.sent, wait === 'before its open' ? ['open y'] : ['open y', 'open y'],
-      wait === 'before its open' ? 'the queued work\'s open, and none of the tune-out\'s own behind it' : wait);
-  }
+    return tail;
+  };
+  f.registry.enterTuneOut('a', 'y', PARAMS, 'agent-tool');
+  assert.equal(await f.registry.openForTuneOut('a', 'y'), undefined);
+  assert.deepEqual(f.server.sent, ['open y'], 'the queued work\'s open, and none of the tune-out\'s own behind it');
+});
+
+test('a tune-out waits for work queued while the work its last wait waited for ran', async () => {
+  const f = await closedChannel();
+  const apply = () => (f.registry as unknown as { applyDesiredChannelState(s: string, c: string): Promise<unknown> })
+    .applyDesiredChannelState('a', 'y').catch(() => undefined);
+  let opens = 0;
+  const held: Array<() => void> = [];
+  f.server.sendChannelsOpen = async ({ channelId }) => {
+    f.server.sent.push(`open ${channelId}`);
+    opens++;
+    // The tune-out's own open queues a reconcile behind it, whose open is
+    // held; the last open is held too.
+    if (opens === 1) void apply();
+    if (opens >= 2) await new Promise<void>((resolve) => { held.push(resolve); });
+    return { channel: descriptor(channelId) };
+  };
+  f.registry.enterTuneOut('a', 'y', PARAMS, 'agent-tool');
+  let answered = false;
+  const opening = f.registry.openForTuneOut('a', 'y').finally(() => { answered = true; });
+  for (let i = 0; i < 40 && held.length < 1; i++) await tick();
+  assert.equal(opens, 2, 'the reconcile\'s open is out, and the answer waits for it');
+  // More work is queued while the reconcile the wait is waiting for runs.
+  void apply();
+  held.shift()!();
+  for (let i = 0; i < 40 && held.length < 1; i++) await tick();
+  assert.equal(opens, 3, 'the work queued meanwhile sends its open');
+  for (let i = 0; i < 10; i++) await tick();
+  assert.equal(answered, false, 'the answer waits for the work queued while the reconcile ran');
+  held.shift()!();
+  assert.equal(await opening, undefined);
+  assert.deepEqual(f.server.sent, ['open y', 'open y', 'open y']);
 });
 
 // --- tune_out itself, through the framework ---------------------------------
