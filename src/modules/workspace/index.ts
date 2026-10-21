@@ -4645,9 +4645,9 @@ export class WorkspaceModule implements Module {
     // Whether a file has CRLF ends or a BOM is a fact about the file, not a
     // line, so each searched file that has either is kept here by its path,
     // for the note on a pattern that names a CR or U+FEFF to name it. A
-    // conflict's disk version is kept only where the workspace's copy of its
-    // path has neither, and is named as that version, since read doesn't show
-    // it.
+    // conflict's disk version is kept, for each, only where the workspace's
+    // copy of its path doesn't have it, and is named as that version, since
+    // read doesn't show it.
     const crlfFiles = new Map<string, { ends: 'CRLF' | 'mixed'; version: GrepText['version'] }>();
     const bomFiles = new Map<string, GrepText['version']>();
     const search = (text: GrepText): Searched => {
@@ -5957,8 +5957,9 @@ const ofVersion = (version: GrepText['version']): string =>
 /**
  * grep's note for a pattern that names a character its lines leave out, where
  * a file it searched has one: it says how many files searched have it and
- * names them, each with whether its ends are CRLF or mixed, so a search for a
- * CR or a BOM still finds the files that have them. The note says a
+ * names them, so a search for a CR or a BOM still finds the files that have
+ * them. The CR note gives each file's ends, CRLF or mixed, and either note
+ * names a conflict's disk version as that version. The note says a
  * character read shows it in the workspace's copy, since grep also searches a
  * conflict's disk version, which read doesn't show. A direct mount keeps no
  * workspace copy, and its read shows disk's file, so on a host with one
