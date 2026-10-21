@@ -1,6 +1,6 @@
 - **Hosts:** agent-framework now depends on membrane `^0.6.0` and
-  context-manager `^0.17.1`, where it depended on `^0.5.87` and `^0.14.1`.
-  context-manager 0.17.1 requires membrane `^0.6.0` itself, so the two
+  context-manager `^0.18.0`, where it depended on `^0.5.87` and `^0.14.1`.
+  context-manager 0.18.0 requires membrane `^0.6.0` itself, so the two
   install one membrane between them. What reaches a host through
   agent-framework, from those releases' notes:
   - **Your own membrane:** a host that builds its own `Membrane` and hands it
@@ -11,7 +11,7 @@
     OpenAI's `cached_tokens`), so a compression fallback that fits can be
     rejected at admission and its chunk quarantined (context-manager 0.16.0).
   - **Your own context-manager:** a host that constructs strategies from its
-    own `@animalabs/context-manager` must also raise that range to `^0.17.1`,
+    own `@animalabs/context-manager` must also raise that range to `^0.18.0`,
     matching agent-framework's dependency, and verify that installation has
     one compatible copy. Leaving the host on 0.14.x installs two copies and
     hands an older strategy to a newer manager; strategy interfaces and
@@ -54,5 +54,24 @@
     demand and the subtree engine. Explicit recipe overrides remain important:
     `policy.ageBandSteps: 0` requests exact ages, `latentDemandMode: 'individual'`
     chooses independent ranking, and `engine: 'dag'` selects the DAG engine.
-  - The rest is in membrane 0.6.0's notes and context-manager 0.15.0's and
-    0.16.0's and 0.17.x's.
+  - **Merges across an unowned message:** the floor is 0.18.0, not 0.17.x,
+    because before it a merge could group the summaries on either side of a
+    message no chunk owns (a raw pin, a message an unpin freed, or a head
+    window `resetHeadWindow` left mid-stream), and under kv-unified without
+    `treeifyNonContiguousSummaries` or `preserveGapBearingSummaries` every
+    compile after it threw `CanonicalForestError`. A store already holding
+    such a summary loads as before (context-manager 0.18.0, #287).
+  - **`close()` is final:** after a context manager's `close()`, every
+    operation that writes or calls into its strategy throws, with an
+    app-owned store too; open a new manager on the store to go on with it
+    (context-manager 0.18.0).
+  - **Compression debt:** `getCompressionDebt()` answers `unknown` when it
+    can't read what decides its state, with `null` for each count it couldn't
+    compute and an operator-facing `error`. A host that shows the report
+    treats `unknown` as needing attention and never shows a `null` count as
+    0 (context-manager 0.18.0).
+  - **Strategy subclasses:** `AutobiographicalStrategy`'s protected
+    `pruneToolEntries` is removed; override `toolPruning` or `prunedForSend`
+    instead (context-manager 0.18.0).
+  - The rest is in membrane 0.6.0's notes and context-manager 0.15.0's,
+    0.16.0's, 0.17.x's and 0.18.0's.
