@@ -452,6 +452,33 @@ export function journalToolDescription(canSkipReply: boolean): string {
     'text is routed' + (canSkipReply ? '; to end the turn without replying, call skip_reply afterwards.' : '.');
 }
 
+/**
+ * channel_open's and channel_close's descriptions for an agent whose window doesn't hold a channel's traffic: an
+ * ephemeral run, whose store is its own unless it's where channel messages are stored (on a host with no residents,
+ * the first registered agent), and on a host that routes conversations every agent but a fork, since a channel's
+ * messages go to its fork or, unrouted, nowhere. The descriptions in CHANNEL_TOOL_DEFINITIONS, written for the agents
+ * that read a channel, promised such an agent what it never gets: "Messages that address you still reach you", and
+ * history "preceding the message that invited you" when nothing invites it. Given per agent (AgentFramework's
+ * getToolsForAgent), so a holder's cached tool list doesn't change.
+ *
+ * Both say the call is for every agent: the decision is recorded per server and channel (setDesiredState), so a run's
+ * close closes the channel for the agents whose windows hold it, which "its messages don't come to you" alone could
+ * read as costing nothing. They claim only what holds on both lanes: a push that names a channel is stored in the
+ * residents' shared slot whether or not the channel is open (handleMcplPushEvent), so on a routed host the residents
+ * get the channel's pushes, and a server may push while a channel is closed and send channels/incoming once it's
+ * open. So opening brings the caller none of the channel's messages, and closing stops none reaching it. The history
+ * channel_open asks for comes back in its result (handleToolOpen), so that clause is true for anyone.
+ */
+export const NON_HOLDER_CHANNEL_DESCRIPTIONS: Readonly<Record<'channel_open' | 'channel_close', string>> = {
+  channel_open:
+    'Open a channel for every agent on this host. Opening it brings you none of its messages; for the agents they do ' +
+    'come to, its server decides what it delivers. Optionally request some of its history, which comes back to you in ' +
+    'this call.',
+  channel_close:
+    'Close a channel for every agent on this host. Closing it stops none of its messages reaching you; for the agents ' +
+    'they do come to, its server decides what closing it stops.',
+};
+
 const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'channel_list',
