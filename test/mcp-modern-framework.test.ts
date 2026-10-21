@@ -19,6 +19,7 @@ import { AgentFramework, WorkspaceModule } from '../src/index.js';
 import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolDefinition, ToolResult } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { answerText, scriptCall } from './helpers/script-call.js';
+import { schedulerPasses } from './helpers/scheduler-passes.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const MODERN = join(here, 'fixtures', 'modern-mcp-server.mjs');
@@ -47,31 +48,6 @@ async function waitFor(what: string, cond: () => boolean, timeoutMs = 8000): Pro
 }
 
 const lines = (file: string) => (existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean) : []);
-
-/**
- * A count of the scheduler's passes over the queued requests: the returned
- * wait ends once a pass that began after it was called has completed. A
- * pass is done with each request it took when it completes, and a turn it
- * starts has asked the membrane for its stream by then, unless an auxiliary
- * call holds the agent's provider gate as it starts. No auxiliary call is
- * in flight at the passes these tests wait for. A pass that throws doesn't
- * count, since it may have stopped before the request a test waits on.
- */
-function schedulerPasses(framework: AgentFramework): () => Promise<void> {
-  const owner = framework as unknown as { processInferenceRequests: () => Promise<void> };
-  const pass = owner.processInferenceRequests.bind(framework);
-  let begun = 0;
-  let completed = 0;
-  owner.processInferenceRequests = async () => {
-    const n = ++begun;
-    await pass();
-    completed = Math.max(completed, n);
-  };
-  return () => {
-    const after = begun + 1;
-    return waitFor('a scheduler pass to complete', () => completed >= after);
-  };
-}
 
 interface Harness { framework: AgentFramework; membrane: MockMembrane; dir: string }
 
@@ -471,7 +447,7 @@ test('quiesce: a list change refreshes the inventory, and its wake parks until r
   await withModern(async ({ framework, membrane }) => {
     framework.start();
     await framework.quiesce({ reason: 'maintenance' });
-    const nextPass = schedulerPasses(framework);
+    const nextPass = schedulerPasses(framework, waitFor);
     const callsBefore = membrane.calls.length;
     const gatedBefore = framework.getHostModeStatus().gatedRequests;
 
@@ -491,7 +467,7 @@ test('quiesce: a lost modern child reconnects and relists without starting a tur
   await withModern(async ({ framework, membrane, dir }) => {
     framework.start();
     await framework.quiesce({ reason: 'maintenance' });
-    const nextPass = schedulerPasses(framework);
+    const nextPass = schedulerPasses(framework, waitFor);
     const callsBefore = membrane.calls.length;
     const gatedBefore = framework.getHostModeStatus().gatedRequests;
     const internals = framework as unknown as {

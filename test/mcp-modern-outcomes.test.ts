@@ -796,6 +796,10 @@ test('a connection lost between continuation rounds is no-response, not an answe
   assert.equal(failure.outcome, 'no-response');
   const account = accounts.find((a) => a.message === failure.message);
   assert.ok(account, `one of the two accounts, not: ${failure.message}`);
+  // The line carries the SDK's reason, which records how the call ended, so
+  // it pins the account to the order: a host that gave the generic close
+  // after reading leg 1's answer would log that with "Not connected", the
+  // reason, and fail here.
   loggedLine(logged, account.line);
   assert.equal(calls(log, 'cont'), 1, 'only leg 1 reached the server');
 });

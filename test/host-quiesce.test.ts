@@ -26,6 +26,7 @@ import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework, ResumeBlockedError } from '../src/index.js';
 import type { TraceEvent } from '../src/types/trace.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { schedulerPasses } from './helpers/scheduler-passes.js';
 
 async function waitFor(
   description: string,
@@ -37,31 +38,6 @@ async function waitFor(
     if (Date.now() > deadline) throw new Error(`Timed out waiting for ${description}`);
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
-}
-
-/**
- * A count of the scheduler's passes over the queued requests: the returned
- * wait ends once a pass that began after it was called has completed. A
- * pass is done with each request it took when it completes, and a turn it
- * starts has asked the membrane for its stream by then, unless an auxiliary
- * call holds the agent's provider gate as it starts. No auxiliary call is
- * in flight at the passes these tests wait for. A pass that throws doesn't
- * count, since it may have stopped before the request a test waits on.
- */
-function schedulerPasses(framework: AgentFramework): () => Promise<void> {
-  const owner = framework as unknown as { processInferenceRequests: () => Promise<void> };
-  const pass = owner.processInferenceRequests.bind(framework);
-  let begun = 0;
-  let completed = 0;
-  owner.processInferenceRequests = async () => {
-    const n = ++begun;
-    await pass();
-    completed = Math.max(completed, n);
-  };
-  return () => {
-    const after = begun + 1;
-    return waitFor('a scheduler pass to complete', () => completed >= after);
-  };
 }
 
 function autobiographical(): AutobiographicalStrategy {
@@ -116,7 +92,7 @@ test('quiesce parks wakes; resume releases them', async () => {
     const before = await framework.quiesce({ reason: 'test window' });
     assert.equal(before.quiesced, true);
     assert.equal(before.drained, true);
-    const nextPass = schedulerPasses(framework);
+    const nextPass = schedulerPasses(framework, waitFor);
 
     const nudge = framework.nudgeAgent('agent', 'operator');
     assert.equal(nudge.ok, true);
@@ -137,7 +113,7 @@ test('parked wakes coalesce per (agent, reason), keeping the set bounded', async
   await withFramework(membrane, async (framework) => {
     framework.start();
     await framework.quiesce();
-    const nextPass = schedulerPasses(framework);
+    const nextPass = schedulerPasses(framework, waitFor);
     for (let i = 0; i < 5; i++) framework.nudgeAgent('agent', 'operator');
     // The loop's next pass compresses same-reason parked requests to one.
     await waitFor(
@@ -159,7 +135,7 @@ test('coalescing keeps an ADDRESSED wake alive when an ambient one of the same r
   await withFramework(membrane, async (framework) => {
     framework.start();
     await framework.quiesce();
-    const nextPass = schedulerPasses(framework);
+    const nextPass = schedulerPasses(framework, waitFor);
     // Re-read on every access: the scheduler REASSIGNS pendingRequests
     // when it takes a batch, so a captured reference goes stale.
     const pending = () => (framework as unknown as { pendingRequests: Array<Record<string, unknown>> }).pendingRequests;
@@ -895,9 +871,14 @@ class GatedMembrane extends MockMembrane {
   }
   override streamYielding(request: NormalizedRequest, options?: unknown): YieldingStream {
     const inner = super.streamYielding(request, options);
-    const gate = () => this.gate();
+    // A cancel lets this stream past the gate, to the aborted event its
+    // inner stream then yields, so a test that fails before open() doesn't
+    // leave stop() waiting on it.
+    let cancelled!: () => void;
+    const cancelling = new Promise<void>((resolve) => { cancelled = resolve; });
+    const gate = () => Promise.race([this.gate(), cancelling]);
     return {
-      cancel: () => inner.cancel(),
+      cancel: () => { inner.cancel(); cancelled(); },
       provideToolResults: (...args: unknown[]) => (inner.provideToolResults as (...a: unknown[]) => void)(...args),
       get isWaitingForTools() { return inner.isWaitingForTools; },
       get pendingToolCallIds() { return inner.pendingToolCallIds; },
@@ -967,16 +948,16 @@ test('a concurrent resume() supersedes a draining quiesce: no abandon, no stale 
     await waitFor('turn to start', () => membrane.calls.length === 1);
 
     // A window sized for a hang, so the resume reaches it while it drains,
-    // however slow the machine is.
+    // however slow the machine is. A resume that didn't supersede it would
+    // show only when the window ends, 60 s on, abandoning the turn.
     const pending = framework.quiesce({ timeoutMs: 60_000, abandon: true });
     await waitFor('quiesce to begin', () => framework.getHostModeStatus().quiesced);
-    assert.equal(framework.getHostModeStatus().quiesced, true, 'draining');
     await framework.resume();
     const status = await pending;
     assert.equal(status.quiesced, false, 'the superseded quiesce reports the live mode');
     assert.ok(
       !traces.some((t) => t.type === 'inference:aborted'),
-      'the turn that outlived the window was NOT abandoned after the resume',
+      'the turn the quiesce was draining was NOT abandoned after the resume',
     );
     assert.ok(!traces.some((t) => t.type === 'host:quiesce'), 'no stale host:quiesce trace');
     // Release the hung turn so teardown is clean.
@@ -1699,7 +1680,7 @@ test('a wake parked on provider admission does not start after quiesce; it runs 
     assert.equal(status.drained, false, 'a parked admission is not "drained"');
 
     // Release the auxiliary: before the fix this started a turn while quiesced.
-    const nextPass = schedulerPasses(framework);
+    const nextPass = schedulerPasses(framework, waitFor);
     releaseAux();
     await auxDone;
     await waitFor('admission released', () => (internals.providerGates.get('agent')?.primaryDepth ?? 0) === 0);

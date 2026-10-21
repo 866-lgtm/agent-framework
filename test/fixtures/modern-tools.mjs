@@ -66,8 +66,10 @@ export function createServer(opts = {}) {
       signal?.addEventListener('abort', () => note('slow-aborted'));
       if (typeof args.release === 'string') {
         // Held until the test lets it go, so the call stays in flight for as
-        // long as the test needs, however slow the machine is.
-        while (!existsSync(args.release)) await new Promise((resolve) => setTimeout(resolve, 10));
+        // long as the test needs, however slow the machine is, or until the
+        // call is cancelled.
+        while (!existsSync(args.release) && !signal?.aborted) await new Promise((resolve) => setTimeout(resolve, 10));
+        if (signal?.aborted) return { content: [{ type: 'text', text: 'cancelled' }] };
         note('slow-finished');
         return { content: [{ type: 'text', text: 'released' }] };
       }
