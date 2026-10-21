@@ -3637,6 +3637,10 @@ export class AgentFramework {
     // and withheld spills, closed for the generation a stop ended, are open
     // for this one.
     this.lifecycleGeneration++;
+    // A sleep kept through a stop() wakes this lifecycle at its end, or now
+    // if it ended while stopped. Before the loop's first pass, so that a wake
+    // owed now joins the requests already pending in one turn.
+    this.eventGate?.resumeSleep();
     this.loopPromise = this.runLoop();
 
     // Start periodic sync timer (if enabled)
@@ -8542,6 +8546,8 @@ export class AgentFramework {
         // deregistered, so disposal must release EventGate liveness itself.
         this.eventGate?.onInferenceEnded(agent.name);
         this.agents.delete(agent.name);
+        // Its sleep and self-wake end with it, as a fork's do.
+        this.eventGate?.agentGone(agent.name);
         this.releaseWindowNowOrAfterResume(agent);
       }
       this.toolImageLedgers.delete(agent.name);
@@ -12733,6 +12739,9 @@ export class AgentFramework {
     this.activeStreams.delete(agentName);
     this.pendingAssistantBlocks.delete(agentName);
     this.agents.delete(agentName);
+    // Its sleep and self-wake end with it (the gate's sleep holds back every
+    // agent's wakes), and neither wake goes to a name that's gone.
+    this.eventGate?.agentGone(agentName);
     if (agent) this.releaseWindowNowOrAfterResume(agent);
     this.turnRouting.delete(agentName);
     this.proseSpeechChains.delete(agentName);
@@ -21240,8 +21249,10 @@ export class AgentFramework {
         }
         const wake = readSkipReplyWake(enrichedCall.input);
         if (wake.kind === 'wake' && this.eventGate) {
-          const { inMs } = this.eventGate.armSelfWake(agentName, wake.seconds, 'skip_reply');
-          console.error(`[self-wake] agent=${agentName} armed in ${Math.round(inMs / 1000)}s (skip_reply)`);
+          const { inMs, armed } = this.eventGate.armSelfWake(agentName, wake.seconds, 'skip_reply');
+          console.error(armed
+            ? `[self-wake] agent=${agentName} armed in ${Math.round(inMs / 1000)}s (skip_reply)`
+            : `[self-wake] agent=${agentName} not armed: the framework has stopped (skip_reply)`);
         }
       }
       this.dispatchChannelToolCall(agentName, enrichedCall);
