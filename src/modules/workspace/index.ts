@@ -2294,9 +2294,9 @@ export class WorkspaceModule implements Module {
     if (mount.direct) return this.bytesFromDisk(mount, relativePath, mountPrefixedPath, mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE);
     const store = this.getStore();
     return this.withMount(mount, async () => {
-      const { undecided } = await this.ensureSynced(mount, relativePath);
+      const { report, undecided } = await this.ensureSynced(mount, relativePath);
       const entry = store.treeGet(mount.treeStateId, relativePath);
-      if (!entry) return { error: undecided !== null ? this.notCheckedYet(mountPrefixedPath, undecided) : `File not found: ${mountPrefixedPath}` };
+      if (!entry) return { error: undecided !== null ? this.notCheckedYet(mountPrefixedPath, undecided) : this.notInWorkspace(mountPrefixedPath, report) };
       const blob = store.getBlob(entry.blobHash);
       if (!blob) return { error: `Blob not found for: ${mountPrefixedPath}` };
       return { data: blob };
