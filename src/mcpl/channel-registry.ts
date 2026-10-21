@@ -4374,6 +4374,18 @@ export class ChannelRegistry {
       }
     }
 
+    // A tuned-out channel's decision is the tune-out, and a close recorded
+    // over it would end it without its cancel, so the backlog it diverted
+    // would never reach the agent. Its cancel is what ends it, as
+    // channel_open's and channel_decline's refusals of a tuned-out channel
+    // say, and the agent closes the channel after that. A module's close
+    // that certified an idle lease, which the guard above lets through, is
+    // refused too, as a refusal it stands down on rather than an error.
+    if (this.getDesiredState(entry.serverId, input.channelId) === 'tuned-out') {
+      const refusal = tunedOutRefusal('channel_close', input.channelId);
+      return isModuleOrigin ? { ...refusal, isError: false } : refusal;
+    }
+
     // A decision the log refused changed nothing, and the answer says so.
     try {
       this.setDesiredState(entry.serverId, input.channelId, 'closed', closeSource);
