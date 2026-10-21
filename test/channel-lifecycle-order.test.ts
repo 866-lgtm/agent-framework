@@ -3047,3 +3047,149 @@ test('an update that keeps the target of a channel only a push has registered le
     assert.equal(f.isOpen(), true, `retarget: ${retarget}`);
   }
 });
+
+test("a transport's close withdraws what it confirmed for that server's channels only, so channel_open and channel_close ask the server again", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x'), descriptor('z')] });
+  await f.registry.handleChanged('other', { added: [descriptor('y')] });
+  assert.equal(dataOf(await f.tool('open')).status, 'opened');
+  assert.equal(dataOf(await f.registry.handleChannelToolCall('channel_open', { serverId: 'other', channelId: 'y' })).status, 'opened');
+  f.calls.length = 0;
+  f.registry.transportClosed('test');
+  assert.equal(f.isOpen('x'), false, "x's open was the closed transport's");
+  assert.equal(f.isOpen('y'), true, "another server's channel keeps its confirmation");
+  assert.equal(f.registry.getDesiredState('test', 'x'), 'open', 'the decision stays');
+  assert.equal(f.registry.getChannelLabel('test', 'x'), 'x', 'the entry stays');
+  assert.equal(f.calls.length, 0, 'the close itself asks the server nothing');
+  assert.notEqual(dataOf(await f.tool('open')).status, 'already open');
+  // z's close was confirmed by a receipt from the closed transport, so it's unknown now too
+  assert.notEqual(dataOf(await f.registry.handleChannelToolCall('channel_close', { serverId: 'test', channelId: 'z' })).status, 'already closed');
+  assert.deepEqual(f.calls.map((c) => `${c.kind} ${c.id}`), ['open x', 'close z'], 'each asks the server');
+  assert.equal(f.isOpen('x'), true, 'the new receipt confirms x open');
+});
+
+test("a request in flight when the transport closes fails without undoing the close's withdrawal, and the next channel_close asks again", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor()] });
+  assert.equal(dataOf(await f.tool('open')).status, 'opened');
+  f.held.add('x');
+  const closing = f.tool('close');
+  await tick();
+  assert.equal(f.pending.length, 1, 'the close is out on the transport');
+  f.registry.transportClosed('test');
+  // The connection's close rejects every request still out on the closed transport.
+  f.pending.shift()!.fail(new Error('the transport closed'));
+  await closing;
+  assert.equal(f.isOpen(), false, "the failure leaves the open flag where the transport's close put it");
+  f.held.delete('x');
+  f.calls.length = 0;
+  assert.notEqual(dataOf(await f.tool('close')).status, 'already closed');
+  assert.deepEqual(f.calls.map((c) => c.kind), ['close']);
+});
+
+test("where the host doesn't direct the lifecycle, a close withdraws what traffic confirmed: delivery is refused until the next transport's traffic confirms it", async () => {
+  const f = fixture();
+  f.setGrant(ALL_CAPABILITY_PATHS.filter((path) => path !== 'channels.lifecycle'));
+  await f.registry.handleChanged('test', { added: [descriptor()] });
+  await f.registry.handleIncoming('test', { messages: [message()] });
+  assert.equal(f.isOpen(), true, 'its traffic showed it open');
+  f.registry.transportClosed('test');
+  assert.equal(f.isOpen(), false);
+  f.calls.length = 0;
+  const outcome = await f.registry.publish('resident', 'words', { serverId: 'test', channelId: 'x' });
+  assert.equal(outcome.status, 'failed');
+  assert.match(String(outcome.reason), /isn't permitted to open or close the "test" server's channels/, 'refused because the host may not open it');
+  assert.deepEqual(f.calls, [], 'nothing is sent to open it');
+  assert.deepEqual(f.publishedWhileOpen, []);
+  await f.registry.handleIncoming('test', { messages: [message('x', 'm2')] });
+  assert.equal(f.isOpen(), true, "the next transport's traffic shows it open again");
+});
+
+test('traffic that arrives before a close and is admitted after it is still admitted, and marks nothing open: a coalesced message held across it, and a sibling behind it', async () => {
+  const admits: Array<() => void> = [];
+  const f = fixture(undefined, undefined, async (_serverId, held) => {
+    await new Promise<void>((resolve) => { admits.push(resolve); });
+    return { messageId: held.messageId, accepted: true };
+  });
+  await f.registry.handleChanged('test', { added: [descriptor('x', true), descriptor('y', true)] });
+  await f.registry.handleChanged('other', { added: [descriptor('z')] });
+  // An earlier drop, and the channels opened again on the next transport.
+  f.registry.transportClosed('test');
+  for (const id of ['x', 'y']) {
+    assert.equal((await f.registry.handleChannelToolCall('channel_open', { serverId: 'test', channelId: id })).success, true);
+    assert.equal(f.isOpen(id), true, `${id} is confirmed open again`);
+  }
+  assert.equal(f.isOpen('z'), false, "the other server's z is confirmed closed");
+  const answered: unknown[] = [];
+  const incoming = f.registry.handleIncoming('test', {
+    messages: [{ ...message('x', 'm1'), coalesce: { key: 'subject' } }, message('y', 'm1')],
+  }, { respond: (result) => { answered.push(result); } });
+  const elsewhere = f.registry.handleIncoming('other', { messages: [{ ...message('z', 'm1'), coalesce: { key: 'subject' } }] });
+  await tick();
+  assert.equal(admits.length, 2, 'both coalesced messages wait on the coalescer');
+  f.registry.transportClosed('test');
+  // The close leaves the connection's grant empty until the next
+  // transport's, so this host now reads as one that doesn't direct the
+  // lifecycle: where traffic alone would mark a channel open.
+  f.setGrant(ALL_CAPABILITY_PATHS.filter((path) => path !== 'channels.lifecycle'));
+  for (const admit of admits) admit();
+  await Promise.all([incoming, elsewhere]);
+  assert.equal(f.isOpen('x'), false, "the held message's admission doesn't confirm x");
+  assert.equal(f.isOpen('y'), false, 'nor does the sibling admitted behind it confirm y');
+  assert.deepEqual(answered, [{ results: [{ messageId: 'm1', accepted: true }, { messageId: 'm1', accepted: true }] }], 'both are still admitted');
+  assert.equal(f.isOpen('z'), true, "the other server's traffic, under way across that close, still shows z open");
+  // The next transport's grant: x is unconfirmed, not confirmed closed.
+  f.setGrant(ALL_CAPABILITY_PATHS);
+  f.calls.length = 0;
+  assert.notEqual(dataOf(await f.registry.handleChannelToolCall('channel_close', { serverId: 'test', channelId: 'x' })).status, 'already closed');
+  assert.deepEqual(f.calls.map((c) => `${c.kind} ${c.id}`), ['close x']);
+});
+
+test("an untargeted push entry, where the host directs the lifecycle, is confirmed by the next transport's traffic, but not by traffic held across the close", async () => {
+  const admits: Array<() => void> = [];
+  const f = fixture(undefined, undefined, async (_serverId, held) => {
+    await new Promise<void>((resolve) => { admits.push(resolve); });
+    return { messageId: held.messageId, accepted: true };
+  });
+  f.registry.ensureChannelRegistered('test', 'dm', 'DM with someone');
+  f.registry.enterTuneOut('test', 'dm', {
+    epochId: 'e1', cadenceSeconds: 60, backlogCap: 20, maxWakes: 3, startedAtSequence: 1,
+  }, 'agent-tool');
+  await f.registry.handleIncoming('test', { messages: [message('dm', 'm0')] });
+  assert.equal(f.isOpen('dm'), true, 'its traffic shows it open');
+  const held = f.registry.handleIncoming('test', { messages: [{ ...message('dm', 'm1'), coalesce: { key: 'subject' } }] });
+  await tick();
+  f.registry.transportClosed('test');
+  assert.equal(f.isOpen('dm'), false);
+  // The next transport's grant, which directs the lifecycle again, has
+  // arrived before the held message is admitted.
+  admits.shift()!();
+  await held;
+  assert.equal(f.isOpen('dm'), false, "the closed transport's traffic doesn't confirm it");
+  await f.registry.handleIncoming('test', { messages: [message('dm', 'm2')] });
+  assert.equal(f.isOpen('dm'), true, "the next transport's traffic does");
+});
+
+test("a lifecycle receipt from before a transport's close confirms nothing: on the closed connection the open is refused as unreachable, and the decision stays", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor()] });
+  f.held.add('x');
+  const opening = f.tool('open');
+  await tick();
+  assert.equal(f.pending.length, 1, 'the open is out on the transport');
+  // The connection closes as a real one does: its grant is emptied and it
+  // reads as down before the registry hears of the close.
+  const server = (f.registry as unknown as { serverRegistry: { getServer(id: string): Record<string, unknown> } })
+    .serverRegistry.getServer('test');
+  f.setGrant([]);
+  Object.assign(server, { isConnected: false, willReconnect: true });
+  f.registry.transportClosed('test');
+  // Its answer was read before the close, and is applied after it.
+  f.pending.shift()!.finish();
+  const result = await opening;
+  assert.equal(f.isOpen(), false, "the closed transport's receipt confirms nothing");
+  assert.equal(result.success, false);
+  assert.match(String(result.error), /isn't connected/, 'the agent is told the server is down');
+  assert.equal(f.calls.filter((c) => c.kind === 'open').length, 1, 'nothing more is sent on the closed connection');
+  assert.equal(f.registry.getDesiredState('test', 'x'), 'open', 'the decision stays recorded');
+});

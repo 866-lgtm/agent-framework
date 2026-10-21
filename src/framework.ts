@@ -12775,25 +12775,26 @@ export class AgentFramework {
 
   /**
    * Scope MCPL context injections for a conversation-bound agent: drop
-   * injections that are another open channel's context (injection namespace
-   * = channelId by adapter convention), keep its own channel and anything
-   * that isn't channel context.
+   * injections that are another registered channel's context (injection
+   * namespace = channelId by adapter convention), keep its own channel and
+   * anything that isn't channel context. A channel's context is its own
+   * whether or not it's open: one the agent closed, or one whose server's
+   * transport closed and that isn't confirmed again yet, still belongs to
+   * its own fork.
    */
   private scopeInjectionsForAgent(
     agentName: string,
     injections: ContextInjection[],
   ): ContextInjection[] {
     const home = this.conversationAgentHomes.get(agentName);
-    if (!home || !this.channelRegistry || injections.length === 0) {
+    const registry = this.channelRegistry;
+    if (!home || !registry || injections.length === 0) {
       return injections;
     }
-    const openChannelIds = new Set(
-      this.channelRegistry.getOpenChannels().map((e) => e.descriptor.id),
-    );
     return injections.filter((inj) => {
       const ns = inj.namespace;
-      if (!ns || !openChannelIds.has(ns)) return true;
-      return ns === home;
+      if (!ns || ns === home) return true;
+      return registry.getDescriptor(ns) === undefined;
     });
   }
 
@@ -25933,6 +25934,11 @@ export class AgentFramework {
     // a SIGKILL preserves them. Permanent removal is owned solely by
     // disconnectMcplServer, which deletes the trees explicitly.
     connection.on('close', (code?: number | null, signal?: string | null, info?: McplConnectionCloseInfo) => {
+      // First here, and synchronously: the closed transport's channel
+      // confirmations go with it before anything else this handler does, so
+      // a registration on the next transport can't come first and lose its
+      // own to this (ChannelRegistry.transportClosed).
+      this.channelRegistry?.transportClosed(connection.id);
       this.featureSetManager?.removeServer(connection.id);
       // RFC-008: a closed provider's class hints are stale — on reconnect it
       // may class its tools differently. Until the next tools/list its tools
@@ -26755,8 +26761,8 @@ export class AgentFramework {
     // Conversation forks act only on their home channel. channel_publish and
     // channel_close default a missing channelId to home and reject foreign
     // ones; channel_open is rejected outright — opening channels mutates
-    // framework-global state (the open-channel set every agent's injections
-    // are scoped against), which is not a fork's call to make.
+    // framework-global state (the open-channel set every agent's channel
+    // context is built from), which is not a fork's call to make.
     const home = this.conversationAgentHomes.get(agentName);
     if (home) {
       const reject = (error: string): void => {

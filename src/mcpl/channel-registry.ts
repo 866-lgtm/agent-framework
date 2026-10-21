@@ -1142,6 +1142,10 @@ export class ChannelRegistry {
   // a new entry, which isn't here. Kept by the host, not read from the
   // descriptor, whose metadata a server's own registration supplies.
   private untargetedPushEntries = new WeakSet<ChannelEntry>();
+  // How many times each server's transport has closed (transportClosed).
+  // handleIncoming reads it as a batch arrives, so traffic admitted after a
+  // close it arrived before confirms nothing.
+  private transportCloses = new Map<string, number>();
 
   private invalidateTransportConfirmation(entry: ChannelEntry): void {
     entry.open = false;
@@ -1631,6 +1635,9 @@ export class ChannelRegistry {
     responder?: Responder,
   ): Promise<void> {
     const results: ChannelIncomingMessageResult[] = [];
+    // The batch came on the transport open now: a close after this point
+    // (transportClosed) leaves its traffic nothing to confirm.
+    const closesAtArrival = this.transportCloses.get(serverId) ?? 0;
 
     for (const message of params.messages) {
       if (!message || typeof message.channelId !== 'string' || !message.channelId
@@ -1770,9 +1777,13 @@ export class ChannelRegistry {
         // its traffic is the only evidence the host gets, so it marks the
         // channel open, as it always has. The entry is the one the message
         // was accepted for: one a re-registration put in its place meanwhile
-        // waits for its own evidence. Durable desired state still changes
-        // exclusively through lifecycle operations. A marker is evidence like
-        // any other message.
+        // waits for its own evidence. Traffic from a transport that has closed
+        // since its batch arrived (here after the coalescer's await, or behind
+        // a sibling's) is no evidence either: the close withdrew what that
+        // transport confirmed, and its connection's grant is empty until the
+        // next one's. Durable desired state still changes exclusively through
+        // lifecycle operations. A marker is evidence like any other message.
+        if ((this.transportCloses.get(serverId) ?? 0) !== closesAtArrival) return;
         if (this.directsLifecycle(serverId)) {
           if (this.unconfirmedChannelTargets.has(incomingEntry) && !this.untargetedPushEntries.has(incomingEntry)) return;
           const desired = this.getDesiredState(serverId, message.channelId);
@@ -2295,6 +2306,42 @@ export class ChannelRegistry {
       }
     }
     // Desired state and migration markers deliberately survive disconnects.
+  }
+
+  /**
+   * The server's transport closed. Whatever it confirmed about a channel,
+   * open or closed, held for that transport only, so each of the server's
+   * channels reads as a registration's does: not open, and not confirmed
+   * closed. Where the host directs the server's lifecycle, a receipt
+   * confirms it again: a `channel_open` asks the server, and delivery opens
+   * before it publishes (an untargeted push entry's traffic confirms it, as
+   * before). Where the host doesn't, its traffic does, as after a
+   * registration. The entries, their desired state, labels and tune-out
+   * state stay, since the server is expected back (`removeServer` is for one
+   * that isn't).
+   *
+   * What was under way here at the close confirms nothing afterwards
+   * (transportCloses). Traffic that arrived before the close and is admitted
+   * after it, behind the coalescer's await, marks nothing open
+   * (handleIncoming). A lifecycle request sent before the close is answered
+   * for an older transport: its failure withdraws the open flag, and its
+   * receipt confirms nothing, and the operation tries again, which on the
+   * closed connection is refused as unreachable, so the decision waits for
+   * the next registration (runLifecycleOperation's sameTarget). What the
+   * connection holds across the boundary is another matter: it reaches
+   * handleIncoming after the next transport's grant, as that transport's
+   * traffic (resetPolicyForTransportBoundary), as it does after a
+   * registration.
+   *
+   * The framework calls this first in its handler for the connection's
+   * `close`, so a registration on the next transport, whose entries are new,
+   * can't come first and lose its confirmations to it.
+   */
+  transportClosed(serverId: string): void {
+    this.transportCloses.set(serverId, (this.transportCloses.get(serverId) ?? 0) + 1);
+    for (const entry of this.channels.values()) {
+      if (entry.serverId === serverId) this.invalidateTransportConfirmation(entry);
+    }
   }
 
   /**
@@ -3057,8 +3104,9 @@ export class ChannelRegistry {
         // release its queue slot and surface the failure to delivery joiners.
         // Its open flag needs no change here: every retry follows a replaced
         // registration, a retarget (already invalidated, whether the old
-        // target's RPC was answered or failed), or a receipt for this very
-        // target.
+        // target's RPC was answered or failed), a receipt from before a
+        // transport's close (invalidated by the close), or a receipt for this
+        // very target.
         if (attempts >= MAX_CHANNEL_LIFECYCLE_ATTEMPTS) {
           const error = new ChannelLifecycleError(
             `the channel's address at the "${serverId}" server, or the decision about it, kept changing, and ${attempts} tries ` +
@@ -3072,7 +3120,14 @@ export class ChannelRegistry {
           throw error;
         }
         attempts++;
+        // A reconnect keeps the connection object, so the count of its
+        // transport's closes (transportClosed) is what tells an answer from
+        // the transport it was sent on apart from one on its successor: an
+        // answer applied after a close it was sent before is from an older
+        // transport, and confirms nothing.
+        const closesAtSend = this.transportCloses.get(serverId) ?? 0;
         const sameTarget = () => this.serverRegistry.getServer(serverId) === server &&
+          (this.transportCloses.get(serverId) ?? 0) === closesAtSend &&
           sameChannelTarget(entry.descriptor, descriptor);
         let result: ChannelsOpenResult | undefined;
         try {
