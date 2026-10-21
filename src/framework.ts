@@ -14,7 +14,7 @@ import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverB
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SILENT_HEARTBEAT_SEPARATOR, type RequestOnlyPrompt, type RequestOnlyStamps } from './silent-heartbeat.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
-import { TuneOutCoordinator, TUNE_OUT_DEFAULTS } from './tune-out/coordinator.js';
+import { TuneOutCoordinator, TUNE_OUT_DEFAULTS, alreadyTunedOutText } from './tune-out/coordinator.js';
 import type {
   MessageId,
   MessageMetadata,
@@ -103,7 +103,7 @@ import { isSilentHeartbeatMarker, isVisiblyEmptyContent, NON_STRING_TEXT_PLACEHO
 import { parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
-import { ChannelRegistry, connectorText, desiredStateInLog, destinationKey, journalToolDescription, NON_HOLDER_CHANNEL_DESCRIPTIONS, type ChannelToolOrigin, type PublishDestination, type PublishOutcome, type SelectedForOpening } from './mcpl/channel-registry.js';
+import { ChannelRegistry, TUNE_OUT_REPLACED, connectorText, desiredStateInLog, destinationKey, journalToolDescription, NON_HOLDER_CHANNEL_DESCRIPTIONS, type ChannelToolOrigin, type PublishDestination, type PublishOutcome, type SelectedForOpening } from './mcpl/channel-registry.js';
 import { KEEP_IDLE_MS, KEEP_NEWEST, ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftAttempt, type DraftReason, type DraftState, type InheritedRisk } from './prose-drafts.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import { INBOUND_SOURCE_KEY, sourceBodyDigest, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
@@ -1373,27 +1373,70 @@ function releasePairedRawItem(block: ContentBlock): ContentBlock {
   return rest as ContentBlock;
 }
 
+/** The text of each notice in `stored` judged for its agent as the primary:
+ *  a channel notice (a system notice of kind `channel-notice`: an open, a
+ *  failed open or a policy admission), and a by-name notice of another
+ *  agent's reply or channel (a system notice with a `speaker`). A fork is
+ *  seeded from its template, which is the primary where connectome-host
+ *  routes conversations, and a seed that kept these would give the fork what
+ *  other conversations did and which channels were opened, with advice
+ *  judged for the primary: a fork closes only its home channel, and only its
+ *  home's traffic is delivered to it. The template's tool calls that caused
+ *  its own notices stay in the seed. `kind: 'channel-notice'` has marked
+ *  every channel notice since the first (0.7.0), so notices stored by
+ *  earlier builds are recognized too, whatever their wording. */
+function primaryNoticeTexts(stored: readonly StoredMessage[]): Set<string> {
+  const texts = new Set<string>();
+  for (const message of stored) {
+    const meta = message.metadata as { system?: unknown; speaker?: unknown; kind?: unknown } | undefined;
+    if (meta?.system !== true) continue;
+    if (typeof meta.speaker !== 'string' && meta.kind !== 'channel-notice') continue;
+    for (const block of message.content) {
+      if (block.type === 'text') texts.add(block.text);
+    }
+  }
+  return texts;
+}
+
+/** Messages copied into a fork's seed without the text blocks whose text is
+ *  in `texts` (primaryNoticeTexts), wherever such a block is. A message with
+ *  no content left is left out, since a request can't carry an empty
+ *  message. */
+function withoutPrimaryNotices<M extends { content: ContentBlock[] }>(messages: readonly M[], texts: ReadonlySet<string>): M[] {
+  const out: M[] = [];
+  for (const message of messages) {
+    const content = message.content.filter((b) => b.type !== 'text' || !texts.has(b.text));
+    if (content.length > 0) out.push({ ...message, content });
+  }
+  return out;
+}
+
 /** One log line for a fork's seed that left something out, so an operator who
  *  sees a fork answer differently from its template has something to check:
- *  the template's thinking blocks, and the tool blocks the pairing pass
- *  dropped (calls with no result in the seed, results whose call isn't in
- *  it). `withoutReasoning` is the seed before that pass, `seed` after it. */
+ *  the template's thinking blocks, its channel and by-name notices
+ *  (primaryNoticeTexts, counting any text block that repeats one word for
+ *  word), and the tool blocks the pairing pass dropped (calls
+ *  with no result in the seed, results whose call isn't in it).
+ *  `withoutReasoning` is the seed without thinking, `withoutNotices` without
+ *  those notices too, and `seed` after the pairing pass. */
 function logSeedOmissions(
   fork: string,
   template: string,
   compiled: readonly { content: ContentBlock[] }[],
   withoutReasoning: readonly { content: ContentBlock[] }[],
+  withoutNotices: readonly { content: ContentBlock[] }[],
   seed: readonly { content: ContentBlock[] }[],
 ): void {
   const count = (messages: readonly { content: ContentBlock[] }[], test: (b: ContentBlock) => boolean) =>
     messages.reduce((n, m) => n + m.content.filter(test).length, 0);
   const thinking = count(compiled, isThinkingBlock);
-  const calls = count(withoutReasoning, (b) => b.type === 'tool_use') - count(seed, (b) => b.type === 'tool_use');
-  const results = count(withoutReasoning, (b) => b.type === 'tool_result') - count(seed, (b) => b.type === 'tool_result');
-  if (thinking + calls + results === 0) return;
+  const notices = count(withoutReasoning, (b) => b.type === 'text') - count(withoutNotices, (b) => b.type === 'text');
+  const calls = count(withoutNotices, (b) => b.type === 'tool_use') - count(seed, (b) => b.type === 'tool_use');
+  const results = count(withoutNotices, (b) => b.type === 'tool_result') - count(seed, (b) => b.type === 'tool_result');
+  if (thinking + notices + calls + results === 0) return;
   console.log(
     `[conversation] ${fork}: seeded from ${template} without ${thinking} thinking block(s), ` +
-    `${calls} unanswered tool call(s) and ${results} orphaned tool result(s)`,
+    `${notices} channel or by-name notice(s), ${calls} unanswered tool call(s) and ${results} orphaned tool result(s)`,
   );
 }
 
@@ -8594,7 +8637,15 @@ export class AgentFramework {
       'whether mentions merit interrupting, and able to cancel. People who ' +
       'mention you get an automatic reaction so they know you saw nothing. ' +
       'Cancelling (mode "cancel") delivers the diverted backlog. The ' +
-      'tune-out auto-cancels after maxWakes mention-bursts.',
+      'tune-out auto-cancels after maxWakes mention-bursts. A tuned-out ' +
+      'channel is kept open, so its traffic reaches your subconscious: where ' +
+      'this host opens and closes the server\'s channels, this opens a ' +
+      'channel you closed, and answers once that open is done. Where the ' +
+      'channel isn\'t open then, the answer\'s openError says why, and when ' +
+      'its messages will reach your subconscious where that\'s known. ' +
+      'Calling tune_out again for a channel already tuned out keeps its ' +
+      'settings, and, where this host can open the channel, tries the open ' +
+      'again if it isn\'t open.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -12489,10 +12540,10 @@ export class AgentFramework {
   /**
    * Spawn a persistent per-channel conversation agent ("fork") from the
    * template agent: own ContextManager under `conversations/{name}`, seeded
-   * with the template's compiled context without its thinking or its unpaired
-   * tool blocks (the SubagentModule wholesale-copy pattern; see the seeding
-   * comment below), registered in the event loop like any agent — but never
-   * primary.
+   * with the template's compiled context without its thinking, its channel
+   * and by-name notices, or its unpaired tool blocks (the SubagentModule
+   * wholesale-copy pattern; see the seeding comment below), registered in the
+   * event loop like any agent — but never primary.
    */
   private async createConversationAgent(name: string, channelId: string): Promise<Agent> {
     const router = this.conversationRouter!;
@@ -12554,6 +12605,15 @@ export class AgentFramework {
       // vouch for the copies. On models that don't bind thinking to its
       // prefix a copy would have been kept, so there the fork loses the
       // template's reasoning.
+      // It leaves out, too, the template's channel notices and its by-name
+      // notices of other agents (primaryNoticeTexts), the channel's own next
+      // fork included. The compile carries no metadata, so each text block
+      // whose text is such a notice's in the template's store goes, wherever
+      // it is, a block of the template's own that repeats one word for word
+      // included. A summary an adaptive template wrote while a notice was in
+      // its window can still mention it, and so can the template's own words.
+      // A notice compiled to other text, as one long enough to be sharded at
+      // ingest or cut by a per-message cap, matches nothing and stays.
       // Then context-manager's stripUnpairedToolBlocks drops each call whose
       // result isn't in the seed and each result whose call isn't, keeping
       // the rest of their messages (a message left with nothing becomes its
@@ -12571,8 +12631,10 @@ export class AgentFramework {
         const { messages: compiled } = await template.toolResultGuard.afterAnnotations(
           () => template.getContextManager().compile(undefined, undefined, { dryRun: true }));
         const withoutReasoning = withoutThinking(compiled);
-        const seed = stripUnpairedToolBlocks(withoutReasoning);
-        logSeedOmissions(name, template.name, compiled, withoutReasoning, seed);
+        const withoutNotices = withoutPrimaryNotices(
+          withoutReasoning, primaryNoticeTexts(template.getContextManager().getAllMessages()));
+        const seed = stripUnpairedToolBlocks(withoutNotices);
+        logSeedOmissions(name, template.name, compiled, withoutReasoning, withoutNotices, seed);
         for (const msg of seed) {
           const participant = msg.participant === template.name ? name : msg.participant;
           contextManager.addMessage(participant, msg.content);
@@ -15394,9 +15456,9 @@ export class AgentFramework {
    * outranks policy) only where the agent it's addressed to can call it for
    * every channel it names (canCloseChannels): a conversation fork may close
    * only its home channel, and an agent's allowedTools can leave
-   * channel_close out. Others can read it too: the other residents, where
-   * several share one slot (#291), and forks spawned from the primary
-   * afterwards, from its window (#235). Where an
+   * channel_close out. The other residents can read it too, where several
+   * share one slot (#291); a fork's seed leaves it out (primaryNoticeTexts).
+   * Where an
    * agent's own send opened a channel it can't close, the primary is told by
    * name too, if it's registered and can close it, and the agent is told
    * that it was. What an open channel delivers is its server's to say (#406),
@@ -15649,9 +15711,8 @@ export class AgentFramework {
    * channel_open as the way to try again only where the agent it's addressed
    * to can call it: a conversation fork's channel_open is refused outright
    * (dispatchChannelToolCall), and an agent's allowedTools can leave it out.
-   * Others can read it too: the other residents, where several share one
-   * slot (#291), and forks spawned from the primary afterwards, from its
-   * window (#235).
+   * The other residents can read it too, where several share one slot
+   * (#291); a fork's seed leaves it out (primaryNoticeTexts).
    * Where the channel is selected for opening, it says so and why, as
    * speech's failure does, and what that means: where the host couldn't
    * record putting the channel's decision back, a later delivery or
@@ -27071,6 +27132,10 @@ export class AgentFramework {
     const entry = this.channelRegistry?.listChannelsRaw()
       .find((e) => e.descriptor.id === channelId);
     let result: { success: boolean; data?: unknown; error?: string; isError?: boolean };
+    // An open that throws is answered too, never left unhandled.
+    const openThrew = (err: unknown): string =>
+      'The tune-out is recorded, but its messages may not reach the subconscious, since opening its channel ' +
+      `failed: ${thrownText(err)}`;
     if (!entry) {
       result = { success: false, error: `unknown channel: ${channelId}`, isError: true };
     } else if (input.mode === 'cancel') {
@@ -27085,17 +27150,66 @@ export class AgentFramework {
         maxWakes: input.maxWakes,
         durationSeconds: input.durationSeconds,
       }, 'agent-tool');
-      result = r.ok
-        ? {
-            success: true,
-            data: {
-              tunedOut: channelId,
-              cadenceSeconds: r.params.cadenceSeconds,
-              backlogCap: r.params.backlogCap,
-              maxWakes: r.params.maxWakes,
-            },
-          }
-        : { success: false, error: r.error, isError: true };
+      if (r.ok) {
+        const data = {
+          tunedOut: channelId,
+          cadenceSeconds: r.params.cadenceSeconds,
+          backlogCap: r.params.backlogCap,
+          maxWakes: r.params.maxWakes,
+        };
+        // A tuned-out channel's traffic must keep arriving for the
+        // subconscious, so the answer waits for its transport (openForTuneOut).
+        // The tune-out is recorded either way, so it's a success, and where
+        // the transport isn't open, openError says why its messages don't or
+        // may not reach the subconscious, and when they will where that's
+        // known, or that the tune-out isn't in effect any more. A rejection is
+        // answered too, never left unhandled, and the result goes through
+        // pushEvent, as every other tool's does.
+        void this.channelRegistry!.openForTuneOut(entry.serverId, channelId)
+          .catch(openThrew)
+          .then((openError) => {
+            this.pushEvent({
+              type: 'tool-result',
+              callId: call.id,
+              toolName: call.name,
+              agentName,
+              moduleName: 'tune-out',
+              result: { success: true, data: { ...data, ...(openError ? { openError } : {}) } },
+            });
+          });
+        return;
+      }
+      // tune_out repeated on a channel already tuned out is where an agent
+      // retries a transport the first open left closed, so where it isn't
+      // open, or work is queued for it, the repeat goes through
+      // openForTuneOut, which joins the open in flight or waits and, where
+      // this host can open the channel, opens it again; the refusal says
+      // what its transport is now.
+      const tuneOut = this.channelRegistry!.getTuneOutState(entry.serverId, channelId);
+      if (r.alreadyTunedOut && tuneOut && !this.channelRegistry!.tuneOutTransportOpen(entry.serverId, channelId)) {
+        void this.channelRegistry!.openForTuneOut(entry.serverId, channelId)
+          .catch(openThrew)
+          .then((openError) => {
+            // The tune-out is read again: one that ended or was replaced while
+            // the open was out isn't described as standing, whatever the open
+            // answered for it.
+            const now = this.channelRegistry!.getTuneOutState(entry.serverId, channelId);
+            const error = now?.params.epochId === tuneOut.params.epochId
+              ? alreadyTunedOutText(channelId, now.params,
+                openError ?? 'Its transport is open now, so its messages reach the subconscious.')
+              : TUNE_OUT_REPLACED;
+            this.pushEvent({
+              type: 'tool-result',
+              callId: call.id,
+              toolName: call.name,
+              agentName,
+              moduleName: 'tune-out',
+              result: { success: false, error, isError: true },
+            });
+          });
+        return;
+      }
+      result = { success: false, error: r.error, isError: true };
     }
     this.pushEvent({
       type: 'tool-result',
