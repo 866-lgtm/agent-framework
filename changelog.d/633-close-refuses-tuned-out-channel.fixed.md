@@ -10,3 +10,11 @@
   overtook now answers in the refusal's words, and a decline that one
   overtook says to cancel the tune-out before calling `channel_close`.
   Before, both said to call `channel_close`, which now refuses it.
+- A tune-out on record when the host starts without a subconscious now ends
+  there, and its channel is decided open again, as a cancel leaves it. A
+  log line names the channel and says how many of the messages the
+  tune-out diverted are stored, which nothing will deliver as its backlog.
+  Before, nothing diverted the channel's traffic or could cancel the
+  tune-out, `tune_out` wasn't offered, and `channel_open`,
+  `channel_decline` and now `channel_close` refused the channel, so its
+  decision couldn't change.

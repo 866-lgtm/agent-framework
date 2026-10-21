@@ -3591,6 +3591,8 @@ export class AgentFramework {
         },
       );
       framework.tuneOutCoordinator.resumeActiveEpochs();
+    } else if (framework.channelRegistry) {
+      framework.endTuneOutsWithoutSubconscious();
     }
 
     // Modules, agents, MCPL servers and the tune-out tool are all in place:
@@ -26815,6 +26817,37 @@ export class AgentFramework {
   /**
    * Build BeforeInferenceParams from agent state and trigger context.
    */
+  /**
+   * A tune-out on record from a boot that ran a subconscious, where this one
+   * runs none: nothing diverts its channel's traffic or ever cancels it,
+   * tune_out isn't registered, and channel_open, channel_close and
+   * channel_decline refuse a tuned-out channel, so the channel would stay
+   * held by a decision nothing here can change. Each one ends here instead,
+   * its channel decided open again as a cancel leaves it, with a log line
+   * that names the channel and says how many of the messages it diverted
+   * are stored, which nothing will now deliver as its backlog.
+   */
+  private endTuneOutsWithoutSubconscious(): void {
+    const registry = this.channelRegistry!;
+    const primary = this.primaryAgentName ? this.agents.get(this.primaryAgentName) : undefined;
+    for (const { serverId, channelId, params } of registry.tuneOutsOnRecord()) {
+      const diverted = (primary?.getContextManager().getAllMessages() ?? []).filter((m) =>
+        (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === params.epochId).length;
+      const held = diverted > 0
+        ? ` The ${diverted} message${diverted === 1 ? '' : 's'} it diverted stay stored, and nothing will deliver them as its backlog.`
+        : '';
+      try {
+        registry.cancelTuneOut(serverId, channelId, 'open', 'no-subconscious');
+      } catch (err) {
+        console.error(`[tune-out] "${channelId}" on the "${serverId}" server is tuned out, and this host runs no subconscious ` +
+          `to watch or cancel it, but ending the tune-out failed, so it stays recorded: ${err instanceof Error ? err.message : String(err)}.${held}`);
+        continue;
+      }
+      console.error(`[tune-out] "${channelId}" on the "${serverId}" server was tuned out, and this host runs no subconscious ` +
+        `to watch or cancel it, so the tune-out ends here and the channel is decided open again.${held}`);
+    }
+  }
+
   /**
    * Dispatch a synthesized channel tool call.
    */

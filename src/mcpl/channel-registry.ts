@@ -3103,6 +3103,19 @@ export class ChannelRegistry {
     return { params: current.tuneOut, wakeCount: current.wakeCount ?? 0 };
   }
 
+  /** Every tune-out on record, whether or not its channel is registered
+   *  here yet: the decisions the lifecycle log's replay restored, and any
+   *  made since. */
+  tuneOutsOnRecord(): Array<{ serverId: string; channelId: string; params: TuneOutParams }> {
+    const found: Array<{ serverId: string; channelId: string; params: TuneOutParams }> = [];
+    for (const [key, record] of this.desiredStates) {
+      if (record.state !== 'tuned-out' || !record.tuneOut) continue;
+      const at = key.indexOf('\u0000');
+      found.push({ serverId: key.slice(0, at), channelId: key.slice(at + 1), params: record.tuneOut });
+    }
+    return found;
+  }
+
   /** Registered channel entries (read-only iteration for the coordinator). */
   listChannelsRaw(): Array<{ serverId: string; descriptor: ChannelDescriptor }> {
     return [...this.channels.values()].map((e) => ({

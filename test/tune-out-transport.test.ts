@@ -1349,6 +1349,66 @@ test('an agent\'s close of a tuned-out channel is refused, and after the cancel 
   assert.equal(f.i.channelRegistry.getDesiredState('disc', CHANNEL), 'closed');
 });
 
+test('a tune-out on record at a boot with no subconscious ends there, its channel decided open again, and the log names it and its stored backlog', async (t) => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'tune-out-transport-'));
+  let second: AgentFramework | undefined;
+  // The second boot stops before its store goes.
+  t.after(async () => {
+    await second?.stop();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+  const statusPath = join(tempDir, 'status.jsonl');
+  const commandPath = join(tempDir, 'commands.txt');
+  writeFileSync(commandPath, '');
+  const config = (subconscious: boolean) => ({
+    storePath: join(tempDir, 'test.chronicle'),
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+    ...(subconscious ? { subconscious: { enabled: true, systemPrompt: 'You are the Subconscious.' } } : {}),
+    mcplServers: [{ id: 'disc', command: process.execPath, args: [FIXTURE], env: { STATUS_PATH: statusPath, COMMAND_PATH: commandPath } }],
+    modules: [],
+  });
+  type Internals = {
+    channelRegistry: ChannelRegistry;
+    agents: Map<string, { getContextManager(): { getAllMessages(): Array<{ metadata?: Record<string, unknown> }> } }>;
+  };
+  // A boot with a subconscious tunes the channel out, and two messages are
+  // diverted.
+  const first = await AgentFramework.create(config(true));
+  await first.start();
+  const i1 = first as unknown as Internals;
+  let deadline = Date.now() + 10_000;
+  while (i1.channelRegistry.listChannelsRaw().length === 0) {
+    if (Date.now() > deadline) throw new Error('timed out waiting for registration');
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  assert.equal((await scriptCall(first, 'scout', 'tune_out', { channelId: CHANNEL })).refused, false);
+  appendFileSync(commandPath, 'ambient m1 backlog one\nambient m2 backlog two\n');
+  const scout = i1.agents.get('scout')!.getContextManager();
+  deadline = Date.now() + 10_000;
+  while (scout.getAllMessages().filter((m) => (m.metadata as { tuneOut?: unknown } | undefined)?.tuneOut).length < 2) {
+    if (Date.now() > deadline) throw new Error('timed out waiting for two diverted messages');
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  await first.stop();
+  // A boot of the same store with no subconscious ends it.
+  const logged: string[] = [];
+  const error = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+  try {
+    second = await AgentFramework.create(config(false));
+  } finally {
+    console.error = error;
+  }
+  const registry = (second as unknown as Internals).channelRegistry;
+  assert.equal(registry.getDesiredState('disc', CHANNEL), 'open', 'decided open again, as a cancel leaves it');
+  assert.equal(registry.getTuneOutState('disc', CHANNEL), null);
+  const line = logged.find((l) => l.includes(`"${CHANNEL}" on the "disc" server was tuned out`));
+  assert.ok(line, logged.join('\n'));
+  assert.ok(line.includes('so the tune-out ends here and the channel is decided open again'), line);
+  assert.ok(line.includes('The 2 messages it diverted stay stored, and nothing will deliver them as its backlog.'), line);
+});
+
 test('a decline of a tuned-out channel whose transport isn\'t open is refused, and the backlog survives to the cancel', async (t) => {
   const f = await framework(t);
   const scout = f.i.agents.get('scout')!.getContextManager();
