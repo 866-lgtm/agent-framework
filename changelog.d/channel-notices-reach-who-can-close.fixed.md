@@ -1,8 +1,9 @@
 - The notice that a channel opened without the agent asking (an open its
   own send or reply caused, or a subscription-policy admission) names
   `channel_close` only to an agent that can call it there for every channel
-  it names, except where several residents share one slot (#291), and in
-  forks spawned from the primary afterwards (#235). A conversation fork can
+  it names, except where several residents share one slot (#291), and where
+  a fork's seed still carries it: in an adaptive template's summary, or in a
+  notice long enough for its template to shard or cut. A conversation fork can
   close only its home channel, and an agent's `allowedTools` can leave
   `channel_close` out. Before, such an agent
   was told to use `channel_close`, and couldn't call it, or its call was

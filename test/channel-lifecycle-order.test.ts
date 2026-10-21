@@ -2555,11 +2555,11 @@ test("where a reply's reader can't close a channel selected for opening, the pri
 
 // The opened notice follows the reply notice's rule: channel_close is named
 // only where the agent it's addressed to can call it for every channel named
-// (other residents of one slot, and forks spawned from the primary later, may
-// read it too: #291, #235), and where an
-// agent's send opened a channel it can't close, the primary is told by name
-// too, if it can close it. The reader's notice carries its inputs only where
-// it was told it can close the channels, so a release passes on only that.
+// (other residents of one slot may read it too, #291; a fork's seed leaves it
+// out), and where an agent's send opened a channel it can't close, the
+// primary is told by name too, if it can close it. The reader's notice
+// carries its inputs only where it was told it can close the channels, so a
+// release passes on only that.
 test('the opened notice names channel_close only where the agent it\'s addressed to can call it, says what the channel delivers only to the agent that holds its traffic, and tells the primary by name where the agent whose send opened it can\'t close it', () => {
   // What the channel delivers: said to the agent whose window holds its
   // traffic. Where conversations are routed (router), that's a fork for its
