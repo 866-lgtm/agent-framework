@@ -7295,10 +7295,16 @@ describe('materialize, status and shutdown', () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     void (m as any).withMount(mount, () => gate);
-    // With no watcher to stop, stop takes the mount's tail before it first waits.
+    // stop waits on the tails it takes with Promise.allSettled, which calls each tail's then. The later work is
+    // queued once stop is waiting on this tail, so it comes after the tails stop took, whatever stop awaits first.
+    const tail = (m as any).mountTurns.get('work');
+    let stopWaits = false;
+    const then = tail.then;
+    tail.then = function (this: Promise<void>, ...args: unknown[]) { stopWaits = true; return then.apply(this, args); };
     const stopping = m.stop();
+    await until(() => stopWaits, 'stop waits on what was in flight');
     let finished = false;
-    // Appended after stop began, as a watcher callback or a late scan would be.
+    // Appended while stop waits, as a watcher callback or a late scan would be.
     void (m as any).withMount(mount, async () => {
       await sleep(100);
       finished = true;
