@@ -2838,8 +2838,9 @@ export class ChannelRegistry {
    * tune-out's success says traffic will arrive, nothing would show it
    * doesn't, and the decision it replaced isn't known here. An open that
    * failed, as a redundant one queued behind a confirming one may, can't
-   * have closed the channel: it leaves the flag as it was, so an open flag
-   * stays open.
+   * have closed the channel: one for the current target leaves the flag as
+   * it was, so an open flag stays open (one for a target no longer current
+   * withdraws it).
    */
   private tuneOutReadsOpen(entry: ChannelEntry | undefined): boolean {
     // A flag is set open only where both marks are cleared, so a failed
@@ -2866,26 +2867,21 @@ export class ChannelRegistry {
     );
     const nextRegistration = `when the "${serverId}" server next registers this channel, if this host may open and ` +
       'close its channels then';
-    // The work queued for the channel, waited for until none is left, as a
-    // delivery's wait does (waitForOpenChannel): work queued while earlier
-    // work ran, such as a registration that came back, goes first too.
-    // Returns the last work's failure, if it failed.
+    // The work queued for the channel as it stands: its tail, waited for,
+    // and its failure returned, if it failed. Each wait below takes it until
+    // no work is left, as a delivery's wait does (waitForOpenChannel), so
+    // work queued while earlier work ran, such as a registration that came
+    // back, goes first too.
+    let awaited: Promise<void> | undefined;
     const settle = async (): Promise<unknown> => {
-      let failed: unknown;
-      for (;;) {
-        const pending = this.channelLifecycleTails.get(lifecycleKey);
-        if (!pending) return failed;
-        try {
-          await pending;
-          failed = undefined;
-        } catch (error) {
-          failed = error;
-        }
-        // A settled tail releases its own key before this resumes, since its
-        // cleanup was registered first (applyDesiredChannelState). The guard,
-        // as waitForOpenChannel's, stops a loop that would await a settled
-        // tail again without yielding, should that order ever change.
-        if (this.channelLifecycleTails.get(lifecycleKey) === pending) return failed;
+      const pending = this.channelLifecycleTails.get(lifecycleKey);
+      if (!pending) return undefined;
+      awaited = pending;
+      try {
+        await pending;
+        return undefined;
+      } catch (error) {
+        return error;
       }
     };
     // What the state answers now, or null where this host is to open the
@@ -2916,10 +2912,18 @@ export class ChannelRegistry {
       // A flag a close that may have taken effect left gets an open.
       return transportOpen ? undefined : null;
     };
-    // settle's last look and the turn this resumes in are apart, and work
-    // can be queued between them, so the queue is looked at again in the
-    // turn that reads the state and queues the open.
-    do await settle(); while (this.channelLifecycleTails.has(lifecycleKey));
+    // Whether work is queued that settle hasn't waited for. It's looked at
+    // in the turn that reads the state and queues the open, or answers, so
+    // work queued after settle's look is waited for too. A settled tail
+    // releases its own key before this runs, since its cleanup was
+    // registered first (applyDesiredChannelState); one still standing isn't
+    // waited for again, so the wait can't spin on it should that order ever
+    // change, as waitForOpenChannel's guard keeps its own from doing.
+    const queuedSince = (): boolean => {
+      const tail = this.channelLifecycleTails.get(lifecycleKey);
+      return tail !== undefined && tail !== awaited;
+    };
+    do await settle(); while (queuedSince());
     const before = answered(this.channels.get(channelKey), notYet(nextRegistration, "it isn't registered here now"));
     if (before !== null) return before;
     let failure: unknown;
@@ -2934,7 +2938,7 @@ export class ChannelRegistry {
     // the last attempt's, is the reason: this open's may concern a
     // registration that work replaced.
     let later: unknown;
-    do later = await settle(); while (this.channelLifecycleTails.has(lifecycleKey));
+    do later = await settle(); while (queuedSince());
     failure = later ?? failure;
     const clause = failure !== undefined ? `: ${lifecycleClause(failure)}` : '';
     const after = this.channels.get(channelKey);

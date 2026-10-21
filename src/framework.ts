@@ -26630,8 +26630,10 @@ export class AgentFramework {
       }
       // tune_out repeated on a channel already tuned out is where an agent
       // retries a transport the first open left closed, so where it isn't
-      // open, the repeat opens it again, or waits for the open in flight
-      // (openForTuneOut), and the refusal says what its transport is now.
+      // open, or work is queued for it, the repeat goes through
+      // openForTuneOut, which joins the open in flight or waits and, where
+      // this host can open the channel, opens it again; the refusal says
+      // what its transport is now.
       const tuneOut = this.channelRegistry!.getTuneOutState(entry.serverId, channelId);
       if (r.alreadyTunedOut && tuneOut && !this.channelRegistry!.tuneOutTransportOpen(entry.serverId, channelId)) {
         void this.channelRegistry!.openForTuneOut(entry.serverId, channelId)
