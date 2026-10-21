@@ -12,7 +12,7 @@
   now reads mount-prefixed and no longer finds that file; `work/work/z/*.ts`,
   as the tools show it, does.
   `workspace--grep`'s `glob` filter takes a mount-prefixed pattern the same
-  way. In both, a `**/` now matches zero or more directories, as in other glob
-  tools, so `project/src/**/*.ts` also finds `project/src/main.ts` and
+  way. In both, a `**/` at the start of a path segment now matches zero or
+  more directories, as in other glob tools, so `project/src/**/*.ts` also finds `project/src/main.ts` and
   `**/*.md` also finds the `.md` files at a mount's root; it used to need at
   least one directory there.
