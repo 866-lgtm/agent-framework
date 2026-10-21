@@ -13,7 +13,7 @@ import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverB
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SILENT_HEARTBEAT_SEPARATOR, type RequestOnlyPrompt, type RequestOnlyStamps } from './silent-heartbeat.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
-import { TuneOutCoordinator, TUNE_OUT_DEFAULTS } from './tune-out/coordinator.js';
+import { TuneOutCoordinator, TUNE_OUT_DEFAULTS, alreadyTunedOutText } from './tune-out/coordinator.js';
 import type {
   MessageId,
   MessageMetadata,
@@ -8333,7 +8333,13 @@ export class AgentFramework {
       'whether mentions merit interrupting, and able to cancel. People who ' +
       'mention you get an automatic reaction so they know you saw nothing. ' +
       'Cancelling (mode "cancel") delivers the diverted backlog. The ' +
-      'tune-out auto-cancels after maxWakes mention-bursts.',
+      'tune-out auto-cancels after maxWakes mention-bursts. A tuned-out ' +
+      'channel is kept open, so its traffic reaches your subconscious: this ' +
+      'opens a channel you closed, and answers once that open is done. Where ' +
+      'the channel isn\'t open then, the answer\'s openError says why, and ' +
+      'when its messages will reach your subconscious where that\'s known. Calling tune_out ' +
+      'again for a channel already tuned out keeps its settings, and opens ' +
+      'the channel if it isn\'t open.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -26573,6 +26579,10 @@ export class AgentFramework {
     const entry = this.channelRegistry?.listChannelsRaw()
       .find((e) => e.descriptor.id === channelId);
     let result: { success: boolean; data?: unknown; error?: string; isError?: boolean };
+    // An open that throws is answered too, never left unhandled.
+    const openThrew = (err: unknown): string =>
+      'The tune-out is recorded, but its messages may not reach the subconscious, since opening its channel ' +
+      `failed: ${thrownText(err)}`;
     if (!entry) {
       result = { success: false, error: `unknown channel: ${channelId}`, isError: true };
     } else if (input.mode === 'cancel') {
@@ -26603,9 +26613,7 @@ export class AgentFramework {
         // answered too, never left unhandled, and the result goes through
         // pushEvent, as every other tool's does.
         void this.channelRegistry!.openForTuneOut(entry.serverId, channelId)
-          .catch((err): string =>
-            'The tune-out is recorded, but its messages may not reach the subconscious, since opening its channel ' +
-            `failed: ${thrownText(err)}`)
+          .catch(openThrew)
           .then((openError) => {
             this.pushEvent({
               type: 'tool-result',
@@ -26614,6 +26622,27 @@ export class AgentFramework {
               agentName,
               moduleName: 'tune-out',
               result: { success: true, data: { ...data, ...(openError ? { openError } : {}) } },
+            });
+          });
+        return;
+      }
+      // tune_out repeated on a channel already tuned out is where an agent
+      // retries a transport the first open left closed, so where it isn't
+      // open, the repeat opens it again, or waits for the open in flight
+      // (openForTuneOut), and the refusal says what its transport is now.
+      const tuneOut = this.channelRegistry!.getTuneOutState(entry.serverId, channelId);
+      if (r.alreadyTunedOut && tuneOut && !this.channelRegistry!.tuneOutTransportOpen(entry.serverId, channelId)) {
+        void this.channelRegistry!.openForTuneOut(entry.serverId, channelId)
+          .catch(openThrew)
+          .then((openError) => openError ?? 'Its transport is open now, so its messages reach the subconscious.')
+          .then((transport) => {
+            this.pushEvent({
+              type: 'tool-result',
+              callId: call.id,
+              toolName: call.name,
+              agentName,
+              moduleName: 'tune-out',
+              result: { success: false, error: alreadyTunedOutText(channelId, tuneOut.params, transport), isError: true },
             });
           });
         return;

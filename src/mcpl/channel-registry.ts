@@ -742,6 +742,22 @@ function supersededClause(action: 'open' | 'close', now: DesiredChannelState | u
   return action === 'close' ? 'a later decision to keep it open came first' : 'a later decision to close it came first';
 }
 
+/** A channel tool's refusal of a tuned-out channel, whose cancel is what ends
+ *  the tune-out, with the backlog it delivers. As an error result the agent
+ *  reads the pointer itself; `data` names the refusal for an in-process
+ *  caller. */
+function tunedOutRefusal(tool: string, channelId: string): ToolResult {
+  return {
+    success: false,
+    isError: true,
+    error:
+      `Channel "${channelId}" is tuned out: its messages go to the subconscious, and ${tool} doesn't change that. ` +
+      `Call tune_out with channelId "${channelId}" and mode "cancel" for it to resume normal attention; cancelling ` +
+      'delivers the diverted backlog.',
+    data: { refusal: 'tuned-out', channelId },
+  };
+}
+
 /** A clause as the start of a sentence. */
 function sentenceStart(clause: string): string {
   return clause.charAt(0).toUpperCase() + clause.slice(1);
@@ -1100,6 +1116,15 @@ export class ChannelRegistry {
   // Losing an open receipt does not confirm closure. Keep that distinction
   // private while preserving the public open:boolean availability projection.
   private unconfirmedChannelTargets = new WeakSet<ChannelEntry>();
+  // Marked entries a close failed for since a receipt or traffic last
+  // confirmed them, cleared where the mark is: a failed request's outcome is
+  // unknown, so such a close may have closed the channel, where an open,
+  // failed or not, can't have. Only a tune-out reads it (openForTuneOut),
+  // since its success says the channel's traffic will arrive.
+  private failedCloseTargets = new WeakSet<ChannelEntry>();
+  // Each tune-out's open in flight, by channel and epoch, so tune_out
+  // repeated meanwhile waits for that open's answer rather than send another.
+  private tuneOutOpens = new Map<string, Promise<string | undefined>>();
   // Entries ensureChannelRegistered made from a push, until a channels/changed
   // update gives one a target (handleChanged's retarget). A registration makes
   // a new entry, which isn't here. Kept by the host, not read from the
@@ -1742,6 +1767,7 @@ export class ChannelRegistry {
           if (desired !== 'open' && desired !== 'tuned-out') return;
         }
         this.unconfirmedChannelTargets.delete(incomingEntry);
+        this.failedCloseTargets.delete(incomingEntry);
         incomingEntry.open = true;
       };
       if (!coalesced) markAccepted();
@@ -2756,23 +2782,74 @@ export class ChannelRegistry {
    * that work leaves. Returns nothing where the transport is open, or, for
    * tune_out's answer, why the channel's messages don't or may not reach the
    * subconscious yet and when they will, or that the tune-out isn't in
-   * effect any more.
+   * effect any more. A call while this tune-out's open is in flight, as a
+   * repeated tune_out makes, gets that open's answer rather than send
+   * another.
    */
-  async openForTuneOut(serverId: string, channelId: string): Promise<string | undefined> {
-    const channelKey = `${serverId}:${channelId}`;
-    const lifecycleKey = this.lifecycleKey(serverId, channelId);
+  openForTuneOut(serverId: string, channelId: string): Promise<string | undefined> {
     // The tune-out this answer is for, by its epoch: one that ended, or that
     // a later decision or a later tune-out replaced, isn't this one.
     const epochId = this.getTuneOutState(serverId, channelId)?.params.epochId;
+    const key = `${this.lifecycleKey(serverId, channelId)}\u0000${epochId ?? ''}`;
+    const inFlight = this.tuneOutOpens.get(key);
+    if (inFlight) return inFlight;
+    const opening = this.openTuneOutTransport(serverId, channelId, epochId);
+    this.tuneOutOpens.set(key, opening);
+    const release = () => {
+      if (this.tuneOutOpens.get(key) === opening) this.tuneOutOpens.delete(key);
+    };
+    void opening.then(release, release);
+    return opening;
+  }
+
+  /**
+   * Whether a tuned-out channel's transport reads open now, as the tune-out
+   * reads it: its server up, and an open flag the tune-out takes as open
+   * (tuneOutReadsOpen). Where it doesn't, a repeated tune_out tries the open
+   * again (openForTuneOut), behind any work queued for the channel.
+   */
+  tuneOutTransportOpen(serverId: string, channelId: string): boolean {
+    return this.getTuneOutState(serverId, channelId) !== null &&
+      this.serverReach(serverId) === 'up' &&
+      this.tuneOutReadsOpen(this.channels.get(`${serverId}:${channelId}`));
+  }
+
+  /**
+   * Whether a tune-out takes an entry's transport as open: its open flag,
+   * unless a close for it failed since it was confirmed (failedCloseTargets),
+   * since that close may have taken effect. The other readers take any flag
+   * a failed request left as it was (runLifecycleOperation), since a send
+   * through it fails where it can be seen, and channel_open sends an open
+   * after a failed close anyway, its decision having been closed. A
+   * tune-out's success says traffic will arrive, nothing would show it
+   * doesn't, and the decision it replaced isn't known here. An open that
+   * failed, as a redundant one queued behind a confirming one may, can't
+   * have closed the channel.
+   */
+  private tuneOutReadsOpen(entry: ChannelEntry | undefined): boolean {
+    // A flag is set open only where both marks are cleared, so a failed
+    // close on an open flag is one since its confirmation.
+    return entry !== undefined && entry.open && !this.failedCloseTargets.has(entry);
+  }
+
+  private async openTuneOutTransport(
+    serverId: string,
+    channelId: string,
+    epochId: string | undefined,
+  ): Promise<string | undefined> {
+    const channelKey = `${serverId}:${channelId}`;
+    const lifecycleKey = this.lifecycleKey(serverId, channelId);
     const inEffect = () =>
       epochId !== undefined && this.getTuneOutState(serverId, channelId)?.params.epochId === epochId;
     const replaced = "The tune-out was recorded, but it isn't in effect any more: it ended, or a later decision about the " +
       'channel or a later tune-out replaced it, while its transport was being opened.';
     // "May not": a failed request leaves its outcome unknown, and an open
-    // that took effect would have its traffic diverted.
-    const notYet = (later: string, why: string): string => withStop(
+    // that took effect would have its traffic diverted. `again` where calling
+    // tune_out again tries the open now: the channel is registered here and
+    // its server up.
+    const notYet = (later: string, why: string, again = false): string => withStop(
       `The tune-out is recorded, but its messages may not reach the subconscious until this host opens the channel, ` +
-      `which it does ${later}; ${why}`,
+      `which it does ${later}${again ? ', or now if you call tune_out again' : ''}; ${why}`,
     );
     const nextRegistration = `when the "${serverId}" server next registers this channel, if this host may open and ` +
       'close its channels then';
@@ -2813,21 +2890,15 @@ export class ChannelRegistry {
           (reach === 'gone' ? unreachableRemedy(reach) : ''),
         );
       }
-      // Only a confirmed open flag is taken as open. The other readers take
-      // a flag a failed request left as it was (runLifecycleOperation),
-      // since a send through it fails where it can be seen, and channel_open
-      // sends an open after a failed close anyway, its decision having been
-      // closed. A tune-out's success says traffic will arrive, nothing would
-      // show it doesn't, and the decision it replaced isn't known here.
-      const confirmedOpen = entry !== undefined && entry.open && !this.unconfirmedChannelTargets.has(entry);
+      const transportOpen = this.tuneOutReadsOpen(entry);
       if (!this.directsLifecycle(serverId)) {
-        return confirmedOpen ? undefined
+        return transportOpen ? undefined
           : `The tune-out is recorded, but ${this.lifecycleRefusal(serverId).message}, so its messages reach the ` +
-            'subconscious only as that server sends them.';
+            'subconscious only as that server sends them. If you need this host to open it, ask whoever runs this host.';
       }
       if (!entry) return missing;
       // A flag a close that may have taken effect left gets an open.
-      return confirmedOpen ? undefined : null;
+      return transportOpen ? undefined : null;
     };
     await settle();
     const before = answered(this.channels.get(channelKey), notYet(nextRegistration, "it isn't registered here now"));
@@ -2849,7 +2920,9 @@ export class ChannelRegistry {
     const after = this.channels.get(channelKey);
     const settled = answered(after, notYet(nextRegistration, `it isn't registered here any more${clause}`));
     if (settled !== null) return settled;
-    return notYet(laterClause(after!), failure !== undefined ? `opening it now didn't complete${clause}` : "it isn't open now");
+    return notYet(
+      laterClause(after!), failure !== undefined ? `opening it now didn't complete${clause}` : "it isn't open now", true,
+    );
   }
 
   /**
@@ -3171,8 +3244,10 @@ export class ChannelRegistry {
           // while not open). A failure from an older connection or target
           // also withdraws the open flag.
           if (this.channels.get(channelKey) === entry) {
-            if (sameTarget()) this.unconfirmedChannelTargets.add(entry);
-            else this.invalidateTransportConfirmation(entry);
+            if (sameTarget()) {
+              this.unconfirmedChannelTargets.add(entry);
+              if (!open) this.failedCloseTargets.add(entry);
+            } else this.invalidateTransportConfirmation(entry);
           }
           // A retarget while this RPC was out queued nothing for the new
           // target, since handleChanged leaves that to this operation. So a
@@ -3227,6 +3302,7 @@ export class ChannelRegistry {
         if (open) this.applyOpenDeclaration(entry, result);
         entry.open = open;
         this.unconfirmedChannelTargets.delete(entry);
+        this.failedCloseTargets.delete(entry);
         const now = this.getDesiredState(serverId, channelId);
         if (open !== (now === 'open' || now === 'tuned-out')) continue;
         return { open, result };
@@ -4036,19 +4112,9 @@ export class ChannelRegistry {
     // A tuned-out channel is transport-open but attention-diverted; a plain
     // open would silently discard the epoch (and its pending backlog dump).
     // Cancelling is the tune-out coordinator's flow, reached via its own
-    // tool — refuse with the pointer rather than eat the state. As an error
-    // result, the agent reads the pointer itself; `data` names the refusal
-    // for an in-process caller.
+    // tool — refuse with the pointer rather than eat the state.
     if (this.getDesiredState(entry.serverId, input.channelId) === 'tuned-out') {
-      return {
-        success: false,
-        isError: true,
-        error:
-          `Channel "${input.channelId}" is tuned out: its messages go to the subconscious, and channel_open doesn't change ` +
-          `that. Call tune_out with channelId "${input.channelId}" and mode "cancel" for it to resume normal attention; ` +
-          'cancelling delivers the diverted backlog.',
-        data: { refusal: 'tuned-out', channelId: input.channelId },
-      };
+      return tunedOutRefusal('channel_open', input.channelId);
     }
 
     const alreadyDesiredOpen = this.getDesiredState(entry.serverId, input.channelId) === 'open';
@@ -4237,15 +4303,7 @@ export class ChannelRegistry {
     // backlog it diverted would never reach the agent. Its cancel is what ends
     // it, as channel_open's refusal of a tuned-out channel says.
     if (this.getDesiredState(entry.serverId, input.channelId) === 'tuned-out') {
-      return {
-        success: false,
-        isError: true,
-        error:
-          `Channel "${input.channelId}" is tuned out: its messages go to the subconscious, and channel_decline doesn't ` +
-          `change that. Call tune_out with channelId "${input.channelId}" and mode "cancel" for it to resume normal ` +
-          'attention; cancelling delivers the diverted backlog.',
-        data: { refusal: 'tuned-out', channelId: input.channelId },
-      };
+      return tunedOutRefusal('channel_decline', input.channelId);
     }
     if (entry.open || this.getDesiredState(entry.serverId, input.channelId) === 'open') {
       // channel_close is the call that closes it: its own answer says when,
