@@ -26,6 +26,8 @@ async function setup(t: TestContext, content: string | Buffer) {
 type LinePage = { totalLines: number; fromLine?: number; toLine?: number; note?: string; content: string };
 type CharPage = { totalChars: number; offsetChars: number; nextOffsetChars: number | null; note?: string; content: string };
 const stored = (result: { data?: unknown }): number => JSON.stringify(result.data).length;
+// A running script's call's resultMaxChars at the default 128 MiB of script memory.
+const SCRIPT_LIMIT = 7_456_527;
 
 test('line reads retain numbering, ranges, and the 2000-line default', async t => {
   const { read } = await setup(t, Array.from({ length: 2005 }, (_, i) => `line ${i + 1}`).join('\n'));
@@ -36,7 +38,7 @@ test('line reads retain numbering, ranges, and the 2000-line default', async t =
     content: '     2\tline 2\n     3\tline 3',
   });
   // A script's call can take far more than a turn's, so its default page is the 2000 lines.
-  const defaults = (await read({}, 5_000_000)).data as LinePage;
+  const defaults = (await read({}, SCRIPT_LIMIT)).data as LinePage;
   assert.equal(defaults.toLine, 2000);
   assert.equal(defaults.content.split('\n').length, 2000);
 });
@@ -95,8 +97,8 @@ test('a long line is cut at 2000 characters, with the offsetChars and limitChars
   const rest = long.length - 1999;
   const at = 1 + 'short\r\n'.length + 1999;
   assert.equal(lines[1], `     2\t${'x'.repeat(1999)} [… read the rest with offsetChars=${at} and limitChars=${rest}]`);
-  // A script's call, at 5,000,000 characters, cuts the line the same way.
-  assert.equal(((await read({}, 5_000_000)).data as LinePage).content.split('\n')[1], lines[1]);
+  // A script's call cuts the line the same way.
+  assert.equal(((await read({}, SCRIPT_LIMIT)).data as LinePage).content.split('\n')[1], lines[1]);
   const more = (await read({ offsetChars: at, limitChars: rest })).data as CharPage;
   assert.equal(more.content, '😀' + 'y'.repeat(1000));
   assert.equal(lines[2], '     3\tlast');

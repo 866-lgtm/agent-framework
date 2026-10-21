@@ -2,10 +2,11 @@ import type { ToolResult } from '../../types/events.js';
 import { type FileText, MAX_LINE_CHARS, jsonCharLength, jsonLength, numberedLine, safeCut } from './text.js';
 
 /**
- * One page of a read, held to the result limit: the framework stores a
- * success's data as JSON, and spills what passes the caller's limit into a
- * file, cut mid-JSON. So a page stops before it would pass the limit, and its
- * note says where to continue.
+ * One page of a read, held to the result limit: the framework gives a
+ * success's data as JSON, and what passes the caller's limit doesn't reach it
+ * whole. A model's result spills into a file, cut mid-JSON, and a script gets
+ * ResultTooLarge in its place. So a page stops before it would pass the limit,
+ * and its note says where to continue.
  */
 
 /** How many lines a read shows when it isn't given a limit. */
