@@ -1,8 +1,13 @@
 - A cut tool result's spill notice, which names the workspace file holding
-  the rest, now survives every reader's per-message cut wherever the bound
-  can hold it: not where a turn's share falls under about 640 characters,
-  past six results at a bound of 4,000, nor where a mount name past about
-  seventy characters makes the notice longer than its room. An ordinary
+  the rest, now survives every reader's per-message cut until a turn's
+  notices alone fill the bound, or a mount name past about seventy
+  characters makes the notice longer than its room. Past six results at a
+  bound of 4,000, or 62 at 40,000, a turn's share is under the notice's
+  room, so each result longer than its share is stored as its notice alone,
+  with no head; where a workspace is writable, its file holds the whole
+  result. Past about 11 results at 4,000, or 119 at 40,000, the notices
+  themselves pass the bound, and the reader's cut takes the later ones. An
+  ordinary
   resident's inline cap is at most the smallest per-message bound among the
   agents that read the shared slot, and `agent_settings` get reports a cap
   set by another reader's bound as
