@@ -103,7 +103,7 @@ import { isSilentHeartbeatMarker, isVisiblyEmptyContent, NON_STRING_TEXT_PLACEHO
 import { parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
-import { ChannelRegistry, connectorText, desiredStateInLog, destinationKey, journalToolDescription, type ChannelToolOrigin, type PublishDestination, type PublishOutcome, type SelectedForOpening } from './mcpl/channel-registry.js';
+import { ChannelRegistry, connectorText, desiredStateInLog, destinationKey, journalToolDescription, NON_HOLDER_CHANNEL_DESCRIPTIONS, type ChannelToolOrigin, type PublishDestination, type PublishOutcome, type SelectedForOpening } from './mcpl/channel-registry.js';
 import { KEEP_IDLE_MS, KEEP_NEWEST, ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftAttempt, type DraftReason, type DraftState, type InheritedRisk } from './prose-drafts.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import { INBOUND_SOURCE_KEY, sourceBodyDigest, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
@@ -6084,6 +6084,10 @@ export class AgentFramework {
         );
       }
       if (tool.name === 'journal' && !canSkipReply) return { ...tool, description: journalToolDescription(false) };
+      // A holder's words are the registry's, so its cached tool list doesn't change.
+      if ((tool.name === 'channel_open' || tool.name === 'channel_close') && !this.holdsChannelTrafficForTools(agentName)) {
+        return { ...tool, description: NON_HOLDER_CHANNEL_DESCRIPTIONS[tool.name] };
+      }
       return tool;
     });
   }
@@ -15568,6 +15572,25 @@ export class AgentFramework {
       return channelIds.every((id) => id === home && this.conversationRouter?.getBinding(id)?.agentName === who);
     }
     if (this.conversationRouter) return false;
+    return this.residentHoldsTraffic(who);
+  }
+
+  /**
+   * Whether `who`'s window holds the traffic of the channels it may open or close, for the words its channel_open and
+   * channel_close carry. A conversation fork does for its home, the one
+   * channel it may close, decided by the home rather than the binding, so a fork whose binding expired keeps its words
+   * through its closure turn: changing them then would send its whole window uncached, for a sentence false for that
+   * turn only. Otherwise as holdsChannelTraffic has it: on a host that routes conversations, the trunk holds none, and
+   * otherwise the delivery agent and the readers of the residents' shared slot do. An ephemeral run holds none.
+   */
+  private holdsChannelTrafficForTools(who: string): boolean {
+    if (this.conversationAgentHomes.has(who)) return true;
+    if (this.conversationRouter) return false;
+    return this.residentHoldsTraffic(who);
+  }
+
+  /** Whether `who` is the delivery agent, or reads the residents' shared slot it stores into. */
+  private residentHoldsTraffic(who: string): boolean {
     const delivery = this.deliveryAgent();
     const agent = this.agents.get(who);
     if (delivery === undefined || agent === undefined) return false;
