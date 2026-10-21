@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
 import { AgentFramework } from '../src/framework.js';
 
-// Focused merge regression: no store, provider, or network is opened.
+// Focused merge regression: the unit harness opens no store/provider/network; the final characterization uses a temporary store.
 function harness() {
   const f = Object.create(AgentFramework.prototype) as any;
   const agent = {};

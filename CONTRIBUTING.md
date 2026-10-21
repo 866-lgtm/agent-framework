@@ -234,25 +234,6 @@ see the ecosystem workspace setup — `bun install` at the `rust-connectome`
 root links the four packages together.
 
 
-### Maintainer prerequisite for the Node-floor CI matrix change
-
-Before merging the dependency-floor change, a repository administrator must
-check main's branch-protection/ruleset required-status contexts. The old
-`Build & Test (ubuntu-latest, node 20)`,
-`Build & Test (macos-latest, node 20)`,
-`Build & Test (macos-latest, node 24)` and unqualified
-`Packed release installs on its own` contexts no longer run.
-Select the required replacement contexts deliberately; the new matrix reports:
-
-- `Build & Test (ubuntu-latest, node 22.12.0)`
-- `Build & Test (ubuntu-latest, node 24)`
-- `Build & Test (ubuntu-latest, node latest)`
-- `Build & Test (macos-latest, node 22.12.0)`
-- `Build & Test (macos-latest, node latest)`
-- `Packed release installs on its own (node 22.12.0)`
-- `Packed release installs on its own (node 24)`
-
-Keep required coverage; do not bypass branch protection or assume the workflow
-file changes repository settings. Contributors without ruleset access should
-ask a maintainer to confirm this migration. This PR does not modify protection
-settings and cannot verify which contexts the repository currently requires.
+CI check contexts follow the workflow matrices. When a matrix changes, a
+maintainer should check that the repository's required-status list matches it;
+workflow edits do not change branch-protection settings themselves.

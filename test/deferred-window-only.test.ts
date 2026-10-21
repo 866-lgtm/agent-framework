@@ -31,9 +31,8 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import type {
   Module,
@@ -752,10 +751,11 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       const first = { ...entry('w-malformed-real', 'bad'), content: [{ type: 'text', text: 42 }] as unknown as ContentBlock[] };
       const second = { ...entry('w-after-malformed', 'after'), seq: 2 };
       const count = cm.getMessageCount.bind(cm);
-      let failCount = failAt === 'initial-count';
-      let readFailures = 0;
+      let failCount = false;
+      let countPhase = 'drain';
+      const failedPhases: string[] = [];
       cm.getMessageCount = () => {
-        if (failCount) { failCount = false; readFailures++; throw new Error('injected count/readback failure'); }
+        if (failCount) { failCount = false; failedPhases.push(countPhase); throw new Error('injected count/readback failure'); }
         return count();
       };
       const errors: string[] = [];
@@ -766,16 +766,22 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       try {
         queue.deferredMessages.push(first, second);
         const drained = queue.drainDeferredFor('assistant') as DeferredEntry[];
+        assert.deepEqual(failedPhases, [], 'handoff must not consume the writer fault');
+        countPhase = 'writer-before-add';
+        failCount = failAt === 'initial-count';
         internals.writeDrainedInOrder(drained, 'test-real-store', (m) => {
+          countPhase = 'write-callback';
           writes.push(m.id);
           try { return cm.addMessage(m.participant, m.content, { deferredWriteId: m.id } as never); }
           catch (e) {
             assert.ok(e instanceof MalformedContentError, 'real CM refusal, not a framework readback stub');
+            countPhase = 'writer-readback';
             if (failAt === 'readback') failCount = true;
             throw e;
           }
         });
-        assert.equal(readFailures, 1, 'the actual CM read boundary failed');
+        assert.deepEqual(failedPhases, [failAt === 'initial-count' ? 'writer-before-add' : 'writer-readback'],
+          'the intended writer count boundary, not queue handoff or the write callback, failed exactly once');
         assert.deepEqual(writes, [first.id, second.id], 'successor proceeds in the same flush');
         assert.deepEqual(internals.deferredMessages, [], 'malformed refusal is not retained as unknown');
         assert.equal(cm.queryMessages({ metadata: { deferredWriteId: first.id } } as never).messages.length, 0);

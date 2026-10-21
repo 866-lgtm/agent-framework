@@ -4678,9 +4678,9 @@ export class AgentFramework {
       console.error(`[provider-wait] agent=${agentName} model=${wait.model} released by ${by} (${release})`);
     }
     // The agent's context strategy may pace its own provider calls by the same
-    // stated wait. context-manager 0.16.0, this package's floor, has no
-    // releaseCompressionPause, so this calls nothing in its strategies. The
-    // release is the operator's word on that wait too, so it is offered to the
+    // stated wait. From context-manager 0.17, its compression lane exposes
+    // releaseCompressionPause. The release is the operator's word on that
+    // wait too, so it is offered to the
     // lane with its scope even when no wait binds here: the lane can hold a
     // pause after this framework's own wait is gone (the records read again,
     // the wait passed, or it was released in another process). The strategy's
@@ -21525,9 +21525,11 @@ export class AgentFramework {
    * them land out of order.
    *
    * An entry context-manager refuses as malformed (MalformedContentError) is
-   * the exception: context-manager validates content and every shard before
-   * writing, so this typed refusal proves no write even if readback fails.
-   * A copy readback actually finds is still counted as written first. Other
+   * the exception for the store's own validation: context-manager checks
+   * content and every shard before writing. A custom synchronous strategy
+   * hook can throw the same class after append (context-manager #288);
+   * unreadable landing in that callback escape remains a limitation until
+   * the CM follow-up lands. A copy actually found still counts first. Other
    * ambiguous errors remain queued for ID reconciliation before retry. A
    * malformed refusal would fail every flush and hold its target's later
    * writes for good, so it's logged and dropped instead, and its
@@ -21652,8 +21654,9 @@ export class AgentFramework {
           onLanded?.(msg, landed[0]!.id);
           continue;
         }
-        // CM validates all content/shards before writing: this typed refusal
-        // cannot have stored a partial body, even when readback is unavailable.
+        // The store's own validation refuses content/shards before append.
+        // A synchronous custom strategy can escape after append (CM #288);
+        // this is not a guarantee for that callback when readback also fails.
         // Any copy readback did find was already handled above.
         if (error instanceof MalformedContentError) {
           this.logDeferredWriteError(msg, where, error, 'dropped');
@@ -21713,7 +21716,8 @@ export class AgentFramework {
 
   /** The line naming a drained write that threw: one that couldn't be stored,
    *  which is already back in the queue; with 'dropped', a malformed refusal
-   *  whose typed refusal guarantees no write; with a count, one stored before the
+   *  from the store's pre-write validation (see the CM #288 caveat above);
+   *  with a count, one stored before the
    *  throw (for a sharded body, how many of its shards), or, with
    *  `foundLater`, one an earlier write of which landed and was found by its
    *  id; with `'unknown'`, one whose store couldn't be read to tell

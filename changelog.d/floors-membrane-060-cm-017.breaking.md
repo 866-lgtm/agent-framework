@@ -10,6 +10,12 @@
     twice (below 0.5.81, OpenAI's too, and OpenRouter's on routes that report
     OpenAI's `cached_tokens`), so a compression fallback that fits can be
     rejected at admission and its chunk quarantined (context-manager 0.16.0).
+  - **Your own context-manager:** a host that constructs strategies from its
+    own `@animalabs/context-manager` must also raise that range to `^0.17.1`,
+    matching agent-framework's dependency, and verify that installation has
+    one compatible copy. Leaving the host on 0.14.x installs two copies and
+    hands an older strategy to a newer manager; strategy interfaces and
+    compression-pause/quarantine behavior differ between those versions.
   - **The kv-unified hysteresis certificate is on by default** for a
     strategy built from a recipe: a `kvUnified` block without
     `hysteresisCertificate` takes the certified exit, and
@@ -37,7 +43,7 @@
     upgrading carries the new text wherever it renders such a note, so a
     provider's prompt cache misses once, from the first such note on
     (membrane 0.6.0).
-  - **Caller-supplied blob references:** context-manager 0.17.1 refuses
+  - **Caller-supplied blob references:** context-manager 0.16.0 and later refuse
     `blob_ref` writes with `MalformedContentError`; these references are
     store-internal. Read with blobs resolved (the default) before copying a
     body into a new write. An unresolved read is not a write-ready payload.
@@ -48,6 +54,5 @@
     demand and the subtree engine. Explicit recipe overrides remain important:
     `policy.ageBandSteps: 0` requests exact ages, `latentDemandMode: 'individual'`
     chooses independent ranking, and `engine: 'dag'` selects the DAG engine.
-    Hosts must type/validate these controls rather than silently accept typos.
   - The rest is in membrane 0.6.0's notes and context-manager 0.15.0's and
     0.16.0's and 0.17.x's.
