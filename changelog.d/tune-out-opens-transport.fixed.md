@@ -7,9 +7,11 @@
   says why the channel's messages don't, or may not, reach the subconscious
   yet and when they will, or that the tune-out isn't in effect any more. The
   answer now comes once the channel's lifecycle work has settled: the work
-  already queued for it, the tune-out's own open where the transport isn't
-  confirmed open, and the work queued while that open was out, each request
-  up to its deadline.
+  already queued for it, the tune-out's own open where the transport may
+  not be open, and the work queued while that open was out, each request
+  up to its deadline. `tune_out` called again for a channel already tuned
+  out tries the open again where its transport may not be open, and its
+  refusal says what the transport is now.
 - `channel_decline` refuses a channel that's tuned out, whatever its
   transport, and says to cancel the tune-out with `tune_out` mode "cancel",
   which delivers what it diverted. Until now a decline of one whose
