@@ -39,6 +39,31 @@ async function waitFor(
   }
 }
 
+/**
+ * A count of the scheduler's passes over the queued requests: the returned
+ * wait ends once a pass that began after it was called has completed. A
+ * pass is done with each request it took when it completes, and a turn it
+ * starts has asked the membrane for its stream by then, unless an auxiliary
+ * call holds the agent's provider gate as it starts. No auxiliary call is
+ * in flight at the passes these tests wait for. A pass that throws doesn't
+ * count, since it may have stopped before the request a test waits on.
+ */
+function schedulerPasses(framework: AgentFramework): () => Promise<void> {
+  const owner = framework as unknown as { processInferenceRequests: () => Promise<void> };
+  const pass = owner.processInferenceRequests.bind(framework);
+  let begun = 0;
+  let completed = 0;
+  owner.processInferenceRequests = async () => {
+    const n = ++begun;
+    await pass();
+    completed = Math.max(completed, n);
+  };
+  return () => {
+    const after = begun + 1;
+    return waitFor('a scheduler pass to complete', () => completed >= after);
+  };
+}
+
 function autobiographical(): AutobiographicalStrategy {
   return new AutobiographicalStrategy({
     adaptiveResolution: true,
@@ -91,11 +116,12 @@ test('quiesce parks wakes; resume releases them', async () => {
     const before = await framework.quiesce({ reason: 'test window' });
     assert.equal(before.quiesced, true);
     assert.equal(before.drained, true);
+    const nextPass = schedulerPasses(framework);
 
     const nudge = framework.nudgeAgent('agent', 'operator');
     assert.equal(nudge.ok, true);
-    // Give the running loop time to (not) start a turn.
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    // A pass over the nudge's wake, which would have started its turn.
+    await nextPass();
     assert.equal(membrane.calls.length, 0, 'no inference while quiesced');
     assert.equal(framework.getAgent('agent')!.state.status, 'idle');
     assert.equal(framework.getHostModeStatus().gatedRequests, 1);
@@ -111,13 +137,15 @@ test('parked wakes coalesce per (agent, reason), keeping the set bounded', async
   await withFramework(membrane, async (framework) => {
     framework.start();
     await framework.quiesce();
+    const nextPass = schedulerPasses(framework);
     for (let i = 0; i < 5; i++) framework.nudgeAgent('agent', 'operator');
     // The loop's next pass compresses same-reason parked requests to one.
     await waitFor(
       'coalescing to a single parked request',
       () => framework.getHostModeStatus().gatedRequests === 1,
     );
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    // A later pass over the coalesced request, which would have started it.
+    await nextPass();
     assert.equal(framework.getHostModeStatus().gatedRequests, 1, 'stays bounded');
     assert.equal(membrane.calls.length, 0);
   });
@@ -131,6 +159,7 @@ test('coalescing keeps an ADDRESSED wake alive when an ambient one of the same r
   await withFramework(membrane, async (framework) => {
     framework.start();
     await framework.quiesce();
+    const nextPass = schedulerPasses(framework);
     // Re-read on every access: the scheduler REASSIGNS pendingRequests
     // when it takes a batch, so a captured reference goes stale.
     const pending = () => (framework as unknown as { pendingRequests: Array<Record<string, unknown>> }).pendingRequests;
@@ -141,11 +170,12 @@ test('coalescing keeps an ADDRESSED wake alive when an ambient one of the same r
       { agentName: 'agent', reason: 'mcpl:channel-incoming', source: 'framework', timestamp: t + 2, addressed: false, channelId: 'lounge' },
     );
     await waitFor('scheduler pass to coalesce', () => framework.getHostModeStatus().gatedRequests === 2);
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    // A later pass over the survivors, which would have started them.
+    await nextPass();
     const survivors = pending().filter((r) => r.reason === 'mcpl:channel-incoming');
     assert.equal(survivors.length, 2, 'one addressed + one ambient survive');
     assert.ok(survivors.some((r) => r.addressed === true && r.channelId === 'dm'), 'the addressed wake survived');
-    assert.ok(survivors.some((r) => r.addressed === false), 'the newest ambient wake survived');
+    assert.ok(survivors.some((r) => r.addressed === false && r.timestamp === t + 2), 'the newest ambient wake survived');
     assert.equal(membrane.calls.length, 0);
   });
 });
@@ -850,15 +880,22 @@ test('MCPL: pushes buffer while quiesced; host/command resume reopens and flushe
 // Review-fix regressions (code review 08-21)
 // ---------------------------------------------------------------------------
 
-/** A membrane whose stream sleeps before producing its response — a turn
- *  that settles on its own after `delayMs`, so a drain window's real length
- *  becomes observable: a collapsed window returns undrained immediately, a
- *  sane one waits for the turn. */
-class DelayedMembrane extends MockMembrane {
-  constructor(private readonly delayMs: number) { super(); }
+/** A membrane whose stream produces its response only once the test opens
+ *  its gate, so a turn stays in flight for as long as a test needs: a
+ *  collapsed drain window returns undrained, a sane one waits for the turn. */
+class GatedMembrane extends MockMembrane {
+  private opened = false;
+  private waiters: Array<() => void> = [];
+  open(): void {
+    this.opened = true;
+    for (const wake of this.waiters.splice(0)) wake();
+  }
+  private gate(): Promise<void> {
+    return this.opened ? Promise.resolve() : new Promise((resolve) => { this.waiters.push(resolve); });
+  }
   override streamYielding(request: NormalizedRequest, options?: unknown): YieldingStream {
     const inner = super.streamYielding(request, options);
-    const delayMs = this.delayMs;
+    const gate = () => this.gate();
     return {
       cancel: () => inner.cancel(),
       provideToolResults: (...args: unknown[]) => (inner.provideToolResults as (...a: unknown[]) => void)(...args),
@@ -866,7 +903,7 @@ class DelayedMembrane extends MockMembrane {
       get pendingToolCallIds() { return inner.pendingToolCallIds; },
       get toolDepth() { return inner.toolDepth; },
       async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        await gate();
         yield* inner as unknown as AsyncIterable<StreamEvent>;
       },
     } as unknown as YieldingStream;
@@ -876,24 +913,28 @@ class DelayedMembrane extends MockMembrane {
 test('a non-finite timeoutMs falls back to the default drain window, never NaN-collapses', async () => {
   // NaN reached quiesce() via Number('12O000') on the HTTP ingress. With the
   // old Math.max(1_000, NaN) the deadline was NaN and the drain window
-  // collapsed to zero. Discriminating observable: a turn that settles after
-  // 600ms is drained by a sane window and NOT by a collapsed one.
-  const membrane = new DelayedMembrane(600);
+  // collapsed to zero. Discriminating observable: a turn held in flight
+  // until quiesce has begun is drained by a sane window, and a collapsed one
+  // has already returned undrained by then.
+  const membrane = new GatedMembrane();
   membrane.pushResponse(createMockResponse([{ type: 'text', text: 'late' }]));
   await withFramework(membrane, async (framework) => {
     framework.start();
     framework.nudgeAgent('agent', 'operator');
     await waitFor('turn to start', () => membrane.calls.length === 1);
-    const started = Date.now();
-    const status = await framework.quiesce({ timeoutMs: Number('12O000') });
+    const quiescing = framework.quiesce({ timeoutMs: Number('12O000') });
+    // quiesce() marks the host quiesced, then checks the drain before its
+    // first await, so the turn is still held at that check.
+    await waitFor('quiesce to begin', () => framework.getHostModeStatus().quiesced);
+    membrane.open();
+    const status = await quiescing;
     assert.equal(status.quiesced, true);
     assert.equal(status.drained, true, 'the window waited for the turn');
-    assert.ok(Date.now() - started >= 400, 'quiesce actually waited');
   });
 });
 
 test('timeoutMs is clamped inside quiesce() — a sub-second value still drains a short turn', async () => {
-  const membrane = new DelayedMembrane(600);
+  const membrane = new GatedMembrane();
   membrane.pushResponse(createMockResponse([{ type: 'text', text: 'late' }]));
   await withFramework(membrane, async (framework) => {
     framework.start();
@@ -901,7 +942,16 @@ test('timeoutMs is clamped inside quiesce() — a sub-second value still drains 
     await waitFor('turn to start', () => membrane.calls.length === 1);
     // 1ms honoured literally would return undrained; the [1s, 10m] floor
     // (now inside quiesce(), shared by WS/HTTP/host-command) waits it out.
-    const status = await framework.quiesce({ timeoutMs: 1 });
+    // The subject is time, so the turn settles on a timer: its gate opens
+    // 300 ms into the window. The drain looks again every 250 ms, and a
+    // timer due sooner always fires first, so a 1 ms window ends at its
+    // first look with the turn still held. A floor of 1 s looks again at
+    // 500, 750 and 1000 ms, so a correct run fails only if none of those
+    // looks finds the turn settled, which takes this process being held up
+    // for most of that second.
+    const quiescing = framework.quiesce({ timeoutMs: 1 });
+    setTimeout(() => membrane.open(), 300);
+    const status = await quiescing;
     assert.equal(status.drained, true);
     assert.equal(AgentFramework.QUIESCE_TIMEOUT_MAX_MS, 600_000);
   });
@@ -916,8 +966,10 @@ test('a concurrent resume() supersedes a draining quiesce: no abandon, no stale 
     framework.nudgeAgent('agent', 'operator');
     await waitFor('turn to start', () => membrane.calls.length === 1);
 
-    const pending = framework.quiesce({ timeoutMs: 5_000, abandon: true });
-    await new Promise((resolve) => setTimeout(resolve, 400));
+    // A window sized for a hang, so the resume reaches it while it drains,
+    // however slow the machine is.
+    const pending = framework.quiesce({ timeoutMs: 60_000, abandon: true });
+    await waitFor('quiesce to begin', () => framework.getHostModeStatus().quiesced);
     assert.equal(framework.getHostModeStatus().quiesced, true, 'draining');
     await framework.resume();
     const status = await pending;
@@ -974,6 +1026,13 @@ test('a cancel that surfaces as a stream ERROR still settles as an operator abor
   await withFramework(membrane, async (framework) => {
     const traces: TraceEvent[] = [];
     framework.onTrace((event) => traces.push(event));
+    // The turn's lifecycle goes to MCPL servers granted it, through the hook
+    // orchestrator, not to onTrace: stand one in that records it.
+    const lifecycle: string[] = [];
+    (framework as unknown as { hookOrchestrator: unknown }).hookOrchestrator = {
+      beforeInference: async () => [],
+      emitLifecycle: (params: { phase: string }) => { lifecycle.push(params.phase); },
+    };
     framework.start();
     framework.nudgeAgent('agent', 'operator');
     await waitFor('turn to start', () => membrane.calls.length === 1);
@@ -987,10 +1046,7 @@ test('a cancel that surfaces as a stream ERROR still settles as an operator abor
     // stream must not be reported failed and then aborted.
     assert.ok(!traces.some((t) => t.type === 'inference:failed'),
       'an abandoned turn is not first recorded as a provider failure');
-    const lifecycle = traces
-      .filter((t) => String(t.type).includes('lifecycle'))
-      .map((t) => (t as { phase?: string }).phase);
-    if (lifecycle.length > 0) assert.ok(!lifecycle.includes('completed'), 'an abandoned turn is not "completed"');
+    assert.deepEqual(lifecycle, ['started', 'aborted'], 'an abandoned turn ends its lifecycle "aborted", not "completed"');
   });
 });
 
@@ -1643,10 +1699,12 @@ test('a wake parked on provider admission does not start after quiesce; it runs 
     assert.equal(status.drained, false, 'a parked admission is not "drained"');
 
     // Release the auxiliary: before the fix this started a turn while quiesced.
+    const nextPass = schedulerPasses(framework);
     releaseAux();
     await auxDone;
     await waitFor('admission released', () => (internals.providerGates.get('agent')?.primaryDepth ?? 0) === 0);
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    // A pass over the requeued wake, which would have started it.
+    await nextPass();
     assert.equal(membrane.calls.length, 0, 'NO inference while quiesced');
     assert.equal(framework.getHostModeStatus().quiesced, true);
     assert.ok(framework.getHostModeStatus().gatedRequests >= 1, 'the wake was requeued, not dropped');
