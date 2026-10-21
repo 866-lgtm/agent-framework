@@ -489,12 +489,36 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     await framework.stop();
   });
 
+  /** The agent's context manager's addMessage throws once, for the message
+   *  with this text, after the real call has stored it: a write that throws
+   *  though its message is stored. The double is ours: from 0.15,
+   *  context-manager logs a throw from a host's onMessage listener and lets
+   *  the write stand, and context-manager issue #288 reports the escape of a
+   *  synchronous throw from its strategy's onNewMessage as a bug. */
+  function throwOnceAfterStoring(framework: AgentFramework, textOf: string): void {
+    const cm = framework.getAgent('assistant')!.getContextManager() as unknown as {
+      addMessage: (participant: string, content: ContentBlock[], ...rest: unknown[]) => string;
+    };
+    const addMessage = cm.addMessage;
+    let thrown = false;
+    cm.addMessage = function (this: unknown, participant, content, ...rest) {
+      const id = addMessage.call(this, participant, content, ...rest);
+      if (!thrown && content.some((b) => (b as { text?: string }).text === textOf)) {
+        thrown = true;
+        throw new Error('failed after storing');
+      }
+      return id;
+    };
+  }
+
   /** The strategy's onNewMessage throws once, synchronously, for the record
    *  with this text. The manager's own store listener calls it as each record
-   *  is written, so the write throws though its message is stored. A host's
-   *  onMessage listener can't do this on context-manager 0.15, which logs its
-   *  throw and lets the write stand. */
-  function throwOnceAfterStoring(framework: AgentFramework, textOf: string): void {
+   *  is written, so the throw escapes the append partway through a sharded
+   *  body, and context-manager removes the shards it wrote. Only one test
+   *  uses it, "a sharded body whose write throws partway lands nothing",
+   *  which relies on that escape, which context-manager issue #288 reports
+   *  as a bug. */
+  function throwOnceFromStrategyHook(framework: AgentFramework, textOf: string): void {
     const strategy = (framework.getAgent('assistant')!.getContextManager() as unknown as {
       strategy: { onNewMessage?: (message: { content: ContentBlock[] }, ctx: unknown) => Promise<void> };
     }).strategy;
@@ -536,29 +560,31 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       'assistant: Done.',
     ], 'stored once, where the stream carried it');
     assert.ok(errors.some((e) => e.includes("threw after it was stored; what was stored counts as written and isn't stored again")
-      && e.includes('strategy failed')), errors.join('\n'));
+      && e.includes('failed after storing')), errors.join('\n'));
     await framework.stop();
   });
 
-  /** Have the agent's strategy throw once its message carrying `textOf` is
-   *  stored, and the store's next windowed read after that throw, the
-   *  drain's readback of what landed, throw too. */
+  /** Have the agent's context manager's addMessage throw once, after storing
+   *  the message carrying `textOf` (as throwOnceAfterStoring), and the
+   *  store's next windowed read after that throw, the drain's readback of
+   *  what landed, throw too. */
   function throwAfterStoringThenUnreadable(framework: AgentFramework, textOf: string): void {
     const cm = framework.getAgent('assistant')!.getContextManager() as unknown as {
-      strategy: { onNewMessage?: (message: { content: ContentBlock[] }, ctx: unknown) => Promise<void> };
+      addMessage: (participant: string, content: ContentBlock[], ...rest: unknown[]) => string;
       getMessageWindow: (...args: unknown[]) => unknown;
     };
-    const onNewMessage = cm.strategy.onNewMessage;
+    const addMessage = cm.addMessage;
     const read = cm.getMessageWindow;
     let thrown = false;
     let unreadable = false;
-    cm.strategy.onNewMessage = function (this: unknown, message, ctx) {
-      if (!thrown && message.content.some((b) => (b as { text?: string }).text === textOf)) {
+    cm.addMessage = function (this: unknown, participant, content, ...rest) {
+      const id = addMessage.call(this, participant, content, ...rest);
+      if (!thrown && content.some((b) => (b as { text?: string }).text === textOf)) {
         thrown = true;
         unreadable = true;
-        throw new Error('strategy failed');
+        throw new Error('failed after storing');
       }
-      return onNewMessage ? onNewMessage.call(this, message, ctx) : Promise.resolve();
+      return id;
     };
     cm.getMessageWindow = function (this: unknown, ...args: unknown[]) {
       if (unreadable) {
@@ -595,7 +621,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       'Antra: look right',
     ], 'stored once, where its first write landed, and what was queued behind it at the turn end');
     assert.ok(errors.some((e) => e.includes("threw, and its store couldn't be read to tell whether it was stored")
-      && e.includes('strategy failed')), errors.join('\n'));
+      && e.includes('failed after storing')), errors.join('\n'));
     assert.ok(errors.some((e) => e.includes('was found by its id: it was stored by an earlier write')), errors.join('\n'));
     await framework.stop();
   });
@@ -628,7 +654,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
   /** A write that stores the entry as the framework does, under its id, then throws. */
   const storedThenThrows = (framework: AgentFramework) => (msg: DeferredEntry): string => {
     framework.getAgent('assistant')!.getContextManager().addMessage(msg.participant, msg.content, { deferredWriteId: msg.id } as never);
-    throw new Error('strategy failed');
+    throw new Error('failed after storing');
   };
 
   it("a drained write that throws when its store couldn't count its messages before it is looked up by its id before it's written again", async () => {
@@ -1244,7 +1270,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     shardOn(framework, 'part one');
     // The strategy throws on the first shard's add, and context-manager
     // removes the shard it wrote before the write throws.
-    throwOnceAfterStoring(framework, 'part one');
+    throwOnceFromStrategyHook(framework, 'part one');
     module.interjections = [
       { participant: 'Antra', content: [...text('part one'), ...text('part two')] },
       { participant: 'Antra', content: text('look right') },
@@ -1453,7 +1479,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     };
     // A logical turn still open between its streams, engaged with chan-beta:
     // no turn is alive, so no tool boundary weighs what is stored now, and
-    // addMessage notes it as one of the turn's arrivals.
+    // it's noted as one of the turn's arrivals.
     const open = { engaged: new Set(['chan-beta']), arrivals: [] as Array<{ messageId: string; channelId: string }> };
     internals.openLogical.set('assistant', open);
     const errors: string[] = [];
@@ -1468,7 +1494,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     } finally { console.error = error; }
     assert.ok(errors.some((e) => e.includes('test flush: deferred write')
       && e.includes("threw after it was stored; what was stored counts as written and isn't stored again")
-      && e.includes('strategy failed')), errors.join('\n'));
+      && e.includes('failed after storing')), errors.join('\n'));
     assert.equal(written.length, 1, 'it counts as written');
     const copies = framework.getAgent('assistant')!.getContextManager().getAllMessages()
       .filter((m) => (m.metadata as { deferredWriteId?: string } | undefined)?.deferredWriteId === 'w1');
@@ -1533,7 +1559,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     assert.equal(internalsOf(framework).deferredMessages.length, 0, 'nothing went back into the queue');
     assert.ok(errors.some((e) => e.includes("turn-end flush: deferred write")
       && e.includes("threw after it was stored; what was stored counts as written and isn't stored again")
-      && e.includes('strategy failed')), errors.join('\n'));
+      && e.includes('failed after storing')), errors.join('\n'));
     await framework.stop(); // stop() lands whatever is still queued
 
     const reopened = await createFramework();
