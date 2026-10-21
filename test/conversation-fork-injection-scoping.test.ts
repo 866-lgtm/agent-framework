@@ -268,6 +268,31 @@ describe('conversation fork injection scoping', () => {
     assertOmits(request.system, 'preview module dm context');
   });
 
+  it("keeps a closed or unconfirmed channel's injections with its own fork: a channel never opened, and channels whose server's transport closed", async () => {
+    const framework = await makeFramework([
+      systemInjection('preview module chanA context', 'chanA'),
+      systemInjection('preview module chanB context', 'chanB'),
+      systemInjection('preview module chanC context', 'chanC'),
+      systemInjection('preview module retrieval context', 'retrieval'),
+    ], []);
+    const registry = installChannelRegistry(framework);
+    // chanC is registered and was never opened.
+    (registry as unknown as { channels: Map<string, unknown> }).channels.set('srv:chanC', {
+      serverId: 'srv', descriptor: { id: 'chanC', type: 'srv', label: 'chanC' }, open: false,
+    });
+    // The server's transport closes: chanA and chanB are unconfirmed now.
+    registry.transportClosed('srv');
+    assert.deepEqual(registry.getOpenChannels(), []);
+    bindForkHome(framework);
+
+    const request = await framework.previewActivation(FORK_AGENT, { injections: true });
+
+    assertContains(request.system, 'preview module chanA context');
+    assertOmits(request.system, 'preview module chanB context');
+    assertOmits(request.system, 'preview module chanC context');
+    assertContains(request.system, 'preview module retrieval context');
+  });
+
   it('fails open when the channel registry is absent', async () => {
     membrane.pushResponse(createMockResponse([]));
     const framework = await makeFramework([
