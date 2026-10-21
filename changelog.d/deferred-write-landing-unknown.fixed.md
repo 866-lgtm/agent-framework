@@ -30,8 +30,9 @@
     the store takes it, and the log says it may now be stored twice. A
     failed reply, or a channel notice the fork or run could act on, among
     such entries reaches the primary once, as the entry itself under its own
-    id, so a crash or a restart doesn't tell it twice. It isn't passed on
-    where the release finds the fork or run had read the copy that landed,
-    at its release or at the `stop()` that ends it. Where a crash leaves the
-    entry to the next boot, boot passes it on anyway, since it can't read
-    that window.
+    id, so a crash or a restart doesn't tell it twice, as long as the
+    release's sync went through. It isn't passed on where the release finds
+    the fork or run had read the copy that landed, at its release or at the
+    `stop()` that ends it. Where a crash or a failed sync leaves the entry
+    to the next boot, boot passes it on anyway, since it can't read that
+    window.

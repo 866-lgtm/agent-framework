@@ -3716,8 +3716,9 @@ export class AgentFramework {
    *
    * Each conversation fork still live ends, as a closing fork's end does,
    * whatever its stream is doing, as each run does: its channel unbinds, and
-   * its window's release passes on to the primary the failed replies it left,
-   * unread in its window or still queued for it. Its end settles a
+   * its window's release passes on to the primary the notices it left that
+   * the primary takes in its place, unread in its window, or still queued
+   * for it unless it read the copy that landed there. Its end settles a
    * tool-result batch its stream still held and removes the stream's
    * entries, and once it has left, its stream's late events are dropped.
    */
@@ -4091,9 +4092,9 @@ export class AgentFramework {
     // does (flushForStart). Each release's pass is a step of its own, and so
     // is the drain: one that throws fails the stop() and leaves the others,
     // and the final flush, to run, and the drain sends a queue whose pass
-    // threw as boot would, its notices to the primary whether read or not.
-    // It runs again after the waits below, for a release an end they let
-    // settle postpones.
+    // threw as boot would, its notices to the primary whether read or not,
+    // un-acked ones included. It runs again after the waits below, for a
+    // release an end they let settle postpones.
     const passPostponedReleases = () => {
       const agents = [...this.releasesAfterResume.values()];
       // Each pass reads its window, and what is queued for it, before the
@@ -4106,11 +4107,16 @@ export class AgentFramework {
         const entries: DeferredWrite[] = [];
         for (const agent of agents) {
           const pass = passes.get(agent.name);
+          // A pass that threw passed on none of the agent's un-acked entries,
+          // which the ack below would drop, so their notices go too: taken
+          // before the drain hands its pending entries to the un-acked set.
+          const unacked = pass ? [] : this.unackedDeferredWrites
+            .filter((msg) => (msg.forAgent ?? this.primaryAgentName) === agent.name && passesToPrimary(msg.metadata));
           for (const msg of this.drainDeferredFor(agent.name)) {
             if (pass && passesToPrimary(msg.metadata)) pass.passOn(msg);
             else entries.push(msg);
           }
-          if (pass) entries.push(...pass.forPrimary);
+          entries.push(...(pass ? pass.forPrimary : unacked));
         }
         this.readdDrained(entries, 'stop: postponed releases');
         this.ackDeferredWrites();
@@ -8550,7 +8556,8 @@ export class AgentFramework {
         // investigation, now or, while quiesced, at resume. A failed reply, or
         // a channel notice the run could act on, among it goes on to the
         // primary as the same queue entry, so no ack comes between the entry
-        // and the primary's notice.
+        // and the primary's notice, unless the run read the copy of it that
+        // landed in its window.
         // Exact-generation disposal owns these name-keyed entries. Remove them
         // before deregistration; the late driveStream finally will see the
         // generation mismatch and leave any future owner untouched. A fork's
@@ -21584,9 +21591,11 @@ export class AgentFramework {
     // A fork or run deregistered while the host is quiesced leaves its queue
     // to its window's release at resume (runReleasesAfterResume, which clears
     // the name first), which stores its writes in that window, or to stop()'s
-    // pass for postponed releases, which clears the name and sends them as
-    // boot would. Drained by any other flush meanwhile, they would meet no
-    // registered agent and be dropped, or written into a window no one reads.
+    // pass for postponed releases, which clears the name, passes its notices
+    // on as that release would (as boot would, where its pass throws), and
+    // drops the rest, logged. Drained by any
+    // other flush meanwhile, they would meet no registered agent and be
+    // dropped, or written into a window no one reads.
     if (this.releasesAfterResume.has(agentName)) return [];
     const mine: typeof this.deferredMessages = [];
     const rest: typeof this.deferredMessages = [];
@@ -22038,11 +22047,12 @@ export class AgentFramework {
    * twice. A queued notice goes on unless the agent read a copy of it that
    * landed in its window; where the window can't be read, it goes on, since
    * telling the primary of a notice the agent may have read costs less than
-   * telling no one. The un-acked entries for the agent have all landed
-   * (their write went through, or a lookup found it: settleFound), so they
-   * go on here; the pending ones are the caller's. Returns the window's
-   * read, `passOn`, what it has queued so far for the primary, and how many
-   * un-acked entries the agent had.
+   * telling no one. Both callers run this before their drain, which hands
+   * pending entries to the un-acked set, so the un-acked entries for the
+   * agent here have all landed (their write went through, or a lookup found
+   * it: settleFound), and they go on here; the pending ones are the
+   * caller's. Returns the window's read, `passOn`, what it has queued so far
+   * for the primary, and how many un-acked entries the agent had.
    */
   private passOnFromReleasedWindow(agent: Agent): {
     window: ReleasedWindow | null;
@@ -22071,9 +22081,9 @@ export class AgentFramework {
    * never read and the primary takes in its place (passesToPrimary: its
    * failed replies, and the channel notices it was told it could act on),
    * other than copies of the entries `held` names; and `held`, for each of
-   * those entries with a copy there, its copies and whether the agent read
-   * them. A notice is read below the lower of its consumed watermark and the
-   * point where the watermark's branch and the current one part
+   * those entries with a copy there, its copies and whether any of them is
+   * unread. A notice is read below the lower of its consumed watermark and
+   * the point where the watermark's branch and the current one part
    * (branchesPartAt), and unread everywhere when it has no watermark. The
    * watermark is set when the agent is created, and moves at a compile, and
    * at a tool boundary whose stream declares it carries the messages
