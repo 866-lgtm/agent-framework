@@ -1781,15 +1781,19 @@ export class EventGate {
   }
 
   /**
-   * End the sleep `agentName` set, once that agent is gone, as a conversation
-   * fork's end does: nobody is asleep then, so the other agents' wakes stop
-   * being held back, and no wake goes to a name that's gone. Returns true if
-   * it was that agent's sleep.
+   * `agentName` is gone, as a conversation fork's end or an ephemeral run's
+   * removes one: its pending self-wake is cancelled, and a sleep it set ends.
+   * The gate's sleep holds back every agent's wakes, so nobody is asleep once
+   * its agent is gone, and neither wake would reach a name that no longer
+   * exists. A sleep another agent set, or one set with no agent, stays.
    */
-  clearSleepFor(agentName: string): boolean {
-    if (this.sleepUntil === 0 || this.sleepAgent !== agentName) return false;
-    this.clearSleep();
-    return true;
+  agentGone(agentName: string): void {
+    const selfWake = this.selfWakeTimers.get(agentName);
+    if (selfWake) {
+      clearTimeout(selfWake);
+      this.selfWakeTimers.delete(agentName);
+    }
+    if (this.sleepUntil !== 0 && this.sleepAgent === agentName) this.clearSleep();
   }
 
   // =========================================================================
@@ -1803,10 +1807,11 @@ export class EventGate {
    * Cancelled by the agent's next turn start (see onInferenceStarted):
    * the semantics are "if nothing else wakes me by then, wake me".
    */
-  armSelfWake(agentName: string, seconds: number, source = 'skip_reply'): { inMs: number } {
+  armSelfWake(agentName: string, seconds: number, source = 'skip_reply'): { inMs: number; armed: boolean } {
     const ms = Math.max(1_000, Math.min(3_600_000, Math.floor(seconds * 1000)));
-    // A stopped framework's late turn arms no timer (disposed).
-    if (this.disposed) return { inMs: ms };
+    // A stopped framework's late turn arms no timer (disposed). A self-wake
+    // doesn't outlive a stop, as dispose() clearing the pending ones says.
+    if (this.disposed) return { inMs: ms, armed: false };
     const prev = this.selfWakeTimers.get(agentName);
     if (prev) clearTimeout(prev);
     const timer = setTimeout(() => {
@@ -1847,7 +1852,7 @@ export class EventGate {
       behavior: 'skip',
       timestamp: this.now(),
     });
-    return { inMs: ms };
+    return { inMs: ms, armed: true };
   }
 
   /** End sleep immediately. Returns true if the agent was asleep. */
@@ -1870,7 +1875,10 @@ export class EventGate {
    * fires early (Node's can, by a millisecond), or a clock set back.
    */
   private wakeFromSleep(reason: string): void {
-    this.sleepTimer = null;
+    // The timer that called it has fired; from resumeSleep(), for a sleep
+    // already over, one may still be armed, and it goes, so no stale step of
+    // it can fire later.
+    if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
     if (this.sleepUntil === 0) return;
     if (this.sleepUntil > this.now()) {
       this.armSleepWake();

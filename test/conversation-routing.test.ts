@@ -712,11 +712,14 @@ describe('Conversation routing', () => {
       assert.equal(framework.getAgent(fork), null, 'the fork is disposed');
       assert.equal(gateOf(framework).getSleepState(), null, "and its sleep ends with it, so the other agents' wakes aren't held back");
     } finally {
+      // So that a run where the fork's end leaves the sleep doesn't hold the
+      // file's process for the sleep's hour.
+      gateOf(framework).clearSleep();
       await framework.stop();
     }
   });
 
-  it("a fork's sleep ends when stop() ends the fork, so a next start() resumes none", async () => {
+  it("a fork's sleep ends when stop() ends the fork", async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello!' }]));
     const framework = await makeGatedFramework();
     framework.pushEvent(incomingEvent({ channelId: 'slack:D8', text: 'hi', channelType: 'im' }));
@@ -724,10 +727,14 @@ describe('Conversation routing', () => {
     const fork = forkName('slack:D8', 1);
     assert.ok(framework.getAgent(fork), 'the fork exists');
     const gate = gateOf(framework);
-    gate.setSleep(3600, 'resting', fork);
-    await framework.stop();
-    assert.equal(framework.getAgent(fork), null, 'stop() ends the fork');
-    assert.equal(gate.inferenceDiagnostics().sleepUntil, 0, 'and its sleep with it');
+    try {
+      gate.setSleep(3600, 'resting', fork);
+      await framework.stop();
+      assert.equal(framework.getAgent(fork), null, 'stop() ends the fork');
+      assert.equal(gate.inferenceDiagnostics().sleepUntil, 0, 'and its sleep with it');
+    } finally {
+      gate.clearSleep();
+    }
   });
 
   it('a write deferred for a fork during its closure turn is stored in the fork before it is disposed', async () => {
