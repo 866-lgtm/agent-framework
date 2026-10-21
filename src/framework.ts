@@ -4080,8 +4080,8 @@ export class AgentFramework {
     //
     // A quiesced host defers each entry again instead, into the persisted
     // queue, for boot recovery. Past the deferral, a write that throws stays
-    // queued with what follows it for its target, unless a malformed refusal
-    // has a confirmed empty readback, when it is dropped (writeDrainedInOrder).
+    // queued with what follows it for its target, unless context-manager
+    // refuses it as malformed, when it is dropped (writeDrainedInOrder).
     // A memory-only queue still loses queued entries at exit. An entry for a target no longer registered,
     // such as one a release postponed after the pass above leaves, or one a
     // quiesced boot restored for an agent gone before a crash, is left for
@@ -21525,11 +21525,12 @@ export class AgentFramework {
    * them land out of order.
    *
    * An entry context-manager refuses as malformed (MalformedContentError) is
-   * the exception once readback confirms that nothing landed. An unknown
-   * landing remains queued for ID reconciliation before retry; a known landed
-   * copy counts as written. A confirmed-empty malformed refusal would fail
-   * every flush and hold its target's later writes for good, so it's logged
-   * and dropped instead, and its
+   * the exception: context-manager validates content and every shard before
+   * writing, so this typed refusal proves no write even if readback fails.
+   * A copy readback actually finds is still counted as written first. Other
+   * ambiguous errors remain queued for ID reconciliation before retry. A
+   * malformed refusal would fail every flush and hold its target's later
+   * writes for good, so it's logged and dropped instead, and its
    * target isn't cut: left in the un-acked set, the next ack drops it from
    * the durable queue. A tool_use dropped this way leaves a tool_result
    * queued behind it to be stored alone. context-manager mends a tool_use
@@ -21581,8 +21582,7 @@ export class AgentFramework {
    *
    * Returns what was written (stored, or deferred again by addMessage, whose
    * id is then empty), in queue order: for one target, its entries up to the
-   * first that couldn't be stored, less malformed refusals whose empty
-   * landing was confirmed and which were therefore dropped. Each comes
+   * first that couldn't be stored, less entries refused as malformed and dropped. Each comes
    * with its content: as given, unless the store took it as more than one
    * message (a sharded body) and can be read back, when its copies are
    * returned joined, as later compiles render them (asCompiled), or its write
@@ -21652,9 +21652,10 @@ export class AgentFramework {
           onLanded?.(msg, landed[0]!.id);
           continue;
         }
-        // Drop malformed entries only when readback confirms nothing landed.
-        // Unknown landing keeps main's reconciliation-before-retry invariant.
-        if (error instanceof MalformedContentError && landed !== undefined) {
+        // CM validates all content/shards before writing: this typed refusal
+        // cannot have stored a partial body, even when readback is unavailable.
+        // Any copy readback did find was already handled above.
+        if (error instanceof MalformedContentError) {
           this.logDeferredWriteError(msg, where, error, 'dropped');
           continue;
         }
@@ -21712,7 +21713,7 @@ export class AgentFramework {
 
   /** The line naming a drained write that threw: one that couldn't be stored,
    *  which is already back in the queue; with 'dropped', a malformed refusal
-   *  whose readback confirms nothing landed; with a count, one stored before the
+   *  whose typed refusal guarantees no write; with a count, one stored before the
    *  throw (for a sharded body, how many of its shards), or, with
    *  `foundLater`, one an earlier write of which landed and was found by its
    *  id; with `'unknown'`, one whose store couldn't be read to tell
