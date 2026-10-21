@@ -709,7 +709,7 @@ test("grep says a BOM isn't part of the first line when a pattern for U+FEFF sea
 });
 
 test("grep's note on a pattern for a CR or U+FEFF names the files searched that have CRLF ends or a BOM, counting every one and naming at most 20", async (t) => {
-  const { dir, call } = setup(t);
+  const { dir, call } = setup(t, { maxFileSize: 1000 });
   const bom = Buffer.from([0xef, 0xbb, 0xbf]);
   writeFileSync(join(dir, 'lf.txt'), 'a\nb\n');
   writeFileSync(join(dir, 'win.bat'), 'echo one\r\necho two\r\n');
@@ -717,12 +717,17 @@ test("grep's note on a pattern for a CR or U+FEFF names the files searched that 
   writeFileSync(join(dir, 'bom.txt'), Buffer.concat([bom, Buffer.from('first\n')]));
   writeFileSync(join(dir, 'both.json'), Buffer.concat([bom, Buffer.from('{}\r\n')]));
   for (let i = 0; i < 3; i++) writeFileSync(join(dir, `src${i}.ts`), `export const v${i} = ${i};\n`);
+  // Files grep doesn't search, binary or over the size limit, are listed as
+  // skipped and named in no note.
+  writeFileSync(join(dir, 'blob.bin'), Buffer.concat([bom, Buffer.from('x\r\n\0y\r\n')]));
+  writeFileSync(join(dir, 'big.txt'), Buffer.concat([bom, Buffer.from('z\r\n'.repeat(400))]));
   const tail = "Lines are matched as read shows them, which leaves out a CRLF end's CR unless the line's own text ends in a CR. "
     + "read with offsetChars shows every CR in the workspace's copy.";
   // On main, \r$ found these files' lines; here no line keeps a CRLF end's
   // CR, so the note names the files, mixed ends as such, sorted as results are.
-  const cr = (await call('grep', { pattern: '\\r$' })).data as { results: unknown[]; totalMatches: number; note?: string };
+  const cr = (await call('grep', { pattern: '\\r$' })).data as { results: unknown[]; totalMatches: number; note?: string; skipped?: Array<{ file: string }> };
   assert.deepEqual([cr.results, cr.totalMatches], [[], 0]);
+  assert.deepEqual(cr.skipped?.map((s) => s.file), ['work/big.txt', 'work/blob.bin']);
   assert.equal(cr.note, 'The pattern names a CR, and 3 files searched have CRLF line ends: '
     + `work/both.json (CRLF), work/mixed.cfg (mixed), work/win.bat (CRLF). ${tail}`);
   const boms = (await call('grep', { pattern: '^\\uFEFF' })).data as { results: unknown[]; note?: string };

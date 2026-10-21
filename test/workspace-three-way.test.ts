@@ -6778,16 +6778,34 @@ describe('grep', () => {
     assert.match(cr.note, /^The pattern names a CR, and 1 file searched has CRLF line ends: work\/a\.txt \(CRLF in its conflicting-disk version\)\. /);
   });
 
-  test("a conflict whose workspace copy and disk version both have CRLF ends is named once in a CR pattern's note, as the workspace's copy", async (t) => {
+  test("a conflict whose workspace copy and disk version both have CRLF ends and a BOM is named once in each note, as the workspace's copy", async (t) => {
     const env = new Env(t);
     const m = await env.open();
     await seedSynced(env, m, 'a.txt', 'v1');
-    env.writeDisk('a.txt', 'disk says ALPHA\r\n');
-    await call(m, 'write', { path: 'work/a.txt', content: 'workspace says GAMMA\r\n' });
+    env.writeDisk('a.txt', '\uFEFFdisk says ALPHA\r\n');
+    await call(m, 'write', { path: 'work/a.txt', content: '\uFEFFworkspace says GAMMA\r\n' });
     assert.equal((await entryOf(m, 'a.txt'))?.conflict?.diskCopy, 'stored');
     const cr = await call(m, 'grep', { pattern: '\\r$' });
     assert.deepEqual(cr.results, []);
     assert.match(cr.note, /^The pattern names a CR, and 1 file searched has CRLF line ends: work\/a\.txt \(CRLF\)\. /);
+    const bom = await call(m, 'grep', { pattern: '^\\uFEFF' });
+    assert.deepEqual(bom.results, []);
+    assert.match(bom.note, /^The pattern names U\+FEFF, and 1 file searched starts with a BOM: work\/a\.txt\. /);
+  });
+
+  test("a conflict whose workspace copy starts with a BOM and whose disk version has CRLF ends is named in each note for the version that has it", async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'v1');
+    env.writeDisk('a.txt', 'disk says ALPHA\r\n');
+    await call(m, 'write', { path: 'work/a.txt', content: '\uFEFFworkspace says GAMMA\n' });
+    assert.equal((await entryOf(m, 'a.txt'))?.conflict?.diskCopy, 'stored');
+    const cr = await call(m, 'grep', { pattern: '\\r$' });
+    assert.deepEqual(cr.results, []);
+    assert.match(cr.note, /^The pattern names a CR, and 1 file searched has CRLF line ends: work\/a\.txt \(CRLF in its conflicting-disk version\)\. /);
+    const bom = await call(m, 'grep', { pattern: '^\\uFEFF' });
+    assert.deepEqual(bom.results, []);
+    assert.match(bom.note, /^The pattern names U\+FEFF, and 1 file searched starts with a BOM: work\/a\.txt\. /);
   });
 
   test("a U+FEFF pattern over a conflict whose disk version alone starts with a BOM gets the note, which names only the workspace's copy as what read shows", async (t) => {
@@ -6837,6 +6855,23 @@ describe('grep', () => {
     assert.deepEqual(hitsOf(gone), ['work/a.txt conflict recorded-disk: disk says ALPHA'], 'disk now has no file at all');
     assert.equal(gone.skipped, undefined, 'and no disk file went unsearched');
     assert.equal(await contentOf(m, 'a.txt'), 'workspace says GAMMA', 'the draft is kept');
+  });
+
+  test("a conflict's recorded disk version with CRLF ends and a BOM is named as that version in each note", async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'v1');
+    env.writeDisk('a.txt', '\uFEFFdisk says ALPHA\r\n');
+    await call(m, 'write', { path: 'work/a.txt', content: 'workspace says GAMMA\n' });
+    assert.equal((await entryOf(m, 'a.txt'))?.conflict?.diskCopy, 'stored');
+    env.writeDisk('a.txt', 'disk now says BETA\n');
+    assert.equal((await entryOf(m, 'a.txt'))?.conflict?.diskChangedSinceRecorded, true);
+    const cr = await call(m, 'grep', { pattern: '\\r$' });
+    assert.deepEqual(cr.results, []);
+    assert.match(cr.note, /^The pattern names a CR, and 1 file searched has CRLF line ends: work\/a\.txt \(CRLF in its recorded-disk version\)\. /);
+    const bom = await call(m, 'grep', { pattern: '^\\uFEFF' });
+    assert.deepEqual(bom.results, []);
+    assert.match(bom.note, /^The pattern names U\+FEFF, and 1 file searched starts with a BOM: work\/a\.txt \(in its recorded-disk version\)\. /);
   });
 });
 
