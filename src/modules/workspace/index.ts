@@ -3703,7 +3703,7 @@ export class WorkspaceModule implements Module {
    * call made again checks it.
    */
   private notCheckedYet(path: string, reason: string): string {
-    return `${this.notInWorkspace(path, { path, state: 'unverified', note: reason })} Try again to check it.`;
+    return `${this.notInWorkspace(path, { path, state: 'unverified', note: reason })} Make the same call again, which checks disk first.`;
   }
 
   /** Why the workspace holds no entry at a path, when disk explains it. */
@@ -4141,7 +4141,7 @@ export class WorkspaceModule implements Module {
               kind: 'file',
               edits: target.edits,
               path: target.path,
-              text: `${target.path} couldn't be checked against disk (${undecided}), so ${subject} changed nothing. Try again to check it.`,
+              text: `${target.path} couldn't be checked against disk (${undecided}), so ${subject} changed nothing. Make the same call again, which checks disk first.`,
               whole: true,
             });
             continue;

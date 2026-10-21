@@ -7077,13 +7077,13 @@ describe('on-agent-action', () => {
         assert.equal(again.success, true, `${tool} again: ${JSON.stringify(again)}`);
       }
     }
-    const unchecked = `work/new.txt is not in the workspace, and disk could not be checked (${KEPT_CHANGING}). Try again to check it.`;
+    const unchecked = `work/new.txt is not in the workspace, and disk could not be checked (${KEPT_CHANGING}). Make the same call again, which checks disk first.`;
     assert.deepEqual(answers, {
       delete: unchecked,
       readBinary: unchecked,
-      edit: `work/new.txt couldn't be checked against disk (${KEPT_CHANGING}), so the edit changed nothing. Try again to check it.`,
+      edit: `work/new.txt couldn't be checked against disk (${KEPT_CHANGING}), so the edit changed nothing. Make the same call again, which checks disk first.`,
       edit_many: 'The edit_many call stored none of its edits: 1 problem.\n\n'
-        + `edit 1: work/new.txt couldn't be checked against disk (${KEPT_CHANGING}), so edit 1 changed nothing. Try again to check it.`,
+        + `edit 1: work/new.txt couldn't be checked against disk (${KEPT_CHANGING}), so edit 1 changed nothing. Make the same call again, which checks disk first.`,
     });
   });
 
@@ -7098,7 +7098,7 @@ describe('on-agent-action', () => {
         unvouched(env, 'a.txt');
         const edit = await whileBranchKeepsChanging(env, () => m.handleToolCall({ id: 't', name: 'edit', input: { path: 'work/a.txt', oldString: 'A line', newString: 'A edited' } }));
         assert.equal(edit.success, false, JSON.stringify(edit));
-        assert.equal(edit.error, `work/a.txt couldn't be checked against disk (${KEPT_CHANGING}), so the edit changed nothing. Try again to check it.`, disk);
+        assert.equal(edit.error, `work/a.txt couldn't be checked against disk (${KEPT_CHANGING}), so the edit changed nothing. Make the same call again, which checks disk first.`, disk);
         // So does edit_many's, the branch left on `other` by the edit's pass
         // changing under its three gathers in turn.
         assert.equal(env.store.currentBranch().name, 'other');
@@ -7106,7 +7106,7 @@ describe('on-agent-action', () => {
           () => m.handleToolCall({ id: 't', name: 'edit_many', input: { edits: [{ path: 'work/a.txt', oldString: 'A line', newString: 'A edited' }] } }));
         assert.equal(many.success, false, JSON.stringify(many));
         assert.equal(many.error, 'The edit_many call stored none of its edits: 1 problem.\n\n'
-          + `edit 1: work/a.txt couldn't be checked against disk (${KEPT_CHANGING}), so edit 1 changed nothing. Try again to check it.`, disk);
+          + `edit 1: work/a.txt couldn't be checked against disk (${KEPT_CHANGING}), so edit 1 changed nothing. Make the same call again, which checks disk first.`, disk);
         // Disk is as it was, and each branch's workspace copy is the one the
         // edits found, read from the store, which no pass changes.
         const onDisk = disk === 'changed' ? 'disk says A2\n' : 'A line\n';
@@ -7148,7 +7148,7 @@ describe('on-agent-action', () => {
       { path: 'work/new.txt', oldString: 'N line', newString: 'N edited' },
     ] } }));
     assert.equal(many.success, false, JSON.stringify(many));
-    const refused = (i: number, path: string) => `edit ${i}: work/${path} couldn't be checked against disk (${KEPT_CHANGING}), so edit ${i} changed nothing. Try again to check it.`;
+    const refused = (i: number, path: string) => `edit ${i}: work/${path} couldn't be checked against disk (${KEPT_CHANGING}), so edit ${i} changed nothing. Make the same call again, which checks disk first.`;
     assert.equal(many.error, ['The edit_many call stored none of its edits: 3 problems.', refused(1, 'a.txt'), refused(2, 'b.txt'), refused(3, 'new.txt')].join('\n\n'));
     assert.deepEqual(['a.txt', 'b.txt', 'new.txt'].map((p) => env.readDisk(p)), ['A line\n', 'B line\n', 'N line\n']);
     const treeStateId = (m as any).mounts.get('work').treeStateId as string;
