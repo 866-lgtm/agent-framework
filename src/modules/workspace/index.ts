@@ -4132,6 +4132,20 @@ export class WorkspaceModule implements Module {
           // workspace didn't hold has no older copy, so taking it in needs no
           // word.
           const subject = tool === 'edit' ? 'the edit' : editList(target.edits);
+          // A pass that decided nothing checked no copy on disk, held or not,
+          // and took nothing in, so the edits would apply to text disk may
+          // have moved past, on whichever branch is selected once it gave up.
+          // They're refused, as a call made again can check.
+          if (undecided !== null) {
+            problems.push({
+              kind: 'file',
+              edits: target.edits,
+              path: target.path,
+              text: `${target.path} couldn't be checked against disk (${undecided}), so ${subject} changed nothing. Try again to check it.`,
+              whole: true,
+            });
+            continue;
+          }
           const whichCopy = (verb: string): string | null => took('modified')
             ? `Disk's copy${tool === 'edit' ? '' : ` of ${target.path}`} had changed since the workspace last agreed with it, so it was taken in first, and ${subject} ${verb} that text.`
             : report?.state === 'unverified'
@@ -4177,9 +4191,7 @@ export class WorkspaceModule implements Module {
             // the disk-only answer describes; any other drop is disk's deletion.
             const text = took('deleted') && report?.state !== 'disk-only'
               ? `File not found: ${target.path}. Disk's copy was deleted since the workspace last agreed with it, and that was taken in first.`
-              : undecided !== null
-                ? `${target.path} couldn't be checked against disk (${undecided}), so ${subject} changed nothing. Try again to check it.`
-                : this.notInWorkspace(target.path, report);
+              : this.notInWorkspace(target.path, report);
             problems.push({ kind: 'file', edits: target.edits, path: target.path, text, whole: true });
             continue;
           }
