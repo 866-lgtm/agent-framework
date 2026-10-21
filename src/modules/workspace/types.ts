@@ -17,6 +17,50 @@ export interface MountConfig {
   /** Access mode */
   mode: 'read-write' | 'read-only';
   /**
+   * Where the mount's tools get what they read (default: 'chronicle').
+   * - 'chronicle': the workspace keeps the mount's files in its store, where
+   *   writes and edits land first, and takes in disk's changes under the
+   *   three-way rule as its listings, searches, syncs and scans reach them.
+   *   A read of a path the store doesn't hold takes in a new file there;
+   *   otherwise it reads the store's copy.
+   * - 'direct': for a checkout an agent reads, not one it changes. Every
+   *   read, listing and search is disk's own copy as it is when it runs,
+   *   and none of its files go into the store. No scan or watcher
+   *   runs, so no call waits behind one, and `sync`, `materialize` and the
+   *   watch settings have nothing to act on. Only with `mode: 'read-only'`,
+   *   and not with `watch` other than 'never', `watchDebounceMs`,
+   *   `watchRootPollMs`, a `wakeOnChange` that would wake (true, or a
+   *   non-empty list) or `autoMaterialize: true`: each of those would never
+   *   act, and the workspace refuses the mount. Its `ignore`
+   *   has a default (see there). Paths, links, its `include`, other mounts'
+   *   directories, size limits and the walk cap hold as on a 'chronicle'
+   *   mount. Its tools read beneath whatever directory is at its
+   *   root, with no check against the one a 'chronicle' run of it last
+   *   agreed with. Where that root now lies elsewhere than the last start
+   *   placed it, each call nests in it, as a start would now, every mount
+   *   configured beneath its path, where that path leads beneath its root,
+   *   and every other mount whose root, as that start placed it, lies
+   *   beneath where its root lies now, or whose configured path lies
+   *   beneath a directory that start found there. A mount configured
+   *   elsewhere whose own root has moved since, and the other mounts' own
+   *   placements, wait for the next start, so a direct root moved into
+   *   another mount's directory is still that mount's too.
+   *
+   * A mount configured 'direct' runs as 'chronicle' from a start that finds
+   * the store holding changes there that disk lacks, on the branch selected
+   * then: a draft, a workspace deletion or a conflict, as `status` counts
+   * them pending, or an intent the workspace can't read, which may hold one
+   * of those. They stay in view, and the workspace says so on stderr and
+   * through the framework's ops alerts, naming them and the ways to start it
+   * direct. It runs unwatched, and walks by the direct kind's default
+   * ignore list where its config names none; `ls` without a path, and
+   * `status`, give its `backend` as 'chronicle' and that list. A mount that
+   * ran direct and runs as 'chronicle' again takes in what disk changed
+   * meanwhile as its listings, searches and syncs reach it, as an unwatched
+   * 'chronicle' mount does after any time away.
+   */
+  backend?: 'chronicle' | 'direct';
+  /**
    * Watch mode for filesystem changes:
    * - 'always': chokidar watches continuously; each event re-observes its paths
    * - 'on-agent-action': after each completed agent tool batch, the mount is
@@ -25,8 +69,8 @@ export interface MountConfig {
    *   the round goes on. Each scan walks from the mount's start, so on a
    *   mount over its `walkCap` it covers the first `walkCap` entries every
    *   time, and files past them come in as `walkCap` describes
-   * - 'never': no background reads; listings and lazy reads still observe
-   *   the paths they show
+   * - 'never': no background reads; listings still observe the paths they
+   *   show, and a read observes a path the store doesn't hold
    */
   watch?: 'always' | 'on-agent-action' | 'never';
   /** Debounce window in ms for watch: 'always' mode (default: 300) */
@@ -43,6 +87,16 @@ export interface MountConfig {
    * says, a directory with what lies beneath it: `.name.swp` and `.name.swx`
    * (the whole name), and names ending in `~` or in `.subl…tmp`, matched by
    * `^\..+\.sw[px]$`, `~$` and `\.subl.*\.tmp$`.
+   *
+   * A mount configured direct (`backend`) whose config names no list takes
+   * `node_modules`, `dist`, `.git`, `build`, `coverage`, `target`,
+   * `__pycache__` and `.venv`, each matching that name at any depth,
+   * whichever kind it runs as. A direct mount's walks of the whole mount,
+   * and of any path no pattern covers, pass over what the list covers. A
+   * listing, glob or grep whose path, or whose pattern's directory, the
+   * list covers is walked all the same, the patterns covering it set aside
+   * and the rest applying beneath it, as a sync that names a path walks it
+   * on a 'chronicle' mount.
    */
   ignore?: string[];
   /**
@@ -98,7 +152,9 @@ export interface MountConfig {
    * include doesn't cover, and a listing that isn't recursive names each
    * directory directly beneath its path that disk has, and each that a
    * covered entry in history implies, with only the files the include
-   * covers. `ignore` still applies to what `include` covers.
+   * covers. A mount running direct has no history (`backend`), so there
+   * disk alone decides each of these. `ignore` still applies to what
+   * `include` covers.
    *
    * On a disk that folds names, the parse reads a path in disk's spelling,
    * as the walk names what it lists, so a covered name whose file disk
@@ -126,7 +182,8 @@ export interface MountConfig {
    * link on a path's way is refused, as on any such mount (followSymlinks).
    * A nested mount's root is placed where disk has it at each start, and its
    * directory is matched by spelling, so four cases fall outside this, as
-   * for any nested mount: on a disk that folds names, a mount configured
+   * for any nested mount, and a fifth on a direct one: on a disk that folds
+   * names, a mount configured
    * through a link that spells a directory otherwise than disk does isn't
    * found nested, and this mount holds its files as its own; on such a disk,
    * a path through a link that spells a nested mount's directory otherwise
@@ -139,7 +196,11 @@ export interface MountConfig {
    * spelling the link's target gives, so a refusal can name a file disk
    * spells outside that include, or leave a covered one unnamed; and a
    * nested mount whose root moves while running, as `acceptRoot` takes,
-   * stays placed where it was until the next start.
+   * stays placed where it was until the next start; and where a direct
+   * mount's root is repointed between a read's parse and its open, a race
+   * left to whoever writes the disk, a mount nested in it by its
+   * directories alone, since its real root holds that root, can have the
+   * read serve a path in its directory.
    *
    * Text the host registers for a path (`registerGeneratedTextFile`) is
    * served there whatever the include says, since it isn't one of the
@@ -147,10 +208,10 @@ export interface MountConfig {
    * anything else checks the path, so every spelling that resolves to its
    * registered path reads it, and none writes it. On a disk that folds names,
    * a spelling in another case isn't its path, and reaches whatever file disk
-   * has there. The framework keeps its own files (`tool-results/`, `refs/`,
-   * `background-scripts/`) only in a writable mount without an include, and
-   * what it kept in a mount before the mount had one is outside the mount
-   * once it has one, unless the include covers it.
+   * has there. The framework keeps its own files (`tool-results/`, `refs/`)
+   * only in a writable mount without an include, and what it kept in a mount
+   * before the mount had one is outside the mount once it has one, unless the
+   * include covers it.
    *
    * Left out, the mount holds everything under its path. Given, it's a list
    * of at least one string, each a name, an `*.ext` glob or a `dir/**` glob,
@@ -271,6 +332,13 @@ export interface WorkspaceConfig {
 export interface MountState {
   /** The mount config */
   config: MountConfig;
+  /**
+   * Whether the mount runs direct (`MountConfig.backend`), as the workspace
+   * decides when initStore gives the store and again at each start: a mount
+   * configured direct runs as 'chronicle' while the store holds changes
+   * there that disk lacks.
+   */
+  direct: boolean;
   /** Tree state ID in Chronicle */
   treeStateId: string;
   /** Branch-local intent (tombstones, store origin, conflicts) for this mount's paths */

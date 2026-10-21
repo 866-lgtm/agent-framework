@@ -16,10 +16,10 @@
  * - Everything else is left unrouted and dropped by the framework — the
  *   trunk is a dormant template, not a listener.
  *
- * Bindings expire after an idle TTL. Expiry runs a final closure turn on the
- * fork (see framework wiring) and unbinds; the next qualifying message on
- * that channel spawns a *fresh* fork (generation + 1) from the current
- * trunk, so handbook/template updates propagate between engagements.
+ * Bindings expire after an idle TTL. Expiry unbinds the channel and runs a
+ * final closure turn on the fork (see framework wiring); the next qualifying
+ * message on that channel spawns a *fresh* fork (generation + 1) from the
+ * current trunk, so handbook/template updates propagate between engagements.
  *
  * The binding table is in-memory — bindings are re-established by the next
  * qualifying message after a restart. The generation counters, by contrast,
@@ -303,7 +303,10 @@ export class ConversationRouter {
     return Object.fromEntries(this.generations);
   }
 
-  /** Restore persisted engagement counters (see exportGenerations). */
+  /** Raise each channel's engagement counter to at least the given
+   * generation, never lowering one: the persisted counters at startup (see
+   * exportGenerations), or a spawn's generation whose fork ended before the
+   * spawn could bind it. */
   hydrateGenerations(generations: Record<string, number>): void {
     for (const [channelId, generation] of Object.entries(generations)) {
       if (typeof generation === 'number' && generation > (this.generations.get(channelId) ?? 0)) {
