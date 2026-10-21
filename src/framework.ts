@@ -15383,21 +15383,23 @@ export class AgentFramework {
   /**
    * Durable window notice for a channel the agent did not ask to open: a
    * subscription-policy admission, announced as the decision before its
-   * transport RPC (a failed open keeps the decision, and channel_list shows
-   * transport state), or an open that the agent's own delivery or reply
-   * caused (`opened-by-delivery`, `opened-by-reply`), once its transport is
-   * confirmed. It names `channel_close` as the opt-out (their decision
-   * outranks policy) only where the agent it's addressed to can call it for
-   * every channel it names (canCloseChannels): a conversation fork may close
-   * only its home channel, and an agent's allowedTools can leave
+   * transport RPC (a failed open keeps the decision, and the host tries again
+   * when the server next registers the channel), or an open that the agent's
+   * own delivery or reply caused (`opened-by-delivery`, `opened-by-reply`),
+   * once its transport is confirmed. It names `channel_close` as the opt-out
+   * (neither the subscription policy nor the server's default reopens a
+   * channel the agent closed) only where the agent it's addressed to can
+   * call it for every channel it names (canCloseChannels): a conversation
+   * fork may close only its home channel, and an agent's allowedTools can leave
    * channel_close out. Others can read it too: the other residents, where
    * several share one slot (#291), and forks spawned from the primary
    * afterwards, from its window (#235). Where an
    * agent's own send opened a channel it can't close, the primary is told by
    * name too, if it's registered and can close it, and the agent is told
    * that it was. What an open channel delivers is its server's to say (#406),
-   * so the notice doesn't promise its traffic, and it says even that only to
-   * an agent whose window holds the channel's traffic (holdsChannelTraffic).
+   * so the notice says how servers differ rather than promising its traffic,
+   * and says that only to an agent whose window holds the channel's traffic
+   * (holdsChannelTraffic).
    * System message: never triggers inference, never conversational, never
    * locus-eligible.
    */
@@ -15464,8 +15466,10 @@ export class AgentFramework {
     // traffic (holdsChannelTraffic), and channel_close is named only to one
     // that can call it for every one of them.
     const optOut = (holds: boolean, canClose: boolean) =>
-      (holds ? ' What an open channel delivers to you depends on its server.' : '') +
-      (canClose ? ` If you don't want ${plural ? 'one of them' : 'it'}, use channel_close; your choice outranks policy.` : '');
+      (holds ? ' What an open channel brings you is up to its server: some send every message in it, and others only ' +
+        "what addresses you unless you're subscribed to it; their own tools can change that." : '') +
+      (canClose ? ` If you don't want ${plural ? 'one of them' : 'it'}, use channel_close: neither the subscription policy ` +
+        "nor its server's own default opens it again." : '');
     // An open caused by an agent's own send is that agent's to hear about, in
     // the window it reads; a policy admission with no agent behind it goes to
     // the primary. An agent that has ended (a run whose final reply is routed
@@ -15503,7 +15507,11 @@ export class AgentFramework {
       this.canCloseChannels(primary, ids);
     const readerText = (told: string) => (cause === 'subscription-policy'
       ? `[channels] Selected for opening by subscription policy: ${shown}. ` +
-        'This records the admission decision; channel_list shows current transport state.'
+        (plural
+          ? "The host opens them, and if one doesn't open, tries again when its server next registers it; " +
+            'channel_list shows whether each is open yet.'
+          : 'The host opens it, and if that fails, tries again when its server next registers it; ' +
+            "channel_list shows whether it's open yet.")
       : `[channels] Now open: ${shown}: your own message into the closed channel opened it.`) +
       optOut(this.holdsChannelTraffic(who, ids), canClose) + told;
     const reader: ChannelNotice = {

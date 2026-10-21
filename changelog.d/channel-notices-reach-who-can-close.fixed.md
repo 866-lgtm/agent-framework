@@ -9,8 +9,8 @@
   refused. Where an agent's own send opened a channel it can't close, the
   primary is now told by name too, if it can close it, and the agent is told
   that it was.
-- The opened notice says "What an open channel delivers to you depends on
-  its server" only to an agent whose window holds the channel's traffic.
+- The opened notice says what an open channel brings, which is up to its
+  server, only to an agent whose window holds the channel's traffic.
   Before, a conversation fork was told this about a channel other than its
   home, whose messages never reach it.
 - The primary's notices name a conversation fork by the channel it's bound
