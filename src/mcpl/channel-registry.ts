@@ -2281,11 +2281,13 @@ export class ChannelRegistry {
    * after it, behind the coalescer's await, marks nothing open
    * (handleIncoming). A lifecycle request sent before the close is answered
    * for an older transport: its failure withdraws the open flag, and its
-   * receipt confirms nothing, and the channel's decision is sent again
-   * (runLifecycleOperation's sameTarget). What the connection
-   * holds across the boundary is another matter: it reaches handleIncoming
-   * after the next transport's grant, as that transport's traffic
-   * (resetPolicyForTransportBoundary), as it does after a registration.
+   * receipt confirms nothing, and the operation tries again, which on the
+   * closed connection is refused as unreachable, so the decision waits for
+   * the next registration (runLifecycleOperation's sameTarget). What the
+   * connection holds across the boundary is another matter: it reaches
+   * handleIncoming after the next transport's grant, as that transport's
+   * traffic (resetPolicyForTransportBoundary), as it does after a
+   * registration.
    *
    * The framework calls this first in its handler for the connection's
    * `close`, so a registration on the next transport, whose entries are new,

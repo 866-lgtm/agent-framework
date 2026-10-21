@@ -2905,18 +2905,26 @@ test("an untargeted push entry, where the host directs the lifecycle, is confirm
   assert.equal(f.isOpen('dm'), true, "the next transport's traffic does");
 });
 
-test("a lifecycle receipt from before a transport's close confirms nothing, and the channel's decision is sent again", async () => {
+test("a lifecycle receipt from before a transport's close confirms nothing: on the closed connection the open is refused as unreachable, and the decision stays", async () => {
   const f = fixture();
   await f.registry.handleChanged('test', { added: [descriptor()] });
   f.held.add('x');
   const opening = f.tool('open');
   await tick();
   assert.equal(f.pending.length, 1, 'the open is out on the transport');
+  // The connection closes as a real one does: its grant is emptied and it
+  // reads as down before the registry hears of the close.
+  const server = (f.registry as unknown as { serverRegistry: { getServer(id: string): Record<string, unknown> } })
+    .serverRegistry.getServer('test');
+  f.setGrant([]);
+  Object.assign(server, { isConnected: false, willReconnect: true });
   f.registry.transportClosed('test');
-  f.held.delete('x');
   // Its answer was read before the close, and is applied after it.
   f.pending.shift()!.finish();
-  await opening;
-  assert.equal(f.calls.filter((c) => c.kind === 'open').length, 2, 'the open is sent again');
-  assert.equal(f.isOpen(), true, 'and that receipt confirms it');
+  const result = await opening;
+  assert.equal(f.isOpen(), false, "the closed transport's receipt confirms nothing");
+  assert.equal(result.success, false);
+  assert.match(String(result.error), /isn't connected/, 'the agent is told the server is down');
+  assert.equal(f.calls.filter((c) => c.kind === 'open').length, 1, 'nothing more is sent on the closed connection');
+  assert.equal(f.registry.getDesiredState('test', 'x'), 'open', 'the decision stays recorded');
 });
