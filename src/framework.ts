@@ -8334,12 +8334,13 @@ export class AgentFramework {
       'mention you get an automatic reaction so they know you saw nothing. ' +
       'Cancelling (mode "cancel") delivers the diverted backlog. The ' +
       'tune-out auto-cancels after maxWakes mention-bursts. A tuned-out ' +
-      'channel is kept open, so its traffic reaches your subconscious: this ' +
-      'opens a channel you closed, and answers once that open is done. Where ' +
-      'the channel isn\'t open then, the answer\'s openError says why, and ' +
-      'when its messages will reach your subconscious where that\'s known. Calling tune_out ' +
-      'again for a channel already tuned out keeps its settings, and opens ' +
-      'the channel if it isn\'t open.',
+      'channel is kept open, so its traffic reaches your subconscious: where ' +
+      'this host opens and closes the server\'s channels, this opens a ' +
+      'channel you closed, and answers once that open is done. Where the ' +
+      'channel isn\'t open then, the answer\'s openError says why, and when ' +
+      'its messages will reach your subconscious where that\'s known. ' +
+      'Calling tune_out again for a channel already tuned out keeps its ' +
+      'settings, and tries the open again if the channel isn\'t open.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -26634,15 +26635,22 @@ export class AgentFramework {
       if (r.alreadyTunedOut && tuneOut && !this.channelRegistry!.tuneOutTransportOpen(entry.serverId, channelId)) {
         void this.channelRegistry!.openForTuneOut(entry.serverId, channelId)
           .catch(openThrew)
-          .then((openError) => openError ?? 'Its transport is open now, so its messages reach the subconscious.')
-          .then((transport) => {
+          .then((openError) => {
+            // The tune-out is read again: one that ended or was replaced while
+            // the open was out isn't described as standing, and the open's
+            // answer says it isn't in effect any more.
+            const now = this.channelRegistry!.getTuneOutState(entry.serverId, channelId);
+            const error = now?.params.epochId !== tuneOut.params.epochId && openError !== undefined
+              ? openError
+              : alreadyTunedOutText(channelId, (now ?? tuneOut).params,
+                openError ?? 'Its transport is open now, so its messages reach the subconscious.');
             this.pushEvent({
               type: 'tool-result',
               callId: call.id,
               toolName: call.name,
               agentName,
               moduleName: 'tune-out',
-              result: { success: false, error: alreadyTunedOutText(channelId, tuneOut.params, transport), isError: true },
+              result: { success: false, error, isError: true },
             });
           });
         return;

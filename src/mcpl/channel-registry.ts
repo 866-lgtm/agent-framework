@@ -2786,30 +2786,36 @@ export class ChannelRegistry {
    * repeated tune_out makes, gets that open's answer rather than send
    * another.
    */
-  openForTuneOut(serverId: string, channelId: string): Promise<string | undefined> {
+  async openForTuneOut(serverId: string, channelId: string): Promise<string | undefined> {
     // The tune-out this answer is for, by its epoch: one that ended, or that
     // a later decision or a later tune-out replaced, isn't this one.
     const epochId = this.getTuneOutState(serverId, channelId)?.params.epochId;
     const key = `${this.lifecycleKey(serverId, channelId)}\u0000${epochId ?? ''}`;
-    const inFlight = this.tuneOutOpens.get(key);
-    if (inFlight) return inFlight;
-    const opening = this.openTuneOutTransport(serverId, channelId, epochId);
-    this.tuneOutOpens.set(key, opening);
-    const release = () => {
-      if (this.tuneOutOpens.get(key) === opening) this.tuneOutOpens.delete(key);
-    };
-    void opening.then(release, release);
+    let opening = this.tuneOutOpens.get(key);
+    if (!opening) {
+      const started = this.openTuneOutTransport(serverId, channelId, epochId);
+      this.tuneOutOpens.set(key, started);
+      const release = () => {
+        if (this.tuneOutOpens.get(key) === started) this.tuneOutOpens.delete(key);
+      };
+      void started.then(release, release);
+      opening = started;
+    }
     return opening;
   }
 
   /**
-   * Whether a tuned-out channel's transport reads open now, as the tune-out
-   * reads it: its server up, and an open flag the tune-out takes as open
-   * (tuneOutReadsOpen). Where it doesn't, a repeated tune_out tries the open
-   * again (openForTuneOut), behind any work queued for the channel.
+   * Whether a tune_out repeated now has nothing to wait for and finds its
+   * channel's transport open, as the tune-out reads it: no lifecycle work
+   * queued for the channel, since the tune-out's own call may still be
+   * waiting for the work queued after its open; its server up; and an open
+   * flag the tune-out takes as open (tuneOutReadsOpen). Where it doesn't,
+   * the repeat goes through openForTuneOut, which joins this tune-out's open
+   * in flight, or waits for the queued work and tries the open again.
    */
   tuneOutTransportOpen(serverId: string, channelId: string): boolean {
     return this.getTuneOutState(serverId, channelId) !== null &&
+      !this.channelLifecycleTails.has(this.lifecycleKey(serverId, channelId)) &&
       this.serverReach(serverId) === 'up' &&
       this.tuneOutReadsOpen(this.channels.get(`${serverId}:${channelId}`));
   }
@@ -2824,7 +2830,7 @@ export class ChannelRegistry {
    * tune-out's success says traffic will arrive, nothing would show it
    * doesn't, and the decision it replaced isn't known here. An open that
    * failed, as a redundant one queued behind a confirming one may, can't
-   * have closed the channel.
+   * have closed the channel, so it leaves an open flag reading open.
    */
   private tuneOutReadsOpen(entry: ChannelEntry | undefined): boolean {
     // A flag is set open only where both marks are cleared, so a failed
@@ -2868,8 +2874,10 @@ export class ChannelRegistry {
         } catch (error) {
           failed = error;
         }
-        // A settled tail releases its own key: one still current after it
-        // settled would be awaited again without yielding, so stop.
+        // A settled tail releases its own key before this resumes, since its
+        // cleanup was registered first (applyDesiredChannelState). The guard,
+        // as waitForOpenChannel's, stops a loop that would await a settled
+        // tail again without yielding, should that order ever change.
         if (this.channelLifecycleTails.get(lifecycleKey) === pending) return failed;
       }
     };
@@ -2894,7 +2902,8 @@ export class ChannelRegistry {
       if (!this.directsLifecycle(serverId)) {
         return transportOpen ? undefined
           : `The tune-out is recorded, but ${this.lifecycleRefusal(serverId).message}, so its messages reach the ` +
-            'subconscious only as that server sends them. If you need this host to open it, ask whoever runs this host.';
+            'subconscious only as that server sends them, and calling tune_out again won\'t change that. If you need ' +
+            'this host to open it, ask whoever runs this host.';
       }
       if (!entry) return missing;
       // A flag a close that may have taken effect left gets an open.
