@@ -15,6 +15,7 @@ import { Membrane, OpenAIResponsesAPIAdapter, OpenAIResponsesFormatter } from '@
 import type { ContentBlock } from '@animalabs/membrane';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { forkAgentName } from '../src/mcpl/conversation-router.js';
+import type { EventGate } from '../src/gate/event-gate.js';
 
 /** The name the router gives a channel's fork, for the `srv` server every
  *  event here comes from. */
@@ -676,6 +677,57 @@ describe('Conversation routing', () => {
     } finally {
       await framework.stop();
     }
+  });
+
+  // The gate's sleep is one for every agent, and its wake goes to the agent
+  // that set it: a fork's sleep ends with the fork.
+  async function makeGatedFramework(conversations: Partial<ConversationRouterConfig> = {}) {
+    return AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'trunk', model: 'test-model', systemPrompt: 'You are the trunk.' }],
+      modules: [],
+      conversations: { templateAgent: 'trunk', ...conversations },
+      gate: { config: { policies: [], default: 'always' }, configPath: join(tempDir, 'gate.json') },
+    });
+  }
+  const gateOf = (framework: AgentFramework) => (framework as unknown as { eventGate: EventGate }).eventGate;
+
+  it("a fork's sleep ends when the idle sweep closes the fork", async () => {
+    const IDLE_TTL_MS = 60_000;
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello!' }]));
+    const framework = await makeGatedFramework({ idleTtlMs: IDLE_TTL_MS });
+    try {
+      framework.pushEvent(incomingEvent({ channelId: 'slack:D7', text: 'hi', channelType: 'im' }));
+      await framework.runUntilIdle();
+      const fork = forkName('slack:D7', 1);
+      assert.ok(framework.getAgent(fork), 'the fork exists');
+      gateOf(framework).setSleep(3600, 'resting', fork);
+
+      forceExpiry(framework, 'slack:D7', IDLE_TTL_MS);
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Final report posted.' }]));
+      framework.pushEvent({ type: 'external-message', source: 'test', content: 'tick', metadata: {} } as unknown as ProcessEvent);
+      await framework.runUntilIdle();
+
+      assert.equal(framework.getAgent(fork), null, 'the fork is disposed');
+      assert.equal(gateOf(framework).getSleepState(), null, "and its sleep ends with it, so the other agents' wakes aren't held back");
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it("a fork's sleep ends when stop() ends the fork, so a next start() resumes none", async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello!' }]));
+    const framework = await makeGatedFramework();
+    framework.pushEvent(incomingEvent({ channelId: 'slack:D8', text: 'hi', channelType: 'im' }));
+    await framework.runUntilIdle();
+    const fork = forkName('slack:D8', 1);
+    assert.ok(framework.getAgent(fork), 'the fork exists');
+    const gate = gateOf(framework);
+    gate.setSleep(3600, 'resting', fork);
+    await framework.stop();
+    assert.equal(framework.getAgent(fork), null, 'stop() ends the fork');
+    assert.equal(gate.inferenceDiagnostics().sleepUntil, 0, 'and its sleep with it');
   });
 
   it('a write deferred for a fork during its closure turn is stored in the fork before it is disposed', async () => {

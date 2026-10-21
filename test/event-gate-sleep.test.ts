@@ -1,12 +1,18 @@
 /**
- * Sleep across a stop: EventGate.dispose() and resumeSleep().
+ * A sleep's wake: EventGate's sleep timer, dispose() and resumeSleep().
  *
  * Contract:
  *   - dispose() keeps the sleep (until, note, agent) and clears its timer, so
  *     nothing fires into a stopped framework and nothing holds the process.
- *   - resumeSleep(), which the framework's start() calls, arms the wake again
- *     for a sleep still ahead, and wakes at once for one that ended while
- *     stopped: that wake is the one the agent asked for.
+ *     Until the next resumeSleep(), nothing arms a sleep's or a self-wake's
+ *     timer, though a turn a failed stop() left running can still ask.
+ *   - resumeSleep(), which the framework's start() calls before its loop's
+ *     first pass, arms the wake again for a sleep still ahead, and wakes at
+ *     once for one that ended while stopped: that wake is the one the agent
+ *     asked for.
+ *   - The wake comes at the sleep's end by the gate's own clock: a sleep
+ *     longer than one timer holds waits in steps, and a timer that fires
+ *     before the end waits out the rest.
  */
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
@@ -20,10 +26,11 @@ import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 const TMP_DIR = join(import.meta.dirname, '../.test-tmp-gate-sleep');
 
-function makeGate() {
+function makeGate(now?: () => number) {
   const inferenceRequests: Array<{ agentName: string; reason: string; source: string }> = [];
   const traces: string[] = [];
   const gate = new EventGate({
+    now,
     configPath: join(TMP_DIR, 'gate.json'),
     initialConfig: { policies: [], default: 'always' },
     emitTrace: (e) => { if (typeof e.eventType === 'string') traces.push(e.eventType); },
@@ -35,8 +42,19 @@ function makeGate() {
 }
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const timeouts = () => process.getActiveResourcesInfo().filter((r) => r === 'Timeout').length;
 
-describe('EventGate sleep across a stop', () => {
+/** stop(), failing with why if it outlasted the sleep: a sleep that ends
+ *  during stop()'s own teardown fires by design, so the test couldn't check
+ *  a sleep kept through a stop. */
+async function stopWithinTheSleep(framework: AgentFramework, sleepMs: number): Promise<void> {
+  const started = Date.now();
+  await framework.stop();
+  const took = Date.now() - started;
+  assert.ok(took < sleepMs, `stop() took ${took} ms, past the ${sleepMs} ms sleep, so the sleep ended during its teardown, which fires by design: this run can't check a sleep kept through a stop`);
+}
+
+describe("EventGate sleep: its wake, a stop and a fork's end", () => {
   beforeEach(() => {
     if (existsSync(TMP_DIR)) rmSync(TMP_DIR, { recursive: true });
     mkdirSync(TMP_DIR, { recursive: true });
@@ -47,7 +65,6 @@ describe('EventGate sleep across a stop', () => {
 
   it('dispose() keeps the sleep and lets nothing fire', async () => {
     const { gate, inferenceRequests, traces } = makeGate();
-    const timeouts = () => process.getActiveResourcesInfo().filter((r) => r === 'Timeout').length;
     const before = timeouts();
     // The first sleep is short too: if setting a sleep again stopped
     // replacing its timer, the first sleep's timer would hold this file's
@@ -90,6 +107,86 @@ describe('EventGate sleep across a stop', () => {
     gate.dispose();
   });
 
+  it('a sleep longer than one timer holds keeps its wake armed', async () => {
+    // setTimeout holds at most 2^31-1 ms, about 24.8 days, and fires a longer
+    // delay after 1 ms.
+    const { gate, inferenceRequests } = makeGate();
+    const timer = () => (gate as unknown as { sleepTimer: unknown }).sleepTimer;
+    const before = timeouts();
+    try {
+      gate.setSleep(30 * 24 * 3600, 'resting', 'agent');
+      const first = timer();
+      await wait(50);
+      assert.strictEqual(timeouts(), before + 1, "a timer still waits for the sleep's end");
+      assert.strictEqual(timer(), first, 'the same one: a step one timer holds, not one that fires at once and is armed again');
+      assert.deepStrictEqual(inferenceRequests, []);
+    } finally {
+      gate.clearSleep();
+    }
+  });
+
+  it("a sleep's wake follows the gate's own clock, and waits out a clock set back", async () => {
+    // The gate's clock runs ten days ahead of the wall clock, and is set back
+    // a second once the sleep is set, so the 100 ms timer fires 900 ms before
+    // the sleep's end by the gate's clock.
+    let offset = 10 * 24 * 3600 * 1000;
+    const { gate, inferenceRequests } = makeGate(() => Date.now() + offset);
+    try {
+      gate.setSleep(0.1, 'resting', 'agent');
+      offset -= 1_000;
+      await wait(400);
+      assert.deepStrictEqual(inferenceRequests, [], "not before the sleep's end by the gate's clock");
+      await wait(1_200);
+      assert.deepStrictEqual(inferenceRequests, [{ agentName: 'agent', reason: 'sleep-expired: resting', source: 'sleep' }]);
+    } finally {
+      gate.clearSleep();
+    }
+  });
+
+  it("clearSleepFor() ends only the named agent's sleep", () => {
+    const { gate } = makeGate();
+    try {
+      gate.setSleep(60, 'resting', 'agent');
+      assert.strictEqual(gate.clearSleepFor('fork'), false);
+      assert.ok(gate.inferenceDiagnostics().sleepUntil > 0, "another agent's end leaves it");
+      assert.strictEqual(gate.clearSleepFor('agent'), true);
+      assert.strictEqual(gate.inferenceDiagnostics().sleepUntil, 0);
+      assert.strictEqual(gate.clearSleepFor('agent'), false, 'nothing left to end');
+    } finally {
+      gate.clearSleep();
+    }
+  });
+
+  it('after dispose(), a sleep set again arms no timer until resumeSleep()', () => {
+    const { gate } = makeGate();
+    const before = timeouts();
+    try {
+      gate.dispose();
+      gate.setSleep(60, 'resting', 'agent');
+      assert.strictEqual(timeouts(), before, 'no timer while disposed');
+      assert.ok(gate.inferenceDiagnostics().sleepUntil > 0, 'the sleep is kept for the next start');
+      gate.resumeSleep();
+      assert.strictEqual(timeouts(), before + 1, 'resumeSleep() arms it');
+    } finally {
+      gate.clearSleep();
+    }
+  });
+
+  it('after dispose(), a self-wake arms no timer until resumeSleep()', () => {
+    const { gate } = makeGate();
+    const before = timeouts();
+    try {
+      gate.dispose();
+      gate.armSelfWake('agent', 60);
+      assert.strictEqual(timeouts(), before, 'no timer while disposed');
+      gate.resumeSleep();
+      gate.armSelfWake('agent', 60);
+      assert.strictEqual(timeouts(), before + 1, 'armed once resumed');
+    } finally {
+      gate.dispose();
+    }
+  });
+
   it("a framework stopped while its agent sleeps wakes nothing until it's started again, then wakes the agent", async () => {
     // A store the caller owns: an owned store closes at stop(), and a start()
     // after that is refused.
@@ -116,7 +213,7 @@ describe('EventGate sleep across a stop', () => {
       // Long enough for stop() to dispose the gate first even on a loaded
       // host: a sleep that ends during stop()'s own teardown still fires.
       internals.eventGate.setSleep(1, 'resting', 'agent');
-      await framework.stop();
+      await stopWithinTheSleep(framework, 1_000);
       await wait(1_500);
       assert.deepStrictEqual(expiries, [], 'nothing expires while stopped');
       assert.ok(!internals.pendingRequests.some((r) => r.source === 'sleep'), 'no wake is queued while stopped');
@@ -148,7 +245,7 @@ describe('EventGate sleep across a stop', () => {
       // As above: the sleep ends after stop() has disposed the gate, so its
       // wake is owed at start rather than queued during the teardown.
       gate.setSleep(1, 'resting', 'agent');
-      await framework.stop();
+      await stopWithinTheSleep(framework, 1_000);
       await wait(1_500);
       assert.strictEqual(framework.nudgeAgent('agent', 'test').ok, true);
       framework.start();

@@ -12649,6 +12649,9 @@ export class AgentFramework {
     this.activeStreams.delete(agentName);
     this.pendingAssistantBlocks.delete(agentName);
     this.agents.delete(agentName);
+    // A sleep the fork set ends with it: the gate's sleep is one for every
+    // agent, and its wake would go to a name that's gone.
+    this.eventGate?.clearSleepFor(agentName);
     if (agent) this.releaseWindowNowOrAfterResume(agent);
     this.turnRouting.delete(agentName);
     this.proseSpeechChains.delete(agentName);
