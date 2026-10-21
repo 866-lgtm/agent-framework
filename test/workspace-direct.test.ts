@@ -2396,20 +2396,22 @@ test("a direct mount's grep matches lines as read shows them, as a 'chronicle' m
   assert.equal(byFile['ref/mixed.txt']!.lineEndings, 'mixed');
   assert.deepEqual(byFile['ref/bom.txt'], { file: 'ref/bom.txt', matches: [{ line: 1, text: 'foo' }] });
   assert.deepEqual(byFile['ref/lf.txt'], { file: 'ref/lf.txt', matches: [{ line: 1, text: 'foo' }] });
-  const cr = "The pattern names a CR, and a file searched has CRLF line ends. Lines are matched as read shows them, "
+  // Each note names the files searched that have what it's about.
+  const cr = (file: string) => `The pattern names a CR, and 1 file searched has CRLF line ends: ${file} (CRLF). Lines are matched as read shows them, `
     + "which leaves out a CRLF end's CR unless the line's own text ends in a CR. read with offsetChars shows every CR in the workspace's copy";
-  const bom = "The pattern names U+FEFF, and a file searched starts with a BOM. Lines are matched as read shows them, "
+  const bom = (file: string) => `The pattern names U+FEFF, and 1 file searched starts with a BOM: ${file}. Lines are matched as read shows them, `
     + "and a BOM isn't part of the first line. read with offsetChars shows any BOM";
   // On a host with a direct mount, which keeps no workspace copy, the notes
   // name disk's file too; on a host with none, the workspace's copy alone.
-  const crDirect = `${cr}, or in disk's file on a direct mount.`;
-  const bomDirect = `${bom} in the workspace's copy, or in disk's file on a direct mount.`;
-  const notes = (crNote: string, bomNote: string) => [crNote, bomNote, `${crNote} ${bomNote}`, null];
-  assert.deepEqual(fromDisk.slice(1).map(([, results, note]) => [results.length, note]), notes(crDirect, bomDirect).map((n) => [0, n]));
+  const onDisk = ", or in disk's file on a direct mount.";
+  const notes = (crEnd: string, bomEnd: string) => [
+    `${cr('ref/crlf.txt')}${crEnd}`, `${bom('ref/bom.txt')}${bomEnd}`, `${cr('ref/both.txt')}${crEnd} ${bom('ref/both.txt')}${bomEnd}`, null];
+  assert.deepEqual(fromDisk.slice(1).map(([, results, note]) => [results.length, note]),
+    notes(onDisk, ` in the workspace's copy${onDisk}`).map((n) => [0, n]));
   await env.close(direct);
   const fromStore = await answers(await env.openChronicle());
   assert.deepEqual(fromStore.map(([input, results]) => [input, results]), fromDisk.map(([input, results]) => [input, results]));
-  assert.deepEqual(fromStore.slice(1).map(([, , note]) => note), notes(`${cr}.`, `${bom} the workspace's copy has.`));
+  assert.deepEqual(fromStore.slice(1).map(([, , note]) => note), notes('.', " the workspace's copy has."));
 });
 
 test("on a host with a direct mount, grep's notes name disk's file too where the search was of a 'chronicle' mount beside it", async (t) => {

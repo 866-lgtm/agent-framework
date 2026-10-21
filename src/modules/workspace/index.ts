@@ -4641,11 +4641,20 @@ export class WorkspaceModule implements Module {
     // `foo$` finds a CRLF file's line, as it does under ripgrep's --crlf, and
     // the line copies into an edit as read's do. ripgrep's --crlf still prints
     // the line with its CR.
-    let searchedCrlf = false, searchedBom = false;
-    const search = (bytes: Buffer): Searched => {
-      const { lines, crlfEnds, lfEnds, bom } = fileText(bytes);
-      if (crlfEnds > 0) searchedCrlf = true;
-      if (bom) searchedBom = true;
+    //
+    // Whether a file has CRLF ends or a BOM is a fact about the file, not a
+    // line, so each searched file that has either is kept here by its path,
+    // for the note on a pattern that names a CR or U+FEFF to name it. A
+    // conflict's disk version is kept only where the workspace's copy of its
+    // path has neither, and is named as that version, since read doesn't show
+    // it.
+    const crlfFiles = new Map<string, { ends: 'CRLF' | 'mixed'; version: GrepText['version'] }>();
+    const bomFiles = new Map<string, GrepText['version']>();
+    const search = (text: GrepText): Searched => {
+      const { lines, crlfEnds, lfEnds, bom } = fileText(text.bytes);
+      const lineEndings = crlfEnds > 0 ? (lfEnds > 0 ? 'mixed' : 'CRLF') : undefined;
+      if (lineEndings !== undefined && !crlfFiles.has(text.file)) crlfFiles.set(text.file, { ends: lineEndings, version: text.version });
+      if (bom && !bomFiles.has(text.file)) bomFiles.set(text.file, text.version);
       const found: GrepMatch[] = [];
       for (let i = 0; i < lines.length; i++) {
         if (regex.test(lines[i])) {
@@ -4658,7 +4667,7 @@ export class WorkspaceModule implements Module {
           found.push(match);
         }
       }
-      return { ...(crlfEnds > 0 ? { lineEndings: lfEnds > 0 ? 'mixed' : 'CRLF' } : {}), matches: found };
+      return { ...(lineEndings !== undefined ? { lineEndings } : {}), matches: found };
     };
 
     for (const { mount, relativePath, moved, root } of mountsToSearch) {
@@ -4676,7 +4685,7 @@ export class WorkspaceModule implements Module {
       if (deeper === null) continue;
       const start = await this.walkStart(mount, relativePath, deeper === relativePath ? '' : deeper.slice(relativePath ? relativePath.length + 1 : 0));
       const searched = (text: GrepText): void => {
-        const hits = search(text.bytes);
+        const hits = search(text);
         if (hits.matches.length > 0) results.push({ file: text.file, ...(text.state !== undefined ? { state: text.state } : {}), version: text.version, ...hits });
       };
       const kept = (path: string): boolean => fileGlob === null || fileGlob.test(path);
@@ -4695,8 +4704,8 @@ export class WorkspaceModule implements Module {
         totalMatches: results.reduce((sum, r) => sum + r.matches.length, 0),
         // A pattern written for a CR can't find a CRLF end's, nor one written
         // for U+FEFF a BOM, which lines as read shows them leave out, so the
-        // answer says why it didn't.
-        ...leftOutNote(input.pattern, searchedCrlf, searchedBom, this.anyRunsDirect()),
+        // answer says why it didn't, and names the files that have them.
+        ...leftOutNote(input.pattern, crlfFiles, bomFiles, this.anyRunsDirect()),
         ...(skipped.length > 0 ? { skipped } : {}),
         ...(incomplete.length > 0 ? { incomplete } : {}),
       },
@@ -5925,27 +5934,57 @@ function inputProblem(
   return null;
 }
 
-const CRLF_CR_MATCHED = 'The pattern names a CR, and a file searched has CRLF line ends. Lines are matched as read shows them, '
-  + 'which leaves out a CRLF end\'s CR unless the line\'s own text ends in a CR.';
-const BOM_MATCHED = 'The pattern names U+FEFF, and a file searched starts with a BOM. Lines are matched as read shows them, '
-  + 'and a BOM isn\'t part of the first line.';
+/** How many files a grep note names before it gives the count of the rest. */
+const NOTE_FILES_MAX = 20;
+
+/**
+ * The files a grep note names, in the order grep searched them, as its
+ * results are: at most NOTE_FILES_MAX of them, then how many more and how to
+ * see them. Each is named by its mount-prefixed path, with what `detail` says
+ * of it.
+ */
+function namedFiles<T>(files: Map<string, T>, detail: (value: T) => string): string {
+  const names = [...files.keys()];
+  const shown = names.slice(0, NOTE_FILES_MAX).map((name) => `${name}${detail(files.get(name)!)}`);
+  const rest = names.length - shown.length;
+  return `${shown.join(', ')}${rest > 0 ? `, and ${rest} more; narrow with path or glob` : ''}`;
+}
+
+/** What a note says of a conflict's disk version, which read doesn't show. */
+const ofVersion = (version: GrepText['version']): string =>
+  version === 'conflicting-disk' || version === 'recorded-disk' ? ` in its ${version} version` : '';
 
 /**
  * grep's note for a pattern that names a character its lines leave out, where
- * a file it searched has one. The note says a character read shows it in the
- * workspace's copy, since grep also searches a conflict's disk version, which
- * read doesn't show. A direct mount keeps no workspace copy, and its read
- * shows disk's file, so on a host with one (`direct`) the note names that
- * too, as the tools' descriptions mention direct mounts only on such a host.
+ * a file it searched has one: it says how many files searched have it and
+ * names them, each with whether its ends are CRLF or mixed, so a search for a
+ * CR or a BOM still finds the files that have them. The note says a
+ * character read shows it in the workspace's copy, since grep also searches a
+ * conflict's disk version, which read doesn't show. A direct mount keeps no
+ * workspace copy, and its read shows disk's file, so on a host with one
+ * (`direct`) the note names that too, as the tools' descriptions mention
+ * direct mounts only on such a host.
  */
-function leftOutNote(pattern: string, searchedCrlf: boolean, searchedBom: boolean, direct: boolean): { note?: string } {
-  if (!searchedCrlf && !searchedBom) return {};
+function leftOutNote(
+  pattern: string,
+  crlfFiles: Map<string, { ends: 'CRLF' | 'mixed'; version: GrepText['version'] }>,
+  bomFiles: Map<string, GrepText['version']>,
+  direct: boolean,
+): { note?: string } {
+  if (crlfFiles.size === 0 && bomFiles.size === 0) return {};
   const named = namedLeftOut(pattern);
   const onDisk = direct ? ', or in disk\'s file on a direct mount' : '';
+  const count = (n: number, one: string, many: string) => `${n} ${n === 1 ? `file searched ${one}` : `files searched ${many}`}`;
   const notes = [
-    named.cr && searchedCrlf ? `${CRLF_CR_MATCHED} read with offsetChars shows every CR in the workspace's copy${onDisk}.` : null,
-    named.bom && searchedBom
-      ? `${BOM_MATCHED} read with offsetChars shows any BOM ${direct ? `in the workspace's copy${onDisk}` : 'the workspace\'s copy has'}.`
+    named.cr && crlfFiles.size > 0
+      ? `The pattern names a CR, and ${count(crlfFiles.size, 'has', 'have')} CRLF line ends: `
+        + `${namedFiles(crlfFiles, ({ ends, version }) => ` (${ends}${ofVersion(version)})`)}. Lines are matched as read shows them, `
+        + `which leaves out a CRLF end's CR unless the line's own text ends in a CR. read with offsetChars shows every CR in the workspace's copy${onDisk}.`
+      : null,
+    named.bom && bomFiles.size > 0
+      ? `The pattern names U+FEFF, and ${count(bomFiles.size, 'starts', 'start')} with a BOM: `
+        + `${namedFiles(bomFiles, (version) => (ofVersion(version) ? ` (${ofVersion(version).slice(1)})` : ''))}. Lines are matched as read shows them, `
+        + `and a BOM isn't part of the first line. read with offsetChars shows any BOM ${direct ? `in the workspace's copy${onDisk}` : 'the workspace\'s copy has'}.`
       : null,
   ].filter((n) => n !== null);
   return notes.length ? { note: notes.join(' ') } : {};

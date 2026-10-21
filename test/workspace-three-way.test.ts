@@ -6775,7 +6775,19 @@ describe('grep', () => {
     // finds no CR there.
     const cr = await call(m, 'grep', { pattern: '\\r$' });
     assert.deepEqual(cr.results, []);
-    assert.match(cr.note, /^The pattern names a CR, and a file searched has CRLF line ends\./);
+    assert.match(cr.note, /^The pattern names a CR, and 1 file searched has CRLF line ends: work\/a\.txt \(CRLF in its conflicting-disk version\)\. /);
+  });
+
+  test("a conflict whose workspace copy and disk version both have CRLF ends is named once in a CR pattern's note, as the workspace's copy", async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'v1');
+    env.writeDisk('a.txt', 'disk says ALPHA\r\n');
+    await call(m, 'write', { path: 'work/a.txt', content: 'workspace says GAMMA\r\n' });
+    assert.equal((await entryOf(m, 'a.txt'))?.conflict?.diskCopy, 'stored');
+    const cr = await call(m, 'grep', { pattern: '\\r$' });
+    assert.deepEqual(cr.results, []);
+    assert.match(cr.note, /^The pattern names a CR, and 1 file searched has CRLF line ends: work\/a\.txt \(CRLF\)\. /);
   });
 
   test("a U+FEFF pattern over a conflict whose disk version alone starts with a BOM gets the note, which names only the workspace's copy as what read shows", async (t) => {
@@ -6787,8 +6799,8 @@ describe('grep', () => {
     assert.equal((await entryOf(m, 'a.txt'))?.conflict?.diskCopy, 'stored');
     const data = await call(m, 'grep', { pattern: '^\\uFEFF' });
     assert.deepEqual(data.results, []);
-    assert.equal(data.note, "The pattern names U+FEFF, and a file searched starts with a BOM. Lines are matched as read shows them, "
-      + "and a BOM isn't part of the first line. read with offsetChars shows any BOM the workspace's copy has.");
+    assert.equal(data.note, "The pattern names U+FEFF, and 1 file searched starts with a BOM: work/a.txt (in its conflicting-disk version). "
+      + "Lines are matched as read shows them, and a BOM isn't part of the first line. read with offsetChars shows any BOM the workspace's copy has.");
     // The workspace's copy, which read shows, has none.
     assert.equal((await call(m, 'read', { path: 'work/a.txt', offsetChars: 0 })).content, 'workspace says GAMMA\n');
   });
