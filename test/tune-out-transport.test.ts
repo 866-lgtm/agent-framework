@@ -1077,11 +1077,12 @@ async function framework(t: { after(fn: () => Promise<void>): void }) {
     membrane,
     events,
     emit: (text: string) => appendFileSync(commandPath, `ambient m${++emitted} ${text}\n`),
-    // A script's call through the framework's bridge, as its text and
-    // whether it's flagged an error.
+    // A script's call through the framework's bridge, as its text, whether
+    // it's flagged an error, and whether it was refused before it ran, which
+    // tells the script nothing was done.
     script: async (tool: string, input: Record<string, unknown>) => {
       const answer = await scriptCall(fw, 'scout', tool, input);
-      return { text: answerText(answer), isError: answer.refused || answer.isError };
+      return { text: answerText(answer), isError: answer.refused || answer.isError, refused: answer.refused };
     },
     answers: () => answers.length,
   };
@@ -1100,7 +1101,7 @@ test('tune_out of a channel this host closed opens it, so its traffic reaches th
   const closedAt = f.events().length;
   const { cadenceSeconds, backlogCap, maxWakes } = TUNE_OUT_DEFAULTS;
   assert.deepEqual(await f.script('tune_out', { channelId: CHANNEL }),
-    { text: JSON.stringify({ tunedOut: CHANNEL, cadenceSeconds, backlogCap, maxWakes }), isError: false });
+    { text: JSON.stringify({ tunedOut: CHANNEL, cadenceSeconds, backlogCap, maxWakes }), isError: false, refused: false });
   assert.deepEqual(f.events().slice(closedAt).map((e) => e.event), ['channel-opened']);
   f.emit('release chatter');
   const scout = f.i.agents.get('scout')!.getContextManager();
@@ -1119,6 +1120,7 @@ test('tune_out answers a success carrying openForTuneOut\'s answer as openError'
   assert.deepEqual(await f.script('tune_out', { channelId: CHANNEL }), {
     text: JSON.stringify({ tunedOut: CHANNEL, cadenceSeconds, backlogCap, maxWakes, openError: 'The tune-out is recorded, but not yet.' }),
     isError: false,
+    refused: false,
   });
 });
 
@@ -1132,7 +1134,9 @@ test('tune_out\'s answer waits while its open is out', async (t) => {
   assert.equal(f.answers(), 0, 'no answer while the open is out');
   held.resolve(undefined);
   const { cadenceSeconds, backlogCap, maxWakes } = TUNE_OUT_DEFAULTS;
-  assert.deepEqual(await answering, { text: JSON.stringify({ tunedOut: CHANNEL, cadenceSeconds, backlogCap, maxWakes }), isError: false });
+  assert.deepEqual(await answering, {
+    text: JSON.stringify({ tunedOut: CHANNEL, cadenceSeconds, backlogCap, maxWakes }), isError: false, refused: false,
+  });
 });
 
 test('tune_out whose open throws answers a success that says opening its channel failed, never a rejection', async (t) => {
@@ -1147,6 +1151,7 @@ test('tune_out whose open throws answers a success that says opening its channel
         'failed: the store went away',
     }),
     isError: false,
+    refused: false,
   });
 });
 
@@ -1159,6 +1164,7 @@ test('tune_out repeated for a channel already tuned out whose transport is open 
   const { cadenceSeconds, backlogCap, maxWakes } = TUNE_OUT_DEFAULTS;
   const again = await f.script('tune_out', { channelId: CHANNEL });
   assert.equal(again.isError, true);
+  assert.equal(again.refused, false, 'a failure after the call ran, not a refusal before it');
   assert.equal(again.text,
     `Nothing changed: "${CHANNEL}" is already tuned out, with cadenceSeconds ${cadenceSeconds}, backlogCap ` +
     `${backlogCap} and maxWakes ${maxWakes}. To change those, cancel it first with tune_out mode "cancel", which ` +
@@ -1202,7 +1208,7 @@ for (const outcome of [
     const { cadenceSeconds, backlogCap, maxWakes } = TUNE_OUT_DEFAULTS;
     if (outcome === 'ends' || outcome === 'ends, the open answering success' || outcome === 'is replaced' ||
       outcome === 'is replaced, the open answering success') {
-      assert.deepEqual(await answering, { text: REPLACED, isError: true },
+      assert.deepEqual(await answering, { text: REPLACED, isError: true, refused: false },
         'nothing describes the tune-out the repeat read as standing, nor the one that replaced it');
       return;
     }
@@ -1217,6 +1223,9 @@ for (const outcome of [
         `backlogCap ${backlogCap} and maxWakes ${maxWakes}. ${transport} To change those, cancel it first with tune_out ` +
         'mode "cancel", which delivers its backlog to you now, then call tune_out again with the new settings.',
       isError: true,
+      // Its open may have run, so it's a failure, not a refusal saying
+      // nothing was done.
+      refused: false,
     });
   });
 }
@@ -1238,10 +1247,11 @@ test('a decline of a tuned-out channel whose transport isn\'t open is refused, a
   (f.i.channelRegistry as unknown as { channels: Map<string, { open: boolean }> }).channels.get(`disc:${CHANNEL}`)!.open = false;
   const declined = await f.script('channel_decline', { channelId: CHANNEL, messageId: 'backlog-one' });
   assert.equal(declined.isError, true);
+  assert.equal(declined.refused, false);
   assert.match(declined.text, /is tuned out: its messages go to the subconscious, and channel_decline doesn't change that/);
   f.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Read the backlog.' }]));
   assert.deepEqual(await f.script('tune_out', { channelId: CHANNEL, mode: 'cancel' }),
-    { text: JSON.stringify({ cancelled: CHANNEL }), isError: false });
+    { text: JSON.stringify({ cancelled: CHANNEL }), isError: false, refused: false });
   const dumped = () => scout.getAllMessages().find((m) => m.content.some((b) => (b.text ?? '').includes('<tuned-out-backlog')));
   const until = Date.now() + 10_000;
   while (!dumped()) {
