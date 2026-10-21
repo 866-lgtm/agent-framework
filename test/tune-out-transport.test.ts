@@ -22,7 +22,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { AgentFramework } from '../src/index.js';
-import type { ScriptToolResult } from '../src/index.js';
 import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
 import type { TuneOutParams } from '../src/mcpl/channel-registry.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
@@ -32,6 +31,7 @@ import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 import type { ChannelDescriptor } from '../src/mcpl/types.js';
 import { TUNE_OUT_DEFAULTS } from '../src/tune-out/coordinator.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { answerText, scriptCall } from './helpers/script-call.js';
 
 function descriptor(id: string): ChannelDescriptor {
   return { id, type: 'test', label: id, direction: 'bidirectional', address: { value: id } };
@@ -1052,7 +1052,6 @@ async function framework(t: { after(fn: () => Promise<void>): void }) {
   const i = fw as unknown as {
     channelRegistry: ChannelRegistry & { handleChannelToolCall(name: string, input: unknown): Promise<{ data?: unknown }> };
     agents: Map<string, { getContextManager(): { getAllMessages(): Array<{ content: Array<{ text?: string }>; metadata?: Record<string, unknown> }> } }>;
-    handleScriptToolCall(agent: string, tool: string, args: Record<string, unknown>): Promise<ScriptToolResult>;
   };
   // What the dispatch pushes as tune_out's answers, as it pushes them: an
   // answer given early shows here at once.
@@ -1078,7 +1077,12 @@ async function framework(t: { after(fn: () => Promise<void>): void }) {
     membrane,
     events,
     emit: (text: string) => appendFileSync(commandPath, `ambient m${++emitted} ${text}\n`),
-    script: (tool: string, input: Record<string, unknown>) => i.handleScriptToolCall('scout', tool, input),
+    // A script's call through the framework's bridge, as its text and
+    // whether it's flagged an error.
+    script: async (tool: string, input: Record<string, unknown>) => {
+      const answer = await scriptCall(fw, 'scout', tool, input);
+      return { text: answerText(answer), isError: answer.refused || answer.isError };
+    },
     answers: () => answers.length,
   };
 }
@@ -1156,7 +1160,7 @@ test('tune_out repeated for a channel already tuned out whose transport is open 
   const again = await f.script('tune_out', { channelId: CHANNEL });
   assert.equal(again.isError, true);
   assert.equal(again.text,
-    `Error: Nothing changed: "${CHANNEL}" is already tuned out, with cadenceSeconds ${cadenceSeconds}, backlogCap ` +
+    `Nothing changed: "${CHANNEL}" is already tuned out, with cadenceSeconds ${cadenceSeconds}, backlogCap ` +
     `${backlogCap} and maxWakes ${maxWakes}. To change those, cancel it first with tune_out mode "cancel", which ` +
     'delivers its backlog to you now, then call tune_out again with the new settings.');
   assert.equal(calls, 0, 'its transport is open, with nothing to wait for');
@@ -1198,7 +1202,7 @@ for (const outcome of [
     const { cadenceSeconds, backlogCap, maxWakes } = TUNE_OUT_DEFAULTS;
     if (outcome === 'ends' || outcome === 'ends, the open answering success' || outcome === 'is replaced' ||
       outcome === 'is replaced, the open answering success') {
-      assert.deepEqual(await answering, { text: `Error: ${REPLACED}`, isError: true },
+      assert.deepEqual(await answering, { text: REPLACED, isError: true },
         'nothing describes the tune-out the repeat read as standing, nor the one that replaced it');
       return;
     }
@@ -1209,7 +1213,7 @@ for (const outcome of [
         'failed: the store went away.',
     }[outcome];
     assert.deepEqual(await answering, {
-      text: `Error: Nothing changed in the tune-out: "${CHANNEL}" is already tuned out, with cadenceSeconds ${cadenceSeconds}, ` +
+      text: `Nothing changed in the tune-out: "${CHANNEL}" is already tuned out, with cadenceSeconds ${cadenceSeconds}, ` +
         `backlogCap ${backlogCap} and maxWakes ${maxWakes}. ${transport} To change those, cancel it first with tune_out ` +
         'mode "cancel", which delivers its backlog to you now, then call tune_out again with the new settings.',
       isError: true,
