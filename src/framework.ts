@@ -105,7 +105,7 @@ import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry, connectorText, destinationKey, journalToolDescription, type ChannelToolOrigin, type PublishDestination, type PublishOutcome, type SelectedForOpening } from './mcpl/channel-registry.js';
 import { KEEP_IDLE_MS, KEEP_NEWEST, ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftAttempt, type DraftReason, type DraftState, type InheritedRisk } from './prose-drafts.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
-import { INBOUND_SOURCE_KEY, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
+import { INBOUND_SOURCE_KEY, sourceBodyDigest, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
 import type { IncomingMessageFacts, RoutingDecision } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
 import { SEND_TOOLS, bareToolName } from './send-tools.js';
@@ -12076,6 +12076,11 @@ export class AgentFramework {
       this.noteInboundAccepted(source);
     }
     metadata[INBOUND_SOURCE_KEY] = source;
+    // The delivered body's version identity (mcpl/inbound-source.ts
+    // sourceBodyDigest; room-220 #46752–#47210), from the body as delivered,
+    // before any host decoration. The stored copy's own digest is taken at
+    // each storage site below, over exactly the blocks stored there.
+    metadata.sourceBodyDigest = sourceBodyDigest(event.content);
 
     // Per-channel conversation routing: messages go to the channel's fork
     // agent (spawned from the template on first qualifying message), never
@@ -12088,7 +12093,7 @@ export class AgentFramework {
       if (!target) return undefined;
       if (this.conversationRouter && this.conversationAgentHomes.has(target.name)) {
         metadata.triggered = event.triggerInference ?? false;
-        const id = target.getContextManager().addMessage('user', event.content, metadata);
+        const id = target.getContextManager().addMessage('user', event.content, AgentFramework.withStoredDigest(metadata, event.content));
         // A correction may target an older engagement. Refresh only the
         // binding whose agent actually received the message.
         if (this.conversationRouter.getBinding(event.channelId)?.agentName === target.name) {
@@ -12157,7 +12162,7 @@ export class AgentFramework {
     }
 
     const placement: CoalescingPlacement = { agent: '' };
-    const id = this.addMessage('user', incomingContent, metadata, { placement, bypassDeferralFor: event.assemblingFor });
+    const id = this.addMessage('user', incomingContent, AgentFramework.withStoredDigest(metadata, incomingContent), { placement, bypassDeferralFor: event.assemblingFor });
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
 
     if (event.triggerInference && !divert) {
@@ -12271,7 +12276,7 @@ export class AgentFramework {
     const trigger = decision.trigger && event.triggerInference !== false;
     messageMetadata.triggered = trigger;
 
-    const id = agent.getContextManager().addMessage('user', event.content, messageMetadata);
+    const id = agent.getContextManager().addMessage('user', event.content, AgentFramework.withStoredDigest(messageMetadata, event.content));
     router.touch(event.channelId);
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
 
@@ -12868,6 +12873,27 @@ export class AgentFramework {
       ...(sourceTimestamp ? { sourceTimestamp } : {}),
       ...(fields.deferred ? { deferred: true as const } : {}),
     };
+  }
+
+  /**
+   * An inbound item's metadata with its stored copy's own digest
+   * (`storedBodyDigest`): the delivered-body digest's function over exactly
+   * the blocks handed to storage here — every decoration included, before
+   * storage shards them. That function hashes blocks as the store keeps them
+   * (inline media re-encoded and relabeled from its bytes), so an unsharded
+   * copy read back hashes to this too. A body the store shards (adaptive
+   * ingress chunking) carries this on every shard, with its metadata, and no
+   * shard hashes to it. Taken at each storage site, never earlier, because
+   * a path can still decorate the body after ingestion stamped it (the
+   * closed-channel invitation; room-220 #48282). An edit through
+   * editMessage keeps metadata but not this hash.
+   */
+  private static withStoredDigest(
+    metadata: Record<string, unknown>,
+    content: readonly ContentBlock[],
+  ): Record<string, unknown> {
+    metadata.storedBodyDigest = sourceBodyDigest(content);
+    return metadata;
   }
 
   /** Source envelope of a channels/incoming event (lane facts as given). */
@@ -13609,6 +13635,12 @@ export class AgentFramework {
     metadata[INBOUND_SOURCE_KEY] = source;
 
     const content = [...event.content];
+    // The delivered body's version identity, before any host decoration
+    // (the closed-channel invitation below). Every push that reaches here
+    // gets one, written over any value the adapter's origin carried. (A
+    // visibly-empty push is refused at admission; the silent-heartbeat marker
+    // stores nothing, so its metadata is never kept.)
+    metadata.sourceBodyDigest = sourceBodyDigest(content);
     if (triggerChannel) {
       const origin = (event.origin ?? {}) as Record<string, unknown>;
       const invitation = this.buildClosedChannelInvitation({
@@ -13637,7 +13669,7 @@ export class AgentFramework {
 
     const placement: CoalescingPlacement = { agent: '' };
     if (!silentHeartbeat) {
-      const id = this.addMessage('user', content, metadata, { placement, bypassDeferralFor: event.assemblingFor });
+      const id = this.addMessage('user', content, AgentFramework.withStoredDigest(metadata, content), { placement, bypassDeferralFor: event.assemblingFor });
       this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event' });
     } else {
       console.error(`[heartbeat] ${event.serverId}: accepted silent scheduled wake ${logValue(event.eventId ?? '')}`);
