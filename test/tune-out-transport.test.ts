@@ -860,7 +860,10 @@ test('a tune-out whose open failed opens the channel when its open is asked for 
 
 test('tuneOutTransportOpen reads a channel open only with a tune-out, its server up, no queued work and an open flag it takes as open', async () => {
   const f = await closedChannel();
-  assert.equal(f.registry.tuneOutTransportOpen('a', 'y'), false, 'no tune-out');
+  await f.registry.handleChannelToolCall('channel_open', { channelId: 'y' });
+  assert.equal(f.isOpen(), true);
+  assert.equal(f.registry.tuneOutTransportOpen('a', 'y'), false, 'no tune-out, the channel confirmed open');
+  await f.registry.handleChannelToolCall('channel_close', { channelId: 'y' });
   f.registry.enterTuneOut('a', 'y', PARAMS, 'agent-tool');
   assert.equal(f.registry.tuneOutTransportOpen('a', 'y'), false, 'the transport closed');
   assert.equal(await f.registry.openForTuneOut('a', 'y'), undefined);
@@ -879,7 +882,7 @@ test('tuneOutTransportOpen reads a channel open only with a tune-out, its server
   answer();
   await queued;
   // The queue's tail is released a few turns after the operation settles.
-  for (let i = 0; i < 5; i++) await tick();
+  for (let i = 0; i < 50 && !f.registry.tuneOutTransportOpen('a', 'y'); i++) await tick();
   assert.equal(f.registry.tuneOutTransportOpen('a', 'y'), true, 'the queued work done');
   // The server goes down, and the entry keeps its flag.
   f.server.isConnected = false;
@@ -916,6 +919,11 @@ test('a tune-out\'s open asked for again while it waits for work queued after it
   assert.equal(f.isOpen(), true);
   assert.equal(f.registry.tuneOutTransportOpen('a', 'y'), false, 'a repeat waits rather than answer at once');
   const again = f.registry.openForTuneOut('a', 'y');
+  let answered = 0;
+  void first.then(() => { answered++; });
+  void again.then(() => { answered++; });
+  for (let i = 0; i < 10; i++) await tick();
+  assert.equal(answered, 0, 'both wait while the reconcile\'s open is out');
   answerThird();
   assert.deepEqual(await Promise.all([first, again]), [undefined, undefined]);
   await changing;
@@ -935,6 +943,13 @@ test('a tune-out\'s open that throws is asked for anew by the next call, not ans
   await assert.rejects(f.registry.openForTuneOut('a', 'y'), /couldn't be read/);
   assert.equal(await f.registry.openForTuneOut('a', 'y'), undefined);
   assert.deepEqual(f.server.sent, ['open y']);
+  // One that throws before it awaits anything still answers with a rejection,
+  // so the dispatch's catch answers it.
+  const tuneOuts = f.registry as unknown as { getTuneOutState(serverId: string, channelId: string): unknown };
+  tuneOuts.getTuneOutState = () => { throw new Error('the tune-out couldn\'t be read'); };
+  let opening: Promise<string | undefined> | undefined;
+  assert.doesNotThrow(() => { opening = f.registry.openForTuneOut('a', 'y'); });
+  await assert.rejects(opening!, /tune-out couldn't be read/);
 });
 
 // --- tune_out itself, through the framework ---------------------------------
@@ -956,8 +971,10 @@ function heldOpen() {
         timer = setTimeout(() => reject(new Error('timed out waiting for the open to be called')), 10_000);
       });
       try { await Promise.race([calledOnce, late]); } finally { clearTimeout(timer); }
-      // Let anything that would answer early run before the test looks.
-      for (let i = 0; i < 10; i++) await new Promise<void>((resolve) => setImmediate(resolve));
+      // An answer that came early would reach the script within the
+      // framework's 10 ms idle poll of its results, so the test looks after
+      // a window well past it.
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
     },
     resolve: (answer: string | undefined) => held!.resolve(answer),
     reject: (error: Error) => held!.reject(error),
@@ -1083,7 +1100,7 @@ test('tune_out repeated for a channel already tuned out whose transport is open 
   assert.equal(calls, 0, 'its transport is open, with nothing to wait for');
 });
 
-for (const outcome of ['opens it', 'fails', 'throws', 'ends'] as const) {
+for (const outcome of ['opens it', 'fails', 'throws', 'ends', 'ends, the open answering success', 'is replaced'] as const) {
   test(`tune_out repeated for a channel already tuned out whose transport isn't open tries the open again, and ${outcome}`, async (t) => {
     const f = await framework(t);
     assert.equal((await f.script('tune_out', { channelId: CHANNEL })).isError, false);
@@ -1103,10 +1120,21 @@ for (const outcome of ['opens it', 'fails', 'throws', 'ends'] as const) {
       // The tune-out ends while the open is out, and the open answers so.
       f.i.channelRegistry.cancelTuneOut('disc', CHANNEL, 'open', 'test');
       held.resolve(REPLACED);
+    } else if (outcome === 'ends, the open answering success') {
+      // The open answered for the tune-out before it ended.
+      f.i.channelRegistry.cancelTuneOut('disc', CHANNEL, 'open', 'test');
+      held.resolve(undefined);
+    } else if (outcome === 'is replaced') {
+      // The tune-out is cancelled and made again, under a new epoch, while
+      // the open is out.
+      f.i.channelRegistry.cancelTuneOut('disc', CHANNEL, 'open', 'test');
+      f.i.channelRegistry.enterTuneOut('disc', CHANNEL, { ...PARAMS, epochId: 'e2', cadenceSeconds: 90 }, 'agent-tool');
+      held.resolve(REPLACED);
     } else held.resolve(outcome === 'fails' ? 'The tune-out is recorded, but not yet.' : undefined);
     const { cadenceSeconds, backlogCap, maxWakes } = TUNE_OUT_DEFAULTS;
-    if (outcome === 'ends') {
-      assert.deepEqual(await answering, { text: `Error: ${REPLACED}`, isError: true }, 'nothing describes the ended tune-out as standing');
+    if (outcome === 'ends' || outcome === 'ends, the open answering success' || outcome === 'is replaced') {
+      assert.deepEqual(await answering, { text: `Error: ${REPLACED}`, isError: true },
+        'nothing describes the tune-out the repeat read as standing, nor the one that replaced it');
       return;
     }
     const transport = {

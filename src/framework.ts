@@ -102,7 +102,7 @@ import { isSilentHeartbeatMarker, isVisiblyEmptyContent, NON_STRING_TEXT_PLACEHO
 import { parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
-import { ChannelRegistry, connectorText, destinationKey, journalToolDescription, type ChannelToolOrigin, type PublishDestination, type PublishOutcome, type SelectedForOpening } from './mcpl/channel-registry.js';
+import { ChannelRegistry, TUNE_OUT_REPLACED, connectorText, destinationKey, journalToolDescription, type ChannelToolOrigin, type PublishDestination, type PublishOutcome, type SelectedForOpening } from './mcpl/channel-registry.js';
 import { KEEP_IDLE_MS, KEEP_NEWEST, ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftAttempt, type DraftReason, type DraftState, type InheritedRisk } from './prose-drafts.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import { INBOUND_SOURCE_KEY, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
@@ -8340,7 +8340,8 @@ export class AgentFramework {
       'channel isn\'t open then, the answer\'s openError says why, and when ' +
       'its messages will reach your subconscious where that\'s known. ' +
       'Calling tune_out again for a channel already tuned out keeps its ' +
-      'settings, and tries the open again if the channel isn\'t open.',
+      'settings, and, where this host can open the channel, tries the open ' +
+      'again if it isn\'t open.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -26637,13 +26638,13 @@ export class AgentFramework {
           .catch(openThrew)
           .then((openError) => {
             // The tune-out is read again: one that ended or was replaced while
-            // the open was out isn't described as standing, and the open's
-            // answer says it isn't in effect any more.
+            // the open was out isn't described as standing, whatever the open
+            // answered for it.
             const now = this.channelRegistry!.getTuneOutState(entry.serverId, channelId);
-            const error = now?.params.epochId !== tuneOut.params.epochId && openError !== undefined
-              ? openError
-              : alreadyTunedOutText(channelId, (now ?? tuneOut).params,
-                openError ?? 'Its transport is open now, so its messages reach the subconscious.');
+            const error = now?.params.epochId === tuneOut.params.epochId
+              ? alreadyTunedOutText(channelId, now.params,
+                openError ?? 'Its transport is open now, so its messages reach the subconscious.')
+              : TUNE_OUT_REPLACED;
             this.pushEvent({
               type: 'tool-result',
               callId: call.id,

@@ -710,6 +710,13 @@ function lifecycleClause(err: unknown): string {
  *  first, at a delivery's wait or at its last check. */
 const CHANNEL_REMOVED_CLAUSE = 'the channel was removed before these words went out';
 
+/** A tune-out's open answered for a tune-out that ended, or that a later
+ *  decision or a later tune-out replaced, while the open was out: by
+ *  openForTuneOut, and by a repeated tune_out whose tune-out isn't the one it
+ *  read before it waited. */
+export const TUNE_OUT_REPLACED = "The tune-out was recorded, but it isn't in effect any more: it ended, or a later " +
+  'decision about the channel or a later tune-out replaced it, while its transport was being opened.';
+
 /**
  * Why words a send opened their channel for didn't go out. The delivery's
  * wait after the open says it whole (`removed`, `not-open`). The open's own
@@ -2811,7 +2818,8 @@ export class ChannelRegistry {
    * waiting for the work queued after its open; its server up; and an open
    * flag the tune-out takes as open (tuneOutReadsOpen). Where it doesn't,
    * the repeat goes through openForTuneOut, which joins this tune-out's open
-   * in flight, or waits for the queued work and tries the open again.
+   * in flight, or waits for the queued work and, where this host can open
+   * the channel, tries the open again.
    */
   tuneOutTransportOpen(serverId: string, channelId: string): boolean {
     return this.getTuneOutState(serverId, channelId) !== null &&
@@ -2830,7 +2838,8 @@ export class ChannelRegistry {
    * tune-out's success says traffic will arrive, nothing would show it
    * doesn't, and the decision it replaced isn't known here. An open that
    * failed, as a redundant one queued behind a confirming one may, can't
-   * have closed the channel, so it leaves an open flag reading open.
+   * have closed the channel: it leaves the flag as it was, so an open flag
+   * stays open.
    */
   private tuneOutReadsOpen(entry: ChannelEntry | undefined): boolean {
     // A flag is set open only where both marks are cleared, so a failed
@@ -2847,8 +2856,6 @@ export class ChannelRegistry {
     const lifecycleKey = this.lifecycleKey(serverId, channelId);
     const inEffect = () =>
       epochId !== undefined && this.getTuneOutState(serverId, channelId)?.params.epochId === epochId;
-    const replaced = "The tune-out was recorded, but it isn't in effect any more: it ended, or a later decision about the " +
-      'channel or a later tune-out replaced it, while its transport was being opened.';
     // "May not": a failed request leaves its outcome unknown, and an open
     // that took effect would have its traffic diverted. `again` where calling
     // tune_out again tries the open now: the channel is registered here and
@@ -2885,7 +2892,7 @@ export class ChannelRegistry {
     // transport itself. `missing` answers for a channel that isn't
     // registered here, where this host directs the lifecycle.
     const answered = (entry: ChannelEntry | undefined, missing: string): string | undefined | null => {
-      if (!inEffect()) return replaced;
+      if (!inEffect()) return TUNE_OUT_REPLACED;
       // A connection that dropped keeps its entries' open flags, and whether
       // this host or the server opens the channel isn't known until it's
       // back, since a reconnect empties the grant until the new one is
@@ -2909,7 +2916,10 @@ export class ChannelRegistry {
       // A flag a close that may have taken effect left gets an open.
       return transportOpen ? undefined : null;
     };
-    await settle();
+    // settle's last look and the turn this resumes in are apart, and work
+    // can be queued between them, so the queue is looked at again in the
+    // turn that reads the state and queues the open.
+    do await settle(); while (this.channelLifecycleTails.has(lifecycleKey));
     const before = answered(this.channels.get(channelKey), notYet(nextRegistration, "it isn't registered here now"));
     if (before !== null) return before;
     let failure: unknown;
@@ -2923,7 +2933,8 @@ export class ChannelRegistry {
     // channel isn't open now, so where the last work failed, its failure,
     // the last attempt's, is the reason: this open's may concern a
     // registration that work replaced.
-    const later = await settle();
+    let later: unknown;
+    do later = await settle(); while (this.channelLifecycleTails.has(lifecycleKey));
     failure = later ?? failure;
     const clause = failure !== undefined ? `: ${lifecycleClause(failure)}` : '';
     const after = this.channels.get(channelKey);
