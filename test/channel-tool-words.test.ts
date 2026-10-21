@@ -50,6 +50,14 @@ const words = (tools: Array<{ name: string; description?: string }>) => ({
   close: tools.find((t) => t.name === 'channel_close')?.description,
 });
 
+/** The one request the run sent, told apart from any resident's by the run's system prompt. */
+function runRequest(membrane: MockMembrane): { tools?: Array<{ name: string; description?: string }> } {
+  const sent = (membrane.calls as unknown as Array<{ system?: unknown; tools?: Array<{ name: string; description?: string }> }>)
+    .filter((c) => JSON.stringify(c.system ?? '').includes('Do the task.'));
+  assert.equal(sent.length, 1, 'the run sent one request');
+  return sent[0]!;
+}
+
 function mention(channelId: string, text: string): ProcessEvent {
   return {
     type: 'mcpl:channel-incoming',
@@ -104,7 +112,7 @@ describe("channel_open and channel_close's words follow whether the agent's wind
       const run = framework.runEphemeralToCompletion(created.agent, created.contextManager);
       framework.start();
       await run;
-      const sent = membrane.calls.at(-1) as unknown as { tools?: Array<{ name: string; description?: string }> };
+      const sent = runRequest(membrane);
       assert.deepEqual(words(sent.tools ?? []), NON_HOLDER, JSON.stringify(words(sent.tools ?? [])));
     } finally {
       await framework.stop();
@@ -140,6 +148,36 @@ describe("channel_open and channel_close's words follow whether the agent's wind
       const sent = membrane.calls.slice(before) as unknown as Array<{ tools?: Array<{ name: string; description?: string }> }>;
       assert.equal(sent.length, 1, 'the closure turn was the one request');
       assert.deepEqual(words(sent[0]!.tools ?? []), HOLDER);
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it("on a routed host, every agent but a fork is given the non-holder's words: a resident beside the trunk, and an ephemeral run", async () => {
+    // A routed host stores a channel's incoming messages only in the fork its channel is bound to, never in a
+    // resident's or a run's window, so no rule naming the trunk alone would do.
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 's.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [
+        { name: 'trunk', model: 'test-model', systemPrompt: 'You are the trunk.' },
+        { name: 'helper', model: 'test-model', systemPrompt: 'You are helper.' },
+      ],
+      modules: [],
+      conversations: { templateAgent: 'trunk' },
+    });
+    try {
+      withChannelTools(framework);
+      assert.deepEqual(words(internals(framework).getToolsForAgent('trunk')), NON_HOLDER);
+      assert.deepEqual(words(internals(framework).getToolsForAgent('helper')), NON_HOLDER);
+      const created = await framework.createEphemeralAgent({ name: 'run-1', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all' });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'done' }]));
+      const run = framework.runEphemeralToCompletion(created.agent, created.contextManager);
+      framework.start();
+      await run;
+      const sent = runRequest(membrane);
+      assert.deepEqual(words(sent.tools ?? []), NON_HOLDER, JSON.stringify(words(sent.tools ?? [])));
     } finally {
       await framework.stop();
     }
