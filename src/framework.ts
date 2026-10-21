@@ -14,7 +14,7 @@ import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverB
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SILENT_HEARTBEAT_SEPARATOR, type RequestOnlyPrompt, type RequestOnlyStamps } from './silent-heartbeat.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
-import { TuneOutCoordinator, TUNE_OUT_DEFAULTS } from './tune-out/coordinator.js';
+import { TuneOutCoordinator, TUNE_OUT_DEFAULTS, alreadyTunedOutText } from './tune-out/coordinator.js';
 import type {
   MessageId,
   MessageMetadata,
@@ -103,7 +103,7 @@ import { isSilentHeartbeatMarker, isVisiblyEmptyContent, NON_STRING_TEXT_PLACEHO
 import { parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
-import { ChannelRegistry, connectorText, desiredStateInLog, destinationKey, journalToolDescription, type ChannelToolOrigin, type PublishDestination, type PublishOutcome, type SelectedForOpening } from './mcpl/channel-registry.js';
+import { ChannelRegistry, TUNE_OUT_REPLACED, connectorText, desiredStateInLog, destinationKey, journalToolDescription, type ChannelToolOrigin, type PublishDestination, type PublishOutcome, type SelectedForOpening } from './mcpl/channel-registry.js';
 import { KEEP_IDLE_MS, KEEP_NEWEST, ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftAttempt, type DraftReason, type DraftState, type InheritedRisk } from './prose-drafts.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import { INBOUND_SOURCE_KEY, sourceBodyDigest, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
@@ -8590,7 +8590,15 @@ export class AgentFramework {
       'whether mentions merit interrupting, and able to cancel. People who ' +
       'mention you get an automatic reaction so they know you saw nothing. ' +
       'Cancelling (mode "cancel") delivers the diverted backlog. The ' +
-      'tune-out auto-cancels after maxWakes mention-bursts.',
+      'tune-out auto-cancels after maxWakes mention-bursts. A tuned-out ' +
+      'channel is kept open, so its traffic reaches your subconscious: where ' +
+      'this host opens and closes the server\'s channels, this opens a ' +
+      'channel you closed, and answers once that open is done. Where the ' +
+      'channel isn\'t open then, the answer\'s openError says why, and when ' +
+      'its messages will reach your subconscious where that\'s known. ' +
+      'Calling tune_out again for a channel already tuned out keeps its ' +
+      'settings, and, where this host can open the channel, tries the open ' +
+      'again if it isn\'t open.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -27048,6 +27056,10 @@ export class AgentFramework {
     const entry = this.channelRegistry?.listChannelsRaw()
       .find((e) => e.descriptor.id === channelId);
     let result: { success: boolean; data?: unknown; error?: string; isError?: boolean };
+    // An open that throws is answered too, never left unhandled.
+    const openThrew = (err: unknown): string =>
+      'The tune-out is recorded, but its messages may not reach the subconscious, since opening its channel ' +
+      `failed: ${thrownText(err)}`;
     if (!entry) {
       result = { success: false, error: `unknown channel: ${channelId}`, isError: true };
     } else if (input.mode === 'cancel') {
@@ -27062,17 +27074,66 @@ export class AgentFramework {
         maxWakes: input.maxWakes,
         durationSeconds: input.durationSeconds,
       }, 'agent-tool');
-      result = r.ok
-        ? {
-            success: true,
-            data: {
-              tunedOut: channelId,
-              cadenceSeconds: r.params.cadenceSeconds,
-              backlogCap: r.params.backlogCap,
-              maxWakes: r.params.maxWakes,
-            },
-          }
-        : { success: false, error: r.error, isError: true };
+      if (r.ok) {
+        const data = {
+          tunedOut: channelId,
+          cadenceSeconds: r.params.cadenceSeconds,
+          backlogCap: r.params.backlogCap,
+          maxWakes: r.params.maxWakes,
+        };
+        // A tuned-out channel's traffic must keep arriving for the
+        // subconscious, so the answer waits for its transport (openForTuneOut).
+        // The tune-out is recorded either way, so it's a success, and where
+        // the transport isn't open, openError says why its messages don't or
+        // may not reach the subconscious, and when they will where that's
+        // known, or that the tune-out isn't in effect any more. A rejection is
+        // answered too, never left unhandled, and the result goes through
+        // pushEvent, as every other tool's does.
+        void this.channelRegistry!.openForTuneOut(entry.serverId, channelId)
+          .catch(openThrew)
+          .then((openError) => {
+            this.pushEvent({
+              type: 'tool-result',
+              callId: call.id,
+              toolName: call.name,
+              agentName,
+              moduleName: 'tune-out',
+              result: { success: true, data: { ...data, ...(openError ? { openError } : {}) } },
+            });
+          });
+        return;
+      }
+      // tune_out repeated on a channel already tuned out is where an agent
+      // retries a transport the first open left closed, so where it isn't
+      // open, or work is queued for it, the repeat goes through
+      // openForTuneOut, which joins the open in flight or waits and, where
+      // this host can open the channel, opens it again; the refusal says
+      // what its transport is now.
+      const tuneOut = this.channelRegistry!.getTuneOutState(entry.serverId, channelId);
+      if (r.alreadyTunedOut && tuneOut && !this.channelRegistry!.tuneOutTransportOpen(entry.serverId, channelId)) {
+        void this.channelRegistry!.openForTuneOut(entry.serverId, channelId)
+          .catch(openThrew)
+          .then((openError) => {
+            // The tune-out is read again: one that ended or was replaced while
+            // the open was out isn't described as standing, whatever the open
+            // answered for it.
+            const now = this.channelRegistry!.getTuneOutState(entry.serverId, channelId);
+            const error = now?.params.epochId === tuneOut.params.epochId
+              ? alreadyTunedOutText(channelId, now.params,
+                openError ?? 'Its transport is open now, so its messages reach the subconscious.')
+              : TUNE_OUT_REPLACED;
+            this.pushEvent({
+              type: 'tool-result',
+              callId: call.id,
+              toolName: call.name,
+              agentName,
+              moduleName: 'tune-out',
+              result: { success: false, error, isError: true },
+            });
+          });
+        return;
+      }
+      result = { success: false, error: r.error, isError: true };
     }
     this.pushEvent({
       type: 'tool-result',
