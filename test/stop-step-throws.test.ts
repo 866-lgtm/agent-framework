@@ -16,8 +16,7 @@ type Internals = {
   ownedStoreClosed: boolean;
   queue: { isClosed: boolean; close(): void };
   retryWaitWakers: Set<() => void>;
-  codeExecutionRunners: Map<string, unknown>;
-  backgroundScripts: Map<string, unknown>;
+  codeExecution: unknown;
   deferredMessages: unknown[];
   [field: string]: unknown;
 };
@@ -160,17 +159,10 @@ const ROWS: Row[] = [
   { step: 'closing the queue', own: 'queue', inject: (fw, e) => throwIn(internals(fw), 'queue', 'close', e) },
   { step: "the tune-out coordinator's stop()", inject: (fw, e) => throwIn(internals(fw), 'tuneOutCoordinator', 'stop', e) },
   {
-    step: "a code_execution runner's dispose()",
+    step: "code_execution's scripts' dispose()",
     inject: (fw, e) => {
-      internals(fw).codeExecutionRunners.set('worker', throwingStub('dispose', e));
-      return () => {};
-    },
-  },
-  {
-    step: "a background script's dispose()",
-    inject: (fw, e) => {
-      internals(fw).backgroundScripts.set('script', { status: 'finished', cancelled: false, runner: throwingStub('dispose', e) });
-      return () => {};
+      internals(fw).codeExecution = { scripts: throwingStub('dispose', e) };
+      return () => { internals(fw).codeExecution = null; };
     },
   },
   { step: "cancelling provider admission", inject: (fw, e) => patchMethod(fw, 'cancelProviderAdmission', e) },

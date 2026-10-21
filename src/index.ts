@@ -59,23 +59,9 @@ export type {
 // Usage tracking
 export { UsageTracker } from './usage/index.js';
 
-// Client-side programmatic tool calling (code_execution): exposed so external
-// tooling can drive the python runtime the way the framework does (protocol
-// harnesses, runtime smoke tests).
-export {
-  PyRunner,
-  buildInjectedTools,
-  buildCodeExecutionToolDefinition,
-  CODE_EXECUTION_TOOL_NAME,
-  PYTHON_RUNTIME_SOURCE,
-} from './code-execution/index.js';
-export type {
-  InjectedTool,
-  ExecResult,
-  PyRunnerOptions,
-  ScriptToolCallHandler,
-  ScriptToolResult,
-} from './code-execution/index.js';
+// Client-side programmatic tool calling (code_execution): the tool's name,
+// and its definition as an agent reads it.
+export { buildCodeExecutionToolDefinition, CODE_EXECUTION_TOOL_NAME } from './code-execution/index.js';
 export type { SessionUsage, AgentUsage, SessionUsageSnapshot, UsageUpdatedEvent } from './usage/index.js';
 
 // EventGate
