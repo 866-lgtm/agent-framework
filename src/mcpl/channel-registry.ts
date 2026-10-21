@@ -1309,6 +1309,13 @@ export class ChannelRegistry {
         return `Channel ${channel} was tuned out meanwhile: its messages go to the subconscious, and channel_open doesn't ` +
           `change that. Call tune_out with channelId ${channel} and mode "cancel" for it to resume normal attention.`;
       }
+      // channel_close refuses a tuned-out channel too, so calling it again
+      // isn't the way: the tune-out's cancel is, and it delivers the backlog.
+      if (action === 'close' && now === 'tuned-out') {
+        return `Channel ${channel} was tuned out meanwhile: its messages go to the subconscious, and channel_close doesn't ` +
+          `change that. Call tune_out with channelId ${channel} and mode "cancel" for it to resume normal attention; ` +
+          'cancelling delivers the diverted backlog.';
+      }
       // The later decision's own work settles the transport, and its call
       // says what became of it, so this says only that this call's change
       // doesn't stand.
@@ -4590,7 +4597,11 @@ export class ChannelRegistry {
         ? `. It isn't registered here any more, so no channel tool can reach it until it's registered here again.${serverBack}`
         : reach === 'up' && !this.directsLifecycle(entry.serverId)
           ? `, and ${this.lifecycleRefusal(entry.serverId).message}; if you need it closed, ask whoever runs this host.`
-          : `. If you still want it closed, call channel_close.${serverBack}`;
+          // channel_close refuses a tuned-out channel, so the cancel comes first.
+          : decided === 'tuned-out'
+            ? `. If you still want it closed, cancel the tune-out with tune_out mode "cancel", which delivers what it ` +
+              `diverted, and then call channel_close.${serverBack}`
+            : `. If you still want it closed, call channel_close.${serverBack}`;
       closeError = decided === 'tuned-out'
         ? `The decline is recorded, but the channel was tuned out meanwhile, and that decision stands: its messages go to ` +
           `the subconscious${step}`
