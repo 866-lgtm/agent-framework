@@ -16,6 +16,7 @@ import type { ContentBlock } from '@animalabs/membrane';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { forkAgentName } from '../src/mcpl/conversation-router.js';
 import type { EventGate } from '../src/gate/event-gate.js';
+import { goneNames } from './helpers/gone-names.js';
 
 /** The name the router gives a channel's fork, for the `srv` server every
  *  event here comes from. */
@@ -703,6 +704,7 @@ describe('Conversation routing', () => {
       const fork = forkName('slack:D7', 1);
       assert.ok(framework.getAgent(fork), 'the fork exists');
       gateOf(framework).setSleep(3600, 'resting', fork);
+      const gone = goneNames(gateOf(framework));
 
       forceExpiry(framework, 'slack:D7', IDLE_TTL_MS);
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Final report posted.' }]));
@@ -711,6 +713,7 @@ describe('Conversation routing', () => {
 
       assert.equal(framework.getAgent(fork), null, 'the fork is disposed');
       assert.equal(gateOf(framework).getSleepState(), null, "and its sleep ends with it, so the other agents' wakes aren't held back");
+      assert.deepStrictEqual(gone, [fork], "the fork's end told the gate, which ends its self-wake too");
     } finally {
       // So that a run where the fork's end leaves the sleep doesn't hold the
       // file's process for the sleep's hour.
@@ -727,11 +730,13 @@ describe('Conversation routing', () => {
     const fork = forkName('slack:D8', 1);
     assert.ok(framework.getAgent(fork), 'the fork exists');
     const gate = gateOf(framework);
+    const gone = goneNames(gate);
     try {
       gate.setSleep(3600, 'resting', fork);
       await framework.stop();
       assert.equal(framework.getAgent(fork), null, 'stop() ends the fork');
       assert.equal(gate.inferenceDiagnostics().sleepUntil, 0, 'and its sleep with it');
+      assert.deepStrictEqual(gone, [fork], "the fork's end told the gate, which ends its self-wake too");
     } finally {
       gate.clearSleep();
     }
