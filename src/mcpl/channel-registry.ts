@@ -3106,12 +3106,12 @@ export class ChannelRegistry {
   /** Every tune-out on record, whether or not its channel is registered
    *  here yet: the decisions the lifecycle log's replay restored, and any
    *  made since. */
-  tuneOutsOnRecord(): Array<{ serverId: string; channelId: string; params: TuneOutParams }> {
-    const found: Array<{ serverId: string; channelId: string; params: TuneOutParams }> = [];
+  tuneOutsOnRecord(): Array<{ serverId: string; channelId: string; params: TuneOutParams; source: string }> {
+    const found: Array<{ serverId: string; channelId: string; params: TuneOutParams; source: string }> = [];
     for (const [key, record] of this.desiredStates) {
       if (record.state !== 'tuned-out' || !record.tuneOut) continue;
       const at = key.indexOf('\u0000');
-      found.push({ serverId: key.slice(0, at), channelId: key.slice(at + 1), params: record.tuneOut });
+      found.push({ serverId: key.slice(0, at), channelId: key.slice(at + 1), params: record.tuneOut, source: record.source });
     }
     return found;
   }
@@ -4604,9 +4604,11 @@ export class ChannelRegistry {
           'decline again to close it.'
         : ' If you need it closed now, call channel_close.';
     if (!stands) {
-      // channel_close closes it after all, whichever decision it was, while
-      // the channel is registered; a server that's up without the grant
-      // keeps its channels as it chooses, as the decline's refusal says.
+      // channel_close closes it after all while the channel is registered,
+      // over an open, or once a tune-out's cancel has ended the tune-out,
+      // since it refuses a tuned-out channel; a server that's up without the
+      // grant keeps its channels as it chooses, as the decline's refusal
+      // says.
       const step = after === undefined
         ? `. It isn't registered here any more, so no channel tool can reach it until it's registered here again.${serverBack}`
         : reach === 'up' && !this.directsLifecycle(entry.serverId)
