@@ -4302,8 +4302,9 @@ export class ChannelRegistry {
       source?: string;
       /** A machine close aimed at an explicitly-opened channel is refused
        *  unless the caller certifies an explicit idle lease (a configured
-       *  per-channel budget is consent to close at that budget). Module
-       *  origin only, like `source`. */
+       *  per-channel budget is consent to close at that budget). A tuned-out
+       *  channel is refused even so, since its tune-out's cancel is what
+       *  ends it. Module origin only, like `source`. */
       overrideExplicitOpen?: boolean;
     },
     origin?: ChannelToolOrigin,
