@@ -247,7 +247,9 @@ export interface FrameworkConfig {
    * takes precedence over this for that agent; the EFFECTIVE cap for every
    * source is min(desired, strategy bound) — desired values above the
    * strategy-derived bound (maxMessageTokens * 4) are hard-clamped to it,
-   * with the clamp reported via agent_settings get.
+   * with the clamp reported via agent_settings get. For an ordinary resident
+   * the bound is the smallest among the agents that read the shared slot,
+   * reported as clamped by `reader-bound` when another reader's sets it.
    */
   toolResultInlineMaxChars?: number;
 
