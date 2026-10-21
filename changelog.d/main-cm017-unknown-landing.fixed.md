@@ -1,0 +1,1 @@
+The dependency alignment now requires context-manager ^0.17.1 and preserves main's unknown-landing reconciliation while dropping malformed deferred writes only after readback confirms nothing landed. The new focused regression tests cover confirmed empty, confirmed stored, unknown/repeated lookup, and retry outcomes without opening a store or contacting a provider.

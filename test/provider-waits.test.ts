@@ -2254,7 +2254,8 @@ const foreignRateLimit = (retryAfterMs: unknown) => Object.assign(new Error('zz 
 
 for (const who of ['resident', 'conversation agent', 'ephemeral run'] as const) {
   const outcome = who === 'ephemeral run' ? 'ends the run at once, marked' : 'is recorded, not slept in the turn';
-  test(`a 429 from another copy of membrane that states a wait ${outcome} (${who})`, async () => {
+  test(`a 429 from another copy of membrane that states a wait ${outcome} (${who})`, async (t) => {
+    const clock = holdClock(t);
     await withStoreDir(async (path) => {
       const log = silence();
       // An ephemeral run doesn't record: a wait past its cap ends it at once.
@@ -2279,9 +2280,13 @@ for (const who of ['resident', 'conversation agent', 'ephemeral run'] as const) 
         } else {
           await conversationTurn(fw, nonOwning, 'zz-first');
         }
+        // A loaded runner can take longer than the stated wait to settle.
+        // Keep the deadline clock inside the wait while real time outlasts it.
+        await clock.outlast(stated);
         assert.deepEqual(fw.providerWaitSnapshot('resident').map((w) => w.model), ['zz-model'], 'the stated wait is recorded');
         assert.equal(internal.providerAccelerationCooldowns.get('resident')?.waitModel, 'zz-model', 'the turn is held by it');
         assert.equal(membrane.primary, 1, 'not retried inside the wait');
+        clock.pass(stated);
         await waitFor(fw, () => membrane.primary >= 2, 'the held turn after the wait');
         assert.equal(membrane.primary, 2, 'run once after it');
       } finally { await fw.stop(); log.restore(); }
