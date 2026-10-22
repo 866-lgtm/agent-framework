@@ -1851,11 +1851,12 @@ export class WorkspaceModule implements Module {
       },
       {
         name: 'glob',
-        description: 'Find files matching a glob pattern, checked against disk first; each match carries its state, as ls describes.' + globDirect,
+        description: 'Find files matching a glob pattern, checked against disk first; each match carries its state, as ls describes. '
+          + 'The pattern is relative to path (or to each mount\'s root). In the mount its first segment names, it is read mount-prefixed instead, like the paths it returns, within path if one is given; in every other mount, as written.' + globDirect,
         inputSchema: {
           type: 'object' as const,
           properties: {
-            pattern: { type: 'string', description: 'Glob pattern (e.g., "**/*.ts")' },
+            pattern: { type: 'string', description: 'Glob pattern, relative (e.g., "**/*.ts") or mount-prefixed (e.g., "project/src/**/*.ts")' },
             path: { type: 'string', description: 'Directory to search in (mount-prefixed, optional)' },
           },
           required: ['pattern'],
@@ -1873,7 +1874,7 @@ export class WorkspaceModule implements Module {
           properties: {
             pattern: { type: 'string', description: 'Regular expression pattern' },
             path: { type: 'string', description: 'File or directory to search (mount-prefixed, optional)' },
-            glob: { type: 'string', description: 'Glob pattern to filter files' },
+            glob: { type: 'string', description: 'Glob pattern to filter files, relative to the mount root (e.g., "src/**/*.ts"); in the mount its first segment names, read mount-prefixed (e.g., "project/src/**/*.ts"), and in every other mount, as written' },
             contextBefore: { type: 'integer', description: 'Context lines before match' },
             contextAfter: { type: 'integer', description: 'Context lines after match' },
           },
@@ -4616,11 +4617,23 @@ export class WorkspaceModule implements Module {
 
     // Every match lies beneath the pattern's literal directory, so the walk
     // starts there: past the walk's cap, a walk of the whole scope can stop
-    // before it gets there.
+    // before it gets there. In the mount a pattern's first segment names, the
+    // pattern is read mount-prefixed (prefixedGlob), from its rest's directory
+    // within `path`.
     const patternDir = literalDirOf(input.pattern);
     for (const { mount, relativePath } of mountsToSearch) {
-      const start = await this.walkStart(mount, relativePath, patternDir);
-      const matched = (path: string) => regex.test(relativePath ? path.slice(relativePath.length + 1) : path);
+      const prefixed = prefixedGlob(input.pattern, mount.config.name);
+      let start: string;
+      let matched: (path: string) => boolean;
+      if (prefixed) {
+        const dir = deeperOf(relativePath, prefixed.dir);
+        if (dir === null) continue;
+        start = await this.walkStart(mount, relativePath, dir === relativePath ? '' : dir.slice(relativePath ? relativePath.length + 1 : 0));
+        matched = (path: string) => prefixed.regex.test(path);
+      } else {
+        start = await this.walkStart(mount, relativePath, patternDir);
+        matched = (path: string) => regex.test(relativePath ? path.slice(relativePath.length + 1) : path);
+      }
       const listing = await this.listingOf(mount, start, true, matched);
       for (const { path, ...view } of listing.files) matches.push({ path: `${mount.config.name}/${path}`, ...view });
       for (const region of listing.incomplete) {
@@ -4651,7 +4664,8 @@ export class WorkspaceModule implements Module {
     const fileGlob = input.glob ? globToRegex(input.glob) : null;
     // The filter matches mount-relative paths, so every file it lets through
     // lies beneath its literal directory, and the walk starts at the deeper of
-    // that and `path`.
+    // that and `path`. In the mount a filter's first segment names, its
+    // mount-prefixed reading takes the filter's place (below).
     const filterDir = input.glob ? literalDirOf(input.glob) : '';
     const contextBefore = input.contextBefore ?? 0;
     const contextAfter = input.contextAfter ?? 0;
@@ -4699,16 +4713,21 @@ export class WorkspaceModule implements Module {
         incomplete.push({ path: `${mount.config.name}/${relativePath}`, reason: this.otherMountNote(mount.config.name, relativePath, 'list', moved) });
         continue;
       }
-      // A `path` and a filter whose directories don't overlap leave no file
-      // the filter can let through, so nothing is searched.
-      const deeper = deeperOf(relativePath, filterDir);
+      // In the mount a filter's first segment names, the filter is read
+      // mount-prefixed (prefixedGlob), from its rest's directory. A `path` and
+      // a filter whose directories don't overlap leave no file the filter can
+      // let through, so nothing is searched.
+      const prefixed = input.glob ? prefixedGlob(input.glob, mount.config.name) : null;
+      const deeper = deeperOf(relativePath, prefixed ? prefixed.dir : filterDir);
       if (deeper === null) continue;
       const start = await this.walkStart(mount, relativePath, deeper === relativePath ? '' : deeper.slice(relativePath ? relativePath.length + 1 : 0));
       const searched = (text: GrepText): void => {
         const matches = search(text.text);
         if (matches.length > 0) results.push({ file: text.file, ...(text.state !== undefined ? { state: text.state } : {}), version: text.version, matches });
       };
-      const kept = (path: string): boolean => fileGlob === null || fileGlob.test(path);
+      const kept = prefixed
+        ? (path: string): boolean => prefixed.regex.test(path)
+        : (path: string): boolean => fileGlob === null || fileGlob.test(path);
       const found = mount.direct
         ? await this.textsFromDisk(mount, relativePath, root, start, kept, searched)
         : await this.textsFromStore(mount, relativePath, start, kept, searched);
@@ -5921,6 +5940,28 @@ function inputProblem(
 }
 
 /**
+ * A glob's reading in the mount its first segment names, in place of the
+ * pattern as written there. Every path the tools take and return is
+ * mount-prefixed, so `notes/diary/*.md` is the natural way to write a
+ * pattern, and tested as written against a mount-relative path it could
+ * never match — a glob answered "no matches" for files that were there.
+ * `regex` matches the rest of the pattern against the mount-relative path,
+ * and `dir` is the rest's literal directory (literalDirOf), from the mount's
+ * root. A pattern that names another mount, or none, has no such reading
+ * (null), and is read as written, relative to the search root. So in a mount
+ * holding a directory named like itself, `work/z/*.ts` names the mount's own
+ * `z`, and `work/work/z/*.ts`, as the tools show it, names the directory's.
+ * The rest's brace groups are the pattern's, so a pattern globToRegex took
+ * doesn't throw here.
+ */
+function prefixedGlob(pattern: string, mountName: string): { regex: RegExp; dir: string } | null {
+  const slash = pattern.indexOf('/');
+  if (slash <= 0 || pattern.slice(0, slash) !== mountName) return null;
+  const rest = pattern.slice(slash + 1);
+  return { regex: globToRegex(rest), dir: literalDirOf(rest) };
+}
+
+/**
  * Convert a glob pattern to a RegExp. Throws, naming the pattern, for a brace
  * group it can't read: a "{" that never closes, a group inside another, or a
  * group with no ",".
@@ -5954,9 +5995,14 @@ function globToRegex(pattern: string): RegExp {
       if (!group.includes(',')) {
         throw new Error(braceRefusal(pattern, 'has a "{" group with no ","; a group needs two or more alternatives, separated by ","'));
       }
-      const alternatives = group.split(',');
-      regex += '(?:' + alternatives.map(a => globPartToRegex(a)).join('|') + ')';
-      i = closeIdx + 1;
+      // A `/` right after the group goes into each alternative, as `{a,b}/x`
+      // and `{a/,b/}x` name the same paths, so an alternative's own `**`
+      // meets it and reads as a `**/` does, as in the group's expansion:
+      // `{src/**,lib}/*.ts` is `src/**/*.ts` or `lib/*.ts`.
+      const slash = pattern[closeIdx + 1] === '/';
+      const alternatives = group.split(',').map((alternative) => (slash ? alternative + '/' : alternative));
+      regex += '(?:' + alternatives.map(globPartToRegex).join('|') + ')';
+      i = closeIdx + (slash ? 2 : 1);
       continue;
     }
     // Accumulate non-brace characters, convert as a chunk
@@ -6002,11 +6048,19 @@ function braceRefusal(pattern: string, problem: string): string {
   return `glob pattern ${JSON.stringify(pattern)} ${problem}. To match a "{" in a name, put "?" in its place.`;
 }
 
+// What each glob token becomes. A `**/` at the start of a path segment matches
+// zero or more whole directories, so `src/**/*.ts` also matches `src/main.ts`;
+// any other `**` matches any run of characters.
+const GLOB_TOKENS: Record<string, string> = { '**/': '(?:.*/)?', '**': '.*', '*': '[^/]*', '?': '[^/]' };
+
+// One part of a pattern, between brace groups or inside one. Whether a `**/`
+// at its start starts a path segment depends on what comes before it in the
+// path, which after a brace group is whichever alternative matched: so it
+// reads as GLOB_TOKENS' `**/` where the path so far is empty or ends with a
+// `/`, as in `{src/,lib/}**/`, and otherwise as any run of characters and
+// then a directory, as in `draft{s,ing}**/`.
+const PART_START_GLOBSTAR = '(?:(?<=^|/)(?:.*/)?|(?<!^|/).*/)';
 function globPartToRegex(part: string): string {
-  return part
-    .replace(/[.+^$()|[\]\\]/g, '\\$&')
-    .replace(/\*\*/g, '__DOUBLESTAR__')
-    .replace(/\*/g, '[^/]*')
-    .replace(/__DOUBLESTAR__/g, '.*')
-    .replace(/\?/g, '[^/]');
+  return part.replace(/(?<=^|\/)\*\*\/|\*\*|[*?]|[.+^$()|[\]\\]/g, (m, offset: number) =>
+    m === '**/' && offset === 0 ? PART_START_GLOBSTAR : GLOB_TOKENS[m] ?? `\\${m}`);
 }
