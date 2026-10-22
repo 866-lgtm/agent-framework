@@ -12,6 +12,112 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.25.0 — 2026-10-22
+
+### Breaking
+
+- **Agents, and whoever writes their prompts, where a mount holds a
+  directory named like the mount itself:** a `workspace--glob` pattern, or a
+  `workspace--grep` `glob` filter, whose first segment is that mount's name
+  is now read mount-prefixed in that mount, from its root and within
+  `path`, and no longer as written there. So a pattern written relative to
+  the mount, such as `work/z/*.ts` for the file the tools show as
+  `work/work/z/a.ts`, no longer finds that file. With a `path`, the same
+  goes for such a directory anywhere beneath it: `glob` with `path:
+  "notes/diary"` and `pattern: "notes/*.md"`, written relative to the path
+  for `notes/diary/notes/x.md`, no longer finds it. Where nothing else
+  matches, the agent gets an answer with no matches (`glob`'s
+  `"matches": []`, `grep`'s `"results": []`), not an error.
+  - **Migration:** write the path as the tools show it: `work/work/z/*.ts`
+    finds `work/work/z/a.ts`, and `notes/diary/notes/*.md` finds
+    `notes/diary/notes/x.md`, with that `path` or without one.
+  - **Unchanged:** in every other mount, and for a pattern whose first
+    segment names no mount, the pattern is still matched relative to the
+    mount (or to `path`).
+
+- **Script authors (`code_execution`):** a tool's text result now reaches a
+  script as that text, in its result's `content[0].text`, where it was the
+  text JSON-encoded. That covers every MCP tool whose result is text only,
+  and every module tool whose `data` is a string, without structured
+  content. A script saved before the upgrade meets the change too. Drop a
+  `JSON.parse` that only unquoted such a result. Where the text is itself
+  JSON, one `JSON.parse` now returns the data, so drop the second. A script
+  that read every result with `JSON.parse` can parse inside a `try` and
+  keep the text when it throws; a string whose text is itself JSON, such as
+  the text `123` or `true`, then reads as the value it spells. A result
+  whose data isn't a string, and a result with structured content, reach a
+  script as before.
+
+### Changed
+
+- Requires `@animalabs/context-manager` ^0.19.0 (was ^0.18.0) and
+  `@animalabs/membrane` ^0.6.1 (was ^0.6.0). context-manager 0.19.0 stores a
+  lone UTF-16 surrogate half in edits and state writes as U+FFFD, where it
+  left state the store couldn't read back, and fixes image-strip pricing;
+  its subclass-facing breaking changes are in its own notes. membrane 0.6.1
+  runs complete tool calls a provider returns under `stop_reason: end_turn`,
+  where 0.6.0 ended the turn without running them.
+
+- A tool result whose `data` is a string now reaches the model as that text.
+  It was JSON-encoded on the way, quoted with every newline, tab and quote
+  escaped, so a multi-line answer, such as a module tool's line-per-item
+  listing, arrived as one escaped line: in context, on the live wire, and in
+  its spill file under `tool-results/`, which `workspace--read` could then
+  page only by character and `workspace--grep` matched as a single line. A
+  spill file now holds the string as the tool returned it. Data that isn't a
+  string reaches the model as before.
+
+  Results stored before the upgrade keep the quoted text they were stored
+  with, so a conversation shows both forms until its older results leave
+  its context. A string is measured as its own text, so one whose JSON form
+  went over the inline cap while its text doesn't, such as a long listing
+  of short lines, now stays inline where it used to spill to a file. A lone
+  UTF-16 surrogate in the string, which JSON escaped, reads as U+FFFD. For
+  a result without an error, `data: ''` reads as an empty result, as
+  `data: undefined` already did.
+
+### Fixed
+
+- A tool presentation file holding `{}`, an object with no keys, is read as the empty document, as a missing presentation file already is. A description defaults file holding `{}` is read as one too, where a missing defaults file is still reported. Before, `{}` was refused for its missing `"version"` and `"tools"`, so every `set_tool_visibility` and `set_tool_description` call refused and the resident was told to ask whoever runs the host to repair the file, though `{}` is what an operator writes by hand to start one. A 0-byte file, and a document with only one of the two keys, are still refused. `parsePresentation('{}')` returns the empty document too, where it threw.
+
+- `workspace--glob` finds files from a mount-prefixed pattern, such as
+  `notes/diary/2026-10-13.md` or `project/src/**/*.ts`, as every other
+  workspace path is written and as its own results are returned. The pattern
+  was matched only against paths relative to the mount (or to `path`), so a
+  mount-prefixed one answered "no matches" for files that were there. When a
+  pattern's first segment names a mount, that mount now matches its rest from
+  the mount's root, in place of the pattern as written. Every other mount
+  still matches the pattern relative to the mount (or to `path`), so
+  `notes/*.md` still finds `project/notes/todo.md` beside the `notes` mount's
+  own files. In a mount holding a directory named like itself, this narrows
+  what a pattern written relative to the mount finds (see Breaking).
+  `workspace--grep`'s `glob` filter takes a mount-prefixed pattern the same
+  way. In both, a `**/` at the start of a path segment now matches zero or
+  more directories, as in other glob tools, so `project/src/**/*.ts` also finds `project/src/main.ts` and
+  `**/*.md` also finds the `.md` files at a mount's root; it used to need at
+  least one directory there. After a brace group whose alternatives each end a
+  directory, a `**/` matches zero or more directories, and so does a `**`
+  that ends an alternative before a `/`, so `{src/,lib/}**/*.ts` and
+  `{src/**,lib}/*.ts` find `src/main.ts`, as `src/**/*.ts` does. `glob`'s description and its `pattern`
+  parameter's description changed, and so did `grep`'s `glob` parameter's
+  description, so the first request after the upgrade that carries the
+  workspace's tools misses the prompt cache from its tool block on.
+
+- **The prose bounce-wake cap no longer latches.** A bounce wakes the resident
+  so it can resend, at most twice in a row, so a bounce → wake → bounce loop
+  ends. The count reset only when a prose envelope was delivered, so a
+  resident that recovered from bounces another way (a send tool, setting the
+  draft aside) kept the count across turns: from its third bounce on, a reply
+  to a fresh message bounced with no wake, and sat unseen until something
+  else woke the resident. The count now also resets when a turn starts with a
+  cause of its own (a channel message, a server event, a gate flush, a timer,
+  an operator nudge), in explicit and hybrid modes. A loop of bounce wakes
+  with no other cause is still capped at two.
+
+- What reaches a request without passing through the context store now carries a lone UTF-16 surrogate as U+FFFD, as the store keeps it (#695). That's a context injection's text and namespace, a hook's or a module's, and what a tool boundary injects into the live round: the messages it heard, with their senders' names, and its own notices. Before, every request an injection was in carried the lone half raw, and the API refuses such a request with a 400 ("The request body is not valid JSON: unexpected end of hex escape"). A namespace is still compared with channel ids as given when an injection is kept to its channel's conversation.
+
+- A lone UTF-16 surrogate in a tool result's text now reaches membrane as U+FFFD, as the context stores it (#695). Before, a text block's text, a reference's stub (from its `name`), an error result's text and the error text of a failure the tool doesn't flag went to membrane with the lone half raw, while the stored copy held U+FFFD. With the tool-result guard on (`toolResultGuard`), such a result left a stored message the context couldn't read back; with a text block or an error result, the agent's next turn sent no request and `stop()` threw. This change doesn't repair a store that already holds such a message.
+
 ## 0.24.1 — 2026-10-22
 
 ### Added
