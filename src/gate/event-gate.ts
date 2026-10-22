@@ -984,9 +984,15 @@ export class EventGate {
       return false;
     }
 
-    // Channel check
+    // Channel check: the event's own channel id, or the registered id the
+    // gate resolves for its route. A push event carries the adapter's raw id
+    // (`origin.channelId`, or none), and a channels/incoming message the
+    // registered one, so a pattern in the registered form matches every
+    // event in its channel: its messages on both paths, and its reactions,
+    // edits, voice reports and other pushes.
     if (compiled.channelRegex && !compiled.channelRegex.test(info.channelId)) {
-      return false;
+      const registered = this.routeChannelFor(info);
+      if (registered === undefined || !compiled.channelRegex.test(registered)) return false;
     }
 
     // Mount check (workspace fs events)
@@ -1190,10 +1196,17 @@ export class EventGate {
   // rate_limit + passive_sample + resets
   // =========================================================================
 
-  /** Resolve the partition key for keyBy-style behaviors. */
-  private resolveKey(metadata: Record<string, unknown> | undefined, keyBy: string | undefined): string {
+  /** Resolve the partition key for keyBy-style behaviors. `keyBy:
+   *  "channelId"` takes the registered id the gate resolves for the event when
+   *  it has one, as channel matching does, so a channel's push events count
+   *  with its channels/incoming messages rather than under their raw id. */
+  private resolveKey(info: GateEventInfo, keyBy: string | undefined): string {
     if (!keyBy) return SHARED_BUCKET_KEY;
-    const value = metadata?.[keyBy];
+    if (keyBy === 'channelId') {
+      const registered = this.routeChannelFor(info);
+      if (registered !== undefined) return registered;
+    }
+    const value = info.metadata?.[keyBy];
     if (value === undefined || value === null || value === '') return SHARED_BUCKET_KEY;
     return String(value);
   }
@@ -1203,7 +1216,7 @@ export class EventGate {
     info: GateEventInfo,
     config: { tokens: number; refillIntervalMs: number; keyBy?: string },
   ): GateDecision {
-    const key = this.resolveKey(info.metadata, config.keyBy);
+    const key = this.resolveKey(info, config.keyBy);
     let buckets = this.rateLimitBuckets.get(policy.name);
     if (!buckets) {
       buckets = new Map();
@@ -1245,7 +1258,7 @@ export class EventGate {
     info: GateEventInfo,
     config: { every: number; keyBy?: string },
   ): GateDecision {
-    const key = this.resolveKey(info.metadata, config.keyBy);
+    const key = this.resolveKey(info, config.keyBy);
     let counters = this.passiveSampleCounters.get(policy.name);
     if (!counters) {
       counters = new Map();
@@ -1318,7 +1331,7 @@ export class EventGate {
       if ('debounce' in b) return false; // batches; never triggers inline
       if ('rate_limit' in b) {
         const cfg = b.rate_limit;
-        const key = this.resolveKey(info.metadata, cfg.keyBy);
+        const key = this.resolveKey(info, cfg.keyBy);
         const bucket = this.rateLimitBuckets.get(policy.name)?.get(key);
         if (!bucket) return true; // fresh bucket starts full
         let tokens = bucket.tokens;
@@ -1330,7 +1343,7 @@ export class EventGate {
       }
       if ('passive_sample' in b) {
         const cfg = b.passive_sample;
-        const key = this.resolveKey(info.metadata, cfg.keyBy);
+        const key = this.resolveKey(info, cfg.keyBy);
         const count = this.passiveSampleCounters.get(policy.name)?.get(key) ?? 0;
         return count + 1 >= cfg.every;
       }

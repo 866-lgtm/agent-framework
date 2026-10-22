@@ -6,6 +6,13 @@
 // TEST appends lines to COMMAND_PATH:
 //   incoming <channelId> <messageId> <ambient|addressed> <text…>
 //   dm <eventId> <authorId> <rawChannelId> <text…>
+//   guild <eventId> <guildId> <rawChannelId> <composite|bare> <text…>
+//     an addressed message in a closed guild channel, as discord-mcpl's
+//     push/event sends it: the raw id in origin.channelId, with the registered
+//     id in origin.mcplChannelId (composite) or without it (bare)
+//   push <json>
+//     a push/event with these params, such as a reaction's or a voice
+//     report's origin and tags
 // Host-side channels/publish and channels/open calls are recorded to
 // STATUS_PATH as JSONL.
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
@@ -52,6 +59,37 @@ function pollCommands() {
               ? ['chat:mention', 'chat:addressed', 'chat:from-human']
               : ['chat:ambient', 'chat:from-human'],
           }],
+        },
+      });
+    } else if (kind === 'push') {
+      const params = JSON.parse(rest.join(' '));
+      log('push-sent', { eventId: params.eventId });
+      send({ jsonrpc: '2.0', id: nextId++, method: 'push/event', params });
+    } else if (kind === 'guild') {
+      const [eventId, guildId, rawChannelId, form, ...words] = rest;
+      log('guild-sent', { eventId });
+      send({
+        jsonrpc: '2.0',
+        id: nextId++,
+        method: 'push/event',
+        params: {
+          featureSet: 'chat',
+          eventId,
+          timestamp: new Date().toISOString(),
+          origin: {
+            source: 'discord',
+            messageId: eventId,
+            guildId,
+            channelId: rawChannelId,
+            ...(form === 'composite' ? { mcplChannelId: `discord:${guildId}:${rawChannelId}` } : {}),
+            channelName: rawChannelId,
+            authorId: 'U-other',
+            authorName: 'someone',
+            isMention: true,
+            isDM: false,
+          },
+          tags: ['chat:mention', 'chat:addressed', 'chat:from-human'],
+          payload: { content: [{ type: 'text', text: words.join(' ') }] },
         },
       });
     } else if (kind === 'dm') {
