@@ -26,6 +26,5 @@
   message heard while acting does there, at most once an interval. An
   invalid `clock` setting makes `AgentFramework.create` throw, naming the
   agent. `resolveClockConfig` (the validation `create` runs, for a host
-  checking a recipe up front), `formatClockText`, `latestBoundary`,
-  `CLOCK_ROW_KIND` and the `ClockConfig` / `ClockStamp` /
-  `ResolvedClockConfig` types are exported.
+  checking a recipe up front), `CLOCK_ROW_KIND` and the `ClockConfig` /
+  `ClockStamp` / `ResolvedClockConfig` types are exported.
