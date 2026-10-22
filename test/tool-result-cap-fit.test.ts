@@ -291,7 +291,7 @@ test("a cap the bound's fit already holds the head under gets no offer to raise 
   });
 });
 
-test('a string is measured as its own text, so one whose JSON passes the cap and whose text fits is stored whole', async () => {
+test('a string is measured as its own text, so one whose JSON goes over the cap while its text fits is stored whole', async () => {
   // As JSON, 1,000 lines of "ab" are 4,002 characters, past the cap of 3,800:
   // each newline escapes to two. As text they are 3,000, so the result stays
   // inline where its JSON form spilled.

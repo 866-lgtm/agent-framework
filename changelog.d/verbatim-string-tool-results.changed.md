@@ -7,9 +7,11 @@
   spill file now holds the string as the tool returned it. Data that isn't a
   string reaches the model as before.
 
-  A string is measured as its own text, so one whose JSON form passed the
-  inline cap but whose text doesn't, such as a long listing of short lines,
-  now stays inline where it used to spill to a file. A lone UTF-16 surrogate
-  in the string, which JSON escaped, reads as U+FFFD. For a result without
-  an error, `data: ''` is stored as no text, as `data: undefined` already
-  was.
+  Results stored before the upgrade keep the quoted text they were stored
+  with, so a conversation shows both forms until its older results leave
+  its context. A string is measured as its own text, so one whose JSON form
+  went over the inline cap while its text doesn't, such as a long listing
+  of short lines, now stays inline where it used to spill to a file. A lone
+  UTF-16 surrogate in the string, which JSON escaped, reads as U+FFFD. For
+  a result without an error, `data: ''` reads as an empty result, as
+  `data: undefined` already did.
