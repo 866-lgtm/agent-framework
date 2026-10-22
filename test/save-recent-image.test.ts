@@ -1506,6 +1506,39 @@ describe('save_recent_image provenance (issue #104)', () => {
     }
   });
 
+  it("a turn that fits, with a save beside an image result past its share but no longer than its notice and note, is stored as each result would be alone", async () => {
+    const h = await startTurn({
+      prefix: 'sri-noted-fits-',
+      inlineCap: 2000,
+      inlineBound: 960,
+      responses: [
+        [
+          { type: 'tool_use', id: 'call_quiet', name: 'world--quiet_failure', input: {} } as ContentBlock,
+          { type: 'tool_use', id: 'call_noted', name: 'world--snap_noted', input: {} } as ContentBlock,
+          saveCall('call_save_batch', { path: 'files/batch.png', index: 0 }),
+        ],
+        done,
+      ],
+    });
+    try {
+      // Three calls under a bound of 960: a share of 320, under the result's
+      // text. By its share the result would keep its slot whole, as it would
+      // alone, so the save marks nothing, and the turn, which fits, is stored
+      // as each result would be alone: the save's receipt whole beside it.
+      const stored = await waitForToolResult(h.framework, 'call_noted');
+      assert.ok(stored.content.length > 320, `the result is past its share (${stored.content.length})`);
+      assert.match(stored.content, /^n{290}/);
+      assert.equal(parseImagePlaceholders(stored.content).length, 1);
+      const receipt = await waitForToolResult(h.framework, 'call_save_batch');
+      const quiet = await waitForToolResult(h.framework, 'call_quiet');
+      assert.ok(stored.content.length + receipt.content.length + quiet.content.length <= 960, 'the turn fits its bound');
+      assert.strictEqual(saved(receipt)[0]!.sha256, sha(PNG), 'the receipt is stored whole, and the save took the snapshot');
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('a save dispatched in the SAME batch as the snapshot waits for it and saves it', async () => {
     // One tool_use round: [snap, save]. Module calls are only enqueued while
     // the save runs at once — without the barrier the inventory is empty at

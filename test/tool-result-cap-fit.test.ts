@@ -136,6 +136,16 @@ const countWrites = (writes: string[]) => (framework: AgentFramework) => {
   internals.writeToolResultFile = (label, content) => { writes.push(label); return write(label, content); };
 };
 
+/** A page the notice advises comes back within the inline cap of 4,000 when
+ *  read alone in its own turn (each read-back code unit can take six
+ *  characters, beside the page's metadata), and is sized to that cap, not
+ *  to the `share` of the turn that cut the result. */
+const assertPageForLaterRead = (limit: number, quotedPath: string, share: number) => {
+  const overhead = quotedPath.length + 256;
+  assert.ok(limit * 6 + overhead <= 4000, `a page of ${limit} comes back within the cap`);
+  assert.ok(limit * 6 + overhead > share, `a page of ${limit} is sized to the cap, not to the share of ${share}`);
+};
+
 /** agent_settings get's view of an agent's inline cap. */
 const capProvenance = (framework: AgentFramework, name: string) =>
   (framework as unknown as { collectAgentSettingsExtensions(): Map<string, { get(agentName: string): Record<string, unknown> }> })
@@ -325,6 +335,9 @@ test("a turn that fits its bound with each result at its least keeps every notic
     const total = storedAll.reduce((sum, text) => sum + text.length, 0);
     assert.ok(total <= 4000, `the turn's results are ${total} characters together`);
     assert.match(storedAll[15]!, /^\n\n\[truncated — showing 0 of \d+ chars; full content: workspace file f\/tool-results\/\S+\.txt\. Page with workspace--read \{.*\}; use nextOffsetChars as offsetChars until null, keeping limitChars\.\]$/);
+    // Under a share below the notice's room, the page is still sized to the cap.
+    const page = /"path":("[^"]+"),"offsetChars":0,"limitChars":(\d+)\}/.exec(storedAll[15]!)!;
+    assertPageForLaterRead(Number(page[2]), page[1]!, 250);
     assert.deepEqual(await shownAllTo('solo'), storedAll, 'every result is shown as stored, the notice whole');
   });
 });
@@ -373,9 +386,7 @@ test("a notice's paging advice is sized to the cap a later read of the file gets
     for (const text of storedAll) {
       const m = /Page with workspace--read (\{"path":("[^"]+"),"offsetChars":0,"limitChars":(\d+)\})/.exec(text);
       assert.ok(m, text.slice(-300));
-      // spillPageAdvice's sizing: each read-back code unit can take six
-      // characters, beside the page's metadata.
-      assert.equal(Number(m[3]), Math.min(2000, Math.floor((4000 - (m[2]!.length + 256)) / 6) - 1));
+      assertPageForLaterRead(Number(m[3]), m[2]!, 1000);
     }
   });
 });
