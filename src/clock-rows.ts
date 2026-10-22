@@ -19,10 +19,12 @@
  *
  * Everything the next clock needs is read back from the window: the last
  * clock row's time, wherever it is, and the newest row's. A window that
- * holds no clock row takes one at its next write, so a window that has
+ * holds no clock row takes one the next time it would take a clock (an
+ * incoming event, a turn's start, a tool boundary), so a window that has
  * just had a clock turned on, or a fork seeded with copies of its
- * template's rows, reads the time at once. A restart, a rollback or a
- * second resident sharing the window leaves nothing stale to reconcile.
+ * template's rows (which carry none of their metadata), reads the time
+ * then. A restart, a rollback or a second resident sharing the window
+ * leaves nothing stale to reconcile.
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
@@ -69,7 +71,7 @@ export function resolveClockConfig(agentName: string, config: ClockConfig | unde
   if (config === undefined) return undefined;
   const at = `Agent "${agentName}" clock`;
   if (config === null || typeof config !== 'object' || Array.isArray(config)) {
-    throw new Error(`${at} must be an object such as { intervalMinutes: 10 }, or left out for no clock rows`);
+    throw new Error(`${at} must be an object such as { intervalMinutes: 10 }, or left out for no clock rows of its own`);
   }
   const { intervalMinutes, intervalSeconds, precision } = config;
   if ((intervalMinutes === undefined) === (intervalSeconds === undefined)) {
@@ -159,7 +161,11 @@ function wallFields(at: number, zone: string): WallFields {
  * offset, the offset changed in between and no boundary falls between the
  * change and `now`: the walk goes on from just before the change. The change
  * is found by searching between the two instants, whatever their offsets
- * are.
+ * are. The same offset at both is taken to mean no change between them: in
+ * the tz data, no zone changes its offset twice within a day, the longest
+ * interval, from 2024 through 2040. Throws if the walk passes 24 changes,
+ * which no real zone reaches, rather than return an instant that isn't a
+ * boundary.
  */
 export function latestBoundary(now: number, intervalSeconds: number, zone: string): number {
   let at = now;
@@ -242,7 +248,8 @@ export interface PlannedClock {
 
 /**
  * The clock row the window takes next, or null when no boundary has passed
- * since the last clock it holds.
+ * since the last clock it holds. The framework asks before an incoming
+ * event, at a turn's start and at a tool boundary (storeDueClock).
  *
  * - `newestRowAt`: the newest row's time, which the clock goes after.
  * - `lastClockAt`: the time the window's last clock row reads, when it holds

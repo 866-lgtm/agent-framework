@@ -376,6 +376,7 @@ describe('clock rows in the framework', () => {
 
   it('after a tool round that spans a boundary: the time it is written, after the results, in the live stream too', async () => {
     const x = await make();
+    x.membrane.supportsInjectedMessages = true; // as membrane's native path declares
     try {
       setClock('2026-10-21T10:41:10Z');
       await wake(x, event('warm up'), [{ type: 'text', text: 'ok' }]);
@@ -401,6 +402,12 @@ describe('clock rows in the framework', () => {
       assert.deepEqual(injected, [{ participant: 'user', content: clock.content }],
         'the stream got exactly the stored clock, so the window matches the live request');
       assert.equal(all.slice(results + 2).filter(isClock).length, 0, 'no second clock for the same boundary');
+
+      // The window now holds two clocks, 10:40 and 10:52. An event before
+      // 11:00 takes none: the last clock is the newest one, 10:52.
+      setClock('2026-10-21T10:57:10Z');
+      await wake(x, event('before eleven'), [{ type: 'text', text: 'ok' }]);
+      assert.equal(rows(x.framework).filter(isClock).length, 2, 'no clock: 10:50 was told by the 10:52 clock');
     } finally { await x.framework.stop(); }
   });
 
@@ -628,14 +635,21 @@ describe('clock rows in the framework', () => {
       assert.deepEqual(x.membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages,
         [{ participant: 'user', content: clocks[1]!.content }], 'and the stream got it, so the window matches the live request');
 
+      let refused = 0;
       cm.addMessage = (participant: string, content: unknown, metadata?: { kind?: string }, ...rest: unknown[]) => {
-        if (metadata?.kind === 'clock') throw new Error('refused before the append');
+        if (metadata?.kind === 'clock') { refused++; throw new Error('refused before the append'); }
         return addMessage(participant, content, metadata, ...rest);
       };
-      setClock('2026-10-21T11:05:10Z');
-      await wake(x, event('still heard'), [{ type: 'text', text: 'got it' }]);
+      // A tool round across 11:00 whose clock is refused: nothing is stored
+      // or injected, and the round goes on.
+      setClock('2026-10-21T10:58:10Z');
+      x.mod.during = () => setClock('2026-10-21T11:02:10Z');
+      await wake(x, event('still heard'), [{ ...ping, id: 't2' } as ContentBlock], [{ type: 'text', text: 'got it' }]);
+      assert.ok(refused >= 1, 'a clock was due and its write was refused');
+      assert.deepEqual(x.membrane.lastStream!.receivedToolResultOptions.length, 1, 'the tool boundary ran');
+      assert.deepEqual(x.membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? [], [], 'and injected no clock');
       const all = rows(x.framework);
-      assert.ok(indexOfText(all, 'still heard') > 0 && indexOfText(all, 'got it') > 0, 'the event and its reply landed');
+      assert.ok(indexOfText(all, 'still heard') > 0 && indexOfText(all, 'got it') > 0, 'the event, the round and its reply landed');
       assert.equal(all.filter(isClock).length, 2, 'with no clock');
     } finally { await x.framework.stop(); }
   });

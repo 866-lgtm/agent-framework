@@ -227,7 +227,7 @@ export interface AgentConfig {
    * when the day has changed — before the next thing it takes: an incoming
    * event, a turn's start, or, mid-turn, after a tool round's results, where
    * it also joins the live stream. Only the latest boundary is written, and
-   * a window that holds no clock row yet takes one at its next write. A
+   * a window that holds no clock row yet takes one at the next of these. A
    * clock reads the boundary's time where its tick would have stood, else
    * the time it is written (after a tool's results, say), so it never
    * reads earlier than a row before it. A clock wakes no one. See
@@ -238,10 +238,12 @@ export interface AgentConfig {
    * - On some models a clock after a tool's results drops the loop's
    *   earlier thinking from the request, as any message heard while acting
    *   does there: at most once an interval.
-   * - Residents share one window, so each reads every resident's clock rows,
-   *   one with no `clock` included, and the finest interval among them sets
-   *   how often they all read one. The subconscious takes none of its own:
-   *   it reads the residents' through its merged view.
+   * - Residents share one window, so every resident reads the clock rows any
+   *   of them writes, a resident with no `clock` of its own included. Each
+   *   writes one when a boundary of its own interval has passed since the
+   *   window's last clock, whichever resident wrote that. The subconscious
+   *   takes none of its own: it reads the residents' through its merged
+   *   view.
    */
   clock?: import('../clock-rows.js').ClockConfig;
 }

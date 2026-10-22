@@ -15469,13 +15469,14 @@ export class AgentFramework {
   /**
    * Store the clock row due in `agent`'s window (clock-rows.ts), if the agent
    * has clock rows and a boundary has passed since the window's last clock,
-   * and return it. The caller places it, by calling this right before what
-   * the clock precedes is written: an incoming event while no turn of the
-   * agent's is alive (or one is assembling before its compile), a fresh
-   * turn's inputs before its compile, or, mid-turn, the messages a tool
-   * boundary injects, where the caller injects the clock first. Each is a
-   * place where a row is either in the request that follows or before every
-   * request still to come, so the window and the live stream keep matching.
+   * or the window holds no clock row yet (planClock), and return it. The
+   * caller places it, by calling this right before what the clock precedes
+   * is written: an incoming event while no turn of the agent's is alive (or
+   * one is assembling before its compile), a fresh turn's inputs before its
+   * compile, or, mid-turn, the messages a tool boundary injects, where the
+   * caller injects the clock first. Each is a place where a row is either in
+   * the request that follows or before every request still to come, so the
+   * window and the live stream keep matching.
    *
    * None while the host is quiesced (the window is frozen for surgery), and
    * none in the residents' shared slot while another of its readers (the
@@ -15533,10 +15534,10 @@ export class AgentFramework {
 
   /** What the next clock is planned from: the window's newest row's time and
    *  the time its last clock row reads, found by reading back from the
-   *  newest row until a clock row comes, however far back it is. In the
-   *  steady state that is the rows since the last clock, about one
-   *  interval's worth; a window with no clock row is read whole once, and
-   *  then takes one (planClock). */
+   *  newest row, CLOCK_SCAN_ROWS at a time, until a clock row comes, however
+   *  far back it is. In the steady state the newest chunk holds it, unless
+   *  more rows than that have come since the last clock; a window with no
+   *  clock row is read whole once, and then takes one (planClock). */
   private lastClockOf(cm: ContextManager): { newestRowAt: number | undefined; lastClockAt: number | undefined } {
     let newestRowAt: number | undefined;
     for (let end = cm.getMessageCount(); end > 0;) {
@@ -17106,9 +17107,11 @@ export class AgentFramework {
     // turn starts with a current clock, a silent heartbeat's tick (which
     // stores no row of its own) included, unless storeDueClock writes none:
     // while the host is quiesced, while another reader of the residents'
-    // shared slot has a turn alive, or when the write fails. Then the next
-    // event or turn start takes it. Fresh turns only, as the flush below: a
-    // turn that resumes took its clock at the tool boundary it resumes from.
+    // shared slot has a turn alive, or when its write fails without landing.
+    // Then a later event, turn start or tool boundary takes it. Fresh turns
+    // only, as the flush below: a turn that resumes continues its logical
+    // turn, which took its clock at its start or at a tool boundary that
+    // could carry one.
     if (attempt === 0 && !resumesTurn) this.storeDueClock(agent, 'turn-start');
     if (
       attempt === 0 &&

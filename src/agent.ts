@@ -169,7 +169,8 @@ export class Agent {
   /** Exact whole-response known-tool wrapper containment (default off). */
   readonly toolWrapperProseGuard: boolean;
   /** Clock rows' interval and precision (see AgentConfig.clock); undefined
-   *  when the agent's window takes none. */
+   *  when the agent writes none of its own (a resident still reads those
+   *  another resident writes into the shared slot). */
   readonly clock: ResolvedClockConfig | undefined;
   /** Prompt-cache TTL forwarded to the provider (see AgentConfig.cacheTtl). */
   readonly cacheTtl: NonNullable<AgentConfig['cacheTtl']>;
