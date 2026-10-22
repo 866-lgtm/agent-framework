@@ -157,6 +157,7 @@ import { bounded, renderList, renderReturn, VALUE_CHARS } from './code-execution
 import { splitProseRuns, withoutRoundsProse } from './prose-segments.js';
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
+import { nameAsStored, textAsStored } from './text-as-stored.js';
 
 /** An MCPL tool call refused because its server isn't in the registry: one
  *  closed for good, one removed, or one whose connect failed without
@@ -929,7 +930,8 @@ function describeDeferredWrite(msg: { id: string; participant: string; content: 
 function isInjectableMidTurn(msg: { participant: string; content: ContentBlock[] }, agentName: string): boolean {
   // Exact, as membrane's role test is: only a participant equal to the
   // request's assistantParticipant (Agent's name) renders as the assistant.
-  return msg.participant !== agentName
+  // It's the name as sent, which the boundary takes as the store keeps it.
+  return nameAsStored(msg.participant) !== agentName
     && !msg.content.some((b) => b.type === 'tool_use' || b.type === 'tool_result');
 }
 
@@ -12145,11 +12147,14 @@ export class AgentFramework {
             // 0.5.x, and from 0.6.0 declares it can't carry them, so none are
             // collected for it. Each goes as its participant and content
             // alone: a stored row's metadata is the host's record, not input
-            // for membrane.
+            // for membrane. Each goes with its name and text as the store
+            // keeps them, whether it's a heard message, rendered or not, or a
+            // notice the boundary made: this is where they leave for the
+            // request.
             currentState.stream.provideToolResults(
               agent.toolResultGuard.submissionResults(membraneResults),
               midTurnInjections.length > 0
-                ? { injectedMessages: midTurnInjections.map(({ participant, content }) => ({ participant, content })) }
+                ? { injectedMessages: midTurnInjections.map(({ participant, content }) => ({ participant: nameAsStored(participant), content: textAsStored(content) })) }
                 : undefined,
             );
             // RFC-006 §3.3: consumption is determined at assembly, and this

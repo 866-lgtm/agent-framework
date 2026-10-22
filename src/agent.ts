@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
+import { injectionsAsStored } from './text-as-stored.js';
 import { assertBooleanSetting, holdsSettings } from './config-checks.js';
 import {
   CONTINUE_ROW,
@@ -1157,6 +1158,8 @@ export class Agent {
     if (this._state.status === 'inferring') {
       throw new Error(`Agent ${this.name} is already inferring`);
     }
+    // Unstored, so they leave for the request here (text-as-stored.ts).
+    injections = injectionsAsStored(injections);
 
     if (this._state.status === 'waiting_for_tools') {
       throw new Error(`Agent ${this.name} is waiting for tool results`);
@@ -1332,6 +1335,9 @@ export class Agent {
     compressionTools: ToolDefinition[] = availableTools,
     options: ActivationRequestOptions = {},
   ): Promise<{ request: NormalizedRequest; continuePrompt?: RequestOnlyPrompt }> {
+    // Unstored, so they leave for the request here (text-as-stored.ts), the
+    // layout hash below included.
+    injections = injectionsAsStored(injections);
     // Compression may revisit hidden tools in recorded history. Keep its full
     // definition set separate from the resident's advertised tools: the
     // autobiographical strategy must declare the same tools on its
