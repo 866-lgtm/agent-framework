@@ -988,8 +988,9 @@ export class EventGate {
     // gate resolves for its route. A push event carries the adapter's raw id
     // (`origin.channelId`, or none), and a channels/incoming message the
     // registered one, so a pattern in the registered form matches every
-    // event in its channel: its messages on both paths, and its reactions,
-    // edits, voice reports and other pushes.
+    // event in its channel whose push names the channel (by `mcplChannelId`,
+    // or a Discord origin's guild and channel): its messages on both paths,
+    // and its reactions, edits, voice reports and other pushes.
     if (compiled.channelRegex && !compiled.channelRegex.test(info.channelId)) {
       const registered = this.routeChannelFor(info);
       if (registered === undefined || !compiled.channelRegex.test(registered)) return false;

@@ -1,20 +1,20 @@
-- **Hosts and residents with gate policies that name a channel:** a
-  policy's `match.channel` in the registered form, such as
+- **Hosts and residents with gate policies that name a channel:** a policy's
+  `match.channel` in the registered form, such as
   `discord:<guild>:<channel>` or `discord:<guild>:*`, now matches every
   event in that channel, its push events included (#702). A message in an
   open channel arrives through `channels/incoming` with the registered id,
   but every other event arrives as a push: an addressed message in a closed
   channel, a message in a channel the adapter subscribes to without opening,
   and in any channel a reaction, an edit, a delete, a voice report or a
-  missed-message catch-up. A push's own channel id is the adapter's raw
-  one (a bare Discord snowflake), or none, as on a voice report, so a
+  missed-message catch-up. A push's own channel id is the adapter's raw one
+  (a bare Discord snowflake), or none, as on a voice report, so a
   registered-form pattern missed all of those, and each fell through to a
-  later policy. The pattern is now tested against the event's
-  own id and, when that misses, against the registered id the framework
-  resolves for the push: its origin's `mcplChannelId`, or, for a Discord
-  origin without one, its guild and channel (`discord:dm:<channel>` when it
-  names no guild, as a DM's doesn't). A push whose origin names its channel neither way, from another
-  adapter, still matches by its raw id alone.
+  later policy. The pattern is now tested against the event's own id and,
+  when that misses, against the registered id the framework resolves for the
+  push: its origin's `mcplChannelId`, or, for a Discord origin without one,
+  its guild and channel (`discord:dm:<channel>` when it names no guild, as a
+  DM's doesn't). A push whose origin names its channel neither way, from
+  another adapter, still matches by its raw id alone.
 
   **Who notices:** a config whose channel policy, written in the registered
   form, sits ahead of the rule that used to take those push events.
@@ -40,15 +40,14 @@
   **Migration:** to keep a registered-form channel policy to the channel's
   messages, closed channels' addressed ones included, add `tagsAny:
   ["chat:ambient", "chat:addressed"]` to it. Those are Discord's message
-  tags, and its reactions, edits, deletes, voice reports and catch-ups
-  carry neither; another adapter's markers may carry `chat:addressed`. To
-  keep it to exactly what it caught before, add `scope:
-  ["mcpl:channel-incoming"]`, since a registered-form pattern matched no
-  push before. Neither changes how `keyBy: "channelId"` now counts. A
-  pattern
-  written as `*<raw id>`, which matched both paths before, matches as it
-  did, and now also matches a push that names its channel only by
-  `mcplChannelId`, such as a voice report.
+  tags, and its reactions, edits, deletes, voice reports and catch-ups carry
+  neither; another adapter's markers may carry `chat:addressed`. To keep it
+  to exactly what it caught before, add `scope: ["mcpl:channel-incoming"]`,
+  since a registered-form pattern matched no push before. Neither changes
+  how `keyBy: "channelId"` now counts. A pattern written as `*<raw id>`,
+  which matched both paths before, matches as it did, and now also matches a
+  push that names its channel only by `mcplChannelId`, such as a voice
+  report.
 
   **Unchanged:** which policy an event meets stays as it was in a config
   whose rules for the push events it receives (addressed messages,
