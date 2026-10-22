@@ -218,6 +218,21 @@ export interface AgentConfig {
    * content-free system receipt is stored instead. Default false.
    */
   toolWrapperProseGuard?: boolean;
+
+  /**
+   * Clock rows (off when left out): when a boundary of this interval on the
+   * agent's local wall clock (counted from local midnight, in the
+   * framework's `timeZone`) has passed since the last clock row, the window
+   * takes one more — `Clock: 10:50 Europe/Berlin (UTC+02:00)`, with the date
+   * when the day has changed — before the next thing it takes: an incoming
+   * event, a turn's start, or, mid-turn, after a tool round's results, where
+   * it also joins the live stream. Only the latest boundary is written. A
+   * clock reads the boundary's time where its tick would have stood, else
+   * the time it is written (after a tool's results, say), so it never
+   * reads earlier than a row before it. A clock wakes no one. See
+   * src/clock-rows.ts.
+   */
+  clock?: import('../clock-rows.js').ClockConfig;
 }
 
 /** The intentionally small set of agent settings that may change in-process. */

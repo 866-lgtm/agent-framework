@@ -10,6 +10,8 @@ export { ProcessQueueImpl } from './queue.js';
 export { ModuleRegistry } from './module-registry.js';
 export { ShutdownTimeoutError, DEFAULT_SHUTDOWN_TIMEOUT_MS } from './shutdown.js';
 export { formatZonedDateTime, formatZonedTime, isValidTimeZone, resolveTimeZone } from './timezone.js';
+export { CLOCK_ROW_KIND, formatClockText, latestBoundary, resolveClockConfig } from './clock-rows.js';
+export type { ClockConfig, ClockStamp, ResolvedClockConfig } from './clock-rows.js';
 export { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
 
 // Built-in modules
