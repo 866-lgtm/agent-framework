@@ -493,8 +493,8 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
    *  with this text, after the real call has stored it: a write that throws
    *  though its message is stored. The double is ours: from 0.15,
    *  context-manager logs a throw from a host's onMessage listener and lets
-   *  the write stand, and context-manager issue #288 reports the escape of a
-   *  synchronous throw from its strategy's onNewMessage as a bug. */
+   *  the write stand, and its fix for issue #288, merged after 0.18.0, does
+   *  the same for a synchronous throw from its strategy's onNewMessage. */
   function throwOnceAfterStoring(framework: AgentFramework, textOf: string): void {
     const cm = framework.getAgent('assistant')!.getContextManager() as unknown as {
       addMessage: (participant: string, content: ContentBlock[], ...rest: unknown[]) => string;
@@ -511,25 +511,29 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     };
   }
 
-  /** The strategy's onNewMessage throws once, synchronously, for the record
-   *  with this text. The manager's own store listener calls it as each record
-   *  is written, so the throw escapes the append partway through a sharded
-   *  body, and context-manager removes the shards it wrote. Only one test
-   *  uses it, "a sharded body whose write throws partway lands nothing",
-   *  which relies on that escape, which context-manager issue #288 reports
-   *  as a bug. */
-  function throwOnceFromStrategyHook(framework: AgentFramework, textOf: string): void {
-    const strategy = (framework.getAgent('assistant')!.getContextManager() as unknown as {
-      strategy: { onNewMessage?: (message: { content: ContentBlock[] }, ctx: unknown) => Promise<void> };
-    }).strategy;
-    const onNewMessage = strategy.onNewMessage;
+  /** The agent's message store throws once from its append of a shard that
+   *  `matches`, after storing that shard: a sharded write that fails partway.
+   *  context-manager then removes what the write stored before the error
+   *  reaches addMessage's caller, unless that removal fails too. Only
+   *  appends that carry a body group are offered to `matches`, so an
+   *  unsharded message never counts toward a match or throws. */
+  function throwOnceFromShardAppend(
+    framework: AgentFramework,
+    matches: (shard: { bodyGroupId: string; shardIndex: number }) => boolean,
+  ): void {
+    type Extra = { bodyGroupId?: string; shardIndex?: number };
+    const store = (framework.getAgent('assistant')!.getContextManager() as unknown as {
+      messageStore: { append: (participant: string, content: ContentBlock[], metadata?: unknown, causedBy?: unknown, extra?: Extra) => unknown };
+    }).messageStore;
+    const append = store.append;
     let thrown = false;
-    strategy.onNewMessage = function (this: unknown, message, ctx) {
-      if (!thrown && message.content.some((b) => (b as { text?: string }).text === textOf)) {
+    store.append = function (this: unknown, participant, content, metadata, causedBy, extra) {
+      const stored = append.call(this, participant, content, metadata, causedBy, extra);
+      if (!thrown && extra?.bodyGroupId !== undefined && matches({ bodyGroupId: extra.bodyGroupId, shardIndex: extra.shardIndex! })) {
         thrown = true;
-        throw new Error('strategy failed');
+        throw new Error('the store failed partway through a body');
       }
-      return onNewMessage ? onNewMessage.call(this, message, ctx) : Promise.resolve();
+      return stored;
     };
   }
 
@@ -1279,9 +1283,9 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     membrane.pushResponse(createMockResponse(text('Done.')));
     const framework = await createFramework();
     shardOn(framework, 'part one');
-    // The strategy throws on the first shard's add, and context-manager
-    // removes the shard it wrote before the write throws.
-    throwOnceFromStrategyHook(framework, 'part one');
+    // The store's append throws after writing the first shard, and
+    // context-manager removes that shard before the write throws.
+    throwOnceFromShardAppend(framework, (shard) => shard.bodyGroupId === 'body-part one' && shard.shardIndex === 0);
     module.interjections = [
       { participant: 'Antra', content: [...text('part one'), ...text('part two')] },
       { participant: 'Antra', content: text('look right') },
@@ -1302,7 +1306,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       'Antra: look right',
     ], 'the body, stored whole at the turn end, then what was queued behind it');
     assert.equal(internalsOf(framework).deferredMessages.length, 0, 'nothing is left in the queue');
-    assert.ok(errors.some((e) => e.includes('could not be stored; it stays queued') && e.includes('strategy failed')), errors.join('\n'));
+    assert.ok(errors.some((e) => e.includes('could not be stored; it stays queued') && e.includes('the store failed partway through a body')), errors.join('\n'));
     await framework.stop();
   });
 
@@ -1321,8 +1325,10 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
     const image = { type: 'image', source: { type: 'base64', data: PNG, mediaType: 'image/png' } } as ContentBlock;
     const cases: Array<{ name: string; content: ContentBlock[]; throwAt: number }> = [
+      { name: 'text, throw at shard 1', content: text(long), throwAt: 1 },
       { name: 'text, throw at shard 2', content: text(long), throwAt: 2 },
       { name: 'text, throw at shard 3', content: text(long), throwAt: 3 },
+      { name: 'a short text, an image, then the long text, throw at shard 1', content: [...text('Intro. '), image, ...text(long)], throwAt: 1 },
       { name: 'a short text, an image, then the long text, throw at shard 2', content: [...text('Intro. '), image, ...text(long)], throwAt: 2 },
     ];
     for (const [i, { name, content, throwAt }] of cases.entries()) {
@@ -1345,17 +1351,11 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       });
       const cm = framework.getAgent('assistant')!.getContextManager();
       const internals = cm as unknown as {
-        strategy: { onNewMessage?: (message: { bodyGroupId?: string }, ctx: unknown) => Promise<void> };
         messageStore: { removeBodyGroup: (id: string) => void };
       };
-      // The strategy throws on the throwAt-th shard's add, as the manager's
-      // own store listener calls it for each record written.
-      const onNewMessage = internals.strategy.onNewMessage;
+      // The store's append throws after writing the throwAt-th shard.
       let shards = 0;
-      internals.strategy.onNewMessage = function (this: unknown, message, ctx) {
-        if (message.bodyGroupId && ++shards === throwAt) throw new Error('strategy failed');
-        return onNewMessage ? onNewMessage.call(this, message, ctx) : Promise.resolve();
-      };
+      throwOnceFromShardAppend(framework, () => ++shards === throwAt);
       internals.messageStore.removeBodyGroup = () => { throw new Error('removal failed'); };
       module.interjections = [{ participant: 'Antra', content }];
       const error = console.error;
