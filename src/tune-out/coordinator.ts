@@ -290,9 +290,9 @@ export class TuneOutCoordinator {
       startedAtSequence: this.hooks.currentSequence(),
       ...(expiresAtMs !== undefined ? { expiresAtMs } : {}),
     };
-    // A tune-out can end in the registry without cancel (a send into the
-    // channel or a close sets its state there), leaving its timers armed:
-    // clear them, so none of them acts on this one.
+    // A tune-out that ended in the registry without this coordinator's
+    // cancel would have left its timers armed: clear them, so none of them
+    // acts on this one.
     this.clearTimers(serverId, channelId);
     this.channelRegistry.enterTuneOut(serverId, channelId, params, source);
     this.armExpiry(serverId, channelId, params);

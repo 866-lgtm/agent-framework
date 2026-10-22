@@ -813,6 +813,15 @@ function supersededClause(action: 'open' | 'close', now: DesiredChannelState | u
   return action === 'close' ? 'a later decision to keep it open came first' : 'a later decision to close it came first';
 }
 
+/** What ends a tune-out, for a channel tool's answer about a tuned-out
+ *  channel (`channel` as the answer shows it, quoted): its cancel, with the
+ *  backlog it delivers, and, for a close, that channel_close closes the
+ *  channel once the cancel has ended the tune-out. */
+function tunedOutPointer(tool: string, channel: string): string {
+  return `Call tune_out with channelId ${channel} and mode "cancel" for it to resume normal attention; cancelling ` +
+    'delivers the diverted backlog' + (tool === 'channel_close' ? ', and channel_close closes it after that.' : '.');
+}
+
 /** A channel tool's refusal of a tuned-out channel, whose cancel is what ends
  *  the tune-out, with the backlog it delivers. As an error result the agent
  *  reads the pointer itself; `data` names the refusal for an in-process
@@ -823,8 +832,7 @@ function tunedOutRefusal(tool: string, channelId: string): ToolResult {
     isError: true,
     error:
       `Channel "${channelId}" is tuned out: its messages go to the subconscious, and ${tool} doesn't change that. ` +
-      `Call tune_out with channelId "${channelId}" and mode "cancel" for it to resume normal attention; cancelling ` +
-      'delivers the diverted backlog.',
+      tunedOutPointer(tool, `"${channelId}"`),
     data: { refusal: 'tuned-out', channelId },
   };
 }
@@ -1335,6 +1343,12 @@ export class ChannelRegistry {
       if (action === 'open' && now === 'tuned-out') {
         return `Channel ${channel} was tuned out meanwhile: its messages go to the subconscious, and channel_open doesn't ` +
           `change that. Call tune_out with channelId ${channel} and mode "cancel" for it to resume normal attention.`;
+      }
+      // channel_close refuses a tuned-out channel too, so calling it again
+      // isn't the way: the tune-out's cancel is, and it delivers the backlog.
+      if (action === 'close' && now === 'tuned-out') {
+        return `Channel ${channel} was tuned out meanwhile: its messages go to the subconscious, and channel_close doesn't ` +
+          `change that. ${tunedOutPointer('channel_close', channel)}`;
       }
       // The later decision's own work settles the transport, and its call
       // says what became of it, so this says only that this call's change
@@ -3123,6 +3137,19 @@ export class ChannelRegistry {
     return { params: current.tuneOut, wakeCount: current.wakeCount ?? 0 };
   }
 
+  /** Every tune-out on record, whether or not its channel is registered
+   *  here yet: the decisions the lifecycle log's replay restored, and any
+   *  made since. */
+  tuneOutsOnRecord(): Array<{ serverId: string; channelId: string; params: TuneOutParams; source: string }> {
+    const found: Array<{ serverId: string; channelId: string; params: TuneOutParams; source: string }> = [];
+    for (const [key, record] of this.desiredStates) {
+      if (record.state !== 'tuned-out' || !record.tuneOut) continue;
+      const at = key.indexOf('\u0000');
+      found.push({ serverId: key.slice(0, at), channelId: key.slice(at + 1), params: record.tuneOut, source: record.source });
+    }
+    return found;
+  }
+
   /** Registered channel entries (read-only iteration for the coordinator). */
   listChannelsRaw(): Array<{ serverId: string; descriptor: ChannelDescriptor }> {
     return [...this.channels.values()].map((e) => ({
@@ -4322,8 +4349,9 @@ export class ChannelRegistry {
       source?: string;
       /** A machine close aimed at an explicitly-opened channel is refused
        *  unless the caller certifies an explicit idle lease (a configured
-       *  per-channel budget is consent to close at that budget). Module
-       *  origin only, like `source`. */
+       *  per-channel budget is consent to close at that budget). A tuned-out
+       *  channel is refused even so, since its tune-out's cancel is what
+       *  ends it. Module origin only, like `source`. */
       overrideExplicitOpen?: boolean;
     },
     origin?: ChannelToolOrigin,
@@ -4399,6 +4427,18 @@ export class ChannelRegistry {
           data: { refusal: 'explicit-open', channelId: input.channelId },
         };
       }
+    }
+
+    // A tuned-out channel's decision is the tune-out, and a close recorded
+    // over it would end it without its cancel, so the backlog it diverted
+    // would never reach the agent. Its cancel is what ends it, as
+    // channel_open's and channel_decline's refusals of a tuned-out channel
+    // say, and the agent closes the channel after that. A module's close
+    // that certified an idle lease, which the guard above lets through, is
+    // refused too, as a refusal it stands down on rather than an error.
+    if (this.getDesiredState(entry.serverId, input.channelId) === 'tuned-out') {
+      const refusal = tunedOutRefusal('channel_close', input.channelId);
+      return isModuleOrigin ? { ...refusal, isError: false } : refusal;
     }
 
     // A decision the log refused changed nothing, and the answer says so.
@@ -4598,14 +4638,20 @@ export class ChannelRegistry {
           'decline again to close it.'
         : ' If you need it closed now, call channel_close.';
     if (!stands) {
-      // channel_close closes it after all, whichever decision it was, while
-      // the channel is registered; a server that's up without the grant
-      // keeps its channels as it chooses, as the decline's refusal says.
+      // channel_close closes it after all while the channel is registered,
+      // over an open, or once a tune-out's cancel has ended the tune-out,
+      // since it refuses a tuned-out channel; a server that's up without the
+      // grant keeps its channels as it chooses, as the decline's refusal
+      // says.
       const step = after === undefined
         ? `. It isn't registered here any more, so no channel tool can reach it until it's registered here again.${serverBack}`
         : reach === 'up' && !this.directsLifecycle(entry.serverId)
           ? `, and ${this.lifecycleRefusal(entry.serverId).message}; if you need it closed, ask whoever runs this host.`
-          : `. If you still want it closed, call channel_close.${serverBack}`;
+          // channel_close refuses a tuned-out channel, so the cancel comes first.
+          : decided === 'tuned-out'
+            ? `. If you still want it closed, cancel the tune-out with tune_out mode "cancel", which delivers what it ` +
+              `diverted, and then call channel_close.${serverBack}`
+            : `. If you still want it closed, call channel_close.${serverBack}`;
       closeError = decided === 'tuned-out'
         ? `The decline is recorded, but the channel was tuned out meanwhile, and that decision stands: its messages go to ` +
           `the subconscious${step}`
