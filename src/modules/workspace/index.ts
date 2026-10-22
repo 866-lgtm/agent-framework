@@ -1852,7 +1852,7 @@ export class WorkspaceModule implements Module {
       {
         name: 'glob',
         description: 'Find files matching a glob pattern, checked against disk first; each match carries its state, as ls describes. '
-          + 'The pattern is relative to path (or to each mount\'s root). In the mount its first segment names, it is read mount-prefixed instead, like the paths it returns, within path if one is given.' + globDirect,
+          + 'The pattern is relative to path (or to each mount\'s root). In the mount its first segment names, it is read mount-prefixed instead, like the paths it returns, within path if one is given; in every other mount, as written.' + globDirect,
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -1874,7 +1874,7 @@ export class WorkspaceModule implements Module {
           properties: {
             pattern: { type: 'string', description: 'Regular expression pattern' },
             path: { type: 'string', description: 'File or directory to search (mount-prefixed, optional)' },
-            glob: { type: 'string', description: 'Glob pattern to filter files, relative to the mount root (e.g., "src/**/*.ts"); in the mount its first segment names, read mount-prefixed (e.g., "project/src/**/*.ts")' },
+            glob: { type: 'string', description: 'Glob pattern to filter files, relative to the mount root (e.g., "src/**/*.ts"); in the mount its first segment names, read mount-prefixed (e.g., "project/src/**/*.ts"), and in every other mount, as written' },
             contextBefore: { type: 'integer', description: 'Context lines before match' },
             contextAfter: { type: 'integer', description: 'Context lines after match' },
           },
