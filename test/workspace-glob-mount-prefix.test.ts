@@ -89,6 +89,16 @@ test('with a path, the pattern may be relative to it or mount-prefixed', async (
   assert.deepEqual(await glob({ path: 'notes/diary', pattern: 'project/**' }), []);
 });
 
+test("with a path, a pattern naming the path's mount reads mount-prefixed, within the path", async (t) => {
+  const { glob, grepFiles } = setup(t);
+  const diary = ['notes/diary/2026-10-12.md', 'notes/diary/2026-10-13.md'];
+  assert.deepEqual(await glob({ path: 'notes/diary', pattern: 'notes/**/*.md' }), diary);
+  // notes/README.md lies outside the path.
+  assert.deepEqual(await glob({ path: 'notes/diary', pattern: 'notes/*.md' }), []);
+  assert.deepEqual(await grepFiles({ pattern: 'entry', path: 'notes/diary', glob: 'notes/diary/*-13.md' }), ['notes/diary/2026-10-13.md']);
+  assert.deepEqual(await grepFiles({ pattern: 'entry', path: 'notes/diary', glob: 'notes/*.md' }), []);
+});
+
 test('a `**/` matches zero or more directories, in a relative or a mount-prefixed pattern', async (t) => {
   const { glob, grepFiles } = setup(t);
   const sources = ['project/src/lib/util.ts', 'project/src/main.ts'];
