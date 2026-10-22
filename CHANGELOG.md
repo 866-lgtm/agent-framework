@@ -115,6 +115,40 @@ Releases up to and including 0.7.3 predate this file; for their contents see
   - The rest is in membrane 0.6.0's notes and context-manager 0.15.0's,
     0.16.0's, 0.17.x's and 0.18.0's.
 
+- **Hosts:** membrane 0.6.0, which agent-framework now depends on, says
+  with each round of tool calls whether its stream can carry messages
+  injected with the round's results: yes on its native tool path, no on its
+  XML tool path. membrane 0.5.87 said neither, and agent-framework now acts
+  on what 0.6.0 says:
+  - **On the native path,** a tool boundary that injects messages marks
+    everything stored so far as read, as a compile does: the injected
+    messages, and anything stored before them. A later coalesced update of
+    one of their subjects is then added after the earlier version rather
+    than replacing it, and a wake queued only to have the agent read one of
+    them starts no turn. With 0.5.87 they stayed unread.
+  - **A notice the primary would take over** when a run or a conversation
+    fork ends and its window is released (a failed reply, or a channel its
+    message opened or couldn't open) is no longer passed on to the primary
+    if it was injected at such a boundary, since the agent read it. It may
+    still be if the window can't be read at the release. With 0.5.87 it was
+    passed on.
+  - **On the XML path,** a tool boundary injects nothing. Messages queued for
+    the agent after a turn's first request wait for the turn's end and are
+    stored then. With 0.5.87, a tool boundary stored those it could inject
+    there and offered them to the stream, which ignored them. While they
+    wait they are in the deferral queue, which is saved to disk only from a
+    quiesce until the queue next drains, so at other times a crash before
+    the turn ends loses them.
+  - **Migration:** nothing to change in code. A host whose agents use XML
+    tool mode should expect a message that arrives during a long turn to
+    reach the agent, and the store, only when the turn ends, and a crash
+    before then to lose it.
+  - **Unchanged:** each round's tool results, what a turn's start stores
+    before its first request, and which messages the native path injects.
+  - **Added after the release:** this entry was written after 0.24.0 was
+    published, so the `CHANGELOG.md` at its tag, `v0.24.0`, doesn't have
+    it.
+
 - **Anyone running agent-framework on a Node before 22.12:** agent-framework
   now declares `engines.node` `>=22.12.0`, where it declared `>=20.0.0`, as
   membrane 0.6.0 and context-manager 0.18.0, which it now depends on, both
