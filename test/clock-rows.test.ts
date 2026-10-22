@@ -240,7 +240,7 @@ describe('planning a clock', () => {
 class ToolModule implements Module {
   readonly name = 'tools';
   /** Runs inside the next tool call: the round's time passes here. */
-  during: (() => void) | null = null;
+  during: (() => void | Promise<void>) | null = null;
   async start(ctx: ModuleContext) { ctx.registerSpeechHandler('*'); }
   async stop() {}
   async onProcess() { return {}; }
@@ -251,7 +251,7 @@ class ToolModule implements Module {
   async handleToolCall(_call: ToolCall): Promise<ToolResult> {
     const during = this.during;
     this.during = null;
-    during?.();
+    await during?.();
     return { success: true, data: { ok: true } };
   }
 }
@@ -520,6 +520,40 @@ describe('clock rows in the framework', () => {
       const request = requestText(x.membrane.calls[before]!);
       assert.match(request, /Clock: Wednesday 2026-10-21, 10:40 UTC/, 'its seed carries the template\'s clock');
       assert.match(request, /Clock: Wednesday 2026-10-21, 12:07 UTC[\s\S]*hello/, 'and a clock of its own ahead of the message');
+    } finally { await x.framework.stop(); }
+  });
+
+  it('a mid-turn clock and a message after it each go in as their own render gives them', async () => {
+    const x = await make();
+    x.membrane.supportsInjectedMessages = true;
+    try {
+      setClock('2026-10-21T10:41:10Z');
+      await wake(x, event('warm up'), [{ type: 'text', text: 'ok' }]);
+      const cm = x.framework.getAgent('assistant')!.getContextManager() as any;
+      const asked: number[] = [];
+      // A stand-in that marks each id's answer with its position in the batch.
+      cm.renderAsNewest = (ids: readonly string[]) => { asked.push(ids.length); return ids.map((_, i) => [{ type: 'text', text: `RENDERED${i}` }]); };
+      setClock('2026-10-21T10:48:10Z');
+      x.mod.during = async () => {
+        setClock('2026-10-21T10:52:10Z');
+        // Stored for the agent to hear, with no wake of its own.
+        (x.framework as any).handleMcplPushEvent({ ...event('MIDTURN'), triggerInference: false });
+        // A beat for the run loop to defer it while the round's tools are pending.
+        await new Promise((r) => setTimeout(r, 30));
+      };
+      // The stream that runs the tool round, kept before the message's own
+      // wake starts another and takes lastStream.
+      let boundary: typeof x.membrane.lastStream = null;
+      const streamYielding = x.membrane.streamYielding.bind(x.membrane);
+      x.membrane.streamYielding = (...args: Parameters<typeof streamYielding>) => {
+        const st = streamYielding(...args);
+        boundary ??= x.membrane.lastStream;
+        return st;
+      };
+      await wake(x, event('go'), [ping], [{ type: 'text', text: 'done' }]);
+      assert.deepEqual(asked, [2], 'the premise: the boundary rendered a clock and a message together');
+      const injected = (boundary!.receivedToolResultOptions[0]?.injectedMessages ?? []) as Array<{ content: unknown }>;
+      assert.deepEqual(injected.map((m) => m.content), [[{ type: 'text', text: 'RENDERED0' }], [{ type: 'text', text: 'RENDERED1' }]]);
     } finally { await x.framework.stop(); }
   });
 

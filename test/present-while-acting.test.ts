@@ -1360,7 +1360,7 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
-  it("a budget restart takes as an arrival an addressed message its boundary stored, whatever the render gave it", async () => {
+  it("a budget restart takes as an arrival an addressed message its boundary stored, though the render gave it null", async () => {
     // The boundary renders the DM as null, and the stream is over its budget,
     // so no live stream hears it. The restart compiles anew, and the DM is
     // still an arrival of the turn it continues.

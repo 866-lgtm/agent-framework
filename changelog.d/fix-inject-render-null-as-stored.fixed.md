@@ -8,6 +8,9 @@
   result, so the agent didn't hear it mid-turn, the line was false, and the
   next request differed from the live rounds anyway. The `[not shown]`
   line, and the log line naming what was left out, are gone. A clock row
-  the render gives `null` goes in as stored too. A single message too big
-  for the recent window, which the strategy stores in parts, still goes in
-  as stored where the next request sends it differently.
+  the render gives `null` goes in as stored too. As stored still differs
+  from the next request where its per-message cap or an image limit reaches
+  such a message, since the render neither cuts it nor counts its images:
+  a batch with more images than `maxLiveImages`, for one. It differs too
+  for a single message too big for the recent window, which the strategy
+  stores in parts.

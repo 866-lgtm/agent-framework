@@ -174,6 +174,16 @@ describe('a message injected at a tool boundary', () => {
     assert.ok(agent.getConsumedWatermark()!.sequence >= row.sequence, 'the consumed mark covers it, as anything injected');
   });
 
+  it("each message goes in as its own render gives it, in its place in the batch", async () => {
+    await create(new WindowedPassthroughStrategy({}));
+    membrane.supportsInjectedMessages = true;
+    // A stand-in render that marks each id's answer with its position, so a
+    // message given another's render shows.
+    renderWith((ids) => ids.map((_, i) => [text(`RENDERED${i}`)]));
+    const injected = await turnWith([[text('FIRST')], [text('SECOND')]]);
+    assert.deepEqual(injected.map((m) => m.content), [[text('RENDERED0')], [text('RENDERED1')]]);
+  });
+
   it('a whole batch the render gives null goes in as stored, images and all, and nothing a tune-out holds', async () => {
     await create(new WindowedPassthroughStrategy({}));
     membrane.supportsInjectedMessages = true;
@@ -204,15 +214,18 @@ describe('a message injected at a tool boundary', () => {
     const shots = [1, 2, 3, 4].map((i) => `SCREENSHOT${i}`);
     const injected = await turnWith(shots.map((s) => [text(s), image()]));
     assert.ok(nulls[0]! >= 1, `the premise: the render placed some of the batch before its window (${nulls[0]} nulls)`);
-    const live = shots.map((s) => holding(injected, s));
-    assert.ok(live.every((c) => c.length > 0), 'every screenshot went into the live round');
-    // The next request carries them where the live round did, in the same form.
+    // Every screenshot went into the live round, in the order it arrived.
+    const live = injected.map((m) => JSON.stringify(m.content));
+    assert.deepEqual(live.map((c) => shots.findIndex((s) => c.includes(s))), [0, 1, 2, 3], JSON.stringify(live.map((c) => c.slice(0, 60))));
+    // The next request carries them where the live round did, right after the
+    // tool result, in the same form.
     membrane.pushResponse(createMockResponse([text('Again.')]));
     go();
     await framework.runUntilIdle();
     const sentNext = membrane.calls[membrane.calls.length - 1]!.messages.map((m) => JSON.stringify(m.content));
     const at = shots.map((s) => sentNext.findIndex((c) => c.includes(s)));
     assert.deepEqual(at, at.map((_, k) => at[0]! + k), `in order, one after another: ${JSON.stringify(at)}`);
+    assert.ok(sentNext[at[0]! - 1]!.includes('"tool_result"'), `right after the tool result: ${sentNext[at[0]! - 1]!.slice(0, 120)}`);
     assert.deepEqual(at.map((k) => JSON.parse(sentNext[k]!)), live.map((c) => JSON.parse(c)));
   });
 
@@ -238,7 +251,9 @@ describe('a message injected at a tool boundary', () => {
 
   it('under the memory strategy, a body bigger than the recent window goes in as stored, and the rest as the next request sends it', async () => {
     // The strategy stores the long message as several shards and the render
-    // gives it null. As stored, it goes in joined, as the store reads it back.
+    // gives it null. As stored, it goes in joined, as the store reads it back:
+    // its image first, then its text as one block, which differs from the
+    // blocks as they were queued.
     await create(new AutobiographicalStrategy({
       adaptiveResolution: true, foldingStrategy: 'kv-stable', recentWindowTokens: 300, kvStableReachTokens: 8_000,
       targetChunkTokens: 200,
@@ -246,12 +261,12 @@ describe('a message injected at a tool boundary', () => {
     const long = 'FIRSTLONG ' + Array.from({ length: 600 }, (_, i) => `word${i}`).join(' ');
     const nulls: number[] = [];
     renderWith((ids, real) => { const r = real(ids)!; nulls.push(r.filter((c) => c === null).length); return r; });
-    const injected = await turnWith([[text(long)], [text('SECONDSHORT and a few words more')]]);
+    const injected = await turnWith([[text('Intro. '), image(), text(long)], [text('SECONDSHORT and a few words more')]]);
     const rows = framework.getAgent('assistant')!.getContextManager().getAllMessages();
     const row = rows.find((m) => JSON.stringify(m.content).includes('FIRSTLONG'))!;
     assert.ok(rows.filter((m) => m.bodyGroupId !== undefined && m.bodyGroupId === row.bodyGroupId).length > 1, 'the premise: it is stored in parts');
     assert.equal(nulls[0], 1, 'the premise: the render gave it null');
-    assert.deepEqual(JSON.parse(holding(injected, 'FIRSTLONG')), [text(long)], 'it goes in whole, as stored');
+    assert.deepEqual(JSON.parse(holding(injected, 'FIRSTLONG')), [image(), text(`Intro. ${long}`)], 'it goes in whole, as the store reads it back');
     const second = holding(injected, 'SECONDSHORT');
     assert.deepEqual(JSON.parse((await nextRequest())('SECONDSHORT')), JSON.parse(second));
   });

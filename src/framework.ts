@@ -11802,9 +11802,8 @@ export class AgentFramework {
           // safe), up to what came after them: a later message can still
           // take an earlier one past an image limit, as for any message, and
           // the next compile then strips that image where the live rounds
-          // carried it. One the render can't place among the newest, which
-          // the next compile sends from before its recent window, goes in as
-          // stored (renderForInjection). A write that threw after it was stored, whose landing
+          // carried it. One the render gives null goes in as stored (see the
+          // boundary's null below). A write that threw after it was stored, whose landing
           // couldn't be read, is the exception: it's carried at the flush
           // that finds it, after what was stored since, so there the store and
           // the live request differ (writeDrainedInOrder).
@@ -11878,7 +11877,8 @@ export class AgentFramework {
             }
             // Rendered in one call: a render prepares as a compile does, so
             // the batch shares one preparation. The image limits count from
-            // the batch's oldest message to the newest, as a compile does.
+            // the batch's oldest message the render places to the newest, as
+            // a compile does.
             // The clock, stored ahead of them, renders first in the same batch
             // and is injected first, as the next compile sends it.
             const rendered = this.renderForInjection(agent, [...(clock ? [clock.id] : []), ...heard.map((h) => h.id)]);
@@ -11890,18 +11890,22 @@ export class AgentFramework {
             // next compile still sends it, raw and in order, after the tool
             // result, so leaving it out would change the prefix as surely as
             // any form, and the agent wouldn't hear it (context-manager#275's
-            // review, R1-1). It goes in as stored. That
-            // rests on two things. The only view filter this framework gives
-            // a store is the tune-out stamp (createAgent's; the other stores
-            // it opens have none), and a stamped message is skipped above, so
-            // no null here means a message the view hides.
-            // And the store and the render run with nothing between them, so
-            // no summary can stand in for what this flush stored, and no
-            // select can move windowed passthrough's anchor past it. A write
-            // found here that landed at an earlier flush (writeDrainedInOrder)
-            // is the exception: by now a summary may stand in for it, or the
-            // anchor be past it, and then it goes in where the next compile
-            // doesn't send it.
+            // review, R1-1). It goes in as stored, which is the form the next
+            // compile sends unless its per-message cap or an image limit
+            // reaches it: the render doesn't count a null message's images or
+            // cut it, so a batch with more images than the limit, or a long
+            // message under a cap that doesn't shard, still differs there.
+            // That rests on two things. The only view filter this framework
+            // gives a store is the tune-out stamp (createAgent's; the other
+            // stores it opens have none), and a stamped message is skipped
+            // above, so no null here means a message the view hides. And the
+            // store and the render run with nothing between them, so nothing
+            // can put a summary in place of what this flush stored, or move
+            // windowed passthrough's anchor past it, before the render. A
+            // write found here that landed at an earlier flush
+            // (writeDrainedInOrder) is the exception: by now a summary may
+            // stand in for it, or the anchor be past it, and then it goes in
+            // where the next compile doesn't send it.
             const asSent = (i: number, content: ContentBlock[]): ContentBlock[] => rendered?.[i] ?? content;
             if (clock) midTurnInjections.push({ participant: 'user', content: asSent(0, clock.content), metadata: clock.metadata });
             heard.forEach((h, i) => {
