@@ -5994,9 +5994,14 @@ function globToRegex(pattern: string): RegExp {
       if (!group.includes(',')) {
         throw new Error(braceRefusal(pattern, 'has a "{" group with no ","; a group needs two or more alternatives, separated by ","'));
       }
-      const alternatives = group.split(',');
+      // A `/` right after the group goes into each alternative, as `{a,b}/x`
+      // and `{a/,b/}x` name the same paths, so an alternative's own `**`
+      // meets it and reads as a `**/` does, as in the group's expansion:
+      // `{src/**,lib}/*.ts` is `src/**/*.ts` or `lib/*.ts`.
+      const slash = pattern[closeIdx + 1] === '/';
+      const alternatives = group.split(',').map((alternative) => (slash ? alternative + '/' : alternative));
       regex += '(?:' + alternatives.map(globPartToRegex).join('|') + ')';
-      i = closeIdx + 1;
+      i = closeIdx + (slash ? 2 : 1);
       continue;
     }
     // Accumulate non-brace characters, convert as a chunk

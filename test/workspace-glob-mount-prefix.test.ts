@@ -135,6 +135,16 @@ test("a `**/` that starts a brace alternative reads as the alternative's place i
   assert.deepEqual(await glob({ pattern: 'notes/a{**/,b/}c.md' }), ['notes/ax/c.md']);
 });
 
+test('a `**` that ends a brace alternative, with a `/` after the group, matches zero or more directories there, as the expansion does', async (t) => {
+  // `{src/**,docs}/*.ts` names what `src/**/*.ts` and `docs/*.ts` name.
+  const { glob } = setup(t, { 'project/docs/guide.ts': 'guide' });
+  const all = ['project/docs/guide.ts', 'project/src/lib/util.ts', 'project/src/main.ts'];
+  assert.deepEqual(await glob({ pattern: 'project/{src/**,docs}/*.ts' }), all);
+  assert.deepEqual(await glob({ pattern: 'project/{src/**,docs/**}/*.ts' }), all);
+  // Without a `/` after the group, the `**` is any run of characters, as before.
+  assert.deepEqual(await glob({ pattern: 'project/{src/**,docs}.ts' }), ['project/src/lib/util.ts', 'project/src/main.ts']);
+});
+
 test("a pattern's other characters match themselves", async (t) => {
   const { glob } = setup(t, { 'project/src/a+b.ts': 'plus', 'project/src/aaab.ts': 'decoy', 'project/src/a.b(c).ts': 'dots', 'project/src/axbc-ts': 'decoy' });
   assert.deepEqual(await glob({ pattern: 'project/src/a+b.ts' }), ['project/src/a+b.ts']);
