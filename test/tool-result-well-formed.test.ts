@@ -108,7 +108,11 @@ for (const guard of [false, true]) for (const [shape, result] of SHAPES) {
   });
 }
 
-test('a lone surrogate in an error result given through the direct Agent API reaches membrane as U+FFFD, as it is stored', async () => {
+/**
+ * One round through the direct Agent API: a call answered with `result`,
+ * then the next request, whose tool results' content goes to `check`.
+ */
+async function directRound(result: ToolResult, agentConfig: Partial<AgentConfig>, check: (sent: unknown[], f: AgentFramework) => void) {
   const membrane = new MockMembrane();
   const requests: NormalizedRequest[] = [];
   const responses: NormalizedResponse[] = [
@@ -121,22 +125,36 @@ test('a lone surrogate in an error result given through the direct Agent API rea
     assert.ok(response, 'no more inference than scripted');
     return response;
   };
-  // The guard stores the direct API's results; without it, the caller keeps
-  // the context, and nothing is stored to compare with.
-  const f = await framework({ success: true, data: 'unused' }, membrane, { toolResultGuard: true });
+  const f = await framework({ success: true, data: 'unused' }, membrane, agentConfig);
   try {
     const agent = f.getAgent('prime')!;
     agent.getContextManager().addMessage('user', [{ type: 'text', text: 'fetch it' }]);
     assert.equal((await agent.runInference(f.getAllTools())).toolCalls.length, 1);
-    agent.provideToolResult('one', { success: false, isError: true, error: LONE });
+    agent.provideToolResult('one', result);
     await agent.runInference(f.getAllTools());
     assert.equal(requests.length, 2);
     const sent = requests[1].messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_result')
       .map((b) => (b as { content: unknown }).content);
     assert.equal(sent.length, 1, 'the second request carries the tool result');
-    assert.equal(sent[0], MENDED, 'the lone half is sent as U+FFFD');
-    assert.equal(sent[0], storedToolResult(f), 'the copy sent is the copy stored');
+    check(sent, f);
   } finally {
     await f.stop();
   }
+}
+
+test('a lone surrogate in an error result given through the direct Agent API reaches membrane as U+FFFD, as it is stored', async () => {
+  // The guard stores the direct API's results; without it, the caller keeps
+  // the context, and nothing is stored to compare with.
+  await directRound({ success: false, isError: true, error: LONE }, { toolResultGuard: true }, (sent, f) => {
+    assert.equal(sent[0], MENDED, 'the lone half is sent as U+FFFD');
+    assert.equal(sent[0], storedToolResult(f), 'the copy sent is the copy stored');
+  });
+});
+
+test("an error that isn't a string, given through the direct Agent API, is passed on as it was", async () => {
+  // That API's results are unchecked: only a string error is made well
+  // formed, and any other value goes on as before.
+  await directRound({ success: false, isError: true, error: ['not a string'] as unknown as string }, {}, (sent) => {
+    assert.deepEqual(sent[0], ['not a string']);
+  });
 });
