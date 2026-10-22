@@ -18,8 +18,13 @@
  * between them) reads the time it is written instead.
  *
  * Everything the next clock needs is read back from the window: the last
- * clock row's time and the newest row's. A restart, a rollback or a second
- * resident sharing the window leaves nothing stale to reconcile.
+ * clock row's time, wherever it is, and the newest row's. A window that
+ * holds no clock row takes one the next time it would take a clock (an
+ * incoming event, a turn's start, a tool boundary), so a window that has
+ * just had a clock turned on, or a fork seeded with copies of its
+ * template's rows (which carry none of their metadata), reads the time
+ * then. A restart, a rollback or a second resident sharing the window
+ * leaves nothing stale to reconcile.
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
@@ -66,7 +71,7 @@ export function resolveClockConfig(agentName: string, config: ClockConfig | unde
   if (config === undefined) return undefined;
   const at = `Agent "${agentName}" clock`;
   if (config === null || typeof config !== 'object' || Array.isArray(config)) {
-    throw new Error(`${at} must be an object such as { intervalMinutes: 10 }, or left out for no clock rows`);
+    throw new Error(`${at} must be an object such as { intervalMinutes: 10 }, or left out for no clock rows of its own`);
   }
   const { intervalMinutes, intervalSeconds, precision } = config;
   if ((intervalMinutes === undefined) === (intervalSeconds === undefined)) {
@@ -145,49 +150,52 @@ function wallFields(at: number, zone: string): WallFields {
 }
 
 /**
- * The instants at which the zone's wall clock reads `secondOfDay` on the
- * given date: one, or two in an hour a DST change repeats, or none in one it
- * skips. A date has at most one offset change, so the offsets half a day
- * either side of the wall time are the only ones it can be read at.
- */
-function wallInstants(year: number, month: number, day: number, secondOfDay: number, zone: string): number[] {
-  const asUtc = Date.UTC(year, month - 1, day) + secondOfDay * 1000;
-  const offsets = new Set([-12, 0, 12].map((h) => wallFields(asUtc + h * 3_600_000, zone).offsetMinutes));
-  const instants = new Set<number>();
-  for (const offset of offsets) {
-    const at = asUtc - offset * 60_000;
-    const f = wallFields(at, zone);
-    if (f.year === year && f.month === month && f.day === day
-      && f.hour * 3600 + f.minute * 60 + f.second === secondOfDay) {
-      instants.add(at);
-    }
-  }
-  return [...instants];
-}
-
-/**
  * The latest boundary at or before `now`: an instant at which the zone's
  * wall clock read a whole multiple of the interval since local midnight. A
  * boundary whose wall time a DST change skips doesn't occur; one it repeats
  * occurs twice.
+ *
+ * While the zone's offset stays the same, its wall clock runs with real
+ * time, so the latest boundary is `now` less how far the wall clock has run
+ * past its last multiple of the interval. Where that instant has another
+ * offset, the offset changed in between and no boundary falls between the
+ * change and `now`: the walk goes on from just before the change. The change
+ * is found by searching between the two instants, whatever their offsets
+ * are. The same offset at both is taken to mean no change between them: in
+ * the tz data, no zone changes its offset twice within a day, the longest
+ * interval, from 2024 through 2040. Throws if the walk passes 24 changes,
+ * which no real zone reaches, rather than return an instant that isn't a
+ * boundary.
  */
 export function latestBoundary(now: number, intervalSeconds: number, zone: string): number {
-  const f = wallFields(now, zone);
-  const secondOfDay = f.hour * 3600 + f.minute * 60 + f.second;
-  let slot = Math.floor(secondOfDay / intervalSeconds);
-  let date = { year: f.year, month: f.month, day: f.day };
-  for (let tries = 0; tries < 8; tries++) {
-    if (slot < 0) {
-      const previous = new Date(Date.UTC(date.year, date.month - 1, date.day - 1));
-      date = { year: previous.getUTCFullYear(), month: previous.getUTCMonth() + 1, day: previous.getUTCDate() };
-      slot = Math.floor((DAY_SECONDS - 1) / intervalSeconds);
-    }
-    const passed = wallInstants(date.year, date.month, date.day, slot * intervalSeconds, zone).filter((at) => at <= now);
-    if (passed.length > 0) return Math.max(...passed);
-    slot--;
+  let at = now;
+  // A pass that doesn't return steps back past an offset change, and a day
+  // of a real zone holds at most two of them; running out of passes is a
+  // defect, and it throws rather than return an instant that isn't a boundary.
+  for (let pass = 0; pass < 24; pass++) {
+    const f = wallFields(at, zone);
+    const secondOfDay = f.hour * 3600 + f.minute * 60 + f.second;
+    const subSecond = at - Math.floor(at / 1000) * 1000;
+    const candidate = at - (secondOfDay % intervalSeconds) * 1000 - subSecond;
+    if (wallFields(candidate, zone).offsetMinutes === f.offsetMinutes) return candidate;
+    at = offsetTakenAt(candidate, at, f.offsetMinutes, zone) - 1;
   }
-  // Unreachable for real zones; a boundary must never be in the future.
-  return now - (now % (intervalSeconds * 1000));
+  throw new Error(`no clock boundary found within 24 offset changes of ${new Date(now).toISOString()} in ${zone}`);
+}
+
+/**
+ * The instant in (`from`, `to`] at which the zone took `offset`, given that
+ * `to` reads at that offset and `from` doesn't, to the millisecond.
+ */
+function offsetTakenAt(from: number, to: number, offset: number, zone: string): number {
+  let before = from;
+  let after = to;
+  while (after - before > 1) {
+    const mid = Math.floor((before + after) / 2);
+    if (wallFields(mid, zone).offsetMinutes === offset) after = mid;
+    else before = mid;
+  }
+  return after;
 }
 
 // ---------------------------------------------------------------------------
@@ -240,13 +248,13 @@ export interface PlannedClock {
 
 /**
  * The clock row the window takes next, or null when no boundary has passed
- * since the last clock it holds.
+ * since the last clock it holds. The framework asks before an incoming
+ * event, at a turn's start and at a tool boundary (storeDueClock).
  *
  * - `newestRowAt`: the newest row's time, which the clock goes after.
- * - `lastClockAt`: the time the window's last clock row reads, when one is
- *   found. Without one, the boundaries up to the newest row count as told
- *   (the window holds no tick to place among them), and the clock carries
- *   the date.
+ * - `lastClockAt`: the time the window's last clock row reads, when it holds
+ *   one. Without one, no boundary counts as told: the window takes a clock
+ *   now, and it carries the date.
  */
 export function planClock(args: {
   now: number;
@@ -258,11 +266,7 @@ export function planClock(args: {
   const { now, newestRowAt, lastClockAt, config } = args;
   const zone = resolveTimeZone(args.zone);
   const boundary = latestBoundary(now, config.intervalSeconds, zone);
-  const told = lastClockAt !== undefined
-    ? latestBoundary(lastClockAt, config.intervalSeconds, zone)
-    : newestRowAt !== undefined
-      ? latestBoundary(newestRowAt, config.intervalSeconds, zone)
-      : -Infinity;
+  const told = lastClockAt !== undefined ? latestBoundary(lastClockAt, config.intervalSeconds, zone) : -Infinity;
   if (boundary <= told) return null;
   // The boundary's own time only where its tick would have been: no row
   // after the boundary comes before the clock. Otherwise the time it is
