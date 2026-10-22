@@ -1326,9 +1326,10 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
-  it("an addressed message a boundary leaves out of the injection doesn't re-pin the turn: the live stream never heard it", async () => {
+  it("an addressed message a boundary leaves out of the injection doesn't re-pin the turn: the live stream heard only the notice of it", async () => {
     // The control is the test above that re-pins: the same DM, injected,
-    // moves the trailing prose to the DM.
+    // moves the trailing prose to the DM. The notice is a system line, which
+    // moves no locus.
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'Station four, proceeding.' },
       { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
@@ -1350,7 +1351,9 @@ describe('present while acting', () => {
     await framework.runUntilIdle();
 
     assert.equal(rendered, 1, 'the premise: the boundary rendered the DM, and left it out');
-    assert.deepEqual(membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? [], [], 'nothing was injected');
+    const injected = membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? [];
+    assert.equal(injected.length, 1, 'only the notice of what was left out is injected');
+    assert.ok(JSON.stringify(injected[0]!.content).startsWith('[{"type":"text","text":"[not shown]'), JSON.stringify(injected[0]));
     assert.deepEqual(routed, [
       { text: 'Station four, proceeding.', locus: 'chan-live-1' },
       { text: 'Carrying on where I was.', locus: 'chan-live-1' },

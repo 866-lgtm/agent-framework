@@ -845,10 +845,13 @@ type InboundResponder = {
  *  For an entry whose write threw after storing it, found in the store and
  *  counted as written, it is what landed, joined the same way, which for a
  *  sharded body can be its first shards alone. A store that can't be read
- *  back (storedCopiesOf logs it) leaves a sharded body as given. */
+ *  back (storedCopiesOf logs it) leaves a sharded body as given. `parts` is
+ *  how many store messages hold it, as read back: a sharded body's shards,
+ *  consecutive from `id`, and 1 where it couldn't be read back. */
 interface DrainedWrite {
   id: MessageId;
   content: ContentBlock[];
+  parts: number;
 }
 
 /** What later compiles render from the store for the copies of one write
@@ -864,6 +867,23 @@ function asCompiled(landed: ReadonlyArray<{ content: ContentBlock[] }>): Content
   const text = blocks.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('');
   return [...blocks.filter((b) => b.type !== 'text'), { type: 'text', text } as ContentBlock];
 }
+
+/** A message's size as a notice gives it: its text's characters and its
+ *  images, each left out when there are none, so empty when it has
+ *  neither. */
+function contentSize(content: readonly ContentBlock[]): string {
+  let chars = 0;
+  let images = 0;
+  for (const b of content) {
+    if (b.type === 'text') chars += b.text.length;
+    else if (b.type === 'image' || b.type === 'generated_image') images++;
+  }
+  const parts: string[] = [];
+  if (chars > 0) parts.push(`${chars.toLocaleString('en-US')} character${chars === 1 ? '' : 's'}`);
+  if (images > 0) parts.push(`${images} image${images === 1 ? '' : 's'}`);
+  return parts.join(' and ');
+}
+
 /** One stored copy of a deferred write, as the drain reads it back: a
  *  sharded body's copies carry its `bodyGroupId`. */
 type StoredCopy = { id: MessageId; content: ContentBlock[]; bodyGroupId?: string };
@@ -11797,7 +11817,8 @@ export class AgentFramework {
           // take an earlier one past an image limit, as for any message, and
           // the next compile then strips that image where the live rounds
           // carried it. One the next compile won't send among its newest
-          // isn't injected. A write that threw after it was stored, whose landing
+          // isn't injected; a notice after the batch tells the agent of it
+          // (recordLeftOutNotice). A write that threw after it was stored, whose landing
           // couldn't be read, is the exception: it's carried at the flush
           // that finds it, after what was stored since, so there the store and
           // the live request differ (writeDrainedInOrder).
@@ -11838,7 +11859,7 @@ export class AgentFramework {
           // What this boundary stored for the agent to hear, in store order,
           // injected or left out, for a boundary that leaves it to the turn's
           // next start as arrivals: that start's compile sends it.
-          const heard: Array<{ msg: DeferredWrite; id: MessageId; content: ContentBlock[] }> = [];
+          const heard: Array<{ msg: DeferredWrite; id: MessageId; content: ContentBlock[]; parts: number }> = [];
           if (currentState.supportsInjectedMessages !== false) {
             const deferred = this.drainDeferredFor(agent.name, (msg) => !isInjectableMidTurn(msg, agent.name));
             // Stored in queue order, cut at the first that can't be stored: it
@@ -11852,7 +11873,7 @@ export class AgentFramework {
             // counts as stored, as what landed of it (writeDrainedInOrder).
             const stored = this.writeDrainedInOrder(deferred, `tool boundary for ${agent.name}`, (msg) =>
               agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id)));
-            for (const [msg, { id, content }] of stored) {
+            for (const [msg, { id, content, parts }] of stored) {
               // Every other resident reads what this boundary stores; for its
               // own agent, the boundary weighs what it injects below.
               this.noteForOtherResidents(agent, msg.metadata, id);
@@ -11861,28 +11882,33 @@ export class AgentFramework {
               // compiled view; injecting it here would put in the live turn
               // what the next compile hides (#232 gap 5).
               if ((msg.metadata as { tuneOut?: unknown } | undefined)?.tuneOut) continue;
-              heard.push({ msg, id, content });
+              heard.push({ msg, id, content, parts });
             }
             // Rendered in one call: a render prepares as a compile does, so
             // the batch shares one preparation. The image limits count from
             // the batch's oldest message to the newest, as a compile does.
             const rendered = this.renderForInjection(agent, heard.map((h) => h.id));
-            const leftOut: MessageId[] = [];
-            heard.forEach(({ msg, id, content }, i) => {
-              const sent = rendered ? rendered[i]! : content;
+            const leftOut: typeof heard = [];
+            heard.forEach((h, i) => {
+              const sent = rendered ? rendered[i]! : h.content;
               // The next compile won't send it among its newest: injected, it
               // would put in the live turn what that compile sends elsewhere,
               // or not at all. It's under any consumed mark the boundary sets
               // (below), as anything stored here is.
-              if (sent === null) { leftOut.push(id); return; }
+              if (sent === null) { leftOut.push(h); return; }
               midTurnInjections.push({
-                participant: msg.participant,
+                participant: h.msg.participant,
                 content: sent,
-                ...(msg.metadata ? { metadata: msg.metadata } : {}),
+                ...(h.msg.metadata ? { metadata: h.msg.metadata } : {}),
               });
             });
             if (leftOut.length > 0) {
-              console.error(`[injection] ${agent.name}: left out of the live round, since the next compile won't send them among its newest: ${leftOut.join(', ')}`);
+              console.error(`[injection] ${agent.name}: left out of the live round, since the next compile won't send them among its newest: ${leftOut.map((h) => h.id).join(', ')}`);
+              // The agent is told what it didn't hear, after the batch, as
+              // the routing notice is: stored, so the next compile sends it
+              // where the live round heard it.
+              const notice = this.recordLeftOutNotice(agent, leftOut);
+              if (notice) midTurnInjections.push(notice);
             }
           }
 
@@ -12127,15 +12153,18 @@ export class AgentFramework {
             // Under context-manager#160 such a write already gives the
             // replies stored after it stamps their requests didn't carry,
             // whatever the mark says; deferring those writers is the fix.
-            // When the boundary injects anything, the mark also covers a
-            // message it stored and left out of the injection, since the next
-            // compile won't send it among its newest. That one then counts as
-            // read though no request carried it: a coalesced render's wake to
-            // read it drops, and a release doesn't pass it to the primary.
-            // Where the view leaves it out, no request will. Where the memory
-            // strategy places it before its recent window, a batch bigger than
-            // that window, the next compile carries it, in whatever turn
-            // something else starts.
+            // The mark also covers a message the boundary stored and left out
+            // of the injection, since the next compile won't send it among its
+            // newest: the notice telling the agent of it is injected, so a
+            // boundary that leaves one out injects something, unless that
+            // notice couldn't be stored. The message then counts as read
+            // though no request carried it: a coalesced render's wake to read
+            // it drops, and a release doesn't pass it to the primary. The
+            // notice has told the agent it came, from whom, and how to read
+            // it. Where the view leaves it out, no request will carry it.
+            // Where the memory strategy places it before its recent window, a
+            // batch bigger than that window, the next compile carries it, in
+            // whatever turn something else starts.
             if (midTurnInjections.length > 0) {
               // Possibly shown, whatever the stream declares: the first-view
               // mark (CoalescerHost.isUnshown) counts a doubt as shown.
@@ -21946,6 +21975,53 @@ export class AgentFramework {
   }
 
   /**
+   * Tell the agent of the messages a tool boundary stored and left out of
+   * its injection, since the next compile won't send them among its newest:
+   * who sent each and its size, and how to read it, `history--extract`
+   * around it where the agent is shown that tool, else its id. None of a
+   * message's words: the line stands in for a message the live round
+   * doesn't carry. A system line, so it's no conversation: it neither
+   * re-pins the turn nor clears its send suppression. It names the agent
+   * it's for, since every resident sharing the slot reads it too. Returns
+   * the notice as stored, for the boundary to inject after the batch, or
+   * undefined when it couldn't be stored, which is logged.
+   */
+  private recordLeftOutNotice(
+    agent: Agent,
+    leftOut: ReadonlyArray<{ msg: { participant: string }; id: MessageId; content: ContentBlock[]; parts: number }>,
+  ): { participant: string; content: ContentBlock[]; metadata: MessageMetadata } | undefined {
+    const canExtract = this.advertisedToolsForAgent(agent.name).some((t) => t.name === 'history--extract');
+    const one = leftOut.length === 1;
+    const lines = leftOut.map(({ msg, id, content, parts }) => {
+      const size = contentSize(content);
+      // A sharded body is that many store messages, consecutive from its
+      // first, which extract reads around it one by one. (Its "after" stops
+      // at 100, so a body of more parts, over 300,000 tokens at the memory
+      // strategy's default shard size, is read only that far.)
+      const read = canExtract
+        ? `history--extract with aroundId "${id}", before 0 and after ${parts - 1} reads it` +
+          `${parts > 1 ? `, stored as ${parts} parts` : ''}.`
+        : `Its id is ${id}${parts > 1 ? `, the first of the ${parts} parts it's stored as` : ''}.`;
+      return `- From ${msg.participant}${size ? `, ${size}` : ''}. ${read}`;
+    });
+    const content: ContentBlock[] = [{
+      type: 'text',
+      text: `[not shown] For ${agent.name}: ${one ? 'A message' : `${leftOut.length} messages`} arrived during your turn that ` +
+        `${one ? "isn't" : "aren't"} shown here, since your context doesn't keep ${one ? 'it' : 'them'} among ` +
+        `your newest messages:\n${lines.join('\n')}`,
+    }];
+    const metadata = { system: true, kind: 'left-out-notice' } as MessageMetadata;
+    try {
+      const id = agent.getContextManager().addMessage('user', content, metadata);
+      this.emitTrace({ type: 'message:added', messageId: id, source: 'left-out-notice' });
+      return { participant: 'user', content, metadata };
+    } catch (err) {
+      console.error(`[injection] ${agent.name}: couldn't store the notice of messages left out of the live round:`, err);
+      return undefined;
+    }
+  }
+
+  /**
    * Write drained entries in queue (seq) order, whatever their targets:
    * residents share one message slot, so the order entries arrived in is the
    * order they're stored. Each target is cut at its own first entry that
@@ -22067,7 +22143,7 @@ export class AgentFramework {
           continue;
         }
         if (found.length > 0) {
-          written.set(msg, { id: found[0]!.id, content: asCompiled(found) });
+          written.set(msg, { id: found[0]!.id, content: asCompiled(found), parts: found.length });
           this.logDeferredWriteError(msg, where, undefined, { count: found.length, sharded: found[0]!.bodyGroupId !== undefined, foundLater: true });
           onLanded?.(msg, found[0]!.id);
           continue;
@@ -22084,14 +22160,14 @@ export class AgentFramework {
         const copies = agent && before !== undefined && (this.storedCountOf(agent) ?? before) - before > 1
           ? this.storedCopiesOf(agent, before, msg.id) ?? []
           : [];
-        written.set(msg, { id, content: copies.length > 1 ? asCompiled(copies) : msg.content });
+        written.set(msg, { id, content: copies.length > 1 ? asCompiled(copies) : msg.content, parts: Math.max(1, copies.length) });
       } catch (error) {
         // What landed, read back from where the store stood before the
         // write; undefined when the store couldn't say, before the write or
         // after it. With no agent there's no store it could have landed in.
         const landed = !agent ? [] : before === undefined ? undefined : this.storedCopiesOf(agent, before, msg.id);
         if (landed && landed.length > 0) {
-          written.set(msg, { id: landed[0]!.id, content: asCompiled(landed) });
+          written.set(msg, { id: landed[0]!.id, content: asCompiled(landed), parts: landed.length });
           this.logDeferredWriteError(msg, where, error, { count: landed.length, sharded: landed[0]!.bodyGroupId !== undefined });
           onLanded?.(msg, landed[0]!.id);
           continue;
