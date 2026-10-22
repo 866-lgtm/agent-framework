@@ -655,8 +655,12 @@ export class EventGate {
     /** Per-event timeout (ms) for the optional gate.js script. Default 50. */
     scriptTimeoutMs?: number;
     /** Map an event to the registered channel it arrived on (the host knows
-     *  how push-event origins compose into channel ids). Default: a
-     *  channel-incoming event's own channel id; nothing for push events. */
+     *  how push-event origins compose into channel ids). The gate routes a
+     *  batched wake by it, tests a policy's `match.channel` against it when
+     *  the event's own id misses, and keys `keyBy: "channelId"` counts on it.
+     *  A resolver that throws counts as returning nothing. Default: a
+     *  channel-incoming event's own channel id; nothing for push events, so
+     *  a push then matches and counts by its own id alone. */
     resolveRouteChannel?: (info: GateEventInfo) => string | undefined;
   }) {
     this.configPath = opts.configPath;

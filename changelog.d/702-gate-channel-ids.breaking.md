@@ -36,6 +36,11 @@
     carried none, as a voice report doesn't. So a channel's messages and
     pushes now share one bucket or counter, and voice reports in different
     channels no longer share one.
+  - **A host that builds its own `EventGate` with `resolveRouteChannel`:**
+    its resolver, which routed batched wakes, now also decides which
+    channel policies a push meets and how `keyBy: "channelId"` counts it.
+    `EventGate`'s default resolver gives no push a registered id, so with
+    it a push matches and counts by its own id, as before.
 
   **Migration:** to keep a registered-form channel policy to the channel's
   messages, closed channels' addressed ones included, add `tagsAny:

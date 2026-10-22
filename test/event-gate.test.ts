@@ -1158,3 +1158,51 @@ describe('sleep', () => {
     }
   });
 });
+
+describe('EventGate: channel patterns and channelId keys through the route resolver (#702)', () => {
+  const policies = (channel: string): GateConfig => ({
+    policies: [
+      { name: 'room', match: { channel }, behavior: 'always' },
+      { name: 'rest', match: {}, behavior: 'skip' },
+    ],
+    default: 'skip',
+  });
+  const push = (metadata: Record<string, unknown>): GateEventInfo =>
+    event({ eventType: 'mcpl:push-event', serverId: 'discord', channelId: typeof metadata.channelId === 'string' ? metadata.channelId : '', metadata });
+  const registeredFromOrigin = (info: GateEventInfo): string | undefined =>
+    typeof info.metadata?.mcplChannelId === 'string' ? info.metadata.mcplChannelId : undefined;
+
+  it("with the default resolver, a push meets a pattern by its own id alone", () => {
+    const { gate } = makeGate(writeConfig('route-default.json', policies('discord:g1:room')));
+    assert.strictEqual(gate.evaluate(push({ channelId: 'room', mcplChannelId: 'discord:g1:room' })).policyName, 'rest');
+    assert.strictEqual(gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g1:room' })).policyName, 'room');
+  });
+
+  it("with a host's resolver, a push meets a pattern by the registered id it resolves", () => {
+    const { gate } = makeGate(writeConfig('route-host.json', policies('discord:g1:room')), { resolveRouteChannel: registeredFromOrigin });
+    assert.strictEqual(gate.evaluate(push({ channelId: 'room', mcplChannelId: 'discord:g1:room' })).policyName, 'room');
+    assert.strictEqual(gate.evaluate(push({ channelId: 'room', mcplChannelId: 'discord:g1:other' })).policyName, 'rest');
+  });
+
+  it("a resolver that throws matches nothing through it, and the event's own id still matches", () => {
+    const resolveRouteChannel = (): string | undefined => { throw new Error('boom'); };
+    const registered = makeGate(writeConfig('route-throw-registered.json', policies('discord:g1:room')), { resolveRouteChannel });
+    assert.strictEqual(registered.gate.evaluate(push({ channelId: 'room', mcplChannelId: 'discord:g1:room' })).policyName, 'rest');
+    const raw = makeGate(writeConfig('route-throw-raw.json', policies('room')), { resolveRouteChannel });
+    assert.strictEqual(raw.gate.evaluate(push({ channelId: 'room' })).policyName, 'room');
+  });
+
+  it("keyBy channelId counts by the resolved id, and by metadata.channelId when the resolver gives none", () => {
+    const config: GateConfig = {
+      policies: [{ name: 'limit', match: {}, behavior: { rate_limit: { tokens: 1, refillIntervalMs: 3_600_000, keyBy: 'channelId' } } }],
+      default: 'skip',
+    };
+    const { gate } = makeGate(writeConfig('route-keyby.json', config), { resolveRouteChannel: registeredFromOrigin });
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g1:room', metadata: { channelId: 'discord:g1:room' } }));
+    gate.evaluate(push({ channelId: 'room', mcplChannelId: 'discord:g1:room' }));
+    gate.evaluate(push({ channelId: 'side' }));
+    gate.evaluate(push({ channelId: 'other' }));
+    const state = gate.getStatus().policies.find((p) => p.name === 'limit')?.rateLimitState;
+    assert.deepStrictEqual(state, { bucketCount: 3, deniedCount: 1 }, "the room's message and push share one bucket; each unresolved push keys on its own channelId");
+  });
+});

@@ -191,6 +191,21 @@ describe('gate channel patterns on both paths', () => {
     assert.deepEqual(limit, { bucketCount: 1, deniedCount: 1 }, "the reaction finds the message's bucket empty");
   });
 
+  it("another adapter's push that names no registered id matches by its raw id alone", async () => {
+    const send = await gateFor([
+      { name: 'registered', match: { scope: BOTH_PATHS, channel: REGISTERED }, behavior: 'defer' },
+      { name: 'raw', match: { scope: BOTH_PATHS, channel: RAW }, behavior: 'defer' },
+      { name: 'rest', match: { scope: BOTH_PATHS }, behavior: 'defer' },
+    ]);
+    assert.equal(await send(push({
+      eventId: 'ev-other-adapter',
+      origin: { source: 'other', channelId: RAW, messageId: 'o-1' },
+      tags: ['chat:addressed'],
+      payload: { content: [{ type: 'text', text: 'hello from elsewhere' }] },
+    })), 'raw');
+    assert.equal(await send(`guild ev-8 g1 ${RAW} bare hello`), 'registered', "a Discord push in the room meets the registered form first");
+  });
+
   it("a DM's push meets a pattern in a DM's registered form", async () => {
     const send = await gateFor(roomThenRest('discord:dm:*'));
     assert.equal(await send('dm ev-6 134 1548000000000000001 are you there?'), 'room');
