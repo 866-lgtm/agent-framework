@@ -1326,6 +1326,39 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
+  it("an addressed message a boundary leaves out of the injection doesn't re-pin the turn: the live stream never heard it", async () => {
+    // The control is the test above that re-pins: the same DM, injected,
+    // moves the trailing prose to the DM.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Station four, proceeding.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Carrying on where I was.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    const cm = framework.getAgent('assistant')!.getContextManager();
+    let rendered = 0;
+    (cm as { renderAsNewest: unknown }).renderAsNewest = (ids: readonly string[]) => { rendered++; return ids.map(() => null); };
+    module.toolDelayMs = 25;
+    module.interjection = 'hey, quick question over here?';
+    module.interjectionMetadata = { channelId: 'discord:dm:antra', tags: ['chat:addressed'] };
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.equal(rendered, 1, 'the premise: the boundary rendered the DM, and left it out');
+    assert.deepEqual(membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? [], [], 'nothing was injected');
+    assert.deepEqual(routed, [
+      { text: 'Station four, proceeding.', locus: 'chan-live-1' },
+      { text: 'Carrying on where I was.', locus: 'chan-live-1' },
+    ]);
+
+    await framework.stop();
+  });
+
   it("a budget restart takes as an arrival an addressed message its boundary stored and left out of the injection", async () => {
     // The boundary renders the DM as null, as for one the next compile won't
     // send among its newest, so the live stream never hears it. The restart

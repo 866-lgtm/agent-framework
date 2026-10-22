@@ -22,7 +22,7 @@ import type {
   ToolResult,
 } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
-import { WindowedPassthroughStrategy, type ContextInjection, type MessageId } from '@animalabs/context-manager';
+import { AutobiographicalStrategy, WindowedPassthroughStrategy, type ContextInjection, type MessageId } from '@animalabs/context-manager';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
@@ -173,6 +173,31 @@ describe('a message injected at a tool boundary', () => {
     assert.ok(logged.some((l) => l.includes('[injection]') && l.includes('left out') && l.includes(row.id)), `the log names it: ${JSON.stringify(logged)}`);
     // As anything stored at a boundary that marks: the text says what that costs.
     assert.ok(agent.getConsumedWatermark()!.sequence >= row.sequence, 'the consumed mark covers it');
+  });
+
+  it('under the memory strategy, a batch bigger than the recent window: the message before it is left out, and the rest goes in as the next request carries it', async () => {
+    // No stand-in: the strategy's own render decides. A recent window smaller than the batch puts the
+    // batch's first message before it.
+    await create(new AutobiographicalStrategy({
+      adaptiveResolution: true, foldingStrategy: 'kv-stable', recentWindowTokens: 300, kvStableReachTokens: 8_000,
+      targetChunkTokens: 1_000,
+    }));
+    // About 1,000 tokens, more than the recent window holds, then a short message that fits in it.
+    const long = 'FIRSTLONG ' + Array.from({ length: 600 }, (_, i) => `word${i}`).join(' ');
+    const logged: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    let injected: Array<{ content: unknown[] }>;
+    try {
+      injected = await turnWith([[text(long)], [text('SECONDSHORT and a few words more')]]);
+    } finally {
+      console.error = original;
+    }
+    assert.equal(holding(injected, 'FIRSTLONG'), '', 'the message before the recent window is left out');
+    const second = holding(injected, 'SECONDSHORT');
+    assert.ok(second.length > 0, 'the rest of the batch goes in');
+    assert.ok(logged.some((l) => l.includes('[injection]') && l.includes('left out')), `the log names it: ${JSON.stringify(logged.filter((l) => l.includes('[injection]')))}`);
+    assert.deepEqual(JSON.parse((await nextRequest())('SECONDSHORT')), JSON.parse(second));
   });
 
   it('goes in as stored where the strategy has no render', async () => {
