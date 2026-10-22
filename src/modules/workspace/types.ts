@@ -23,21 +23,42 @@ export interface MountConfig {
    *   three-way rule as its listings, searches, syncs and scans reach them.
    *   A read of a path the store doesn't hold takes in a new file there;
    *   otherwise it reads the store's copy.
-   * - 'direct': for a checkout an agent reads, not one it changes. Every
-   *   read, listing and search is disk's own copy as it is when it runs,
-   *   and none of its files go into the store. No scan or watcher
+   * - 'direct': for a checkout, such as a git one, whose history is its
+   *   own. Every read, listing and search is disk's own copy as it is when
+   *   it runs, and none of its files go into the store. No scan or watcher
    *   runs, so no call waits behind one, and `sync`, `materialize` and the
-   *   watch settings have nothing to act on. Only with `mode: 'read-only'`,
-   *   and not with `watch` other than 'never', `watchDebounceMs`,
-   *   `watchRootPollMs`, a `wakeOnChange` that would wake (true, or a
-   *   non-empty list) or `autoMaterialize: true`: each of those would never
-   *   act, and the workspace refuses the mount. Its `ignore`
+   *   watch settings have nothing to act on. Not with `watch` other than
+   *   'never', `watchDebounceMs`, `watchRootPollMs`, a `wakeOnChange` that
+   *   would wake (true, or a non-empty list) or `autoMaterialize: true`:
+   *   each of those would never act, and the workspace refuses the mount.
+   *   Writable, as any mount with no `mode` is, its `write`, `edit`,
+   *   `edit_many` and `delete` land on disk when they answer, or don't
+   *   happen: a file is staged beside itself in `.workspace-staged-<id>` and
+   *   renamed over itself, keeping its mode, so no reader sees half of it;
+   *   an edit is applied to disk's text as it is now, and again on top of a
+   *   change another writer makes meanwhile; and `edit_many` checks every
+   *   edit before writing its files one by one, naming each file's outcome
+   *   if a write fails partway. A file with other hard links gets a file of
+   *   its own at its path, and the others keep the old text; a file this
+   *   process may not write is refused. Nothing is synced, so a power loss
+   *   can lose a write its answer called landed. An undo or other move of
+   *   the store's head leaves the files as they are, and at the agent's next
+   *   start the framework tells it once that writes from turns its history
+   *   no longer holds are still on disk. Where each agent's latest write
+   *   lies is saved at a clean stop, in a record no branch switch rewinds,
+   *   so a restart on another branch still tells it, and after a crash a
+   *   move away from the writes since then isn't told. The framework's own
+   *   files, its
+   *   tool-result spills, saved payloads and fetched references, never go to
+   *   a mount configured direct. Its `ignore`
    *   has a default (see there). Paths, links, its `include`, other mounts'
    *   directories, size limits and the walk cap hold as on a 'chronicle'
-   *   mount. Its tools read beneath whatever directory is at its
-   *   root, with no check against the one a 'chronicle' run of it last
-   *   agreed with. Where that root now lies elsewhere than the last start
-   *   placed it, each call nests in it, as a start would now, every mount
+   *   mount. Its tools read and write beneath whatever directory is at its
+   *   root when each call starts, with no check against the one a
+   *   'chronicle' run of it last agreed with, so a root repointed through a
+   *   link is read and written where it leads now. Where that root now lies
+   *   elsewhere than the last start placed it, each call nests in it, as a
+   *   start would now, every mount
    *   configured beneath its path, where that path leads beneath its root,
    *   and every other mount whose root, as that start placed it, lies
    *   beneath where its root lies now, or whose configured path lies

@@ -5418,6 +5418,16 @@ export class AgentFramework {
     }
     this.resetCompletedStop('addModule()');
     await this.moduleRegistry.addModule(module);
+    // The workspace judges whether an agent's history holds a message as the
+    // framework judges its own notices, for its head-move notice
+    // (noticeHeadMoves) and the writes it weighs against it. A module taken
+    // for the workspace by its writeBinary (getWorkspaceModule) may have no
+    // such call, as a host's own or a test's stand-in hasn't.
+    const workspace = this.getWorkspaceModule();
+    if (workspace === module && typeof workspace.useHistory === 'function') {
+      workspace.useHistory((agentName, messageId) =>
+        this.agents.get(agentName)?.getContextManager().getMessage(messageId as MessageId) != null);
+    }
     this.emitTrace({ type: 'module:added', moduleName: module.name });
   }
 
@@ -5787,7 +5797,7 @@ export class AgentFramework {
           }
           const mount = this.firstWritableMountName(workspace);
           if (!mount) {
-            console.error(`[refs] couldn't store ${fileName}: no writable workspace mount without an include`);
+            console.error(`[refs] couldn't store ${fileName}: ${this.noFileMountText()}`);
             return null;
           }
           const path = `${mount}/refs/${fileName}`;
@@ -14932,6 +14942,48 @@ export class AgentFramework {
   }
 
   /**
+   * Turn start, every one: where the agent's history holds neither its
+   * latest direct write to a mount nor the notice of its departure
+   * from it, as after an undo or another move of the store's head away from
+   * that write, the workspace's notice that those writes are still on disk
+   * goes into the history, privately, before the compile, as the drafts
+   * notice does, and the workspace keeps its id (headMoveNotice). On an
+   * unmoved head it finds nothing due and stores nothing.
+   */
+  private noticeHeadMoves(agent: Agent): void {
+    const workspace = this.getWorkspaceModule();
+    // A module taken for the workspace by its writeBinary may have no such
+    // check (addModule says why), and then nothing is due.
+    if (!workspace || typeof workspace.headMoveNotice !== 'function' || typeof workspace.headMoveNoticeStored !== 'function') return;
+    let due: { text: string; mounts: string[] } | null;
+    try {
+      due = workspace.headMoveNotice(agent.name);
+    } catch (err) {
+      console.error('[workspace] head-move check failed:', err);
+      return;
+    }
+    if (!due) return;
+    let mid: string;
+    try {
+      mid = agent.getContextManager().addMessage(
+        'user',
+        [{ type: 'text', text: due.text }],
+        { system: true, kind: 'workspace-head-move', mounts: due.mounts } as MessageMetadata,
+      );
+    } catch (err) {
+      console.error('[workspace] head-move notice failed:', err);
+      return;
+    }
+    // Recorded as soon as it's stored, so nothing after can leave it stored and unrecorded.
+    workspace.headMoveNoticeStored(agent.name, due.mounts, mid);
+    try {
+      this.emitTrace({ type: 'message:added', messageId: mid, source: 'workspace-head-move' });
+    } catch (err) {
+      console.error('[workspace] head-move notice trace failed:', err);
+    }
+  }
+
+  /**
    * Logical turn end, after the turn's deferred notices are flushed: record
    * as noticed exactly the drafts a stored message names (the receipt, a
    * held-draft notice, a bounce notice), each with the message that names
@@ -17356,6 +17408,10 @@ export class AgentFramework {
       }
       this.midTurnInputSignals.delete(agent.name);
     }
+    // At every start, opening, continuing or resuming: a head can move under
+    // a running turn without ending it, so the notice that writes the history
+    // no longer holds are still on disk goes in before this start's compile.
+    this.noticeHeadMoves(agent);
 
     if (opensTurn) {
       // The turn's trigger channel (item-3 redux): the channel of a
@@ -20476,20 +20532,45 @@ export class AgentFramework {
   }
 
   /**
-   * The first read-write mount without an include, or null. The framework
-   * keeps its own files there (`tool-results/`, `refs/`). A mount with an
-   * include holds only the files it names, so it would refuse them, and a
-   * setup whose only writable mount has one is treated as having none.
+   * The first read-write mount without an include that isn't configured
+   * direct, or null. The framework keeps its own files there
+   * (`tool-results/`, `refs/`). A mount with an include holds only the files
+   * it names, so it would refuse them, and a setup whose only writable mount
+   * has one, or is direct, is treated as having none.
    */
   private firstWritableMountName(workspace: WorkspaceModule): string | null {
     const mounts = (workspace as unknown as {
-      getMounts?: () => Array<{ name: string; mode: string; include?: readonly string[] }>;
+      getMounts?: () => Array<{ name: string; mode: string; include?: readonly string[]; backend?: 'direct' }>;
     }).getMounts?.();
     if (mounts) {
-      const rw = mounts.find((m) => m.mode !== 'read-only' && m.include === undefined);
+      // Not a mount configured direct, whether it runs direct or as
+      // 'chronicle' this session: it's a directory agents write directly
+      // when it runs direct, so these, the framework's files about the
+      // agent's calls, would stay there after an undo, and in a checkout, as
+      // a direct mount often is, `git status` would show them.
+      const rw = mounts.find((m) => m.mode !== 'read-only' && m.include === undefined && m.backend !== 'direct');
       return rw?.name ?? null;
     }
     return null;
+  }
+
+  /**
+   * Why firstWritableMountName found no mount, for the words that say so:
+   * none writable without an include, or only mounts configured direct, which
+   * it passes over.
+   */
+  private noFileMountText(): string {
+    return this.directPassedOver()
+      ? 'no writable workspace mount without an include that keeps its files in the store'
+      : 'no writable workspace mount without an include';
+  }
+
+  /** Whether firstWritableMountName passed over a writable mount without an include because it's configured direct. */
+  private directPassedOver(): boolean {
+    const mounts = (this.getWorkspaceModule() as unknown as {
+      getMounts?: () => Array<{ mode: string; include?: readonly string[]; backend?: 'direct' }>;
+    } | null)?.getMounts?.();
+    return mounts?.some((m) => m.mode !== 'read-only' && m.include === undefined && m.backend === 'direct') ?? false;
   }
 
   /**
@@ -20852,7 +20933,7 @@ export class AgentFramework {
     }
     return {
       text: head
-        + '\n\n[truncated — original was ' + content.length + ' chars; no writable workspace mount without an include, full content not retained]'
+        + '\n\n[truncated — original was ' + content.length + ' chars; ' + this.noFileMountText() + ', full content not retained]'
         + kept,
       filePath: null,
       written,
@@ -27405,7 +27486,12 @@ export class AgentFramework {
             return null;
           }
         : null;
-      return normalizeStandardToolResult(result, label, save, mcplToolNoWordsText(serverId, callName));
+      // Where the only mount that could hold it is direct, the stub says so,
+      // rather than that no workspace is mounted (noFileMountText).
+      const noSave = workspace && !mount && this.directPassedOver()
+        ? 'no workspace mount that keeps its files in the store can save it'
+        : undefined;
+      return normalizeStandardToolResult(result, label, save, mcplToolNoWordsText(serverId, callName), noSave);
     }
     const blocks = (Array.isArray(result.content) ? result.content : []) as McpToolResultContent[];
     // When the result contains non-text blocks (RFC-005 references, images),
@@ -28456,7 +28542,7 @@ export class AgentFramework {
           });
           let result: Awaited<ReturnType<typeof workspace.writeBinary>>;
           try {
-            result = await workspace.writeBinary(destination, bytes, image.mediaType);
+            result = await workspace.writeBinary(destination, bytes, image.mediaType, { agentName });
           } catch (error) {
             // A throw leaves the file's tree entry as it was, unless its
             // error says that whether the entry changed isn't known

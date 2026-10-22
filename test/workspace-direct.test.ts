@@ -1830,8 +1830,6 @@ test('a direct mount whose config sets what would never act there is refused, na
     assert.fail(`accepted ${JSON.stringify(mount)}`);
   };
   const lead = '[workspace] Mount "ref" is direct, which reads disk as it is with no store, watcher or push: ';
-  assert.equal(refused({ mode: 'read-write' }), `${lead}mode must be 'read-only', not "read-write"`);
-  assert.equal(refused({ mode: undefined }), `${lead}mode must be 'read-only' (left out, it's 'read-write')`);
   assert.equal(refused({ watch: 'always' }), `${lead}watch "always" would watch nothing (leave it out, or set 'never')`);
   assert.equal(refused({ watch: 'on-agent-action' }), `${lead}watch "on-agent-action" would watch nothing (leave it out, or set 'never')`);
   assert.equal(refused({ watchDebounceMs: 100 }), `${lead}watchDebounceMs would tune no watcher (leave it out)`);
@@ -1840,11 +1838,12 @@ test('a direct mount whose config sets what would never act there is refused, na
   assert.equal(refused({ wakeOnChange: ['created'] }), `${lead}wakeOnChange would never wake (leave it out)`);
   assert.equal(refused({ autoMaterialize: true }), `${lead}autoMaterialize would never push (leave it out)`);
   assert.equal(
-    refused({ mode: 'read-write', autoMaterialize: true }),
-    `${lead}mode must be 'read-only', not "read-write"; autoMaterialize would never push (leave it out)`,
+    refused({ mode: 'read-write', watch: 'always', autoMaterialize: true }),
+    `${lead}watch "always" would watch nothing (leave it out, or set 'never'); autoMaterialize would never push (leave it out)`,
   );
-  for (const accepted of [{}, { watch: 'never' as const }, { wakeOnChange: false }, { wakeOnChange: [] }, { autoMaterialize: false }]) {
-    new WorkspaceModule({ mounts: [{ ...base, ...accepted }] });
+  // Either mode is a direct mount's own, and one that names none writes, as any mount does.
+  for (const accepted of [{}, { mode: 'read-write' as const }, { mode: undefined }, { watch: 'never' as const }, { wakeOnChange: false }, { wakeOnChange: [] }, { autoMaterialize: false }]) {
+    new WorkspaceModule({ mounts: [{ ...base, ...accepted } as MountConfig] });
   }
   assert.throws(
     () => new WorkspaceModule({ mounts: [{ ...base, backend: 'disk' as MountConfig['backend'] }] }),
@@ -2273,6 +2272,35 @@ test("a mount configured direct with no ignore list walks by the direct kind's d
   const listed = (await data<{ entries: Array<{ path: string }> }>(held, 'ls', { path: 'ref', recursive: true })).entries.map((e) => e.path);
   assert.deepEqual(listed.filter((path) => !['drafted.ts', 'src/a.ts'].includes(path)), []);
   assert.deepEqual(env.store.treeList('workspace/ref/tree').map((e) => e.path).sort(), ['drafted.ts', 'src/a.ts']);
+});
+
+test("a mount configured direct that runs as 'chronicle' is still direct to getMounts, and its agents' saved positions still give the notice", async (t) => {
+  const env = new Env(t);
+  // A direct session's scout position, saved at its stop, on a branch gone since.
+  const direct = await env.open({ mode: 'read-write' });
+  (direct as unknown as { directHeads: Map<string, Map<string, unknown>> }).directHeads.set('ref', new Map([['scout', { branchId: 'zz-a-branch-gone-since', after: 1, notice: null }]]));
+  await env.close(direct);
+  const chronicle = await env.openChronicle();
+  await data(chronicle, 'write', { path: 'ref/drafted.ts', content: 'draft\n' });
+  await env.close(chronicle);
+  // Naming no mode, so it's writable.
+  const m = await env.open({ mode: undefined });
+  assert.equal(env.alerts.length, 1, "it runs as 'chronicle'");
+  // Its directory is a checkout either way, so the framework's files pass over it.
+  assert.equal(m.getMounts()[0]?.backend, 'direct');
+  // And status gives its mode as writable, as when it runs direct.
+  const status = (await data<Record<string, Record<string, unknown>>>(m, 'status')).ref!;
+  assert.deepEqual([status.mode, status.backend], ['read-write', 'chronicle']);
+  // And the writes the scout made while it ran direct are on disk.
+  assert.deepEqual(m.headMoveNotice('scout')?.mounts, ['ref']);
+  await env.close(m);
+  // A mode it names is given as named, and a store-backed mount naming none shows none, as on main.
+  const named = await env.open({ mode: 'read-only' });
+  const namedStatus = (await data<Record<string, Record<string, unknown>>>(named, 'status')).ref!;
+  assert.deepEqual([namedStatus.mode, namedStatus.backend], ['read-only', 'chronicle']);
+  await env.close(named);
+  const plain = await env.open({ backend: 'chronicle', mode: undefined, watch: 'never' });
+  assert.equal((await data<Record<string, Record<string, unknown>>>(plain, 'status')).ref!.mode, undefined);
 });
 
 test("a mount that ran direct takes in what disk changed meanwhile when it runs as 'chronicle' again", async (t) => {
