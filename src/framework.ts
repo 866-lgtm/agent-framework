@@ -414,8 +414,10 @@ function malformedResponseContent(response: EventResponse): { where: string; pla
  * mid-turn message's text at chars/4 and its other blocks about as
  * context-manager's store prices them (injectedBlockTokens), and a small
  * per-block envelope allowance. On membrane's native tool path a mid-turn
- * message rides into the next round with its stored content as it is
- * (provideToolResults' injectedMessages). Its XML tool path declares that it
+ * message rides into the next round as the boundary injects it, which is as
+ * the strategy renders it for the next compile, cut and with its images
+ * limited (renderForInjection), or its stored content where the strategy
+ * can't say (provideToolResults' injectedMessages). Its XML tool path declares that it
  * can't carry injected messages, so the tool boundary injects none there and
  * that term is zero. Deliberately a
  * ceiling-ish heuristic, but for a mid-turn message's media at the store's
@@ -11785,14 +11787,20 @@ export class AgentFramework {
           // live turn sees them instead of the agent staying deaf until the
           // turn ends. The window stores them here, right after the
           // tool_result message, which is exactly where the membrane appends
-          // them in the live conversation — same participant, same content
-          // blocks, and neither carries the row's metadata — and compile()
-          // emits recent messages verbatim, so the next turn's compiled prefix
-          // byte-matches the live request (prompt-cache safe). A write that
-          // threw after it was stored, whose landing couldn't be read, is the
-          // exception: it's carried at the flush that finds it, after what was
-          // stored since, so there the store and the live request differ
-          // (writeDrainedInOrder).
+          // them in the live conversation — same participant, and neither
+          // carries the row's metadata — and each goes in as the next compile
+          // will send it, which the strategy renders (renderForInjection): cut
+          // by the per-message cap, a sharded body joined, and its images as
+          // the image limits leave them at the newest position. So the next
+          // turn's compiled prefix matches the live request (prompt-cache
+          // safe), up to what came after them: a later message can still
+          // take an earlier one past an image limit, as for any message, and
+          // the next compile then strips that image where the live rounds
+          // carried it. One the next compile won't send among its newest
+          // isn't injected. A write that threw after it was stored, whose landing
+          // couldn't be read, is the exception: it's carried at the flush
+          // that finds it, after what was stored since, so there the store and
+          // the live request differ (writeDrainedInOrder).
           //
           // The queue is drained ONLY at the target agent's own boundary:
           // draining at another agent's boundary would store the messages
@@ -11827,19 +11835,21 @@ export class AgentFramework {
           // a held message does, rather than sitting in the window between
           // rounds the stream never showed it.
           const midTurnInjections: Array<{ participant: string; content: ContentBlock[]; metadata?: MessageMetadata }> = [];
-          // The injected messages' ids, for a boundary that leaves them to the
-          // turn's next start as arrivals.
-          const injectedIds = new Map<object, MessageId>();
+          // What this boundary stored for the agent to hear, in store order,
+          // injected or left out, for a boundary that leaves it to the turn's
+          // next start as arrivals: that start's compile sends it.
+          const heard: Array<{ msg: DeferredWrite; id: MessageId; content: ContentBlock[] }> = [];
           if (currentState.supportsInjectedMessages !== false) {
             const deferred = this.drainDeferredFor(agent.name, (msg) => !isInjectableMidTurn(msg, agent.name));
             // Stored in queue order, cut at the first that can't be stored: it
             // and what follows wait for the turn's end, and only what was
             // stored is injected (the round's results go on either way). One
             // the store refuses as malformed is dropped instead, and what
-            // follows goes on. A sharded body read back from its store is
-            // injected as later compiles render it, its shards joined, and a
-            // write that threw after storing, which counts as stored, as what
-            // landed of it (writeDrainedInOrder).
+            // follows goes on. What was stored is injected as the next compile
+            // will send it (renderForInjection). Where the strategy can't say,
+            // a sharded body read back from its store is injected as later
+            // compiles join it, and a write that threw after storing, which
+            // counts as stored, as what landed of it (writeDrainedInOrder).
             const stored = this.writeDrainedInOrder(deferred, `tool boundary for ${agent.name}`, (msg) =>
               agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id)));
             for (const [msg, { id, content }] of stored) {
@@ -11851,13 +11861,28 @@ export class AgentFramework {
               // compiled view; injecting it here would put in the live turn
               // what the next compile hides (#232 gap 5).
               if ((msg.metadata as { tuneOut?: unknown } | undefined)?.tuneOut) continue;
-              const injection = {
+              heard.push({ msg, id, content });
+            }
+            // Rendered in one call: a render prepares as a compile does, so
+            // the batch shares one preparation. The image limits count from
+            // the batch's oldest message to the newest, as a compile does.
+            const rendered = this.renderForInjection(agent, heard.map((h) => h.id));
+            const leftOut: MessageId[] = [];
+            heard.forEach(({ msg, id, content }, i) => {
+              const sent = rendered ? rendered[i]! : content;
+              // The next compile won't send it among its newest: injected, it
+              // would put in the live turn what that compile sends elsewhere,
+              // or not at all. It's under any consumed mark the boundary sets
+              // (below), as anything stored here is.
+              if (sent === null) { leftOut.push(id); return; }
+              midTurnInjections.push({
                 participant: msg.participant,
-                content,
+                content: sent,
                 ...(msg.metadata ? { metadata: msg.metadata } : {}),
-              };
-              midTurnInjections.push(injection);
-              injectedIds.set(injection, id);
+              });
+            });
+            if (leftOut.length > 0) {
+              console.error(`[injection] ${agent.name}: left out of the live round, since the next compile won't send them among its newest: ${leftOut.join(', ')}`);
             }
           }
 
@@ -11995,10 +12020,11 @@ export class AgentFramework {
             }
           } else if (routesLocus && !shouldEndTurn) {
             // A boundary that can't re-pin now (over budget, or no live
-            // stream to tell) leaves its injections to the turn's next start,
-            // as arrivals: a budget restart, or a re-inference on these tool
-            // results.
-            for (const inj of midTurnInjections) this.noteArrival(agent.name, inj.metadata, injectedIds.get(inj)!);
+            // stream to tell) leaves what it stored for the agent to the
+            // turn's next start, as arrivals: a budget restart, or a
+            // re-inference on these tool results. That includes a message
+            // left out of the injection, since that start compiles anew.
+            for (const { msg, id } of heard) this.noteArrival(agent.name, msg.metadata, id);
           }
 
           if (shouldEndTurn) {
@@ -12101,6 +12127,15 @@ export class AgentFramework {
             // Under context-manager#160 such a write already gives the
             // replies stored after it stamps their requests didn't carry,
             // whatever the mark says; deferring those writers is the fix.
+            // When the boundary injects anything, the mark also covers a
+            // message it stored and left out of the injection, since the next
+            // compile won't send it among its newest. That one then counts as
+            // read though no request carried it: a coalesced render's wake to
+            // read it drops, and a release doesn't pass it to the primary.
+            // Where the view leaves it out, no request will. Where the memory
+            // strategy places it before its recent window, a batch bigger than
+            // that window, the next compile carries it, in whatever turn
+            // something else starts.
             if (midTurnInjections.length > 0) {
               // Possibly shown, whatever the stream declares: the first-view
               // mark (CoalescerHost.isUnshown) counts a doubt as shown.
@@ -21736,8 +21771,9 @@ export class AgentFramework {
     // messages flush at the next turn's START (before its compile — riding
     // their own wake), at the agent's next tool boundary (where they are
     // ALSO injected into the live stream — hear-while-acting — all but a
-    // message a tune-out holds from the residents), or in driveStream's
-    // finally when the turn ends.
+    // message a tune-out holds from the residents, and one the next compile
+    // won't send among its newest), or in driveStream's finally when the
+    // turn ends.
     // Quiesce (issue #122): the window exists to run compression/refold
     // against a FROZEN context — module events and api message.send must not
     // append mid-surgery. Deferred here, flushed by resume(). tool_result
@@ -21886,6 +21922,27 @@ export class AgentFramework {
       if (!this.deferredMessages.some((m) => m.id === msg.id)) this.deferredMessages.push(msg);
     }
     if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
+  }
+
+  /**
+   * What the next compile sends for each of `ids`, messages a tool boundary
+   * has just stored, as the agent's strategy renders them as the newest of
+   * its window (ContextManager.renderAsNewest): cut by the per-message cap,
+   * a sharded body joined, and the image limits applied over the batch, so
+   * the live stream hears what the next compile sends. An id comes back as
+   * null where that compile won't send the message among its newest.
+   * Undefined where the strategy has no such hook, or the render threw,
+   * which is logged: the boundary then injects what it stored, as it did
+   * before strategies could say.
+   */
+  private renderForInjection(agent: Agent, ids: MessageId[]): Array<ContentBlock[] | null> | undefined {
+    if (ids.length === 0) return undefined;
+    try {
+      return agent.getContextManager().renderAsNewest(ids);
+    } catch (error) {
+      console.error(`[injection] ${agent.name}: couldn't render the messages a tool boundary stored as the next compile sends them, so they're injected as stored:`, error);
+      return undefined;
+    }
   }
 
   /**

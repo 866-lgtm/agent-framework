@@ -1326,6 +1326,36 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
+  it("a budget restart takes as an arrival an addressed message its boundary stored and left out of the injection", async () => {
+    // The boundary renders the DM as null, as for one the next compile won't
+    // send among its newest, so the live stream never hears it. The restart
+    // compiles anew, and the DM is still an arrival of the turn it continues.
+    const overBudget = createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use');
+    overBudget.usage = { inputTokens: 100, outputTokens: 5 };
+    membrane.pushResponse(overBudget);
+
+    const framework = await createFramework({ maxStreamTokens: 20 });
+    const routed = stubChannelRegistry(framework);
+    const cm = framework.getAgent('assistant')!.getContextManager();
+    let rendered = 0;
+    (cm as { renderAsNewest: unknown }).renderAsNewest = (ids: readonly string[]) => { rendered++; return ids.map(() => null); };
+    module.toolDelayMs = 25;
+    module.interjection = 'quick question for you';
+    module.interjectionMetadata = addressed('discord:dm:antra');
+    feedStart(framework, 2, [{ type: 'text', text: 'After the restart.' }] as ContentBlock[]);
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.equal(membrane.calls.length, 2, 'control: the turn restarted for its budget');
+    assert.equal(rendered, 1, 'the premise: the boundary rendered the DM, and left it out');
+    assert.deepEqual(routed, [{ text: 'After the restart.', locus: 'discord:dm:antra' }], 'the restart re-pinned to the DM');
+
+    await framework.stop();
+  });
+
   for (const [label, messages, expected] of [
     ["keeps the turn's locus", [], 'chan-turn'],
     ['moves it to the newest addressed arrival',
