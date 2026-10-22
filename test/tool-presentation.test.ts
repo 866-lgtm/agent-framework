@@ -328,7 +328,7 @@ test('a presentation file the host can\'t use: edits refuse it and the catalogue
  } finally {rmSync(dir,{recursive:true,force:true});}
 });
 
-test('a presentation file holding {} is the empty document, as a missing one is, and a 0-byte file or half a document still refuses',()=>{
+test('a presentation file holding {} is the empty document, as a missing one is, and a 0-byte file, half a document or a value that isn\'t an object still refuses',()=>{
  const dir=mkdtempSync(join(tmpdir(),'presentation-empty-object-'));
  try {
   const path=join(dir,'tools.json'), p=new ToolPresentation({path,cataloguePath:'board/tools.md'});
@@ -345,6 +345,8 @@ test('a presentation file holding {} is the empty document, as a missing one is,
   for (const [content,problem] of [
    ['{"tools":{}}','"version" must be 1, and it\'s missing'],
    ['{"version":1}','"tools" must be an object of tool names, and it\'s missing'],
+   // Top-level values that aren't objects, for which Object.keys() gives no keys either (or, for null, throws).
+   ...['null','true','1'].map(value=>[value,`its top level is ${value}, not an object like {"version":1,"tools":{}}`]),
   ]) {
    writeFileSync(path,content);
    assert.equal(p.edit('set_tool_visibility',{name:'example',visible:true},tools).error,refusedAs(problem),content);
