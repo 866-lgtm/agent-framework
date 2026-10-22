@@ -11883,12 +11883,14 @@ export class AgentFramework {
             // and is injected first, as the next compile sends it.
             const rendered = this.renderForInjection(agent, [...(clock ? [clock.id] : []), ...heard.map((h) => h.id)]);
             const first = clock ? 1 : 0;
-            // A null is a message the render places before its window: the
-            // memory strategy's recent window, when what this boundary stored
-            // is bigger than it. The next compile still sends it, raw and in
-            // order, after the tool result, so leaving it out would change the
-            // prefix as surely as any form, and the agent wouldn't hear it
-            // (context-manager#275's review, R1-1). It goes in as stored. That
+            // A null is a message the render places before its window. Under
+            // the memory strategy that's one before its recent window, when
+            // what this boundary stored is bigger than it, or any message
+            // while a head window a topic change reset hasn't filled yet. The
+            // next compile still sends it, raw and in order, after the tool
+            // result, so leaving it out would change the prefix as surely as
+            // any form, and the agent wouldn't hear it (context-manager#275's
+            // review, R1-1). It goes in as stored. That
             // rests on two things. The only view filter this framework gives
             // a store is the tune-out stamp (createAgent's; the other stores
             // it opens have none), and a stamped message is skipped above, so
@@ -21902,9 +21904,8 @@ export class AgentFramework {
     // messages flush at the next turn's START (before its compile — riding
     // their own wake), at the agent's next tool boundary (where they are
     // ALSO injected into the live stream — hear-while-acting — all but a
-    // message a tune-out holds from the residents, and one the next compile
-    // won't send among its newest), or in driveStream's finally when the
-    // turn ends.
+    // message a tune-out holds from the residents), or in driveStream's
+    // finally when the turn ends.
     // Quiesce (issue #122): the window exists to run compression/refold
     // against a FROZEN context — module events and api message.send must not
     // append mid-surgery. Deferred here, flushed by resume(). tool_result

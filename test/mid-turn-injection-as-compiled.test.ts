@@ -216,6 +216,26 @@ describe('a message injected at a tool boundary', () => {
     assert.deepEqual(at.map((k) => JSON.parse(sentNext[k]!)), live.map((c) => JSON.parse(c)));
   });
 
+  it('under the memory strategy, after a head window reset, a message the head has not filled up to goes in as the next request sends it', async () => {
+    // A reset head window (connectome-host's /newtopic) that hasn't filled yet
+    // ends at the newest message, so the render gives every id null, whatever
+    // the batch's size. The next compile sends the head's messages raw.
+    await create(new AutobiographicalStrategy({
+      adaptiveResolution: true, foldingStrategy: 'kv-stable', headWindowTokens: 4000, compressionModel: 'mock',
+      autoTickOnNewMessage: false,
+    } as never));
+    const cm = framework.getAgent('assistant')!.getContextManager();
+    for (let i = 0; i < 3; i++) cm.addMessage(i % 2 ? 'assistant' : 'user', [text(`hist${i} before the new topic`)]);
+    await cm.resetHeadWindow('A new topic.');
+    const nulls: number[] = [];
+    renderWith((ids, real) => { const r = real(ids)!; nulls.push(r.filter((c) => c === null).length); return r; });
+    const injected = await turnWith([[text('AFTERRESET a short message')]]);
+    assert.equal(nulls[0], 1, 'the premise: the render gave the message null');
+    const live = holding(injected, 'AFTERRESET');
+    assert.deepEqual(JSON.parse(live), [text('AFTERRESET a short message')], 'it goes in as stored');
+    assert.deepEqual(JSON.parse((await nextRequest())('AFTERRESET')), JSON.parse(live), 'as the next request sends it');
+  });
+
   it('under the memory strategy, a body bigger than the recent window goes in as stored, and the rest as the next request sends it', async () => {
     // The strategy stores the long message as several shards and the render
     // gives it null. As stored, it goes in joined, as the store reads it back.
