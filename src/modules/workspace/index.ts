@@ -2037,7 +2037,7 @@ export class WorkspaceModule implements Module {
         return { success: false, isError: true, error: `The ${call.name} call did nothing: ${problem}.` };
       }
       const input = call.input as Record<string, unknown>;
-      // The most of this call's result that reaches its caller whole: past
+      // The most of this call's result that can reach its caller whole: past
       // it, a model's result spills into a file, and a script gets
       // ResultTooLarge in its place. A call made in process carries none and
       // takes the data itself, so its read pages by its line limit alone.
@@ -3844,7 +3844,7 @@ export class WorkspaceModule implements Module {
 
   /**
    * A read's page, held to `maxChars`, the most of this call's result that
-   * reaches its caller whole. A call that carries none, made in process,
+   * can reach its caller whole. A call that carries none, made in process,
    * takes the data itself: its page holds to its line limit alone, with every
    * line whole, as it did before pages had a budget.
    */
