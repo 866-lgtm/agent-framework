@@ -124,12 +124,13 @@ import {
 import {
   TOOL_IMAGE_REF_RE,
   ToolImageLedger,
-  cutStoredToolResult,
+  cutStoredToolResultToFit,
   formatKeptImageSlots,
   parseImagePlaceholders,
   sha256Hex,
   storedImageSlots,
   toolResultCutAt,
+  toolResultShare,
   type ParsedImagePlaceholder,
   type ShownRanges,
 } from './tool-image-ledger.js';
@@ -865,6 +866,10 @@ function asCompiled(landed: ReadonlyArray<{ content: ContentBlock[] }>): Content
 type StoredCopy = { id: MessageId; content: ContentBlock[]; bodyGroupId?: string };
 const storedCopy = (m: { id: MessageId; content: ContentBlock[]; bodyGroupId?: string }): StoredCopy =>
   ({ id: m.id, content: m.content, ...(m.bodyGroupId !== undefined ? { bodyGroupId: m.bodyGroupId } : {}) });
+
+/** A tool result's spill file as writeToolResultFile left it: its path, with
+ *  an error if the write failed, or null with no writable workspace. */
+type SpillWrite = { path: string; error?: string; branchLeft?: true } | null;
 
 /** A released agent's window as its pass to the primary reads it
  *  (AgentFramework.releasedWindow). */
@@ -2875,6 +2880,10 @@ export class AgentFramework {
    * ephemeral agents have isolated slots and are their own only readers.
    */
   private readonly sharedSlotAgents = new Set<Agent>();
+  /** Rounds of tool calls, by their results array, that a save_recent_image
+   *  in the round counted by their share of the bound: such a round is
+   *  stored by its share whether or not it fits (buildStoredToolResultContent). */
+  private readonly toolRoundsByShare = new WeakSet<CompletedToolCall[]>();
   /** The windows of forks and runs deregistered while the host was quiesced,
    *  by agent name (releaseWindowNowOrAfterResume); resume() releases them
    *  (runReleasesAfterResume), or stop() passes on what they left, unread or
@@ -11694,7 +11703,7 @@ export class AgentFramework {
         if (currentState.status === 'ready') {
           // Effective inline cap: agent_settings override → durable config →
           // house default, clamped to the strategy bound (see resolver).
-          const maxChars = this.resolveToolResultInlineCap(agent).cap;
+          const { cap: maxChars, bound } = this.resolveToolResultInlineCap(agent);
 
           // Oversized results — successes AND errors — spill to a workspace
           // file (truncated preview + file reference) instead of being
@@ -11702,8 +11711,8 @@ export class AgentFramework {
           // history copy and the live wire copy below — the two must stay
           // byte-matched (the window stores what the membrane sends;
           // divergence breaks the compile prefix).
-          const { blocks: toolResultContent, spilled } =
-            await this.buildStoredToolResultContent(agent.name, currentState.toolResults, maxChars);
+          const { blocks: toolResultContent, spilled, keptCap } =
+            await this.buildStoredToolResultContent(agent.name, currentState.toolResults, maxChars, bound);
 
           // A spill writes to the workspace, and the turn can be stopped
           // meanwhile. A host's cancelStream, stop() and abortInference cancel
@@ -11759,7 +11768,7 @@ export class AgentFramework {
           const membraneResults = currentState.toolResults.map(tc =>
             this.toMembraneToolResult(tc.id, tc.result, maxChars, spilled.get(tc.id))
           );
-          agent.toolResultGuard.storeResults(toolResultContent, membraneResults, currentState.toolResults, turnRowMetadata, maxChars);
+          agent.toolResultGuard.storeResults(toolResultContent, membraneResults, currentState.toolResults, turnRowMetadata, keptCap);
 
           // Flush any messages that were deferred while this turn was in
           // flight: this agent's own entries, those addressed to it and, for
@@ -18508,15 +18517,16 @@ export class AgentFramework {
               // one door a giant blob still walks through).
               const readyState = agent.state as AgentState;
               if (readyState.status === 'ready') {
-                const cap = this.resolveToolResultInlineCap(agent).cap;
-                const { blocks: toolResultContent, spilled } = await this.buildStoredToolResultContent(
+                const { cap, bound } = this.resolveToolResultInlineCap(agent);
+                const { blocks: toolResultContent, spilled, keptCap } = await this.buildStoredToolResultContent(
                   agent.name,
                   readyState.toolResults,
                   cap,
+                  bound,
                 );
                 agent.toolResultGuard.storeResults(toolResultContent, readyState.toolResults.map((tc) =>
                   this.toMembraneToolResult(tc.id, tc.result, cap, spilled.get(tc.id))), readyState.toolResults,
-                  this.silentTurnRowMetadata(agent.name), cap);
+                  this.silentTurnRowMetadata(agent.name), keptCap);
                 // The response is already complete: this batch is never
                 // submitted in this turn, so it cannot be refused. Admit it.
                 agent.toolResultGuard.settleTurnEnded();
@@ -19826,10 +19836,12 @@ export class AgentFramework {
       // token (as during a real tool call) and lands AFTER the pair, never
       // between tool_use and its tool_result. The two addMessage calls
       // below are synchronous and adjacent — nothing can interleave.
+      const { bound } = this.resolveToolResultInlineCap(agent);
       const { blocks } = await this.buildStoredToolResultContent(
         agentName,
         [{ id: toolUseId, name: toolName, input, result, durationMs }],
         call.resultMaxChars,
+        bound,
       );
       const toolUse: ContentBlock[] = [
         { type: 'tool_use', id: toolUseId, name: toolName, input } as ContentBlock,
@@ -20291,10 +20303,12 @@ export class AgentFramework {
     // An agent that has gone gets nothing, its drop logged once (noticeTargetFor).
     if (!this.noticeTargetFor(agentName, `script ${scriptId} wake`)) throw new Error(`agent ${agentName} has no context to wake`);
     const agent = this.agents.get(agentName);
-    const maxChars = agent
-      ? this.resolveToolResultInlineCap(agent).cap
-      : DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS;
-    const { text: shown } = await this.spillOrTruncate(text, maxChars, `script-${label}`);
+    // A reader's strategy cuts the wake's whole message, so its spill fits the
+    // readers' bound with its notice.
+    const { cap: maxChars, bound } = agent
+      ? this.resolveToolResultInlineCap(agent)
+      : { cap: DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS, bound: undefined };
+    const { text: shown } = await this.spillOrTruncate(text, maxChars, `script-${label}`, null, bound);
     // The spill can take a while: the agent may have gone since, or the host begun to stop.
     if (this.stopHasBegun()) throw new Error('this host is stopping');
     const target = this.noticeTargetFor(agentName, `script ${scriptId} wake`);
@@ -20344,15 +20358,38 @@ export class AgentFramework {
     agentName: string,
     toolResults: CompletedToolCall[],
     maxChars: number | undefined,
+    /** The readers' smallest per-message bound (resolveToolResultInlineCap). */
+    bound: number | undefined = undefined,
   ): Promise<{
     blocks: ContentBlock[];
     spilled: Map<string, { text: string; filePath: string | null }>;
+    /** Where a withheld stub's kept fields are cut: the share's keptCap
+     *  (toolResultShare), which is the cap where there's no bound. */
+    keptCap: number | undefined;
   }> {
     const spilled = new Map<string, { text: string; filePath: string | null }>();
     const dateLabel = new Date().toISOString().slice(0, 10);
+    // The results are stored as one message, whose bound a reader's
+    // strategy spends across them in order. Each is stored as it would be
+    // alone, unless together they pass the bound, or a save in the round
+    // counted the round by its share (toolRoundsByShare): then each is
+    // stored under its share (toolResultShare). A result carrying an image
+    // keeps its live copy cut at the cap; any other's live copy is its stored
+    // text.
+    const alone = new Map<string, { text: string; shown: ShownRanges | null; stored: { text: string; filePath: string | null; written?: SpillWrite } }>();
     for (const tc of toolResults) {
       const { text, shown } = this.storedToolResultText(agentName, tc, maxChars);
-      spilled.set(tc.id, await this.spillOrTruncate(text, maxChars, `${dateLabel}-${tc.id}`, shown));
+      alone.set(tc.id, { text, shown, stored: await this.spillOrTruncate(text, maxChars, `${dateLabel}-${tc.id}`, shown, bound) });
+    }
+    const share = maxChars === undefined ? undefined : toolResultShare(maxChars, bound, toolResults.length);
+    const total = [...alone.values()].reduce((sum, { stored }) => sum + stored.text.length, 0);
+    const byShare = share?.bound !== undefined && toolResults.length > 1
+      && (this.toolRoundsByShare.has(toolResults) || total > bound!);
+    for (const tc of toolResults) {
+      const { text, shown, stored } = alone.get(tc.id)!;
+      spilled.set(tc.id, byShare
+        ? await this.spillOrTruncate(text, share!.cap, `${dateLabel}-${tc.id}`, shown, share!.bound, stored.written)
+        : stored);
     }
     const blocks: ContentBlock[] = toolResults.map(tc => ({
       type: 'tool_result' as const,
@@ -20363,7 +20400,10 @@ export class AgentFramework {
       content: spilled.get(tc.id)!.text,
       isError: tc.result.isError,
     }));
-    return { blocks, spilled };
+    // A withheld round's stubs carry the guard's notice and place beside the
+    // fields they keep, so under a bound their fields are cut within the
+    // share, whether or not the round's results were stored by it.
+    return { blocks, spilled, keptCap: share?.keptCap ?? maxChars };
   }
 
   /**
@@ -20492,7 +20532,7 @@ export class AgentFramework {
     label: string,
     content: string,
     branch?: string,
-  ): Promise<{ path: string; error?: string; branchLeft?: true } | null> {
+  ): Promise<SpillWrite> {
     const place = this.toolResultFilePlace(label);
     if (!place) return null;
     const { workspace, path, safeLabel } = place;
@@ -20536,16 +20576,18 @@ export class AgentFramework {
   }
 
   /** How to read a tool result's file back a page at a time, with each page
-   *  sized to come back within `cap`. */
-  private spillPageAdvice(path: string, cap: number): string {
+   *  sized to come back within `cap`, and, where `canRaise`, that raising
+   *  the inline cap would show more: where a cap at the readers' bound would
+   *  keep a longer head, or the whole result. */
+  private spillPageAdvice(path: string, cap: number, canRaise: boolean): string {
     // JSON serialization can expand each read-back code unit to six
     // chars (\\u0000). Leave room for the page's metadata and a possible
     // extra code unit at a surrogate-pair boundary.
     const pageOverhead = JSON.stringify(path).length + 256;
     const readLimit = Math.max(1, Math.min(2000, Math.floor((cap - pageOverhead) / 6) - 1));
     return `Page with workspace--read ${JSON.stringify({ path, offsetChars: 0, limitChars: readLimit })}; `
-      + 'use nextOffsetChars as offsetChars until null, keeping limitChars. Or raise the inline cap via '
-      + 'agent_settings update tool_result_inline_max_chars.';
+      + 'use nextOffsetChars as offsetChars until null, keeping limitChars.'
+      + (canRaise ? ' Or raise the inline cap via agent_settings update tool_result_inline_max_chars.' : '');
   }
 
   private async spillOrTruncate(
@@ -20555,7 +20597,14 @@ export class AgentFramework {
     /** What the live copy showed beside this text (storedToolResultText);
      *  null when the live copy was this text. */
     shown: ShownRanges | null = null,
-  ): Promise<{ text: string; filePath: string | null }> {
+    /** The most a reader's strategy keeps of this copy: the readers'
+     *  smallest per-message bound, or the result's share of it
+     *  (buildStoredToolResultContent). */
+    bound: number | undefined = undefined,
+    /** The spill file an earlier cut of this text wrote: reused, not written
+     *  again. Undefined when none was cut. */
+    written?: SpillWrite,
+  ): Promise<{ text: string; filePath: string | null; written?: SpillWrite }> {
     if (!cap || content.length <= cap) return { text: content, filePath: null };
     // The stored text is the only place save_recent_image discovers tool
     // images. When the live wire delivered them beside the text, whatever
@@ -20563,20 +20612,24 @@ export class AgentFramework {
     // saw that the index would silently slide past (issue #104), so the
     // newest slots past the cut that the live copy showed are re-appended
     // after the notice. Otherwise the live copy is this text, and nothing
-    // past the cut is kept (#403).
-    const cut = cutStoredToolResult(content, cap, shown);
+    // past the cut is kept (#403). The stored copy, notice and kept slots
+    // included, fits `bound`, the most a reader's strategy keeps of it, so
+    // no reader's cut takes the notice (cutStoredToolResultToFit), and the
+    // spill notices name the head they kept.
+    const cut = cutStoredToolResultToFit(content, cap, shown, bound);
     const { head } = cut;
     const kept = formatKeptImageSlots(cut);
 
-    const written = await this.writeToolResultFile(label, content);
+    if (written === undefined) written = await this.writeToolResultFile(label, content);
     if (written && written.error === undefined) {
       const path = written.path;
       return {
         text: head
           + `\n\n[truncated — showing ${head.length} of ${content.length} chars; full content: workspace file ${path}`
-          + `. ${this.spillPageAdvice(path, cap)}]`
+          + `. ${this.spillPageAdvice(path, cap, bound === undefined || cutStoredToolResultToFit(content, bound, shown, bound).head.length > head.length)}]`
           + kept,
         filePath: path,
+        written,
       };
     }
     if (written) {
@@ -20589,6 +20642,7 @@ export class AgentFramework {
           + ` (${written.error}); content over the cap was not retained]`
           + kept,
         filePath: null,
+        written,
       };
     }
     return {
@@ -20596,6 +20650,7 @@ export class AgentFramework {
         + '\n\n[truncated — original was ' + content.length + ' chars; no writable workspace mount without an include, full content not retained]'
         + kept,
       filePath: null,
+      written,
     };
   }
 
@@ -20899,8 +20954,10 @@ export class AgentFramework {
    * the array is text-only (let JSON path handle it; saves a code path).
    * `maxChars`, when provided, caps each accompanying text block so an image
    * inlined alongside an enormous text payload can't blow the context. A
-   * block is cut as the stored copy is (toolResultCutAt), never inside a
-   * slot, so the stored copy can keep exactly the slots this showed (#403).
+   * block is cut at the cap as the stored copy's cut at that cap is
+   * (toolResultCutAt), never inside a slot, so the stored copy can keep
+   * exactly the slots this showed (#403); under a readers' bound the stored
+   * copy's cut can come earlier (cutStoredToolResultToFit).
    */
   private tryNativeToolResultContent(
     data: unknown,
@@ -20977,12 +21034,21 @@ export class AgentFramework {
    * (Sol's #94 ruling: a durable preference must not be a durable path for
    * one tool result to exceed maxMessageTokens; the way to see the whole
    * result is the spill file, not an over-bound blob in live context).
+   * An ordinary resident's results land in the shared slot, which each of
+   * its readers compiles under its own strategy, so the bound is the
+   * smallest of theirs, as the tune-out dump's is (residentMessageChars); a
+   * fork's or an ephemeral agent's store has itself as its only reader.
    */
   private resolveToolResultInlineCap(agent: Agent): {
     cap: number;
     source: 'agent-settings-override' | 'framework-config' | 'default';
-    /** Set when the desired value was reduced to the strategy bound. */
-    clampedBy: 'strategy-bound' | null;
+    /** Set when the desired value was reduced to a bound: the agent's own
+     *  strategy's, or a smaller one of another reader of its slot. */
+    clampedBy: 'strategy-bound' | 'reader-bound' | null;
+    /** The smallest per-message bound among the readers of the agent's
+     *  store, which a stored copy, notice included, must fit
+     *  (cutStoredToolResultToFit); undefined when no reader has one. */
+    bound: number | undefined;
   } {
     const override = this.toolResultInlineMaxCharsOverride.get(agent.name);
     const configured = this.toolResultInlineMaxCharsConfig;
@@ -20990,12 +21056,24 @@ export class AgentFramework {
     const source = override !== undefined
       ? 'agent-settings-override' as const
       : configured !== null ? 'framework-config' as const : 'default' as const;
-    const strategyBound = this.strategyDerivedToolResultChars(agent);
-    const clamped = strategyBound !== undefined && strategyBound < desired;
+    let bound = this.strategyDerivedToolResultChars(agent);
+    let byReader = false;
+    if (this.isOrdinaryResident(agent)) {
+      for (const reader of this.sharedSlotAgents) {
+        if (reader === agent) continue;
+        const readerBound = this.strategyDerivedToolResultChars(reader);
+        if (readerBound !== undefined && (bound === undefined || readerBound < bound)) {
+          bound = readerBound;
+          byReader = true;
+        }
+      }
+    }
+    const clamped = bound !== undefined && bound < desired;
     return {
-      cap: clamped ? strategyBound : desired,
+      cap: clamped ? bound! : desired,
       source,
-      clampedBy: clamped ? 'strategy-bound' : null,
+      clampedBy: clamped ? (byReader ? 'reader-bound' : 'strategy-bound') : null,
+      bound,
     };
   }
 
@@ -21004,8 +21082,9 @@ export class AgentFramework {
    * its caller whole. A call from a running script resolves to the script,
    * which takes any result that fits its memory (scriptResultMaxChars). Any
    * other call's result is stored in its agent's context under the agent's
-   * inline cap, and a call for an agent the framework doesn't hold gets the
-   * house default.
+   * inline cap, unless its round's results together pass the readers' bound,
+   * when each takes its share (buildStoredToolResultContent), and a call for
+   * an agent the framework doesn't hold gets the house default.
    */
   private resultMaxCharsFor(agentName: string, callId: string): number {
     const ce = this.codeExecution;
@@ -27924,11 +28003,24 @@ export class AgentFramework {
         // carries the same ref.
         const state = agent.state;
         if (state.status === 'waiting_for_tools') {
-          const cap = this.resolveToolResultInlineCap(agent).cap;
+          // The commit stores a round as each result would be alone, or by
+          // its share where they pass the bound together, which a sibling
+          // still running can decide. Where the two ways differ for a result
+          // counted here, the round is marked to be stored by its share
+          // (toolRoundsByShare), so the count holds either way: a result
+          // counted before the mark is the same both ways. The share is of
+          // the round's calls, finished or not.
+          const { cap, bound } = this.resolveToolResultInlineCap(agent);
+          const share = toolResultShare(cap, bound, state.pending.size + state.completed.length);
           for (let i = state.completed.length - 1; i >= 0 && collecting(); i--) {
             const tc = state.completed[i]!;
             const { text, shown } = this.storedToolResultText(agentName, tc, cap);
-            considerToolResultImages(tc.id, tc.name, storedImageSlots(text, cap, shown), 0);
+            const alone = storedImageSlots(text, cap, shown, bound);
+            const byShare = storedImageSlots(text, share.cap, shown, share.bound);
+            if (alone.length !== byShare.length || alone.some((slot, j) => slot.text !== byShare[j]!.text)) {
+              this.toolRoundsByShare.add(state.completed);
+            }
+            considerToolResultImages(tc.id, tc.name, this.toolRoundsByShare.has(state.completed) ? byShare : alone, 0);
           }
         }
 
