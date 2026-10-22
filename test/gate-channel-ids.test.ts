@@ -88,19 +88,40 @@ describe('gate channel patterns on both paths', () => {
     return Object.assign(send, { status: () => gate.getStatus() });
   }
 
+  /** A push/event the fixture sends as given. */
+  const push = (params: Record<string, unknown>): string => `push ${JSON.stringify({ featureSet: 'chat', timestamp: new Date().toISOString(), ...params })}`;
+  /** An addressed message in a closed guild channel, as discord-mcpl's
+   *  push/event sends it: the raw id in origin.channelId, with the registered
+   *  id in origin.mcplChannelId (composite) or without it (bare). */
+  const guildMessage = (eventId: string, guildId: string, rawChannelId: string, form: 'composite' | 'bare'): string => push({
+    eventId,
+    origin: {
+      source: 'discord',
+      messageId: eventId,
+      guildId,
+      channelId: rawChannelId,
+      ...(form === 'composite' ? { mcplChannelId: `discord:${guildId}:${rawChannelId}` } : {}),
+      channelName: rawChannelId,
+      authorId: 'U-other',
+      authorName: 'someone',
+      isMention: true,
+      isDM: false,
+    },
+    tags: ['chat:mention', 'chat:addressed', 'chat:from-human'],
+    payload: { content: [{ type: 'text', text: 'hello' }] },
+  });
+
   /** One addressed message in the room down each path: channels/incoming,
    *  and a push with the registered id in its origin and without it. */
   async function matched(policies: GatePolicy[]): Promise<{ incoming: string; pushComposite: string; pushBare: string }> {
     const send = await gateFor(policies);
     return {
       incoming: await send(`incoming ${REGISTERED} m-1 addressed hello`),
-      pushComposite: await send(`guild ev-2 g1 ${RAW} composite hello`),
-      pushBare: await send(`guild ev-3 g1 ${RAW} bare hello`),
+      pushComposite: await send(guildMessage('ev-2', 'g1', RAW, 'composite')),
+      pushBare: await send(guildMessage('ev-3', 'g1', RAW, 'bare')),
     };
   }
 
-  /** A push/event the fixture sends as given. */
-  const push = (params: Record<string, unknown>): string => `push ${JSON.stringify({ featureSet: 'chat', timestamp: new Date().toISOString(), ...params })}`;
   /** A reaction in the room, as discord-mcpl's reaction push carries it. */
   const reaction = push({
     eventId: 'ev-reaction',
@@ -155,7 +176,7 @@ describe('gate channel patterns on both paths', () => {
       { name: 'rest', match: { scope: BOTH_PATHS }, behavior: 'defer' },
     ]);
     assert.equal(await send(reaction), 'room-reactions');
-    assert.equal(await send(`guild ev-2 g1 ${RAW} composite hello`), 'rest', 'an addressed message in the room has no reaction tag');
+    assert.equal(await send(guildMessage('ev-2', 'g1', RAW, 'composite')), 'rest', 'an addressed message in the room has no reaction tag');
   });
 
   it("a voice report, whose origin names its channel by the registered id alone, meets the room's policy", async () => {
@@ -165,8 +186,8 @@ describe('gate channel patterns on both paths', () => {
 
   it("another channel's push doesn't meet the room's policy", async () => {
     const send = await gateFor(roomThenRest(REGISTERED));
-    assert.equal(await send('guild ev-4 g1 general composite hello'), 'rest');
-    assert.equal(await send('guild ev-5 g2 room bare hello'), 'rest', 'nor does a channel of the same raw id in another guild');
+    assert.equal(await send(guildMessage('ev-4', 'g1', 'general', 'composite')), 'rest');
+    assert.equal(await send(guildMessage('ev-5', 'g2', 'room', 'bare')), 'rest', 'nor does a channel of the same raw id in another guild');
   });
 
   it("a channel's message, a reaction and a voice report there share one sampling counter under keyBy channelId", async () => {
@@ -203,12 +224,12 @@ describe('gate channel patterns on both paths', () => {
       tags: ['chat:addressed'],
       payload: { content: [{ type: 'text', text: 'hello from elsewhere' }] },
     })), 'raw');
-    assert.equal(await send(`guild ev-8 g1 ${RAW} bare hello`), 'registered', "a Discord push in the room meets the registered form first");
+    assert.equal(await send(guildMessage('ev-8', 'g1', RAW, 'bare')), 'registered', "a Discord push in the room meets the registered form first");
   });
 
   it("a DM's push meets a pattern in a DM's registered form", async () => {
     const send = await gateFor(roomThenRest('discord:dm:*'));
     assert.equal(await send('dm ev-6 134 1548000000000000001 are you there?'), 'room');
-    assert.equal(await send(`guild ev-7 g1 ${RAW} composite hello`), 'rest');
+    assert.equal(await send(guildMessage('ev-7', 'g1', RAW, 'composite')), 'rest');
   });
 });

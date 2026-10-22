@@ -74,17 +74,12 @@ export interface GatePolicyMatch {
   scope?: string[];
   /** ServerId to match (exact or glob with *). */
   source?: string;
-  /** Channel to match (exact or glob with *), against the event's channel id
-   *  or the registered id the gate resolves for it. A channels/incoming
-   *  message carries the registered id (`discord:<guild>:<channel>`), and a
-   *  push event the adapter's raw one (a bare Discord snowflake), or none, as
-   *  a voice report carries none. The framework resolves a push to its
-   *  registered id from its origin's `mcplChannelId`, or, for a Discord
-   *  origin without one, from its guild and channel (`discord:dm:<channel>`
-   *  when it names no guild, as a DM's doesn't). So a pattern in the
-   *  registered form, or a glob of it, matches every event in that channel
-   *  whose push names it this way: its messages, and its reactions, edits and
-   *  other pushes. A raw id matches only push events. */
+  /** Channel to match (exact or glob with *): against the event's channel
+   *  id, then the registered id the gate resolves for it
+   *  (`resolveRouteChannel`). A channels/incoming message carries the
+   *  registered id (`discord:<guild>:<channel>`), and a push the adapter's
+   *  raw one or none, so a registered-form pattern meets every event in its
+   *  channel whose push names the channel, and a raw id only push events. */
   channel?: string;
   /** Content text filter. */
   filter?: { type: 'text' | 'regex'; pattern: string };
