@@ -12,6 +12,149 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.24.1 — 2026-10-22
+
+### Added
+
+- **Clock rows** (`AgentConfig.clock`, off by default): with
+  `clock: { intervalMinutes: 10 }` (or `intervalSeconds`, and `precision:
+  'minutes' | 'seconds'`), an agent's window takes a `Clock: 10:50
+  Europe/Berlin (UTC+02:00)` row whenever a boundary of that interval on its
+  local wall clock (from local midnight, in the framework's `timeZone`) has
+  passed since its last clock: before an incoming event, at a fresh turn's
+  start (a silent heartbeat tick included), and mid-turn after a tool
+  round's results, where it also joins the live stream as an injected
+  message (not on a stream that can't carry injected messages, such as
+  membrane's XML prefill path: there the next event or turn start writes
+  it). Only the latest boundary is written, and a window that holds no
+  clock row yet, a conversation fork's seeded one included, takes one at the
+  next of these. A clock reads the boundary's time where that tick would have
+  stood, else the time it is written (after a tool round or a reply that
+  spanned the boundary), so it never reads earlier than a row before it; it
+  shows the weekday and date when the day has changed since the last clock.
+  Clock rows are `system: true`, `kind: 'clock'`, with `metadata.clock: {
+  at, onBoundary, zone }`; they wake no one, move no routing locus and clear
+  no send suppression. None is written while the host is quiesced, or into
+  the residents' shared slot while another of its readers has a turn alive.
+  Residents share one window, so every resident reads the clock rows any of
+  them writes, one with no `clock` of its own included; each writes one when
+  a boundary of its own interval has passed since the window's last clock.
+  The subconscious takes none of its own. On some models a clock after a
+  tool's results drops the loop's earlier thinking from the request, as any
+  message heard while acting does there, at most once an interval. An
+  invalid `clock` setting makes `AgentFramework.create` throw, naming the
+  agent. `resolveClockConfig` (the validation `create` runs, for a host
+  checking a recipe up front), `CLOCK_ROW_KIND` and the `ClockConfig` /
+  `ClockStamp` / `ResolvedClockConfig` types are exported.
+
+### Changed
+
+- The workspace's `edit` and `edit_many` refuse a file the workspace holds
+  when the check of disk before them decided nothing, because the selected
+  branch kept changing while it ran. They store nothing, and say so, with
+  that reason and to make the same call again. Before, they applied to the
+  workspace's copy without a word, so where disk had changed they edited
+  text disk had moved past and left the path in conflict, and they committed
+  on whichever branch was selected when the check gave up. Where disk's copy
+  couldn't be read, an `edit` or `edit_many` still applies to the
+  workspace's copy and says so.
+
+- A cut tool result's spill notice, which names the workspace file holding
+  the rest, now survives every reader's per-message cut until a turn's
+  notices alone fill the bound, or a mount name past about seventy
+  characters makes the notice longer than its room. Past six results at a
+  bound of 4,000, or 62 at 40,000, a turn's share is under the notice's
+  room, so each result longer than its share is stored as its notice alone,
+  with no head; where a workspace is writable, its file holds the whole
+  result. Past about 11 results at 4,000, or 119 at 40,000, the notices
+  themselves pass the bound, and the reader's cut takes the later ones. An
+  ordinary
+  resident's inline cap is at most the smallest per-message bound among the
+  agents that read the shared slot, and `agent_settings` get reports a cap
+  set by another reader's bound as
+  `tool_result_inline_max_chars_clamped_by: "reader-bound"`. Where a cut
+  result's stored copy, notice and kept image slots included, would pass
+  that bound, its head moves back until it fits, and image slots that still
+  don't fit keep the newest. A reader's strategy spends its bound across a
+  message, and a turn's results are stored as one message, so where they
+  pass the bound together, which used to cut or leave out a later result
+  silently, each now takes an equal share of it. A turn whose results fit is
+  stored as each result would be alone, unless a `save_recent_image` in it
+  counted a result whose kept image slots the share would change: that turn
+  is stored by its share, so the images the save counted are the ones
+  stored. A withheld turn under a bound, whether or not its results fit,
+  cuts each stub's kept fields within its share less the notice's room, so
+  every stub's notice and place survive the reader's cut too, under a note
+  that now reads
+  `[cut: N of these fields' M characters; …]`; under a share of about 640
+  characters or less a stub keeps a single character of its fields. The
+  notice offers raising the inline cap only where a cap at the bound would
+  keep more of the result, and a stored copy that leaves out every image
+  slot past its cut says so.
+
+### Fixed
+
+- The workspace's `delete`, `edit` and `edit_many`, and its `readBinary`
+  method, no longer answer "File not found" for a path the workspace doesn't
+  hold when the check of disk before them decided nothing, because the
+  selected branch kept changing while it ran. Each now says that disk
+  couldn't be checked, with that reason, and to make the same call again.
+  Before, they answered "File not found" even when disk held the file
+  (#552). `readBinary` also gives `delete`'s answer for every other path the
+  workspace doesn't hold, such as one whose disk copy couldn't be read, where
+  it said "File not found" whatever the reason.
+
+- `channel_close` refuses a channel that's tuned out, as `channel_open` and
+  `channel_decline` do, and says to cancel the tune-out with `tune_out` mode
+  "cancel", which delivers what it diverted (#633). The channel can be closed
+  after that. Until now the close answered success and ended the tune-out
+  without its cancel, so its diverted backlog never reached the agent, and a
+  later cancel found nothing to cancel. A module's close, such as one that
+  certifies an idle lease (`overrideExplicitOpen`), is refused the same way,
+  with `isError: false` and `data.refusal` `'tuned-out'`, so it can stand
+  down as it does on the explicit-open refusal. A close that a tune-out
+  overtook now answers in the refusal's words, and a decline that one
+  overtook says to cancel the tune-out before calling `channel_close`.
+  Before, both said to call `channel_close`, which now refuses it.
+- A tune-out on record where the host has no tune-out coordinator, at a
+  start with no subconscious or when a start with no servers connects its
+  first one, now ends as the channels come up, and its channel is decided
+  open again, as a cancel leaves it, still the agent's decision. A log line
+  names the channel and says how many of the messages the tune-out diverted
+  are held, which nothing will deliver as its backlog. Before, nothing
+  diverted the channel's traffic or could cancel the tune-out, `tune_out`
+  wasn't offered, and `channel_open`, `channel_decline` and now
+  `channel_close` refused the channel, so its decision couldn't change.
+
+- A modern MCP server whose `requestTimeoutMs` is a value `String()` can't
+  print, such as `{"toString": 1}`, which a JSON configuration can hold, is
+  now refused like any other wrong deadline, with the value shown as
+  `[a value that cannot be printed]`. Before, checking the configuration
+  threw a `TypeError` instead: connecting to the server failed with that
+  error's text, and `listMcplServers` threw rather than list any server.
+
+- A message that arrives during a turn's tool call is injected into the
+  live stream as the next compile would send it, where it was injected
+  whole. The agent's strategy renders the boundary's messages as the newest
+  of its window (context-manager's `renderAsNewest`): cut by the
+  per-message cap, a sharded body joined, and its images as the image
+  limits leave them, counted newest-first across the batch. So the next
+  turn's request matches what the live rounds carried, and its prompt cache
+  holds, where a message over `maxMessageTokens`, or with more images than
+  `maxLiveImages`, made the next request differ there. A message that
+  arrives later can still take an injected one past an image limit, as it
+  can any message. A message the next compile won't send among its newest,
+  such as one in a batch bigger than the memory strategy's recent window,
+  isn't injected, and a log line names it. In its place a stored system
+  line after the batch, `[not shown]`, tells the agent who sent it, its
+  size in characters and images, and the `history--extract` call that reads
+  it, or its id where the agent isn't shown that tool. It names the agent
+  it's for, since residents sharing a slot read it too. Where that boundary
+  marks what it stored as read, the message counts as read with it, so a
+  coalesced render's wake to read it is dropped and a release doesn't pass
+  it to the primary. A strategy without `renderAsNewest`, or a render that
+  throws, which is logged, gets the message as stored, as before.
+
 ## 0.24.0 — 2026-10-22
 
 ### Breaking
