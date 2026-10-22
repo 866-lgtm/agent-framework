@@ -4,9 +4,12 @@
   listing, arrived as one escaped line: in context, on the live wire, and in
   its spill file under `tool-results/`, which `workspace--read` could then
   page only by character and `workspace--grep` matched as a single line. A
-  spill file now holds the string as the tool returned it. Objects, numbers,
-  booleans and arrays other than MCP content arrays are still sent as JSON,
-  and MCP content arrays as their blocks.
+  spill file now holds the string as the tool returned it. Data that isn't a
+  string reaches the model as before.
 
-  For a result without an error, `data: ''` is stored as no text, as
-  `data: undefined` already was.
+  A string is measured as its own text, so one whose JSON form passed the
+  inline cap but whose text doesn't, such as a long listing of short lines,
+  now stays inline where it used to spill to a file. A lone UTF-16 surrogate
+  in the string, which JSON escaped, reads as U+FFFD. For a result without
+  an error, `data: ''` is stored as no text, as `data: undefined` already
+  was.

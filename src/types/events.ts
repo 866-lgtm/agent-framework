@@ -187,8 +187,12 @@ export interface ToolResult {
   /** Whether the tool succeeded */
   success: boolean;
   /**
-   * Result data (if success). The model reads a string as that text, an MCP
-   * content array as its blocks, and anything else as JSON.
+   * Result data (if success). The model reads a string as that text, and
+   * other data as toolResultDataToHistoryString renders it: an MCP content
+   * array whose every block it knows as those blocks, and anything else as
+   * JSON, where RFC-005 shows a reference as its stub and withholds inline
+   * data that claims a uri or a disposition. With no data, it reads the
+   * result's error text, if any.
    */
   data?: unknown;
   /** Error message (if failure) */

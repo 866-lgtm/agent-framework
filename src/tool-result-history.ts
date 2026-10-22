@@ -75,13 +75,16 @@ export function toolResultDataToHistoryString(
   const fromArray = tryHistoryStringFromContentArray(data, options);
   // A string is the text the tool means to say, kept as it is: JSON would
   // quote it and escape every newline, so a multi-line result would reach
-  // the model, a script and its spill file as one escaped line.
+  // the model, a script and its spill file as one escaped line. Kept well
+  // formed: a lone UTF-16 surrogate, which JSON escaped, isn't text, a
+  // provider can refuse a request that carries one, and UTF-8 can't store
+  // it in a spill file, so it reads as U+FFFD.
   // JSON leaves out undefined, a function and a symbol: a result with no data
   // is stored as no text, as an empty content array is.
   // RFC-005 shows only objects otherwise (shownInHistory), so a string has
   // nothing for historyJson to stub or withhold.
   const str = fromArray
-    ?? (typeof data === 'string' ? data : historyJson(data))
+    ?? (typeof data === 'string' ? data.toWellFormed() : historyJson(data))
     ?? '';
   return maxChars ? truncateForHistory(str, maxChars) : str;
 }

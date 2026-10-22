@@ -85,6 +85,15 @@ test('string data: kept as it is, not JSON-quoted', () => {
   assert.equal(toolResultDataToHistoryString('{"ok":true}'), '{"ok":true}');
 });
 
+test('string data: a lone surrogate reads as U+FFFD, and a pair is kept', () => {
+  // JSON escaped a lone surrogate as six characters of text. Kept as it is,
+  // it would reach the provider's request, which can be refused for it, and
+  // a spill file, which UTF-8 can't hold it in.
+  assert.equal(toolResultDataToHistoryString('cut \ud83d here'), 'cut \ufffd here');
+  assert.equal(toolResultDataToHistoryString('end \udc00'), 'end \ufffd');
+  assert.equal(toolResultDataToHistoryString('a pair \ud83d\ude00 stays'), 'a pair \ud83d\ude00 stays');
+});
+
 test('string data: maxChars truncates the text itself with a marker', () => {
   const out = toolResultDataToHistoryString('line\n'.repeat(100), 50);
   assert.ok(out.startsWith('line\nline\n'), 'truncation keeps real newlines');
