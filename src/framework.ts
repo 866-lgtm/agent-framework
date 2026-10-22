@@ -3623,6 +3623,8 @@ export class AgentFramework {
         },
       );
       framework.tuneOutCoordinator.resumeActiveEpochs();
+    } else {
+      framework.endTuneOutsWithoutCoordinator();
     }
 
     // Modules, agents, MCPL servers and the tune-out tool are all in place:
@@ -25266,6 +25268,9 @@ export class AgentFramework {
     // configured servers can still deploy its first one at runtime.
     if (!this.mcplServerRegistry || !this.mcplHostCapabilities) {
       await this.initializeMcpl([], this.mcplInferenceRoutingConfig ?? undefined);
+      // The lifecycle log's replay restored any tune-out on record, and no
+      // coordinator is made here to carry one.
+      this.endTuneOutsWithoutCoordinator();
     }
 
     const collision = this.mcplPrefixCollision(config, undefined, claim);
@@ -27129,6 +27134,47 @@ export class AgentFramework {
       isError: result.isError ?? false,
       ...structured,
     };
+  }
+
+  /**
+   * A tune-out on record where this host has no tune-out coordinator: a
+   * start with no subconscious makes none, and neither does a channel
+   * subsystem brought up after start by connectMcplServer. Nothing then
+   * diverts the channel's traffic or ever cancels its tune-out, tune_out
+   * isn't offered, and channel_open, channel_close and channel_decline
+   * refuse a tuned-out channel, so the channel would stay held by a decision
+   * nothing here can change. Each one ends here instead, its channel decided
+   * open again as a cancel leaves it, under the tune-out's own source, so an
+   * agent's tune-out keeps the agent's provenance (the housekeeping guard
+   * reads it). A log line names the channel and says how many of the
+   * messages it diverted are held here, stored or still queued to be
+   * written, which nothing will now deliver as its backlog.
+   */
+  private endTuneOutsWithoutCoordinator(): void {
+    const registry = this.channelRegistry;
+    if (!registry || this.tuneOutCoordinator) return;
+    const primary = this.primaryAgentName ? this.agents.get(this.primaryAgentName) : undefined;
+    const ofEpoch = (epochId: string) => (m: { metadata?: unknown }): boolean =>
+      (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === epochId;
+    for (const { serverId, channelId, params, source } of registry.tuneOutsOnRecord()) {
+      const diverted = typeof params.epochId !== 'string' ? 0
+        : (primary?.getContextManager().getAllMessages() ?? []).filter(ofEpoch(params.epochId)).length +
+          this.deferredMessages.filter((m) => (m.forAgent ?? this.primaryAgentName) === this.primaryAgentName)
+            .filter(ofEpoch(params.epochId)).length;
+      const held = diverted === 0 ? ''
+        : diverted === 1 ? ' The 1 message it diverted stays here, and nothing will deliver it as its backlog.'
+        : ` The ${diverted} messages it diverted stay here, and nothing will deliver them as its backlog.`;
+      try {
+        registry.cancelTuneOut(serverId, channelId, 'open', source);
+      } catch (err) {
+        console.error(`[tune-out] "${channelId}" on the "${serverId}" server is tuned out, and nothing on this host watches ` +
+          `or cancels tune-outs, but ending this one failed, so it stays recorded until a start that can end it: ` +
+          `${err instanceof Error ? err.message : String(err)}.${held}`);
+        continue;
+      }
+      console.error(`[tune-out] "${channelId}" on the "${serverId}" server was tuned out, and nothing on this host watches ` +
+        `or cancels tune-outs, so the tune-out ends here and the channel is decided open again.${held}`);
+    }
   }
 
   /**

@@ -305,7 +305,9 @@ test('a channel_open or channel_close that a later decision overtook says which 
   f.registry.enterTuneOut('a', 'x', { epochId: 'e2', cadenceSeconds: 60, backlogCap: 10, maxWakes: 3, startedAtSequence: 0 }, 'agent-tool');
   await answer();
   assert.equal((await closingX).error,
-    'Channel "x": it was tuned out meanwhile, so this close doesn\'t stand. Call channel_close again to close it.');
+    'Channel "x" was tuned out meanwhile: its messages go to the subconscious, and channel_close doesn\'t change that. ' +
+    'Call tune_out with channelId "x" and mode "cancel" for it to resume normal attention; cancelling delivers the diverted ' +
+    'backlog, and channel_close closes it after that.');
 });
 
 test('a channel_open or channel_close whose change already holds says so, and why nothing more came', async () => {
@@ -642,7 +644,8 @@ test('a decline that a later decision replaced while its acknowledgment was out 
     ['a tune-out', async (f) => {
       f.registry.enterTuneOut('a', 'x', { epochId: 'e1', cadenceSeconds: 60, backlogCap: 10, maxWakes: 3, startedAtSequence: 0 }, 'agent-tool');
     }, 'The decline is recorded, but the channel was tuned out meanwhile, and that decision stands: its messages go to the ' +
-      'subconscious. If you still want it closed, call channel_close.'],
+      'subconscious. If you still want it closed, cancel the tune-out with tune_out mode "cancel", which delivers what it ' +
+      'diverted, and then call channel_close.'],
   ];
   const declineHeld = async () => {
     const f = await fixture({ a: ['x'] });
@@ -1099,7 +1102,8 @@ test('a decline that a tune-out replaced sends nothing for that decision', async
   assert.equal(declined.data?.status, 'replaced');
   assert.equal(declined.data?.closeError,
     'The decline is recorded, but the channel was tuned out meanwhile, and that decision stands: its messages go to the ' +
-    'subconscious. If you still want it closed, call channel_close.');
+    'subconscious. If you still want it closed, cancel the tune-out with tune_out mode "cancel", which delivers what it ' +
+    'diverted, and then call channel_close.');
 });
 
 test('a decline that a later open replaced, on a server whose channels this host can\'t open or close, says whom to ask', async () => {
