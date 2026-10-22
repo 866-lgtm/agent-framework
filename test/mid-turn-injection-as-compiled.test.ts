@@ -315,6 +315,9 @@ describe('a message injected at a tool boundary', () => {
   it("gives the round's results to the stream when a queued sender's name isn't a string", { timeout: 20_000 }, async () => {
     await create(new WindowedPassthroughStrategy({ maxMessageTokens: 50 }));
     module.participant = 42 as unknown as string;
+    // A turn whose results never reach the stream never ends, so the wait is
+    // bounded and the assertion says what happened. On main it passes: this
+    // pins that the boundary's name step keeps main's handling.
     await Promise.race([turnWith([[text('NUMMSG')]]), new Promise((r) => setTimeout(r, 10_000))]);
     assert.ok((membrane.lastStream?.receivedToolResults ?? []).length > 0, "the round's results reach the stream");
   });

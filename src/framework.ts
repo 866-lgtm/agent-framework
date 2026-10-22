@@ -157,7 +157,7 @@ import { bounded, renderList, renderReturn, VALUE_CHARS } from './code-execution
 import { splitProseRuns, withoutRoundsProse } from './prose-segments.js';
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
-import { nameAsStored, textAsStored } from './text-as-stored.js';
+import { contentAsStored, nameAsStored } from './text-as-stored.js';
 
 /** An MCPL tool call refused because its server isn't in the registry: one
  *  closed for good, one removed, or one whose connect failed without
@@ -12154,7 +12154,7 @@ export class AgentFramework {
             currentState.stream.provideToolResults(
               agent.toolResultGuard.submissionResults(membraneResults),
               midTurnInjections.length > 0
-                ? { injectedMessages: midTurnInjections.map(({ participant, content }) => ({ participant: nameAsStored(participant), content: textAsStored(content) })) }
+                ? { injectedMessages: midTurnInjections.map(({ participant, content }) => ({ participant: nameAsStored(participant), content: contentAsStored(content) })) }
                 : undefined,
             );
             // RFC-006 §3.3: consumption is determined at assembly, and this

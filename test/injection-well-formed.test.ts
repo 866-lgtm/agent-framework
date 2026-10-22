@@ -72,6 +72,7 @@ const CASES: Array<{ position: string; shape: keyof typeof SHAPES; grant?: strin
   { position: 'system', shape: 'string', grant: ['tools', 'contextHooks.beforeInference.inject.system'] },
   // context-manager names a beforeUser injection's message by its namespace.
   { position: 'beforeUser', shape: 'blocks', inNamespace: 'string' },
+  { position: 'afterUser', shape: 'blocks', inNamespace: 'string' },
   // One that isn't a string, which §10.4 doesn't allow, is read by its text form.
   { position: 'beforeUser', shape: 'blocks', inNamespace: 'array' },
 ];
@@ -124,14 +125,17 @@ for (const { position, shape, grant, inNamespace } of CASES) {
 class Injecting implements Module {
   readonly name = 'injecting';
   private readonly trigger = new Trigger();
-  constructor(private readonly position: 'beforeUser' | 'system') {}
+  constructor(
+    private readonly position: 'beforeUser' | 'system',
+    private readonly content: Array<Record<string, unknown>> = [{ type: 'text', text: LONE }],
+  ) {}
   async start() {}
   async stop() {}
   getTools() { return []; }
   async handleToolCall() { return { success: false, isError: true, error: 'no tools' }; }
   onProcess(event: ProcessEvent) { return this.trigger.onProcess(event); }
   async gatherContext() {
-    return [{ namespace: 'mod', position: this.position, content: [{ type: 'text' as const, text: LONE }] }];
+    return [{ namespace: 'mod', position: this.position, content: this.content as never }];
   }
 }
 
@@ -170,22 +174,35 @@ test("a lone surrogate in an injection given straight to an Agent's inference re
   });
   frameworks.push(framework);
   await framework.start();
-  const agent = framework.getAgent('prime')!;
-  // The direct API sends through membrane.stream, which the mock's membrane doesn't have.
-  const requests: Array<{ messages: Array<{ participant: string }> }> = [];
-  (agent as unknown as { membrane: unknown }).membrane = {
-    stream: async (request: { messages: Array<{ participant: string }> }) => {
-      requests.push(request);
-      return createMockResponse([{ type: 'text', text: 'Hello.' }]);
-    },
-  };
-  await agent.runInferenceWithInjections([], [
+  membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hello.' }]));
+  await framework.getAgent('prime')!.runInferenceWithInjections([], [
     { namespace: LONE, position: 'beforeUser', content: [{ type: 'text', text: LONE }] },
     { namespace: 'sys', position: 'system', content: [{ type: 'text', text: LONE }] },
   ]);
-  assert.equal(requests.length, 1, 'the premise: one request went out');
-  const sent = hookTexts(requests[0]);
+  assert.equal(membrane.calls.length, 1, 'the premise: one request went out');
+  const sent = hookTexts(membrane.calls[0]);
   assert.ok(sent.length > 0, 'the request carries the injections');
   for (const t of sent) assert.ok(t.isWellFormed(), `the injection's text is well formed: ${JSON.stringify(t)}`);
-  assert.ok(requests[0]!.messages.some((m) => m.participant === `system_context:${MENDED}`), 'its namespace too');
+  assert.ok(membrane.calls[0]!.messages.some((m) => m.participant === `system_context:${MENDED}`), 'its namespace too');
+});
+
+test("a lone surrogate in a module's injected image link reaches the request as U+FFFD", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'af-module-image-well-formed-')); dirs.push(dir);
+  const membrane = new MockMembrane();
+  membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hello.' }]));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: membrane.asMembrane(),
+    agents: [{ name: 'prime', model: 'test-model', systemPrompt: 'You are prime.' }],
+    modules: [new Injecting('beforeUser', [{ type: 'image', source: { type: 'url', url: 'https://example.com/HOOK\ud83d.png' } }])],
+    syncIntervalMs: 0,
+  });
+  frameworks.push(framework);
+  await framework.start();
+  framework.pushEvent({ type: 'external-message', source: 'test', content: 'hello', metadata: {} });
+  await until(() => membrane.calls.length >= 1, 'the request');
+  const sent = hookTexts(membrane.calls[0]);
+  assert.ok(sent.length > 0, "the request carries the module's image");
+  for (const t of sent) assert.ok(t.isWellFormed(), `the image's link is well formed: ${JSON.stringify(t)}`);
+  assert.ok(sent.includes('https://example.com/HOOK\ufffd.png'), 'the lone half goes out as U+FFFD');
 });
