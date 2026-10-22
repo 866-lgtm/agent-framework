@@ -3772,15 +3772,15 @@ export class WorkspaceModule implements Module {
       // path the mount passes over by design is observed, as a sync naming
       // it would observe it (#276).
       const pass = await this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] }, { named: true });
-      // A pass that gave up (the selected branch kept changing) decided
-      // nothing and leaves no report. It's read as a copy disk couldn't be
+      // A pass that decided nothing (undecidedOf: the selected branch kept
+      // changing) leaves no report. It's read as a copy disk couldn't be
       // checked, with its reason, so the answer says the check didn't finish.
-      const gaveUp = !pass.reports.has(relativePath) && pass.incomplete.length > 0;
+      const undecided = undecidedOf(pass);
       const report = pass.reports.get(relativePath)
-        ?? (gaveUp ? { path: relativePath, state: 'unverified' as const, note: pass.incomplete[0]!.reason } : undefined);
-      // A check that gave up may well finish on the next read, as grep's
-      // answer to the same says of grep.
-      const again = gaveUp ? ['Read again to check it.'] : [];
+        ?? (undecided !== null ? { path: relativePath, state: 'unverified' as const, note: undecided } : undefined);
+      // A check that decided nothing may well finish on the next read, as
+      // grep's answer to the same says of grep.
+      const again = undecided !== null ? ['Read again to check it.'] : [];
       // A mode taken in alone isn't a change to the text, so it leaves the
       // read nothing to say, as it leaves an edit nothing.
       const took = (op: TreeOp) => pass.ops.some((o) => o.path === relativePath && o.op === op && !o.modeOnly);
