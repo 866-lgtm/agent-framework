@@ -25,6 +25,7 @@ import type {
 import { AgentFramework, PassthroughStrategy } from '../src/index.js';
 import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../src/tool-result-history.js';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
+import { TOOL_RESULT_NOTICE_ROOM } from '../src/tool-image-ledger.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
 
 /**
@@ -494,7 +495,7 @@ describe('tool-result spill completion (issue #89)', () => {
       const stored = await waitForStoredToolResult(h.framework);
       assert.ok(stored, 'tool result should be stored');
       assert.ok(stored.content.length < CAPPED, 'inline copy must be capped');
-      assert.match(stored.content, /no writable workspace, full content not retained/);
+      assert.match(stored.content, /no writable workspace mount without an include, full content not retained/);
       assert.doesNotMatch(stored.content, /workspace file/);
     } finally {
       await h.framework.stop();
@@ -584,6 +585,31 @@ describe('tool-result spill completion (issue #89)', () => {
     }
   });
 
+  it('cuts a failed spill\'s reason at 200 units without halving a surrogate pair', async () => {
+    // 199 units, then an emoji whose two units straddle the 200-unit cut.
+    const reason = `${'r'.repeat(199)}😀 and the rest of the reason`;
+    const proto = WorkspaceModule.prototype as unknown as { writeBinary: (...args: unknown[]) => Promise<unknown> };
+    const writeBinary = proto.writeBinary;
+    proto.writeBinary = async () => ({ success: false, error: reason });
+    let h: SpillHarness | undefined;
+    try {
+      h = await startSpillTurn({
+        prefix: 'spill-pair-',
+        result: { success: true, data: { blob: 'w'.repeat(60_000) } },
+        withWorkspace: true,
+      });
+      const stored = await waitForStoredToolResult(h.framework);
+      assert.ok(stored, 'tool result should be stored');
+      assert.ok(stored.content.includes(`FAILED (${'r'.repeat(199)})`), `the cut leaves the emoji out whole: ${stored.content.slice(-400)}`);
+    } finally {
+      proto.writeBinary = writeBinary;
+      if (h) {
+        await h.framework.stop();
+        rmSync(h.tempDir, { recursive: true, force: true });
+      }
+    }
+  });
+
   it('clamps the default down to the strategy bound and reports it', async () => {
     // maxMessageTokens=1000 → strategy bound 4000 < default 24000. This branch
     // decides the cap for every resident on a bounded strategy — pin it.
@@ -596,7 +622,10 @@ describe('tool-result spill completion (issue #89)', () => {
     try {
       const stored = await waitForStoredToolResult(h.framework);
       assert.ok(stored, 'tool result should be stored');
-      assert.match(stored.content, /showing 4000 of \d+ chars/);
+      // The cap is the strategy's bound, so the head moves back to leave the
+      // notice its room: the stored copy, notice included, fits the bound.
+      assert.ok(stored.content.length <= 4000, `the stored copy is ${stored.content.length} characters`);
+      assert.match(stored.content, new RegExp(`showing ${4000 - TOOL_RESULT_NOTICE_ROOM} of \\d+ chars`));
       const prov = capProvenance(h.framework);
       assert.strictEqual(prov.tool_result_inline_max_chars_effective, 4000);
       assert.strictEqual(prov.tool_result_inline_max_chars_source, 'default');
@@ -674,7 +703,10 @@ describe('tool-result spill completion (issue #89)', () => {
       // The clamp is enforced on the wire, not just reported.
       const stored = await waitForStoredToolResult(h.framework);
       assert.ok(stored, 'tool result should be stored');
-      assert.match(stored.content, /showing 4000 of \d+ chars/);
+      // The cap is the strategy's bound, so the head moves back to leave the
+      // notice its room: the stored copy, notice included, fits the bound.
+      assert.ok(stored.content.length <= 4000, `the stored copy is ${stored.content.length} characters`);
+      assert.match(stored.content, new RegExp(`showing ${4000 - TOOL_RESULT_NOTICE_ROOM} of \\d+ chars`));
     } finally {
       await h.framework.stop();
       rmSync(h.tempDir, { recursive: true, force: true });
