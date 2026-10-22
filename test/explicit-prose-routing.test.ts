@@ -2860,4 +2860,69 @@ describe('explicit prose routing', () => {
     });
   }
 
+  // The bounce-wake cap (PROSE_BOUNCE_WAKE_CAP = 2) stops a bounce → wake →
+  // bounce loop. Its count used to reset only when a prose envelope was
+  // delivered, so a resident that recovered from each bounce some other way
+  // (a send tool, setting the draft aside) kept the count across turns, and
+  // from the third bounce on, a reply to a fresh message bounced with no wake.
+  for (const mode of ['explicit', 'hybrid'] as const) {
+    const prefix = mode === 'explicit' ? '>>' : '>>>';
+    // Words that bounce in each mode: unprefixed prose in explicit mode; in
+    // hybrid, where unprefixed prose goes to the locus, a target that names
+    // no channel.
+    const bouncing = (n: number): string => mode === 'explicit' ? `reply ${n}` : `>>>#nowhere reply ${n}`;
+    const setAside = `${prefix}skip_reply {{unsent}}`;
+
+    it(`${mode}: a turn with a cause of its own resets the bounce-wake count, so recovering without a prose delivery doesn't silence later bounces`, async () => {
+      const framework = await createFramework(mode);
+      const routed = stubRegistry(framework);
+      let turns = 0;
+      framework.onTrace((e) => {
+        if ((e as { type: string }).type === 'inference:started') turns++;
+      });
+      // Three messages. Each reply bounces; each bounce wake sets the draft
+      // aside instead of delivering prose.
+      feedTurn(framework, 1, [{ type: 'text', text: bouncing(1) }] as ContentBlock[]);
+      feedTurn(framework, 2, [{ type: 'text', text: setAside }] as ContentBlock[]);
+      feedTurn(framework, 3, [{ type: 'text', text: bouncing(2) }] as ContentBlock[]);
+      feedTurn(framework, 4, [{ type: 'text', text: setAside }] as ContentBlock[]);
+      feedTurn(framework, 5, [{ type: 'text', text: bouncing(3) }] as ContentBlock[]);
+      feedTurn(framework, 6, [{ type: 'text', text: setAside }] as ContentBlock[]);
+      try {
+        for (let message = 1; message <= 3; message++) {
+          trigger(framework);
+          await framework.runUntilIdle();
+          assert.equal(turns, message * 2, `message ${message}: its reply bounced and the bounce woke the agent`);
+        }
+        assert.equal(routed.length, 0, 'nothing was delivered');
+        assert.equal(context(framework).bounces, 3, 'three bounce notices');
+      } finally {
+        await framework.stop();
+      }
+    });
+
+    it(`${mode}: a bounce loop with no other cause still stops waking after two bounces`, async () => {
+      const framework = await createFramework(mode);
+      stubRegistry(framework);
+      let turns = 0;
+      framework.onTrace((e) => {
+        if ((e as { type: string }).type === 'inference:started') turns++;
+      });
+      feedTurn(framework, 1, [{ type: 'text', text: bouncing(1) }] as ContentBlock[]);
+      feedTurn(framework, 2, [{ type: 'text', text: bouncing(2) }] as ContentBlock[]);
+      feedTurn(framework, 3, [{ type: 'text', text: bouncing(3) }] as ContentBlock[]);
+      // Were the third bounce to wake, this turn would run: it answers, so
+      // the test fails on the count rather than hanging.
+      feedTurn(framework, 4, [{ type: 'text', text: setAside }] as ContentBlock[]);
+      try {
+        trigger(framework);
+        await framework.runUntilIdle();
+        assert.equal(turns, 3, 'the message, then two bounce wakes; the third bounce wakes nothing');
+        assert.equal(context(framework).bounces, 3, 'every bounce still leaves its notice');
+      } finally {
+        await framework.stop();
+      }
+    });
+  }
+
 });
