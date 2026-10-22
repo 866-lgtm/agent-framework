@@ -4664,7 +4664,8 @@ export class WorkspaceModule implements Module {
     const fileGlob = input.glob ? globToRegex(input.glob) : null;
     // The filter matches mount-relative paths, so every file it lets through
     // lies beneath its literal directory, and the walk starts at the deeper of
-    // that and `path`.
+    // that and `path`. In the mount a filter's first segment names, its
+    // mount-prefixed reading takes the filter's place (below).
     const filterDir = input.glob ? literalDirOf(input.glob) : '';
     const contextBefore = input.contextBefore ?? 0;
     const contextAfter = input.contextAfter ?? 0;

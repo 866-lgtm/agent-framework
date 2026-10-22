@@ -77,8 +77,8 @@ test('relative patterns match relative to every mount', async (t) => {
     'project/README.md', 'project/docs/guide.md', 'project/notes/todo.md',
   ]);
   assert.deepEqual(await glob({ pattern: '*.md' }), ['notes/README.md', 'project/README.md']);
-  // A pattern whose first segment is a mount's name keeps its relative
-  // reading too: project/notes/ still matches, beside the notes mount's root.
+  // In every other mount, a pattern whose first segment is a mount's name is
+  // read as written: project/notes/ matches, beside the notes mount's root.
   assert.deepEqual(await glob({ pattern: 'notes/*.md' }), ['notes/README.md', 'project/notes/todo.md']);
 });
 
@@ -98,11 +98,15 @@ test('a first segment that is a brace group or a wildcard names no mount', async
 });
 
 test("with a path, a pattern naming the path's mount reads mount-prefixed, within the path", async (t) => {
-  const { glob, grepFiles } = setup(t, { 'notes/drafts/one.md': 'one', 'notes/diary/notes1': 'a note' });
-  const diary = ['notes/diary/2026-10-12.md', 'notes/diary/2026-10-13.md'];
+  const { glob, grepFiles } = setup(t, { 'notes/drafts/one.md': 'one', 'notes/diary/notes1': 'a note', 'notes/diary/notes/x.md': 'x' });
+  const diary = ['notes/diary/2026-10-12.md', 'notes/diary/2026-10-13.md', 'notes/diary/notes/x.md'];
   assert.deepEqual(await glob({ path: 'notes/diary', pattern: 'notes/**/*.md' }), diary);
-  // notes/README.md lies outside the path, and so does notes/drafts.
+  // notes/README.md lies outside the path, and so does notes/drafts. And a
+  // pattern relative to the path that starts with the mount's name names the
+  // mount: notes/diary/notes/x.md is found by its path as the tools show it.
   assert.deepEqual(await glob({ path: 'notes/diary', pattern: 'notes/*.md' }), []);
+  assert.deepEqual(await glob({ path: 'notes/diary', pattern: 'notes/diary/notes/*.md' }), ['notes/diary/notes/x.md']);
+  assert.deepEqual(await glob({ pattern: 'notes/diary/notes/*.md' }), ['notes/diary/notes/x.md']);
   assert.deepEqual(await glob({ path: 'notes/diary', pattern: 'notes/drafts/*.md' }), []);
   assert.deepEqual(await grepFiles({ pattern: 'entry', path: 'notes/diary', glob: 'notes/diary/*-13.md' }), ['notes/diary/2026-10-13.md']);
   assert.deepEqual(await grepFiles({ pattern: 'readme', glob: 'notes/*.md' }), ['notes/README.md']);
