@@ -199,6 +199,30 @@ describe('conversation fork injection scoping', () => {
     assertContains(system, 'hook retrieval context');
   });
 
+  it('scopes by a namespace as given, so one holding a lone surrogate that names another channel stays out of the fork', async () => {
+    // The namespace is made well formed for the request only after scoping:
+    // channel ids are compared as given, and well formed first it would name
+    // no channel and reach every agent.
+    membrane.pushResponse(createMockResponse([]));
+    const other = 'chanB \ud83d';
+    const framework = await makeFramework([
+      systemInjection('module other context', other),
+      systemInjection('module home context', 'chanA'),
+    ], [FORK_AGENT]);
+    installChannelRegistry(framework, ['chanA', other]);
+    bindForkHome(framework);
+    installHookInjections(framework, [systemInjection('hook other context', other)]);
+
+    framework.pushEvent(triggerEvent());
+    await framework.runUntilIdle();
+
+    assert.equal(membrane.calls.length, 1);
+    const system = membrane.calls[0]!.system;
+    assertOmits(system, 'module other context');
+    assertOmits(system, 'hook other context');
+    assertContains(system, 'module home context');
+  });
+
   it('passes module injections through for non-conversation agents', async () => {
     membrane.pushResponse(createMockResponse([]));
     const framework = await makeFramework([

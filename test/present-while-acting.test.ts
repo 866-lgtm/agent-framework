@@ -353,6 +353,34 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
+  it("injects a re-pin notice with its channel's id as the store keeps it, a lone surrogate as U+FFFD", async () => {
+    // The notice is built from the channel's id as the server gave it, and
+    // stored, which mends it; the live round sends it as the store keeps it.
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Answering.' }] as ContentBlock[]));
+
+    const framework = await createFramework();
+    stubChannelRegistry(framework);
+    module.toolDelayMs = 25;
+    module.interjection = 'hey, over here?';
+    module.interjectionMetadata = { channelId: 'discord:dm:an\ud83d', tags: ['chat:addressed'] };
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    const wired = membrane.lastStream!.receivedToolResultOptions
+      .flatMap((o) => o?.injectedMessages ?? [])
+      .flatMap((m) => (m.content as Array<{ text?: string }>).map((b) => b.text ?? ''))
+      .filter((t) => t.includes('[routing]'));
+    assert.equal(wired.length, 1, 'the premise: the re-pin notice was injected');
+    assert.ok(wired[0]!.isWellFormed(), `the notice is well formed: ${JSON.stringify(wired[0])}`);
+    assert.ok(wired[0]!.includes('discord:dm:an\ufffd'), 'its channel id holds U+FFFD');
+
+    await framework.stop();
+  });
+
   it('an ADDRESSED mid-turn injection re-pins the locus for subsequent prose', async () => {
     // 2026-07-31 Mythos misroutes (n=6): someone explicitly addresses the
     // agent from another channel mid-turn (mention / reply / DM); the

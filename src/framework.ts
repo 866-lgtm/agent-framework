@@ -157,6 +157,7 @@ import { bounded, renderList, renderReturn, VALUE_CHARS } from './code-execution
 import { splitProseRuns, withoutRoundsProse } from './prose-segments.js';
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
+import { contentAsStored, nameAsStored } from './text-as-stored.js';
 
 /** An MCPL tool call refused because its server isn't in the registry: one
  *  closed for good, one removed, or one whose connect failed without
@@ -910,7 +911,8 @@ function describeDeferredWrite(msg: { id: string; participant: string; content: 
 function isInjectableMidTurn(msg: { participant: string; content: ContentBlock[] }, agentName: string): boolean {
   // Exact, as membrane's role test is: only a participant equal to the
   // request's assistantParticipant (Agent's name) renders as the assistant.
-  return msg.participant !== agentName
+  // It's the name as sent, which the boundary takes as the store keeps it.
+  return nameAsStored(msg.participant) !== agentName
     && !msg.content.some((b) => b.type === 'tool_use' || b.type === 'tool_result');
 }
 
@@ -1233,6 +1235,12 @@ function isTurnContinuation(reason: string): boolean {
   return reason === 'context_budget_restart' || reason === 'tool_results_ready'
     || reason === 'tool_result_guard_retry';
 }
+
+/** Wake sources the framework generates for itself (bounce wakes,
+ *  continuations, retries, unsticks, admission requeues). A wake from any
+ *  other source — a channel message, a heartbeat or other server event, a
+ *  gate flush, a timer, an operator nudge — is a cause of its own. */
+const FRAMEWORK_WAKE_SOURCES = new Set(['framework', 'scheduler']);
 const CONVERSATION_ROUTER_STATE_ID = 'framework/conversation-router';
 const INFERENCE_LOG_ID = 'framework/inference-log';
 const PROCESS_LOG_ID = 'framework/process-log';
@@ -12127,11 +12135,14 @@ export class AgentFramework {
             // 0.5.x, and from 0.6.0 declares it can't carry them, so none are
             // collected for it. Each goes as its participant and content
             // alone: a stored row's metadata is the host's record, not input
-            // for membrane.
+            // for membrane. Each goes with its name and text as the store
+            // keeps them, whether it's a heard message, rendered or not, or a
+            // notice the boundary made: this is where they leave for the
+            // request.
             currentState.stream.provideToolResults(
               agent.toolResultGuard.submissionResults(membraneResults),
               midTurnInjections.length > 0
-                ? { injectedMessages: midTurnInjections.map(({ participant, content }) => ({ participant, content })) }
+                ? { injectedMessages: midTurnInjections.map(({ participant, content }) => ({ participant: nameAsStored(participant), content: contentAsStored(content) })) }
                 : undefined,
             );
             // RFC-006 §3.3: consumption is determined at assembly, and this
@@ -14428,6 +14439,16 @@ export class AgentFramework {
       // requests[0] in that mixed batch bypassed the turn lock because a
       // restart existed, then treated the continuation as a fresh turn.
       const trigger = budgetRestart ?? requests[0];
+      // The bounce-wake cap (bounceProse) stops a bounce → wake → bounce loop
+      // that nothing else feeds. A turn with a cause of its own is not that
+      // loop, so the count starts again. Otherwise only a delivered prose
+      // envelope reset it, and a resident that recovers from bounces with a
+      // send tool kept the count for good: every later bounce, a reply to a
+      // fresh message included, appended its notice without a wake.
+      // (Optional chaining: prototype-built harnesses leave the map unset.)
+      if (requests.some((r) => !FRAMEWORK_WAKE_SOURCES.has(r.source))) {
+        this.proseBounceStreaks?.delete(agentName);
+      }
       // Route this turn's auto-published speech to the channel that triggered
       // it (item-3 redux). A batched wake may carry several triggering channels
       // (messages arrived in >1 channel while the agent was busy/idle):
@@ -16604,7 +16625,9 @@ export class AgentFramework {
     }
   }
 
-  /** Cap on consecutive bounce-triggered wakes (notices still append after). */
+  /** Cap on consecutive bounce-triggered wakes (notices still append after).
+   *  The count resets on a delivered prose envelope, and when a turn starts
+   *  with a cause of its own (processInferenceRequests). */
   private static readonly PROSE_BOUNCE_WAKE_CAP = 2;
 
   /**
