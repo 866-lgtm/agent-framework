@@ -125,6 +125,11 @@ function parseDocument(raw: string, descriptionsOnly: boolean): PresentationDocu
   let doc: unknown;
   try { doc = JSON.parse(raw); }
   catch (error) { throw new PresentationFileError([`it isn't valid JSON: ${errorMessage(error)}`]); }
+  // An object with no keys carries no settings, so it's the empty document,
+  // as a missing file is: it's what an operator writes by hand to start one.
+  // A 0-byte file isn't JSON and still refuses, since the store's
+  // temp-and-rename never writes one: that's what a lost file looks like.
+  if (doc && typeof doc === 'object' && !Array.isArray(doc) && Object.keys(doc).length === 0) return { version: 1, tools: {} };
   const problems = documentProblems(doc, descriptionsOnly);
   if (problems.length) throw new PresentationFileError(problems);
   return doc as PresentationDocument;
