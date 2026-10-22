@@ -813,6 +813,15 @@ function supersededClause(action: 'open' | 'close', now: DesiredChannelState | u
   return action === 'close' ? 'a later decision to keep it open came first' : 'a later decision to close it came first';
 }
 
+/** What ends a tune-out, for a channel tool's answer about a tuned-out
+ *  channel (`channel` as the answer shows it, quoted): its cancel, with the
+ *  backlog it delivers, and, for a close, that channel_close closes the
+ *  channel once the cancel has ended the tune-out. */
+function tunedOutPointer(tool: string, channel: string): string {
+  return `Call tune_out with channelId ${channel} and mode "cancel" for it to resume normal attention; cancelling ` +
+    'delivers the diverted backlog' + (tool === 'channel_close' ? ', and channel_close closes it after that.' : '.');
+}
+
 /** A channel tool's refusal of a tuned-out channel, whose cancel is what ends
  *  the tune-out, with the backlog it delivers. As an error result the agent
  *  reads the pointer itself; `data` names the refusal for an in-process
@@ -823,8 +832,7 @@ function tunedOutRefusal(tool: string, channelId: string): ToolResult {
     isError: true,
     error:
       `Channel "${channelId}" is tuned out: its messages go to the subconscious, and ${tool} doesn't change that. ` +
-      `Call tune_out with channelId "${channelId}" and mode "cancel" for it to resume normal attention; cancelling ` +
-      'delivers the diverted backlog.',
+      tunedOutPointer(tool, `"${channelId}"`),
     data: { refusal: 'tuned-out', channelId },
   };
 }
@@ -1340,8 +1348,7 @@ export class ChannelRegistry {
       // isn't the way: the tune-out's cancel is, and it delivers the backlog.
       if (action === 'close' && now === 'tuned-out') {
         return `Channel ${channel} was tuned out meanwhile: its messages go to the subconscious, and channel_close doesn't ` +
-          `change that. Call tune_out with channelId ${channel} and mode "cancel" for it to resume normal attention; ` +
-          'cancelling delivers the diverted backlog.';
+          `change that. ${tunedOutPointer('channel_close', channel)}`;
       }
       // The later decision's own work settles the transport, and its call
       // says what became of it, so this says only that this call's change

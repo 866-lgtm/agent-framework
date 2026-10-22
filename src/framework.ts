@@ -27080,9 +27080,9 @@ export class AgentFramework {
         : (primary?.getContextManager().getAllMessages() ?? []).filter(ofEpoch(params.epochId)).length +
           this.deferredMessages.filter((m) => (m.forAgent ?? this.primaryAgentName) === this.primaryAgentName)
             .filter(ofEpoch(params.epochId)).length;
-      const held = diverted > 0
-        ? ` The ${diverted} message${diverted === 1 ? '' : 's'} it diverted stay here, and nothing will deliver them as its backlog.`
-        : '';
+      const held = diverted === 0 ? ''
+        : diverted === 1 ? ' The 1 message it diverted stays here, and nothing will deliver it as its backlog.'
+        : ` The ${diverted} messages it diverted stay here, and nothing will deliver them as its backlog.`;
       try {
         registry.cancelTuneOut(serverId, channelId, 'open', source);
       } catch (err) {

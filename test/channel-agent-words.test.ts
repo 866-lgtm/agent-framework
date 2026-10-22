@@ -307,7 +307,7 @@ test('a channel_open or channel_close that a later decision overtook says which 
   assert.equal((await closingX).error,
     'Channel "x" was tuned out meanwhile: its messages go to the subconscious, and channel_close doesn\'t change that. ' +
     'Call tune_out with channelId "x" and mode "cancel" for it to resume normal attention; cancelling delivers the diverted ' +
-    'backlog.');
+    'backlog, and channel_close closes it after that.');
 });
 
 test('a channel_open or channel_close whose change already holds says so, and why nothing more came', async () => {

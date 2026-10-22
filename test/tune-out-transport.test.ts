@@ -712,7 +712,7 @@ test('a close of a tuned-out channel is refused, open or not, and changes nothin
     isError: true,
     error: 'Channel "y" is tuned out: its messages go to the subconscious, and channel_close doesn\'t change that. Call ' +
       'tune_out with channelId "y" and mode "cancel" for it to resume normal attention; cancelling delivers the diverted ' +
-      'backlog.',
+      'backlog, and channel_close closes it after that.',
     data: { refusal: 'tuned-out', channelId: 'y' },
   };
   const agent = { kind: 'agent' as const, agentName: 'scout' };
@@ -766,7 +766,7 @@ test('a module\'s close of a tuned-out channel that certifies an idle lease is r
       isError: false,
       error: 'Channel "y" is tuned out: its messages go to the subconscious, and channel_close doesn\'t change that. Call ' +
         'tune_out with channelId "y" and mode "cancel" for it to resume normal attention; cancelling delivers the diverted ' +
-        'backlog.',
+        'backlog, and channel_close closes it after that.',
       data: { refusal: 'tuned-out', channelId: 'y' },
     },
   );
@@ -1330,7 +1330,7 @@ test('an agent\'s close of a tuned-out channel is refused, and after the cancel 
   assert.equal(refused.text,
     `Channel "${CHANNEL}" is tuned out: its messages go to the subconscious, and channel_close doesn't change that. Call ` +
     `tune_out with channelId "${CHANNEL}" and mode "cancel" for it to resume normal attention; cancelling delivers the ` +
-    'diverted backlog.');
+    'diverted backlog, and channel_close closes it after that.');
   assert.equal(f.i.channelRegistry.getDesiredState('disc', CHANNEL), 'tuned-out', 'the tune-out stands');
   // The refusal's advice: cancel, which delivers the backlog, then close.
   f.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Read the backlog.' }]));
@@ -1424,6 +1424,25 @@ test('a tune-out on record at a start with no subconscious ends there, its chann
   assert.equal(registry.getTuneOutState('disc', CHANNEL), null);
   assert.ok(store.logged.includes(`[tune-out] ${endedLine} The 2 messages it diverted stay here, and nothing will deliver them ` +
     'as its backlog.'), store.logged.join('\n'));
+});
+
+test('the ending counts a diverted message still queued to be written, and says so in the singular', async (t) => {
+  const store = await tunedOutStore(t, 0);
+  const second = await store.start(false, true);
+  const i = second as unknown as RestartInternals & {
+    deferredMessages: Array<{ id: string; seq: number; participant: string; content: unknown[]; metadata?: unknown; forAgent?: string; heldAt: number }>;
+    endTuneOutsWithoutCoordinator(): void;
+  };
+  // A tune-out recorded on this start, with one diverted write still held
+  // for the primary and one for another agent, which isn't the primary's
+  // backlog.
+  i.channelRegistry.enterTuneOut('disc', CHANNEL, { ...PARAMS, epochId: 'held' }, 'agent-tool');
+  const diverted = { participant: 'chatter', content: [{ type: 'text', text: 'held' }], metadata: { tuneOut: { epochId: 'held' } }, heldAt: Date.now() };
+  i.deferredMessages.push({ id: 'w1', seq: 1, ...diverted }, { id: 'w2', seq: 2, ...diverted, forAgent: 'someone-else' });
+  await store.capture(async () => { i.endTuneOutsWithoutCoordinator(); });
+  assert.ok(store.logged.includes(`[tune-out] ${endedLine} The 1 message it diverted stays here, and nothing will deliver it as ` +
+    'its backlog.'), store.logged.join('\n'));
+  i.deferredMessages.length = 0;
 });
 
 test('a tune-out on record when a start without servers connects one later ends then, keeping the agent\'s provenance', async (t) => {
