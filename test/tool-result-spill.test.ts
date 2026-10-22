@@ -485,6 +485,27 @@ describe('tool-result spill completion (issue #89)', () => {
     }
   });
 
+  it('an empty string result is stored and sent as a result with no data is: as no text', async () => {
+    // JSON quoted an empty string as '""'. Kept as it is, it is the text a
+    // result with no data already gave, so nothing downstream meets a new shape.
+    const seen: Array<{ stored: string; wire: unknown }> = [];
+    for (const result of [{ success: true, data: '' }, { success: true }] as ToolResult[]) {
+      const h = await startSpillTurn({ prefix: 'empty-string-', result, withWorkspace: false });
+      try {
+        const stored = await waitForStoredToolResult(h.framework);
+        assert.ok(stored, 'tool result should be stored');
+        const wire = h.membrane.lastStream?.receivedToolResults[0] as Array<{ content: unknown }> | undefined;
+        assert.ok(wire && wire.length === 1, 'one wire tool result expected');
+        seen.push({ stored: stored.content, wire: wire[0].content });
+      } finally {
+        await h.framework.stop();
+        rmSync(h.tempDir, { recursive: true, force: true });
+      }
+    }
+    assert.deepStrictEqual(seen[0], seen[1], 'an empty string goes as no data does');
+    assert.deepStrictEqual(seen[0], { stored: '', wire: '' });
+  });
+
   it('falls back to EXPLICIT plain truncation with no writable workspace', async () => {
     const h = await startSpillTurn({
       prefix: 'spill-nows-',

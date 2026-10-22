@@ -273,7 +273,7 @@ export interface ToolCall {
   /**
    * How long this call's result may be and still reach its caller whole,
    * measured as the framework stores it: an error's text, or a success's data
-   * as JSON (a content array as its text). For a model's call it is the
+   * as JSON (a string or a content array as its text). For a model's call it is the
    * agent's inline cap, past which the framework spills the result to a
    * workspace file and sends a preview. A result that long is stored whole
    * unless its round's results together pass the readers' per-message bound,
