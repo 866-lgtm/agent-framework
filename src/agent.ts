@@ -19,6 +19,7 @@ import {
   type StoredRowLike,
 } from './silent-heartbeat.js';
 import { randomUUID } from 'node:crypto';
+import { resolveClockConfig, type ResolvedClockConfig } from './clock-rows.js';
 import {
   nonErrorResultText,
   truncateForHistory,
@@ -167,6 +168,10 @@ export class Agent {
   readonly proseRouting: 'locus' | 'explicit' | 'hybrid' | 'disabled';
   /** Exact whole-response known-tool wrapper containment (default off). */
   readonly toolWrapperProseGuard: boolean;
+  /** Clock rows' interval and precision (see AgentConfig.clock); undefined
+   *  when the agent writes none of its own (a resident still reads those
+   *  another resident writes into the shared slot). */
+  readonly clock: ResolvedClockConfig | undefined;
   /** Prompt-cache TTL forwarded to the provider (see AgentConfig.cacheTtl). */
   readonly cacheTtl: NonNullable<AgentConfig['cacheTtl']>;
   /** Emit prompt-cache markers on requests (see AgentConfig.promptCaching). */
@@ -296,6 +301,7 @@ export class Agent {
     this.toolResultGuard = new ToolResultGuard(config.name, contextManager, config.toolResultGuard === true);
     this.proseRouting = config.proseRouting ?? 'locus';
     this.toolWrapperProseGuard = config.toolWrapperProseGuard === true;
+    this.clock = resolveClockConfig(config.name, config.clock);
     this.cacheTtl = config.cacheTtl ?? '1h';
     this.promptCaching = config.promptCaching !== false;
     this.prefillUserMessage = config.prefillUserMessage;

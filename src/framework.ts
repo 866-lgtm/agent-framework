@@ -697,6 +697,7 @@ import type {
 } from './mcpl/types.js';
 import type { ContextInjection } from '@animalabs/context-manager';
 import { formatZonedDateTime, resolveTimeZone } from './timezone.js';
+import { CLOCK_ROW_KIND, clockStampOf, planClock, takesClockBefore } from './clock-rows.js';
 import { firstFreeBranchName } from './branch-names.js';
 import {
   DEFAULT_DISCORD_AWARENESS_EMOJI,
@@ -11564,6 +11565,10 @@ export class AgentFramework {
       // Speech happens only via speak_in_channel (its own marked voice).
       proseRouting: 'explicit',
       allowedTools: [...SUBCONSCIOUS_TOOL_NAMES, 'think', 'skip_reply', 'end_turn'],
+      // No clock rows of its own: its merged view carries the residents'
+      // clocks, and clocks it planned from its own rows alone would read the
+      // time a second time beside them, or disagree with them.
+      clock: undefined,
     };
     const agent = new Agent(agentConfig, contextManager, this.membrane);
     this.adoptToolResultGuard(agent);
@@ -11861,6 +11866,12 @@ export class AgentFramework {
           // next start as arrivals: that start's compile sends it.
           const heard: Array<{ msg: DeferredWrite; id: MessageId; content: ContentBlock[]; parts: number }> = [];
           if (currentState.supportsInjectedMessages !== false) {
+            // A clock row due (storeDueClock) goes right after the round's
+            // results, ahead of what is drained below, and joins the stream
+            // the same way. A boundary that passed during the round can't
+            // stand between a tool's call and its results, so this clock
+            // reads the time it's written (clock-rows.ts).
+            const clock = this.storeDueClock(agent, 'tool-boundary');
             const deferred = this.drainDeferredFor(agent.name, (msg) => !isInjectableMidTurn(msg, agent.name));
             // Stored in queue order, cut at the first that can't be stored: it
             // and what follows wait for the turn's end, and only what was
@@ -11887,10 +11898,21 @@ export class AgentFramework {
             // Rendered in one call: a render prepares as a compile does, so
             // the batch shares one preparation. The image limits count from
             // the batch's oldest message to the newest, as a compile does.
-            const rendered = this.renderForInjection(agent, heard.map((h) => h.id));
+            // The clock, stored ahead of them, renders first in the same batch
+            // and is injected first, as the next compile sends it.
+            const rendered = this.renderForInjection(agent, [...(clock ? [clock.id] : []), ...heard.map((h) => h.id)]);
+            const first = clock ? 1 : 0;
+            if (clock) {
+              const sent = rendered ? rendered[0]! : clock.content;
+              if (sent !== null) {
+                midTurnInjections.push({ participant: 'user', content: sent, metadata: clock.metadata });
+              } else {
+                console.error(`[clock] ${agent.name}: clock ${clock.id} left out of the live round, since the next compile won't send it among its newest`);
+              }
+            }
             const leftOut: typeof heard = [];
             heard.forEach((h, i) => {
-              const sent = rendered ? rendered[i]! : h.content;
+              const sent = rendered ? rendered[i + first]! : h.content;
               // The next compile won't send it among its newest: injected, it
               // would put in the live turn what that compile sends elsewhere,
               // or not at all. It's under any consumed mark the boundary sets
@@ -12493,6 +12515,11 @@ export class AgentFramework {
       if (!target) return undefined;
       if (this.conversationRouter && this.conversationAgentHomes.has(target.name)) {
         metadata.triggered = event.triggerInference ?? false;
+        // A fork's channel messages are stored past its deferral; a clock goes
+        // ahead of one only while the fork has no turn alive (storeDueClock).
+        if (!this.turnAlive(target) && takesClockBefore('user', event.content, metadata, target.name)) {
+          this.storeDueClock(target, 'event');
+        }
         const id = target.getContextManager().addMessage('user', event.content, AgentFramework.withStoredDigest(metadata, event.content));
         // A correction may target an older engagement. Refresh only the
         // binding whose agent actually received the message.
@@ -12676,6 +12703,10 @@ export class AgentFramework {
     const trigger = decision.trigger && event.triggerInference !== false;
     messageMetadata.triggered = trigger;
 
+    // As for a correction above: a clock ahead only while no turn is alive.
+    if (!this.turnAlive(agent) && takesClockBefore('user', event.content, messageMetadata, agent.name)) {
+      this.storeDueClock(agent, 'event');
+    }
     const id = agent.getContextManager().addMessage('user', event.content, AgentFramework.withStoredDigest(messageMetadata, event.content));
     router.touch(event.channelId);
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
@@ -15500,6 +15531,102 @@ export class AgentFramework {
     return routing.engaged.has(m.channelId) ? m.channelId : undefined;
   }
 
+  /** Whether `agent` has a turn alive: starting, streaming or waiting on its tools. */
+  private turnAlive(agent: Agent): boolean {
+    return this.activeTurnTokens.has(agent.name)
+      || this.pendingAssistantBlocks.has(agent.name)
+      || this.activeStreams.has(agent.name);
+  }
+
+  /**
+   * Store the clock row due in `agent`'s window (clock-rows.ts), if the agent
+   * has clock rows and a boundary has passed since the window's last clock,
+   * or the window holds no clock row yet (planClock), and return it. The
+   * caller places it, by calling this right before what the clock precedes
+   * is written: an incoming event while no turn of the agent's is alive (or
+   * one is assembling before its compile), a fresh turn's inputs before its
+   * compile, or, mid-turn, the messages a tool boundary injects, where the
+   * caller injects the clock first. Each is a place where a row is either in
+   * the request that follows or before every request still to come, so the
+   * window and the live stream keep matching.
+   *
+   * None while the host is quiesced (the window is frozen for surgery), and
+   * none in the residents' shared slot while another of its readers (the
+   * subconscious among them, through its merged view) has a turn alive: the
+   * row would sit inside that turn without joining its stream. A clock that
+   * can't be planned or stored is logged and skipped: it never holds up what
+   * it would have preceded. One whose write threw after it landed is the
+   * window's all the same, so it's returned, and a tool boundary injects it.
+   */
+  private storeDueClock(
+    agent: Agent,
+    occasion: 'event' | 'turn-start' | 'tool-boundary',
+  ): { id: MessageId; content: ContentBlock[]; metadata: MessageMetadata } | undefined {
+    const config = agent.clock;
+    if (!config || this.quiesced) return undefined;
+    if (this.sharedSlotAgents.has(agent)) {
+      for (const reader of this.sharedSlotAgents) {
+        if (reader !== agent && this.turnAlive(reader)) return undefined;
+      }
+    }
+    let planned: ReturnType<typeof planClock>;
+    try {
+      planned = planClock({ now: Date.now(), ...this.lastClockOf(agent.getContextManager()), config, zone: this.timeZone });
+    } catch (err) {
+      console.error(`[clock] ${agent.name}: no clock row at ${occasion}:`, err);
+      return undefined;
+    }
+    if (!planned) return undefined;
+    const metadata = { system: true, kind: CLOCK_ROW_KIND, clock: planned.stamp } as MessageMetadata;
+    const before = this.storedCountOf(agent);
+    let id: MessageId;
+    try {
+      id = agent.getContextManager().addMessage('user', planned.content, metadata);
+    } catch (err) {
+      // A write can throw after its row landed, as when context-manager's own
+      // propagation of it fails: what landed is read back from where the
+      // store stood before, as writeDrainedInOrder reads a drained write's.
+      const at = planned.stamp.at;
+      const landed = before === undefined
+        ? undefined
+        : this.storedSince(agent, before, (m) => clockStampOf(m.metadata)?.at === at, 'clock', 'the clock write');
+      if (!landed || landed.length === 0) {
+        console.error(`[clock] ${agent.name}: no clock row at ${occasion}${landed ? '' : ' (whether it landed is unknown)'}:`, err);
+        return undefined;
+      }
+      console.error(`[clock] ${agent.name}: the clock row at ${occasion} landed though its write threw:`, err);
+      id = landed[0]!.id;
+    }
+    this.emitTrace({ type: 'message:added', messageId: id, source: `clock:${occasion}` });
+    return { id, content: planned.content, metadata };
+  }
+
+  /** Rows a window's last-clock scan reads at a time. */
+  private static readonly CLOCK_SCAN_ROWS = 256;
+
+  /** What the next clock is planned from: the window's newest row's time and
+   *  the time its last clock row reads, found by reading back from the
+   *  newest row, CLOCK_SCAN_ROWS at a time, until a clock row comes, however
+   *  far back it is. In the steady state the newest chunk holds it, unless
+   *  more rows than that have come since the last clock; a window with no
+   *  clock row is read whole once, and then takes one (planClock). */
+  private lastClockOf(cm: ContextManager): { newestRowAt: number | undefined; lastClockAt: number | undefined } {
+    let newestRowAt: number | undefined;
+    for (let end = cm.getMessageCount(); end > 0;) {
+      const span = Math.min(end, AgentFramework.CLOCK_SCAN_ROWS);
+      const { messages } = cm.getMessageWindow(end - span, span, { resolveBlobs: false });
+      if (newestRowAt === undefined && messages.length > 0) {
+        newestRowAt = new Date(messages[messages.length - 1]!.timestamp).getTime();
+      }
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const stamp = clockStampOf(messages[i]!.metadata);
+        if (stamp) return { newestRowAt, lastClockAt: stamp.at };
+      }
+      end -= span;
+    }
+    return { newestRowAt, lastClockAt: undefined };
+  }
+
   /**
    * Weigh a message that no tool boundary of the agent's open logical turn
    * will weigh: one that would re-pin the locus becomes one of the turn's
@@ -17048,6 +17175,16 @@ export class AgentFramework {
     // turn, and flushing there would insert messages between its rounds.
     // Before recordTurnCheckpoint: these are the turn's inputs, not its
     // products — undoing the turn must not destroy them.
+    // A clock row due (storeDueClock) goes ahead of the turn's inputs, so a
+    // turn starts with a current clock, a silent heartbeat's tick (which
+    // stores no row of its own) included, unless storeDueClock writes none:
+    // while the host is quiesced, while another reader of the residents'
+    // shared slot has a turn alive, or when its write fails without landing.
+    // Then a later event, turn start or tool boundary takes it. Fresh turns
+    // only, as the flush below: a turn that resumes continues its logical
+    // turn, which took its clock at its start or at a tool boundary that
+    // could carry one.
+    if (attempt === 0 && !resumesTurn) this.storeDueClock(agent, 'turn-start');
     if (
       attempt === 0 &&
       !resumesTurn &&
@@ -21870,6 +22007,12 @@ export class AgentFramework {
       return '' as MessageId; // Deferred — flushed at the target's next boundary
     }
 
+    // A clock row due goes first (storeDueClock). A write that gets here is a
+    // tool result (which takes none), or no turn of the agent's is alive, or
+    // its turn is assembling before its compile, or it comes from stop()'s
+    // drain, once every stream it could join has settled: the clock is in
+    // whatever request comes next.
+    if (takesClockBefore(participant, content, metadata, agent.name)) this.storeDueClock(agent, 'event');
     const stored = agent.getContextManager().addMessage(
       participant,
       content,
@@ -22208,13 +22351,26 @@ export class AgentFramework {
    *  `bodyGroupId`. Undefined when the store can't be read back, which is
    *  logged: not the same as nothing found. */
   private storedCopiesOf(agent: Agent, from: number, deferredWriteId: string): StoredCopy[] | undefined {
+    return this.storedSince(
+      agent, from, (m) => m.metadata?.deferredWriteId === deferredWriteId, 'deferral', `deferred write ${deferredWriteId}`);
+  }
+
+  /** The messages `match` picks among those the agent's store gained from
+   *  position `from` on, in store order, with their blobs resolved. Undefined
+   *  when the store can't be read back, which is logged under `tag`, naming
+   *  `what` was written: not the same as nothing found. */
+  private storedSince(
+    agent: Agent,
+    from: number,
+    match: (m: StoredMessage) => boolean,
+    tag: string,
+    what: string,
+  ): StoredCopy[] | undefined {
     try {
       const cm = agent.getContextManager();
-      return cm.getMessageWindow(from, Math.max(0, cm.getMessageCount() - from)).messages
-        .filter((m) => m.metadata?.deferredWriteId === deferredWriteId)
-        .map(storedCopy);
+      return cm.getMessageWindow(from, Math.max(0, cm.getMessageCount() - from)).messages.filter(match).map(storedCopy);
     } catch (error) {
-      console.error(`[deferral] could not read back what deferred write ${deferredWriteId} stored in ${agent.name}'s store:`, error);
+      console.error(`[${tag}] could not read back what ${what} stored in ${agent.name}'s store:`, error);
       return undefined;
     }
   }

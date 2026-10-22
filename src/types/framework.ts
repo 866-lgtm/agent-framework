@@ -117,9 +117,10 @@ export interface FrameworkConfig {
   subconscious?: import('../tune-out/tools.js').SubconsciousConfig;
 
   /**
-   * IANA zone used only when rendering wall-clock times for the agent.
-   * Stored/protocol timestamps remain epoch/UTC. Defaults to AGENT_TIMEZONE,
-   * then the process zone.
+   * IANA zone of the agent's wall clock: it renders wall-clock times for the
+   * agent, and it sets where clock rows' boundaries fall (AgentConfig.clock,
+   * counted from local midnight here). Stored/protocol timestamps remain
+   * epoch/UTC. Defaults to AGENT_TIMEZONE, then the process zone.
    */
   timeZone?: string;
 
