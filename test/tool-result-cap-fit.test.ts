@@ -291,6 +291,16 @@ test("a cap the bound's fit already holds the head under gets no offer to raise 
   });
 });
 
+test('a string is measured as its own text, so one whose JSON passes the cap and whose text fits is stored whole', async () => {
+  // As JSON, 1,000 lines of "ab" are 4,002 characters, past the cap of 3,800:
+  // each newline escapes to two. As text they are 3,000, so the result stays
+  // inline where its JSON form spilled.
+  const payload = 'ab\n'.repeat(1000);
+  await withResidents({ agents: [{ name: 'solo', maxMessageTokens: 1000 }], mount: 'files', inlineMaxChars: 3800, payload }, async ({ stored }) => {
+    assert.equal(stored, payload);
+  });
+});
+
 test("a result between the cap and the bound is offered a higher cap, which would store it whole", async () => {
   // The 3,900 characters are stored as they are: past the cap of 3,800, and
   // within the bound of 4,000.

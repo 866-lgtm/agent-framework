@@ -485,6 +485,53 @@ describe('tool-result spill completion (issue #89)', () => {
     }
   });
 
+  it('a result stored JSON-quoted, as strings were before they went as their text, is sent as stored after a restart', async () => {
+    // History keeps each result's text as it was stored, so a string result
+    // stored in its old quoted form reaches the next request byte for byte,
+    // and a cached prompt's prefix doesn't move. This doesn't depend on how a
+    // string is rendered now: the store is seeded with the old form directly.
+    const quoted = JSON.stringify('As of 10:00. 2 open.\n[review] org/repo#1 "Fix it"');
+    const { tempDir, storePath } = tempStorePath('string-stored-');
+    try {
+      const seed = await AgentFramework.create({
+        storePath,
+        membrane: new MockMembrane().asMembrane(),
+        agents: [{ name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all' }],
+        modules: [],
+        syncIntervalMs: 0,
+      });
+      try {
+        const cm = seed.getAgent('prime')!.getContextManager();
+        cm.addMessage('prime', [{ type: 'tool_use', id: 'call_old', name: 'canned--fetch', input: {} }]);
+        cm.addMessage('user', [{ type: 'tool_result', toolUseId: 'call_old', content: quoted }]);
+      } finally {
+        await seed.stop();
+      }
+      const h = await startSpillTurn({
+        prefix: 'unused-',
+        result: { success: true, data: 'new' },
+        withWorkspace: false,
+        tempDir,
+        storePath,
+      });
+      try {
+        const deadline = Date.now() + 20_000;
+        while (h.membrane.calls.length === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+        const request = h.membrane.calls[0];
+        assert.ok(request, 'the boot makes a request');
+        const sent = request.messages
+          .flatMap((m) => (Array.isArray(m.content) ? m.content : []) as Array<{ type: string; toolUseId?: string; content?: unknown }>)
+          .filter((b) => b.type === 'tool_result' && b.toolUseId === 'call_old')
+          .map((b) => b.content);
+        assert.deepStrictEqual(sent, [quoted], 'the stored result goes as it was stored');
+      } finally {
+        await h.framework.stop();
+      }
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('an empty string result is stored and sent as a result with no data is: as no text', async () => {
     // JSON quoted an empty string as '""'. Kept as it is, it is the text a
     // result with no data already gave, so nothing downstream meets a new shape.
