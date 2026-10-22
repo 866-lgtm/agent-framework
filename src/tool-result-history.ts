@@ -11,10 +11,11 @@
  *
  * For MCP-shaped content arrays, this helper keeps text blocks verbatim and
  * replaces image blocks with a short `[image: mimeType, ~NKB]` placeholder.
- * For anything else it falls back to JSON, written by RFC-005's rules at
- * every depth (historyJson): a reference is shown as its stub wherever it
- * sits in the data, so its uri never reaches history, and inline data that
- * claims a uri or a disposition is withheld.
+ * A string is already text and is kept as it is. For anything else it falls
+ * back to JSON, written by RFC-005's rules at every depth (historyJson): a
+ * reference is shown as its stub wherever it sits in the data, so its uri
+ * never reaches history, and inline data that claims a uri or a disposition
+ * is withheld.
  */
 
 import { INLINE_WITHHELD_TEXT, isInlineContradiction, referenceStubOrNull } from './mcpl/references.js';
@@ -72,9 +73,19 @@ export function toolResultDataToHistoryString(
   options?: HistorySerializeOptions,
 ): string {
   const fromArray = tryHistoryStringFromContentArray(data, options);
+  // A string is the text the tool means to say, kept as it is: JSON would
+  // quote it and escape every newline, so a multi-line result would reach
+  // the model, a script and its spill file as one escaped line. Kept well
+  // formed: a lone UTF-16 surrogate, which JSON escaped, isn't text, a
+  // provider can refuse a request that carries one, and UTF-8 can't store
+  // it in a spill file, so it reads as U+FFFD.
   // JSON leaves out undefined, a function and a symbol: a result with no data
   // is stored as no text, as an empty content array is.
-  const str = fromArray ?? historyJson(data) ?? '';
+  // RFC-005 shows only objects otherwise (shownInHistory), so a string has
+  // nothing for historyJson to stub or withhold.
+  const str = fromArray
+    ?? (typeof data === 'string' ? data.toWellFormed() : historyJson(data))
+    ?? '';
   return maxChars ? truncateForHistory(str, maxChars) : str;
 }
 

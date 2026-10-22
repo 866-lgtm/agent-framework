@@ -186,7 +186,13 @@ export interface ModuleEvent {
 export interface ToolResult {
   /** Whether the tool succeeded */
   success: boolean;
-  /** Result data (if success) */
+  /**
+   * Result data (if success). The model reads a string as that text, an MCP
+   * content array whose every block the framework knows as those blocks, and
+   * anything else as JSON, where RFC-005 shows a reference as its stub and
+   * withholds inline data that claims a uri or a disposition. With no data,
+   * it reads the result's error text, if any.
+   */
   data?: unknown;
   /** Error message (if failure) */
   error?: string;
@@ -270,7 +276,7 @@ export interface ToolCall {
   /**
    * How long this call's result may be and still reach its caller whole,
    * measured as the framework stores it: an error's text, or a success's data
-   * as JSON (a content array as its text). For a model's call it is the
+   * as JSON (a string or a content array as its text). For a model's call it is the
    * agent's inline cap, past which the framework spills the result to a
    * workspace file and sends a preview. A result that long is stored whole
    * unless its round's results together pass the readers' per-message bound,

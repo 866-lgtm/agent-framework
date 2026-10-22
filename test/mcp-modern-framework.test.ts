@@ -156,10 +156,10 @@ test('model path: the result reaches the model, structured-only as JSON', async 
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as never);
     await waitFor('the tool round', () => (membrane.lastStream?.receivedToolResults.length ?? 0) >= 1);
-    // The framework renders string data JSON-encoded, as it does for every
-    // string tool result; decoded, it is the structured value's JSON.
+    // The result's data is the structured value's JSON, a string, which
+    // reaches the model as that text.
     const [delivered] = membrane.lastStream!.receivedToolResults[0] as Array<{ content: string }>;
-    assert.deepEqual(JSON.parse(JSON.parse(delivered!.content)), { answer: 42, ok: false, nothing: null });
+    assert.deepEqual(JSON.parse(delivered!.content), { answer: 42, ok: false, nothing: null });
   });
 });
 
@@ -224,11 +224,11 @@ test('scripts get every result in one shape, structured results whole', async ()
       isError: false,
     });
     // Without structured content, content is the model's text: the history
-    // rendering, which JSON-encodes a text result. structuredContent is null.
+    // rendering, which for a text result is that text. structuredContent is null.
     assert.deepEqual(await handle('agent', 'mcpl--modern--echo', { text: 'x' }), {
       ok: true,
       isError: false,
-      value: { content: [{ type: 'text', text: JSON.stringify('echo:x') }], structuredContent: null, isError: false },
+      value: { content: [{ type: 'text', text: 'echo:x' }], structuredContent: null, isError: false },
     });
   });
 });
@@ -404,7 +404,7 @@ process.stdin.on('data', (c) => {
     const [delivered] = membrane.lastStream!.receivedToolResults[0] as Array<{ content: string; isError: boolean }>;
     assert.equal(delivered!.isError, false);
     // No server text block: the structured value is shown beside the stubs.
-    assert.equal(JSON.parse(delivered!.content),
+    assert.equal(delivered!.content,
       '[resource link "a.md": https://example.invalid/a.md; not fetched]\n[resource memo://n, text/plain]\nnote body\n{"count":2}');
     const status = framework.listMcplServers().find((s) => s.id === 'plain')!;
     assert.equal(status.family, 'legacy');
