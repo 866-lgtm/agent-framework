@@ -15,4 +15,7 @@
   way. In both, a `**/` at the start of a path segment now matches zero or
   more directories, as in other glob tools, so `project/src/**/*.ts` also finds `project/src/main.ts` and
   `**/*.md` also finds the `.md` files at a mount's root; it used to need at
-  least one directory there.
+  least one directory there. `glob`'s description and its `pattern`
+  parameter's description changed, and so did `grep`'s `glob` parameter's
+  description, so the first request after the upgrade that carries the
+  workspace's tools misses the prompt cache from its tool block on.

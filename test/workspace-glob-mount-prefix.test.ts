@@ -89,14 +89,27 @@ test('with a path, the pattern may be relative to it or mount-prefixed', async (
   assert.deepEqual(await glob({ path: 'notes/diary', pattern: 'project/**' }), []);
 });
 
+test('a first segment that is a brace group or a wildcard names no mount', async (t) => {
+  // Read as written in every mount, so neither finds notes/diary's files,
+  // which notes/diary/*.md finds.
+  const { glob } = setup(t);
+  assert.deepEqual(await glob({ pattern: '{notes,project}/diary/*.md' }), []);
+  assert.deepEqual(await glob({ pattern: 'note?/diary/*.md' }), []);
+});
+
 test("with a path, a pattern naming the path's mount reads mount-prefixed, within the path", async (t) => {
-  const { glob, grepFiles } = setup(t);
+  const { glob, grepFiles } = setup(t, { 'notes/drafts/one.md': 'one', 'notes/diary/notes1': 'a note' });
   const diary = ['notes/diary/2026-10-12.md', 'notes/diary/2026-10-13.md'];
   assert.deepEqual(await glob({ path: 'notes/diary', pattern: 'notes/**/*.md' }), diary);
-  // notes/README.md lies outside the path.
+  // notes/README.md lies outside the path, and so does notes/drafts.
   assert.deepEqual(await glob({ path: 'notes/diary', pattern: 'notes/*.md' }), []);
+  assert.deepEqual(await glob({ path: 'notes/diary', pattern: 'notes/drafts/*.md' }), []);
   assert.deepEqual(await grepFiles({ pattern: 'entry', path: 'notes/diary', glob: 'notes/diary/*-13.md' }), ['notes/diary/2026-10-13.md']);
-  assert.deepEqual(await grepFiles({ pattern: 'entry', path: 'notes/diary', glob: 'notes/*.md' }), []);
+  assert.deepEqual(await grepFiles({ pattern: 'readme', glob: 'notes/*.md' }), ['notes/README.md']);
+  assert.deepEqual(await grepFiles({ pattern: 'readme', path: 'notes/diary', glob: 'notes/*.md' }), []);
+  // A pattern with no `/` names no mount, even one that starts with a
+  // mount's name, so it's read relative to the path.
+  assert.deepEqual(await glob({ path: 'notes/diary', pattern: 'notes1' }), ['notes/diary/notes1']);
 });
 
 test('a `**/` matches zero or more directories, in a relative or a mount-prefixed pattern', async (t) => {
@@ -146,7 +159,7 @@ test('a `**` that ends a brace alternative, with a `/` after the group, matches 
 });
 
 test("a pattern's other characters match themselves", async (t) => {
-  const { glob } = setup(t, { 'project/src/a+b.ts': 'plus', 'project/src/aaab.ts': 'decoy', 'project/src/a.b(c).ts': 'dots', 'project/src/axbc-ts': 'decoy' });
+  const { glob } = setup(t, { 'project/src/a+b.ts': 'plus', 'project/src/aaab.ts': 'decoy', 'project/src/a.b(c).ts': 'dots', 'project/src/axbc-ts': 'decoy', 'project/src/axb(c).ts': 'decoy' });
   assert.deepEqual(await glob({ pattern: 'project/src/a+b.ts' }), ['project/src/a+b.ts']);
   assert.deepEqual(await glob({ pattern: 'project/src/a.b(c).ts' }), ['project/src/a.b(c).ts']);
 });
@@ -155,6 +168,8 @@ test("grep's glob filter takes a mount-prefixed pattern", async (t) => {
   const { grepFiles } = setup(t);
   assert.deepEqual(await grepFiles({ pattern: 'entry', glob: 'notes/diary/*.md' }), ['notes/diary/2026-10-12.md', 'notes/diary/2026-10-13.md']);
   assert.deepEqual(await grepFiles({ pattern: 'entry', glob: 'project/src/*.ts' }), ['project/src/main.ts']);
+  // In every other mount, a filter naming a mount is read as written.
+  assert.deepEqual(await grepFiles({ pattern: 'entry', glob: 'notes/*.md' }), ['project/notes/todo.md']);
   // Relative filters still match relative to each mount.
   assert.deepEqual(await grepFiles({ pattern: 'entry', glob: '**/*.md' }), [
     'notes/diary/2026-10-12.md', 'notes/diary/2026-10-13.md', 'project/docs/guide.md', 'project/notes/todo.md',

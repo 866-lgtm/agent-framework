@@ -259,8 +259,10 @@ export interface MountConfig {
    * `glob`, `grep`) take up to it from their scope's start every time:
    * `glob`'s is the directory its pattern's segments before the first
    * wildcard name beneath its `path`, and `grep`'s the deeper of its `path`
-   * and its `glob` filter's directory, as far as disk lists each segment
-   * with that spelling as a directory, not a link. Each directory's listing
+   * and its `glob` filter's directory. For a pattern or filter whose first
+   * segment names the mount, that directory is the one its rest names from
+   * the mount's root. Either way, the walk descends as far as disk lists
+   * each segment with that spelling as a directory, not a link. Each directory's listing
    * is read whole, so a deletion is seen wherever the walk lists, whatever
    * it took.
    *
