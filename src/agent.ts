@@ -1921,14 +1921,21 @@ export class Agent {
     // via buildStoredToolResultContent, with workspace spill). No workspace
     // is reachable from here, so the house default cap applies as plain
     // truncation — bounded beats unbounded, for errors too.
-    const content = results.map((r) => ({
-      type: 'tool_result' as const,
-      toolUseId: r.id,
-      content: r.result.isError
-        ? truncateForHistory(r.result.error ?? 'Unknown error', DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS)
-        : nonErrorResultText(r.result, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS),
-      isError: r.result.isError,
-    }));
+    const content = results.map((r) => {
+      // This API's results are unchecked (nonErrorResultText), so each field
+      // is read once, and only an error that is a string is made well formed;
+      // any other error value is passed on as it was before.
+      const isError = r.result.isError;
+      const error: unknown = isError ? r.result.error ?? 'Unknown error' : undefined;
+      return {
+        type: 'tool_result' as const,
+        toolUseId: r.id,
+        content: isError
+          ? truncateForHistory(typeof error === 'string' ? error.toWellFormed() : error as string, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS)
+          : nonErrorResultText(r.result, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS),
+        isError,
+      };
+    });
 
     return [{
       participant: 'user',
