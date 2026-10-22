@@ -523,6 +523,27 @@ describe('clock rows in the framework', () => {
     } finally { await x.framework.stop(); }
   });
 
+  it('a mid-turn clock the render gives null goes in as stored, as the next compile sends it from before its window', async () => {
+    const x = await make();
+    x.membrane.supportsInjectedMessages = true;
+    try {
+      setClock('2026-10-21T10:41:10Z');
+      await wake(x, event('warm up'), [{ type: 'text', text: 'ok' }]);
+      const cm = x.framework.getAgent('assistant')!.getContextManager() as any;
+      let rendered = 0;
+      cm.renderAsNewest = (ids: readonly string[]) => { rendered++; return ids.map(() => null); };
+      setClock('2026-10-21T10:48:10Z');
+      x.mod.during = () => setClock('2026-10-21T10:52:10Z');
+      await wake(x, event('go'), [ping], [{ type: 'text', text: 'done' }]);
+      assert.equal(rendered, 1, 'the premise: the boundary rendered the clock');
+      const all = rows(x.framework);
+      const clock = all[all.findIndex((r) => r.content.some((b) => b.type === 'tool_result')) + 1]!;
+      assert.ok(isClock(clock), 'the premise: a clock follows the tool results');
+      assert.deepEqual(x.membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages,
+        [{ participant: 'user', content: clock.content }], 'the stream got the stored clock');
+    } finally { await x.framework.stop(); }
+  });
+
   it('on a stream that can\'t carry injected messages: no mid-turn clock, and the next event takes it', async () => {
     const x = await make();
     x.membrane.supportsInjectedMessages = false;
