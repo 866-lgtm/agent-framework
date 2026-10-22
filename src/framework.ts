@@ -20631,7 +20631,7 @@ export class AgentFramework {
     tc: CompletedToolCall,
     maxChars: number | undefined,
   ): { text: string; shown: ShownRanges | null } {
-    if (tc.result.isError) return { text: tc.result.error ?? 'Unknown error', shown: null };
+    if (tc.result.isError) return { text: (tc.result.error ?? 'Unknown error').toWellFormed(), shown: null };
     const ledger = this.toolImageLedgerFor(agentName);
     let blocks = null as HistoryBlockSpan[] | null;
     const text = nonErrorResultText(tc.result, undefined, {
@@ -21185,7 +21185,8 @@ export class AgentFramework {
       if (b.type === 'text') {
         // A text that isn't a string shows as the converters' placeholder,
         // rather than sending the whole array to the JSON fallback.
-        let text = typeof b.text === 'string' ? b.text : NON_STRING_TEXT_PLACEHOLDER;
+        // Well formed, as the stored copy's text is (nonErrorResultText).
+        let text = typeof b.text === 'string' ? b.text.toWellFormed() : NON_STRING_TEXT_PLACEHOLDER;
         if (maxChars && text.length > maxChars) {
           text = text.slice(0, toolResultCutAt(text, maxChars))
             + '\n\n[truncated — original was ' + text.length + ' chars'
