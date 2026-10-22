@@ -14,7 +14,10 @@
  * provideToolResults(results, { injectedMessages }) (membrane ≥0.5.72), so
  * the next round of the SAME turn sees them instead of the agent staying
  * deaf until the turn ends. (A message a tune-out holds from the residents
- * is stored there but not injected: module-rows-held-from-residents.)
+ * is stored there but not injected: module-rows-held-from-residents.) That
+ * holds on a stream that can carry them, as membrane 0.6.0's native tool path
+ * declares; on its XML tool path, which declares it can't, they wait for the
+ * turn's end.
  */
 
 import { describe, it, beforeEach, afterEach } from 'node:test';

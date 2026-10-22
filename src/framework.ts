@@ -415,8 +415,9 @@ function malformedResponseContent(response: EventResponse): { where: string; pla
  * context-manager's store prices them (injectedBlockTokens), and a small
  * per-block envelope allowance. On membrane's native tool path a mid-turn
  * message rides into the next round with its stored content as it is
- * (provideToolResults' injectedMessages); its XML tool path drops injected
- * messages, so there the estimate errs high. Deliberately a
+ * (provideToolResults' injectedMessages). Its XML tool path declares that it
+ * can't carry injected messages, so the tool boundary injects none there and
+ * that term is zero. Deliberately a
  * ceiling-ish heuristic, but for a mid-turn message's media at the store's
  * flat prices — the cost of overestimating is one early recompile;
  * the cost of underestimating is the 400 this projection exists to prevent.
@@ -1117,9 +1118,10 @@ type SpeechPublished = (to: PublishDestination, text: string, messageId: string 
 
 /**
  * How a round's prose is delivered: under which turn's routing, and how what
- * it doesn't send is held. `notice` says when the notice for an envelope that
- * bounces or is held back as a draft is presented: with this round's tool
- * results ('now') or at the next boundary that presents messages ('later').
+ * it doesn't send is held. `notice` says whether the notice for an envelope
+ * that bounces or is held back as a draft is queued now, for this round's tool
+ * boundary on a stream that presents injected messages ('now'), or not at all
+ * ('later'), which leaves the drafts to be named as holdProseDrafts says.
  * `keepPrivate` is a skip_reply round: its envelopes all stay in the context,
  * and none is sent, bounced or held.
  */
