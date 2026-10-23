@@ -5,9 +5,11 @@
   of the result's fields, one `key: value` to a line (`path: …`,
   `totalLines: …`, `nextOffsetChars: null`), then labelled sections: a
   page's `--- content ---`, grep's matches by file and version (`N:` for a
-  match, `N-` for a line of its context), what grep skipped, and a receipt's
-  `--- files ---` and `--- changed ---`. A value holding a line break, such
-  as a path, is written as a JSON string. A control character in a file
+  match, `N-` for a line of its context, as grep writes them), what grep
+  skipped, and a receipt's `--- files ---` and `--- changed ---`. A value
+  outside a page's content and a receipt's changed lines that holds a line
+  break (LF, CR, VT, FF, NEL, U+2028 or U+2029), such as a path or a line
+  grep matched, is written as a JSON string. A control character in a file
   reaches the model as itself, where JSON wrote an escape such as `\u001b`.
 
   **Who needs to act:**
@@ -17,7 +19,8 @@
   - a host or module that reads these results' fields from `result.data`,
     through `executeToolCall` or `ctx.callTool`: read `result.structured`.
     connectome-host reads either since 0.11.0
-    (anima-research/connectome-host#324).
+    (anima-research/connectome-host#324), and needs that version or later:
+    before it, its file viewers show such a file as empty.
 
   **What a page holds:** a page is held to the call's result limit as its
   text measures it, where it was measured as JSON, and so is a receipt.
@@ -25,16 +28,19 @@
     default 24,000 characters, a page of this repository's
     `src/modules/workspace/index.ts` now ends at line 475, where it ended at
     line 454. A spilled result's notice sizes the read-back page it suggests
-    the same way, so below a cap of about 2,300 characters it suggests a
-    longer one.
+    the same way, so below a cap of about 12,300 characters it suggests a
+    longer one than before.
   - A script's page is never shorter than before, since a page's text is
-    shorter than its JSON. A script's answer carries the fields beside the
-    text, which the limit doesn't count. Together they can pass what a
-    script takes only on a page of more than about 3.7 million characters
-    that holds control characters, which JSON writes as six bytes each where
-    no other character takes more than three. Such a page answers
-    `ResultTooLarge`, which cuts nothing, and the script reads a smaller
-    page.
+    shorter than its JSON, unless its path or a note holds a line break,
+    which the text quotes. A script's answer carries the result's fields, a
+    page's content among them, beside the text, and the limit counts the
+    text alone. A script's limit counts each character at the six bytes it
+    takes at most in the answer, and only a control character takes more
+    than three, so the two together can pass what the script takes only on
+    a page of more than half that limit (about 3.7 million characters at
+    the default 128 MiB of script memory) that holds control characters.
+    Such a page answers `ResultTooLarge`, which cuts nothing, and the script
+    reads a smaller page.
 
   **Unchanged:** the tools' descriptions and inputs; the words of their
   notes; their errors, which were text already; the results of `write`,

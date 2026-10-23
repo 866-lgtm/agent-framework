@@ -562,7 +562,11 @@ function manyHeadText(data: { edits: number; replacements: number; files: Listed
  * regions are named by their lines. edit_many lists its files while they
  * fit, a file whose notes don't fit without them, or without its edits'
  * numbers too, and counts the rest. edit's receipt, of one file, keeps its
- * counts and notes and shows no region where those alone pass `maxChars`.
+ * counts and notes and shows no region where those leave no room for it. The
+ * line that names what a receipt leaves out comes after what it keeps, and
+ * where its counts and notes leave too little room for that line too, as
+ * they can with long notes or a limit far under the 1,000 a residence or an
+ * agent can set, the receipt passes `maxChars` by it.
  * The model reads the text; a script gets the receipt's fields beside it.
  */
 export function editReceipt(tool: EditTool, files: StoredFile[], editCount: number, maxChars: number): ToolResult {

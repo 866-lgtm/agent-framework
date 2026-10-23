@@ -1,6 +1,5 @@
 // The text helpers the workspace's read, grep and edit share: a file's lines as
-// read shows them, numbered lines with a long one cut, a BOM's check, and a
-// string's length as JSON, which a page's budget is counted in.
+// read shows them, numbered lines with a long one cut, and a BOM's check.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { fileText, hasBom, numberedLine, safeCut } from '../src/modules/workspace/text.js';

@@ -8,10 +8,13 @@ import { type FileText, MAX_LINE_CHARS, numberedLine, safeCut } from './text.js'
  * limit doesn't reach it whole. A model's result spills into a file, cut, and
  * a script gets ResultTooLarge in its place. So a page stops before its text
  * would pass the limit, and its note says where to continue. A script's
- * answer carries the page's fields beside its text, which the limit doesn't
- * count but leaves room for, since it counts each character at the six bytes
- * it takes at most in the script's answer: the two pass it only together, on
- * a page of millions of characters, most of them control characters.
+ * answer carries the page's fields, its content among them, beside its text,
+ * and the limit counts the text alone. A script's limit counts each character
+ * at the six bytes it takes at most in the answer, and no character but a
+ * control character takes more than three, so the text and the fields
+ * together pass what the script takes only on a page of more than half that
+ * limit (about 3.7 million characters at the default 128 MiB of script
+ * memory) holding control characters.
  */
 
 /** How many lines a read shows when it isn't given a limit. */
@@ -55,8 +58,6 @@ function pageText(page: Page): string {
 /** A page as read answers it: its text for the model, and its fields for a script. */
 const pageAnswer = (page: Page): ToolResult => textAnswer(pageText(page), page);
 
-/** What content adds to its page's text: its label's line with the line feed before it, and its own characters. */
-const contentCost = (chars: number): number => (chars > 0 ? sectionLead('content') + chars : 0);
 
 /**
  * Lines from `offset` (1-based), at most `limit` of them, each numbered and a
@@ -119,9 +120,9 @@ export function linePage(path: string, file: FileText, offset: number, limit: nu
     return joined([to === last ? endNote : budgetNote(to, rest), ...notes]);
   };
   // A page's text's length: its fields' and note's, measured with no content,
-  // and its content's, under the content's label.
+  // and its content's, under the content's label. A page here has a line.
   const lengthAt = (to: number, contentChars: number, note: string | undefined) =>
-    pageText(page(to, '', note)).length + contentCost(contentChars);
+    pageText(page(to, '', note)).length + sectionLead('content') + contentChars;
   // The page is the longest that fits. Its length isn't monotone in its
   // lines: the page that ends the file carries no stop note, the one at the
   // line limit a shorter one than a stop, and one whose last line is cut a
@@ -213,8 +214,10 @@ export function characterPage(path: string, file: FileText, offsetChars: number,
   let to = Math.min(end, start + Math.max(0, maxChars - overhead));
   if (splitsPair(text, to)) to--;
   // A page always moves on, by one character at least, though a limit too
-  // small for the page's own fields then passes it. Where that reaches the
-  // page's own end, it holds all it was asked for, so it names no stop.
+  // small for the page's own fields and its first character then passes it:
+  // with room for one code unit, a surrogate pair is still taken whole. Where
+  // that reaches the page's own end, it holds all it was asked for, so it
+  // names no stop.
   if (to === start) to = Math.min(end, start + step(start));
   return pageAnswer(page(to, joined([to < end ? stoppedNote(to, end - to) : null, ...notes])));
 }

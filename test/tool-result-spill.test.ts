@@ -358,6 +358,9 @@ describe('tool-result spill completion (issue #89)', () => {
           const outcome = storage.spilled.get(`page-${pages}`)!;
           assert.strictEqual(outcome.filePath, null, 'read-back must not spill again');
           assert.ok(outcome.text.length <= cap);
+          // And it uses its room: the advised page is sized to the cap, up to
+          // the 2,000 characters a page is advised at the most.
+          if (page.nextOffsetChars !== null) assert.ok(outcome.text.length > Math.min(cap / 2, 2_000), `a page of ${outcome.text.length} at a cap of ${cap}`);
           assert.strictEqual(outcome.text, (result.data as Array<{ text: string }>)[0]!.text, 'the page is stored as its text');
           assert.ok(outcome.text.endsWith(`\n--- content ---\n${page.content}`), 'which ends with its content');
           recovered += page.content;

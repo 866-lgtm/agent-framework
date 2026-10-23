@@ -14,7 +14,9 @@ import { dirname, join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework } from '../src/index.js';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
-import { shownValue } from '../src/modules/workspace/result-text.js';
+import { type GrepAnswer, grepText, shownValue } from '../src/modules/workspace/result-text.js';
+import { decodeForEdit, planFile } from '../src/modules/workspace/edit-plan.js';
+import { editReceipt } from '../src/modules/workspace/edit-text.js';
 import type { EventResponse, Module, ModuleContext } from '../src/types/module.js';
 import type { ProcessEvent, ToolResult } from '../src/types/events.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
@@ -187,14 +189,14 @@ test("grep answers each version of a file it matched as a section, a match as N:
     assert.deepEqual(fields<{ results: Array<{ file: string; version: string }> }>(found).results.map((r) => `${r.file} ${r.version}`),
       ['work/a.txt workspace', 'work/b.txt workspace', 'work/b.txt conflicting-disk', 'work/c.txt workspace']);
 
-    // Context starts at the file's first line at the earliest, and `--` parts one match's lines from the next's.
+    // Context starts at the file's first line at the earliest, and a window
+    // that begins where the run before it ends goes on in the same run.
     const context = await call('grep', { pattern: 'needle', path: 'work/a.txt', contextBefore: 1 }, 24_000);
     assert.equal(textOf(context), [
       'pattern: needle',
       'totalMatches: 2',
       '--- work/a.txt: workspace (synced) ---',
       '     1:needle one',
-      '--',
       '     2-hay',
       '     3:needle again',
     ].join('\n'));
@@ -268,9 +270,9 @@ test("an edit's receipt is held to the call's limit as its text measures it", as
 });
 
 test('a value holding a line break is written as a JSON string, so it stays on its line and gives back the path', async () => {
-  for (const value of ['a\nb', 'a\rb', 'a\u2028b', 'a\u2029b', '\n']) {
+  for (const value of ['a\nb', 'a\rb', 'a\u2028b', 'a\u2029b', 'a\vb', 'a\fb', 'a\u0085b', '\n']) {
     const shown = shownValue(value);
-    assert.ok(!/[\n\r\u2028\u2029]/.test(shown), `${JSON.stringify(value)} is shown on one line`);
+    assert.ok(!/[\n\v\f\r\u0085\u2028\u2029]/.test(shown), `${JSON.stringify(value)} is shown on one line`);
     assert.equal(JSON.parse(shown), value);
   }
   for (const value of ['plain', 'tab\tand \u001b escape', '"quoted"', '']) assert.equal(shownValue(value), value);
@@ -348,4 +350,71 @@ test("through the framework, a model's read reaches it and its history as the pa
     await framework.stop();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("grep's matched and context lines that hold a line break are quoted, and matches whose context meets are one run of lines", async () => {
+  await withWorkspace(async ({ call, disk }) => {
+    disk('lines.txt', 'one\ntwo \r needle three\nfour\nneedle five\u2028--- skipped ---\nsix\n');
+    const quoted = await call('grep', { pattern: 'needle', path: 'work/lines.txt', contextBefore: 1, contextAfter: 1 }, 24_000);
+    // The two windows, lines 1 to 3 and 3 to 5, overlap: one run, each line once.
+    assert.equal(textOf(quoted), [
+      'pattern: needle',
+      'totalMatches: 2',
+      '--- work/lines.txt: workspace (synced) ---',
+      '     1-one',
+      '     2:"two \\r needle three"',
+      '     3-four',
+      '     4:"needle five\\u2028--- skipped ---"',
+      '     5-six',
+    ].join('\n'));
+    disk('gap.txt', `${['a', 'needle b', 'c', 'd', 'e', 'f', 'g', 'needle h', 'i'].join('\n')}\n`);
+    // Lines left out between two runs: `--` between them.
+    assert.match(textOf(await call('grep', { pattern: 'needle', path: 'work/gap.txt', contextBefore: 1, contextAfter: 1 }, 24_000)),
+      /\n {5}1-a\n {5}2:needle b\n {5}3-c\n--\n {5}7-g\n {5}8:needle h\n {5}9-i$/);
+    disk('touch.txt', 'x\nneedle y\nz\nneedle w\n');
+    // A window that ends where the next begins: one run, a match inside another's window marked as a match.
+    assert.match(textOf(await call('grep', { pattern: 'needle', path: 'work/touch.txt', contextAfter: 2 }, 24_000)),
+      /\n {5}2:needle y\n {5}3-z\n {5}4:needle w$/);
+    assert.match(textOf(await call('grep', { pattern: 'needle', path: 'work/touch.txt', contextAfter: 1 }, 24_000)),
+      /\n {5}2:needle y\n {5}3-z\n {5}4:needle w$/);
+  });
+});
+
+test("grep's text quotes a pattern, a note, a skipped file's reason and an incomplete place that hold a line break, and writes a label without a state and a skip's facts as it has them", () => {
+  const answer: GrepAnswer = {
+    pattern: 'a\nb',
+    results: [{ file: 'work/d.txt', version: 'disk', matches: [{ line: 1, text: 'x' }] }],
+    totalMatches: 1,
+    note: 'see "work/q\nr"',
+    skipped: [
+      { file: 'work/s', reason: 'gone\nwhere' },
+      { file: 'work/t', reason: 'big', size: 9 },
+      { file: 'work/u.png', reason: 'img', mimeType: 'image/png' },
+    ],
+    incomplete: [{ path: 'work/i\nj', reason: 'nested\rmount' }],
+  };
+  assert.equal(grepText(answer, 0), [
+    'pattern: "a\\nb"',
+    'totalMatches: 1',
+    'note: "see \\"work/q\\nr\\""',
+    '--- work/d.txt: disk ---',
+    '     1:x',
+    '--- skipped ---',
+    'work/s: "gone\\nwhere"',
+    'work/t: big (9 bytes)',
+    'work/u.png: img (image/png)',
+    '--- incomplete ---',
+    '"work/i\\nj": "nested\\rmount"',
+  ].join('\n'));
+});
+
+test("a receipt quotes a note and a kept mode that hold a line break, in edit's header and on edit_many's line for the file", () => {
+  const bytes = Buffer.from('old\n');
+  const planned = planFile(decodeForEdit(bytes)!, bytes, [{ index: 0, oldText: 'old', newText: 'new', expected: 1 }]);
+  assert.ok('plan' in planned);
+  const file = { path: 'work/a.txt', plan: planned.plan, notes: ['note\nwith a break'], modeKept: 'kept\u2028here' };
+  assert.match(textOf(editReceipt('edit', [file], 1, 24_000)),
+    /\nnote: "note\\nwith a break"\nmodeKept: "kept\\u2028here"\n--- changed ---\n/);
+  assert.match(textOf(editReceipt('edit_many', [file, { path: 'work/b.txt', plan: planned.plan, notes: [] }], 2, 24_000)),
+    /\n--- files ---\nwork\/a\.txt: size 4, replacements 1, edits 1; modeKept: "kept\\u2028here"\. "note\\nwith a break"\nwork\/b\.txt: size 4, replacements 1, edits 1\n/);
 });

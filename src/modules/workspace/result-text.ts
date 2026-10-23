@@ -9,19 +9,21 @@ import type { ToolResult } from '../../types/events.js';
  * receipt is held to the call's result limit as this text measures it.
  */
 
-const LINE_BREAK = /[\n\r\u2028\u2029]/;
+/** The characters Unicode says end a line (UAX #14's mandatory breaks): LF, VT, FF, CR, NEL, U+2028 and U+2029. */
+const LINE_BREAK = /[\n\v\f\r\u0085\u2028\u2029]/;
 
 /**
  * A value as a header line, a section's label or a listed line writes it: as
  * it is, or, where it holds a line break, as a JSON string. A path can hold
- * one, and so can a note naming it; written as it is, it would start a line
- * that reads as one of the answer's own, and the quoted form gives back
- * exactly what the value holds. JSON leaves U+2028 and U+2029 as they are,
- * so they're escaped too.
+ * one, and so can a note naming it or a line of a file grep matched; written
+ * as it is, it would start a line that reads as one of the answer's own, and
+ * the quoted form gives back exactly what the value holds. JSON leaves NEL,
+ * U+2028 and U+2029 as they are, so they're escaped too.
  */
 export function shownValue(value: string | number | boolean | null): string {
   if (typeof value !== 'string') return String(value);
-  return LINE_BREAK.test(value) ? JSON.stringify(value).replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029') : value;
+  if (!LINE_BREAK.test(value)) return value;
+  return JSON.stringify(value).replace(/[\u0085\u2028\u2029]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
 }
 
 /** A header line: a field's key and its value as shownValue writes it. */
@@ -63,11 +65,14 @@ export interface GrepAnswer {
 /**
  * grep's text: its pattern, match count and note, then a section for each
  * version of a file it matched, labelled with the file, the version, the
- * file's state and its line ends where it has them, then what it skipped and
- * where its search was incomplete. A match's line reads `N:text`, as grep
- * writes one, and where the call asked for context, each line around it reads
- * `N-text`, with `--` between one match's lines and the next's. Each match's
- * context starts `contextBefore` lines before it, or at the file's first line.
+ * file's state where grep gives one and its line ends where it has them, then
+ * what it skipped and where its search was incomplete. As grep writes them, a
+ * match's line reads `N:text`, and where the call asked for context, each
+ * line around it reads `N-text`: matches whose context meets or overlaps are
+ * one run of lines, each line once, and `--` stands between runs with lines
+ * left out between them. Each match's context starts `contextBefore` lines
+ * before it, or at the file's first line. A line's text is written through
+ * shownValue, since more of the answer follows it.
  */
 export function grepText(answer: GrepAnswer, contextBefore: number): string {
   const header = [fieldLine('pattern', answer.pattern), fieldLine('totalMatches', answer.totalMatches)];
@@ -77,16 +82,22 @@ export function grepText(answer: GrepAnswer, contextBefore: number): string {
       + (result.state !== undefined ? ` (${result.state})` : '')
       + (result.lineEndings !== undefined ? `; lineEndings: ${result.lineEndings}` : '');
     const lines: string[] = [];
+    const matched = new Set(result.matches.map((match) => match.line));
+    // The last line written: matches come in line order, so a window that
+    // meets or overlaps the run before it goes on from there.
+    let last = 0;
     for (const match of result.matches) {
       if (match.context === undefined) {
-        lines.push(`${String(match.line).padStart(6)}:${match.text}`);
+        lines.push(`${String(match.line).padStart(6)}:${shownValue(match.text)}`);
         continue;
       }
-      if (lines.length > 0) lines.push('--');
       const first = Math.max(1, match.line - contextBefore);
       match.context.forEach((text, k) => {
         const n = first + k;
-        lines.push(`${String(n).padStart(6)}${n === match.line ? ':' : '-'}${text}`);
+        if (n <= last) return;
+        if (last > 0 && n > last + 1) lines.push('--');
+        lines.push(`${String(n).padStart(6)}${matched.has(n) ? ':' : '-'}${shownValue(text)}`);
+        last = n;
       });
     }
     return sectionText(label, lines.join('\n'));
