@@ -174,9 +174,9 @@ describe('thinkingBinding.dropBlock', () => {
   });
 
   it('gives no sample from a stream whose first call dropped blocks, and calibrates the next stream, which dropped none', async () => {
-    // A stream's skip is the stream's: after a fold the first call of a turn drops blocks, and the next stream that
+    // A stream's skip is the stream's: a stream whose first call drops blocks gives no sample, and the next stream that
     // drops none is a sample again. Kept anywhere longer-lived than the stream, such as the agent, the skip would stop
-    // calibration for good. One resident, two turns, two streams.
+    // calibration for good. One agent, two turns, two streams.
     const dir = mkdtempSync(join(tmpdir(), 'af-thinking-binding-streams-'));
     const membrane = new MockMembrane();
     const framework = await AgentFramework.create({
