@@ -30,16 +30,18 @@ interface TraceEntry {
 function makeGate(configPath: string, opts?: {
   initialConfig?: GateConfig;
   resolveRouteChannel?: (info: GateEventInfo) => string | undefined;
+  channelShown?: (channel: { serverId: string; channelId: string }) => string;
   privilegedUsersPath?: string;
 }) {
   const traces: TraceEntry[] = [];
   const messages: Array<{ participant: string; content: unknown; metadata?: unknown }> = [];
-  const inferenceRequests: Array<{ agentName: string; reason: string; source: string; channelId?: string; counterparty?: string; addressed?: boolean; at?: number; routeChannelId?: string }> = [];
+  const inferenceRequests: Array<{ agentName: string; reason: string; source: string; channelId?: string; counterparty?: string; addressed?: boolean; at?: number; routeChannelId?: string; routeServerId?: string }> = [];
 
   const gate = new EventGate({
     configPath,
     initialConfig: opts?.initialConfig,
     ...(opts?.resolveRouteChannel ? { resolveRouteChannel: opts.resolveRouteChannel } : {}),
+    ...(opts?.channelShown ? { channelShown: opts.channelShown } : {}),
     ...(opts?.privilegedUsersPath ? { privilegedUsersPath: opts.privilegedUsersPath } : {}),
     emitTrace: (e) => traces.push(e as TraceEntry),
     addMessage: (p, c, m) => { messages.push({ participant: p, content: c, metadata: m }); return ''; },
@@ -411,6 +413,58 @@ describe('debounce', () => {
     assert.doesNotMatch(text, /##/);
   });
 
+  it("a batched wake names two servers' channels with one id apart, each with its own count", () => {
+    // Channel ids are unique only within one server's connection.
+    const path = writeConfig('debounce-shared-id.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, messages } = makeGate(path, { channelShown: (c) => `${c.serverId}:${c.channelId}` });
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'a', channelId: 'general', content: 'one',
+      metadata: { channelName: 'general' } }));
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'b', channelId: 'general', content: 'two',
+      metadata: { channelName: 'general' } }));
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'b', channelId: 'general', content: 'three',
+      metadata: { channelName: 'general' } }));
+    const batch = gate as unknown as {
+      debounceTimers: Map<string, { timer: ReturnType<typeof setTimeout> }>;
+      fireDebounce(policyName: string): void;
+    };
+    clearTimeout(batch.debounceTimers.get('chat')!.timer);
+    batch.fireDebounce('chat');
+
+    const text = (messages[0]!.content as Array<{ text: string }>)[0]!.text;
+    assert.match(text, /- 1 message in #general \(a:general\)/);
+    assert.match(text, /- 2 messages in #general \(b:general\)/);
+  });
+
+  it("a batched wake shows a push event's adapter id as it is, and only a registered channel as the registry names it", () => {
+    const path = writeConfig('debounce-raw-id.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, messages } = makeGate(path, { channelShown: (c) => `shown ${c.serverId} ${c.channelId}` });
+    // A push event carries the adapter's raw id, which no route maps to a
+    // registered channel here; a channel message names its registered one.
+    gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'discord', channelId: '1548', content: 'dm' }));
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'hi' }));
+    const batch = gate as unknown as {
+      debounceTimers: Map<string, { timer: ReturnType<typeof setTimeout> }>;
+      fireDebounce(policyName: string): void;
+    };
+    clearTimeout(batch.debounceTimers.get('chat')!.timer);
+    batch.fireDebounce('chat');
+
+    const text = (messages[0]!.content as Array<{ text: string }>)[0]!.text;
+    assert.match(text, /- 1 message in 1548\b/);
+    assert.match(text, /- 1 message in shown discord discord:g:room\b/);
+    assert.doesNotMatch(text, /shown discord 1548/, "an adapter's raw id isn't named as a registered channel");
+  });
+
   it('a quoted event\'s content is cut where no surrogate pair is halved', (t) => {
     t.mock.timers.enable({ apis: ['setTimeout'] });
     const path = writeConfig('debounce-pair.json', {
@@ -526,6 +580,7 @@ describe('debounce', () => {
     await new Promise(r => setTimeout(r, 150));
     assert.strictEqual(inferenceRequests.length, 1);
     assert.strictEqual(inferenceRequests[0].routeChannelId, 'discord:dm:1548', 'the addressed event names the route');
+    assert.strictEqual(inferenceRequests[0].routeServerId, 'discord', "and the route's server, since ids are unique only per server");
     assert.strictEqual(inferenceRequests[0].counterparty, 'discord:user:42', 'route and author come from the same event');
     assert.strictEqual(inferenceRequests[0].channelId, undefined, 'telemetry channel unchanged for push events');
     // The batched-wake line names the registered id, not the raw snowflake.
@@ -539,6 +594,7 @@ describe('debounce', () => {
     assert.strictEqual(inferenceRequests.length, 2);
     assert.strictEqual(inferenceRequests[1].channelId, 'discord:g:room');
     assert.strictEqual(inferenceRequests[1].routeChannelId, undefined, 'ambient chatter never sets a route');
+    assert.strictEqual(inferenceRequests[1].routeServerId, undefined, 'nor its server');
   });
 
   it('the default resolver routes an addressed channel-incoming event; a push event needs the host resolver', async () => {

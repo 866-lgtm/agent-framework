@@ -131,6 +131,10 @@ export interface WakeProvenance {
    *  (2026-09-30: a DM reply published into a guild channel). Ambient-only
    *  batches still set nothing and keep the legacy fallback. */
   routeChannelId?: string;
+  /** The server of `routeChannelId`'s channel, beside it whenever the chosen
+   *  event named its server: channel ids are unique only within one
+   *  server's connection (MCPL §14.2). */
+  routeServerId?: string;
   /** Timestamp (ms) of the chosen event, so a consumer coalescing several
    *  requests can order by event recency, not by flush order. */
   at?: number;
@@ -236,7 +240,9 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
     ...(channelId ? { channelId } : {}),
     ...(pick.authorId ? { counterparty: `${ns}:user:${pick.authorId}` } : {}),
     ...(pick.addressed ? { addressed: true } : {}),
-    ...(pick.addressed && pick.routeChannelId ? { routeChannelId: pick.routeChannelId } : {}),
+    ...(pick.addressed && pick.routeChannelId
+      ? { routeChannelId: pick.routeChannelId, ...(pick.serverId ? { routeServerId: pick.serverId } : {}) }
+      : {}),
     at: pick.timestamp,
   };
 }
@@ -633,6 +639,7 @@ export class EventGate {
   private requestInferenceFn: (agentName: string, reason: string, source: string, provenance?: WakeProvenance) => void;
   private getAgentNamesFn: () => string[];
   private resolveRouteChannelFn: (info: GateEventInfo) => string | undefined;
+  private channelShownFn?: (channel: { serverId: string; channelId: string }) => string;
   /** Clock injection — keeps the new rate_limit / passive_sample paths
    *  testable without monkey-patching Date.now globally. */
   private now: () => number;
@@ -658,6 +665,11 @@ export class EventGate {
      *  how push-event origins compose into channel ids). Default: a
      *  channel-incoming event's own channel id; nothing for push events. */
     resolveRouteChannel?: (info: GateEventInfo) => string | undefined;
+    /** How the agent is shown a channel, its server's and its id (the
+     *  framework's ChannelRegistry.nameShown): a batched wake's summary names
+     *  each channel so, since two servers' channels can share an id. Default:
+     *  the id. */
+    channelShown?: (channel: { serverId: string; channelId: string }) => string;
   }) {
     this.configPath = opts.configPath;
     this.privilegedUsersPath = opts.privilegedUsersPath;
@@ -666,6 +678,7 @@ export class EventGate {
     this.requestInferenceFn = opts.requestInference;
     this.getAgentNamesFn = opts.getAgentNames;
     this.resolveRouteChannelFn = opts.resolveRouteChannel ?? defaultRouteChannel;
+    this.channelShownFn = opts.channelShown;
     this.now = opts.now ?? (() => Date.now());
     this.loadPrivileged();
 
@@ -1575,24 +1588,35 @@ export class EventGate {
 
     const lines: string[] = quoted.map(e => `- [${e.policyName}] (${e.eventType}): ${e.content}`);
     if (referenced.length > 0) {
-      const byChannel = new Map<string, { count: number; oldest: number; label?: string }>();
+      // By channel, its server and its id: two servers' channels can share
+      // an id.
+      const byChannel = new Map<string, { name: string; count: number; oldest: number; label?: string }>();
       for (const e of referenced) {
         // The registered id when known, so this line names the channel the
         // same way routing notices and send tools do (a push event's own
-        // channelId is the adapter's raw id).
-        const key = e.routeChannelId ?? e.channelId ?? '(unknown channel)';
-        const entry = byChannel.get(key) ?? { count: 0, oldest: e.timestamp, label: e.channelLabel };
+        // channelId is the adapter's raw id), shown as the agent names it
+        // back where the event names its server.
+        // Only a registered id is a channel name; an adapter's raw id is
+        // shown as it is.
+        const id = e.routeChannelId ?? e.channelId;
+        const name = id === undefined
+          ? '(unknown channel)'
+          : e.routeChannelId !== undefined && e.serverId !== undefined && this.channelShownFn
+            ? this.channelShownFn({ serverId: e.serverId, channelId: e.routeChannelId })
+            : id;
+        const key = JSON.stringify([e.serverId ?? null, id ?? null]);
+        const entry = byChannel.get(key) ?? { name, count: 0, oldest: e.timestamp, label: e.channelLabel };
         entry.count += 1;
         entry.oldest = Math.min(entry.oldest, e.timestamp);
         entry.label = entry.label ?? e.channelLabel;
         byChannel.set(key, entry);
       }
-      for (const [channelId, { count, oldest, label }] of byChannel) {
+      for (const { name, count, oldest, label } of byChannel.values()) {
         // Prefer the human-readable name; keep the id parenthesized so the
         // agent can still address tools that want the composite id. A name
         // may carry its own `#`, so one is added only where the name lacks
         // it, as at the other places that add a `#`.
-        const channel = label ? `${label.startsWith('#') ? label : `#${label}`} (${channelId})` : channelId;
+        const channel = label ? `${label.startsWith('#') ? label : `#${label}`} (${name})` : name;
         const age = Math.round((Date.now() - oldest) / 1000);
         lines.push(
           `- ${count} message${count > 1 ? 's' : ''} in ${channel} ` +

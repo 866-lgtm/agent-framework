@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
+import { injectionsAsStored } from './text-as-stored.js';
 import { assertBooleanSetting, holdsSettings } from './config-checks.js';
 import {
   CONTINUE_ROW,
@@ -1157,6 +1158,8 @@ export class Agent {
     if (this._state.status === 'inferring') {
       throw new Error(`Agent ${this.name} is already inferring`);
     }
+    // Unstored, so they leave for the request here (text-as-stored.ts).
+    injections = injectionsAsStored(injections);
 
     if (this._state.status === 'waiting_for_tools') {
       throw new Error(`Agent ${this.name} is waiting for tool results`);
@@ -1332,6 +1335,9 @@ export class Agent {
     compressionTools: ToolDefinition[] = availableTools,
     options: ActivationRequestOptions = {},
   ): Promise<{ request: NormalizedRequest; continuePrompt?: RequestOnlyPrompt }> {
+    // Unstored, so they leave for the request here (text-as-stored.ts), the
+    // layout hash below included.
+    injections = injectionsAsStored(injections);
     // Compression may revisit hidden tools in recorded history. Keep its full
     // definition set separate from the resident's advertised tools: the
     // autobiographical strategy must declare the same tools on its
@@ -1921,14 +1927,21 @@ export class Agent {
     // via buildStoredToolResultContent, with workspace spill). No workspace
     // is reachable from here, so the house default cap applies as plain
     // truncation — bounded beats unbounded, for errors too.
-    const content = results.map((r) => ({
-      type: 'tool_result' as const,
-      toolUseId: r.id,
-      content: r.result.isError
-        ? truncateForHistory(r.result.error ?? 'Unknown error', DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS)
-        : nonErrorResultText(r.result, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS),
-      isError: r.result.isError,
-    }));
+    const content = results.map((r) => {
+      // This API's results are unchecked (nonErrorResultText), so each field
+      // is read once, and only an error that is a string is made well formed;
+      // any other error value is passed on as it was before.
+      const isError = r.result.isError;
+      const error: unknown = isError ? r.result.error ?? 'Unknown error' : undefined;
+      return {
+        type: 'tool_result' as const,
+        toolUseId: r.id,
+        content: isError
+          ? truncateForHistory(typeof error === 'string' ? error.toWellFormed() : error as string, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS)
+          : nonErrorResultText(r.result, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS),
+        isError,
+      };
+    });
 
     return [{
       participant: 'user',
