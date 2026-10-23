@@ -6096,10 +6096,15 @@ describe('a search starts at the directory its pattern names', () => {
       // With a path inside that directory, glob's pattern relative to the
       // path reads as main reads it. grep's filter, which main reads relative
       // to the mount, reads mount-prefixed there too, and names the mount's
-      // own z/deep, outside the path, so it lets nothing through.
-      await eachOnItsOwn(t, layout,
-        [{ path: 'work/work', pattern: 'z/deep/*.ts' }, ['work/work/z/deep/q.ts']],
-        [{ pattern: 'needle', path: 'work/work', glob: 'work/z/deep/*.ts' }, []]);
+      // own z/deep, outside the path, so it's refused, naming the filter that
+      // reaches beneath the path, which finds the file.
+      assert.deepEqual(await matchesOf(await layout(new Env(t)), { path: 'work/work', pattern: 'z/deep/*.ts' }), ['work/work/z/deep/q.ts']);
+      const m = await layout(new Env(t));
+      assert.match(
+        await refused(m, 'grep', { pattern: 'needle', path: 'work/work', glob: 'work/z/deep/*.ts' }),
+        /is read mount-prefixed, from the root of mount "work", so no file within "work\/work" matches it\. To filter beneath it, write "work\/work\/z\/deep\/\*\.ts"\.$/,
+      );
+      assert.deepEqual(await grepped(m, { pattern: 'needle', path: 'work/work', glob: 'work/work/z/deep/*.ts' }), ['work/work/z/deep/q.ts']);
     }
   });
 
@@ -6182,15 +6187,17 @@ describe('a search starts at the directory its pattern names', () => {
     }
   });
 
-  test('grep with a path and a filter whose directories don\'t overlap searches nothing, and takes nothing in', async (t) => {
+  test('a path and a grep filter, or a mount-prefixed glob pattern, whose directories don\'t overlap are refused, searching nothing and taking nothing in', async (t) => {
     const env = new Env(t);
     env.writeDisk('src/a.ts', 'a needle');
     env.writeDisk('test/a.test.ts', 'a needle');
     env.writeDisk('testing/a.ts', 'a needle');
     const m = await env.open();
-    assert.deepEqual(await grepped(m, { pattern: 'needle', path: 'work/test', glob: 'src/**' }), []);
+    assert.match(await refused(m, 'grep', { pattern: 'needle', path: 'work/test', glob: 'src/**' }), /so no file within "work\/test" matches it/);
     // A sibling whose name starts with the path's lies outside it.
-    assert.deepEqual(await grepped(m, { pattern: 'needle', path: 'work/test', glob: 'testing/**' }), []);
+    assert.match(await refused(m, 'grep', { pattern: 'needle', path: 'work/test', glob: 'testing/**' }), /so no file within "work\/test" matches it/);
+    // glob's mount-prefixed pattern there is refused too, before any walk.
+    assert.match(await refused(m, 'glob', { path: 'work/test', pattern: 'work/src/**' }), /so no file within "work\/test" matches it/);
     for (const path of ['test/a.test.ts', 'src/a.ts', 'testing/a.ts']) {
       assert.equal(env.store.treeGet(TREE, path), null, `no pass took in ${path}`);
     }

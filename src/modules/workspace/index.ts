@@ -2029,7 +2029,7 @@ export class WorkspaceModule implements Module {
           properties: {
             pattern: { type: 'string', description: 'Regular expression pattern' },
             path: { type: 'string', description: 'File or directory to search (mount-prefixed, optional)' },
-            glob: { type: 'string', description: 'Glob pattern to filter files, relative to the mount root (e.g., "src/**/*.ts"); in the mount its first segment names, read mount-prefixed (e.g., "project/src/**/*.ts"), and in every other mount, as written' },
+            glob: { type: 'string', description: 'Glob pattern to filter files: one with a "/" is matched from the mount\'s root, whatever the path (e.g., "src/**/*.ts"), and in the mount its first segment names, read mount-prefixed (e.g., "project/src/**/*.ts"), in every other mount as written; one with no "/" also matches a file\'s name at any depth (e.g., "*.ts")' },
             contextBefore: { type: 'integer', description: 'Context lines before match' },
             contextAfter: { type: 'integer', description: 'Context lines after match' },
           },
@@ -5271,15 +5271,26 @@ export class WorkspaceModule implements Module {
     // starts there: past the walk's cap, a walk of the whole scope can stop
     // before it gets there. In the mount a pattern's first segment names, the
     // pattern is read mount-prefixed (prefixedGlob), from its rest's directory
-    // within `path`.
+    // within `path`. A `path` that directory can't overlap leaves no file the
+    // pattern can match, so the glob is refused, as grep's is, saying how
+    // the pattern is read, rather than answered with no matches; but a path
+    // in another mount's directory is that mount's, and is said so, as grep
+    // says it. Only a `path` can do either, and it names one mount, so
+    // nothing has been searched yet.
     const patternDir = literalDirOf(input.pattern);
-    for (const { mount, relativePath } of mountsToSearch) {
+    for (const { mount, relativePath, moved, root } of mountsToSearch) {
       const prefixed = prefixedGlob(input.pattern, mount.config.name);
       let start: string;
       let matched: (path: string) => boolean;
       if (prefixed) {
         const dir = deeperOf(relativePath, prefixed.dir);
-        if (dir === null) continue;
+        if (dir === null) {
+          if (this.holderOf(mount.config.name, relativePath, false, moved)) {
+            incomplete.push({ path: `${mount.config.name}/${relativePath}`, reason: this.otherMountNote(mount.config.name, relativePath, 'list', moved) });
+            continue;
+          }
+          return { success: false, error: await this.disjointRefusal('glob', input.path!, input.pattern, true, mount, relativePath, root), isError: true };
+        }
         start = await this.walkStart(mount, relativePath, dir === relativePath ? '' : dir.slice(relativePath ? relativePath.length + 1 : 0));
         matched = (path: string) => prefixed.regex.test(path);
       } else {
@@ -5314,11 +5325,19 @@ export class WorkspaceModule implements Module {
     }
 
     const fileGlob = input.glob ? globToRegex(input.glob) : null;
-    // The filter matches mount-relative paths, so every file it lets through
-    // lies beneath its literal directory, and the walk starts at the deeper of
-    // that and `path`. In the mount a filter's first segment names, its
-    // mount-prefixed reading takes the filter's place (below).
+    // The filter matches mount-relative paths, from the mount's root whatever
+    // the `path`, so every file it lets through lies beneath its literal
+    // directory, and the walk starts at the deeper of that and `path`. In the
+    // mount a filter's first segment names, its mount-prefixed reading takes
+    // the filter's place (below). One with no "/" also matches a file's name,
+    // wherever the file lies, as ripgrep's --glob does: "*.ts" lets every .ts
+    // file through, where tested against the path alone it let through only
+    // those at the mount's root. The path is still tried, so a "**" in such a
+    // filter spans directories as it did, and nothing it let through before
+    // is lost. A filter read mount-prefixed always holds a "/" after the
+    // mount's name, so it never takes the name test.
     const filterDir = input.glob ? literalDirOf(input.glob) : '';
+    const byName = fileGlob !== null && !input.glob!.includes('/');
     const contextBefore = input.contextBefore ?? 0;
     const contextAfter = input.contextAfter ?? 0;
 
@@ -5367,11 +5386,17 @@ export class WorkspaceModule implements Module {
       }
       // In the mount a filter's first segment names, the filter is read
       // mount-prefixed (prefixedGlob), from its rest's directory. A `path` and
-      // a filter whose directories don't overlap leave no file the filter can
-      // let through, so nothing is searched.
+      // a filter whose directories, in the reading this mount takes, don't
+      // overlap leave no file the filter can let through, so the grep is
+      // refused, saying how the filter is read, rather than answered with no
+      // matches: written relative to the `path`, as glob's pattern is, it
+      // names nothing there. Only a `path` can do this, and it names one
+      // mount, so nothing has been searched yet.
       const prefixed = input.glob ? prefixedGlob(input.glob, mount.config.name) : null;
       const deeper = deeperOf(relativePath, prefixed ? prefixed.dir : filterDir);
-      if (deeper === null) continue;
+      if (deeper === null) {
+        return { success: false, error: await this.disjointRefusal('grep', input.path!, input.glob!, prefixed !== null, mount, relativePath, root), isError: true };
+      }
       const start = await this.walkStart(mount, relativePath, deeper === relativePath ? '' : deeper.slice(relativePath ? relativePath.length + 1 : 0));
       const searched = (text: GrepText): void => {
         const matches = search(text.text);
@@ -5379,7 +5404,8 @@ export class WorkspaceModule implements Module {
       };
       const kept = prefixed
         ? (path: string): boolean => prefixed.regex.test(path)
-        : (path: string): boolean => fileGlob === null || fileGlob.test(path);
+        : (path: string): boolean => fileGlob === null || fileGlob.test(path)
+          || (byName && fileGlob.test(path.slice(path.lastIndexOf('/') + 1)));
       const found = mount.direct
         ? await this.textsFromDisk(mount, relativePath, root, start, kept, searched)
         : await this.textsFromStore(mount, relativePath, start, kept, searched);
@@ -5397,6 +5423,33 @@ export class WorkspaceModule implements Module {
         ...(incomplete.length > 0 ? { incomplete } : {}),
       },
     };
+  }
+
+  /**
+   * Why a grep or a glob whose `path` (`given`, in the mount at
+   * `relativePath`) and filter or pattern can't overlap did nothing. grep's
+   * filter is matched from the mount's root, and in the mount its first
+   * segment names, either tool's is read mount-prefixed (`prefixed`), from
+   * that mount's root; either way no file at or beneath the path can pass
+   * it. Where the path isn't a file, it names the one that reaches beneath
+   * it, the one meant if it was written relative to the path, mount-prefixed
+   * as the tools write paths: the path's own `{`, `}`, `*` and `?` stand as
+   * `?`, which matches each of them, and since the search stays beneath the
+   * path, a `?` that would match a sibling's name too takes nothing in from
+   * outside it. One with an empty, `.` or `..` segment gets no suggestion,
+   * since no path holds such a segment. Segments are read as written, so one
+   * a brace group splits around isn't told apart.
+   */
+  private async disjointRefusal(tool: 'grep' | 'glob', given: string, filter: string, prefixed: boolean, mount: MountState, relativePath: string, root: string): Promise<string> {
+    const name = mount.config.name;
+    const rest = prefixed ? filter.slice(filter.indexOf('/') + 1) : filter;
+    const read = `The ${tool} did nothing: its ${tool === 'grep' ? 'glob' : 'pattern'} ${JSON.stringify(filter)} `
+      + (prefixed ? `is read mount-prefixed, from the root of mount ${JSON.stringify(name)}` : 'is matched against paths from the mount\'s root');
+    if (await this.namesFile(mount, relativePath, root)) return `${read}, so ${JSON.stringify(given)} doesn't match it.`;
+    const within = `${read}, so no file within ${JSON.stringify(given)} matches it.`;
+    if (rest.split('/').some((segment) => segment === '' || segment === '.' || segment === '..')) return within;
+    const reaching = `${name}/${relativePath.replace(/[{}*?]/g, '?')}/${rest}`;
+    return `${within} To ${tool === 'grep' ? 'filter' : 'match'} beneath it, write ${JSON.stringify(reaching)}.`;
   }
 
   /**
