@@ -341,6 +341,7 @@ describe('isNewestContextEntry', () => {
     const written = internals().agents.get('scout')!.getContextManager().getAllMessages()
       .find((m) => m.content.some((b) => b.type === 'text' && (b.text ?? '').includes('LINE-A')))!;
     assert.deepEqual(written.metadata, { source: 'gate:debounce', policies: ['addressed'] }, 'as 0.26.0 wrote it');
+    assert.deepEqual(traces.filter((t) => t.type === 'message:added' && (t as { source?: string }).source === 'gate:wake-line').length, 1, 'its write traced as message:added');
     placing.placeWakeLines(scout(), [line]);
     assert.equal(linesIn('LINE-A'), 1, 'written once: a later start writes it no second time');
   });
@@ -678,51 +679,48 @@ describe('a handed line across readers, a flush, a quiesce and a hold', () => {
     .map((m) => m.content.map((x) => (x.type === 'text' ? x.text : '')).join(''));
   const wake = (lines: unknown[], timestamp = Date.now()) => ({ agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp, wakeLines: lines });
 
-  it('a co-resident\'s start writes the line into the shared slot even with its message newest, once, and the primary\'s start writes none', async () => {
+  // Every resident gets every batched wake. Only the delivery agent's start
+  // places the line, so it lands once, before that agent's own answer.
+  it('one wake for two residents, the co-resident first: she writes no line, and the delivery agent\'s start writes it once, after her reply and before its own answer', async () => {
     const b = await bare(['scout', 'mira']);
     try {
-      const mira = b.framework.getAgent('mira')!;
-      assert.ok(b.internals.sharedSlotAgents.has(mira), 'premise: mira reads the residents\' shared slot');
       storeDm(b, 'ev-1', 'are you there?');
-      const line = dmLine('ev-1', 'LINE-SLOT');
+      const line = dmLine('ev-1', 'LINE-MIRA-FIRST');
       b.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'mira answers' }]));
       b.internals.pendingRequests.push({ ...wake([line]), agentName: 'mira' });
       await b.framework.runUntilIdle();
       assert.equal(b.membrane.calls.length, 1, 'premise: mira\'s turn ran');
-      let slot = texts(b);
-      assert.equal(slot.filter((t) => t.includes('LINE-SLOT')).length, 1, 'mira\'s start wrote it, though the DM was newest: her start can\'t hold arrivals off the slot');
-      assert.ok(slot.findIndex((t) => t.includes('LINE-SLOT')) > slot.findIndex((t) => t.includes('are you there?')));
-      b.internals.placeWakeLines(b.framework.getAgent('scout')!, [line]);
-      slot = texts(b);
-      assert.equal(slot.filter((t) => t.includes('LINE-SLOT')).length, 1, 'and the primary\'s start wrote it no second time');
+      assert.equal(texts(b).filter((t) => t.includes('LINE-MIRA-FIRST')).length, 0, 'mira places nothing');
+      b.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'scout answers' }]));
+      b.internals.pendingRequests.push(wake([line]));
+      await b.framework.runUntilIdle();
+      assert.equal(b.membrane.calls.length, 2, 'premise: scout\'s turn ran');
+      const all = texts(b);
+      const mira = all.findIndex((t) => t.includes('mira answers'));
+      const at = all.findIndex((t) => t.includes('LINE-MIRA-FIRST'));
+      const scout = all.findIndex((t) => t.includes('scout answers'));
+      assert.equal(all.filter((t) => t.includes('LINE-MIRA-FIRST')).length, 1, 'written once');
+      assert.ok(mira >= 0 && at > mira && scout > at, `after mira's reply, before scout's answer (mira ${mira}, line ${at}, scout ${scout})`);
     } finally { await done(b); }
   });
 
-  it('a co-resident\'s start while the primary\'s turn is alive: no line written or queued, traced, and left for a later start', async () => {
+  it('one wake for two residents, the delivery agent first: it leaves the line out as newest, and the co-resident\'s later start writes none after its answer', async () => {
     const b = await bare(['scout', 'mira']);
     try {
       storeDm(b, 'ev-1', 'are you there?');
-      storeChatter(b);
-      const traces: Array<{ type: string }> = [];
-      b.framework.onTrace((event) => { traces.push(event as unknown as { type: string }); });
-      const line = dmLine('ev-1', 'LINE-WAIT');
-      const mira = b.framework.getAgent('mira')!;
-      b.internals.activeTurnTokens.set('scout', 1);
-      try {
-        b.internals.placeWakeLines(mira, [line]);
-      } finally {
-        b.internals.activeTurnTokens.delete('scout');
-      }
-      assert.equal(texts(b).filter((t) => t.includes('LINE-WAIT')).length, 0, 'not written into scout\'s live turn');
-      const queued = (b.framework as unknown as { deferredMessages: Array<{ content: Array<{ type: string; text?: string }> }> }).deferredMessages
-        .filter((m) => m.content.some((c) => c.type === 'text' && (c.text ?? '').includes('LINE-WAIT')));
-      assert.equal(queued.length, 0, 'nor queued to reach that turn later');
-      assert.deepEqual(traces.filter((t) => t.type === 'gate:wake-line-omitted').map((t) => (t as { reason?: string }).reason), ['held'], 'traced as left out, held');
-      b.internals.placeWakeLines(mira, [line]);
-      assert.equal(texts(b).filter((t) => t.includes('LINE-WAIT')).length, 1, 'a later start, scout idle, writes it');
+      const line = dmLine('ev-1', 'LINE-SCOUT-FIRST');
+      b.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'scout answers' }]));
+      b.internals.pendingRequests.push(wake([line]));
+      await b.framework.runUntilIdle();
+      assert.equal(b.membrane.calls.length, 1, 'premise: scout\'s turn ran');
+      b.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'mira answers' }]));
+      b.internals.pendingRequests.push({ ...wake([line]), agentName: 'mira' });
+      await b.framework.runUntilIdle();
+      assert.equal(b.membrane.calls.length, 2, 'premise: mira\'s turn ran');
+      assert.ok(texts(b).some((t) => t.includes('scout answers')), 'premise: scout\'s answer is in the slot');
+      assert.equal(texts(b).filter((t) => t.includes('LINE-SCOUT-FIRST')).length, 0, 'no wake line after an answered DM');
     } finally { await done(b); }
   });
-
   it('one wake for two agents: each request carries the gate\'s own line object, which "written once" rests on', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'wake-line-identity-'));
     const framework = await AgentFramework.create({

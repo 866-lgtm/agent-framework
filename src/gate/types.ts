@@ -249,16 +249,16 @@ export interface GateEntryRef {
  *  start of the wake's turn decides it (the framework's placeWakeLines): the
  *  delivery agent's own start leaves it out while that entry is still the
  *  newest, and writes it once something follows; a co-resident's start
- *  writes it whatever is newest; two or more such lines are each written;
+ *  places none; two or more such lines are each written;
  *  and none is written while the host is quiesced or another reader of the
  *  residents' shared slot has a turn alive. A line left out stays for a
  *  later fresh start of the same wake. Its text is rendered when it's
  *  written (wakeLineText), so its age is true then.
  *
  *  Every request for one wake carries the same object: the framework writes
- *  each line once by its identity, whichever of the wake's agents starts
- *  first. A host that hands the gate's requests on itself passes the line
- *  on as it is, not a copy per agent. */
+ *  each line once by its identity, across the wake's retries and holds. A
+ *  host that hands the gate's requests on itself passes the line on as it
+ *  is, not a copy per agent. */
 export interface WakeLine {
   /** The event's own entry. */
   entry: GateEntryRef;
