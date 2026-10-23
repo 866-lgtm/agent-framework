@@ -37,8 +37,9 @@ A turn continues when the model ended it (stop reason `end_turn` or
   `>>>skip_reply` in hybrid mode whose hold is still standing at the end;
 - it asked for a ` !` continuation (`>>#ops !`), which runs instead, with no
   row, and counts toward nothing;
-- its prose bounced (explicit mode): the bounce already wakes the agent to
-  resend, under its own cap;
+- its closing prose bounced (explicit or hybrid mode): the bounce, with the
+  bounce-wake cap, is that turn's answer, and continuing once the cap is
+  spent would restart the loop the cap breaks;
 - it was a silent heartbeat tick;
 - it ended with a refusal, a `max_tokens` cut-off, or the stall guard's
   `no_progress` / `round_limit`;
@@ -64,7 +65,9 @@ acknowledge themselves and write no receipt):
 [continue] lena, another turn starts now. If you're done, call skip_reply; anything you write without it is sent as usual.
 ```
 
-It names the agent, since residents read one shared message slot. When the
+It names the agent, since residents read one shared message slot. For the
+same reason it is never written while another resident's turn is alive: the
+continuation waits for that turn to end, as a clock row does. When the
 last turn's closing words were held because that turn had already sent, it
 adds `Your closing words last turn were held, not sent: that turn had already
 sent with a send tool.` The last continuation of a run adds `This is the last
@@ -79,9 +82,10 @@ It is short and event-shaped: longer instruction blocks about output, sent as
 user-role messages, have tripped provider classifiers.
 
 The row is never written for a turn that doesn't run: a wake the inference
-policy drops, or that a quiesce drops, writes none and gives back its count;
-a row that can't be stored gives back its count, and withdraws a turn the
-continuation alone caused. It is appended before the turn compiles and never
+policy drops, or that a quiesce drops, writes none and gives back its count,
+as does one a resumed turn (a budget restart) takes in; a row that can't be
+stored gives back its count, and withdraws a turn the continuation alone
+caused. A write that throws after its row landed counts as written. It is appended before the turn compiles and never
 retracted, so the prompt-cache prefix stays stable.
 
 ## The next turn

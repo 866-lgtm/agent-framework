@@ -141,6 +141,7 @@ describe('autoContinue', () => {
     autoContinue: AgentConfig['autoContinue'],
     proseRouting: AgentConfig['proseRouting'] = 'locus',
     allowedTools?: AgentConfig['allowedTools'],
+    others: AgentConfig[] = [],
   ): Promise<AgentFramework> {
     const framework = await AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
@@ -148,7 +149,7 @@ describe('autoContinue', () => {
       agents: [{
         name: 'assistant', model: 'test-model', systemPrompt: 'You are a test agent.', proseRouting, autoContinue,
         ...(allowedTools ? { allowedTools } : {}),
-      }],
+      }, ...others],
       modules: [module],
     });
     module.framework = framework;
@@ -590,6 +591,116 @@ describe('autoContinue', () => {
     }
   });
 
+  it("waits for another resident's turn before writing its row into the shared slot", async () => {
+    const framework = await createFramework(true, 'locus', undefined, [{ name: 'other', model: 'test-model', systemPrompt: 'Another resident.' }]);
+    stubRegistry(framework);
+    const internals = framework as unknown as {
+      autoContinueAfterTurn(agent: unknown, routing: unknown, trigger: unknown, stopReason: string): void;
+      processInferenceRequests(): Promise<void>;
+      pendingRequests: InferenceRequest[];
+      activeTurnTokens: Map<string, number>;
+    };
+    const triggers = script(framework, [skipReply()]);
+    try {
+      internals.autoContinueAfterTurn(framework.getAgent('assistant')!, {}, undefined, 'end_turn');
+      internals.activeTurnTokens.set('other', 424242);
+      await internals.processInferenceRequests();
+      assert.equal(triggers.length, 0, 'no turn while the other resident\'s turn is alive');
+      assert.deepEqual(notices(framework), [], 'and no row in the middle of it');
+      assert.equal(internals.pendingRequests.filter((r) => r.reason === 'auto-continue').length, 1, 'the continuation waits');
+      internals.activeTurnTokens.delete('other');
+      await within(framework.runUntilIdle(), 'the continuation');
+      assert.equal(triggers.length, 1);
+      assert.deepEqual(notices(framework), [row(false)]);
+    } finally {
+      internals.activeTurnTokens.delete('other');
+      await framework.stop();
+    }
+  });
+
+  it('a row whose write threw after it landed counts as written: the turn runs, with one row', async () => {
+    const framework = await createFramework(true);
+    stubRegistry(framework);
+    const cm = framework.getAgent('assistant')!.getContextManager() as unknown as {
+      addMessage(role: string, content: unknown, metadata?: { kind?: string }): unknown;
+    };
+    const original = cm.addMessage.bind(cm);
+    cm.addMessage = (role, content, metadata) => {
+      const id = original(role, content, metadata);
+      if (metadata?.kind === 'auto-continue') throw new Error('synthetic propagation failure after the write');
+      return id;
+    };
+    const triggers = script(framework, [prose('one'), skipReply()]);
+    try {
+      trigger(framework);
+      await within(framework.runUntilIdle(), 'the run to settle');
+      assert.equal(triggers.length, 2, 'the continuation runs');
+      assert.deepEqual(notices(framework), [row(false)], 'its one row is there');
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it('a row that fails for a continuation batched with another framework wake gives back its count; the turn runs', async () => {
+    const framework = await createFramework(true);
+    stubRegistry(framework);
+    const internals = framework as unknown as {
+      autoContinueAfterTurn(agent: unknown, routing: unknown, trigger: unknown, stopReason: string): void;
+      pendingRequests: InferenceRequest[];
+      autoContinueStreaks: Map<string, number>;
+    };
+    const cm = framework.getAgent('assistant')!.getContextManager() as unknown as {
+      addMessage(role: string, content: unknown, metadata?: { kind?: string }): unknown;
+    };
+    const original = cm.addMessage.bind(cm);
+    cm.addMessage = (role, content, metadata) => {
+      if (metadata?.kind === 'auto-continue') throw new Error('synthetic store failure');
+      return original(role, content, metadata);
+    };
+    const triggers = script(framework, [skipReply()]);
+    try {
+      internals.autoContinueAfterTurn(framework.getAgent('assistant')!, {}, undefined, 'end_turn');
+      internals.pendingRequests.push({ agentName: 'assistant', reason: 'framework-test-wake', source: 'framework', timestamp: Date.now() });
+      await within(framework.runUntilIdle(), 'the turn');
+      assert.equal(triggers.length, 1, 'the other wake still has its turn');
+      assert.deepEqual(notices(framework), []);
+      assert.equal(internals.autoContinueStreaks.get('assistant') ?? 0, 0, 'the count is given back');
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it('a quiesce parks a requeued trigger without its continuation mark, and gives back the count', async () => {
+    const framework = await createFramework(true);
+    stubRegistry(framework);
+    const internals = framework as unknown as {
+      autoContinueAfterTurn(agent: unknown, routing: unknown, trigger: unknown, stopReason: string): void;
+      processInferenceRequests(): Promise<void>;
+      pendingRequests: InferenceRequest[];
+      quiesced: boolean;
+      autoContinueStreaks: Map<string, number>;
+    };
+    try {
+      internals.autoContinueAfterTurn(framework.getAgent('assistant')!, {}, undefined, 'end_turn');
+      // Swap the bare wake for a requeued turn trigger that carried the mark
+      // (as a provider park's requeue hands back), with a cause of its own.
+      const wake = internals.pendingRequests.find((r) => r.reason === 'auto-continue')!;
+      internals.pendingRequests.length = 0;
+      internals.pendingRequests.push({ ...wake, reason: 'framework-test-wake' });
+      internals.quiesced = true;
+      await internals.processInferenceRequests();
+      const parked = internals.pendingRequests.filter((r) => r.agentName === 'assistant');
+      assert.equal(parked.length, 1, 'the trigger parks for resume');
+      assert.equal(parked[0]!.reason, 'framework-test-wake');
+      assert.equal(parked[0]!.autoContinueRun, undefined, 'without the mark, so resume writes no stale row');
+      assert.equal(internals.autoContinueStreaks.get('assistant') ?? 0, 0);
+    } finally {
+      internals.quiesced = false;
+      internals.pendingRequests.length = 0;
+      await framework.stop();
+    }
+  });
+
   it('a quiesce drops a queued continuation and gives back its count', async () => {
     const framework = await createFramework(true);
     stubRegistry(framework);
@@ -614,15 +725,16 @@ describe('autoContinue', () => {
     }
   });
 
-  it('explicit: a turn whose prose bounced is woken by the bounce, not also continued', async () => {
+  it("explicit: a turn whose closing prose bounced is left to the bounce, past its cap too", async () => {
     const framework = await createFramework(true, 'explicit');
     stubRegistry(framework);
-    const triggers = script(framework, [prose('no prefix here'), prose('>>skip_reply fine')]);
+    // Every turn ends in unprefixed prose: the message's turn, then the two
+    // bounce wakes the cap allows. With the setting off it is the same 3.
+    const triggers = script(framework, [prose('no prefix'), prose('still none'), prose('none again'), prose('and again')]);
     try {
       trigger(framework);
       await within(framework.runUntilIdle(), 'the run to settle');
-      assert.equal(triggers.length, 2, 'one wake, not a bounce and a continuation');
-      assert.equal(triggers[1]!.reason, 'prose-bounce');
+      assert.deepEqual(triggers.slice(1).map((t) => t.reason), ['prose-bounce', 'prose-bounce'], 'no continuation, before or after the bounce cap is spent');
       assert.deepEqual(notices(framework), []);
     } finally {
       await framework.stop();

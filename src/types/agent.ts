@@ -244,9 +244,9 @@ export interface AgentConfig {
    * instead of a pause until the next event. A turn ended through
    * `skip_reply` (or another tool that ends the turn, such as `sleep`), or
    * whose last prose envelope is `>>skip_reply` (explicit) or `>>>skip_reply`
-   * (hybrid), pauses as usual. So does one whose prose bounced (the bounce
-   * wakes the agent), and an agent offered no way to stop (locus or disabled
-   * mode without an offered `skip_reply`).
+   * (hybrid), pauses as usual. So does one whose closing prose bounced (the
+   * bounce and its cap answer it), and an agent offered no way to stop
+   * (locus or disabled mode without an offered `skip_reply`).
    *
    * As the next turn starts, a short `[continue]` system row naming the agent
    * joins the window: another turn starts, how to stop, and that unmarked

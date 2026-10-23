@@ -1101,6 +1101,13 @@ interface TurnRouting {
    * destination is named.)
    */
   lastEnvelopeSkipped?: boolean;
+  /**
+   * Explicit or hybrid mode: the turn's latest envelope bounced (no
+   * destination, an unresolved or refused one, a failed send). Its bounce,
+   * with the bounce-wake cap, is that turn's answer, so autoContinue leaves
+   * it to the bounce.
+   */
+  lastEnvelopeBounced?: boolean;
   /** Successful plain-prose destinations in delivery order; deduped by the receipt. */
   deliveries: ChannelRef[];
   /** Plain-prose segments the turn suppressed without drafts (proseRouting=disabled, or a round withheld before its scripts returned: ScriptRound.withhold), reported by its receipt. */
@@ -14820,9 +14827,23 @@ export class AgentFramework {
       // A batch with a cause of its own is that cause's turn: no row, and the
       // run starts again below.
       const continuation = requests.find(carriesContinuation);
-      const continuationMark = continuation?.autoContinueRun && !requests.some(hasOwnCauseForRun)
+      let continuationMark = continuation?.autoContinueRun && !requests.some(hasOwnCauseForRun)
         ? { ...continuation.autoContinueRun, sole: requests.every(carriesContinuation) }
         : undefined;
+      // A batch that resumes a logical turn (a budget restart, a guard retry)
+      // takes the continuation's wake into that turn, which writes no start
+      // inputs: its count goes back, and it writes no row.
+      if (continuationMark && requests.some((r) => resumesLogicalTurn(r.reason))) {
+        this.giveBackAutoContinue(agentName, 'a resumed turn took its wake');
+        continuationMark = undefined;
+      }
+      // Its row goes into the residents' shared slot, which no write may
+      // enter while another reader's turn is alive (as for a clock row): the
+      // continuation waits until that turn has ended.
+      if (continuationMark && this.sharedSlotBusy(agent)) {
+        this.pendingRequests.push(...requests);
+        continue;
+      }
 
       // Start streaming inference (non-blocking — driveStream runs in background)
       // The request that grants the turn-alive exception must also define the
@@ -16636,9 +16657,9 @@ export class AgentFramework {
    * reaches here, and clears the run's count.
    *
    * It continues only an agent that has a way to stop it is offered: the
-   * skip_reply tool, or in explicit/hybrid mode a skip envelope. It doesn't
-   * add a continuation to a bounce wake the turn's prose already queued, and
-   * never continues an ephemeral run or a conversation fork. The wake names
+   * skip_reply tool, or in explicit/hybrid mode a skip envelope. It leaves
+   * a turn whose closing prose bounced to the bounce, and never continues an
+   * ephemeral run or a conversation fork. The wake names
    * the turn's locus, or the unresolved channel of a turn that had none, so
    * the next turn speaks, or doesn't, where this one did; a batched message's
    * channel outranks it. Its mark (InferenceRequest.autoContinueRun) holds
@@ -16679,10 +16700,11 @@ export class AgentFramework {
       console.error(`[continue] ${name}: not continued — no way to stop is offered (no skip_reply tool, no skip envelope in ${agent.proseRouting} mode)`);
       return;
     }
-    // The turn's prose bounced, and the bounce already wakes the agent to
-    // resend it (bounceProse, with its own cap).
-    if (this.pendingRequests.some((r) => r.agentName === name && r.reason === 'prose-bounce')) {
-      console.error(`[continue] ${name}: not continued — a bounce wake is already queued`);
+    // The turn's closing prose bounced: the bounce, with its own cap, is
+    // explicit and hybrid mode's answer to that turn, and continuing past
+    // the cap would restart the loop the cap breaks.
+    if (routing.lastEnvelopeBounced) {
+      console.error(`[continue] ${name}: not continued — the turn's closing prose bounced`);
       return;
     }
     const count = (this.autoContinueStreaks.get(name) ?? 0) + 1;
@@ -16737,19 +16759,44 @@ export class AgentFramework {
     const text = autoContinueNotice({
       agentName: agent.name, stop: mark.stop, last: count >= max, heldAfterSend: mark.heldAfterSend,
     });
+    const before = this.storedCountOf(agent);
+    let id: MessageId;
     try {
-      const id = agent.getContextManager().addMessage(
+      id = agent.getContextManager().addMessage(
         'user',
         [{ type: 'text', text }],
         { system: true, kind: 'auto-continue', agentName: agent.name, continuation: count, maxConsecutive: max } as MessageMetadata,
       );
-      this.emitTrace({ type: 'message:added', messageId: id, source: 'auto-continue' });
-      console.error(`[continue] ${agent.name}: continuation ${count} of ${max} starts`);
-      return true;
     } catch (err) {
-      console.error(`[continue] ${agent.name}: row not stored, so not continued:`, err);
-      return false;
+      // A write can throw after its row landed (context-manager's own
+      // propagation failing): read back from where the store stood, as the
+      // clock row does, so a row that is there isn't called missing.
+      const landed = before === undefined
+        ? undefined
+        : this.storedSince(agent, before, (m) => {
+          const meta = m.metadata as { kind?: unknown; agentName?: unknown } | undefined;
+          return meta?.kind === 'auto-continue' && meta.agentName === agent.name;
+        }, 'continue', 'the continuation row');
+      if (!landed || landed.length === 0) {
+        console.error(`[continue] ${agent.name}: row not stored${landed ? '' : ' (whether it landed is unknown)'}, so not continued:`, err);
+        return false;
+      }
+      console.error(`[continue] ${agent.name}: the continuation row landed though its write threw:`, err);
+      id = landed[0]!.id;
     }
+    this.emitTrace({ type: 'message:added', messageId: id, source: 'auto-continue' });
+    console.error(`[continue] ${agent.name}: continuation ${count} of ${max} starts`);
+    return true;
+  }
+
+  /** Whether another reader of the residents' shared slot has a turn alive,
+   *  so no row may be written there now (as storeDueClock checks). */
+  private sharedSlotBusy(agent: Agent): boolean {
+    if (!this.sharedSlotAgents.has(agent)) return false;
+    for (const reader of this.sharedSlotAgents) {
+      if (reader !== agent && this.turnAlive(reader)) return true;
+    }
+    return false;
   }
 
   /** A continuation whose turn doesn't run: the run's count goes back to
@@ -17056,6 +17103,7 @@ export class AgentFramework {
   ): Promise<void> {
     const routing = round.routing;
     for (const envelope of splitHybridEnvelopes(rawText)) {
+      routing.lastEnvelopeBounced = false;
       const normalized = envelope;
       const attempted = normalized.startsWith('>>>');
       const parsed = parseHybridProsePrefix(normalized);
@@ -17201,6 +17249,7 @@ export class AgentFramework {
     // or continuation, even when delivery runs after that turn has ended.
     if (parsed.continueTurn && !round.keepPrivate) routing.continuation = true;
     routing.lastEnvelopeSkipped = parsed.kind === 'private';
+    routing.lastEnvelopeBounced = false;
 
     if (parsed.kind === 'private') {
       // The text already lives in the assistant message (window/chronicle);
@@ -17373,6 +17422,7 @@ export class AgentFramework {
     after: { substituted?: Draft; outcome?: 'unknown' } = {},
   ): void {
     const name = agent.name;
+    round.routing.lastEnvelopeBounced = true;
     if (after.outcome === 'unknown' && !after.substituted) {
       // Words with no draft behind them, whose send threw, may have gone
       // out. Like an unknown outcome, that is marker-only: holding them as a
@@ -18030,8 +18080,10 @@ export class AgentFramework {
       const mark = trigger.autoContinueRun;
       const { autoContinueRun: _mark, ...unmarked } = trigger;
       trigger = unmarked;
-      if (!this.writeAutoContinueNotice(agent, mark)) {
-        this.giveBackAutoContinue(agent.name, 'its row could not be stored');
+      // Another reader's turn may have started since the scheduler checked.
+      const busy = this.sharedSlotBusy(agent);
+      if (busy || !this.writeAutoContinueNotice(agent, mark)) {
+        this.giveBackAutoContinue(agent.name, busy ? "another resident's turn is alive in the shared slot" : 'its row could not be stored');
         if (mark.sole) {
           console.error(`[continue] ${agent.name}: turn not started (the continuation was its only cause)`);
           if (this.activeTurnTokens.get(agent.name) === turnToken) {

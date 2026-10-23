@@ -12,7 +12,7 @@
   The next turn keeps the turn's locus unless a batched message names
   another channel. Its wake has reason `auto-continue`. Not continued:
   refusals, `max_tokens` cut-offs, the stall guard's ends, silent heartbeat
-  ticks, a turn whose prose bounced, ephemeral runs, conversation forks, an
+  ticks, a turn whose closing prose bounced, ephemeral runs, conversation forks, an
   agent offered no way to stop, and a quiesce (which drops a queued
   continuation); a ` !` continuation runs instead. Each continuation is a
   full inference: an agent that answers and ends its turn gets at least one
