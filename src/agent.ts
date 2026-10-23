@@ -1595,6 +1595,12 @@ export class Agent {
       emitTokens: true,
       emitBlocks: false,
       emitUsage: true,
+      // The framework retries its turns itself (errorPolicy, provider holds,
+      // stated waits), each attempt a fresh compile a stop can cancel, so
+      // membrane sends a failed round once and hands the error up: since
+      // membrane 0.7 its own schedules, ten minutes at a 529, would otherwise
+      // run inside each of the framework's attempts, out of its sight.
+      retry: false,
       // Retry a content-policy refusal at the provider seam rather than at
       // the framework level: membrane replays the SAME request immediately
       // (cache-warm), where a framework-level requeue would recompile and
