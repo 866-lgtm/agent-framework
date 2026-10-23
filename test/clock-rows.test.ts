@@ -240,7 +240,7 @@ describe('planning a clock', () => {
 class ToolModule implements Module {
   readonly name = 'tools';
   /** Runs inside the next tool call: the round's time passes here. */
-  during: (() => void | Promise<void>) | null = null;
+  during: (() => void) | null = null;
   async start(ctx: ModuleContext) { ctx.registerSpeechHandler('*'); }
   async stop() {}
   async onProcess() { return {}; }
@@ -251,7 +251,7 @@ class ToolModule implements Module {
   async handleToolCall(_call: ToolCall): Promise<ToolResult> {
     const during = this.during;
     this.during = null;
-    await during?.();
+    during?.();
     return { success: true, data: { ok: true } };
   }
 }
@@ -534,12 +534,10 @@ describe('clock rows in the framework', () => {
       // A stand-in that marks each id's answer with its position in the batch.
       cm.renderAsNewest = (ids: readonly string[]) => { asked.push(ids.length); return ids.map((_, i) => [{ type: 'text', text: `RENDERED${i}` }]); };
       setClock('2026-10-21T10:48:10Z');
-      x.mod.during = async () => {
+      x.mod.during = () => {
         setClock('2026-10-21T10:52:10Z');
-        // Stored for the agent to hear, with no wake of its own.
+        // Queued for the agent to hear, synchronously, with no wake of its own.
         (x.framework as any).handleMcplPushEvent({ ...event('MIDTURN'), triggerInference: false });
-        // A beat for the run loop to defer it while the round's tools are pending.
-        await new Promise((r) => setTimeout(r, 30));
       };
       // The stream that runs the tool round, kept before the message's own
       // wake starts another and takes lastStream.
