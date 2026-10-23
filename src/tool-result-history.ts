@@ -262,6 +262,21 @@ export function shownToScript(value: unknown): unknown {
 }
 
 /**
+ * A value nested in an MCPL peer's content block as a script reads it, as a
+ * JSON replacer applies it inside the blocks: what RFC-005 governs
+ * (governedByRfc005, history's guard, since the classifier would make a
+ * notice of any other object) gets the treatment the script lane gives a
+ * peer's block (referenceBlockForScript), its reference bound to the server
+ * that sent it, and any other value is itself. A stub or a notice isn't
+ * governed, so a block the top-level pass already treated is left as it is.
+ */
+export function shownToScriptFromServer(value: unknown, serverId: string): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const b = value as Record<string, unknown>;
+  return governedByRfc005(b) ? referenceBlockForScript(b, serverId) : value;
+}
+
+/**
  * The text RFC-005 shows a value of a tool result's data as, when it shows it
  * as text rather than as its fields: a reference's stub, an invalid one's
  * unrecognized-block line, or inline data withheld. Null for any other value.

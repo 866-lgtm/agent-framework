@@ -17,6 +17,10 @@
   references' URIs included. Which results are a module's is decided by
   where the dispatch sent the call, not by the tool's name. An MCPL
   peer's inline data beside a URI that isn't a string, such as an object,
-  now also reaches a script as the withheld notice. `structuredContent`
-  still reaches a script whole, from every tool, and so do fields a server
-  puts outside its content blocks' reference positions.
+  now also reaches a script as the withheld notice. What an MCPL peer's
+  content block carries in its other fields gets the same treatment at
+  any depth: an RFC-005 reference there arrives as its stub's facts,
+  bound to that server, one the classifier rejects as its notice, and
+  inline data beside a URI as the withheld notice, where before such
+  fields reached a script whole. `structuredContent` still reaches a script whole, from
+  every tool.
