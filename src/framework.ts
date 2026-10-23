@@ -76,7 +76,7 @@ import { asModuleRow, heldHandle, heldWriteId, matchesMessageQuery } from './hel
 import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
-import { Agent, assertAgentSwitches } from './agent.js';
+import { Agent, assertAgentSwitches, dryCompileStatsOf } from './agent.js';
 import { assertBooleanSetting, holdsSettings } from './config-checks.js';
 import { ModuleRegistry, checkedToolResult, ensureStateRegistered, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
@@ -2615,6 +2615,29 @@ export class AgentFramework {
   private presentationPreviews = new WeakMap<object, PresentationSnapshot>();
   getRequestToolPresentation(request: object): PresentationSnapshot | null {
     return this.presentationPreviews.get(request) ?? null;
+  }
+  /**
+   * The render stats of the dry compile that built `request`, a request
+   * `previewActivation` returned (or `Agent.buildActivationRequest` with
+   * `dryRun`), as context-manager gives them in `CompileResult.renderStats`:
+   * what that compile's select put in the context, by kind. They count the
+   * selection, not each message of the request. The injections
+   * context-manager merges in after its select, such as those
+   * `previewActivation` gathers with `injections: true`, aren't counted, and
+   * neither is what the agent adds after the compile, such as a `[Continue]`
+   * turn or a request-only row. A message the agent drops for holding only
+   * empty text is counted. context-manager's doc of `CompileResult.renderStats`
+   * names the rest. A later preview or live compile leaves them as they were.
+   * They're the object the compile returned, not a copy, so treat them as
+   * read-only: a change to them shows in every later read. Null for a request
+   * no dry run built, a request that is sent included, and when the agent's
+   * strategy records none (of context-manager's own, the autobiographical
+   * strategy and the knowledge strategy built on it do). Null too with
+   * context-manager before 0.20.1, whose compiles carry no render stats: a
+   * host that reads them moves its own context-manager to 0.20.1.
+   */
+  getRequestCompileStats(request: object): NonNullable<ReturnType<ContextManager['getRenderStats']>> | null {
+    return dryCompileStatsOf(request);
   }
 
   private store: JsStore;
@@ -7862,6 +7885,9 @@ export class AgentFramework {
    *
    * Pass `{ injections: true }` to opt into full-fidelity gathering and accept
    * those side effects (byte-faithful to a real activation's injected context).
+   *
+   * What the dry compile selected, by kind, is `getRequestCompileStats` of the
+   * request this returns.
    */
   async previewActivation(
     agentName: string,

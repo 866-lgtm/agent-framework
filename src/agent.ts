@@ -40,6 +40,23 @@ export interface ActivationRequestOptions {
   membraneRetries?: boolean;
 }
 
+/** A compile's render stats, as context-manager's `getRenderStats()` types
+ *  them; context-manager 0.20.1 gives each compile its own, where the
+ *  strategy records them, in `CompileResult.renderStats`. */
+type RenderStats = NonNullable<ReturnType<ContextManager['getRenderStats']>>;
+
+/** The render stats of the dry compile behind each request a dry run
+ *  assembled (`assembleActivationRequest` with `dryRun`), by that request.
+ *  A request that is sent has none here. Read through the framework's
+ *  `getRequestCompileStats`. */
+const dryCompileStats = new WeakMap<object, RenderStats | undefined>();
+
+/** The render stats of the dry compile that built `request`, or null: see
+ *  `AgentFramework.getRequestCompileStats`. */
+export function dryCompileStatsOf(request: object): RenderStats | null {
+  return dryCompileStats.get(request) ?? null;
+}
+
 export interface StartStreamResult {
   stream: YieldingStream;
   request: NormalizedRequest;
@@ -1426,7 +1443,7 @@ export class Agent {
           system: this.buildSystemPrompt(prospectiveSystemInjections),
         })
       : undefined;
-    let { messages, systemInjections } = await this.compileWithInjections(
+    const compiled = await this.compileWithInjections(
       budget,
       injections,
       immutablePrefixHash || options.dryRun
@@ -1436,6 +1453,10 @@ export class Agent {
           }
         : undefined,
     );
+    let { messages, systemInjections } = compiled;
+    // context-manager 0.20.1's field, read structurally so this compiles
+    // against 0.20.0 too, whose compiles carry none.
+    const { renderStats } = compiled as typeof compiled & { renderStats?: RenderStats };
 
     // Sanitize: strip empty/whitespace text blocks and drop messages left with
     // no content. The Anthropic API rejects empty text blocks with 400
@@ -1506,6 +1527,7 @@ export class Agent {
       ...this.requestSettings(),
       ...(kvUnified ? { cacheMarkers: 'cm-owned' as const } : {}),
     };
+    if (options.dryRun) dryCompileStats.set(request, renderStats);
     return { request, ...(continuePrompt ? { continuePrompt } : {}) };
   }
 
