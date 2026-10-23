@@ -17,9 +17,10 @@
  * bucket are denied (decision: trigger=false). Tokens regenerate at one per
  * `refillIntervalMs`, capped at `tokens`. Buckets are partitioned by the
  * value of `keyBy` resolved against event metadata — so a per-user limit
- * uses `keyBy: "senderId"`, a per-channel limit uses `keyBy: "channelId"`,
- * etc. With no `keyBy` (or when the resolved value is missing), one shared
- * bucket is used for the policy.
+ * uses `keyBy: "senderId"`, a per-channel limit uses `keyBy: "channelId"`
+ * (resolved to the channel's registered id, as `keyBy` says), etc. With no
+ * `keyBy` (or when the resolved value is missing), one shared bucket is used
+ * for the policy.
  */
 export interface RateLimitConfig {
   /** Max bucket capacity, also the initial fill. Must be > 0. */
@@ -27,8 +28,12 @@ export interface RateLimitConfig {
   /** Milliseconds between token regenerations. Must be > 0. */
   refillIntervalMs: number;
   /**
-   * Metadata field name to partition buckets by. If absent or the metadata
-   * field is missing on a given event, all events share one bucket.
+   * Metadata field name to partition buckets by. `"channelId"` takes the
+   * channel's registered id where the gate resolves one, as `match.channel`
+   * does, so a channel's push events share its messages' bucket, a voice
+   * report's included, though it carries no `channelId`. Otherwise, if
+   * absent or the metadata field is missing on a given event, all such
+   * events share one bucket.
    */
   keyBy?: string;
 }
@@ -45,7 +50,8 @@ export interface RateLimitConfig {
 export interface PassiveSampleConfig {
   /** Trigger every N-th match. Must be > 0. */
   every: number;
-  /** Optional metadata field name for separate per-key counters. */
+  /** Optional metadata field name for separate per-key counters, resolved
+   *  as `RateLimitConfig.keyBy` is. */
   keyBy?: string;
 }
 
@@ -68,7 +74,12 @@ export interface GatePolicyMatch {
   scope?: string[];
   /** ServerId to match (exact or glob with *). */
   source?: string;
-  /** ChannelId to match (exact or glob with *). */
+  /** Channel to match (exact or glob with *): against the event's channel
+   *  id, then the registered id the gate resolves for it
+   *  (`resolveRouteChannel`). A channels/incoming message carries the
+   *  registered id (`discord:<guild>:<channel>`), and a push the adapter's
+   *  raw one or none, so a registered-form pattern meets every event in its
+   *  channel whose push names the channel, and a raw id only push events. */
   channel?: string;
   /** Content text filter. */
   filter?: { type: 'text' | 'regex'; pattern: string };
