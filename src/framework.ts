@@ -10,6 +10,7 @@ import {
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStream, DetailedUsage, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
+import { classifyFailure, retryDecision, MEMBRANE_RETRY_SETTINGS, type RetrySettings } from '@animalabs/membrane/retry';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks, continuesBody, MalformedContentError, malformedContentPlaces, CompressionWithdrawn } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SILENT_HEARTBEAT_SEPARATOR, type RequestOnlyPrompt, type RequestOnlyStamps } from './silent-heartbeat.js';
@@ -1805,31 +1806,69 @@ function hostCommandRequester(serverId: string, params: HostCommandParams): Oper
 
 
 /**
- * Default error policy - retry with exponential backoff.
+ * Default error policy: membrane's own retry schedules, decided here.
  *
- * Respects MembraneError.retryable: non-retryable errors (400 invalid_request,
- * 401 auth, context_length, safety) are terminal on attempt 0. Retrying them
- * burns API quota without any chance of success — the payload doesn't change
- * between attempts. Production traces showed clerk + reviewer wasting 4
- * inferences on each 400 due to blind retries.
- *
- * For retryable errors, honors retryAfterMs when present (rate limits),
- * otherwise falls back to exponential backoff capped at maxRetries.
+ * The framework's turns pass `retry: false` to membrane, so a failure reaches
+ * this policy after one send, and the framework is the one retry layer: each
+ * retry is a fresh compile, a stop cancels its wait, and the wait is seen.
+ * The decision is membrane's (`@animalabs/membrane/retry`), on the settings
+ * given (membrane's defaults unless a host passes its own, e.g. from a
+ * recipe's retry config):
+ * - not retryable (400 invalid_request, 401 auth, context_length, safety,
+ *   a caller-code error): terminal on the first failure. Retrying them burns
+ *   API quota without any chance of success; production traces showed clerk +
+ *   reviewer wasting 4 inferences on each 400 due to blind retries.
+ * - overloaded (a 529, or an overloaded error mid-stream): the overloaded
+ *   schedule, jittered (by default 7 tries, 10 s doubling to 5 min, ~10 min).
+ * - rate limited (429): the base schedule with at least 5 tries.
+ * - any other retryable failure, a stream deadline on a sent request
+ *   included (membrane leaves those to its caller): the base schedule (by
+ *   default 3 tries, 1 s then 2 s).
+ * A provider's stated wait (`retryAfterMs`) is waited when it is longer than
+ * the backoff, up to the framework's own cap (PROVIDER_ACCELERATION_MAX_
+ * COOLDOWN_MS, ten minutes) where a schedule's ceiling is lower; past it the
+ * turn ends here. (Before this policy runs, the framework holds a resident
+ * for a stated wait or an acceleration 429 itself, and ends an ephemeral run
+ * on a wait past that cap; see holdProviderAcceleration and
+ * nonOwningProviderWait.)
+ * An error that isn't a MembraneError is retried as a retryable failure, on
+ * the base schedule.
  */
-class DefaultErrorPolicy implements ErrorPolicy {
-  maxRetries = 3;
+export class DefaultErrorPolicy implements ErrorPolicy {
+  /** The most retries any class allows (ErrorPolicy's bound, for readers). */
+  readonly maxRetries: number;
+  private readonly settings: RetrySettings;
+
+  constructor(settings: RetrySettings = MEMBRANE_RETRY_SETTINGS as RetrySettings) {
+    // A stated wait up to the framework's own cap is slept and retried, as it
+    // was before: nonOwningProviderWait ends an ephemeral run on a longer one,
+    // and a resident's waits are held before this policy runs. Membrane's
+    // schedules alone would end the turn on one past a minute.
+    this.settings = Object.fromEntries(Object.entries(settings).map(([cls, s]) => [cls, s && {
+      ...s,
+      statedWaitCeilingMs: s.statedWaitCeilingMs === null ? null : Math.max(s.statedWaitCeilingMs, PROVIDER_ACCELERATION_MAX_COOLDOWN_MS),
+    }])) as RetrySettings;
+    this.maxRetries = Math.max(0, ...Object.values(settings).map((s) => (s?.maxAttempts ?? 1) - 1));
+  }
 
   onInferenceError(error: Error, _agentName: string, attempt: number): ErrorAction {
-    if (isMembraneError(error) && error.retryable === false) {
-      return { retry: false };
+    if (!isMembraneError(error)) {
+      // Not a provider failure membrane classified: retried as any other
+      // retryable failure, on the base schedule.
+      const decision = retryDecision('retryable', attempt + 1, undefined, this.settings);
+      return decision.retry ? { retry: true, delayMs: decision.delayMs } : { retry: false };
     }
-    if (attempt < this.maxRetries) {
-      const delayMs = isMembraneError(error) && typeof error.retryAfterMs === 'number'
-        ? error.retryAfterMs
-        : Math.pow(2, attempt) * 1000;
-      return { retry: true, delayMs };
-    }
-    return { retry: false };
+    if (error.retryable === false) return { retry: false };
+    // The facts membrane classifies by, read off the error itself (from either
+    // copy of membrane, as isMembraneError takes one). No `deadline` fact: a
+    // stream deadline is a retryable timeout here, as it was before membrane
+    // 0.7, where membrane itself gives it no retry.
+    const facts = error as { retryable?: boolean; type?: string; httpStatus?: number; message?: string };
+    // A failure that doesn't say is retried as an unknown one is; only false refuses (handled above).
+    const cls = classifyFailure({ retryable: facts.retryable !== false, type: facts.type, httpStatus: facts.httpStatus, message: facts.message });
+    // `attempt` counts this turn's earlier failures; membrane counts tries.
+    const decision = retryDecision(cls, attempt + 1, error.retryAfterMs, this.settings);
+    return decision.retry ? { retry: true, delayMs: decision.delayMs } : { retry: false };
   }
 }
 
@@ -18054,6 +18093,9 @@ export class AgentFramework {
         continuePrompt,
       } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
         silentHeartbeat: trigger?.silentHeartbeat,
+        // This turn's retries are the framework's (errorPolicy below), not
+        // membrane's inside each attempt.
+        membraneRetries: false,
       });
       // The compile can wait for annotations (each batch has one spill
       // deadline), so check ownership, admission, and the lifecycle again.
