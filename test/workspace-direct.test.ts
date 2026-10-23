@@ -2377,6 +2377,123 @@ test("a direct mount's listings pass over another mount's directory, naming the 
   assert.match(await failure(m, 'read', { path: 'ref/inner/x.ts' }), /lies in mount "inner", nested in mount "ref"/);
 });
 
+test("a direct mount's read shows a file's text as a 'chronicle' mount's does: lines without a CRLF end's CR, no BOM, a long line cut, and each page held to the call's result limit, with the notes that say so", async (t) => {
+  const env = new Env(t);
+  env.file('crlf.txt', 'one\r\ntwo\r\n');
+  env.file('bom.txt', Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('first\n')]));
+  env.file('bad.txt', Buffer.from([0x61, 0xff, 0x62, 0x0a]));
+  env.file('mixed.txt', 'a\r\nb\nc\r\r\nd\n');
+  env.file('long.txt', `${'x'.repeat(60000)}\ny\n`);
+  env.file('big.txt', Array.from({ length: 3000 }, (_, i) => `line ${i + 1} of a file with fairly ordinary lines`).join('\n'));
+  // Each file read as a page of lines and as a page of characters, at a
+  // model's limit, at a small one, and with none, as an in-process call makes it.
+  const reads: Array<[Record<string, unknown>, number | undefined]> = [];
+  for (const path of ['crlf.txt', 'bom.txt', 'bad.txt', 'mixed.txt', 'long.txt', 'big.txt']) {
+    for (const cap of [24000, 1000, undefined]) {
+      reads.push([{ path: `ref/${path}` }, cap], [{ path: `ref/${path}`, offsetChars: 0, limitChars: 5000 }, cap]);
+    }
+  }
+  const answers = async (m: WorkspaceModule): Promise<Array<[Record<string, unknown>, number | undefined, Record<string, any>]>> => {
+    const out: Array<[Record<string, unknown>, number | undefined, Record<string, any>]> = [];
+    for (const [input, cap] of reads) {
+      const r = await m.handleToolCall({ id: 'read', name: 'read', input, ...(cap !== undefined ? { resultMaxChars: cap } : {}) });
+      out.push([input, cap, r.success ? r.data as Record<string, any> : { error: r.error }]);
+    }
+    return out;
+  };
+  const direct = await env.open();
+  const fromDisk = await answers(direct);
+  const page = (path: string, cap: number | undefined, chars = false) =>
+    fromDisk.find(([input, c]) => input.path === `ref/${path}` && c === cap && ('offsetChars' in input) === chars)![2];
+  assert.equal(page('crlf.txt', 24000).content, '     1\tone\n     2\ttwo');
+  assert.match(page('crlf.txt', 24000).note, /^Line ends are CRLF, shown without the CR\./);
+  assert.equal(page('bom.txt', 24000).content, '     1\tfirst');
+  assert.match(page('bom.txt', 24000).note, /BOM/);
+  assert.match(page('bad.txt', 24000).note, /isn't valid UTF-8/);
+  assert.equal(page('mixed.txt', 24000).content, '     1\ta\n     2\tb\n     3\tc\r\r\n     4\td');
+  assert.equal(page('long.txt', 24000).content, `     1\t${'x'.repeat(2000)} [… read the rest with offsetChars=2000 and limitChars=58000]\n     2\ty`);
+  // Every page a call with a result limit asked for is a page, and fits it.
+  for (const [input, cap, d] of fromDisk) {
+    const label = `${String(input.path)}${'offsetChars' in input ? ' in characters' : ''} at ${cap}`;
+    assert.equal(typeof d.content, 'string', `${label}: ${JSON.stringify(d).slice(0, 200)}`);
+    if (cap !== undefined) assert.ok(JSON.stringify(d).length <= cap, `${label}: ${JSON.stringify(d).length}`);
+  }
+  assert.ok(page('big.txt', 24000).toLine < 3000);
+  assert.equal(page('long.txt', undefined).content.length, '     1\t'.length + 60000 + '\n     2\ty'.length);
+  await env.close(direct);
+  // The same answers as a 'chronicle' mount's, whose first read of a file
+  // takes it in with nothing more to say of it.
+  assert.deepEqual(fromDisk, await answers(await env.openChronicle()));
+});
+
+test("a direct mount's grep matches lines as read shows them, as a 'chronicle' mount's grep does, with each file's lineEndings and the notes on a pattern for a CR or U+FEFF", async (t) => {
+  const env = new Env(t);
+  env.file('crlf.txt', 'alpha\r\nfoo\r\nomega\r\n');
+  env.file('mixed.txt', 'foo\r\nbar\n');
+  env.file('lf.txt', 'foo\n');
+  env.file('bom.txt', Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('foo\n')]));
+  env.file('both.txt', Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('x\r\n')]));
+  const calls: Array<Record<string, unknown>> = [
+    { pattern: '^foo$' },
+    { pattern: '\\r$', path: 'ref/crlf.txt' },
+    { pattern: '^\\uFEFF', path: 'ref/bom.txt' },
+    { pattern: '^\\uFEFF|\\r$', path: 'ref/both.txt' },
+    { pattern: '\\r', path: 'ref/lf.txt' },
+  ];
+  // A 'chronicle' mount labels each result with its path's state and the
+  // workspace's copy, a direct mount's with disk's file: the rest is the same,
+  // but for where the notes say read shows what lines leave out.
+  const answers = async (m: WorkspaceModule): Promise<Array<[Record<string, unknown>, Array<Record<string, unknown>>, string | null]>> => {
+    const out: Array<[Record<string, unknown>, Array<Record<string, unknown>>, string | null]> = [];
+    for (const input of calls) {
+      const d = await data<{ results: Array<Record<string, unknown>>; note?: string }>(m, 'grep', input);
+      out.push([input, d.results.map(({ state: _state, version: _version, ...rest }) => rest), d.note ?? null]);
+    }
+    return out;
+  };
+  const direct = await env.open();
+  const fromDisk = await answers(direct);
+  const byFile = Object.fromEntries(fromDisk[0]![1].map((r) => [r.file, r]));
+  assert.deepEqual(byFile['ref/crlf.txt'], { file: 'ref/crlf.txt', lineEndings: 'CRLF', matches: [{ line: 2, text: 'foo' }] });
+  assert.equal(byFile['ref/mixed.txt']!.lineEndings, 'mixed');
+  assert.deepEqual(byFile['ref/bom.txt'], { file: 'ref/bom.txt', matches: [{ line: 1, text: 'foo' }] });
+  assert.deepEqual(byFile['ref/lf.txt'], { file: 'ref/lf.txt', matches: [{ line: 1, text: 'foo' }] });
+  // Each note names the files searched that have what it's about.
+  const cr = (file: string) => `The pattern names a CR, and 1 file searched has CRLF line ends: ${file} (CRLF). Lines are matched as read shows them, `
+    + "which leaves out a CRLF end's CR unless the line's own text ends in a CR. read with offsetChars shows every CR in the workspace's copy";
+  const bom = (file: string) => `The pattern names U+FEFF, and 1 file searched starts with a BOM: ${file}. Lines are matched as read shows them, `
+    + "and a BOM isn't part of the first line. read with offsetChars shows any BOM";
+  // On a host with a direct mount, which keeps no workspace copy, the notes
+  // name disk's file too; on a host with none, the workspace's copy alone.
+  const onDisk = ", or in disk's file on a direct mount.";
+  const notes = (crEnd: string, bomEnd: string) => [
+    `${cr('ref/crlf.txt')}${crEnd}`, `${bom('ref/bom.txt')}${bomEnd}`, `${cr('ref/both.txt')}${crEnd} ${bom('ref/both.txt')}${bomEnd}`, null];
+  assert.deepEqual(fromDisk.slice(1).map(([, results, note]) => [results.length, note]),
+    notes(onDisk, ` in the workspace's copy${onDisk}`).map((n) => [0, n]));
+  await env.close(direct);
+  const fromStore = await answers(await env.openChronicle());
+  assert.deepEqual(fromStore.map(([input, results]) => [input, results]), fromDisk.map(([input, results]) => [input, results]));
+  assert.deepEqual(fromStore.slice(1).map(([, , note]) => note), notes('.', " the workspace's copy has."));
+});
+
+test("on a host with a direct mount, grep's notes name disk's file too where the search was of a 'chronicle' mount beside it", async (t) => {
+  const env = new Env(t);
+  const work = join(env.root, 'work');
+  mkdirSync(work);
+  writeFileSync(join(work, 'crlf.txt'), 'alpha\r\nomega\r\n');
+  writeFileSync(join(work, 'bom.txt'), Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('foo\n')]));
+  // The tools' descriptions mention direct mounts on this host, and so do
+  // the notes, whichever of its mounts a grep searched.
+  const m = await env.open({}, [{ name: 'work', path: work, mode: 'read-write', watch: 'never' }]);
+  const onDisk = ", or in disk's file on a direct mount.";
+  const cr = await data<{ results: unknown[]; note?: string }>(m, 'grep', { pattern: '\\r$', path: 'work/crlf.txt' });
+  assert.deepEqual(cr.results, []);
+  assert.ok(cr.note?.endsWith(`read with offsetChars shows every CR in the workspace's copy${onDisk}`), cr.note);
+  const bom = await data<{ results: unknown[]; note?: string }>(m, 'grep', { pattern: '^\\uFEFF', path: 'work/bom.txt' });
+  assert.deepEqual(bom.results, []);
+  assert.ok(bom.note?.endsWith(`read with offsetChars shows any BOM in the workspace's copy${onDisk}`), bom.note);
+});
+
 test('inOrder hands each result on in order, at most `width` at once', async () => {
   const settle: Array<() => void> = [];
   const settled: number[] = [];
