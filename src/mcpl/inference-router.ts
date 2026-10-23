@@ -26,6 +26,7 @@ import type {
 import type { FeatureSetManager } from './feature-set-manager.js';
 import { McplFeatureSetError } from './feature-set-manager.js';
 import type { HookOrchestrator } from './hook-orchestrator.js';
+import { logValue } from './log-value.js';
 
 // ============================================================================
 // Responder interface
@@ -181,6 +182,10 @@ export class InferenceRouter {
   private featureSetManager: FeatureSetManager;
   private routingPolicy: InferenceRoutingPolicy | null;
   private emitTraceFn: (event: { type: string; [key: string]: unknown }) => void;
+  /** The servers whose refusal for want of a model has been logged: one
+   *  line each, so a server that keeps asking doesn't flood the operator's
+   *  log, and the set holds no more than the host's servers. */
+  private loggedRefusals = new Set<string>();
 
   constructor(
     membrane: Membrane,
@@ -201,7 +206,7 @@ export class InferenceRouter {
    *
    * 1. Validate feature set
    * 2. Check loop prevention (reject if inside a hook)
-   * 3. Resolve model from routing policy
+   * 3. Resolve model from routing policy, refusing when it names none
    * 4. Build membrane request
    * 5. Run inference, streaming its visible text as chunks when asked
    * 6. Answer with the result, or with the error for any ending that isn't
@@ -233,11 +238,42 @@ export class InferenceRouter {
       return;
     }
 
-    // 3. Resolve model
+    // 3. Resolve model. With no routing policy, or one that names no model
+    // for this feature set, the operator has chosen no model for this
+    // server's inference: refused rather than guessed, since a model picked
+    // here would run, on whatever credentials and at whatever price it
+    // carries, for a server the operator never chose it for. The answer is
+    // -32603, the code the router answers a failed inference with, as it
+    // answered this request when it reached the provider with no model; the
+    // server's grant can still list inferenceRequest, so not -32002.
     const model = this.resolveModel(
       params.featureSet,
       params.conversationId,
     );
+    if (model === undefined) {
+      const policy = Boolean(this.routingPolicy);
+      const why = policy
+        ? `the inference routing policy (inferenceRouting) names no model for feature set ${JSON.stringify(params.featureSet)}`
+        : 'the host sets no inference routing policy (inferenceRouting)';
+      if (!this.loggedRefusals.has(serverId)) {
+        this.loggedRefusals.add(serverId);
+        console.error(
+          `[mcpl] ${logValue(serverId)}: inference/request refused: ` +
+            (policy
+              ? `the inference routing policy names no model for feature set ${logValue(params.featureSet)}; ` +
+                'give it a default, or a byFeature or wildcards entry for that feature set'
+              : 'the host sets no inference routing policy; ' +
+                'set inferenceRouting in the framework config to choose the model server-initiated inference runs on') +
+            '. This line prints once per server; later refusals are answered but not logged.',
+        );
+      }
+      responder.respondError(
+        -32603,
+        `inference/request refused: ${why}, so the host has no model to run it on; ` +
+          "it stays refused until the host's operator configures one",
+      );
+      return;
+    }
 
     // Emit trace: inference start
     this.emitTraceFn({
@@ -325,37 +361,32 @@ export class InferenceRouter {
    * 2. Exact feature set match
    * 3. Wildcard pattern match (first match wins)
    * 4. Default from policy
-   * 5. Fallback string 'default'
+   *
+   * Only an entry naming a model counts: one that is empty or not a string
+   * names none and is passed over, as a missing one is. That includes what a
+   * server-sent conversation id or feature set such as `constructor` or
+   * `__proto__` finds on Object.prototype, which is never a string. A
+   * conversation id that is falsy reads no override.
+   *
+   * Undefined with no policy, or when none of these names a model: the
+   * request is then refused.
    */
   private resolveModel(
     featureSet: string,
     conversationId?: string,
-  ): string {
-    if (!this.routingPolicy) {
-      return 'default';
+  ): string | undefined {
+    const policy = this.routingPolicy;
+    if (!policy) {
+      return undefined;
     }
+    const named = (value: unknown): string | undefined =>
+      typeof value === 'string' && value !== '' ? value : undefined;
 
-    // Check per-conversation override
-    if (conversationId && this.routingPolicy.overrides?.[conversationId]) {
-      return this.routingPolicy.overrides[conversationId];
-    }
-
-    // Check exact feature set match
-    if (this.routingPolicy.byFeature?.[featureSet]) {
-      return this.routingPolicy.byFeature[featureSet];
-    }
-
-    // Check wildcard patterns
-    if (this.routingPolicy.wildcards) {
-      for (const [pattern, matchedModel] of Object.entries(this.routingPolicy.wildcards)) {
-        if (wildcardMatch(pattern, featureSet)) {
-          return matchedModel;
-        }
-      }
-    }
-
-    // Default
-    return this.routingPolicy.default;
+    return (conversationId ? named(policy.overrides?.[conversationId]) : undefined)
+      ?? named(policy.byFeature?.[featureSet])
+      // First wildcard that matches and names a model.
+      ?? Object.entries(policy.wildcards ?? {}).find(([pattern, m]) => named(m) && wildcardMatch(pattern, featureSet))?.[1]
+      ?? named(policy.default);
   }
 
   // ==========================================================================
