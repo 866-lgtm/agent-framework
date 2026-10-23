@@ -294,6 +294,33 @@ test("a miss's closest region, among lines that score alike, is the first of the
   assert.ok(miss?.kind === 'miss' && miss.hint.startsWith('Closest region (line 1, similarity 0.50)'), JSON.stringify(miss));
 });
 
+test("a miss's closest region clears only the bigram slots each line used, a step or two a line", () => {
+  // After each line, closestRegion clears only the slots that line used
+  // (touched). Never cleared, touched grows by a slot a line, and the search
+  // over 100,000 lines took 5.3 s of CPU rather than 33 ms, on Linux with
+  // Node 24.22.1. The clearing is a for...of over touched, so the child
+  // counts the steps of the array iterator over the search of 1,000 lines:
+  // two a line, one for the line's slot and one to end the loop. Patching the
+  // iterator's next turns off V8's fast path for array loops for the rest of
+  // a process, so the count runs in a child. Past ten steps a line, it throws.
+  const moduleUrl = new URL('../src/modules/workspace/edit-plan.js', import.meta.url).href;
+  const helperUrl = new URL('./helpers/count-calls.js', import.meta.url).href;
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+    const { decodeForEdit, planFile } = await import(${JSON.stringify(moduleUrl)});
+    const { countingCalls } = await import(${JSON.stringify(helperUrl)});
+    const bytes = Buffer.from('abc\\n'.repeat(1_000));
+    const file = decodeForEdit(bytes);
+    const arrayIterator = Object.getPrototypeOf([][Symbol.iterator]());
+    const { result, calls } = countingCalls(arrayIterator, 'next', () => true, 10_000,
+      () => planFile(file, bytes, [{ index: 0, oldText: 'abd', newText: 'z', expected: 1 }]));
+    console.log(JSON.stringify({ steps: calls, hint: result.problems[0].hint }));
+  `], { encoding: 'utf8', timeout: 120_000 });
+  assert.equal(child.status, 0, child.stderr || `stopped by ${child.signal}`);
+  const { steps, hint } = JSON.parse(child.stdout) as { steps: number; hint: string };
+  assert.ok(hint.startsWith('Closest region (line 1, similarity 0.50)'), hint);
+  assert.ok(steps >= 1_000 && steps < 10_000, `${steps} steps of the array iterator`);
+});
+
 test("in a file with no CRLF line end, the size floor is exact for an old text with line feeds", () => {
   const bytes = Buffer.from('a\nb\n');
   assert.deepEqual(planFile(decodeForEdit(bytes)!, bytes, [spec(0, 'a\n', 'bbb\n')], hintBudget(), 5), { tooLarge: 6 });
