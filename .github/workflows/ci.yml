@@ -23,7 +23,12 @@ jobs:
   # organization gets few at once, shared by every repository), so a pull
   # request takes the ones that test it: Build & Test's macOS leg at the
   # engines floor only, and code_execution's Bun macOS legs only when it
-  # touches what they test. Pushes to main take every leg.
+  # touches what they run: any source (the tests import the framework, not
+  # only code_execution), tsconfig.json, package.json, their own tests and
+  # helpers, or this workflow. ci-workflow-pins.test.ts checks every file
+  # those tests import falls inside the filter. The diff is base...head, as
+  # changelog.yml takes it, not the merge commit, which can carry main's
+  # newer commits. Pushes to main take every leg.
   changes:
     name: What the change touches
     runs-on: ubuntu-latest
@@ -42,6 +47,7 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           both='["ubuntu-latest","macos-latest"]'
           if [ "$EVENT" != "pull_request" ]; then
@@ -50,9 +56,9 @@ jobs:
             exit 0
           fi
           echo 'build-exclude=[{"os":"macos-latest","node":24},{"os":"macos-latest","node":"latest"}]' >> "$GITHUB_OUTPUT"
-          changed=$(git diff --name-only "$BASE"...HEAD)
+          changed=$(git diff --name-only "$BASE"..."$HEAD_SHA")
           echo "$changed"
-          if echo "$changed" | grep -qE '^(src/code-execution/|test/code-execution|test/helpers/|package\.json$|\.github/workflows/ci\.yml$)'; then
+          if echo "$changed" | grep -qE '^(src/|test/code-execution|test/helpers/|tsconfig\.json$|package\.json$|\.github/workflows/ci\.yml$)'; then
             echo "bun-os=$both" >> "$GITHUB_OUTPUT"
           else
             echo "bun-os=[\"ubuntu-latest\"]" >> "$GITHUB_OUTPUT"
@@ -208,11 +214,12 @@ jobs:
   # later (create() refuses it on an older one), so they run under 1.4.0, the
   # oldest release it admits, and under 1.4.3.
   #
-  # On a pull request that touches none of code_execution's files, its tests,
-  # the test helpers, package.json or this workflow, the macOS legs are left
-  # out (`changes`): they take two of the few macOS runners the organization
-  # gets at once, and a change elsewhere seldom reaches a child's stdio. Every
-  # push to main runs both platforms.
+  # On a pull request that touches no source, none of these tests or the
+  # test helpers, and not tsconfig.json, package.json or this workflow (a
+  # change to other tests or the docs), the macOS legs are left out
+  # (`changes`): they take two of the few macOS runners the organization gets
+  # at once, and nothing they run has changed. Every push to main runs both
+  # platforms.
   code-execution-bun:
     name: code_execution under Bun (${{ matrix.os }}, bun ${{ matrix.bun }})
     needs: changes
