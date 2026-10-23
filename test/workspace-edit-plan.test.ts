@@ -258,15 +258,9 @@ test("crowded edits whose counts stopped short, where the crowded check names no
   assert.ok(calls >= 1 && calls < 1_000, `${calls} searches for a line feed`);
 });
 
-/** The searches `run` makes for a line feed, with indexOf or lastIndexOf; past 1,000 of either, it throws. */
+/** The searches `run` makes for a line feed with indexOf; past 1,000, it throws. */
 function lineFeedSearches<R>(run: () => R): { result: R; calls: number } {
-  let forward = 0;
-  const backward = countingCalls(String.prototype, 'lastIndexOf', (_self, args) => args[0] === '\n', 1_000, () => {
-    const counted = countingCalls(String.prototype, 'indexOf', (_self, args) => args[0] === '\n', 1_000, run);
-    forward = counted.calls;
-    return counted.result;
-  });
-  return { result: backward.result, calls: forward + backward.calls };
+  return countingCalls(String.prototype, 'indexOf', (args) => args[0] === '\n', 1_000, run);
 }
 
 test("a miss's closest region is the line most like the first 2,000 code units of the old text's first line, its bigrams each counted as often as that line has them", () => {
@@ -294,7 +288,7 @@ test("a miss's closest region, among lines that score alike, is the first of the
   assert.ok(miss?.kind === 'miss' && miss.hint.startsWith('Closest region (line 1, similarity 0.50)'), JSON.stringify(miss));
 });
 
-test("a miss's closest region clears only the bigram slots each line used, a step or two a line", () => {
+test("a miss's closest region clears only the bigram slots each line used, in fewer than ten iterator steps a line", () => {
   // After each line, closestRegion clears only the slots that line used
   // (touched). Never cleared, touched grows by a slot a line, and the search
   // over 100,000 lines took 5.3 s of CPU rather than 33 ms, on Linux with
@@ -597,7 +591,7 @@ test('an old text read without its BOM or CR is found in one pass over a long ru
     const bytes = Buffer.from(text!);
     const file = decodeForEdit(bytes)!;
     let read = 0;
-    const { result: planned, calls: searches } = countingCalls(String.prototype, 'indexOf', (_self, args) => typeof args[0] === 'string' && args[0].length >= needle.length, 4, () => {
+    const { result: planned, calls: searches } = countingCalls(String.prototype, 'indexOf', (args) => typeof args[0] === 'string' && args[0].length >= needle.length, 4, () => {
       const counted = countingCalls(String.prototype, 'charCodeAt', () => true, 10 * text!.length, () => planFile(file, bytes, [spec(0, oldText!, newText!)]));
       read = counted.calls;
       return counted.result;
@@ -612,9 +606,8 @@ test('an old text read without its BOM or CR is found in one pass over a long ru
 test("each of 200 edits of an old text read more than one way counts its other reading only until a refusal has more than it shows", () => {
   // Lines alternate between "x" with a CR of its own and "x" alone, before
   // CRLF ends, so "x\r" reads as given on the one and without its CR on the
-  // other, 400,000 times each. As given, each edit's count takes from the
-  // call's budget; the other reading's stops at 21, one past the 20 a
-  // refusal shows, for every edit.
+  // other, 400,000 times each. Each edit's other reading stops at 21, one
+  // past the 20 a refusal shows.
   const bytes = Buffer.from('x\r\r\nx\r\n'.repeat(400_000));
   const planned = planFile(decodeForEdit(bytes)!, bytes, Array.from({ length: 200 }, (_, k) => spec(k, 'x\r', `${k}`)));
   assert.ok('problems' in planned);

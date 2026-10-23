@@ -10,7 +10,7 @@
 export function countingCalls<R>(
   owner: object,
   name: string,
-  counted: (self: unknown, args: unknown[]) => boolean,
+  counted: (args: unknown[]) => boolean,
   ceiling: number,
   run: () => R,
 ): { result: R; calls: number } {
@@ -18,7 +18,7 @@ export function countingCalls<R>(
   const original = slot[name] as (this: unknown, ...args: unknown[]) => unknown;
   let calls = 0;
   slot[name] = function (this: unknown, ...args: unknown[]): unknown {
-    if (counted(this, args) && ++calls > ceiling) throw new Error(`${name} was called more than ${ceiling} times where counted`);
+    if (counted(args) && ++calls > ceiling) throw new Error(`${name} was called more than ${ceiling} times where counted`);
     return original.apply(this, args);
   };
   try {

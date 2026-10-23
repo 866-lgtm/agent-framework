@@ -1195,7 +1195,7 @@ test("edit_many's refusal of 200 edits of an oldString read more than one way na
   // the rest come to 200.
   const shown = error.match(/\n\nedit \d+: [^\n]*/g) ?? [];
   assert.ok(shown.length > 0 && shown.every((line) => line.includes("oldString ends in a CR, and occurs in work/m.txt read more than one way, so which you mean can't be told.")), shown.find((line) => !line.includes('read more than one way')));
-  assert.equal(shown.length + Number(/(\d+) more problems/.exec(error)?.[1] ?? 0), 200);
+  assert.equal(shown.length + Number(/(\d+) more problems?\b/.exec(error)?.[1] ?? 0), 200);
 });
 
 test("a crowded edit whose count stopped short of its ask, which no crowded problem names, is named by its count as a floor", async (t) => {
