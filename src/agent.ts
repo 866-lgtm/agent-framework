@@ -4,7 +4,8 @@ import { createHash } from 'node:crypto';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
-import { assertBooleanSetting, holdsSettings } from './config-checks.js';
+import { injectionsAsStored } from './text-as-stored.js';
+import { assertBooleanSetting, holdsSettings, kindOf } from './config-checks.js';
 import {
   CONTINUE_ROW,
   continueTurn,
@@ -32,6 +33,11 @@ export interface ActivationRequestOptions {
   /** A request that will never be sent (a preview): compile it as a dry
    *  run (see `compileWithInjections` for what that leaves alone). */
   dryRun?: boolean;
+  /** `false`: the caller retries this stream's failures itself, so membrane
+   *  sends a failed round once and hands the error up. The framework's turns
+   *  pass it (its errorPolicy is their retry layer); a direct caller of
+   *  startStream keeps membrane's retries. */
+  membraneRetries?: boolean;
 }
 
 export interface StartStreamResult {
@@ -58,6 +64,7 @@ import type {
 } from '@animalabs/context-manager';
 import type {
   AgentConfig,
+  AutoContinueConfig,
   AgentState,
   SameRoundThinkTextPolicy,
   SameRoundThinkTextPolicySource,
@@ -96,7 +103,8 @@ const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
  * `toolWrapperProseGuard`, `thinking.enabled` or `refusalHandling.autoRewind`
  * holds anything but true or false (assertBooleanSetting), or whose `thinking`
  * or `refusalHandling` is anything but an object, null or false
- * (holdsSettings). The constructor runs it first, so the rule holds wherever
+ * (holdsSettings), or whose `autoContinue` resolveAutoContinue refuses.
+ * The constructor runs it first, so the rule holds wherever
  * an Agent is built. `create()` also runs it for each of its agents before
  * anything opens, and `createEphemeralAgent` before it reserves the name, so a
  * refusal there leaves nothing behind. Membrane reads `thinking.enabled`, and
@@ -136,6 +144,45 @@ export function assertAgentSwitches(config: AgentConfig): void {
     'true keeps a response whose whole prose is a tool-call-shaped wrapper from running or entering the agent\'s history, ' +
       'and false or leaving it out doesn\'t',
   );
+  resolveAutoContinue(config);
+}
+
+/** `AutoContinueConfig.maxConsecutive` when left out. */
+export const DEFAULT_AUTO_CONTINUE_MAX = 3;
+/** The most continuations in a row a config may ask for. */
+const MAX_AUTO_CONTINUE_MAX = 20;
+
+/**
+ * `AgentConfig.autoContinue` resolved: undefined when off (left out, null or
+ * false), else its cap. `true` takes the default cap; an object takes
+ * `maxConsecutive`, a whole number from 1 to 20 (the default when left out).
+ * Any other value is refused.
+ */
+export function resolveAutoContinue(config: AgentConfig): { maxConsecutive: number } | undefined {
+  const setting = `Agent "${config.name}" autoContinue`;
+  const value: unknown = config.autoContinue;
+  if (value === true) return { maxConsecutive: DEFAULT_AUTO_CONTINUE_MAX };
+  if (value !== undefined && value !== null && value !== false && (typeof value !== 'object' || Array.isArray(value))) {
+    throw new Error(
+      `${setting} must be true, false or an object such as { maxConsecutive: 3 }, not ${kindOf(value)}` +
+        (typeof value === 'string' ? ' (true and false go unquoted)' : ''),
+    );
+  }
+  if (!holdsSettings(setting, value as AgentConfig['autoContinue'], '{ maxConsecutive: 3 }')) return undefined;
+  const max = (value as AutoContinueConfig).maxConsecutive;
+  if (max === undefined) return { maxConsecutive: DEFAULT_AUTO_CONTINUE_MAX };
+  if (typeof max !== 'number' || !Number.isInteger(max) || max < 1 || max > MAX_AUTO_CONTINUE_MAX) {
+    // The value's kind, never the value (config-checks): a `${VAR}` that
+    // lands here could be a credential.
+    const kind = typeof max !== 'number' ? kindOf(max)
+      : !Number.isInteger(max) ? 'a number that isn\'t whole'
+        : max < 1 ? 'a number below 1' : `a number above ${MAX_AUTO_CONTINUE_MAX}`;
+    throw new Error(
+      `${setting}.maxConsecutive must be a whole number from 1 to ${MAX_AUTO_CONTINUE_MAX}, not ${kind}: ` +
+        'the most turns in a row that continue without skip_reply before the agent waits for the next event',
+    );
+  }
+  return { maxConsecutive: max };
 }
 
 /**
@@ -168,6 +215,9 @@ export class Agent {
   readonly proseRouting: 'locus' | 'explicit' | 'hybrid' | 'disabled';
   /** Exact whole-response known-tool wrapper containment (default off). */
   readonly toolWrapperProseGuard: boolean;
+  /** Continuation after a turn the model ends itself (see
+   *  AgentConfig.autoContinue); undefined when off. */
+  readonly autoContinue: { maxConsecutive: number } | undefined;
   /** Clock rows' interval and precision (see AgentConfig.clock); undefined
    *  when the agent writes none of its own (a resident still reads those
    *  another resident writes into the shared slot). */
@@ -301,6 +351,7 @@ export class Agent {
     this.toolResultGuard = new ToolResultGuard(config.name, contextManager, config.toolResultGuard === true);
     this.proseRouting = config.proseRouting ?? 'locus';
     this.toolWrapperProseGuard = config.toolWrapperProseGuard === true;
+    this.autoContinue = resolveAutoContinue(config);
     this.clock = resolveClockConfig(config.name, config.clock);
     this.cacheTtl = config.cacheTtl ?? '1h';
     this.promptCaching = config.promptCaching !== false;
@@ -1157,6 +1208,8 @@ export class Agent {
     if (this._state.status === 'inferring') {
       throw new Error(`Agent ${this.name} is already inferring`);
     }
+    // Unstored, so they leave for the request here (text-as-stored.ts).
+    injections = injectionsAsStored(injections);
 
     if (this._state.status === 'waiting_for_tools') {
       throw new Error(`Agent ${this.name} is waiting for tool results`);
@@ -1332,6 +1385,9 @@ export class Agent {
     compressionTools: ToolDefinition[] = availableTools,
     options: ActivationRequestOptions = {},
   ): Promise<{ request: NormalizedRequest; continuePrompt?: RequestOnlyPrompt }> {
+    // Unstored, so they leave for the request here (text-as-stored.ts), the
+    // layout hash below included.
+    injections = injectionsAsStored(injections);
     // Compression may revisit hidden tools in recorded history. Keep its full
     // definition set separate from the resident's advertised tools: the
     // autobiographical strategy must declare the same tools on its
@@ -1589,6 +1645,12 @@ export class Agent {
       emitTokens: true,
       emitBlocks: false,
       emitUsage: true,
+      // A caller that retries itself (the framework's turns: errorPolicy,
+      // provider holds, stated waits, each attempt a fresh compile a stop can
+      // cancel) has membrane send a failed round once and hand the error up:
+      // since membrane 0.7 its own schedules, ten minutes at a 529, would
+      // otherwise run inside each of the caller's attempts, out of its sight.
+      ...(options.membraneRetries === false ? { retry: false } : {}),
       // Retry a content-policy refusal at the provider seam rather than at
       // the framework level: membrane replays the SAME request immediately
       // (cache-warm), where a framework-level requeue would recompile and
@@ -1921,14 +1983,21 @@ export class Agent {
     // via buildStoredToolResultContent, with workspace spill). No workspace
     // is reachable from here, so the house default cap applies as plain
     // truncation — bounded beats unbounded, for errors too.
-    const content = results.map((r) => ({
-      type: 'tool_result' as const,
-      toolUseId: r.id,
-      content: r.result.isError
-        ? truncateForHistory(r.result.error ?? 'Unknown error', DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS)
-        : nonErrorResultText(r.result, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS),
-      isError: r.result.isError,
-    }));
+    const content = results.map((r) => {
+      // This API's results are unchecked (nonErrorResultText), so each field
+      // is read once, and only an error that is a string is made well formed;
+      // any other error value is passed on as it was before.
+      const isError = r.result.isError;
+      const error: unknown = isError ? r.result.error ?? 'Unknown error' : undefined;
+      return {
+        type: 'tool_result' as const,
+        toolUseId: r.id,
+        content: isError
+          ? truncateForHistory(typeof error === 'string' ? error.toWellFormed() : error as string, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS)
+          : nonErrorResultText(r.result, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS),
+        isError,
+      };
+    });
 
     return [{
       participant: 'user',
