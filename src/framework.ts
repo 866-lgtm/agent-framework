@@ -23066,8 +23066,9 @@ export class AgentFramework {
    *   batched wake, so a co-resident writing the line would put it under the
    *   message, the line #727 left out, or after the delivery agent's answer,
    *   a wake line for a message already answered. Its request shows what the
-   *   slot holds, as on `main`; a reply after the message is in the message's
-   *   own channel, so nothing it reads there misdirects.
+   *   slot holds, as on `main`: a reply after the message is in the message's
+   *   own channel, but a message from another channel that lands between the
+   *   gate's decision and its compile follows the message with no line.
    * - Two or more lines are all written, each naming its message, its age
    *   counted to now.
    * - None is written while the host is quiesced or another reader of the
