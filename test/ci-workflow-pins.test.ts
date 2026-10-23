@@ -9,8 +9,8 @@
  *   nothing fails: these tests do.
  * - When a pull request runs code_execution's Bun legs on macOS. The
  *   `changes` job runs them when the diff matches a filter. Every file those
- *   tests import, directly or through others, must match it, or a change to
- *   that file skips the legs that test it.
+ *   tests import or load by path, directly or through others, must match it,
+ *   or a change to that file skips the legs that test it.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -21,10 +21,13 @@ const ROOT = new URL('../../', import.meta.url);
 const read = (path: string) => readFileSync(new URL(path, ROOT), 'utf8');
 const exists = (path: string) => existsSync(new URL(path, ROOT));
 
+/** A line that runs npm test, however it's spelled: `npm test`, `npm run test`, `npm t`, with arguments or not. */
+const NPM_TEST_LINE = /^\s*(?:run: )?npm (?:run )?(?:test|t)\b(?!:)/m;
+
 /** The steps of a workflow file that run `npm test`, each as its text from its `- name:` line to the next step's. */
 function npmTestSteps(workflow: string): string[] {
   const steps = workflow.split(/\n(?= {6}- (?:name|uses):)/);
-  return steps.filter((step) => /^\s*(?:run: )?npm test\s*$/m.test(step));
+  return steps.filter((step) => NPM_TEST_LINE.test(step));
 }
 
 test("npm test passes AF_TEST_CONCURRENCY as --test-concurrency, only when it's set, before --test-timeout", () => {
@@ -42,7 +45,7 @@ for (const workflow of ['.github/workflows/ci.yml', '.github/workflows/publish.y
     for (const step of steps) {
       const exported = step.indexOf('export AF_TEST_CONCURRENCY');
       assert.ok(exported >= 0, `a step exports AF_TEST_CONCURRENCY:\n${step}`);
-      assert.ok(exported < step.search(/^\s*npm test\s*$/m), `it exports it before npm test:\n${step}`);
+      assert.ok(exported < step.search(NPM_TEST_LINE), `it exports it before npm test:\n${step}`);
     }
   });
 }
@@ -70,18 +73,27 @@ function bunTestFiles(): string[] {
   });
 }
 
-/** Repository paths a TypeScript file imports with a relative specifier (`.js` read as its `.ts` source). */
-function relativeImports(file: string): string[] {
+/**
+ * Repository paths a TypeScript file reaches by a relative specifier: what it imports (`from`, `import()`, a
+ * side-effect `import '…'`) and what it loads by path (`new URL('…', import.meta.url)`, such as the child
+ * entries the isolate spawns). A `.js` specifier is read as its `.ts` source; a template such as
+ * `./child-entry${ext}` is read up to the `${`, as its `.ts` file when that exists.
+ */
+function relativeReferences(file: string): string[] {
   const source = read(file);
-  const specifiers = [...source.matchAll(/(?:\bfrom\s*|\bimport\s*\(\s*)['"](\.\.?\/[^'"]+)['"]/g)].map((m) => m[1]);
-  return specifiers.map((specifier) => {
-    const path = normalize(join(dirname(file), specifier));
-    const ts = path.replace(/\.js$/, '.ts');
-    return path.endsWith('.js') && exists(ts) ? ts : path;
-  });
+  const pattern = /(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+|\bnew URL\(\s*)['"`](\.\.?\/[^'"`$]*)/g;
+  return [...source.matchAll(pattern)]
+    .map((m) => m[1])
+    .filter((specifier) => !specifier.endsWith('/'))
+    .map((specifier) => {
+      const path = normalize(join(dirname(file), specifier));
+      if (path.endsWith('.js') && exists(path.replace(/\.js$/, '.ts'))) return path.replace(/\.js$/, '.ts');
+      if (!/\.[a-z]+$/.test(path) && exists(`${path}.ts`)) return `${path}.ts`;
+      return path;
+    });
 }
 
-test("every file code_execution's Bun tests import, directly or through others, matches the macOS filter", () => {
+test("every file code_execution's Bun tests import or load by path, directly or through others, matches the macOS filter", () => {
   const filter = bunMacosFilter();
   const seen = new Set<string>();
   const queue = bunTestFiles();
@@ -89,9 +101,12 @@ test("every file code_execution's Bun tests import, directly or through others, 
     const file = queue.pop()!;
     if (seen.has(file)) continue;
     seen.add(file);
-    if (file.endsWith('.ts')) queue.push(...relativeImports(file));
+    if (file.endsWith('.ts') && exists(file)) queue.push(...relativeReferences(file));
   }
   assert.ok([...seen].some((file) => file.startsWith('src/')), 'the walk reaches source files');
+  for (const loaded of ['src/code-execution/isolate/child-entry.ts', 'test/helpers/fake-child-entry.ts', 'src/code-execution/quickjs.wasm']) {
+    assert.ok(seen.has(loaded), `the walk reaches ${loaded}, which is loaded by path, not imported`);
+  }
   const outside = [...seen].filter((file) => !filter.test(file)).sort();
   assert.deepEqual(outside, [], 'files the Bun tests run that a pull request could change without running them on macOS');
   for (const config of ['tsconfig.json', 'package.json', '.github/workflows/ci.yml']) {
