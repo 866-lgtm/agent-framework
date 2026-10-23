@@ -1332,17 +1332,18 @@ class ScriptMembrane {
 function firstPostHeld(posted: string[], released: Promise<void>): unknown {
   // Speech reaches the registry through deliverSpeech, or through
   // routeSpeech, which reduces its outcome to the confirmed delivery.
-  const deliverSpeech = async (_agent: string, text: string, channelId: string | null) => {
+  type Channel = { serverId: string; channelId: string };
+  const deliverSpeech = async (_agent: string, text: string, to: Channel | null) => {
     posted.push(text.trim());
     if (posted.length === 1) await released;
-    return { status: 'delivered' as const, destination: { serverId: 'stub', channelId: channelId ?? '' }, at: Date.now() };
+    return { status: 'delivered' as const, destination: { serverId: to?.serverId ?? 'stub', channelId: to?.channelId ?? '' }, at: Date.now() };
   };
   return new Proxy({
-    resolveProseTarget: (spec: string) => spec === '#cafe' ? { channelId: 'chan-cafe' } : { error: `no channel ${spec}` },
+    resolveProseTarget: (spec: string) => spec === '#cafe' ? { serverId: 'stub', channelId: 'chan-cafe' } : { error: `no channel ${spec}` },
     deliverSpeech,
-    routeSpeech: async (agent: string, text: string, channelId: string) => {
-      const outcome = await deliverSpeech(agent, text, channelId);
-      return { delivered: true, channelId: outcome.destination.channelId };
+    routeSpeech: async (agent: string, text: string, to: Channel | null) => {
+      const outcome = await deliverSpeech(agent, text, to);
+      return { delivered: true, serverId: outcome.destination.serverId, channelId: outcome.destination.channelId };
     },
     getDefaultPublishChannel: () => null,
     isChannelOpen: () => true,

@@ -561,12 +561,12 @@ test('C2 / vector 42: reassigning the server id to another endpoint starts a new
 test('C3: a replacement follows the prior delivery into its fork, never into a fresh one', async (t) => {
   const f = await fixture({ framework: { conversations: { templateAgent: 'agent', bind: { channel: 'always' }, trigger: { channel: 'always' } } } as never }); t.after(f.close); await f.register();
   await f.send('channels/incoming', { messages: [f.channel('c', 'fork_original', { initial: true })] });
-  const router = (f.framework as unknown as { conversationRouter: { getBinding(id: string): { agentName: string } | undefined; unbind(id: string): void } }).conversationRouter;
-  const g1 = router.getBinding('chat')!.agentName;
-  router.unbind('chat');
+  const router = (f.framework as unknown as { conversationRouter: { getBinding(channel: { serverId: string; channelId: string }): { agentName: string } | undefined; unbind(channel: { serverId: string; channelId: string }): void } }).conversationRouter;
+  const g1 = router.getBinding({ serverId: 'editor', channelId: 'chat' })!.agentName;
+  router.unbind({ serverId: 'editor', channelId: 'chat' });
   const edit = await f.send('push/event', f.params('e', 'fork_edit', { channelId: 'chat', key: 'message:m' }));
   assert.equal(edit.result.coalesce.outcome, 'replaced');
-  assert.equal(router.getBinding('chat'), undefined, 'no fresh fork was spawned for the edit');
+  assert.equal(router.getBinding({ serverId: 'editor', channelId: 'chat' }), undefined, 'no fresh fork was spawned for the edit');
   const g1ctx = JSON.stringify(f.framework.getAgent(g1)!.getContextManager().getAllMessages());
   assert(g1ctx.includes('fork_edit') && !g1ctx.includes('fork_original'));
 });
@@ -599,8 +599,8 @@ test('G4: a deferred channel-scoped push spawns the conversation fork it needs',
   f.alwaysRespond();
   await f.framework.runUntilIdle();
   assert.equal(f.renders.length, 1);
-  const router = (f.framework as unknown as { conversationRouter: { getBinding(id: string): { agentName: string } | undefined } }).conversationRouter;
-  const fork = router.getBinding('chat')?.agentName;
+  const router = (f.framework as unknown as { conversationRouter: { getBinding(channel: { serverId: string; channelId: string }): { agentName: string } | undefined } }).conversationRouter;
+  const fork = router.getBinding({ serverId: 'editor', channelId: 'chat' })?.agentName;
   assert(fork, 'a fork was bound');
   assert(JSON.stringify(f.framework.getAgent(fork!)!.getContextManager().getAllMessages()).includes('document_diff'));
   assert(!f.context().includes('document_diff'));
@@ -708,14 +708,14 @@ test('R2: work admitted under a former binding never reaches the replacement end
 test('R3: a deferred notice displacing an unread plain occurrence stays in its fork', async (t) => {
   const f = await fixture({ framework: { conversations: { templateAgent: 'agent', bind: { channel: 'always' }, trigger: { channel: 'always' } } } as never, server: { shouldTriggerInference: () => true } }); t.after(f.close); await f.register();
   await f.send('channels/incoming', { messages: [f.channel('c', 'fork_plain', { initial: true })] });
-  const router = (f.framework as unknown as { conversationRouter: { getBinding(id: string): { agentName: string } | undefined; unbind(id: string): void } }).conversationRouter;
-  const g1 = router.getBinding('chat')!.agentName;
-  router.unbind('chat');
+  const router = (f.framework as unknown as { conversationRouter: { getBinding(channel: { serverId: string; channelId: string }): { agentName: string } | undefined; unbind(channel: { serverId: string; channelId: string }): void } }).conversationRouter;
+  const g1 = router.getBinding({ serverId: 'editor', channelId: 'chat' })!.agentName;
+  router.unbind({ serverId: 'editor', channelId: 'chat' });
   const r = await f.send('push/event', f.params('n', 'fallback', { deferred: true, channelId: 'chat', key: 'message:m' }));
   assert.equal(r.result.coalesce.outcome, 'replaced');
   f.alwaysRespond();
   await f.framework.runUntilIdle();
-  assert.equal(router.getBinding('chat'), undefined, 'no fresh fork');
+  assert.equal(router.getBinding({ serverId: 'editor', channelId: 'chat' }), undefined, 'no fresh fork');
   const g1ctx = JSON.stringify(f.framework.getAgent(g1)!.getContextManager().getAllMessages());
   assert(g1ctx.includes('document_diff') && !g1ctx.includes('fork_plain'));
 });
@@ -3361,8 +3361,8 @@ test("#157: a notice that births its subject and is still pending at a restart i
   assert(isMarked(stored), "the edit is the agent's first view");
 });
 
-type IncomingAnchor = { buildChannelContext: (agent?: string) => { incoming?: { channelId: string; messageId: string } } | undefined };
-const incomingAnchor = (f: Fixture) => (f.framework as unknown as { channelRegistry: IncomingAnchor }).channelRegistry.buildChannelContext('agent')?.incoming;
+type IncomingAnchor = { buildChannelContext: (agent: string | undefined, serverId: string) => { incoming?: { channelId: string; messageId: string } } | undefined };
+const incomingAnchor = (f: Fixture) => (f.framework as unknown as { channelRegistry: IncomingAnchor }).channelRegistry.buildChannelContext('agent', 'editor')?.incoming;
 
 test("#157: a channel edit that is the agent's first view moves context.incoming to its message, as the message would", async (t) => {
   const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close); await f.register(); await f.register('other');
