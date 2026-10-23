@@ -3,7 +3,8 @@
 // Registers two open guild channels and, on command, sends either
 // channels/incoming traffic or a Discord-shaped DM push/event (raw snowflake
 // channel id in the origin, exactly what discord-mcpl sends for a DM). The
-// TEST appends lines to COMMAND_PATH:
+// TEST appends lines to COMMAND_PATH, each acted on once its newline is
+// written (writtenLines):
 //   incoming <channelId> <messageId> <ambient|addressed> <text…>
 //   dm <eventId> <authorId> <rawChannelId> <text…>
 //   push <json>

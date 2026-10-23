@@ -3,7 +3,8 @@
 // Registers one channel (`disc:guild:noisy`, initiallyOpen) and then emits
 // channel traffic on command: the TEST appends lines to COMMAND_PATH
 // (`ambient <id> <text>` / `addressed <id> <text>`), the fixture polls the
-// file and sends a channels/incoming Request per line. Host-side
+// file and sends a channels/incoming Request per line, once the line's
+// newline is written (writtenLines). Host-side
 // channels/acknowledge calls are recorded to STATUS_PATH as JSONL — the
 // test asserts the deterministic suppressed-mention reaction there. It keeps
 // its channel's lifecycle as a server does: channels/open and channels/close

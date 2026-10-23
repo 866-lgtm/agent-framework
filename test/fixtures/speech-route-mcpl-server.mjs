@@ -2,7 +2,8 @@
 //
 // Registers the channels in CHANNELS (JSON array of {id,label}; two Discord
 // guild channels by default) and, on command, sends inbound traffic over
-// BOTH MCPL lanes. The TEST appends one JSON object per line to COMMAND_PATH:
+// BOTH MCPL lanes. The TEST appends one JSON object per line to COMMAND_PATH,
+// each acted on once its newline is written (writtenLines):
 //   {"op":"incoming","channelId":…,"messageId":…,"mode":"ambient"|"addressed",
 //    "text":…, "threadId"?, "metadata"?, "eventId"?, "coalesce"?}
 //   {"op":"dm","eventId":…,"authorId":…,"authorName"?,"rawChannelId":…,"text":…,

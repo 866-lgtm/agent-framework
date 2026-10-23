@@ -433,11 +433,11 @@ test('the resident\'s failure marker never claims an uncertain delivery did not 
       .map((m) => (m.content[0] as { text: string }).text);
     const traces: Array<{ type: string; detail?: unknown }> = [];
     framework.onTrace((event) => traces.push(event));
-    const turn = async (mode: string, n: number, detail?: unknown) => {
+    // `inTwoParts` writes the mode's line in two parts, as a poll can read a
+    // long line half written: the fixture waits for its newline.
+    const turn = async (mode: string, n: number, detail?: unknown, inTwoParts = false) => {
       const line = JSON.stringify({ op: 'publish-mode', mode, detail });
-      // Turn 3's line is about 10 KB, long enough for a poll to read it half
-      // written, so it goes in two parts: the fixture waits for its newline.
-      if (n === 3) await appendInTwoParts(commandPath, line, 100);
+      if (inTwoParts) await appendInTwoParts(commandPath, line, 100);
       else appendFileSync(commandPath, line + '\n');
       membrane.pushResponse(createMockResponse([{ type: 'text', text: `reply ${n}` }]));
       appendFileSync(commandPath, JSON.stringify({ op: 'incoming', channelId: 'discord:g1:room', messageId: `m-${n}`, mode: 'addressed', text: 'hello?' }) + '\n');
@@ -452,7 +452,8 @@ test('the resident\'s failure marker never claims an uncertain delivery did not 
     assert.doesNotMatch(uncertain!, /did not receive|Nothing was posted/);
     assert.match(failed!, /could not be delivered/);
     assert.match(failed!, /Nothing was posted/);
-    await turn('error', 3, { posted: ['111'], note: 'x'.repeat(10_000) });
+    // About 10 KB, long enough for a poll to read it half written.
+    await turn('error', 3, { posted: ['111'], note: 'x'.repeat(10_000) }, true);
     const partial = markers()[2]!;
     assert.match(partial, /was not confirmed/);
     assert.match(partial, /Connector detail:.*"posted":\["111"\]/);
