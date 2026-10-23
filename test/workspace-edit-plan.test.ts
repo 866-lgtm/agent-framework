@@ -445,28 +445,20 @@ test('a thousand edits of one stretch are named as at most a thousand clashes', 
 test('many edits matching one text cost their replacements, not their pairs at every place', () => {
   // Every pair of these 2,000 edits overlaps at each of 500 places. Walking
   // the pairs at every place, the planner took 34 s on this case, on Linux
-  // with Node 24.22.0; linking past each named edit's replacements takes
-  // 0.3 s. The child reports the CPU time its planning took, which a slow or
-  // throttled machine doesn't stretch as it does the wall clock, and is
-  // stopped at 120 s.
-  const moduleUrl = new URL('../src/modules/workspace/edit-plan.js', import.meta.url).href;
-  const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
-    const { decodeForEdit, planFile } = await import(${JSON.stringify(moduleUrl)});
-    const bytes = Buffer.from('x '.repeat(500));
-    const specs = Array.from({ length: 2000 }, (_, index) => ({ index, oldText: 'x', newText: 'y', expected: 'all' }));
-    const before = process.cpuUsage();
-    const planned = planFile(decodeForEdit(bytes), bytes, specs);
-    const used = process.cpuUsage(before);
-    console.log(JSON.stringify({
-      ms: (used.user + used.system) / 1000,
-      problems: planned.problems.map((problem) => [problem.kind, problem.edits, problem.same]),
-    }));
-  `], { encoding: 'utf8', timeout: 120_000, maxBuffer: 16 * 1024 * 1024 });
-  assert.equal(child.status, 0, child.stderr || `stopped by ${child.signal}`);
-  const { ms, problems: named } = JSON.parse(child.stdout) as { ms: number; problems: unknown };
-  assert.ok(ms < 5_000, `planning took ${ms} ms of CPU`);
+  // with Node 24.22.0. Each later replacement the walk meets is looked up in
+  // a Set, whether its edit is named. Linking past each named edit's
+  // replacements, the walk meets each of the 1,000,000 replacements about
+  // once; walking the pairs, it meets one for each pair at each place, about
+  // 1e9. Past ten times the replacements, the count of lookups throws.
+  const bytes = Buffer.from('x '.repeat(500));
+  const specs = Array.from({ length: 2000 }, (_, index) => spec(index, 'x', 'y', 'all'));
+  const file = decodeForEdit(bytes)!;
+  const { result: planned, calls } = countingCalls(Set.prototype, 'has', () => true, 10_000_000, () => planFile(file, bytes, specs));
+  assert.ok('problems' in planned);
+  assert.ok(calls >= 1_000_000, `${calls} lookups`);
   // Each edit after the first is named once, with the first, as the same text.
-  assert.deepEqual(named, Array.from({ length: 1999 }, (_, k) => ['clash', [0, k + 1], true]));
+  assert.deepEqual(planned.problems.map((problem) => problem.kind === 'clash' && [problem.kind, problem.edits, problem.same]),
+    Array.from({ length: 1999 }, (_, k) => ['clash', [0, k + 1], true]));
 });
 
 test('each clash names its own line', () => {
