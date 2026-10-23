@@ -2,6 +2,7 @@ import type { ContentBlock, YieldingStream } from '@animalabs/membrane';
 import type { ContextStrategy } from '@animalabs/context-manager';
 import type { ToolCallId, ToolResult, ToolCall } from './events.js';
 import type { SilentHeartbeatTick } from '../silent-heartbeat.js';
+import type { WakeLine } from '../gate/types.js';
 
 export type SameRoundThinkTextPolicy = 'public' | 'private';
 export type SameRoundThinkTextPolicySource =
@@ -511,6 +512,12 @@ export interface InferenceRequest {
   wakeChannelId?: string;
   /** Timestamp of the event the wake provenance was taken from (ms). */
   wakeAt?: number;
+  /** Batched-wake lines the gate handed to this wake rather than wrote
+   *  (WakeLine), decided by a fresh start of its turn as WakeLine says: each
+   *  written once into the window it names, or left for a later fresh start
+   *  of the same wake. A retry, or a start that resumes a logical turn,
+   *  decides none. */
+  wakeLines?: WakeLine[];
   /** Suppress every automatic plain-prose delivery for this logical turn.
    * Explicit tool calls remain available. Used by authenticated silent wakes. */
   suppressProse?: boolean;
