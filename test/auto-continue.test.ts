@@ -370,6 +370,34 @@ describe('autoContinue', () => {
     }
   });
 
+  for (const [what, extra] of [
+    ['a silent heartbeat tick', { reason: 'heartbeat', source: 'heartbeat', suppressProse: true }],
+    ['another framework wake', { reason: 'prose-bounce', source: 'framework' }],
+  ] as const) {
+    it(`${what} batched with a continuation neither restarts the run nor takes its notice`, async () => {
+      // Cap 1: if the batched wake restarted the run, the second turn's end
+      // would continue a third time.
+      const framework = await createFramework({ maxConsecutive: 1 });
+      stubRegistry(framework);
+      const internals = framework as unknown as { pendingRequests: InferenceRequest[] };
+      const triggers = script(framework, [prose('one'), prose('two'), prose('three')]);
+      let injected = false;
+      framework.onTrace((e) => {
+        if ((e as { type: string }).type !== 'inference:started' || injected) return;
+        injected = true;
+        internals.pendingRequests.push({ agentName: 'assistant', timestamp: Date.now(), ...extra } as InferenceRequest);
+      });
+      try {
+        trigger(framework);
+        await within(framework.runUntilIdle(), 'the run to settle');
+        assert.equal(triggers.length, 2, 'the cap still holds');
+        assert.deepEqual(notices(framework), [autoContinueNotice(1, 1, 'call skip_reply')], 'the continuation\'s notice is written');
+      } finally {
+        await framework.stop();
+      }
+    });
+  }
+
   it('a continuation the inference policy drops writes no notice and gives back its count', async () => {
     const framework = await createFramework(true);
     stubRegistry(framework);
@@ -512,13 +540,19 @@ describe('autoContinue', () => {
     stubRegistry(framework);
     const internals = framework as unknown as { autoContinueStreaks: Map<string, number> };
     const triggers = script(framework, [prose('>>#alpha ! step one'), prose('>>skip_reply done')]);
+    // The count as the ' !' continuation's turn starts: before its own end
+    // (a skip, which clears it anyway) can hide anything.
+    const countAtStart: Array<number | undefined> = [];
+    framework.onTrace((e) => {
+      if ((e as { type: string }).type === 'inference:started') countAtStart.push(internals.autoContinueStreaks.get('assistant'));
+    });
     try {
       trigger(framework);
       await within(framework.runUntilIdle(), 'the run');
       assert.equal(triggers.length, 2);
       assert.equal(triggers[1]!.reason, 'prose-continuation');
       assert.equal(notices(framework).length, 0);
-      assert.equal(internals.autoContinueStreaks.has('assistant'), false);
+      assert.equal(countAtStart[1], undefined, "the ' !' continuation counted toward nothing");
     } finally {
       await framework.stop();
     }

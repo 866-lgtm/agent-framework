@@ -245,7 +245,8 @@ export interface AgentConfig {
    * locus (locus and hybrid modes).
    * At most `maxConsecutive` (default 3) continuations run in a row: the
    * count starts again when a turn starts with a cause of its own (a
-   * message, a heartbeat, a timer) or a tool ends one. Silent heartbeat
+   * message, a timer, a heartbeat that isn't a silent tick) or a tool ends
+   * one. Silent heartbeat
    * ticks, refusals, `max_tokens` cut-offs, the stall guard's ends and
    * ephemeral runs never continue. A ` !` continuation the turn asked for
    * runs instead, and counts toward nothing. See docs/auto-continue.md.

@@ -73,7 +73,10 @@ later), no `[continue]` row is written, and the run's count starts again.
 
 At most `maxConsecutive` continuations run in a row (default 3). The count
 starts again when a turn starts with a cause of its own (anything but a
-framework wake), and when a tool ends a turn. Each continued turn is a full
+framework wake or a silent heartbeat tick), and when a tool ends a turn. A
+silent tick batched with a continuation neither restarts the run nor takes
+its notice, so a resident whose ticks come faster than its turns still
+reaches the cap. Each continued turn is a full
 inference over the context (mostly cache reads), and in locus mode its prose
 is published, so the cap bounds both the cost and the posts of an agent that
 never skips.

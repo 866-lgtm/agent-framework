@@ -1302,6 +1302,15 @@ function isTurnContinuation(reason: string): boolean {
  *  other source — a channel message, a heartbeat or other server event, a
  *  gate flush, a timer, an operator nudge — is a cause of its own. */
 const FRAMEWORK_WAKE_SOURCES = new Set(['framework', 'scheduler']);
+
+/** Whether a wake is a cause of its own for an autoContinue run: one from
+ *  outside the framework that isn't a silent heartbeat tick. A batch holding
+ *  one is that cause's turn: the run starts again, and no `[continue]` row is
+ *  written for the continuation it carries. A silent tick is neither: batched
+ *  with a continuation it neither restarts the run nor takes its notice. */
+function hasOwnCauseForRun(r: InferenceRequest): boolean {
+  return !FRAMEWORK_WAKE_SOURCES.has(r.source) && r.suppressProse !== true;
+}
 const CONVERSATION_ROUTER_STATE_ID = 'framework/conversation-router';
 const INFERENCE_LOG_ID = 'framework/inference-log';
 const PROCESS_LOG_ID = 'framework/process-log';
@@ -14796,7 +14805,7 @@ export class AgentFramework {
       if (requests.some((r) => r.reason === AUTO_CONTINUE_REASON)) {
         const pending = this.autoContinuePending.get(agentName);
         this.autoContinuePending.delete(agentName);
-        if (pending && requests.every((r) => FRAMEWORK_WAKE_SOURCES.has(r.source))
+        if (pending && !requests.some(hasOwnCauseForRun)
           && !this.writeAutoContinueNotice(agent, pending)) {
           this.autoContinueStreaks.set(agentName, pending.count - 1);
           requests = requests.filter((r) => r.reason !== AUTO_CONTINUE_REASON);
@@ -14823,8 +14832,13 @@ export class AgentFramework {
       // (Optional chaining: prototype-built harnesses leave the map unset.)
       if (requests.some((r) => !FRAMEWORK_WAKE_SOURCES.has(r.source))) {
         this.proseBounceStreaks?.delete(agentName);
-        // Likewise autoContinue's cap bounds only a run of continuations
-        // that nothing else feeds.
+      }
+      // Likewise autoContinue's cap bounds only a run of continuations that
+      // nothing else feeds. A silent heartbeat tick doesn't feed it: batched
+      // with a continuation it would otherwise restart the run at every tick,
+      // and a resident whose ticks come faster than its turns would never
+      // reach the cap (hasOwnCauseForRun).
+      if (requests.some(hasOwnCauseForRun)) {
         this.autoContinueStreaks?.delete(agentName);
       }
       // Route this turn's auto-published speech to the channel that triggered
