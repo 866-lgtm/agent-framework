@@ -1574,6 +1574,24 @@ test('a receipt keeps aside only what its own call can add: one edit of a file o
   }
 });
 
+test("a receipt counts the line feed between each of its region's lines, so a region of many short lines keeps to its cap", () => {
+  // Three hundred lines of one character: each line feed is a third of a
+  // line's own length or more, so a region counted without them would show
+  // where its text passes the cap.
+  const bytes = Buffer.from('start\n');
+  const planned = planFile(decodeForEdit(bytes)!, bytes, [{ index: 0, oldText: 'start', newText: Array.from({ length: 300 }, () => 'x').join('\n'), expected: 1 }]);
+  assert.ok('plan' in planned);
+  const files = [{ path: 'work/s.txt', plan: planned.plan, notes: [] }];
+  let shown = 0;
+  for (let maxChars = 2_000; maxChars <= 3_500; maxChars++) {
+    const receipt = editReceipt('edit', files, 1, maxChars);
+    const length = receiptText(receipt).length;
+    if (length > maxChars) assert.fail(`${length} characters at a cap of ${maxChars}`);
+    if (!changedOf(receipt).startsWith('[not shown')) shown++;
+  }
+  assert.ok(shown > 0, 'the region shows at the larger caps');
+});
+
 test("what a receipt keeps aside doesn't grow with a line's length: twenty edits of a long line show their region with what twenty of a short one need", () => {
   // For the note naming the region of twenty edits on one line, a receipt
   // keeps aside twenty ranges that end by line 3, however long the line. Kept
