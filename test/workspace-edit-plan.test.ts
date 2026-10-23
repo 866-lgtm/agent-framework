@@ -294,9 +294,10 @@ test("a miss's closest region clears only the bigram slots each line used, in fe
   // over 100,000 lines took 5.3 s of CPU rather than 33 ms, on Linux with
   // Node 24.22.1. The clearing is a for...of over touched, so the child
   // counts the steps of the array iterator over the search of 1,000 lines:
-  // two a line, one for the line's slot and one to end the loop. Patching the
-  // iterator's next turns off V8's fast path for array loops for the rest of
-  // a process, so the count runs in a child. Past ten steps a line, it throws.
+  // two a line, one for the line's slot and one to end the loop. Every array
+  // loop in a process goes through the patched next while it's in place, and
+  // V8 may keep a slower path after it's restored, so the count runs in a
+  // child. Past ten steps a line, it throws.
   const moduleUrl = new URL('../src/modules/workspace/edit-plan.js', import.meta.url).href;
   const helperUrl = new URL('./helpers/count-calls.js', import.meta.url).href;
   const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
