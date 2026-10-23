@@ -12,6 +12,47 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.26.0 — 2026-10-23
+
+### Breaking
+
+- **Hosts:** agent-framework now requires `@animalabs/membrane` ^0.7.1 (was
+  ^0.6.1) and `@animalabs/context-manager` ^0.20.0 (was ^0.19.0), which
+  admit no membrane 0.6.x. A host whose own membrane range is still ^0.6 gets
+  two membrane copies, and an error one copy builds isn't an instance of the
+  other's `MembraneError`, which the framework's error policy reads.
+  **Migration:** move the host to membrane ^0.7.1 with this release
+  (connectome-host 0.13.0 does). The framework calls through the `Membrane`
+  its host passes in, so membrane 0.7's retry changes reach its turns through
+  the host's retry config: since 0.7, membrane also retries on
+  `streamYielding()`, the turn path, inside each of the framework's own
+  attempts, and the framework's error policy retries above it as before.
+  **Unchanged:** the framework's error policy and what it does with a
+  failure that reaches it.
+
+### Fixed
+
+- A cut tool result's spill notice now survives every reader's per-message
+  cut while the turn, each result at its least, fits the bound, unless a
+  mount name past about seventy characters makes the notice longer than its
+  room, or results' notices differ in length (by call ids of different
+  lengths) and the turn passes the bound by that difference. Under a turn's
+  share of the bound, a result is at its least whole where it's no longer
+  than what its cut would store in its place, and otherwise as its notice
+  alone. 0.24.1 said the notice survived until a turn's notices alone filled
+  the bound, which wasn't true for a notice longer than its share: results
+  stored within their shares could leave it no room, and a result just past
+  its share was stored as a notice longer than the result. Now, in a turn
+  stored by its share, such a result is stored whole, and save_recent_image
+  counts the image slots it holds. A turn whose results fit the bound
+  together is stored as before, unless a save_recent_image in it had it
+  stored by its share only because such a result's slots differed: it's now
+  stored as each result would be alone, as other turns that fit are.
+- A spill notice's paging advice in a turn stored by its share is sized to
+  the inline cap that a later read of the file comes back under, alone in
+  its own turn, rather than to the share. Under a share below the notice's
+  room, the advice was to read one character at a time.
+
 ## 0.25.0 — 2026-10-22
 
 ### Breaking
