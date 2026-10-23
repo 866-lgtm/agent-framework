@@ -277,7 +277,17 @@ export interface FrameworkConfig {
    */
   hostToolClasses?: Record<string, string[]>;
 
-  /** Inference routing policy for server-initiated inference (optional). */
+  /**
+   * Inference routing policy for server-initiated inference (optional): the
+   * model an MCPL server's inference/request runs on. Without one, each such
+   * request is refused with -32603 and a message naming this setting; the
+   * framework doesn't choose a model for a server. A server's effective
+   * grant can still list `inferenceRequest` then, since the grant comes from
+   * what the server advertises and `enabledCapabilities`, not from this
+   * policy. A policy that names no model for a request's feature set (no
+   * override, byFeature or wildcards entry that names one, and an empty
+   * `default`) refuses that request the same way, naming the feature set.
+   */
   inferenceRouting?: InferenceRoutingPolicy;
 
   /** EventGate config. If omitted, all events trigger inference (unchanged default). */
