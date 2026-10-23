@@ -8,8 +8,9 @@
   match, `N-` for a line of its context, as grep writes them), what grep
   skipped, and a receipt's `--- files ---` and `--- changed ---`. A value
   outside a page's content and a receipt's changed lines that holds a line
-  break (LF, CR, VT, FF, NEL, U+2028 or U+2029), such as a path or a line
-  grep matched, is written as a JSON string. A control character in a file
+  break (LF, CR, VT, FF, NEL, U+2028 or U+2029) or starts with `"`, such as
+  a path or a line grep matched, is written as a JSON string, so a value
+  shown as it is never starts with `"`. A control character in a file
   reaches the model as itself, where JSON wrote an escape such as `\u001b`.
 
   **Who needs to act:**
@@ -31,8 +32,7 @@
     the same way, so below a cap of about 12,300 characters it suggests a
     longer one than before.
   - A script's page is never shorter than before, since a page's text is
-    shorter than its JSON, unless its path or a note holds a line break,
-    which the text quotes. A script's answer carries the result's fields, a
+    shorter than its JSON, unless the text quotes its path or a note. A script's answer carries the result's fields, a
     page's content among them, beside the text, and the limit counts the
     text alone. A script's limit counts each character at the six bytes it
     takes at most in the answer, and only a control character takes more

@@ -14,15 +14,19 @@ const LINE_BREAK = /[\n\v\f\r\u0085\u2028\u2029]/;
 
 /**
  * A value as a header line, a section's label or a listed line writes it: as
- * it is, or, where it holds a line break, as a JSON string. A path can hold
- * one, and so can a note naming it or a line of a file grep matched; written
- * as it is, it would start a line that reads as one of the answer's own, and
- * the quoted form gives back exactly what the value holds. JSON leaves NEL,
- * U+2028 and U+2029 as they are, so they're escaped too.
+ * it is, or, where it holds a line break or starts with a quote, as a JSON
+ * string. A path can hold a line break, and so can a note naming it or a line
+ * of a file grep matched; written as it is, it would start a line that reads
+ * as one of the answer's own. A value written as it is never starts with a
+ * quote, so one that does is always the quoted form, which gives back exactly
+ * what the value holds: without that, a value that is itself a JSON string,
+ * such as a line of a file reading `"a\nb"`, would read as the quoted form of
+ * another. JSON leaves NEL, U+2028 and U+2029 as they are, so they're escaped
+ * too.
  */
 export function shownValue(value: string | number | boolean | null): string {
   if (typeof value !== 'string') return String(value);
-  if (!LINE_BREAK.test(value)) return value;
+  if (!value.startsWith('"') && !LINE_BREAK.test(value)) return value;
   return JSON.stringify(value).replace(/[\u0085\u2028\u2029]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
 }
 

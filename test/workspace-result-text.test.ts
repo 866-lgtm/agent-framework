@@ -275,7 +275,14 @@ test('a value holding a line break is written as a JSON string, so it stays on i
     assert.ok(!/[\n\v\f\r\u0085\u2028\u2029]/.test(shown), `${JSON.stringify(value)} is shown on one line`);
     assert.equal(JSON.parse(shown), value);
   }
-  for (const value of ['plain', 'tab\tand \u001b escape', '"quoted"', '']) assert.equal(shownValue(value), value);
+  for (const value of ['plain', 'tab\tand \u001b escape', 'a "quoted" word', '']) assert.equal(shownValue(value), value);
+  // A value that starts with a quote is quoted, so it can't read as the
+  // quoted form of another: `"a\nb"` as written in a file, and a line break
+  // between a and b, are shown apart.
+  assert.equal(shownValue('"quoted"'), '"\\"quoted\\""');
+  assert.equal(shownValue('"a\\nb"'), '"\\"a\\\\nb\\""');
+  assert.equal(shownValue('a\nb'), '"a\\nb"');
+  for (const value of ['"quoted"', '"a\\nb"', 'a\nb', '"']) assert.equal(JSON.parse(shownValue(value)), value);
   // Every break is escaped, each as JSON's four-digit escape.
   assert.equal(shownValue('a\u0085b\u2028c\u2029d\u2028e\vf'), '"a\\u0085b\\u2028c\\u2029d\\u2028e\\u000bf"');
   assert.equal(shownValue(null), 'null');
