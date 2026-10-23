@@ -76,7 +76,7 @@ import { asModuleRow, heldHandle, heldWriteId, matchesMessageQuery } from './hel
 import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
-import { Agent, assertAgentSwitches, dryCompileStatsOf } from './agent.js';
+import { Agent, assertAgentSwitches, dryCompileStatsOf, type RenderStats } from './agent.js';
 import { assertBooleanSetting, holdsSettings } from './config-checks.js';
 import { ModuleRegistry, checkedToolResult, ensureStateRegistered, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
@@ -2623,11 +2623,14 @@ export class AgentFramework {
    * what that compile's select put in the context, by kind. They count the
    * selection, not each message of the request. The injections
    * context-manager merges in after its select, such as those
-   * `previewActivation` gathers with `injections: true`, aren't counted, and
-   * neither is what the agent adds after the compile, such as a `[Continue]`
-   * turn or a request-only row. A message the agent drops for holding only
-   * empty text is counted. context-manager's doc of `CompileResult.renderStats`
-   * names the rest. A later preview or live compile leaves them as they were.
+   * `previewActivation` gathers with `injections: true`, aren't counted;
+   * context-manager's doc of `CompileResult.renderStats` names what else its
+   * compile does after the select. The agent then changes the messages
+   * itself, and the stats come from before that: they count a message it
+   * drops, such as one left holding only blank text, and leave out the turns
+   * it adds, such as `[Continue]`, a silent heartbeat's separator and
+   * request-only turns. A later preview or live compile leaves them as they
+   * were.
    * They're the object the compile returned, not a copy, so treat them as
    * read-only: a change to them shows in every later read. Null for a request
    * no dry run built, a request that is sent included, and when the agent's
@@ -2636,7 +2639,7 @@ export class AgentFramework {
    * context-manager before 0.20.1, whose compiles carry no render stats: a
    * host that reads them moves its own context-manager to 0.20.1.
    */
-  getRequestCompileStats(request: object): NonNullable<ReturnType<ContextManager['getRenderStats']>> | null {
+  getRequestCompileStats(request: object): RenderStats | null {
     return dryCompileStatsOf(request);
   }
 

@@ -43,7 +43,7 @@ export interface ActivationRequestOptions {
 /** A compile's render stats, as context-manager's `getRenderStats()` types
  *  them; context-manager 0.20.1 gives each compile its own, where the
  *  strategy records them, in `CompileResult.renderStats`. */
-type RenderStats = NonNullable<ReturnType<ContextManager['getRenderStats']>>;
+export type RenderStats = NonNullable<ReturnType<ContextManager['getRenderStats']>>;
 
 /** The render stats of the dry compile behind each request a dry run
  *  assembled (`assembleActivationRequest` with `dryRun`), by that request.
