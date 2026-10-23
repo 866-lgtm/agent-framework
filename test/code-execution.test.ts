@@ -290,6 +290,119 @@ describe('code_execution through the framework', () => {
     });
   });
 
+  it('a module tool that returns a string hands the script that string, not its JSON encoding', async () => {
+    // The tool contract: a script's tool function returns "the same text the
+    // tool would have returned to you directly". For a string result that
+    // is the string itself, newlines and quotes intact.
+    const listing = 'As of 10:00.\n[review] org/repo#1 "Fix it"';
+    class ListingModule extends ScriptToolModule {
+      override getTools(): ToolDefinition[] {
+        return [...super.getTools(), {
+          name: 'listing',
+          description: 'A line-per-item listing.',
+          inputSchema: { type: 'object', properties: {} },
+        }];
+      }
+      override async handleToolCall(call: ToolCall): Promise<ToolResult> {
+        if (call.name.endsWith('listing')) return { success: true, data: listing };
+        return super.handleToolCall(call);
+      }
+    }
+    const membrane = new MockMembrane();
+    const code = [
+      'const r = await tools["test--listing"]({});',
+      'const t = r.content[0].text;',
+      'const lines = t.split("\\n");',
+      'text("count: " + lines.length);',
+      'text("second: " + lines[1]);',
+      'text("quoted: " + t.startsWith(\'"\'));',
+    ].join('\n');
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'call_ce_str', name: 'code_execution', input: { code } },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+    await withFramework('ce-string-', { membrane, module: new ListingModule() }, async (framework) => {
+      await runEphemeral(framework, 'worker');
+      const [results] = membrane.lastStream!.receivedToolResults as WireResult[][];
+      const wire = results![0]!;
+      assert.strictEqual(wire.toolUseId, 'call_ce_str');
+      assert.match(wire.content, /count: 2/);
+      assert.match(wire.content, /second: \[review\] org\/repo#1 "Fix it"/);
+      assert.match(wire.content, /quoted: false/);
+    });
+  });
+
+  it("an MCP tool's text-only result reaches the model and a script as that text, not its JSON encoding", async () => {
+    // The MCPL tool-result mapping hands a result whose blocks are all text
+    // on as their joined text, so an MCP tool's text answer is string data
+    // too: the model and a script get the text as the server sent it.
+    const listing = 'As of 10:00.\n[review] org/repo#1 "Fix it"';
+    // A stdio MCPL server whose one tool answers with a single text block
+    // holding the `text` it was given. It accepts the framework's initial
+    // featureSets/update, as the fixtures' servers do, so the connection
+    // doesn't wait out the policy request's timeout.
+    const server = `
+      let buf = '';
+      process.stdin.on('data', (c) => {
+        buf += c.toString('utf8');
+        let i;
+        while ((i = buf.indexOf('\\n')) >= 0) {
+          const line = buf.slice(0, i); buf = buf.slice(i + 1);
+          if (!line.trim()) continue;
+          let m; try { m = JSON.parse(line); } catch { continue; }
+          const reply = (result) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result }) + '\\n');
+          if (m.method === 'initialize') reply({ protocolVersion: '2024-11-05', serverInfo: { name: 'echo', version: '1.0.0' }, capabilities: { tools: {}, experimental: { mcpl: { version: '0.4' } } } });
+          else if (m.method === 'tools/list') reply({ tools: [{ name: 'echo', description: 'e', inputSchema: { type: 'object' } }] });
+          else if (m.method === 'tools/call') reply({ content: [{ type: 'text', text: String(m.params.arguments.text) }] });
+          else if (m.method === 'featureSets/update') { if (m.id !== undefined) reply({ accepted: true }); }
+        }
+      });
+    `;
+    const { tempDir, storePath } = tempStorePath('ce-mcp-string-');
+    const membrane = new MockMembrane();
+    const code = [
+      `const r = await tools["mcpl--echo--echo"]({ text: ${JSON.stringify(listing)} });`,
+      'const t = r.content[0].text;',
+      'const lines = t.split("\\n");',
+      'text("count: " + lines.length);',
+      'text("second: " + lines[1]);',
+      'text("quoted: " + t.startsWith(\'"\'));',
+    ].join('\n');
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'call_mcp_direct', name: 'mcpl--echo--echo', input: { text: listing } },
+      { type: 'tool_use', id: 'call_mcp_script', name: 'code_execution', input: { code } },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: [],
+      modules: [],
+      mcplServers: [{ id: 'echo', command: process.execPath, args: ['-e', server] }],
+      syncIntervalMs: 0,
+      codeExecution: { enabled: true },
+    });
+    try {
+      await framework.start();
+      await until(() => framework.getAllTools().some((t) => t.name === 'mcpl--echo--echo'), 'the echo server\'s tool');
+      const created = await framework.createEphemeralAgent({ name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all' });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+      await framework.runEphemeralToCompletion(created.agent, created.contextManager);
+      const wire = membrane.lastStream!.receivedToolResults[0] as WireResult[];
+      const direct = wire.find((r) => r.toolUseId === 'call_mcp_direct');
+      assert.strictEqual(direct?.content, listing, 'the model gets the text, not its JSON encoding');
+      const script = wire.find((r) => r.toolUseId === 'call_mcp_script');
+      assert.ok(script, 'the script call has a result');
+      assert.match(script.content, /count: 2/);
+      assert.match(script.content, /second: \[review\] org\/repo#1 "Fix it"/);
+      assert.match(script.content, /quoted: false/);
+    } finally {
+      await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('two code_execution calls in one response both run, and the turn completes', async () => {
     const membrane = new MockMembrane();
     const module = new ScriptToolModule();
@@ -1111,19 +1224,20 @@ describe('a round whose run or wait call watches a script that can change its ro
     // What each `>>` label names; a test can rename one while a script runs.
     const directory: Record<string, string> = { '#alpha': 'chan-alpha' };
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-      resolveLocus: () => 'world:test',
-      resolveProseTarget: (spec: string) => (directory[spec] ? { channelId: directory[spec] } : { error: `no channel ${spec}` }),
-      routeSpeech: async (_agent: string, text: string, channelId: string | null) => {
-        if (!channelId) return null;
-        log.push(`publish:${text}@${channelId}`);
-        return { delivered: true, serverId: 'stub', channelId };
+      // Every channel is the stub's server's: the framework names each with it.
+      resolveLocus: () => ({ serverId: 'stub', channelId: 'world:test' }),
+      resolveProseTarget: (spec: string) => (directory[spec] ? { serverId: 'stub', channelId: directory[spec] } : { error: `no channel ${spec}` }),
+      routeSpeech: async (_agent: string, text: string, to: { channelId: string } | null) => {
+        if (!to) return null;
+        log.push(`publish:${text}@${to.channelId}`);
+        return { delivered: true, serverId: 'stub', channelId: to.channelId };
       },
       // A named or sticky destination posts through deliverSpeech, as with
       // the real registry, which reports the post's outcome.
-      deliverSpeech: async (_agent: string, text: string, channelId: string | null) => {
-        if (!channelId) return { status: 'failed', reason: 'no channel', at: Date.now() };
-        log.push(`publish:${text}@${channelId}`);
-        return { status: 'delivered', destination: { serverId: 'stub', channelId }, at: Date.now() };
+      deliverSpeech: async (_agent: string, text: string, to: { channelId: string } | null) => {
+        if (!to) return { status: 'failed', reason: 'no channel', at: Date.now() };
+        log.push(`publish:${text}@${to.channelId}`);
+        return { status: 'delivered', destination: { serverId: 'stub', channelId: to.channelId }, at: Date.now() };
       },
       resolveDestination: ({ channelId }: { channelId: string }) => ({ destination: { serverId: 'stub', channelId } }),
       // Each delivery hands its stream the destination its publish went to,
@@ -1136,7 +1250,7 @@ describe('a round whose run or wait call watches a script that can change its ro
         log.push(`tool:${name}`);
         if (name === 'skip_reply') return { success: true, endTurn: true, data: { skipped: true, note: 'Turn ended; nothing sent.' } };
         // A successful channel_open moves the turn's locus, as the real one does.
-        if (name === 'channel_open') return { success: true, data: { channelId: input?.channelId } };
+        if (name === 'channel_open') return { success: true, data: { channelId: input?.channelId, serverId: 'stub' } };
         return { success: true, data: {} };
       },
       getChannelTools: () => CHANNEL_TOOLS,

@@ -6043,6 +6043,13 @@ describe('a search starts at the directory its pattern names', () => {
     env.writeDisk('z/deep/y.ts', 'nothing here');
   };
 
+  // glob and grep each on a mount of its own, so neither answers from what
+  // the other's pass took into the store.
+  const eachOnItsOwn = async (t: TestContext, open: (env: Env) => Promise<WorkspaceModule>, globbed: [Record<string, unknown>, string[]], grep: [Record<string, unknown>, string[]]): Promise<void> => {
+    assert.deepEqual(await matchesOf(await open(new Env(t)), globbed[0]), globbed[1], JSON.stringify(globbed[0]));
+    assert.deepEqual(await grepped(await open(new Env(t)), grep[0]), grep[1], JSON.stringify(grep[0]));
+  };
+
   // Each search runs on a mount of its own: one before it would have taken
   // z/deep's files in, and a walk reports what the store holds wherever it
   // stopped.
@@ -6076,6 +6083,107 @@ describe('a search starts at the directory its pattern names', () => {
       const m = await env.open({ walkCap: 2 });
       assert.deepEqual(await grepped(m, input), want, JSON.stringify(input));
     }
+  });
+
+  // In the mount its first segment names, a pattern is read mount-prefixed,
+  // so its walk starts at z/deep: a walk from the root would stop at the cap
+  // and name regions outside z/deep.
+  test('past the walk cap, a mount-prefixed pattern walks from the directory the rest of it names, in glob and in grep\'s filter', async (t) => {
+    const outside = (regions: Array<{ path: string }> | undefined) => (regions ?? []).filter((r) => !r.path.startsWith('work/z/deep'));
+    // Where the mount also holds part of a directory named like itself, the
+    // pattern isn't read as written there, so nothing walks it.
+    for (const partial of [false, true]) {
+      const layout = (env: Env): void => {
+        pastTheCap(env);
+        if (partial) for (const f of ['work/z/1.txt', 'work/z/2.txt', 'work/z/3.txt']) env.writeDisk(f, 'filler');
+      };
+      const globs: Array<[Record<string, unknown>, string[]]> = [
+        [{ pattern: 'work/z/deep/*.ts' }, ['work/z/deep/x.ts', 'work/z/deep/y.ts']],
+        [{ pattern: 'work/z/deep/**/*.ts' }, ['work/z/deep/x.ts', 'work/z/deep/y.ts']],
+        [{ path: 'work/z', pattern: 'work/z/deep/*.ts' }, ['work/z/deep/x.ts', 'work/z/deep/y.ts']],
+      ];
+      for (const [input, want] of globs) {
+        const env = new Env(t);
+        layout(env);
+        const m = await env.open({ walkCap: 2 });
+        const found = await call(m, 'glob', input);
+        const what = JSON.stringify({ partial, ...input });
+        assert.deepEqual(found.matches.map((match: { path: string }) => match.path), want, what);
+        assert.deepEqual(outside(found.incomplete), [], what);
+      }
+      const greps: Array<[Record<string, unknown>, string[]]> = [
+        [{ pattern: 'needle', glob: 'work/z/deep/*.ts' }, ['work/z/deep/x.ts']],
+        [{ pattern: 'needle', path: 'work/z', glob: 'work/z/deep/**' }, ['work/z/deep/x.ts']],
+      ];
+      for (const [input, want] of greps) {
+        const env = new Env(t);
+        layout(env);
+        const m = await env.open({ walkCap: 2 });
+        const searched = await call(m, 'grep', input);
+        const what = JSON.stringify({ partial, ...input });
+        assert.deepEqual(searched.results.map((result: { file: string }) => result.file), want, what);
+        assert.deepEqual(outside(searched.incomplete), [], what);
+      }
+    }
+  });
+
+  // In a mount holding a directory named like itself, a pattern written
+  // relative to the mount, as main reads every pattern, now reads
+  // mount-prefixed: `work/z/deep/*.ts` names the mount's own z/deep, not
+  // work/z/deep inside it. The tools show that file as work/work/z/deep/q.ts,
+  // and that pattern finds it, past the cap too.
+  test('in a mount holding a directory named like itself, a pattern naming the mount reads mount-prefixed only', async (t) => {
+    for (const cap of [undefined, 2]) {
+      const layout = async (env: Env): Promise<WorkspaceModule> => {
+        if (cap) pastTheCap(env); else env.writeDisk('z/deep/x.ts', 'a needle');
+        env.writeDisk('work/z/deep/q.ts', 'a needle');
+        return env.open(cap ? { walkCap: cap } : {});
+      };
+      await eachOnItsOwn(t, layout,
+        [{ pattern: 'work/z/deep/*.ts' }, cap ? ['work/z/deep/x.ts', 'work/z/deep/y.ts'] : ['work/z/deep/x.ts']],
+        [{ pattern: 'needle', glob: 'work/z/deep/*.ts' }, ['work/z/deep/x.ts']]);
+      await eachOnItsOwn(t, layout,
+        [{ pattern: 'work/work/z/deep/*.ts' }, ['work/work/z/deep/q.ts']],
+        [{ pattern: 'needle', glob: 'work/work/z/deep/*.ts' }, ['work/work/z/deep/q.ts']]);
+      // With a path inside that directory, glob's pattern relative to the
+      // path reads as main reads it. grep's filter, which main reads relative
+      // to the mount, reads mount-prefixed there too, and names the mount's
+      // own z/deep, outside the path, so it lets nothing through.
+      await eachOnItsOwn(t, layout,
+        [{ path: 'work/work', pattern: 'z/deep/*.ts' }, ['work/work/z/deep/q.ts']],
+        [{ pattern: 'needle', path: 'work/work', glob: 'work/z/deep/*.ts' }, []]);
+    }
+  });
+
+  // A walk named at a directory sets aside the ignore patterns that cover it,
+  // so a mount-prefixed pattern finds what lies beneath an ignored directory
+  // it names: here node_modules, in a direct mount's default ignore list.
+  test('on a direct mount, a mount-prefixed pattern finds what lies beneath the ignored directory it names', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('node_modules/pkg/b.js', 'a needle');
+    env.writeDisk('work/node_modules/pkg/a.js', 'a needle');
+    const m = await env.open({ backend: 'direct', mode: 'read-only' } as Partial<MountConfig>);
+    assert.deepEqual(await matchesOf(m, { pattern: 'work/node_modules/pkg/*.js' }), ['work/node_modules/pkg/b.js']);
+    assert.deepEqual(await grepped(m, { pattern: 'needle', glob: 'work/node_modules/pkg/*.js' }), ['work/node_modules/pkg/b.js']);
+    assert.deepEqual(await matchesOf(m, { pattern: 'work/work/node_modules/pkg/*.js' }), ['work/work/node_modules/pkg/a.js']);
+  });
+
+  // A pass reports what the workspace tracks beneath its scope whatever disk
+  // shows, so a mount-prefixed pattern lists a draft written where disk has
+  // no directory.
+  test('a mount-prefixed pattern lists what the workspace holds where disk has no directory', async (t) => {
+    const want = ['work/z/deep/new.ts', 'work/z/deep/x.ts'];
+    await eachOnItsOwn(t, async (env) => {
+      env.writeDisk('z/deep/x.ts', 'a needle');
+      const m = await env.open();
+      await call(m, 'write', { path: 'work/z/deep/new.ts', content: 'a needle' });
+      return m;
+    }, [{ pattern: 'work/z/deep/*.ts' }, want], [{ pattern: 'needle', glob: 'work/z/deep/*.ts' }, want]);
+    await eachOnItsOwn(t, async (env) => {
+      const m = await env.open();
+      await call(m, 'write', { path: 'work/q/new.ts', content: 'a needle' });
+      return m;
+    }, [{ pattern: 'work/q/*.ts' }, ['work/q/new.ts']], [{ pattern: 'needle', glob: 'work/q/*.ts' }, ['work/q/new.ts']]);
   });
 
   // Each list is what a walk of the whole mount finds: the test passes on

@@ -10,6 +10,8 @@ export { ProcessQueueImpl } from './queue.js';
 export { ModuleRegistry } from './module-registry.js';
 export { ShutdownTimeoutError, DEFAULT_SHUTDOWN_TIMEOUT_MS } from './shutdown.js';
 export { formatZonedDateTime, formatZonedTime, isValidTimeZone, resolveTimeZone } from './timezone.js';
+export { CLOCK_ROW_KIND, resolveClockConfig } from './clock-rows.js';
+export type { ClockConfig, ClockStamp, ResolvedClockConfig } from './clock-rows.js';
 export { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
 
 // Built-in modules
@@ -70,7 +72,7 @@ export type { GateConfig, GateOptions, GatePolicy, GatePolicyMatch, GateBehavior
 
 // MCPL channel registry (exposed for modules that need channel-level operations)
 export { ChannelRegistry } from './mcpl/index.js';
-export type { PublishRefusalReason } from './mcpl/index.js';
+export type { ChannelRef, PublishRefusalReason } from './mcpl/index.js';
 
 // Where each accepted inbound item came from (`metadata.inboundSource`), and
 // the digest its delivered and stored bodies are stamped with

@@ -117,9 +117,10 @@ export interface FrameworkConfig {
   subconscious?: import('../tune-out/tools.js').SubconsciousConfig;
 
   /**
-   * IANA zone used only when rendering wall-clock times for the agent.
-   * Stored/protocol timestamps remain epoch/UTC. Defaults to AGENT_TIMEZONE,
-   * then the process zone.
+   * IANA zone of the agent's wall clock: it renders wall-clock times for the
+   * agent, and it sets where clock rows' boundaries fall (AgentConfig.clock,
+   * counted from local midnight here). Stored/protocol timestamps remain
+   * epoch/UTC. Defaults to AGENT_TIMEZONE, then the process zone.
    */
   timeZone?: string;
 
@@ -240,8 +241,9 @@ export interface FrameworkConfig {
    * workspace file under `tool-results/` (deterministic `<date>-<callId>.txt`
    * name, overwritten on collision, retained until the workspace owner
    * deletes it — never auto-GC'd) and replaced inline by a bounded preview
-   * plus the file reference; with no writable mount without an include, the
-   * fallback is explicit plain truncation. Default 24000 (house-safe; issue #89). Must be
+   * plus the file reference; with no writable mount without an include that
+   * keeps its files in the store (not configured direct), the fallback is
+   * explicit plain truncation. Default 24000 (house-safe; issue #89). Must be
    * >= 1000. A resident's own agent_settings value
    * `tool_result_inline_max_chars` (durable, persisted in framework state)
    * takes precedence over this for that agent; the EFFECTIVE cap for every
