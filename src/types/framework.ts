@@ -16,6 +16,13 @@ export type { TraceEvent, TraceEventListener } from './trace.js';
 export interface ModuleProcessResponse {
   moduleName: string;
   response: EventResponse;
+  /**
+   * Set when applying the response threw: the operation it threw at, such
+   * as `the edit of <id>`, and the error's message. What the response asked
+   * for before that was applied, that operation may have taken effect in
+   * part or whole, and the rest of it wasn't (EventResponse).
+   */
+  threw?: { at: string; error: string };
 }
 
 /**

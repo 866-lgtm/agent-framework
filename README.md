@@ -122,7 +122,7 @@ interface Module {
 }
 ```
 
-An `EventResponse` can add/edit/remove messages, request inference, signal tool changes, and atomically update module state:
+An `EventResponse` can add/edit/remove messages, request inference, signal tool changes, and update module state after its message changes. The framework applies it in that order; when one step throws, what came before it stays applied, that step may have taken effect in part, and the rest of that response isn't:
 
 ```typescript
 return {

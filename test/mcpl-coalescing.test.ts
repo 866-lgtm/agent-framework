@@ -1681,6 +1681,11 @@ test("a wake to read a render starts its turn when the store can't say whether t
   const cm = f.framework.getAgent('agent')!.getContextManager() as unknown as { queryMessages: (...a: unknown[]) => unknown };
   const query = cm.queryMessages;
   cm.queryMessages = () => { throw new Error('a blob the store names is missing'); };
+  // The blob-free scan that stands in when the query throws can't read the
+  // store either.
+  const scanning = f.framework as unknown as { landedPositions?: unknown };
+  scanning.landedPositions = () => { throw new Error('a blob the store names is missing, and the scan failed too'); };
+  t.after(() => { delete scanning.landedPositions; });
   internals.pendingRequests.push({ agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsDeferredWrite: 'render-1' });
   const triggers: unknown[] = [];
   const start = internals.startAgentStream;
