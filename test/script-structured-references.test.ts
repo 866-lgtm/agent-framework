@@ -540,7 +540,12 @@ test("an MCPL peer's structured blocks too deep to convert to JSON reach a scrip
     const failing = JSON.parse(await script('mcpl--files--attach')) as { content: [{ text: string }]; isError: boolean };
     assert.equal(failing.isError, true);
     assert.match(failing.content[0].text, /\. The call itself completed, with this error: the vault refused$/);
+    // Its trace and terminal read the peer's error answer, with no blocks,
+    // and no failed dispatch is marked for either call.
     assert.deepEqual(seen.outcomes[1], { type: 'tool:failed', error: 'the vault refused' });
+    assert.deepEqual(seen.lifecycle.filter(([method]) => method === 'markDispatchFailure'), []);
+    const both = seen.lifecycle.filter(([method]) => method === 'onResult').map(([, , , result]) => result as ToolResult);
+    assert.deepEqual(both.map((r) => [r.success, r.isError === true, r.data]), [[true, false, []], [false, true, []]]);
   });
 });
 
