@@ -73,7 +73,10 @@ export interface MountConfig {
    * them pending, or an intent the workspace can't read, which may hold one
    * of those. They stay in view, and the workspace says so on stderr and
    * through the framework's ops alerts, naming them and the ways to start it
-   * direct. It runs unwatched, and walks by the direct kind's default
+   * direct. Until a start finds none held, it takes no writes, edits or
+   * deletions, so what's held only shrinks: a `sync` of a held path takes
+   * disk's copy, and a `materialize` naming the mount writes the store's.
+   * It runs unwatched, and walks by the direct kind's default
    * ignore list where its config names none; `ls` without a path, and
    * `status`, give its `backend` as 'chronicle' and that list. A mount that
    * ran direct and runs as 'chronicle' again takes in what disk changed

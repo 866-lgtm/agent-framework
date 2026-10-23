@@ -1709,8 +1709,8 @@ export class WorkspaceModule implements Module {
     const message = (one
       ? "A mount configured direct runs as 'chronicle' this session. To start it direct, settle each held change, then start it again: "
       : "Mounts configured direct run as 'chronicle' this session. To start a mount direct, settle each change held at it, then start it again: ") +
-      "sync its path to take disk's copy, or configure the mount 'chronicle' and read-write, materialize it, " +
-      `follow the answer, and restore its direct config. ${intents}${which}: ${held.slice(0, 10).join(', ')}` +
+      "sync its path to take disk's copy, or materialize it by name, a read-only one configured read-write first, " +
+      `and follow the answer. Meanwhile it takes no writes. ${intents}${which}: ${held.slice(0, 10).join(', ')}` +
       `${held.length > 10 ? `, and ${held.length - 10} more` : ''}.`;
     console.warn(`[workspace] ${message}`);
     this.ctx?.notifyOps?.('workspace-mount-not-direct', 'framework', message, { held: Object.fromEntries(mounts.map(([name, paths]) => [name, paths.length])) });
@@ -1828,7 +1828,8 @@ export class WorkspaceModule implements Module {
   getMounts(): Array<{ name: string; mode: 'read-write' | 'read-only'; include?: readonly string[]; backend?: 'direct' }> {
     return [...this.mounts.values()].map((m) => ({
       name: m.config.name,
-      mode: m.config.mode === 'read-only' ? 'read-only' : 'read-write',
+      // Read-only where this session takes no writes there (writeRefusal).
+      mode: writeRefusal(m) === null ? 'read-write' : 'read-only',
       ...(m.config.include ? { include: [...m.config.include] } : {}),
       ...(m.config.backend === 'direct' ? { backend: 'direct' as const } : {}),
     }));
@@ -2378,9 +2379,8 @@ export class WorkspaceModule implements Module {
         isError: true,
       };
     }
-    if (mount.config.mode === 'read-only') {
-      return { success: false, error: `Mount "${mount.config.name}" is read-only`, isError: true };
-    }
+    const refusal = writeRefusal(mount);
+    if (refusal) return { success: false, error: refusal, isError: true };
     const maxSize = mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
     if (data.byteLength > maxSize) {
       return { success: false, error: `Content exceeds max file size (${maxSize} bytes)`, isError: true };
@@ -4105,9 +4105,8 @@ export class WorkspaceModule implements Module {
     }
     const { mount, relativePath, path } = await this.parseFilePath(input.path);
     input = { ...input, path };
-    if (mount.config.mode === 'read-only') {
-      return { success: false, error: `Mount "${mount.config.name}" is read-only`, isError: true };
-    }
+    const refusal = writeRefusal(mount);
+    if (refusal) return { success: false, error: refusal, isError: true };
 
     const store = this.getStore();
     const maxSize = mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
@@ -4467,7 +4466,8 @@ export class WorkspaceModule implements Module {
       // One that names the mount's root, its bare name included, names no
       // file.
       if (where.relativePath === '') return unusable(`${path} names the root of mount "${where.mount.config.name}", which isn't a file; ls ${where.mount.config.name} lists the files in it.`);
-      if (where.mount.config.mode === 'read-only') return unusable(`Mount "${where.mount.config.name}" is read-only`);
+      const refusal = writeRefusal(where.mount);
+      if (refusal) return unusable(refusal);
       const generated = tool === 'edit_many' ? this.findGeneratedTextFile(path) : undefined;
       if (generated) return unusable(`${path}: ${this.generatedFileRefusal(generated, callerAgentName)}.`);
       return where;
@@ -5056,9 +5056,8 @@ export class WorkspaceModule implements Module {
   private async handleDelete(input: DeleteInput, callerAgentName?: string): Promise<ToolResult> {
     const { mount, relativePath, path } = await this.parseFilePath(input.path);
     input = { ...input, path };
-    if (mount.config.mode === 'read-only') {
-      return { success: false, error: `Mount "${mount.config.name}" is read-only`, isError: true };
-    }
+    const refusal = writeRefusal(mount);
+    if (refusal) return { success: false, error: refusal, isError: true };
     if (mount.direct) return this.deleteDirect(mount, relativePath, input.path, callerAgentName);
 
     const store = this.getStore();
@@ -6393,6 +6392,26 @@ const UNREADABLE_INTENT = "its workspace intent can't be read; a sync of the pat
  */
 function watchOf(config: MountConfig): 'always' | 'on-agent-action' | 'never' {
   return config.watch ?? (config.backend === 'direct' ? 'never' : 'always');
+}
+
+/**
+ * Why a write, edit, deletion or peer module's writeBinary to this mount is
+ * refused, or null where it may go ahead: a read-only mount, and a mount
+ * configured direct that runs as 'chronicle' this session (chooseKinds),
+ * since the store holds changes there that disk lacks. A write there would
+ * stay in the store, beside an agent told the mount is its checkout, and
+ * add to what keeps it off direct; refused, what's held only shrinks, and
+ * the next start once none is held runs it direct.
+ */
+function writeRefusal(mount: MountState): string | null {
+  const name = mount.config.name;
+  if (mount.config.mode === 'read-only') return `Mount "${name}" is read-only`;
+  if (mount.config.backend === 'direct' && !mount.direct) {
+    return `Mount "${name}" is configured direct, and runs as 'chronicle' this session because its start found the store holding changes there that disk lacks, `
+      + `so it takes no writes this session, and calling again is refused the same way. To run it direct again, settle what's held `
+      + `(sync each held path to take disk's copy, or materialize mount "${name}" by name to write the store's copies to disk), and the host's next start runs it direct`;
+  }
+  return null;
 }
 
 /**
