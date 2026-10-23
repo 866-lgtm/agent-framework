@@ -309,7 +309,8 @@ describe('autoContinue', () => {
     const triggers = script(framework, [prose('private check')]);
     const internals = framework as unknown as { pendingRequests: InferenceRequest[] };
     try {
-      internals.pendingRequests.push({ agentName: 'assistant', reason: 'heartbeat', source: 'framework', timestamp: Date.now(), suppressProse: true } as InferenceRequest);
+      // As a real tick arrives: from its MCPL server, not the framework.
+      internals.pendingRequests.push({ agentName: 'assistant', reason: 'heartbeat', source: 'heartbeat', timestamp: Date.now(), suppressProse: true } as InferenceRequest);
       await within(framework.runUntilIdle(), 'the silent turn');
       assert.equal(triggers.length, 1);
       assert.equal(notices(framework).length, 0);
@@ -360,7 +361,7 @@ describe('autoContinue', () => {
       trigger(framework);
       await within(framework.runUntilIdle(), 'the run to settle');
       assert.equal(triggers.length, 2, 'one more turn, not two');
-      assert.ok(triggers[1]!.reason === 'channel-message' || triggers[1]!.reason === 'auto-continue');
+      assert.equal(triggers[1]!.reason, 'channel-message', 'the message, queued first, is the turn\'s trigger');
       assert.equal(triggers[1]!.channelId, 'chan-b', "the message's channel outranks the continuation's, though queued first");
       assert.deepEqual(notices(framework), [], 'the message is the turn\'s cause: no [continue] row');
       assert.equal(internals.autoContinueStreaks.has('assistant'), false, 'and the run starts again');
@@ -545,6 +546,20 @@ describe('autoContinue config', () => {
     for (const bad of ['yes', 1, [], { maxConsecutive: 0 }, { maxConsecutive: 21 }, { maxConsecutive: 2.5 }, { maxConsecutive: '3' }]) {
       assert.throws(() => resolveAutoContinue(at(bad)), /Agent "a" autoContinue/, JSON.stringify(bad));
     }
+  });
+
+  it('names the value\'s kind, never the value, which could be a secret', () => {
+    const secret = 'sk-ant-not-a-real-key';
+    const message = (bad: unknown): string => {
+      try { resolveAutoContinue(at(bad)); } catch (err) { return (err as Error).message; }
+      return '';
+    };
+    assert.match(message({ maxConsecutive: secret }), /not a string:/);
+    assert.ok(!message({ maxConsecutive: secret }).includes(secret));
+    assert.ok(!message(secret).includes(secret));
+    assert.match(message({ maxConsecutive: 0 }), /not a number below 1:/);
+    assert.match(message({ maxConsecutive: 21 }), /not a number above 20:/);
+    assert.match(message({ maxConsecutive: 2.5 }), /not a number that isn't whole:/);
   });
 });
 

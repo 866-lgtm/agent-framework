@@ -18924,7 +18924,8 @@ export class AgentFramework {
       if (cancelKind === 'turn_ended') {
         // A tool ended the turn (skip_reply, sleep): the agent stopped on
         // purpose, so a later autoContinue run counts from one again.
-        this.autoContinueStreaks.delete(agent.name);
+        // (Optional chaining: prototype-built harnesses leave the map unset.)
+        this.autoContinueStreaks?.delete(agent.name);
         if (turnProseRouting === 'explicit') {
           void turnSpeechChain.then(() => this.requestProseContinuation(agent, streamRouting));
         } else {

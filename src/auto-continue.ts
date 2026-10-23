@@ -5,12 +5,6 @@
  * notice the next turn reads.
  */
 
-/**
- * Stop reasons of a turn the model ended itself. The others don't continue:
- * a refusal has its own handling (retries, rewind, the reaction), a
- * `max_tokens` end was cut off rather than chosen, and `no_progress` and
- * `round_limit` are the stall guard's verdict that the turn wasn't moving.
- */
 /** The reason on a continuation's wake (InferenceRequest.reason). */
 export const AUTO_CONTINUE_REASON = 'auto-continue';
 
@@ -23,6 +17,12 @@ export interface PendingAutoContinue {
   stop: string | undefined;
 }
 
+/**
+ * Stop reasons of a turn the model ended itself. The others don't continue:
+ * a refusal has its own handling (retries, rewind, the reaction), a
+ * `max_tokens` end was cut off rather than chosen, and `no_progress` and
+ * `round_limit` are the stall guard's verdict that the turn wasn't moving.
+ */
 export const AUTO_CONTINUE_STOP_REASONS: ReadonlySet<string> = new Set(['end_turn', 'stop_sequence']);
 
 /**

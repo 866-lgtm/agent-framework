@@ -172,8 +172,13 @@ export function resolveAutoContinue(config: AgentConfig): { maxConsecutive: numb
   const max = (value as AutoContinueConfig).maxConsecutive;
   if (max === undefined) return { maxConsecutive: DEFAULT_AUTO_CONTINUE_MAX };
   if (typeof max !== 'number' || !Number.isInteger(max) || max < 1 || max > MAX_AUTO_CONTINUE_MAX) {
+    // The value's kind, never the value (config-checks): a `${VAR}` that
+    // lands here could be a credential.
+    const kind = typeof max !== 'number' ? kindOf(max)
+      : !Number.isInteger(max) ? 'a number that isn\'t whole'
+        : max < 1 ? 'a number below 1' : `a number above ${MAX_AUTO_CONTINUE_MAX}`;
     throw new Error(
-      `${setting}.maxConsecutive must be a whole number from 1 to ${MAX_AUTO_CONTINUE_MAX}, not ${JSON.stringify(max) ?? String(max)}: ` +
+      `${setting}.maxConsecutive must be a whole number from 1 to ${MAX_AUTO_CONTINUE_MAX}, not ${kind}: ` +
         'the most turns in a row that continue without skip_reply before the agent waits for the next event',
     );
   }
