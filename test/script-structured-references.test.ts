@@ -396,12 +396,19 @@ test("a module's reference deeper in its blocks reaches a script as the model's 
   });
 });
 
-test("an MCPL peer's treated blocks, returned again as a module's, are left as they are", async () => {
+test("an MCPL peer's treated blocks, returned again as a module's, are left as they are, while a raw reference beside them is treated", async () => {
   await withPeers(async ({ answer, script, exit }) => {
     answer({ content: [...blocks('twice'), never('twice')], structuredContent: { attachments: 2 } });
     const once = JSON.parse(await script('mcpl--files--attach')) as { content: unknown[]; structuredContent: unknown };
-    const again = JSON.parse(await exit({ success: true, data: once.content, structured: once.structuredContent }, 'fwd--whole', false));
-    assert.deepEqual(again, { content: once.content, structuredContent: { attachments: 2 }, isError: false });
+    // A raw reference beside the treated blocks shows that the exit treats
+    // this result at all, so the blocks left as they are were treated again.
+    const raw = { type: 'resource', uri: 'https://files.example.test/raw.pdf?sig=RAW-TWICE', name: 'raw.pdf', mimeType: 'application/pdf' };
+    const again = JSON.parse(await exit({ success: true, data: [...once.content, raw], structured: once.structuredContent }, 'fwd--whole', false)) as { content: unknown[] };
+    assert.deepEqual({ ...again, content: again.content.slice(0, -1) }, { content: once.content, structuredContent: { attachments: 2 }, isError: false });
+    const last = again.content.at(-1) as Record<string, unknown>;
+    assert.deepEqual([last.type, last.name, typeof last.refId, 'uri' in last], ['resource', 'raw.pdf', 'string', false]);
+    assert.equal(last.refId, referenceRegistry.findByUri(raw.uri)?.refId, 'the stub names the raw reference\'s own record');
+    assert.equal(JSON.stringify(again).includes('files.example.test/raw.pdf'), false);
   });
 });
 
@@ -481,6 +488,16 @@ test("an MCPL peer's inline data beside a uri that isn't a string reaches a scri
     // The model's lanes show no uri, so they keep the image.
     const model = JSON.stringify((await modelCall('attach')).data);
     assert.ok(model.includes('iVBORw0KGgo=') && !model.includes(INLINE_WITHHELD_TEXT), model);
+  });
+});
+
+test("inline data beside an empty uri reaches a script as sent from a module, as history reads it, and withheld from an MCPL peer", async () => {
+  await withPeers(async ({ answer, script, forward }) => {
+    const inline = { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png', uri: '' };
+    forward.nested = [inline];
+    assert.deepEqual((JSON.parse(await script('fwd--nested')) as { content: unknown }).content, [inline]);
+    answer({ content: [inline], structuredContent: {} });
+    assert.deepEqual((JSON.parse(await script('mcpl--files--attach')) as { content: unknown }).content, [{ type: 'text', text: INLINE_WITHHELD_TEXT }]);
   });
 });
 

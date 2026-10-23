@@ -5,8 +5,10 @@
   returns whole. An RFC-005 reference anywhere in them, a `disposition:
   "never"` one included, arrives without its URI, as the stub's facts an
   MCPL peer's reference arrives as (`refId`, the labels the block gave,
-  `savedTo`). Inline data that also claims a URI of any value or a
-  disposition arrives as the withheld notice. A reference the classifier
+  `savedTo`). Inline data that also claims a URI, of any type, or a
+  disposition arrives as the withheld notice; a null or absent URI is
+  none, and in a module's result so is an empty one, as the model's
+  history reads it. A reference the classifier
   rejects arrives as its notice; that includes an MCP-form embedded
   resource, whose URI sits under `resource`, which the model's history
   shows the same way, so a script no longer gets its text. Anything else

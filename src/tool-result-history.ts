@@ -229,9 +229,10 @@ function shownInHistory(value: unknown): unknown {
   const b = value as Record<string, unknown>;
   if (!governedByRfc005(b)) return value;
   if ((b.type === 'image' || b.type === 'audio') && typeof b.data === 'string') {
-    // JSON writes every field, so here inline data beside a uri of any value
+    // JSON writes every field, so here inline data beside a uri of any type
     // is withheld, not only beside a string one as in the lanes, which show
-    // no uri: an object can carry a credential. An empty uri carries none.
+    // no uri: an object can carry a credential. A null, absent or empty uri
+    // carries none (hasUri).
     return hasUri(b.uri) || b.disposition !== undefined ? INLINE_WITHHELD_TEXT : value;
   }
   return referenceStubOrNull(b, 'from tool result') ?? value;
@@ -243,7 +244,9 @@ function shownInHistory(value: unknown): unknown {
  * RFC-005 governs is shown as the script lane shows it, a reference as its
  * stub's facts without its uri and an invalid one as the notice
  * (referenceBlockForScript), and inline data that also claims a uri of any
- * value or a disposition as the withheld notice, each as a text block. Any
+ * type or a disposition as the withheld notice, each as a text block. A
+ * null, absent or empty uri claims none (hasUri), so inline data beside one
+ * is itself. Any
  * other value is itself. What it gives is either a stub or a notice, which
  * RFC-005 doesn't govern, or the value itself, which it gives again, so
  * applying it twice gives what applying it once gave.
