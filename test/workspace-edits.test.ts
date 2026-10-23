@@ -1180,18 +1180,16 @@ test("an edit matched with quotes read as equal, or read without its CR, counts 
     + 'Include more of the text around it to single out the one you mean.\nThis call counted as many occurrences as one call may, so 85 is a floor'), read);
 });
 
-test("edits of an oldString read more than one way, each found many times, each take about a pass over the file", async (t) => {
+test("edit_many refuses each of 200 edits of an oldString read more than one way, each found many times", async (t) => {
   // Lines alternate between "x" with a CR of its own and "x" alone, before
   // CRLF ends, so "x\r" reads as given on the one and without its CR on the
-  // other. Each edit's other reading stops once it has those a refusal shows.
+  // other. That each edit's other reading stops once it has those a refusal
+  // shows is pinned in the planner's tests, where its count can be read.
   const { call, file } = setup(t);
   await file('m.txt', 'x\r\r\nx\r\n'.repeat(400_000));
-  const before = process.cpuUsage();
   const error = errorOf(await call('edit_many', { edits: Array.from({ length: 200 }, (_, k) => ({ path: 'work/m.txt', oldString: 'x\r', newString: `${k}` })) }));
-  const used = process.cpuUsage(before);
   assert.match(error, /^The edit_many call stored none of its edits: 200 problems\./);
   assert.match(error, /\n\nedit 1: oldString ends in a CR, and occurs in work\/m\.txt read more than one way, so which you mean can't be told\./);
-  assert.ok((used.user + used.system) / 1000 < 4_000, `${(used.user + used.system) / 1000} ms of CPU`);
 });
 
 test("a crowded edit whose count stopped short of its ask, which no crowded problem names, is named by its count as a floor", async (t) => {

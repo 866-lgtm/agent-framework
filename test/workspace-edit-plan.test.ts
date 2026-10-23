@@ -580,6 +580,19 @@ test('an old text read without its BOM or CR is found in one pass over a long ru
   }
 });
 
+test("each of 200 edits of an old text read more than one way counts its other reading only until a refusal has more than it shows", () => {
+  // Lines alternate between "x" with a CR of its own and "x" alone, before
+  // CRLF ends, so "x\r" reads as given on the one and without its CR on the
+  // other, 400,000 times each. As given, each edit's count takes from the
+  // call's budget; the other reading's stops at 21, one past the 20 a
+  // refusal shows, for every edit.
+  const bytes = Buffer.from('x\r\r\nx\r\n'.repeat(400_000));
+  const planned = planFile(decodeForEdit(bytes)!, bytes, Array.from({ length: 200 }, (_, k) => spec(k, 'x\r', `${k}`)));
+  assert.ok('problems' in planned);
+  assert.deepEqual(planned.problems.map((p) => p.kind === 'readings' && p.readings.map((reading) => reading.leaves === 'cr' && [reading.found, reading.atLeast])),
+    Array.from({ length: 200 }, () => [false, [21, true]]));
+});
+
 test("a read form's one pass finds a match inside one it passed over, and none that a mismatch ends", () => {
   // Each old text carries a line's CR, so it matches only before a CRLF line
   // end, and repeats part of itself.
