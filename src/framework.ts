@@ -71,8 +71,7 @@ import type {
   AgentRuntimeSettingsSnapshot,
   AgentSettingsExtension,
   SameRoundThinkTextPolicy,
-  ModuleMessage,
-} from './types/index.js';
+  ModuleMessage, AutoContinueRun } from './types/index.js';
 import { asModuleRow, heldHandle, heldWriteId, matchesMessageQuery } from './held-writes.js';
 import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
@@ -156,6 +155,7 @@ import { DEFAULT_OUTPUT_BOUNDS } from './code-execution/isolate/output.js';
 import type { PreludeTool } from './code-execution/isolate/prelude.js';
 import { bounded, renderList, renderReturn, VALUE_CHARS } from './code-execution/isolate/render.js';
 import { splitProseRuns, withoutRoundsProse } from './prose-segments.js';
+import { AUTO_CONTINUE_REASON, AUTO_CONTINUE_STOP_REASONS, autoContinueNotice } from './auto-continue.js';
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
@@ -1094,6 +1094,20 @@ interface TurnRouting {
   hybridHold?: 'private' | 'failed';
   /** The turn asked for a ` !` continuation; taken once. */
   continuation: boolean;
+  /**
+   * Explicit mode: the turn's latest envelope was `>>skip_reply`, so it
+   * ended on a deliberate skip and autoContinue leaves it paused. (Hybrid
+   * reads `hybridHold === 'private'`, which a `>>>skip_reply` leaves until a
+   * destination is named.)
+   */
+  lastEnvelopeSkipped?: boolean;
+  /**
+   * Explicit or hybrid mode: the turn's latest envelope bounced (no
+   * destination, an unresolved or refused one, a failed send). Its bounce,
+   * with the bounce-wake cap, is that turn's answer, so autoContinue leaves
+   * it to the bounce.
+   */
+  lastEnvelopeBounced?: boolean;
   /** Successful plain-prose destinations in delivery order; deduped by the receipt. */
   deliveries: ChannelRef[];
   /** Plain-prose segments the turn suppressed without drafts (proseRouting=disabled, or a round withheld before its scripts returned: ScriptRound.withhold), reported by its receipt. */
@@ -1294,6 +1308,21 @@ function isTurnContinuation(reason: string): boolean {
  *  other source — a channel message, a heartbeat or other server event, a
  *  gate flush, a timer, an operator nudge — is a cause of its own. */
 const FRAMEWORK_WAKE_SOURCES = new Set(['framework', 'scheduler']);
+
+/** Whether a wake is a cause of its own for an autoContinue run: one from
+ *  outside the framework that isn't a silent heartbeat tick. A batch holding
+ *  one is that cause's turn: the run starts again, and no `[continue]` row is
+ *  written for the continuation it carries. A silent tick is neither: batched
+ *  with a continuation it neither restarts the run nor takes its notice. */
+function hasOwnCauseForRun(r: InferenceRequest): boolean {
+  return !FRAMEWORK_WAKE_SOURCES.has(r.source) && r.suppressProse !== true;
+}
+
+/** Whether a wake carries an autoContinue continuation: its own wake, or a
+ *  requeued turn trigger that kept the mark (InferenceRequest.autoContinueRun). */
+function carriesContinuation(r: InferenceRequest): boolean {
+  return r.autoContinueRun !== undefined;
+}
 const CONVERSATION_ROUTER_STATE_ID = 'framework/conversation-router';
 const INFERENCE_LOG_ID = 'framework/inference-log';
 const PROCESS_LOG_ID = 'framework/process-log';
@@ -2734,6 +2763,10 @@ export class AgentFramework {
   /** Consecutive bounce-wakes per agent; capped so an agent that keeps
    *  emitting unprefixed prose can't wake-loop (notices still append). */
   private proseBounceStreaks: Map<string, number> = new Map();
+  /** Consecutive autoContinue continuations per agent, capped by its
+   *  maxConsecutive. Cleared when a turn starts with a cause of its own
+   *  (processInferenceRequests) or a tool ends a turn (skip_reply). */
+  private autoContinueStreaks: Map<string, number> = new Map();
   private pendingAssistantBlocks: Map<string, ContentBlock[]> = new Map();
   /** Streams the FRAMEWORK cancelled for non-terminal reasons, keyed
    *  `${agentName}:${streamId}`: an endTurn tool result or a context-budget
@@ -14651,6 +14684,21 @@ export class AgentFramework {
       // kept): heartbeat/gate wakes arrive once per tick and nothing else
       // bounds a multi-day maintenance window's accumulation.
       if (this.quiesced) {
+        // An autoContinue continuation doesn't outlast a quiesce: at resume,
+        // possibly hours later, "another turn starts now" would be untrue.
+        // Its own wake is dropped and the run's count given back; a requeued
+        // trigger that carried one parks without the mark.
+        if (requests.some(carriesContinuation)) {
+          this.giveBackAutoContinue(agentName, 'the host is quiesced');
+          requests = requests
+            .filter((r) => r.reason !== AUTO_CONTINUE_REASON)
+            .map((r) => {
+              if (!carriesContinuation(r)) return r;
+              const { autoContinueRun: _mark, ...rest } = r;
+              return rest;
+            });
+          if (requests.length === 0) continue;
+        }
         // Continuations of a held turn (budget restart, non-streaming tool
         // results) pass; everything else parks.
         const passThrough = requests.filter((r) => isTurnContinuation(r.reason));
@@ -14767,7 +14815,33 @@ export class AgentFramework {
         if (requests.some((r) => resumesLogicalTurn(r.reason))) {
           this.endContinuedTurn(agentName, { kind: 'dropped', why: 'the inference policy dropped its continuation' });
         }
+        if (requests.some(carriesContinuation)) this.giveBackAutoContinue(agentName, 'the inference policy dropped its wake');
         this.endPendingPrimary(agentName);
+        continue;
+      }
+
+      // An autoContinue continuation is the turn's when nothing in the batch
+      // is a cause of its own (hasOwnCauseForRun): then the turn's trigger
+      // carries its mark, and the turn writes its `[continue]` row as it
+      // starts (startAgentStream), past every gate that could still stop it.
+      // A batch with a cause of its own is that cause's turn: no row, and the
+      // run starts again below.
+      const continuation = requests.find(carriesContinuation);
+      let continuationMark = continuation?.autoContinueRun && !requests.some(hasOwnCauseForRun)
+        ? { ...continuation.autoContinueRun, sole: requests.every(carriesContinuation) }
+        : undefined;
+      // A batch that resumes a logical turn (a budget restart, a guard retry)
+      // takes the continuation's wake into that turn, which writes no start
+      // inputs: its count goes back, and it writes no row.
+      if (continuationMark && requests.some((r) => resumesLogicalTurn(r.reason))) {
+        this.giveBackAutoContinue(agentName, 'a resumed turn took its wake');
+        continuationMark = undefined;
+      }
+      // Its row goes into the residents' shared slot, which no write may
+      // enter while another reader's turn is alive (as for a clock row): the
+      // continuation waits until that turn has ended.
+      if (continuationMark && this.sharedSlotBusy(agent)) {
+        this.pendingRequests.push(...requests);
         continue;
       }
 
@@ -14787,6 +14861,14 @@ export class AgentFramework {
       // (Optional chaining: prototype-built harnesses leave the map unset.)
       if (requests.some((r) => !FRAMEWORK_WAKE_SOURCES.has(r.source))) {
         this.proseBounceStreaks?.delete(agentName);
+      }
+      // Likewise autoContinue's cap bounds only a run of continuations that
+      // nothing else feeds. A silent heartbeat tick doesn't feed it: batched
+      // with a continuation it would otherwise restart the run at every tick,
+      // and a resident whose ticks come faster than its turns would never
+      // reach the cap (hasOwnCauseForRun).
+      if (requests.some(hasOwnCauseForRun)) {
+        this.autoContinueStreaks?.delete(agentName);
       }
       // Route this turn's auto-published speech to the channel that triggered
       // it (item-3 redux). A batched wake may carry several triggering channels
@@ -14814,12 +14896,21 @@ export class AgentFramework {
       const eventAt = (r: InferenceRequest): number => r.wakeAt ?? r.timestamp;
       let ambientReq: InferenceRequest | undefined;
       let addressedReq: InferenceRequest | undefined;
+      // An autoContinue wake names the finished turn's locus. It speaks for
+      // the turn only when nothing else in the batch names a channel: a
+      // message that arrived meanwhile, ambient included, outranks it, though
+      // its wake was queued first.
+      let continuationReq: InferenceRequest | undefined;
       for (const r of requests) {
         if (!r.channelId) continue;
+        if (r.reason === AUTO_CONTINUE_REASON) {
+          continuationReq ??= r;
+          continue;
+        }
         if (!ambientReq || eventAt(r) >= eventAt(ambientReq)) ambientReq = r;
         if (r.addressed && (!addressedReq || eventAt(r) >= eventAt(addressedReq))) addressedReq = r;
       }
-      const channelReq = addressedReq ?? ambientReq;
+      const channelReq = addressedReq ?? ambientReq ?? continuationReq;
       // Telemetry provenance (who/where woke the agent). An ADDRESSED winner
       // is its own provenance, even when it names no author (a push event
       // can route without an author id): borrowing another request's author
@@ -14865,6 +14956,8 @@ export class AgentFramework {
         // channel is that message's, never one server's id with another's.
         channelId: channelReq?.channelId,
         channelServerId: channelReq?.channelServerId,
+        // Only the mark this batch decided, never one requests[0] carried.
+        autoContinueRun: continuationMark,
         addressed: addressedReq !== undefined,
         // A context-budget restart continues the same logical turn: it keeps
         // the channel for routing but names no author — the restart is its
@@ -16553,6 +16646,169 @@ export class AgentFramework {
     });
   }
 
+  /**
+   * autoContinue (AgentConfig.autoContinue): after a turn the model ended
+   * itself (AUTO_CONTINUE_STOP_REASONS), with prose or with nothing, queue
+   * another, unless its last word was a skip (`>>skip_reply`, or a hybrid
+   * `>>>skip_reply` hold still standing). Runs at the logical turn end of a
+   * stream's `complete`, after the turn's deliveries and `[delivered]`
+   * receipt, and only when the turn asked for no ` !` continuation (that one
+   * runs instead). A tool that ends the turn (skip_reply, sleep) never
+   * reaches here, and clears the run's count.
+   *
+   * It continues only an agent that has a way to stop it is offered: the
+   * skip_reply tool, or in explicit/hybrid mode a skip envelope. It leaves
+   * a turn whose closing prose bounced to the bounce, and never continues an
+   * ephemeral run or a conversation fork. The wake names
+   * the turn's locus, or the unresolved channel of a turn that had none, so
+   * the next turn speaks, or doesn't, where this one did; a batched message's
+   * channel outranks it. Its mark (InferenceRequest.autoContinueRun) holds
+   * what the `[continue]` row says, written as the turn starts
+   * (startAgentStream). A run is capped at maxConsecutive; the last allowed
+   * row says so, and the cap holds until a turn starts with a cause of its own.
+   */
+  private autoContinueAfterTurn(
+    agent: Agent,
+    routing: TurnRouting,
+    trigger: InferenceRequest | undefined,
+    stopReason: string,
+    opts: { heldAfterSend?: boolean } = {},
+  ): void {
+    const config = agent.autoContinue;
+    if (!config) return;
+    const name = agent.name;
+    if (!AUTO_CONTINUE_STOP_REASONS.has(stopReason)) return;
+    // A silent heartbeat tick is a private self-check, never the start of a run.
+    if (trigger?.suppressProse) return;
+    // A subagent's run ends with its result; a conversation fork answers
+    // its home channel's message.
+    if (this.ephemeralRuns.has(name) || this.conversationAgentHomes.has(name)) return;
+    if (this.providerAdmissionClosed || this.agents.get(name) !== agent) {
+      console.error(`[continue] ${name}: not continued — ${this.providerAdmissionClosed ? 'the framework is stopping' : 'the agent is no longer registered'}`);
+      return;
+    }
+    const skipped = agent.proseRouting === 'explicit'
+      ? routing.lastEnvelopeSkipped === true
+      : agent.proseRouting === 'hybrid' && routing.hybridHold === 'private';
+    if (skipped) {
+      this.autoContinueStreaks.delete(name);
+      console.error(`[continue] ${name}: turn ended on a skip_reply envelope — waiting for the next event`);
+      return;
+    }
+    const stop = this.autoContinueStop(agent);
+    if (!stop) {
+      console.error(`[continue] ${name}: not continued — no way to stop is offered (no skip_reply tool, no skip envelope in ${agent.proseRouting} mode)`);
+      return;
+    }
+    // The turn's closing prose bounced: the bounce, with its own cap, is
+    // explicit and hybrid mode's answer to that turn, and continuing past
+    // the cap would restart the loop the cap breaks.
+    if (routing.lastEnvelopeBounced) {
+      console.error(`[continue] ${name}: not continued — the turn's closing prose bounced`);
+      return;
+    }
+    const count = (this.autoContinueStreaks.get(name) ?? 0) + 1;
+    if (count > config.maxConsecutive) {
+      console.error(`[continue] ${name}: ${config.maxConsecutive} continuation(s) in a row already — waiting for the next event`);
+      return;
+    }
+    this.autoContinueStreaks.set(name, count);
+    console.error(
+      `[continue] ${name}: turn ended (${stopReason}) without skip_reply — continuation ${count} of ${config.maxConsecutive}` +
+        (routing.locus ? ` in ${this.channelRegistry?.nameShown(routing.locus) ?? routing.locus.channelId}` : ''),
+    );
+    // The next turn speaks where this one did (locus and hybrid modes): the
+    // locus's server and id, as the framework's own wakes name a channel. A
+    // turn that had no channel (noChannel: its wake named one that resolves
+    // to none) passes its wake's channel on, so the next has none either,
+    // rather than taking the global fallback this one refused.
+    const channel = routing.locus
+      ? { channelId: routing.locus.channelId, channelServerId: routing.locus.serverId }
+      : routing.noChannel && trigger?.channelId
+        ? { channelId: trigger.channelId, ...(trigger.channelServerId ? { channelServerId: trigger.channelServerId } : {}) }
+        : {};
+    this.pendingRequests.push({
+      agentName: name,
+      reason: AUTO_CONTINUE_REASON,
+      source: 'framework',
+      timestamp: Date.now(),
+      ...channel,
+      autoContinueRun: { stop, ...(opts.heldAfterSend ? { heldAfterSend: true } : {}) },
+    });
+  }
+
+  /** How an autoContinue agent stops a run, as its `[continue]` row says it,
+   *  or undefined when no way is offered: the skip_reply tool when the
+   *  channel registry offers it and the agent may call it, else a skip
+   *  envelope in explicit or hybrid mode. */
+  private autoContinueStop(agent: Agent): string | undefined {
+    if (this.channelRegistry && this.canAgentUseTool(agent.name, 'skip_reply')) return 'call skip_reply';
+    if (agent.proseRouting === 'explicit') return 'end with a >>skip_reply envelope';
+    if (agent.proseRouting === 'hybrid') return 'end with a >>>skip_reply envelope';
+    return undefined;
+  }
+
+  /**
+   * Store a continuation's `[continue]` row in the agent's window as its turn
+   * starts (startAgentStream), with the run's count as it stands and the
+   * agent's cap. False when it couldn't be stored.
+   */
+  private writeAutoContinueNotice(agent: Agent, mark: AutoContinueRun): boolean {
+    const count = this.autoContinueStreaks.get(agent.name) ?? 1;
+    const max = agent.autoContinue?.maxConsecutive ?? count;
+    const text = autoContinueNotice({
+      agentName: agent.name, stop: mark.stop, last: count >= max, heldAfterSend: mark.heldAfterSend,
+    });
+    const before = this.storedCountOf(agent);
+    let id: MessageId;
+    try {
+      id = agent.getContextManager().addMessage(
+        'user',
+        [{ type: 'text', text }],
+        { system: true, kind: 'auto-continue', agentName: agent.name, continuation: count, maxConsecutive: max } as MessageMetadata,
+      );
+    } catch (err) {
+      // A write can throw after its row landed (context-manager's own
+      // propagation failing): read back from where the store stood, as the
+      // clock row does, so a row that is there isn't called missing.
+      const landed = before === undefined
+        ? undefined
+        : this.storedSince(agent, before, (m) => {
+          const meta = m.metadata as { kind?: unknown; agentName?: unknown } | undefined;
+          return meta?.kind === 'auto-continue' && meta.agentName === agent.name;
+        }, 'continue', 'the continuation row');
+      if (!landed || landed.length === 0) {
+        console.error(`[continue] ${agent.name}: row not stored${landed ? '' : ' (whether it landed is unknown)'}, so not continued:`, err);
+        return false;
+      }
+      console.error(`[continue] ${agent.name}: the continuation row landed though its write threw:`, err);
+      id = landed[0]!.id;
+    }
+    this.emitTrace({ type: 'message:added', messageId: id, source: 'auto-continue' });
+    console.error(`[continue] ${agent.name}: continuation ${count} of ${max} starts`);
+    return true;
+  }
+
+  /** Whether another reader of the residents' shared slot has a turn alive,
+   *  so no row may be written there now (as storeDueClock checks). */
+  private sharedSlotBusy(agent: Agent): boolean {
+    if (!this.sharedSlotAgents.has(agent)) return false;
+    for (const reader of this.sharedSlotAgents) {
+      if (reader !== agent && this.turnAlive(reader)) return true;
+    }
+    return false;
+  }
+
+  /** A continuation whose turn doesn't run: the run's count goes back to
+   *  what it was before it was queued. */
+  private giveBackAutoContinue(agentName: string, why: string): void {
+    const count = this.autoContinueStreaks?.get(agentName);
+    if (!count) return;
+    if (count <= 1) this.autoContinueStreaks.delete(agentName);
+    else this.autoContinueStreaks.set(agentName, count - 1);
+    console.error(`[continue] ${agentName}: continuation ${count} dropped — ${why}`);
+  }
+
   /** The agent's routing state for its current turn, made when it has none. */
   private routingOf(agentName: string): TurnRouting {
     let routing = this.turnRouting.get(agentName);
@@ -16847,6 +17103,7 @@ export class AgentFramework {
   ): Promise<void> {
     const routing = round.routing;
     for (const envelope of splitHybridEnvelopes(rawText)) {
+      routing.lastEnvelopeBounced = false;
       const normalized = envelope;
       const attempted = normalized.startsWith('>>>');
       const parsed = parseHybridProsePrefix(normalized);
@@ -16991,6 +17248,8 @@ export class AgentFramework {
     // A private round (one that called skip_reply) asks for no publication
     // or continuation, even when delivery runs after that turn has ended.
     if (parsed.continueTurn && !round.keepPrivate) routing.continuation = true;
+    routing.lastEnvelopeSkipped = parsed.kind === 'private';
+    routing.lastEnvelopeBounced = false;
 
     if (parsed.kind === 'private') {
       // The text already lives in the assistant message (window/chronicle);
@@ -17163,6 +17422,7 @@ export class AgentFramework {
     after: { substituted?: Draft; outcome?: 'unknown' } = {},
   ): void {
     const name = agent.name;
+    round.routing.lastEnvelopeBounced = true;
     if (after.outcome === 'unknown' && !after.substituted) {
       // Words with no draft behind them, whose send threw, may have gone
       // out. Like an unknown outcome, that is marker-only: holding them as a
@@ -17808,6 +18068,37 @@ export class AgentFramework {
     // agent's assembly placed in this agent's queue (freeze's `joined`,
     // vector 25). Not once the host is quiesced, when it waits for resume().
     if (assembled && !this.quiesced && this.deferredMessages.length > 0) this.flushForStart(agent, 'assembly');
+
+    // An autoContinue continuation's `[continue]` row, written here: the
+    // turn has passed every gate that could still stop it (a stopping
+    // framework, a provider park's requeue, a stated wait), and the row is
+    // the newest of its inputs, before its checkpoint. The trigger goes on
+    // without the mark, so a retry doesn't write it again. A row that can't
+    // be stored gives back the run's count, and withdraws a turn the
+    // continuation alone caused: it would wake to nothing it can read.
+    if (attempt === 0 && !resumesTurn && trigger?.autoContinueRun) {
+      const mark = trigger.autoContinueRun;
+      const { autoContinueRun: _mark, ...unmarked } = trigger;
+      trigger = unmarked;
+      // Another reader's turn may have started since the scheduler checked.
+      const busy = this.sharedSlotBusy(agent);
+      if (busy || !this.writeAutoContinueNotice(agent, mark)) {
+        this.giveBackAutoContinue(agent.name, busy ? "another resident's turn is alive in the shared slot" : 'its row could not be stored');
+        if (mark.sole) {
+          console.error(`[continue] ${agent.name}: turn not started (the continuation was its only cause)`);
+          if (this.activeTurnTokens.get(agent.name) === turnToken) {
+            this.activeTurnTokens.delete(agent.name);
+            this.activeTurnTriggers.delete(agent.name);
+          }
+          if (!this.activeTurnTokens.has(agent.name)
+            && this.deferredMessages.length > 0 && !this.pendingAssistantBlocks.has(agent.name)) {
+            this.readdDrained(this.drainDeferredFor(agent.name), 'withdrawn-turn flush');
+            this.ackDeferredWrites();
+          }
+          return false;
+        }
+      }
+    }
 
     // The turn has passed its gate, so from here it goes on with a copy of
     // its trigger without a batch wake's marks or the mark of a wake to read
@@ -18766,6 +19057,10 @@ export class AgentFramework {
       // deliveries have run. Explicit mode doesn't hold the turn
       // for them, so it checks at the end of its chain.
       if (cancelKind === 'turn_ended') {
+        // A tool ended the turn (skip_reply, sleep): the agent stopped on
+        // purpose, so a later autoContinue run counts from one again.
+        // (Optional chaining: prototype-built harnesses leave the map unset.)
+        this.autoContinueStreaks?.delete(agent.name);
         if (turnProseRouting === 'explicit') {
           void turnSpeechChain.then(() => this.requestProseContinuation(agent, streamRouting));
         } else {
@@ -19770,7 +20065,17 @@ export class AgentFramework {
             // A `!` continuation this turn asked for. This gives prose the
             // same continuation ability tool rounds have (wanted for
             // robotics-style loops where an end-of-turn pause is harmful).
+            // Otherwise autoContinue, for an agent that has it, continues a
+            // turn the model ended itself unless that end was a skip.
+            const askedToContinue = finalRouting.continuation;
             this.requestProseContinuation(agent, finalRouting);
+            if (!askedToContinue) {
+              // Closing words held, not sent, because the turn had already
+              // sent with a send tool: the continuation's row says so.
+              const heldAfterSend = turnProseRouting !== 'explicit' && turnSilenced && silenceCause === 'send'
+                && terminalContent.some((b) => b.type === 'text' && (b as { text: string }).text.trim().length > 0);
+              this.autoContinueAfterTurn(agent, finalRouting, trigger, response.stopReason, { heldAfterSend });
+            }
 
             break;
           }
