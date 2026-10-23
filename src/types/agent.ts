@@ -152,7 +152,9 @@ export interface AgentConfig {
    * Extended thinking config. When `enabled: true`, the agent runs with
    * Anthropic's native extended thinking; responses include `thinking` blocks
    * with cryptographic signatures, and the API enforces `temperature: 1`
-   * (Membrane handles this). Omit or set `enabled: false` to disable.
+   * (Membrane handles this). Omit or set `enabled: false` to disable, except
+   * on a model whose thinking is always on (Fable, Mythos), which thinks
+   * whatever this says.
    */
   thinking?: {
     enabled: boolean;
@@ -162,9 +164,57 @@ export interface AgentConfig {
     /**
      * How thinking content is returned: 'summarized' (readable summary) or
      * 'omitted' (empty thinking field, signature only). Fable 5 / Opus 4.7+
-     * default to 'omitted' — set 'summarized' to receive thinking text.
+     * default to 'omitted' — set 'summarized' to receive thinking text. A
+     * model whose thinking is always on (Fable, Mythos) is sent a thinking
+     * config only to carry `thinkingBinding.dropBlock`, so this reaches it
+     * only with that set.
      */
     display?: 'summarized' | 'omitted';
+  };
+  /**
+   * How the provider binds this agent's signed thinking to the conversation
+   * before it. A host sets it from what it knows of the agent's model and
+   * route.
+   */
+  thinkingBinding?: {
+    /**
+     * Ask the provider to drop a signed thinking block whose earlier
+     * conversation has changed, as a fold changes it, rather than refuse the
+     * request. An account that enforces the binding otherwise answers such a
+     * request with a 400. One that doesn't decides for itself: the four
+     * accounts tried on 2026-10-18 dropped such blocks silently, so there the
+     * model sees nothing different and the report is what's new, and one
+     * that would show such a block to the model is asked to drop it instead.
+     *
+     * It's sent as `thinking.block_binding.prefix_mismatch_behavior:
+     * "drop_block"` with the `thinking-binding-controls-2026-08-01` beta,
+     * which membrane's Anthropic and Bedrock adapters carry (Bedrock's
+     * acceptance of the beta hasn't been tried). On any other adapter it does
+     * nothing, so a host should refuse it there. A thinking config the host
+     * sends itself, through `request.extra` or as `thinking` in
+     * `providerParams`, replaces the one membrane builds, control included.
+     *
+     * On a model whose thinking is always on (Fable, Mythos), membrane
+     * carries it in an adaptive thinking config whatever `thinking.enabled`
+     * says, with `thinking.display` when that's set, so such an agent's
+     * `display` takes effect only with this setting. On any other model, it
+     * goes only in the thinking config membrane sends while thinking is on.
+     * Membrane tells the first kind by its id, which names `fable` or
+     * `mythos`. Opus 5.5, Haiku 5.5, Sonnet 5.5, Sonnet 5, Fable 5 and Fable
+     * 5.1 accepted the config on 2026-10-18. Mythos hasn't been tried, and
+     * membrane notes that the family has refused thinking configs with a 400
+     * before, so for a Mythos model the setting may fail every request.
+     *
+     * On a framework turn, each call's report of the blocks the provider
+     * dropped goes to its `inference:usage` trace, and neither that call nor
+     * its stream's later calls feed the context strategy's calibration, since
+     * the provider doesn't bill a block it dropped and the strategy still
+     * counts it. The direct API carries the control too, but reads no report:
+     * it traces no usage and feeds no calibration.
+     *
+     * Default false: nothing is sent, and the account's default applies.
+     */
+    dropBlock?: boolean;
   };
   /**
    * How to handle a model content-policy refusal (`stop_reason: refusal`).

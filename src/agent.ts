@@ -100,15 +100,16 @@ const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
 
 /**
  * Refuse an agent config whose `promptCaching`, `toolResultGuard`,
- * `toolWrapperProseGuard`, `thinking.enabled` or `refusalHandling.autoRewind`
- * holds anything but true or false (assertBooleanSetting), or whose `thinking`
- * or `refusalHandling` is anything but an object, null or false
- * (holdsSettings), or whose `autoContinue` resolveAutoContinue refuses.
- * The constructor runs it first, so the rule holds wherever
- * an Agent is built. `create()` also runs it for each of its agents before
- * anything opens, and `createEphemeralAgent` before it reserves the name, so a
- * refusal there leaves nothing behind. Membrane reads `thinking.enabled`, and
- * the refusal is here because the setting is AgentConfig's.
+ * `toolWrapperProseGuard`, `thinking.enabled`, `thinkingBinding.dropBlock` or
+ * `refusalHandling.autoRewind` holds anything but true or false
+ * (assertBooleanSetting), or whose `thinking`, `thinkingBinding` or
+ * `refusalHandling` is anything but an object, null or false (holdsSettings),
+ * or whose `autoContinue` resolveAutoContinue refuses. The constructor runs it
+ * first, so the rule holds wherever an Agent is built. `create()` also runs it
+ * for each of its agents before anything opens, and `createEphemeralAgent`
+ * before it reserves the name, so a refusal there leaves nothing behind.
+ * Membrane reads `thinking.enabled`, and the refusal is here because the
+ * setting is AgentConfig's.
  */
 export function assertAgentSwitches(config: AgentConfig): void {
   const agent = `Agent "${config.name}"`;
@@ -122,6 +123,14 @@ export function assertAgentSwitches(config: AgentConfig): void {
       `${agent} thinking.enabled`,
       config.thinking.enabled,
       'true asks the provider for extended thinking, and false or leaving it out doesn\'t',
+    );
+  }
+  if (holdsSettings(`${agent} thinkingBinding`, config.thinkingBinding, '{ dropBlock: true }')) {
+    assertBooleanSetting(
+      `${agent} thinkingBinding.dropBlock`,
+      config.thinkingBinding.dropBlock,
+      'true asks the provider to drop a signed thinking block whose earlier conversation changed rather than refuse the request, ' +
+        'and false or leaving it out sends nothing, so the account\'s default applies',
     );
   }
   if (holdsSettings(`${agent} refusalHandling`, config.refusalHandling, '{ autoRewind: true }')) {
@@ -208,6 +217,9 @@ export class Agent {
    * blocks are preserved through Chronicle.
    */
   readonly thinking: AgentConfig['thinking'];
+  /** Whether requests ask the provider to drop signed thinking whose earlier
+   *  conversation changed (see AgentConfig.thinkingBinding.dropBlock). */
+  private readonly thinkingDropBlock: boolean;
   /** Refusal auto-rewind policy (see AgentConfig.refusalHandling). */
   readonly refusalHandling: AgentConfig['refusalHandling'];
   readonly toolResultGuard: ToolResultGuard;
@@ -347,6 +359,7 @@ export class Agent {
     this.maxTokens = config.maxTokens ?? 4096;
     this.temperature = config.temperature;
     this.thinking = config.thinking;
+    this.thinkingDropBlock = config.thinkingBinding?.dropBlock === true;
     this.refusalHandling = config.refusalHandling;
     this.toolResultGuard = new ToolResultGuard(config.name, contextManager, config.toolResultGuard === true);
     this.proseRouting = config.proseRouting ?? 'locus';
@@ -1498,20 +1511,21 @@ export class Agent {
 
   /**
    * The request fields that come from this agent's own settings: its model
-   * config, prompt caching and cache TTL, prefill message, provider
-   * parameters and participant name. Every request the agent sends takes
-   * them from here, a framework turn's (assembleActivationRequest) and the
-   * direct API's (runInferenceWithInjections), so a setting reaches both or
-   * neither.
+   * config, thinking binding, prompt caching and cache TTL, prefill message,
+   * provider parameters and participant name. Every request the agent sends
+   * takes them from here, a framework turn's (assembleActivationRequest) and
+   * the direct API's (runInferenceWithInjections), so a setting reaches both
+   * or neither.
    */
   private requestSettings(): Pick<NormalizedRequest,
     'config' | 'promptCaching' | 'cacheTtl' | 'prefillUserMessage' | 'providerParams' | 'assistantParticipant'> {
+    const thinking = this.requestThinking();
     return {
       config: {
         model: this.model,
         maxTokens: this.maxTokens,
         ...(this.temperature !== undefined && { temperature: this.temperature }),
-        ...(this.thinking !== undefined && { thinking: this.thinking }),
+        ...(thinking !== undefined && { thinking }),
       },
       promptCaching: this.promptCaching,
       cacheTtl: this.cacheTtl,
@@ -1519,6 +1533,20 @@ export class Agent {
       ...(this.providerParams && { providerParams: this.providerParams }),
       assistantParticipant: this.name,
     };
+  }
+
+  /**
+   * The thinking config a request carries: the agent's own, with the binding
+   * control added when `thinkingBinding.dropBlock` asks for it. A model whose
+   * thinking is always on takes the control whatever `enabled` says, so an
+   * agent with no thinking config of its own still sends one, holding only
+   * the control and `enabled: false`. Membrane sends nothing from it to any
+   * other model, since thinking is off there.
+   */
+  private requestThinking(): NonNullable<NormalizedRequest['config']['thinking']> | undefined {
+    if (!this.thinkingDropBlock) return this.thinking;
+    const own = this.thinking !== null && typeof this.thinking === 'object' ? this.thinking : { enabled: false };
+    return { ...own, blockBinding: { prefixMismatchBehavior: 'drop_block' } };
   }
 
   /** The request `assembleActivationRequest` builds (see there), for preview
