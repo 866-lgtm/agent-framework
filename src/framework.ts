@@ -8134,8 +8134,8 @@ export class AgentFramework {
    * Remove a gate policy by name at runtime. Returns false if it didn't exist.
    * Throws if no gate is configured, gate.json has no rule list a change could
    * edit, it isn't used and the removal doesn't mend it, or it can't be read,
-   * isn't JSON or can't be written (EventGate.removePolicy); the rule then
-   * stays in force.
+   * isn't JSON or can't be written (EventGate.removePolicy); the rules in
+   * force then stay as they were.
    */
   removeGatePolicy(name: string): boolean {
     if (!this.eventGate) {

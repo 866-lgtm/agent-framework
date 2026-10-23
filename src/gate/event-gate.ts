@@ -1498,7 +1498,8 @@ function notUsedClause(write: Extract<StartWrite, { kind: 'start-without' }>, st
   const out = outOfForce(write);
   if (out) {
     return `it isn't used at this start: under its default, "${write.default}", ${out.said}, so the gate runs the starting `
-      + `rules under their own default, "${starting.config?.default ?? 'always'}", as a start without gate.json does. ${back}, or ${out.fix}, puts it in use`;
+      + `rules under their own default, "${starting.config?.default ?? 'always'}", as a start without gate.json does. ${back}, or ${out.fix}, puts it in use`
+      + (out.nextStart ? ' (a fix to the starting rules, at the next start)' : '');
   }
   return `under its default, "${write.default}", it would hold back every event: it isn't used at this start, and the gate runs `
     + `no rules, as a start without gate.json does, so every event gets the default, "always". ${back}, or fixing the starting rules, puts rules in force`;
@@ -1509,7 +1510,7 @@ function notUsedClause(write: Extract<StartWrite, { kind: 'start-without' }>, st
  * beside it or in it, which could wake the agent, and what would put them in
  * force: null where the starting rules were refused whole.
  */
-function outOfForce(write: Extract<StartWrite, { kind: 'start-without' }>): { said: string; fix: string } | null {
+function outOfForce(write: Extract<StartWrite, { kind: 'start-without' }>): { said: string; fix: string; nextStart: boolean } | null {
   const nameless = write.nameless ?? 0;
   const left = [...(write.leftOut ?? []).map((name) => `"${name}"`), ...(nameless === 0 ? [] : [nameless === 1 ? 'one with no name' : `${nameless} with no name`])];
   const held = write.heldOut ?? [];
@@ -1528,7 +1529,11 @@ function outOfForce(write: Extract<StartWrite, { kind: 'start-without' }>): { sa
   // in force for it to be used, so where both kinds keep it out, both fixes
   // are needed; giving gate.json rules of its own is the other way, which the
   // entry gives first.
-  return said.length > 0 ? { said: said.join(', and '), fix: fix.length > 1 ? `both ${fix.join(', and ')}` : fix[0]! } : null;
+  // The starting rules are read at a start, so a fix to them puts gate.json in
+  // use from the next one.
+  return said.length > 0
+    ? { said: said.join(', and '), fix: fix.length > 1 ? `both ${fix.join(', and ')}` : fix[0]!, nextStart: left.length > 0 }
+    : null;
 }
 
 /**
@@ -1556,7 +1561,8 @@ function describeUnsaved(starting: StartingRules, write: StartWrite, loaded: boo
     return `At start, gate.json, which has no rules the gate reads, wasn't used: under its default, "${write.default}", ${out.said}. The gate `
       + `runs the starting rules under their own default, "${starting.config?.default ?? 'always'}", as a start without gate.json `
       + 'does, but they aren\'t saved in it: once gate.json changes and loads, what it holds is in force instead. Giving '
-      + `gate.json rules under "policies", or ${out.fix}, puts it in use.`;
+      + `gate.json rules under "policies", or ${out.fix}, puts it in use`
+      + `${out.nextStart ? ' (a fix to the starting rules, at the next start)' : ''}.`;
   }
   if (loaded) return null;
   if (write.kind === 'seed-failed') {
@@ -1564,8 +1570,8 @@ function describeUnsaved(starting: StartingRules, write: StartWrite, loaded: boo
       ? `At start, gate.json couldn't be created (${write.error}), so the host's starting rules are in force but aren't saved in it. `
         + 'Whoever runs this host can fix what keeps it from being written.'
       : `At start, writing the host's starting rules to gate.json failed partway (${write.error}), so gate.json may be left `
-        + "part-written. The starting rules are in force but aren't saved in it. Whoever runs this host can fix what kept it "
-        + 'from being written, and gate.json.';
+        + "part-written. The starting rules are in force but aren't saved in it, and a restart before gate.json is fixed starts "
+        + 'from them too. Whoever runs this host can fix what kept it from being written, and gate.json.';
   }
   if (write.kind === 'reconcile-failed') {
     const what = write.atOpen
@@ -2229,7 +2235,8 @@ export class EventGate {
         remedy: sharing === 1
           ? `${removes ? 'Replacing or removing' : 'Replacing'} "${only}" by name would bring gate.json into force.`
           : sharing > 1
-            ? `gate.json has ${sharing} rules named "${only}", and a change by that name replaces the first of them or removes them all.`
+            ? `gate.json has ${sharing} rules named "${only}", and a change by that name replaces the first of them`
+              + `${removes ? ' or removes them all' : ''}.`
             : 'No change through the gate can bring it into force, so gate.json has to be fixed by an edit of its own; '
               + 'until then, a change is refused the same way.',
       };
@@ -2466,7 +2473,8 @@ export class EventGate {
    * it holds, it throws, writing nothing, for a gate.json the gate doesn't use
    * that the removal doesn't mend or would leave with no rules in force, and
    * throws when the write fails, which may
-   * leave gate.json part-written; the rule then stays in force, with its state.
+   * leave gate.json part-written; the rules in force then stay as they were,
+   * with their state.
    */
   removePolicy(name: string): boolean {
     // nameOf gives undefined for a rule with no name, so a call from JavaScript
@@ -2532,7 +2540,7 @@ export class EventGate {
     // rule it leaves out would wake on, so its default holds events back.
     if (remedy !== undefined && read.config.policies.length === 0) {
       throw new Error(
-        'Nothing was saved: with this change, gate.json would have no rules of its own, and its default would hold back every '
+        'Nothing was saved: with this change, gate.json would have no rules the gate reads, and its default would hold back every '
         + `event. Meanwhile the gate runs ${this.rulesRun()}. ${remedy}`,
       );
     }
@@ -2544,7 +2552,8 @@ export class EventGate {
         ? `gate.json couldn't be written (${errorText(err)}), so nothing was saved: the rules in force and gate.json stay `
           + 'as they were. Whoever runs this host can fix what keeps it from being written.'
         : `Writing gate.json failed partway (${errorText(err)}), so the change isn't in force: the rules in force stay as `
-          + 'they were. gate.json may hold the whole change, which the gate reads at its next reload, or part of it, or nothing. '
+          + 'they were. gate.json may hold the whole change, which the gate reads at its next reload, or part of it, or nothing, '
+          + 'which it can\'t read, so they stay until gate.json is fixed. '
           + 'Whoever runs this host can fix what kept it from being written, and check what gate.json holds.', { cause: err });
     }
     const was = this.config;
