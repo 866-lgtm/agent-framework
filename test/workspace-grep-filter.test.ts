@@ -176,8 +176,24 @@ for (const [kind, mount] of KINDS) {
         'The glob did nothing: its pattern "work/lib/*.ts" is read mount-prefixed, from the root of mount "work", so "work/src/main.ts" doesn\'t match it.',
       );
       assert.deepEqual(await globbed(m, { path: 'work/src', pattern: 'work/src/*.ts' }), ['work/src/main.ts']);
-      // A pattern as written is relative to the path, so it isn't refused.
+      // A pattern as written is relative to the path, so it isn't refused:
+      // main.ts names the file directly in the path, and lib/*.ts names
+      // nothing there.
+      assert.deepEqual(await globbed(m, { path: 'work/src', pattern: 'main.ts' }), ['work/src/main.ts']);
       assert.deepEqual(await globbed(m, { path: 'work/src', pattern: 'lib/*.ts' }), []);
+    });
+
+    test('glob, given the pattern its refusal names (the path\'s braces written as "?"), finds the file beneath the path and not a sibling\'s; its refusal names no pattern where one has a "." segment', async (t) => {
+      // XnameX's file matches the suggested pattern too, and stays out, since
+      // the search stays beneath the path.
+      const { m } = await opened(t, mount, ['{name}/a/x.ts', 'XnameX/a/z.ts']);
+      assert.match(await globRefusal(m, { path: 'work/{name}', pattern: 'work/a/*.ts' }), / To match beneath it, write "work\/\?name\?\/a\/\*\.ts"\.$/);
+      assert.deepEqual(await globbed(m, { path: 'work/{name}', pattern: 'work/?name?/a/*.ts' }), ['work/{name}/a/x.ts']);
+      // One with a "." segment gets no suggestion.
+      assert.equal(
+        await globRefusal(m, { path: 'work/src', pattern: 'work/./lib/*.ts' }),
+        'The glob did nothing: its pattern "work/./lib/*.ts" is read mount-prefixed, from the root of mount "work", so no file within "work/src" matches it.',
+      );
     });
 
     test('glob\'s refusal leaves a path in a nested mount\'s directory to that mount, as grep does', async (t) => {
