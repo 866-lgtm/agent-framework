@@ -64,6 +64,7 @@ import type {
 } from '@animalabs/context-manager';
 import type {
   AgentConfig,
+  AutoContinueConfig,
   AgentState,
   SameRoundThinkTextPolicy,
   SameRoundThinkTextPolicySource,
@@ -102,7 +103,8 @@ const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
  * `toolWrapperProseGuard`, `thinking.enabled` or `refusalHandling.autoRewind`
  * holds anything but true or false (assertBooleanSetting), or whose `thinking`
  * or `refusalHandling` is anything but an object, null or false
- * (holdsSettings). The constructor runs it first, so the rule holds wherever
+ * (holdsSettings), or whose `autoContinue` resolveAutoContinue refuses.
+ * The constructor runs it first, so the rule holds wherever
  * an Agent is built. `create()` also runs it for each of its agents before
  * anything opens, and `createEphemeralAgent` before it reserves the name, so a
  * refusal there leaves nothing behind. Membrane reads `thinking.enabled`, and
@@ -142,6 +144,33 @@ export function assertAgentSwitches(config: AgentConfig): void {
     'true keeps a response whose whole prose is a tool-call-shaped wrapper from running or entering the agent\'s history, ' +
       'and false or leaving it out doesn\'t',
   );
+  resolveAutoContinue(config);
+}
+
+/** `AutoContinueConfig.maxConsecutive` when left out. */
+export const DEFAULT_AUTO_CONTINUE_MAX = 3;
+/** The most continuations in a row a config may ask for. */
+const MAX_AUTO_CONTINUE_MAX = 20;
+
+/**
+ * `AgentConfig.autoContinue` resolved: undefined when off (left out, null or
+ * false), else its cap. Anything else is refused: `true`, or an object whose
+ * `maxConsecutive` is left out or a whole number from 1 to 20.
+ */
+export function resolveAutoContinue(config: AgentConfig): { maxConsecutive: number } | undefined {
+  const setting = `Agent "${config.name}" autoContinue`;
+  const value = config.autoContinue;
+  if (value === true) return { maxConsecutive: DEFAULT_AUTO_CONTINUE_MAX };
+  if (!holdsSettings(setting, value, '{ maxConsecutive: 3 }')) return undefined;
+  const max = (value as AutoContinueConfig).maxConsecutive;
+  if (max === undefined) return { maxConsecutive: DEFAULT_AUTO_CONTINUE_MAX };
+  if (typeof max !== 'number' || !Number.isInteger(max) || max < 1 || max > MAX_AUTO_CONTINUE_MAX) {
+    throw new Error(
+      `${setting}.maxConsecutive must be a whole number from 1 to ${MAX_AUTO_CONTINUE_MAX}, not ${JSON.stringify(max) ?? String(max)}: ` +
+        'the most turns in a row that continue without skip_reply before the agent waits for the next event',
+    );
+  }
+  return { maxConsecutive: max };
 }
 
 /**
@@ -174,6 +203,9 @@ export class Agent {
   readonly proseRouting: 'locus' | 'explicit' | 'hybrid' | 'disabled';
   /** Exact whole-response known-tool wrapper containment (default off). */
   readonly toolWrapperProseGuard: boolean;
+  /** Continuation after a turn the model ends itself (see
+   *  AgentConfig.autoContinue); undefined when off. */
+  readonly autoContinue: { maxConsecutive: number } | undefined;
   /** Clock rows' interval and precision (see AgentConfig.clock); undefined
    *  when the agent writes none of its own (a resident still reads those
    *  another resident writes into the shared slot). */
@@ -307,7 +339,8 @@ export class Agent {
     this.toolResultGuard = new ToolResultGuard(config.name, contextManager, config.toolResultGuard === true);
     this.proseRouting = config.proseRouting ?? 'locus';
     this.toolWrapperProseGuard = config.toolWrapperProseGuard === true;
-    this.clock = resolveClockConfig(config.name, config.clock);
+    this.autoContinue = resolveAutoContinue(config);
+    this.clock =resolveClockConfig(config.name, config.clock);
     this.cacheTtl = config.cacheTtl ?? '1h';
     this.promptCaching = config.promptCaching !== false;
     this.prefillUserMessage = config.prefillUserMessage;

@@ -9,6 +9,13 @@ export type SameRoundThinkTextPolicySource =
   | 'recipe'
   | 'compatibility_default';
 
+/** `AgentConfig.autoContinue` as an object (`true` means `{}`). */
+export interface AutoContinueConfig {
+  /** Continuations in a row before the agent waits for the next event:
+   *  a whole number, 1 to 20. Default 3. */
+  maxConsecutive?: number;
+}
+
 /**
  * Configuration for an agent.
  */
@@ -218,6 +225,28 @@ export interface AgentConfig {
    * content-free system receipt is stored instead. Default false.
    */
   toolWrapperProseGuard?: boolean;
+
+  /**
+   * Continue on the agent's own turn ending (off when left out): a turn the
+   * model ends itself (stop reason `end_turn` or `stop_sequence`), whether
+   * its last response is prose or empty, is followed by another turn,
+   * instead of a pause until the next event. A turn ended through
+   * `skip_reply` (or another tool that ends the turn, such as `sleep`), or
+   * whose last prose envelope is `>>skip_reply` (explicit) or `>>>skip_reply`
+   * (hybrid), pauses as usual.
+   *
+   * Before the next turn a short system notice joins the window, after the
+   * turn's `[delivered]` receipt, saying that the turn continues and that
+   * skip_reply stops it; near the cap it also says how many continuations
+   * are left. The next turn keeps the turn's locus (locus and hybrid modes).
+   * At most `maxConsecutive` (default 3) continuations run in a row: the
+   * count starts again when a turn starts with a cause of its own (a
+   * message, a heartbeat, a timer) or a tool ends one. Silent heartbeat
+   * ticks, refusals, `max_tokens` cut-offs, the stall guard's ends and
+   * ephemeral runs never continue. A ` !` continuation the turn asked for
+   * runs instead, and counts toward nothing. See docs/auto-continue.md.
+   */
+  autoContinue?: boolean | AutoContinueConfig;
 
   /**
    * Clock rows (off when left out): when a boundary of this interval on the
