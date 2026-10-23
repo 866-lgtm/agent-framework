@@ -547,7 +547,7 @@ describe('MCPL inference router: a request the routing policy names no model for
       policy,
       (event) => { traces.push(event); },
     );
-    const ask = async (serverId: string, featureSet: string, stream = false, conversationId?: string) => {
+    const ask = async (serverId: string, featureSet: string, stream = false, conversationId?: string, noChunks = false) => {
       const answers: Array<{ result?: McplInferenceRequestResult; error?: { code: number; message: string; data?: unknown } }> = [];
       await router.handleInferenceRequest(serverId, {
         featureSet,
@@ -558,7 +558,7 @@ describe('MCPL inference router: a request the routing policy names no model for
         requestId: 7,
         respond: (result) => { answers.push({ result }); },
         respondError: (code, message, data) => { answers.push({ error: { code, message, data } }); },
-        sendChunk: () => { throw new Error('a refused request sends no chunk'); },
+        ...(noChunks ? {} : { sendChunk: () => { throw new Error('a refused request sends no chunk'); } }),
       });
       return answers;
     };
@@ -593,7 +593,9 @@ describe('MCPL inference router: a request the routing policy names no model for
       // inferenceRequest, so not -32002.
       assert.deepStrictEqual(answers, [{ error: { code: -32603, message: NO_POLICY, data: undefined } }]);
       assert.deepStrictEqual(reached, []);
-      assert.deepStrictEqual(traces, [], 'no inference started, so none is traced');
+      // The failure a trace watcher saw when this failed at the provider,
+      // with no inference_start, since none started.
+      assert.deepStrictEqual(traces, [{ type: 'mcpl:inference_fail', serverId: 'srv', model: null, error: NO_POLICY, streamed: stream }]);
     });
   }
 
@@ -603,29 +605,43 @@ describe('MCPL inference router: a request the routing policy names no model for
     const lines = await logged(async () => {
       answered.push((await ask('srv-a', 'memory.consolidation')).length);
       answered.push((await ask('srv-a', 'memory.consolidation')).length);
+      answered.push((await ask('srv-a', 'drafts')).length);
       answered.push((await ask('srv-b', 'memory.consolidation')).length);
     });
 
-    assert.deepStrictEqual(answered, [1, 1, 1]);
+    assert.deepStrictEqual(answered, [1, 1, 1, 1]);
     assert.deepStrictEqual(lines, [
-      '[mcpl] srv-a: inference/request refused: the host sets no inference routing policy; set inferenceRouting in the framework config to choose the model server-initiated inference runs on. This line prints once per server; later refusals are answered but not logged.',
-      '[mcpl] srv-b: inference/request refused: the host sets no inference routing policy; set inferenceRouting in the framework config to choose the model server-initiated inference runs on. This line prints once per server; later refusals are answered but not logged.',
+      '[mcpl] srv-a: inference/request refused: the host sets no inference routing policy (inferenceRouting); set inferenceRouting in the framework config to choose the model server-initiated inference runs on. This line prints once per server; later refusals are answered and traced but not logged.',
+      '[mcpl] srv-b: inference/request refused: the host sets no inference routing policy (inferenceRouting); set inferenceRouting in the framework config to choose the model server-initiated inference runs on. This line prints once per server; later refusals are answered and traced but not logged.',
     ]);
   });
 
-  it('logs once per server across feature sets, naming what to give the policy, and the server and feature set as given', async () => {
-    const { ask } = refusingRouter({ default: '' });
+  it('traces a refused request that asked to stream but has no way to send chunks as not streamed', async () => {
+    const { ask, traces } = refusingRouter(null);
+    await logged(async () => { await ask('srv', 'notes', true, undefined, true); });
+
+    assert.deepStrictEqual(traces, [{ type: 'mcpl:inference_fail', serverId: 'srv', model: null, error: NO_POLICY, streamed: false }]);
+  });
+
+  it('logs once per server and feature set with a policy, naming what to give it, and the server and feature set as given', async () => {
+    const { ask, traces } = refusingRouter({ default: '' });
     const odd = 'notes\u200b=x';
     const server = 'srv\n[mcpl] other: forged';
     const answered: Array<Awaited<ReturnType<typeof ask>>> = [];
     const lines = await logged(async () => {
       answered.push(await ask(server, odd));
+      answered.push(await ask(server, odd));
       answered.push(await ask(server, 'drafts'));
+      answered.push(await ask('srv-2', odd));
     });
 
-    assert.deepStrictEqual(answered.map((a) => a[0]?.error?.code), [-32603, -32603]);
-    assert.strictEqual(lines.length, 1, lines.join('\n'));
-    assert.ok(lines[0]!.includes('; give it a default, or a byFeature or wildcards entry for that feature set. This line prints once per server'), lines[0]);
+    assert.deepStrictEqual(answered.map((a) => a[0]?.error?.code), [-32603, -32603, -32603, -32603]);
+    assert.strictEqual(traces.length, 4, 'every refusal is traced');
+    assert.deepStrictEqual(traces[0], { type: 'mcpl:inference_fail', serverId: server, model: null, error: noModelFor(odd), streamed: false });
+    assert.strictEqual(lines.length, 3, lines.join('\n'));
+    assert.match(lines[2]!, /^\[mcpl\] srv-2: /);
+    assert.ok(lines[0]!.includes('; give it a default, or a byFeature or wildcards entry for that feature set. This line prints once per server and feature set; later refusals are answered and traced but not logged.'), lines[0]);
+    assert.ok(lines[1]!.includes('names no model for feature set drafts;'), lines[1]);
     assert.ok(!lines[0]!.includes('\u200b'), 'the invisible character is shown escaped');
     const shown = /feature set ("[^"]*")/.exec(lines[0]!)![1]!;
     assert.strictEqual(JSON.parse(shown), odd, 'the operator can read back exactly the name the server sent');

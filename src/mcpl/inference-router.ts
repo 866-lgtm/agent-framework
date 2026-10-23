@@ -182,9 +182,9 @@ export class InferenceRouter {
   private featureSetManager: FeatureSetManager;
   private routingPolicy: InferenceRoutingPolicy | null;
   private emitTraceFn: (event: { type: string; [key: string]: unknown }) => void;
-  /** The servers whose refusal for want of a model has been logged: one
-   *  line each, so a server that keeps asking doesn't flood the operator's
-   *  log, and the set holds no more than the host's servers. */
+  /** The refusals for want of a model that have been logged: one line per
+   *  server with no policy, and per server and feature set with one, so a
+   *  server that keeps asking doesn't flood the operator's log. */
   private loggedRefusals = new Set<string>();
 
   constructor(
@@ -238,6 +238,12 @@ export class InferenceRouter {
       return;
     }
 
+    // Streaming needs a way to send chunks and an id to tag them with;
+    // without either, the request is answered whole.
+    const sendChunk = params.stream ? responder.sendChunk?.bind(responder) : undefined;
+    const chunkRequestId = sendChunk ? responder.requestId : undefined;
+    const streamed = chunkRequestId != null;
+
     // 3. Resolve model. With no routing policy, or one that names no model
     // for this feature set, the operator has chosen no model for this
     // server's inference: refused rather than guessed, since a model picked
@@ -252,26 +258,40 @@ export class InferenceRouter {
     );
     if (model === undefined) {
       const policy = Boolean(this.routingPolicy);
-      const why = policy
-        ? `the inference routing policy (inferenceRouting) names no model for feature set ${JSON.stringify(params.featureSet)}`
+      // One reason, quoted for where it goes: JSON for the server, logValue
+      // for the host log.
+      const reason = (quote: (value: string) => string) => policy
+        ? `the inference routing policy (inferenceRouting) names no model for feature set ${quote(params.featureSet)}`
         : 'the host sets no inference routing policy (inferenceRouting)';
-      if (!this.loggedRefusals.has(serverId)) {
-        this.loggedRefusals.add(serverId);
+      const message = `inference/request refused: ${reason(JSON.stringify)}, so the host has no model to run it on; ` +
+        "it stays refused until the host's operator configures one";
+      // Logged once per server with no policy, and once per server and
+      // feature set with one, since each feature set the policy misses is
+      // its own entry to add; validateInbound (step 1) bounds feature sets
+      // to those the server declares.
+      const key = JSON.stringify(policy ? [serverId, params.featureSet] : [serverId]);
+      if (!this.loggedRefusals.has(key)) {
+        this.loggedRefusals.add(key);
         console.error(
-          `[mcpl] ${logValue(serverId)}: inference/request refused: ` +
+          `[mcpl] ${logValue(serverId)}: inference/request refused: ${reason(logValue)}; ` +
             (policy
-              ? `the inference routing policy names no model for feature set ${logValue(params.featureSet)}; ` +
-                'give it a default, or a byFeature or wildcards entry for that feature set'
-              : 'the host sets no inference routing policy; ' +
-                'set inferenceRouting in the framework config to choose the model server-initiated inference runs on') +
-            '. This line prints once per server; later refusals are answered but not logged.',
+              ? 'give it a default, or a byFeature or wildcards entry for that feature set. ' +
+                'This line prints once per server and feature set'
+              : 'set inferenceRouting in the framework config to choose the model server-initiated inference runs on. ' +
+                'This line prints once per server') +
+            '; later refusals are answered and traced but not logged.',
         );
       }
-      responder.respondError(
-        -32603,
-        `inference/request refused: ${why}, so the host has no model to run it on; ` +
-          "it stays refused until the host's operator configures one",
-      );
+      // The failure a trace watcher saw when this request failed at the
+      // provider, still seen; no inference_start, since none started.
+      this.emitTraceFn({
+        type: 'mcpl:inference_fail',
+        serverId,
+        model: null,
+        error: message,
+        streamed,
+      });
+      responder.respondError(-32603, message);
       return;
     }
 
@@ -298,12 +318,6 @@ export class InferenceRouter {
         temperature: params.preferences?.temperature,
       },
     };
-
-    // Streaming needs a way to send chunks and an id to tag them with;
-    // without either, the request is answered whole.
-    const sendChunk = params.stream ? responder.sendChunk?.bind(responder) : undefined;
-    const chunkRequestId = sendChunk ? responder.requestId : undefined;
-    const streamed = chunkRequestId != null;
 
     try {
       // 5. Run inference. Both modes end in membrane's response, and one
