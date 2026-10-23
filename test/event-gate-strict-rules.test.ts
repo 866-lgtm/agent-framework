@@ -1198,7 +1198,7 @@ test('a first start that can\'t create gate.json runs the starting rules, and sa
   assert.equal(status.default, 'skip');
   assert.deepEqual(names(gate), ['user-input']);
   assert.equal(status.errors.length, 1);
-  assert.match(status.errors[0]!, /^At start, gate\.json couldn't be created \(EACCES[^)]*\), so the host's starting rules are in force but aren't saved in it\.$/);
+  assert.match(status.errors[0]!, /^At start, gate\.json couldn't be created \(EACCES[^)]*\), so the host's starting rules are in force but aren't saved in it\. Whoever runs this host can fix what keeps it from being written\.$/);
 
   // Someone writes gate.json, and a reload applies it: the rules in force are its own.
   chmodSync(dir, 0o755);
@@ -1239,7 +1239,8 @@ test('a first start whose write of the starting rules fails partway runs them, a
   assert.notEqual(parsed, '', 'the half written is not JSON');
   assert.equal(fileError, unused(parsed, "the host's starting rules"));
   assert.equal(unsaved, 'At start, writing the host\'s starting rules to gate.json failed partway (ENOSPC: no space left on device, write), so '
-    + 'gate.json may be left part-written. The starting rules are in force but aren\'t saved in it.');
+    + 'gate.json may be left part-written. The starting rules are in force but aren\'t saved in it. Whoever runs this host can fix '
+    + 'what kept it from being written, and gate.json.');
   assert.deepEqual(rest, []);
 });
 
@@ -1623,7 +1624,7 @@ test("a later start over a gate.json with a rule list but no rules of its own, w
   t.after(() => several.gate.dispose());
   const severalOut = 'the host\'s starting rules would leave out "limited" and 2 with no name, which could wake the agent, and the host\'s '
     + '"dm" and "thread", which could wake the agent, would be kept out by gate.json\'s rules of those names, which the gate leaves out';
-  const severalFix = 'both fixing "limited" and 2 with no name in the starting rules and fixing gate.json\'s "dm" and "thread"';
+  const severalFix = 'both fixing "limited" and 2 with no name in the starting rules, and fixing gate.json\'s "dm" and "thread"';
   const severalSaid = several.gate.getStatus().errors;
   assert.ok(severalSaid[0]!.endsWith(`gate.json has no rules but ones the gate leaves out, so ${notUsedFor(severalOut, severalFix)}.`), severalSaid[0]);
   assert.equal(severalSaid[severalSaid.length - 1], startSaidFor(severalOut, severalFix));
@@ -1806,7 +1807,8 @@ test('a reconcile whose write leaves gate.json unable to load runs what it read 
   assert.equal(fileError, unused(parsed, 'the rules it read from gate.json at start and the ones it was adding'));
   const partway = (error: string, read = '.'): string => `At start, adding the host's starting rules "tickets" to gate.json failed partway (${error}), so `
     + `gate.json may be left part-written. The gate runs the rules it read from gate.json and the ones it was adding, which aren't saved${read} `
-    + 'A restart before gate.json is fixed starts from the host\'s starting rules.';
+    + 'A restart before gate.json is fixed starts from the host\'s starting rules. Whoever runs this host can fix what kept it '
+    + 'from being written, and gate.json.';
   // gate.json's own entry is now its load error, so the start's names what those rules hold that the gate reads past or leaves out.
   assert.equal(unsaved, partway(
     'ENOSPC: no space left on device, write',
@@ -2007,6 +2009,14 @@ test('wake_add_rule refuses a behavior, or a placement, of the wrong kind in its
       + `Put it in "match". Its parameters are ${parameters}.`),
     long.content,
   );
+  // Of two fields of one parameter, one too long to show whole: the parameter is named alone.
+  const longer = await call({ name: 'watch', tagsAny: ['chat:ambient'], channel: `discord:*:${'1'.repeat(90)}`, behavior: 'skip' });
+  assert.equal(longer.isError, true);
+  assert.ok(
+    longer.content.includes(`wake_add_rule has "tagsAny" and "channel", fields of "match", which it doesn't take here, so nothing `
+      + `was saved. Put them in "match". Its parameters are ${parameters}.`),
+    longer.content,
+  );
   // Two fields of one parameter are shown there together.
   const both = await call({ name: 'watch', tagsAny: ['chat:ambient'], source: 'discord', behavior: 'skip' });
   assert.equal(both.isError, true);
@@ -2111,6 +2121,10 @@ test('wake_add_rule refuses a behavior, or a placement, of the wrong kind in its
   const description = framework.getAllTools().find((tool) => tool.name === 'wake_add_rule')!.description;
   assert.ok(description.includes('debounceMs: 60000'), 'the example uses the shorthand, which works in both tool modes');
   assert.ok(!description.includes('behavior: { debounce'), 'and no longer the object form');
+  // A removed rule's batch goes the way its timer's would, held while the agent's turn runs.
+  const removing = framework.getAllTools().find((tool) => tool.name === 'wake_remove_rule')!.description;
+  assert.ok(removing.includes('is still delivered, held while your turn runs, as its timer would deliver it'), removing);
+  assert.ok(!removing.includes('delivered first'), removing);
   // Each of the description's examples, made as the call it shows, is saved as it reads.
   const examples = [...description.matchAll(/`(\{ name: "[^`]+\})`/g)]
     .map((m) => new Function(`return (${m[1]});`)() as Record<string, unknown>);
@@ -2473,38 +2487,47 @@ test("a change whose write of gate.json fails says whether gate.json was changed
   const { gate, configPath } = makeGate(tempDir(t), { file: { policies: [MENTIONS] } });
   const before = readFileSync(configPath, 'utf-8');
   const original = fs.writeFileSync;
-  /** A change whose write fails as `syscall` reports, after writing `landed` of its text. */
-  const failing = (syscall: string, error: string, landed: number): string => {
-    const write = t.mock.method(fs, 'writeFileSync', (path: unknown, data: unknown) => {
+  const asWas = (error: string): string => `gate.json couldn't be written (${error}), so nothing was saved: the rules in force and `
+    + 'gate.json stay as they were. Whoever runs this host can fix what keeps it from being written.';
+  const partway = (error: string): string => `Writing gate.json failed partway (${error}), so the change isn't in force: the rules in `
+    + 'force stay as they were. gate.json may hold the whole change, which the gate reads at its next reload, or part of it, or '
+    + 'nothing. Whoever runs this host can fix what kept it from being written, and check what gate.json holds.';
+  /** A change whose `call` fails as `syscall` reports, after writing `landed` characters of its text. */
+  const failing = (call: 'mkdirSync' | 'writeFileSync', syscall: string, error: string, landed = 0): string => {
+    const cause = Object.assign(new Error(error), { code: error.split(':')[0], syscall });
+    const mock = t.mock.method(fs, call, (path: unknown, data: unknown) => {
       if (landed > 0) original(path as string, String(data).slice(0, landed));
-      throw Object.assign(new Error(error), { code: error.split(':')[0], syscall });
+      throw cause;
     });
     syncBuiltinESMExports();
+    let thrown: unknown;
     try {
       gate.addPolicy({ name: 'dm', match: { tagsAny: ['chat:dm'] }, behavior: 'always' });
-      return '(nothing was thrown)';
     } catch (err) {
-      return (err as Error).message;
+      thrown = err;
     } finally {
-      write.mock.restore();
+      mock.mock.restore();
       syncBuiltinESMExports();
     }
+    assert.ok(thrown instanceof Error, `the change throws when ${syscall} fails`);
+    assert.equal(thrown.cause, cause, 'with the filesystem error as its cause');
+    return thrown.message;
   };
-  // Its open fails: nothing was written.
-  assert.equal(
-    failing('open', "EACCES: permission denied, open 'gate.json'", 0),
-    "gate.json couldn't be written (EACCES: permission denied, open 'gate.json'), so nothing was saved, and gate.json is as it "
-    + 'was. Whoever runs this host can fix what keeps it from being written.',
-  );
+  // Its directory or its open fails: nothing was written.
+  assert.equal(failing('mkdirSync', 'mkdir', "EACCES: permission denied, mkdir 'state'"), asWas("EACCES: permission denied, mkdir 'state'"));
+  assert.equal(failing('writeFileSync', 'open', "EACCES: permission denied, open 'gate.json'"), asWas("EACCES: permission denied, open 'gate.json'"));
   assert.equal(readFileSync(configPath, 'utf-8'), before);
   // It fails partway: what landed is there.
-  assert.equal(
-    failing('write', 'ENOSPC: no space left on device, write', 10),
-    'Writing gate.json failed partway (ENOSPC: no space left on device, write), so the change isn\'t in force, and gate.json may '
-    + 'be left part-written. Whoever runs this host can fix what kept it from being written, and gate.json.',
-  );
+  assert.equal(failing('writeFileSync', 'write', 'ENOSPC: no space left on device, write', 10), partway('ENOSPC: no space left on device, write'));
   assert.equal(readFileSync(configPath, 'utf-8').length, 10);
   assert.deepEqual(names(gate), ['mentions'], 'the rules in force stay');
+  // Its close fails after the whole text landed: the next reload reads the change.
+  writeFileSync(configPath, before);
+  assert.equal(failing('writeFileSync', 'close', 'EIO: i/o error, close', Infinity), partway('EIO: i/o error, close'));
+  assert.deepEqual(onDisk(configPath).policies.map((rule) => rule.name), ['mentions', 'dm']);
+  (gate as unknown as { lastReloadCheck: number }).lastReloadCheck = 0;
+  gate.evaluate(MENTION);
+  assert.deepEqual(names(gate), ['mentions', 'dm'], 'the next reload reads the whole change');
 });
 
 test('a removal by a name that is not a non-empty string finds no rule, so rules gate.json holds with no name stay', (t) => {
@@ -2513,4 +2536,39 @@ test('a removal by a name that is not a non-empty string finds no rule, so rules
   const before = readFileSync(configPath, 'utf-8');
   for (const name of [undefined, '', null, 5]) assert.equal(gate.removePolicy(name as unknown as string), false, String(name));
   assert.equal(readFileSync(configPath, 'utf-8'), before);
+});
+
+test("a change that would leave a gate.json the gate doesn't use with no rules in force is refused, since its default would hold back every event", (t) => {
+  t.mock.method(console, 'error', () => {});
+  // Its one rule names no kind, so the gate leaves it out, and under "skip" doesn't use the file.
+  const deafening = { default: 'skip', policies: [{ name: 'x', match: {}, behavior: {} }] };
+  const refused = (runs: string): string => 'Nothing was saved: with this change, gate.json would have no rules of its own, and its '
+    + `default would hold back every event. Meanwhile the gate runs ${runs}. Replacing "x" by name would bring gate.json into force.`;
+  const starting = { default: 'skip', policies: [MENTIONS] };
+
+  // At a later start, which runs the host's starting rules in its place.
+  const later = makeGate(tempDir(t), { file: deafening, initialConfig: starting });
+  const written = readFileSync(later.configPath, 'utf-8');
+  assert.throws(() => later.gate.removePolicy('x'), { message: refused("the host's starting rules") });
+  assert.equal(readFileSync(later.configPath, 'utf-8'), written, 'nothing was written');
+  assert.equal(later.gate.evaluate(MENTION).trigger, true, 'the starting rules still wake the agent');
+  // A replacement that leaves it a rule in force brings it into force.
+  later.gate.addPolicy({ name: 'x', match: { tagsAny: ['chat:dm'] }, behavior: 'always' });
+  assert.deepEqual(names(later.gate), ['x']);
+
+  // At a reload, which keeps the rules in force.
+  const reload = makeGate(tempDir(t), { file: { default: 'skip', policies: [MENTIONS] } });
+  writeFileSync(reload.configPath, JSON.stringify(deafening));
+  (reload.gate as unknown as { lastReloadCheck: number }).lastReloadCheck = 0;
+  assert.equal(reload.gate.evaluate(MENTION).trigger, true);
+  assert.match(reload.gate.getStatus().errors.join(' '), /isn't in force/, 'the reload read it');
+  assert.deepEqual(names(reload.gate), ['mentions'], 'and kept the rules in force');
+  assert.throws(() => reload.gate.removePolicy('x'), { message: refused(RUNS_LAST) });
+  assert.equal(reload.gate.evaluate(MENTION).trigger, true);
+
+  // Beside another rule the removal leaves, it's offered and goes through.
+  const beside = makeGate(tempDir(t), { file: { default: 'skip', policies: [{ name: 'x', match: {}, behavior: {} }, MENTIONS] }, initialConfig: starting });
+  assert.throws(() => beside.gate.addPolicy({ name: 'y', behavior: 'skip' }), /Replacing or removing "x" by name would bring gate\.json into force\.$/);
+  assert.equal(beside.gate.removePolicy('x'), true);
+  assert.deepEqual(names(beside.gate), ['mentions']);
 });

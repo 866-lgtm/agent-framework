@@ -9199,8 +9199,9 @@ export class AgentFramework {
       name: 'wake_remove_rule',
       description:
         'Remove a wake rule (gate.json policy) by name at runtime. Any pending ' +
-        'debounce batch for that rule is delivered first. Returns whether a rule ' +
-        'was removed (false if no rule had that name).',
+        'debounce batch for that rule is still delivered, held while your turn runs, as ' +
+        'its timer would deliver it. Returns whether a rule was removed (false if no ' +
+        'rule had that name).',
       inputSchema: {
         type: 'object',
         properties: {

@@ -188,6 +188,8 @@ test("over a gate.json that isn't JSON, a change is refused before an anchor or 
   assert.throws(() => gate.addPolicy({ name: 'ambient', behavior: 'defer' }, { position: { before: 'half-made' } }), { message: notJson(parseError(BROKEN)) });
   // Not false: the file may hold the rule.
   assert.throws(() => gate.removePolicy('half-made'), { message: notJson(parseError(BROKEN)) });
+  // A name that isn't a non-empty string names no rule in any file.
+  assert.equal(gate.removePolicy(''), false);
 
   assert.deepEqual(readdirSync(dir), ['gate.json']);
   assert.equal(readFileSync(configPath, 'utf-8'), BROKEN);

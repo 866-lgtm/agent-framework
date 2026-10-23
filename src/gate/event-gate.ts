@@ -864,8 +864,10 @@ const BEHAVIORS_NEEDED = '"always", "defer" or "skip", or an object holding one 
 
 /**
  * A rule's behavior: "always" when left out; one of the three names; or an
- * object holding one of the timing kinds. Anything else but a list was read as
- * "always", a rule that wakes on every event it matches, and is read so. Of
+ * object holding one of the timing kinds. Anything else but a list or an
+ * object was read as "always", a rule that wakes on every event it matches,
+ * and is read so; a list, or an object holding none of the kinds, was
+ * refused, and the rule is left out. Of
  * two kinds or more, "debounce", then "rate_limit", then "passive_sample" was
  * the one read, whatever their order, and is read so. Each other kind is read
  * on its own as well, so that a refusal names its problems too, and a load
@@ -1522,9 +1524,11 @@ function outOfForce(write: Extract<StartWrite, { kind: 'start-without' }>): { sa
       + `${held.length === 1 ? 'rule of that name' : 'rules of those names'}, which the gate leaves out`);
     fix.push(`fixing gate.json's ${quotedList(held)}`);
   }
-  // Every one of them has to be put in force for gate.json to be used, so where
-  // both kinds keep it out, both fixes are needed.
-  return said.length > 0 ? { said: said.join(', and '), fix: fix.length > 1 ? `both ${fix.join(' and ')}` : fix[0]! } : null;
+  // While gate.json has no rules of its own, every one of them has to be put
+  // in force for it to be used, so where both kinds keep it out, both fixes
+  // are needed; giving gate.json rules of its own is the other way, which the
+  // entry gives first.
+  return said.length > 0 ? { said: said.join(', and '), fix: fix.length > 1 ? `both ${fix.join(', and ')}` : fix[0]! } : null;
 }
 
 /**
@@ -1557,9 +1561,11 @@ function describeUnsaved(starting: StartingRules, write: StartWrite, loaded: boo
   if (loaded) return null;
   if (write.kind === 'seed-failed') {
     return write.atOpen
-      ? `At start, gate.json couldn't be created (${write.error}), so the host's starting rules are in force but aren't saved in it.`
+      ? `At start, gate.json couldn't be created (${write.error}), so the host's starting rules are in force but aren't saved in it. `
+        + 'Whoever runs this host can fix what keeps it from being written.'
       : `At start, writing the host's starting rules to gate.json failed partway (${write.error}), so gate.json may be left `
-        + "part-written. The starting rules are in force but aren't saved in it.";
+        + "part-written. The starting rules are in force but aren't saved in it. Whoever runs this host can fix what kept it "
+        + 'from being written, and gate.json.';
   }
   if (write.kind === 'reconcile-failed') {
     const what = write.atOpen
@@ -1571,7 +1577,8 @@ function describeUnsaved(starting: StartingRules, write: StartWrite, loaded: boo
     // gate.json's own entry is now its load error.
     const read = write.sentences?.length ? `, read as a load reads them: ${write.sentences.join(' ')}` : '.';
     return `At start, ${what}. The gate runs the rules it read from gate.json and the ones it was adding, which aren't saved${read} `
-      + `A restart before gate.json is fixed starts from ${starting.config ? "the host's starting rules" : 'no rules'}.`;
+      + `A restart before gate.json is fixed starts from ${starting.config ? "the host's starting rules" : 'no rules'}. `
+      + 'Whoever runs this host can fix what kept it from being written, and gate.json.';
   }
   return null;
 }
@@ -1929,7 +1936,8 @@ export class EventGate {
       if (this.configNote) console.error(`[gate] ${this.configNote}`);
     } else if (write.kind === 'reconcile-failed') {
       this.config = write.config;
-      // Its text is what a change then edits, so every rule it holds keeps its name.
+      // A change over the part-written gate.json is refused; once gate.json is
+      // gone, this text is what a change edits, so every rule it holds keeps its name.
       this.configText = write.text;
       this.configNote = write.note ?? null;
       this.configSource = 'file';
@@ -2212,10 +2220,14 @@ export class EventGate {
       const names = [...new Set(read.silenced ?? [])];
       const only = names.length === 1 ? names[0] : undefined;
       const sharing = only === undefined ? 0 : edit.rules.filter((rule) => nameOf(rule) === only).length;
+      // A removal that would leave no rules in force is refused (writeConfig),
+      // so it isn't offered.
+      const rest = readConfig({ ...edit.top, policies: edit.rules.filter((rule) => nameOf(rule) !== only) }, 'gate.json');
+      const removes = !('refused' in rest) && rest.config.policies.length > 0;
       return {
         ...edit,
         remedy: sharing === 1
-          ? `Replacing or removing "${only}" by name would bring gate.json into force.`
+          ? `${removes ? 'Replacing or removing' : 'Replacing'} "${only}" by name would bring gate.json into force.`
           : sharing > 1
             ? `gate.json has ${sharing} rules named "${only}", and a change by that name replaces the first of them or removes them all.`
             : 'No change through the gate can bring it into force, so gate.json has to be fixed by an edit of its own; '
@@ -2357,7 +2369,8 @@ export class EventGate {
    * holds, such as a list of rules parked under another name, beside which a
    * change adds a "policies" list where there's none (rulesForChange). Over a
    * gate.json the gate doesn't use, only a change after which it loads is
-   * written, such as one replacing or removing the rule that keeps it out; any
+   * written, such as one replacing or removing the rule that keeps it out, and
+   * that leaves it rules in force, since it holds events back by default; any
    * other is refused, naming what does, and the file stays as written. When
    * gate.json is absent, the change edits the text whose rules are in force the
    * same way, or the rules in force where there's none. A gate.json that can't
@@ -2379,7 +2392,9 @@ export class EventGate {
    * a gate.json that can't be read or isn't JSON, one with no rule list it
    * could edit without writing over what it holds, one a start didn't use,
    * which runs as one without it does, while it's unchanged, or one the gate
-   * doesn't use that the change doesn't mend; and throws when the write fails.
+   * doesn't use that the change doesn't mend or would leave with no rules in
+   * force; and throws when the write fails, which may leave gate.json
+   * part-written.
    */
   addPolicy(
     rawPolicy: unknown,
@@ -2441,14 +2456,17 @@ export class EventGate {
    * debounce batch is sent once the removal is written and in force, as its
    * timer would have sent it, so buffered events aren't silently dropped
    * (clearStateFor). Freshest on-disk config is re-read first, and every other
-   * rule is written back as it was written (see addPolicy). Throws, writing
-   * nothing, for a gate.json that can't be read or isn't JSON, one with no
-   * rule list it could edit, or one a start didn't use, as addPolicy does.
-   * Otherwise returns false, writing nothing, if no policy of that name exists,
-   * gate.json's own rules included, so one the gate leaves out can be removed
-   * by name too. For a name it holds, throws, writing nothing, for a gate.json
-   * the gate doesn't use that the removal doesn't mend, and when the write
-   * fails; the rule then stays in force, with its state.
+   * rule is written back as it was written (see addPolicy). A name that isn't
+   * a non-empty string names no rule, so it returns false, writing nothing,
+   * whatever gate.json holds. Otherwise it throws, writing nothing, for a
+   * gate.json that can't be read or isn't JSON, one with no rule list it could
+   * edit, or one a start didn't use, as addPolicy does, and returns false,
+   * writing nothing, if no policy of that name exists, gate.json's own rules
+   * included, so one the gate leaves out can be removed by name too. For a name
+   * it holds, it throws, writing nothing, for a gate.json the gate doesn't use
+   * that the removal doesn't mend or would leave with no rules in force, and
+   * throws when the write fails, which may
+   * leave gate.json part-written; the rule then stays in force, with its state.
    */
   removePolicy(name: string): boolean {
     // nameOf gives undefined for a rule with no name, so a call from JavaScript
@@ -2484,9 +2502,12 @@ export class EventGate {
   /**
    * Persist gate.json and apply it in memory together: `top`, its own fields,
    * with `rules` as its rule list. Only what loads is written: a change to a
-   * gate.json the gate doesn't use, which doesn't mend what keeps it out, throws,
-   * naming that and `remedy`, what would bring it into force, and writes
-   * nothing. The rules in force are then what the text
+   * gate.json the gate doesn't use, for which `remedy` is given, what would
+   * bring it into force, throws, naming that and `remedy`, and writes nothing,
+   * where the change doesn't mend what keeps it out, or where it would leave
+   * gate.json with no rules in force: such a gate.json holds events back by
+   * default, so putting it in force would hold back every event, those the
+   * rules in force wake on included. The rules in force are then what the text
    * written reads as, as at a load, so what it still holds that the gate reads
    * past or leaves out stays named; the text is kept as `configText`, so
    * `reloadIfChanged` doesn't parse it again. Once the text is written and its
@@ -2507,15 +2528,24 @@ export class EventGate {
         `Nothing was saved: with this change, gate.json wouldn't be used. ${sentence(read.refused)}${remedy ? ` ${remedy}` : ''}`,
       );
     }
+    // One the gate doesn't use, and that a change can mend, holds back what a
+    // rule it leaves out would wake on, so its default holds events back.
+    if (remedy !== undefined && read.config.policies.length === 0) {
+      throw new Error(
+        'Nothing was saved: with this change, gate.json would have no rules of its own, and its default would hold back every '
+        + `event. Meanwhile the gate runs ${this.rulesRun()}. ${remedy}`,
+      );
+    }
     try {
       mkdirSync(dirname(this.configPath), { recursive: true });
       writeFileSync(this.configPath, text);
     } catch (err) {
       throw new Error(beforeWriting(err)
-        ? `gate.json couldn't be written (${errorText(err)}), so nothing was saved, and gate.json is as it was. Whoever `
-          + 'runs this host can fix what keeps it from being written.'
-        : `Writing gate.json failed partway (${errorText(err)}), so the change isn't in force, and gate.json may be left `
-          + 'part-written. Whoever runs this host can fix what kept it from being written, and gate.json.', { cause: err });
+        ? `gate.json couldn't be written (${errorText(err)}), so nothing was saved: the rules in force and gate.json stay `
+          + 'as they were. Whoever runs this host can fix what keeps it from being written.'
+        : `Writing gate.json failed partway (${errorText(err)}), so the change isn't in force: the rules in force stay as `
+          + 'they were. gate.json may hold the whole change, which the gate reads at its next reload, or part of it, or nothing. '
+          + 'Whoever runs this host can fix what kept it from being written, and check what gate.json holds.', { cause: err });
     }
     const was = this.config;
     this.configText = text;
