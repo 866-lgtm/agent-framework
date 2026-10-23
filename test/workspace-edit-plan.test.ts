@@ -552,20 +552,31 @@ test("an old text carrying a line's CR at its end matches before a CRLF line end
 test('an old text read without its BOM or CR is found in one pass over a long run of the same', () => {
   // Only the text's start, or a place before a CRLF line end, takes such an
   // old text, so the places it passes over are most of the run. Searching
-  // again from each, the planner compared the old text in full at every
-  // place: 3.3 s of CPU for the first of these and 5.3 s for the second, on
-  // Linux with Node 24.22.0.
+  // again from each with indexOf, the planner compared the old text in full
+  // at every place: 3.3 s of CPU for the first of these and 5.3 s for the
+  // second, on Linux with Node 24.22.0. In one pass, the read form is
+  // searched for by its code units (charCodeAt), a few for each of the
+  // text's, and never with indexOf; the old text as given is, once. Past a
+  // few such searches, or ten code units read for each of the text's, the
+  // counts throw.
   const run = 'a'.repeat(200_000);
   const needle = 'a'.repeat(50_000);
   for (const [text, oldText, newText, after] of [
     [`\uFEFF${run}`, `\uFEFF${needle}`, '\uFEFFb', `\uFEFFb${'a'.repeat(150_000)}`],
     [`${run}\r\n`, `${needle}\r`, 'b\r', `${'a'.repeat(150_000)}b\r\n`],
   ]) {
-    const before = process.cpuUsage();
-    const planned = plan(text!, [spec(0, oldText!, newText!)]);
-    const used = process.cpuUsage(before);
-    assert.ok((used.user + used.system) / 1000 < 500, `${(used.user + used.system) / 1000} ms of CPU`);
-    assert.equal(planned.bytes.toString(), after);
+    const bytes = Buffer.from(text!);
+    const file = decodeForEdit(bytes)!;
+    let read = 0;
+    const { result: planned, calls: searches } = countingCalls(String.prototype, 'indexOf', (_self, args) => typeof args[0] === 'string' && args[0].length >= needle.length, 4, () => {
+      const counted = countingCalls(String.prototype, 'charCodeAt', () => true, 10 * text!.length, () => planFile(file, bytes, [spec(0, oldText!, newText!)]));
+      read = counted.calls;
+      return counted.result;
+    });
+    assert.ok('plan' in planned, JSON.stringify(planned));
+    assert.equal(planned.plan.bytes.toString(), after);
+    assert.ok(searches <= 1, `${searches} searches for the old text with indexOf`);
+    assert.ok(read >= text!.length, `${read} code units read`);
   }
 });
 
