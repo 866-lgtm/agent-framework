@@ -24,6 +24,7 @@ import type {
   GatePolicyMatch,
   GateBehavior,
   GateDecision,
+  GateEntryRef,
   GateEventInfo,
   GatePolicyStats,
   GateStatus,
@@ -32,7 +33,7 @@ import type {
 } from './types.js';
 
 // Re-export types consumers need
-export type { GateConfig, GateOptions, GateDecision, GateEventInfo } from './types.js';
+export type { GateConfig, GateOptions, GateDecision, GateEntryRef, GateEventInfo } from './types.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -104,6 +105,10 @@ interface PendingEvent {
    *  whose `channelId` is the adapter's raw id (a bare Discord snowflake for a
    *  DM) — unroutable. Absent when the host could not resolve one. */
   routeChannelId?: string;
+  /** The event's own identity among what the framework stored at arrival:
+   *  a channel message's id, a push event's event id (isNewestEntry). */
+  messageId?: string;
+  eventId?: string;
 }
 
 /**
@@ -640,6 +645,7 @@ export class EventGate {
   private getAgentNamesFn: () => string[];
   private resolveRouteChannelFn: (info: GateEventInfo) => string | undefined;
   private channelShownFn?: (channel: { serverId: string; channelId: string }) => string;
+  private isNewestEntryFn?: (entry: GateEntryRef) => boolean;
   /** Clock injection — keeps the new rate_limit / passive_sample paths
    *  testable without monkey-patching Date.now globally. */
   private now: () => number;
@@ -670,6 +676,12 @@ export class EventGate {
      *  each channel so, since two servers' channels can share an id. Default:
      *  the id. */
     channelShown?: (channel: { serverId: string; channelId: string }) => string;
+    /** Whether an MCPL event's own context entry is still the newest entry in
+     *  the window a batched wake's line would be written to, with nothing
+     *  waiting to be written there. A batched wake for that one message
+     *  writes no line: the message, right above, is its whole cause. Absent:
+     *  every batched wake writes its line, as before. */
+    isNewestEntry?: (entry: GateEntryRef) => boolean;
   }) {
     this.configPath = opts.configPath;
     this.privilegedUsersPath = opts.privilegedUsersPath;
@@ -679,6 +691,7 @@ export class EventGate {
     this.getAgentNamesFn = opts.getAgentNames;
     this.resolveRouteChannelFn = opts.resolveRouteChannel ?? defaultRouteChannel;
     this.channelShownFn = opts.channelShown;
+    this.isNewestEntryFn = opts.isNewestEntry;
     this.now = opts.now ?? (() => Date.now());
     this.loadPrivileged();
 
@@ -1527,6 +1540,8 @@ export class EventGate {
       serverId: info.serverId || undefined,
       addressed: Array.isArray(info.tags) && info.tags.includes('chat:addressed'),
       routeChannelId: this.routeChannelFor(info),
+      ...(typeof info.metadata?.messageId === 'string' ? { messageId: info.metadata.messageId } : {}),
+      ...(typeof info.metadata?.eventId === 'string' ? { eventId: info.metadata.eventId } : {}),
     };
 
     const existing = this.debounceTimers.get(policy.name);
@@ -1626,12 +1641,28 @@ export class EventGate {
       }
     }
 
-    const text = `[Gate: ${events.length} event${events.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
-
-    this.addMessageFn('user', [{ type: 'text', text }], {
-      source: 'gate:debounce',
-      policies: policyNames,
-    });
+    // The line says which messages a wake is for. For one message that is
+    // still the newest thing in the window it would be written to, it says
+    // nothing the message right above doesn't: the wake runs without it, its
+    // provenance (and the reply's channel) unchanged. Several messages, one
+    // with anything after it, or content the line quotes, keep the line.
+    const only = events.length === 1 && events[0].inContext ? events[0] : undefined;
+    if (only && this.newestEntry(only)) {
+      const shownChannel = only.routeChannelId ?? only.channelId;
+      this.emitTrace({
+        type: 'gate:wake-line-omitted',
+        policyNames,
+        eventType: only.eventType,
+        ...(shownChannel !== undefined ? { channelId: shownChannel } : {}),
+        timestamp: Date.now(),
+      });
+    } else {
+      const text = `[Gate: ${events.length} event${events.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
+      this.addMessageFn('user', [{ type: 'text', text }], {
+        source: 'gate:debounce',
+        policies: policyNames,
+      });
+    }
 
     // Provenance of the batched wake (who/where woke the agent): the newest
     // ADDRESSED event first, else the newest event naming a channel or an
@@ -1643,6 +1674,22 @@ export class EventGate {
     const provenance = wakeProvenance(events);
     for (const agentName of this.getAgentNamesFn()) {
       this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);
+    }
+  }
+
+  /** isNewestEntry for one event; a callback fault keeps the line. */
+  private newestEntry(event: PendingEvent): boolean {
+    if (!this.isNewestEntryFn) return false;
+    try {
+      return this.isNewestEntryFn({
+        eventType: event.eventType,
+        ...(event.serverId !== undefined ? { serverId: event.serverId } : {}),
+        ...(event.channelId !== undefined ? { channelId: event.channelId } : {}),
+        ...(event.messageId !== undefined ? { messageId: event.messageId } : {}),
+        ...(event.eventId !== undefined ? { eventId: event.eventId } : {}),
+      }) === true;
+    } catch {
+      return false;
     }
   }
 
