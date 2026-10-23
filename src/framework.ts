@@ -28345,8 +28345,9 @@ export class AgentFramework {
     // content blocks are the exception: what a script prints comes back to
     // the model, so each gets the treatment RFC-005 gives it on every lane
     // the model reads, here, where the server that sent them is known, and
-    // so does what RFC-005 governs at any depth within them, as history's
-    // JSON stubs it (shownToScriptFromServer). A module's blocks get it at
+    // so does what RFC-005 governs at any depth within them, by the same
+    // peer reading, bound to that server (shownToScriptFromServer). A
+    // module's blocks get it at
     // the script lane's exit (scriptResultAnswer). A standard peer's blocks
     // reach the script as sent.
     const forScript = this.scriptToolWaiters?.has(call.id) ?? false;
@@ -28587,7 +28588,8 @@ export class AgentFramework {
    * direct path (a module's callTool, a channel's tool call) doesn't come
    * here: it returns the server's result itself (directToolResult), for
    * either engine, as does a script's call whose result is structured, with
-   * an MCPL peer's blocks given RFC-005's treatment (referenceBlockForScript).
+   * an MCPL peer's blocks given RFC-005's treatment (referenceBlockForScript),
+   * and what's nested in them at any depth (shownToScriptFromServer).
    */
   private async mcpToolResult(
     result: { content?: unknown; isError?: boolean; structuredContent?: unknown },

@@ -6,7 +6,9 @@
  * reference id, what the server said about it in that block, and `savedTo`,
  * the workspace path the dispatch fetched its payload to for the script; a
  * block the classifier rejects arrives as the notice the model's lanes show,
- * and inline data that claims a bulk disposition as the withheld notice. A
+ * and inline data that claims a bulk disposition as the withheld notice; the
+ * same holds for what RFC-005 governs nested at any depth in a block's other
+ * fields, its references bound to the peer. A
  * standard peer's blocks arrive as the server sent them. A module's blocks,
  * such as an MCPL peer's it got through ctx.callTool and returns whole, are
  * read as the model's history reads a module's data: what RFC-005 governs,
@@ -332,6 +334,19 @@ test('an error with structured content is fetched for the script, and reaches it
   });
 });
 
+test("an MCPL peer's structured failure reaches a script with what's nested in its blocks treated too", async () => {
+  await withPeers(async ({ answer, script }) => {
+    const sealed = never('nested-failure');
+    answer({ content: [{ type: 'text', text: 'the attach failed', attachment: sealed }], structuredContent: { partial: true }, isError: true });
+    const out = await script('mcpl--files--attach');
+    assert.equal(out.includes('never-token'), false, out);
+    const object = JSON.parse(out) as { content: Array<Record<string, unknown>>; isError: boolean };
+    const attachment = object.content[0]!.attachment as Record<string, unknown>;
+    assert.deepEqual([object.isError, attachment.refId, 'uri' in attachment], [true, referenceRegistry.findByUri(sealed.uri)?.refId, false]);
+    assert.equal(typeof attachment.refId, 'string');
+  });
+});
+
 test("a module's structured result, an MCPL peer's it got through ctx.callTool, reaches a script with each block read as the model's lanes read a module's", async () => {
   await withPeers(async ({ answer, script, fetched }) => {
     answer({ content: [...blocks('module'), never('module')], structuredContent: { attachments: 2 } });
@@ -535,7 +550,9 @@ test("each shape RFC-005 governs, nested in an MCPL peer's block, reaches a scri
     const embedded = { type: 'resource', resource: { uri: 'https://files.example.invalid/nested-shapes/doc.txt?sig=embedded-token', text: 'the doc' } };
     const byUri = { type: 'image', uri: 'https://files.example.invalid/nested-shapes/pic.png?sig=image-token', mimeType: 'image/png' };
     const emptyUri = { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png', uri: '' };
-    const text = { type: 'text', text: 'shapes', embedded, byUri, emptyUri };
+    const sealedInline = { type: 'audio', data: 'AAAA', mimeType: 'audio/wav', disposition: 'never' };
+    const objectUri = { type: 'resource', uri: { href: 'https://files.example.invalid/nested-shapes/obj?sig=object-token' }, name: 'obj' };
+    const text = { type: 'text', text: 'shapes', embedded, byUri, emptyUri, sealedInline, objectUri };
     answer({ content: [text], structuredContent: {} });
     const [block] = (JSON.parse(await script('mcpl--files--attach')) as { content: Array<Record<string, unknown>> }).content;
     // An MCP-form embedded resource is the classifier's invalid block, so its notice, without its text.
@@ -548,7 +565,10 @@ test("each shape RFC-005 governs, nested in an MCPL peer's block, reaches a scri
     assert.deepEqual(referenceRegistry.findByUri(byUri.uri)?.serverIds, ['files']);
     // An empty uri beside inline data is the classifier's contradiction on a peer's lane.
     assert.deepEqual(block.emptyUri, { type: 'text', text: INLINE_WITHHELD_TEXT });
-    assert.equal(/embedded-token|image-token/.test(JSON.stringify(block)), false);
+    // Inline data claiming only a disposition is withheld, and a uri that isn't a string is the classifier's notice.
+    assert.deepEqual(block.sealedInline, { type: 'text', text: INLINE_WITHHELD_TEXT });
+    assert.equal((block.objectUri as Record<string, unknown>).type, 'text');
+    assert.equal(/embedded-token|image-token|object-token/.test(JSON.stringify(block)), false);
   });
 });
 
