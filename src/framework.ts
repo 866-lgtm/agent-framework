@@ -20419,7 +20419,10 @@ export class AgentFramework {
               getContextManager?: () => { getStrategy?: () => unknown };
             }).getContextManager?.()?.getStrategy?.() as
               | {
-                  reportRealInputTokens?: (n: number) => void;
+                  reportRealInputTokens?: (
+                    n: number,
+                    overhead?: Pick<NormalizedRequest, 'system' | 'tools'>,
+                  ) => void;
                   reportKvUnifiedAccepted?: (args: {
                     submissionId: string;
                     acceptedAt?: number;
@@ -20428,8 +20431,18 @@ export class AgentFramework {
                   reportKvUnifiedFailed?: (submissionId: string) => void;
                 }
               | undefined;
+            // The provider's total counts the system prompt and the tool
+            // definitions this request sent, and the strategy's estimate of
+            // its compile doesn't, so they go with the sample: left out, the
+            // multiplier learns them as a per-token rate, and a tool-heavy
+            // agent's samples can fall out of its band for good
+            // (context-manager #323). A strategy from before then ignores
+            // the second argument.
             try {
-              strat?.reportRealInputTokens?.(realTotal);
+              strat?.reportRealInputTokens?.(
+                realTotal,
+                compiledRequest ? { system: compiledRequest.system, tools: compiledRequest.tools } : undefined,
+              );
             } catch { /* calibration is best-effort */ }
 
             const kvSubmission = takeKvSubmission?.();
