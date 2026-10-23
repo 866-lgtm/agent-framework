@@ -7,7 +7,10 @@
  * the workspace path the dispatch fetched its payload to for the script; a
  * block the classifier rejects arrives as the notice the model's lanes show,
  * and inline data that claims a bulk disposition as the withheld notice. A
- * standard peer's blocks arrive as the server sent them.
+ * standard peer's blocks arrive as the server sent them. A module's blocks,
+ * such as an MCPL peer's it got through ctx.callTool and returns whole, are
+ * read as the model's history reads a module's data: what RFC-005 governs,
+ * at any depth, as the script lane shows it, and anything else as sent.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -17,8 +20,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { AgentFramework, WorkspaceModule } from '../src/index.js';
-import type { ScriptToolResult, ToolResult } from '../src/index.js';
-import { EXPIRY_REASON, INLINE_WITHHELD_TEXT } from '../src/mcpl/references.js';
+import type { EventResponse, Module, ModuleContext, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
+import { EXPIRY_REASON, INLINE_WITHHELD_TEXT, referenceRegistry } from '../src/mcpl/references.js';
 import type { ReferenceRecord } from '../src/mcpl/references.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
@@ -62,6 +65,42 @@ const blocks = (test: string) => [
   { type: 'image', uri: uris(test).old, mimeType: 'image/png', expiresAt: '2027-01-01T00:00:00Z\u202E' },
 ];
 
+/** A `never` reference, which RFC-005 withholds, with its uri, from every lane the model reads. */
+const never = (test: string) => ({ type: 'resource', uri: `https://files.example.invalid/${test}/sealed.pdf?sig=never-token`, name: 'sealed.pdf', disposition: 'never' });
+
+/**
+ * A module that calls the MCPL peer's tool through ctx.callTool and hands the
+ * result on: whole (`whole`), without its structured view (`unstructured`),
+ * or a result of its own holding a reference deeper in its blocks (`nested`,
+ * and `deep--nested`, a name a server's prefix `fwd--deep` would fit).
+ * `during` runs while a call is in flight, before its result.
+ */
+class Forward implements Module {
+  readonly name = 'fwd';
+  private ctx: ModuleContext | null = null;
+  nested: unknown[] = [];
+  nestedStructured: unknown = { nested: true };
+  during: () => void = () => {};
+  async start(ctx: ModuleContext): Promise<void> { this.ctx = ctx; }
+  async stop(): Promise<void> {}
+  async onProcess(): Promise<EventResponse> { return {}; }
+  getTools(): ToolDefinition[] {
+    return ['whole', 'unstructured', 'nested', 'deep--nested', 'failing'].map((name) => ({ name, description: name, inputSchema: { type: 'object' } }));
+  }
+  async handleToolCall(call: ToolCall): Promise<ToolResult> {
+    const name = call.name.includes('--') ? call.name.slice(call.name.lastIndexOf('--') + 2) : call.name;
+    this.during();
+    if (name === 'nested') return { success: true, data: this.nested, structured: this.nestedStructured };
+    if (name === 'failing') return { success: false, isError: true, error: 'the module failed', data: this.nested, structured: { partial: true } };
+    const result = await this.ctx!.callTool({ id: `fwd-${randomUUID()}`, name: 'mcpl--files--attach', input: {} });
+    if (name === 'unstructured') {
+      const { structured: _structured, ...rest } = result;
+      return rest;
+    }
+    return result;
+  }
+}
+
 /** A tools/call result as a server may send it, nonconformant blocks included. */
 interface Answer { content: unknown[]; structuredContent?: unknown; isError?: boolean }
 
@@ -75,6 +114,13 @@ interface Harness {
   /** The URIs the fetcher was asked for, saved records aside. */
   fetched: string[];
   workspace: WorkspaceModule;
+  forward: Forward;
+  /** The script lane's exit itself, for a result, the tool name it answers, and whether its call went to a server. */
+  exit: (result: ToolResult, tool: string, toServer: boolean) => Promise<string>;
+  /** The framework's tool prefixes, by server, as a connect or disconnect changes them. */
+  prefixes: Map<string, string>;
+  /** Runs while a server answers a call, before its answer. */
+  duringServerCall: (fn: () => void) => void;
 }
 
 async function withPeers(fn: (h: Harness) => Promise<void>, opts: { eager?: boolean } = {}): Promise<void> {
@@ -82,21 +128,24 @@ async function withPeers(fn: (h: Harness) => Promise<void>, opts: { eager?: bool
   const board = join(dir, 'board');
   mkdirSync(board);
   const workspace = new WorkspaceModule({ mounts: [{ name: 'board', path: board, mode: 'read-write', watch: 'never' }] });
+  const forward = new Forward();
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store'), membrane: new MockMembrane().asMembrane(),
-    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }], modules: [workspace],
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }], modules: [workspace, forward],
   });
   workspace.initStore(framework.getStore());
   let answer: Answer = { content: [] };
+  let during: () => void = () => {};
   // Two legacy-engine peers: `files` negotiated MCPL, `plain` is MCP-only.
-  const peer = (id: string, capabilities: Record<string, unknown> | null) => ({ id, capabilities, sendToolsCall: async () => answer });
+  const peer = (id: string, capabilities: Record<string, unknown> | null) => ({ id, capabilities, sendToolsCall: async () => { during(); return answer; } });
   const peers = new Map([['files', peer('files', {})], ['plain', peer('plain', null)]]);
   const fetched: string[] = [];
   const internals = framework as unknown as {
     mcplServerRegistry: unknown;
     mcplPrefixMap: Map<string, string>;
     getReferenceFetcher: () => unknown;
-    handleScriptToolCall: (agent: string, tool: string, args: Record<string, unknown>) => Promise<ScriptToolResult>;
+    scriptToolCall: (agent: string, tool: string, argsJson: string, context: object) => Promise<{ ok: boolean; json: string }>;
+    scriptResultAnswer: (result: ToolResult, tool: string, toServer: boolean) => Promise<{ json: string }>;
     dispatchMcplToolCall: (agent: string, call: { id: string; name: string; input: unknown }, serverId: string, prefix: string) => void;
     pushEvent: (event: { type: string; callId?: string; result?: ToolResult }) => void;
   };
@@ -130,12 +179,15 @@ async function withPeers(fn: (h: Harness) => Promise<void>, opts: { eager?: bool
   try {
     await fn({
       answer: (result) => { answer = result; },
-      // The string a script's call returns; its flags are pinned in
-      // mcp-modern-framework and code-execution.
-      script: async (tool) => (await internals.handleScriptToolCall.call(framework, 'agent', tool, {})).text,
+      // The JSON of the result a script's call gets: { content, structuredContent, isError }.
+      script: async (tool) => (await internals.scriptToolCall.call(framework, 'agent', tool, '{}', {})).json,
       modelCall,
       fetched,
       workspace,
+      forward,
+      exit: async (result, tool, toServer) => (await internals.scriptResultAnswer.call(framework, result, tool, toServer)).json,
+      prefixes: internals.mcplPrefixMap,
+      duringServerCall: (fn) => { during = fn; },
     });
   } finally {
     await framework.stop();
@@ -195,7 +247,7 @@ test("content that isn't a list of blocks reaches a script as the model reads it
     const plainModel = await modelCall('attach', 'plain');
     assert.equal(plainModel.isError, true);
     assert.ok(plainModel.error?.startsWith(notice), plainModel.error);
-    assert.deepEqual(JSON.parse(await script('mcpl--plain--attach')), { content: [], structuredContent: { a: 1 }, isError: true, error: notice });
+    assert.deepEqual(JSON.parse(await script('mcpl--plain--attach')), { content: [{ type: 'text', text: notice }], structuredContent: { a: 1 }, isError: true });
     // An MCPL peer's reading has no content and reads the structured view, on both paths.
     const filesModel = await modelCall('attach', 'files');
     assert.equal(filesModel.isError, false);
@@ -225,16 +277,17 @@ test('without structured content, an MCPL peer\'s result reaches a script as stu
   });
 });
 
-test("an MCPL peer's structured result past the script cap is saved with its references as their ids, no URI in the file", async () => {
-  await withPeers(async ({ answer, script, workspace }) => {
+test("an MCPL peer's large structured result reaches a script whole, its references as their ids, no URI", async () => {
+  await withPeers(async ({ answer, script }) => {
+    // Past main's old 5 MB script cap, which saved such a result to the
+    // workspace: a result now reaches the script whole up to its memory's
+    // bound, past which it's refused as ResultTooLarge.
     answer({ content: blocks('oversized'), structuredContent: { pad: 'x'.repeat(5_000_000) } });
-    const out = JSON.parse(await script('mcpl--files--attach')) as { isError: boolean; oversized: { chars: number; savedTo: string } };
-    assert.equal(out.isError, false);
-    const read = await workspace.readBinary(out.oversized.savedTo);
-    assert.ok('data' in read, `the saved result is readable: ${out.oversized.savedTo}`);
-    const saved = read.data.toString('utf8');
-    assert.ok(!saved.includes('example.invalid'), 'no URI in the saved file');
-    const object = JSON.parse(saved) as { content: Array<{ refId?: string }> };
+    const out = await script('mcpl--files--attach');
+    assert.ok(!out.includes('example.invalid'), 'no URI reaches the script');
+    const object = JSON.parse(out) as { content: Array<{ refId?: string }>; structuredContent: { pad: string }; isError: boolean };
+    assert.equal(object.isError, false);
+    assert.equal(object.structuredContent.pad.length, 5_000_000);
     assert.deepEqual(object.content, treated(object.content[0]!.refId!, object.content[2]!.refId!, object.content[10]!.refId!));
   });
 });
@@ -247,7 +300,7 @@ test("only a script that reads the blocks gets the script-demand fetch: not the 
     assert.deepEqual(fetched, [], 'nothing here is eager-eligible, and the model\'s call gets no more than the eager pass');
 
     answer({ content: [blocks('error')[0], { type: 'text', text: 'the attach failed' }], isError: true });
-    assert.equal(await script('mcpl--files--attach'), 'Error: the attach failed');
+    assert.equal(await script('mcpl--files--attach'), JSON.stringify({ content: [{ type: 'text', text: 'the attach failed' }], structuredContent: null, isError: true }));
     assert.deepEqual(fetched, [], 'a script that reads an error as its text alone gets no more than the eager pass');
   });
 });
@@ -259,7 +312,7 @@ test("the eager pass still runs for the model's call and for an error a script r
     assert.deepEqual(fetched, [uris('eager-model').report]);
 
     answer({ content: [blocks('eager-error')[0], { type: 'text', text: 'the attach failed' }], isError: true });
-    assert.equal(await script('mcpl--files--attach'), 'Error: the attach failed');
+    assert.equal(await script('mcpl--files--attach'), JSON.stringify({ content: [{ type: 'text', text: 'the attach failed' }], structuredContent: null, isError: true }));
     assert.deepEqual(fetched, [uris('eager-model').report, uris('eager-error').report]);
   }, { eager: true });
 });
@@ -269,13 +322,183 @@ test('an error with structured content is fetched for the script, and reaches it
     answer({ content: [blocks('structured-error')[0], { type: 'text', text: 'the attach failed' }], structuredContent: { partial: true }, isError: true });
     const out = await script('mcpl--files--attach');
     assert.ok(!out.includes('example.invalid'), out);
-    const object = JSON.parse(out) as { content: Array<{ refId?: string }>; structuredContent: unknown; isError: boolean; error: string };
+    const object = JSON.parse(out) as { content: Array<{ refId?: string }>; structuredContent: unknown; isError: boolean };
     assert.deepEqual(object, {
       content: [treated(object.content[0]!.refId!, '', '')[0], { type: 'text', text: 'the attach failed' }],
       structuredContent: { partial: true },
       isError: true,
-      error: 'the attach failed',
     });
     assert.deepEqual(fetched, [uris('structured-error').report], 'the script reads the blocks, so its reference was fetched first');
+  });
+});
+
+test("a module's structured result, an MCPL peer's it got through ctx.callTool, reaches a script with each block read as the model's lanes read a module's", async () => {
+  await withPeers(async ({ answer, script, fetched }) => {
+    answer({ content: [...blocks('module'), never('module')], structuredContent: { attachments: 2 } });
+    const out = await script('fwd--whole');
+    for (const token of ['secret-token', 'other-token', 'old-token', 'beside-token', 'embedded-token', 'never-token']) {
+      assert.ok(!out.includes(token), `${token} doesn't reach the script: ${out.slice(0, 2000)}`);
+    }
+    const object = JSON.parse(out) as { content: Array<{ refId?: string }>; structuredContent: unknown; isError: boolean };
+    const [report, , big] = object.content;
+    const old = object.content[10];
+    const sealed = object.content[11];
+    const expected: unknown[] = [...treated(report!.refId!, big!.refId!, old!.refId!)];
+    // A resource_link isn't a reference RFC-005 governs: the model's history
+    // shows a module's as its fields, and so does the script.
+    expected[8] = blocks('module')[8]!;
+    expected.push({ type: 'resource', refId: sealed!.refId!, name: 'sealed.pdf', savedTo: null });
+    assert.deepEqual(object, { content: expected, structuredContent: { attachments: 2 }, isError: false });
+    assert.deepEqual(fetched, [uris('module').report, uris('module').big, uris('module').old, never('module').uri],
+      'the module\'s references were fetched for the script, as before');
+    // Each came through ctx.callTool, whose arrival bound it to the server
+    // that sent it, and the exit adds no other server.
+    for (const uri of [uris('module').report, never('module').uri]) {
+      assert.deepEqual(referenceRegistry.findByUri(uri)?.serverIds, ['files'], uri);
+    }
+  });
+});
+
+test("a module's result without structured content reaches a script as the model's stubs, its reference ids the structured reading's", async () => {
+  await withPeers(async ({ answer, script }) => {
+    const all = blocks('module-text');
+    const content = [all[0], all[2], all[9], never('module-text')];
+    answer({ content, structuredContent: {} });
+    const structured = JSON.parse(await script('fwd--whole')) as { content: Array<{ refId?: string }> };
+    const out = await script('fwd--unstructured');
+    for (const token of ['secret-token', 'other-token', 'never-token']) assert.ok(!out.includes(token), `${token}: ${out}`);
+    for (const block of [structured.content[0], structured.content[3]]) assert.ok(out.includes(`[${block!.refId}]`), `the same reference id: ${out}`);
+  });
+});
+
+test("a module's reference deeper in its blocks reaches a script as the model's lanes show it, and other values as sent", async () => {
+  await withPeers(async ({ script, forward }) => {
+    const sealed = never('module-nested');
+    forward.nested = [
+      { type: 'text', text: 'one sealed report' },
+      { type: 'json', value: { attachment: sealed, list: [sealed, { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png', uri: { sig: 'object-token' } }], kept: { uri: 'https://files.example.invalid/plain-data' } } },
+    ];
+    const out = await script('fwd--nested');
+    assert.ok(!out.includes('never-token') && !out.includes('object-token'), out);
+    const object = JSON.parse(out) as { content: [unknown, { value: { attachment: { refId: string } } }] };
+    const refId = object.content[1].value.attachment.refId;
+    const stub = { type: 'resource', refId, name: 'sealed.pdf', savedTo: null };
+    assert.deepEqual(object, {
+      content: [
+        { type: 'text', text: 'one sealed report' },
+        { type: 'json', value: { attachment: stub, list: [stub, { type: 'text', text: INLINE_WITHHELD_TEXT }], kept: { uri: 'https://files.example.invalid/plain-data' } } },
+      ],
+      structuredContent: { nested: true },
+      isError: false,
+    }, 'inline data beside a uri of any value is withheld, and a value RFC-005 doesn\'t govern keeps its fields');
+    // A reference the module made itself is bound to no server.
+    assert.deepEqual(referenceRegistry.findByUri(sealed.uri)?.serverIds, []);
+  });
+});
+
+test("an MCPL peer's treated blocks, returned again as a module's, are left as they are", async () => {
+  await withPeers(async ({ answer, script, exit }) => {
+    answer({ content: [...blocks('twice'), never('twice')], structuredContent: { attachments: 2 } });
+    const once = JSON.parse(await script('mcpl--files--attach')) as { content: unknown[]; structuredContent: unknown };
+    const again = JSON.parse(await exit({ success: true, data: once.content, structured: once.structuredContent }, 'fwd--whole', false));
+    assert.deepEqual(again, { content: once.content, structuredContent: { attachments: 2 }, isError: false });
+  });
+});
+
+test("a server's result reaches a script as its dispatch gave it when its server disconnects while the call is in flight", async () => {
+  await withPeers(async ({ answer, script, prefixes, duringServerCall, fetched }) => {
+    const content = blocks('disconnect');
+    answer({ content, structuredContent: { attachments: 2 } });
+    // The MCP-only peer's blocks reach a script as sent, so a treatment at
+    // the exit would show. Its prefix leaves the map as a disconnect takes
+    // it, after the dispatch sent the call.
+    duringServerCall(() => { prefixes.delete('mcpl--plain'); });
+    const object = JSON.parse(await script('mcpl--plain--attach')) as { content: unknown };
+    assert.equal(prefixes.has('mcpl--plain'), false, 'the prefix left while the call ran');
+    assert.deepEqual(object.content, content);
+    assert.deepEqual(fetched, [], 'nothing is fetched for a server\'s result at the exit');
+  });
+});
+
+test("a module tool's result is treated when a server with a prefix that fits its name connects while its call is in flight", async () => {
+  await withPeers(async ({ script, forward, prefixes, fetched }) => {
+    forward.nested = [never('connect')];
+    // The prefix arrives as a runtime connect gives it, after the dispatch
+    // sent the call to the module.
+    forward.during = () => { prefixes.set('fwd--deep', 'files'); };
+    const out = await script('fwd--deep--nested');
+    assert.equal(prefixes.get('fwd--deep'), 'files', 'the prefix arrived while the call ran');
+    assert.ok(!out.includes('never-token'), out);
+    const object = JSON.parse(out) as { content: [{ refId: string }] };
+    assert.deepEqual(object.content, [{ type: 'resource', refId: object.content[0].refId, name: 'sealed.pdf', savedTo: null }]);
+    assert.deepEqual(fetched, [never('connect').uri], 'the exit fetches for it as for any module\'s result');
+  });
+});
+
+test("a module's failed result with structured content reaches a script with its blocks treated and its error", async () => {
+  await withPeers(async ({ script, forward }) => {
+    forward.nested = [{ type: 'text', text: 'partly attached' }, never('module-failing')];
+    const out = await script('fwd--failing');
+    assert.ok(!out.includes('never-token'), out);
+    const object = JSON.parse(out) as { content: [unknown, { refId: string }]; structuredContent: unknown; isError: boolean };
+    assert.deepEqual(object, {
+      content: [{ type: 'text', text: 'partly attached' }, { type: 'resource', refId: object.content[1].refId, name: 'sealed.pdf', savedTo: null }],
+      structuredContent: { partial: true },
+      isError: true,
+    });
+  });
+});
+
+test("a module's structured content reaches a script whole, a reference in it included, while its blocks are treated", async () => {
+  await withPeers(async ({ script, forward }) => {
+    const inStructured = { type: 'resource', uri: 'https://files.example.invalid/structured/sealed.pdf?sig=structured-token', disposition: 'never' };
+    forward.nested = [never('module-structured')];
+    forward.nestedStructured = { attachment: inStructured };
+    const object = JSON.parse(await script('fwd--nested')) as { content: [{ refId?: string; uri?: string }]; structuredContent: unknown };
+    assert.equal(object.content[0].uri, undefined, 'the block is its stub');
+    assert.deepEqual(object.structuredContent, { attachment: inStructured }, 'RFC-005 governs content blocks, so the structured view is as the module gave it');
+  });
+});
+
+test("a module's structured blocks that JSON can't convert reach a script as a failure naming the tool", async () => {
+  await withPeers(async ({ exit }) => {
+    const object = JSON.parse(await exit({ success: true, data: [{ type: 'text', text: 'a count', count: BigInt(1) }], structured: {} }, 'fwd--whole', false)) as {
+      content: [{ text: string }]; structuredContent: unknown; isError: boolean;
+    };
+    assert.equal(object.isError, true);
+    assert.equal(object.structuredContent, null);
+    assert.match(object.content[0].text, /^tool 'fwd--whole' returned a result that can't be converted to JSON/);
+  });
+});
+
+test("an MCPL peer's inline data beside a uri that isn't a string reaches a script as the withheld notice", async () => {
+  await withPeers(async ({ answer, script, modelCall }) => {
+    const inline = { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png', uri: { sig: 'object-token' } };
+    answer({ content: [{ type: 'text', text: 'one image' }, inline], structuredContent: { images: 1 } });
+    const out = await script('mcpl--files--attach');
+    assert.ok(!out.includes('object-token'), out);
+    assert.deepEqual((JSON.parse(out) as { content: unknown }).content, [{ type: 'text', text: 'one image' }, { type: 'text', text: INLINE_WITHHELD_TEXT }]);
+    // The model's lanes show no uri, so they keep the image.
+    const model = JSON.stringify((await modelCall('attach')).data);
+    assert.ok(model.includes('iVBORw0KGgo=') && !model.includes(INLINE_WITHHELD_TEXT), model);
+  });
+});
+
+test("inline data beside a null uri reaches a script as sent, from an MCPL peer and from a module", async () => {
+  await withPeers(async ({ answer, script, forward }) => {
+    const inline = { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png', uri: null };
+    answer({ content: [inline], structuredContent: {} });
+    assert.deepEqual((JSON.parse(await script('mcpl--files--attach')) as { content: unknown }).content, [inline]);
+    forward.nested = [inline];
+    assert.deepEqual((JSON.parse(await script('fwd--nested')) as { content: unknown }).content, [inline]);
+  });
+});
+
+test("an MCPL peer's reference nested under another block's fields reaches a script whole, as its structured content does", async () => {
+  await withPeers(async ({ answer, script }) => {
+    const text = { type: 'text', text: 'one report', attachment: never('nested-peer') };
+    answer({ content: [text], structuredContent: {} });
+    assert.deepEqual((JSON.parse(await script('mcpl--files--attach')) as { content: unknown }).content, [text],
+      'RFC-005 governs content blocks: a field a server puts beside a block\'s own is its data');
   });
 });

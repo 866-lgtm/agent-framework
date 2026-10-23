@@ -131,8 +131,9 @@ async function waitFor(predicate: () => boolean, message: string, timeoutMs = EV
 }
 
 /**
- * A polling watcher, once chokidar's first scan is done. A change made before
- * then can be part of the files chokidar starts from (ignoreInitial), and is
+ * A polling watcher, once chokidar's first scan is done and its poll reports
+ * changes (changesFlow). A change made before then can be part of the files
+ * chokidar starts from (ignoreInitial), or of the poll's first stat, and is
  * then never reported. If the watcher has reported an error and isn't ready
  * when the wait checks, the wait fails with that error, and a watcher that
  * doesn't get ready is stopped.
@@ -144,6 +145,7 @@ async function readyWithPolling(): Promise<{ watcher: MountWatcher; batches: FsC
   try {
     await waitFor(() => ready || failed !== undefined, 'expected the watcher to be ready');
     if (!ready) throw failed;
+    await changesFlow(tmp, collected.batches, []);
   } catch (error) {
     await collected.watcher.stop();
     throw error;
@@ -330,8 +332,10 @@ describe('MountWatcher lifecycle', () => {
     try {
       assert.ok(existsSync(nested), 'start() should have created the watched path');
       // A file written before chokidar's first scan is done can be part of
-      // what it starts from (ignoreInitial), and then is never reported.
+      // what it starts from (ignoreInitial), or of the poll's first stat, just
+      // after onReady, and then is never reported.
       await waitFor(() => ready, 'onReady should have fired');
+      await changesFlow(nested, batches, []);
       writeFileSync(join(nested, 'ticket.md'), 'hi');
       await changeFor(batches, 'ticket.md');
     } finally {
@@ -455,6 +459,7 @@ describe('MountWatcher lifecycle', () => {
 
     try {
       await waitFor(() => ready, 'expected initial watcher ready');
+      await changesFlow(tmp, batches, []);
 
       const file = join(tmp, 'normal.md');
       writeFileSync(file, 'v1');
@@ -605,7 +610,11 @@ describe('MountWatcher lifecycle', () => {
 
   // The identity is read from the descriptor held, so it's the held
   // directory's even when the root is replaced between the open and the read.
-  // Here the replacement happens inside the open, and a poll finds it.
+  // Here the replacement happens inside the open, and a poll finds it. The
+  // poll is driven at once, before chokidar's first instance is ready, as a
+  // loaded host's timer can run it first: the re-attach then closes that
+  // instance, whose ready never comes. So the test waits for a ready after
+  // the re-attach, which is what the watcher promises, not for two readies.
   it('reads the held root identity from what it holds, so a root replaced as it was opened is found', {
     skip: process.platform !== 'linux',
   }, async () => {
@@ -621,14 +630,16 @@ describe('MountWatcher lifecycle', () => {
       }
       return fd;
     }, async () => {
-      let readyCount = 0;
       let reattachCount = 0;
+      let readyAfterReattach = false;
       const { watcher } = collectWithNative(
-        { onReady: () => { readyCount++; }, onReattach: () => { reattachCount++; } },
-        { ...makeConfig(), path: root },
+        { onReady: () => { if (reattachCount > 0) readyAfterReattach = true; }, onReattach: () => { reattachCount++; } },
+        { ...makeConfig(), path: root, watchRootPollMs: EVENT_MS * 6 },
       );
       try {
-        await waitFor(() => reattachCount > 0 && readyCount > 1, 'expected a poll to find the root replaced as it was opened');
+        await (watcher as unknown as { checkRootLiveness(): Promise<void> }).checkRootLiveness();
+        assert.strictEqual(reattachCount, 1, 'a poll finds the root replaced as it was opened, and re-attaches');
+        await waitFor(() => readyAfterReattach, 'expected the watcher ready after the re-attach');
         assert.deepStrictEqual(descriptorsOf(root), [root], 'the watcher holds the root at its path');
         assert.deepStrictEqual(descriptorsOf(`${root}.away`), [], 'the watcher still holds the directory moved away');
       } finally {
@@ -738,6 +749,7 @@ describe('MountWatcher lifecycle', () => {
         await (watcher as unknown as { reattach(): Promise<void> }).reattach();
         assert.ok(errors.some((e) => e.message === 'close failed'), "the re-attach reported its close's failure");
         await waitFor(() => readyCount === 2, 'expected the watcher to attach again');
+        await changesFlow(tmp, batches, []);
         writeFileSync(join(tmp, 'after.md'), 'x');
         await changeFor(batches, 'after.md', 'created');
       } finally {
