@@ -141,9 +141,9 @@ const countWrites = (writes: string[]) => (framework: AgentFramework) => {
  *  characters, beside the page's metadata), and is sized to that cap, not
  *  to the `share` of the turn that cut the result. */
 const assertPageForLaterRead = (limit: number, quotedPath: string, share: number) => {
-  const overhead = quotedPath.length + 256;
-  assert.ok(limit * 6 + overhead <= 4000, `a page of ${limit} comes back within the cap`);
-  assert.ok(limit * 6 + overhead > share, `a page of ${limit} is sized to the cap, not to the share of ${share}`);
+  const overhead = (JSON.parse(quotedPath) as string).length + 256;
+  assert.ok(limit + overhead <= 4000, `a page of ${limit} comes back within the cap`);
+  assert.ok(limit + overhead > share, `a page of ${limit} is sized to the cap, not to the share of ${share}`);
 };
 
 /** agent_settings get's view of an agent's inline cap. */

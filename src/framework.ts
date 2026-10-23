@@ -21876,11 +21876,12 @@ export class AgentFramework {
    *  the inline cap would show more: where a cap at the readers' bound would
    *  keep a longer head, or the whole result. */
   private spillPageAdvice(path: string, cap: number, canRaise: boolean): string {
-    // JSON serialization can expand each read-back code unit to six
-    // chars (\\u0000). Leave room for the page's metadata and a possible
-    // extra code unit at a surrogate-pair boundary.
-    const pageOverhead = JSON.stringify(path).length + 256;
-    const readLimit = Math.max(1, Math.min(2000, Math.floor((cap - pageOverhead) / 6) - 1));
+    // A page is held to the cap as its text measures it, each code unit one
+    // character (the workspace's read-page.ts). Leave room for the page's
+    // fields and notes, and a possible extra code unit at a surrogate-pair
+    // boundary.
+    const pageOverhead = path.length + 256;
+    const readLimit = Math.max(1, Math.min(2000, cap - pageOverhead - 1));
     return `Page with workspace--read ${JSON.stringify({ path, offsetChars: 0, limitChars: readLimit })}; `
       + 'use nextOffsetChars as offsetChars until null, keeping limitChars.'
       + (canRaise ? ' Or raise the inline cap via agent_settings update tool_result_inline_max_chars.' : '');
