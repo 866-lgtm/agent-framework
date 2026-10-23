@@ -18,7 +18,7 @@ import { AnthropicAdapter, Membrane } from '@animalabs/membrane';
 import type { DetailedUsage, Membrane as MembraneType, NormalizedResponse } from '@animalabs/membrane';
 
 import { Agent, AgentFramework } from '../src/index.js';
-import type { Module, ToolCall, TraceEvent } from '../src/index.js';
+import type { EventResponse, Module, ProcessEvent, ToolCall, TraceEvent } from '../src/index.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
 
 const DROP_BLOCK = 'true asks the provider to drop a signed thinking block whose earlier conversation changed rather than refuse the request, ' +
@@ -103,6 +103,14 @@ describe('thinkingBinding.dropBlock', () => {
         'a model whose thinking is always on carries it in an adaptive config, with no thinking config of the agent\'s own');
       assert.ok(fable.beta.includes(BETA));
 
+      // On such a model the agent's `display` goes out in that config, and so only with the setting.
+      const shown = { enabled: false, display: 'summarized' };
+      const fableShown = await send({ model: 'claude-fable-5-1', thinking: shown, thinkingBinding: { dropBlock: true } });
+      assert.deepEqual(fableShown.thinking, { type: 'adaptive', display: 'summarized', block_binding: binding }, 'display beside the control');
+      const fableUnset = await send({ model: 'claude-fable-5-1', thinking: shown });
+      assert.equal(fableUnset.thinking, undefined, 'without the setting, such a model is sent no thinking config, display included');
+      assert.equal(fableUnset.beta.includes(BETA), false);
+
       const off = await send({ thinkingBinding: { dropBlock: true } });
       assert.equal(off.thinking, undefined, 'another model with thinking off sends no thinking config, so no control');
       assert.equal(off.beta.includes(BETA), false);
@@ -165,6 +173,50 @@ describe('thinkingBinding.dropBlock', () => {
     }
   });
 
+  it('gives no sample from a stream whose first call dropped blocks, and calibrates the next stream, which dropped none', async () => {
+    // A stream's skip is the stream's: after a fold the first call of a turn drops blocks, and the next stream that
+    // drops none is a sample again. Kept anywhere longer-lived than the stream, such as the agent, the skip would stop
+    // calibration for good. One resident, two turns, two streams.
+    const dir = mkdtempSync(join(tmpdir(), 'af-thinking-binding-streams-'));
+    const membrane = new MockMembrane();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
+      agents: [{ ...agentWith({ thinkingBinding: { dropBlock: true } }), proseRouting: 'disabled' } as never],
+      modules: [new InputModule()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+    });
+    const completed: TraceEvent[] = [];
+    framework.onTrace((event) => { if (event.type === 'inference:completed') completed.push(event); });
+    framework.start();
+    try {
+      const calibrated: number[] = [];
+      const strategy = framework.getAgent('agent')!.getContextManager().getStrategy() as unknown as { reportRealInputTokens?: (n: number) => void };
+      strategy.reportRealInputTokens = (n) => { calibrated.push(n); };
+      const dropped = { reason: 'prefix_binding_mismatch', path: 'messages.1.content.0', message: 1 };
+      const turn = async (text: string) => {
+        const before = completed.length;
+        framework.pushEvent({ type: 'external-message', source: 'test', content: text, metadata: {} } as never);
+        await framework.runUntilIdle();
+        for (const until = Date.now() + 10_000; completed.length === before && Date.now() < until;) await new Promise((r) => setTimeout(r, 10));
+        assert.equal(completed.length, before + 1, `the turn for "${text}" completed`);
+      };
+
+      membrane.pushResponse(withRound(createMockResponse([{ type: 'text', text: 'First.' }]),
+        { inputTokens: 100, outputTokens: 10, cacheCreationTokens: 0, cacheReadTokens: 400 }, { dropped: [dropped], mismatchAllowed: [] }));
+      await turn('Run once.');
+      assert.equal(membrane.calls.length, 1, 'the first turn\'s stream ran');
+      assert.deepEqual(calibrated, [], 'its first call dropped a block: no sample');
+
+      membrane.pushResponse(withRound(createMockResponse([{ type: 'text', text: 'Second.' }]),
+        { inputTokens: 120, outputTokens: 10, cacheCreationTokens: 0, cacheReadTokens: 500 }, { dropped: [], mismatchAllowed: [] }));
+      await turn('Run again.');
+      assert.equal(membrane.calls.length, 2, 'the second turn\'s stream ran');
+      assert.deepEqual(calibrated, [120 + 0 + 500], 'the next stream dropped none, and is a sample again');
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('refuses a setting that is not true or false, and a thinkingBinding other than an object, null or false', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-thinking-binding-refused-'));
     const storePath = join(dir, 'store.chronicle');
@@ -194,6 +246,19 @@ describe('thinkingBinding.dropBlock', () => {
     }
   });
 });
+
+/** Turns each external message into a user message and a request for inference. */
+class InputModule implements Module {
+  readonly name = 'input';
+  async start() {}
+  async stop() {}
+  getTools() { return []; }
+  async handleToolCall() { return { success: false, isError: true, error: 'none' }; }
+  async onProcess(event: ProcessEvent): Promise<EventResponse> {
+    if (event.type !== 'external-message') return {};
+    return { addMessages: [{ participant: 'User', content: [{ type: 'text', text: String(event.content) }] }], requestInference: true };
+  }
+}
 
 class EchoTools implements Module {
   readonly name = 'test';
