@@ -20616,7 +20616,7 @@ export class AgentFramework {
     for (const tc of toolResults) {
       const { text, shown, stored } = alone.get(tc.id)!;
       spilled.set(tc.id, byShare
-        ? await this.spillOrTruncate(text, share!.cap, `${dateLabel}-${tc.id}`, shown, share!.bound, stored.written)
+        ? await this.spillOrTruncate(text, share!.cap, `${dateLabel}-${tc.id}`, shown, share!.bound, stored.written, { readCap: maxChars! })
         : stored);
     }
     const blocks: ContentBlock[] = toolResults.map(tc => ({
@@ -20832,6 +20832,11 @@ export class AgentFramework {
     /** The spill file an earlier cut of this text wrote: reused, not written
      *  again. Undefined when none was cut. */
     written?: SpillWrite,
+    /** Set where `cap` and `bound` are this text's share of one turn's
+     *  bound (buildStoredToolResultContent): `readCap` is the inline cap,
+     *  which a later read of the file comes back under alone in its own turn
+     *  and its paging advice is sized to. */
+    share?: { readCap: number },
   ): Promise<{ text: string; filePath: string | null; written?: SpillWrite }> {
     if (!cap || content.length <= cap) return { text: content, filePath: null };
     // The stored text is the only place save_recent_image discovers tool
@@ -20841,45 +20846,67 @@ export class AgentFramework {
     // newest slots past the cut that the live copy showed are re-appended
     // after the notice. Otherwise the live copy is this text, and nothing
     // past the cut is kept (#403). The stored copy, notice and kept slots
-    // included, fits `bound`, the most a reader's strategy keeps of it, so
-    // no reader's cut takes the notice (cutStoredToolResultToFit), and the
-    // spill notices name the head they kept.
-    const cut = cutStoredToolResultToFit(content, cap, shown, bound);
+    // included, fits `bound`, the most a reader's strategy keeps of it,
+    // where `bound` leaves the notice its room, so no reader's cut takes the
+    // notice (cutStoredToolResultToFit), and the spill notices name the head
+    // they kept. Under a share too small for that, a cut keeps no head and
+    // stores its notice alone, and a text no longer than that notice is
+    // stored whole, with no file written: each result at its least.
+    const readCap = share?.readCap ?? cap;
+    const cut = cutStoredToolResultToFit(content, cap, shown, bound,
+      share ? this.spillNoticeLength(label, content, shown, bound, readCap) : undefined);
+    if (cut.head === content) return { text: content, filePath: null };
     const { head } = cut;
     const kept = formatKeptImageSlots(cut);
 
     if (written === undefined) written = await this.writeToolResultFile(label, content);
+    const notice = this.spillNotice(head.length, content, shown, bound, readCap, written);
+    // The notice was measured as a written file's reads. A write that failed
+    // keeps nothing, and its notice, naming the failure, can be longer: under
+    // a share, a cut that keeps no head and would store no less than the
+    // text is stored as the text itself, where the text holds no image slot.
+    // One that does is stored as it was measured, cut, since save_recent_image
+    // counted it so before the write.
+    if (share && head.length === 0 && notice.length >= content.length && parseImagePlaceholders(content).length === 0) {
+      return { text: content, filePath: null, written };
+    }
+    return { text: head + notice + kept, filePath: written && written.error === undefined ? written.path : null, written };
+  }
+
+  /**
+   * The notice a cut copy carries after its head (spillOrTruncate): the file
+   * holding the whole result and how to read it back, or why there is none.
+   */
+  private spillNotice(headLength: number, content: string, shown: ShownRanges | null, bound: number | undefined,
+    readCap: number, written: SpillWrite): string {
     if (written && written.error === undefined) {
-      const path = written.path;
-      return {
-        text: head
-          + `\n\n[truncated — showing ${head.length} of ${content.length} chars; full content: workspace file ${path}`
-          + `. ${this.spillPageAdvice(path, cap, bound === undefined || cutStoredToolResultToFit(content, bound, shown, bound).head.length > head.length)}]`
-          + kept,
-        filePath: path,
-        written,
-      };
+      const canRaise = bound === undefined || cutStoredToolResultToFit(content, bound, shown, bound).head.length > headLength;
+      return `\n\n[truncated — showing ${headLength} of ${content.length} chars; full content: workspace file ${written.path}`
+        + `. ${this.spillPageAdvice(written.path, readCap, canRaise)}]`;
     }
     if (written) {
       // A workspace was there and the write FAILED — say that, loudly and
       // distinctly. Telling the agent "no writable workspace" would teach
       // them their residence lacks a capability it actually has.
-      return {
-        text: head
-          + `\n\n[truncated — showing ${head.length} of ${content.length} chars; spill to workspace file ${written.path} FAILED`
-          + ` (${written.error}); content over the cap was not retained]`
-          + kept,
-        filePath: null,
-        written,
-      };
+      return `\n\n[truncated — showing ${headLength} of ${content.length} chars; spill to workspace file ${written.path} FAILED`
+        + ` (${written.error}); content over the cap was not retained]`;
     }
-    return {
-      text: head
-        + '\n\n[truncated — original was ' + content.length + ' chars; no writable workspace mount without an include, full content not retained]'
-        + kept,
-      filePath: null,
-      written,
-    };
+    return '\n\n[truncated — original was ' + content.length + ' chars; no writable workspace mount without an include, full content not retained]';
+  }
+
+  /**
+   * The length of the notice a cut of `content` that keeps no head would
+   * carry, before any file is written, as it reads once its file is
+   * (toolResultFilePlace, where any earlier cut of the text wrote it too), so
+   * the cut and save_recent_image's count of the result before it measure
+   * alike. For keeping whole, under a share, a text no longer than its notice
+   * (cutStoredToolResultToFit). A write that fails carries a notice naming
+   * the failure instead (spillOrTruncate).
+   */
+  private spillNoticeLength(label: string, content: string, shown: ShownRanges | null, bound: number | undefined,
+    readCap: number): number {
+    const place = this.toolResultFilePlace(label);
+    return this.spillNotice(0, content, shown, bound, readCap, place ? { path: place.path } : null).length;
   }
 
   /**
@@ -28373,11 +28400,16 @@ export class AgentFramework {
           // the round's calls, finished or not.
           const { cap, bound } = this.resolveToolResultInlineCap(agent);
           const share = toolResultShare(cap, bound, state.pending.size + state.completed.length);
+          const dateLabel = new Date().toISOString().slice(0, 10);
           for (let i = state.completed.length - 1; i >= 0 && collecting(); i--) {
             const tc = state.completed[i]!;
             const { text, shown } = this.storedToolResultText(agentName, tc, cap);
             const alone = storedImageSlots(text, cap, shown, bound);
-            const byShare = storedImageSlots(text, share.cap, shown, share.bound);
+            // By its share, with the notice the commit's cut would carry, so a
+            // result no longer than its notice counts as kept whole, as the
+            // commit stores it.
+            const byShare = storedImageSlots(text, share.cap, shown, share.bound,
+              this.spillNoticeLength(`${dateLabel}-${tc.id}`, text, shown, share.bound, cap));
             if (alone.length !== byShare.length || alone.some((slot, j) => slot.text !== byShare[j]!.text)) {
               this.toolRoundsByShare.add(state.completed);
             }
