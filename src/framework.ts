@@ -156,7 +156,7 @@ import { DEFAULT_OUTPUT_BOUNDS } from './code-execution/isolate/output.js';
 import type { PreludeTool } from './code-execution/isolate/prelude.js';
 import { bounded, renderList, renderReturn, VALUE_CHARS } from './code-execution/isolate/render.js';
 import { splitProseRuns, withoutRoundsProse } from './prose-segments.js';
-import { AUTO_CONTINUE_STOP_REASONS, autoContinueNotice } from './auto-continue.js';
+import { AUTO_CONTINUE_REASON, AUTO_CONTINUE_STOP_REASONS, autoContinueNotice, type PendingAutoContinue } from './auto-continue.js';
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
@@ -2746,6 +2746,9 @@ export class AgentFramework {
    *  maxConsecutive. Cleared when a turn starts with a cause of its own
    *  (processInferenceRequests) or a tool ends a turn (skip_reply). */
   private autoContinueStreaks: Map<string, number> = new Map();
+  /** A queued continuation's notice, per agent, until the turn that takes its
+   *  wake starts (writeAutoContinueNotice) or the wake is dropped. */
+  private autoContinuePending: Map<string, PendingAutoContinue> = new Map();
   private pendingAssistantBlocks: Map<string, ContentBlock[]> = new Map();
   /** Streams the FRAMEWORK cancelled for non-terminal reasons, keyed
    *  `${agentName}:${streamId}`: an endTurn tool result or a context-budget
@@ -14779,8 +14782,29 @@ export class AgentFramework {
         if (requests.some((r) => resumesLogicalTurn(r.reason))) {
           this.endContinuedTurn(agentName, { kind: 'dropped', why: 'the inference policy dropped its continuation' });
         }
+        if (requests.some((r) => r.reason === AUTO_CONTINUE_REASON)) this.dropAutoContinue(agentName, 'the inference policy dropped its wake');
         this.endPendingPrimary(agentName);
         continue;
+      }
+
+      // An autoContinue wake's notice is written now, as the turn that takes
+      // it starts, so it never claims a turn that doesn't run. Only when the
+      // continuation is the turn's whole cause: a batch with a cause of its
+      // own (a message, a heartbeat) is that cause's turn, and its run of
+      // continuations starts again below. A notice that can't be stored
+      // starts no continuation: without it the turn would wake to nothing.
+      if (requests.some((r) => r.reason === AUTO_CONTINUE_REASON)) {
+        const pending = this.autoContinuePending.get(agentName);
+        this.autoContinuePending.delete(agentName);
+        if (pending && requests.every((r) => FRAMEWORK_WAKE_SOURCES.has(r.source))
+          && !this.writeAutoContinueNotice(agent, pending)) {
+          this.autoContinueStreaks.set(agentName, pending.count - 1);
+          requests = requests.filter((r) => r.reason !== AUTO_CONTINUE_REASON);
+          if (requests.length === 0) {
+            this.endPendingPrimary(agentName);
+            continue;
+          }
+        }
       }
 
       // Start streaming inference (non-blocking — driveStream runs in background)
@@ -14829,12 +14853,21 @@ export class AgentFramework {
       const eventAt = (r: InferenceRequest): number => r.wakeAt ?? r.timestamp;
       let ambientReq: InferenceRequest | undefined;
       let addressedReq: InferenceRequest | undefined;
+      // An autoContinue wake names the finished turn's locus. It speaks for
+      // the turn only when nothing else in the batch names a channel: a
+      // message that arrived meanwhile, ambient included, outranks it, though
+      // its wake was queued first.
+      let continuationReq: InferenceRequest | undefined;
       for (const r of requests) {
         if (!r.channelId) continue;
+        if (r.reason === AUTO_CONTINUE_REASON) {
+          continuationReq ??= r;
+          continue;
+        }
         if (!ambientReq || eventAt(r) >= eventAt(ambientReq)) ambientReq = r;
         if (r.addressed && (!addressedReq || eventAt(r) >= eventAt(addressedReq))) addressedReq = r;
       }
-      const channelReq = addressedReq ?? ambientReq;
+      const channelReq = addressedReq ?? ambientReq ?? continuationReq;
       // Telemetry provenance (who/where woke the agent). An ADDRESSED winner
       // is its own provenance, even when it names no author (a push event
       // can route without an author id): borrowing another request's author
@@ -16578,11 +16611,14 @@ export class AgentFramework {
    * runs instead). A tool that ends the turn (skip_reply, sleep) never
    * reaches here, and clears the run's count.
    *
-   * The next turn reads a `[continue]` notice, stored now so it is the newest
-   * row the turn compiles (after the receipt), and keeps this turn's locus
-   * through its wake's channelId. A run is capped at maxConsecutive; the
-   * last allowed notice says so, and the cap holds until a turn starts with
-   * a cause of its own.
+   * This queues the wake and holds the notice it reads
+   * (autoContinuePending): the scheduler writes the `[continue]` row as the
+   * turn that takes the wake starts, and only when the continuation is that
+   * turn's whole cause (processInferenceRequests); a dropped wake writes
+   * none and gives back its count (dropAutoContinue). The wake names this
+   * turn's locus, which a batched message's channel outranks. A run is
+   * capped at maxConsecutive; the last allowed notice says so, and the cap
+   * holds until a turn starts with a cause of its own.
    */
   private autoContinueAfterTurn(
     agent: Agent,
@@ -16623,37 +16659,53 @@ export class AgentFramework {
         : agent.proseRouting === 'hybrid'
           ? 'end with a >>>skip_reply envelope'
           : undefined;
-    const text = autoContinueNotice(count, config.maxConsecutive, stop);
-    try {
-      // Stored straight into the window, as the receipt just was: the turn's
-      // stream is over, so the row lands after its response, and the next
-      // compile reads it as the newest row.
-      const id = agent.getContextManager().addMessage(
-        'user',
-        [{ type: 'text', text }],
-        { system: true, kind: 'auto-continue', continuation: count, maxConsecutive: config.maxConsecutive } as MessageMetadata,
-      );
-      this.emitTrace({ type: 'message:added', messageId: id, source: 'auto-continue' });
-    } catch (err) {
-      // Without its notice the next turn would wake to nothing it can read
-      // as a cause: no notice, no continuation.
-      console.error(`[continue] ${name}: notice not stored, so not continued:`, err);
-      this.autoContinueStreaks.set(name, count - 1);
-      return;
-    }
+    this.autoContinuePending.set(name, { count, max: config.maxConsecutive, stop });
     console.error(
       `[continue] ${name}: turn ended (${stopReason}) without skip_reply — continuation ${count} of ${config.maxConsecutive}` +
         (routing.locus ? ` in ${this.channelRegistry?.nameShown(routing.locus) ?? routing.locus.channelId}` : ''),
     );
     this.pendingRequests.push({
       agentName: name,
-      reason: 'auto-continue',
+      reason: AUTO_CONTINUE_REASON,
       source: 'framework',
       timestamp: Date.now(),
       // The next turn speaks where this one did (locus and hybrid modes):
       // the locus's server and id, as the framework's own wakes name a channel.
       ...(routing.locus ? { channelId: routing.locus.channelId, channelServerId: routing.locus.serverId } : {}),
     });
+  }
+
+  /**
+   * Store a continuation's `[continue]` notice in the agent's window, as the
+   * turn that takes its wake starts: no turn is running, so the row lands
+   * after everything the last turn wrote (its `[delivered]` receipt
+   * included, outside explicit mode) and is the newest row the turn
+   * compiles. False when it couldn't be stored.
+   */
+  private writeAutoContinueNotice(agent: Agent, pending: PendingAutoContinue): boolean {
+    const text = autoContinueNotice(pending.count, pending.max, pending.stop);
+    try {
+      const id = agent.getContextManager().addMessage(
+        'user',
+        [{ type: 'text', text }],
+        { system: true, kind: 'auto-continue', continuation: pending.count, maxConsecutive: pending.max } as MessageMetadata,
+      );
+      this.emitTrace({ type: 'message:added', messageId: id, source: 'auto-continue' });
+      return true;
+    } catch (err) {
+      console.error(`[continue] ${agent.name}: notice not stored, so not continued:`, err);
+      return false;
+    }
+  }
+
+  /** A queued continuation whose wake starts no turn: its notice is never
+   *  written, and the run's count goes back to what it was before. */
+  private dropAutoContinue(agentName: string, why: string): void {
+    const pending = this.autoContinuePending.get(agentName);
+    if (!pending) return;
+    this.autoContinuePending.delete(agentName);
+    this.autoContinueStreaks.set(agentName, pending.count - 1);
+    console.error(`[continue] ${agentName}: continuation ${pending.count} dropped — ${why}`);
   }
 
   /** The agent's routing state for its current turn, made when it has none. */

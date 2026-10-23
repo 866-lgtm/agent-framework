@@ -235,10 +235,14 @@ export interface AgentConfig {
    * whose last prose envelope is `>>skip_reply` (explicit) or `>>>skip_reply`
    * (hybrid), pauses as usual.
    *
-   * Before the next turn a short system notice joins the window, after the
-   * turn's `[delivered]` receipt, saying that the turn continues and that
-   * skip_reply stops it; near the cap it also says how many continuations
-   * are left. The next turn keeps the turn's locus (locus and hybrid modes).
+   * As the next turn starts, a short system notice joins the window (after
+   * the last turn's `[delivered]` receipt, outside explicit mode, which
+   * writes none), saying that the turn continues and that skip_reply stops
+   * it; near the cap it also says how many continuations are left. It's
+   * written only when the continuation is that turn's whole cause: a
+   * message batched with it makes it that message's turn, with no notice,
+   * in the message's channel. Otherwise the next turn keeps the turn's
+   * locus (locus and hybrid modes).
    * At most `maxConsecutive` (default 3) continuations run in a row: the
    * count starts again when a turn starts with a cause of its own (a
    * message, a heartbeat, a timer) or a tool ends one. Silent heartbeat

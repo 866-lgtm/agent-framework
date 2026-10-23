@@ -5,7 +5,7 @@ import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.
 import { ToolResultGuard } from './tool-result-guard.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
 import { injectionsAsStored } from './text-as-stored.js';
-import { assertBooleanSetting, holdsSettings } from './config-checks.js';
+import { assertBooleanSetting, holdsSettings, kindOf } from './config-checks.js';
 import {
   CONTINUE_ROW,
   continueTurn,
@@ -154,14 +154,21 @@ const MAX_AUTO_CONTINUE_MAX = 20;
 
 /**
  * `AgentConfig.autoContinue` resolved: undefined when off (left out, null or
- * false), else its cap. Anything else is refused: `true`, or an object whose
- * `maxConsecutive` is left out or a whole number from 1 to 20.
+ * false), else its cap. `true` takes the default cap; an object takes
+ * `maxConsecutive`, a whole number from 1 to 20 (the default when left out).
+ * Any other value is refused.
  */
 export function resolveAutoContinue(config: AgentConfig): { maxConsecutive: number } | undefined {
   const setting = `Agent "${config.name}" autoContinue`;
-  const value = config.autoContinue;
+  const value: unknown = config.autoContinue;
   if (value === true) return { maxConsecutive: DEFAULT_AUTO_CONTINUE_MAX };
-  if (!holdsSettings(setting, value, '{ maxConsecutive: 3 }')) return undefined;
+  if (value !== undefined && value !== null && value !== false && (typeof value !== 'object' || Array.isArray(value))) {
+    throw new Error(
+      `${setting} must be true, false or an object such as { maxConsecutive: 3 }, not ${kindOf(value)}` +
+        (typeof value === 'string' ? ' (true and false go unquoted)' : ''),
+    );
+  }
+  if (!holdsSettings(setting, value as AgentConfig['autoContinue'], '{ maxConsecutive: 3 }')) return undefined;
   const max = (value as AutoContinueConfig).maxConsecutive;
   if (max === undefined) return { maxConsecutive: DEFAULT_AUTO_CONTINUE_MAX };
   if (typeof max !== 'number' || !Number.isInteger(max) || max < 1 || max > MAX_AUTO_CONTINUE_MAX) {

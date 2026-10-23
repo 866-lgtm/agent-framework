@@ -126,11 +126,15 @@ describe('autoContinue', () => {
   async function createFramework(
     autoContinue: AgentConfig['autoContinue'],
     proseRouting: AgentConfig['proseRouting'] = 'locus',
+    allowedTools?: AgentConfig['allowedTools'],
   ): Promise<AgentFramework> {
     const framework = await AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
       membrane: membrane.asMembrane(),
-      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'You are a test agent.', proseRouting, autoContinue }],
+      agents: [{
+        name: 'assistant', model: 'test-model', systemPrompt: 'You are a test agent.', proseRouting, autoContinue,
+        ...(allowedTools ? { allowedTools } : {}),
+      }],
       modules: [module],
     });
     module.framework = framework;
@@ -269,7 +273,21 @@ describe('autoContinue', () => {
     }
   });
 
-  for (const stop of ['max_tokens', 'refusal'] as const) {
+  it('continues a turn that ends on a stop sequence', async () => {
+    const framework = await createFramework(true);
+    stubRegistry(framework);
+    const triggers = script(framework, [createMockResponse([text('stopped at the sequence')], 'stop_sequence'), skipReply()]);
+    try {
+      trigger(framework);
+      await within(framework.runUntilIdle(), 'the run to settle');
+      assert.equal(triggers.length, 2);
+      assert.equal(triggers[1]!.reason, 'auto-continue');
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  for (const stop of ['max_tokens', 'refusal', 'no_progress', 'round_limit'] as const) {
     it(`does not continue a turn that ended with ${stop}`, async () => {
       const framework = await createFramework(true);
       stubRegistry(framework);
@@ -318,6 +336,140 @@ describe('autoContinue', () => {
       assert.equal(triggers.length, 3, 'a prose end continues again');
       assert.deepEqual(notices(framework), [autoContinueNotice(1, 2, 'call skip_reply')]);
     } finally {
+      await framework.stop();
+    }
+  });
+
+  it("a message that arrives during the turn takes the next turn: its channel, no notice, a fresh run", async () => {
+    const framework = await createFramework(true);
+    stubRegistry(framework);
+    const internals = framework as unknown as { pendingRequests: InferenceRequest[]; autoContinueStreaks: Map<string, number> };
+    const triggers = script(framework, [prose('Working in the commons.'), skipReply()]);
+    // An ambient message in another channel, queued while the first turn
+    // runs: it waits for that turn, then batches with the continuation.
+    let injected = false;
+    framework.onTrace((e) => {
+      if ((e as { type: string }).type !== 'inference:started' || injected) return;
+      injected = true;
+      internals.pendingRequests.push({
+        agentName: 'assistant', reason: 'channel-message', source: 'stub', timestamp: Date.now(),
+        channelId: 'chan-b', channelServerId: 'stub',
+      });
+    });
+    try {
+      trigger(framework);
+      await within(framework.runUntilIdle(), 'the run to settle');
+      assert.equal(triggers.length, 2, 'one more turn, not two');
+      assert.ok(triggers[1]!.reason === 'channel-message' || triggers[1]!.reason === 'auto-continue');
+      assert.equal(triggers[1]!.channelId, 'chan-b', "the message's channel outranks the continuation's, though queued first");
+      assert.deepEqual(notices(framework), [], 'the message is the turn\'s cause: no [continue] row');
+      assert.equal(internals.autoContinueStreaks.has('assistant'), false, 'and the run starts again');
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it('a continuation the inference policy drops writes no notice and gives back its count', async () => {
+    const framework = await createFramework(true);
+    stubRegistry(framework);
+    const internals = framework as unknown as {
+      inferencePolicy: { shouldInfer(agent: string, requests: InferenceRequest[]): boolean };
+      autoContinueStreaks: Map<string, number>;
+      autoContinuePending: Map<string, unknown>;
+    };
+    internals.inferencePolicy = { shouldInfer: (_agent, requests) => !requests.some((r) => r.reason === 'auto-continue') };
+    const triggers = script(framework, [prose('Only this.')]);
+    try {
+      trigger(framework);
+      await within(framework.runUntilIdle(), 'the run to settle');
+      assert.equal(triggers.length, 1);
+      assert.deepEqual(notices(framework), [], 'no notice claims a turn that never ran');
+      assert.equal(internals.autoContinueStreaks.get('assistant') ?? 0, 0, 'the count is given back');
+      assert.equal(internals.autoContinuePending.size, 0);
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it('a notice that cannot be stored starts no continuation and gives back its count', async () => {
+    const framework = await createFramework(true);
+    stubRegistry(framework);
+    const internals = framework as unknown as { autoContinueStreaks: Map<string, number> };
+    const cm = framework.getAgent('assistant')!.getContextManager() as unknown as {
+      addMessage(role: string, content: unknown, metadata?: { kind?: string }): unknown;
+    };
+    const original = cm.addMessage.bind(cm);
+    cm.addMessage = (role, content, metadata) => {
+      if (metadata?.kind === 'auto-continue') throw new Error('synthetic store failure');
+      return original(role, content, metadata);
+    };
+    const triggers = script(framework, [prose('Only this.')]);
+    try {
+      trigger(framework);
+      await within(framework.runUntilIdle(), 'the run to settle');
+      assert.equal(triggers.length, 1, 'no turn wakes without its notice');
+      assert.equal(internals.autoContinueStreaks.get('assistant') ?? 0, 0);
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  for (const [mode, first, stop] of [
+    ['explicit', '>>#alpha hello', 'end with a >>skip_reply envelope'],
+    ['hybrid', 'hello', 'end with a >>>skip_reply envelope'],
+    ['locus', 'hello', undefined],
+  ] as const) {
+    it(`${mode}: an agent that can't call skip_reply is told ${stop ? 'its envelope' : 'no way to stop'}`, async () => {
+      const framework = await createFramework({ maxConsecutive: 1 }, mode, ['robot--move']);
+      stubRegistry(framework);
+      // Without skip_reply, the cap ends the run.
+      const triggers = script(framework, [prose(first), prose(first), prose(first)]);
+      try {
+        trigger(framework);
+        await within(framework.runUntilIdle(), 'the run to settle');
+        assert.equal(triggers.length, 2);
+        assert.deepEqual(notices(framework), [autoContinueNotice(1, 1, stop)]);
+      } finally {
+        await framework.stop();
+      }
+    });
+  }
+
+  it('queues nothing for an ephemeral run, a stopping framework or an agent no longer registered', async () => {
+    const framework = await createFramework(true);
+    stubRegistry(framework);
+    const internals = framework as unknown as {
+      autoContinueAfterTurn(agent: unknown, routing: unknown, trigger: unknown, stopReason: string): void;
+      pendingRequests: InferenceRequest[];
+      ephemeralRuns: Map<string, unknown>;
+      providerAdmissionClosed: boolean;
+      autoContinuePending: Map<string, unknown>;
+      autoContinueStreaks: Map<string, number>;
+    };
+    const agent = framework.getAgent('assistant')!;
+    const queued = () => internals.pendingRequests.filter((r) => r.reason === 'auto-continue').length;
+    try {
+      internals.ephemeralRuns.set('assistant', {});
+      internals.autoContinueAfterTurn(agent, {}, undefined, 'end_turn');
+      internals.ephemeralRuns.delete('assistant');
+      assert.equal(queued(), 0, 'an ephemeral run ends with its result');
+
+      internals.providerAdmissionClosed = true;
+      internals.autoContinueAfterTurn(agent, {}, undefined, 'end_turn');
+      internals.providerAdmissionClosed = false;
+      assert.equal(queued(), 0, 'a stopping framework starts nothing');
+
+      internals.autoContinueAfterTurn(Object.create(agent), {}, undefined, 'end_turn');
+      assert.equal(queued(), 0, 'an agent object no longer the registered one starts nothing');
+
+      // The same call for the registered agent does queue one.
+      internals.autoContinueAfterTurn(agent, {}, undefined, 'end_turn');
+      assert.equal(queued(), 1);
+      assert.equal(internals.autoContinuePending.size, 1);
+    } finally {
+      internals.pendingRequests.length = 0;
+      internals.autoContinuePending.clear();
+      internals.autoContinueStreaks.clear();
       await framework.stop();
     }
   });
@@ -382,6 +534,11 @@ describe('autoContinue config', () => {
     assert.deepEqual(resolveAutoContinue(at(true)), { maxConsecutive: 3 });
     assert.deepEqual(resolveAutoContinue(at({})), { maxConsecutive: 3 });
     assert.deepEqual(resolveAutoContinue(at({ maxConsecutive: 7 })), { maxConsecutive: 7 });
+  });
+
+  it('tells a string or number it can be true, false or an object', () => {
+    assert.throws(() => resolveAutoContinue(at('true')), /must be true, false or an object such as \{ maxConsecutive: 3 \}, not a string \(true and false go unquoted\)/);
+    assert.throws(() => resolveAutoContinue(at(1)), /must be true, false or an object/);
   });
 
   it('refuses anything else', () => {

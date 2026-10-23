@@ -11,6 +11,18 @@
  * `max_tokens` end was cut off rather than chosen, and `no_progress` and
  * `round_limit` are the stall guard's verdict that the turn wasn't moving.
  */
+/** The reason on a continuation's wake (InferenceRequest.reason). */
+export const AUTO_CONTINUE_REASON = 'auto-continue';
+
+/** What a queued continuation's notice says, held until its turn starts. */
+export interface PendingAutoContinue {
+  /** This continuation's place in the run, 1 to `max`. */
+  count: number;
+  max: number;
+  /** How the agent stops (autoContinueNotice's `stop`), if it can. */
+  stop: string | undefined;
+}
+
 export const AUTO_CONTINUE_STOP_REASONS: ReadonlySet<string> = new Set(['end_turn', 'stop_sequence']);
 
 /**

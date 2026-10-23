@@ -28,8 +28,10 @@ A turn continues when the model ended it (stop reason `end_turn` or
 
 ## What the agent reads
 
-Before the next turn a short system row joins the window, after the turn's
-`[delivered]` receipt, so it is the newest thing the turn reads:
+As the next turn starts, a short system row joins the window, so it is the
+newest thing the turn reads (after the last turn's `[delivered]` receipt,
+outside explicit mode, whose envelopes acknowledge themselves and write no
+receipt):
 
 ```
 [continue] Your last turn ended without skip_reply, so another one starts now. To stop and wait for the next event, call skip_reply.
@@ -46,8 +48,12 @@ An agent that can't call `skip_reply` is told to end with a `>>skip_reply`
 (explicit) or `>>>skip_reply` (hybrid) envelope instead; in locus or disabled
 mode without the tool, the row names no way to stop and the cap ends the run.
 
-The row is stored at the turn's end, after its response, and never retracted,
-so the prompt-cache prefix stays stable. It is deliberately short and
+The row is written by the scheduler as it starts the turn that takes the
+continuation's wake, never earlier, so it never claims a turn that doesn't
+run: a wake the inference policy drops writes no row and gives back its
+count, and a row that can't be stored starts no continuation. It is appended
+before the turn compiles and never retracted, so the prompt-cache prefix
+stays stable. It is deliberately short and
 event-shaped: longer instruction blocks about output, sent as user-role
 messages, have tripped provider classifiers.
 
@@ -56,8 +62,12 @@ messages, have tripped provider classifiers.
 The continuation's wake has source `framework` and reason `auto-continue`. In
 locus and hybrid modes it carries the turn's locus as its channel, so the next
 turn's plain prose lands where the last one's did rather than in the
-process-global last-inbound channel. A message that arrives meanwhile joins
-the same turn, as any batched wake does.
+process-global last-inbound channel.
+
+A message that arrives meanwhile joins the same turn, as any batched wake
+does, and then that turn is the message's: its channel outranks the
+continuation's (ambient included, though the continuation's wake was queued
+later), no `[continue]` row is written, and the run's count starts again.
 
 ## The cap
 
