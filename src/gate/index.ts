@@ -9,5 +9,6 @@ export type {
   GateEventInfo,
   GateStatus,
   GatePolicyStats,
+  UnreadableConfigKept,
   WakeLine,
 } from './types.js';
