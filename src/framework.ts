@@ -22626,12 +22626,11 @@ export class AgentFramework {
     return stored;
   }
 
-  /** Where addMessage delivers: the named agent, else the primary, else the
-   *  first registered agent. Undefined when there is no such agent. */
   /**
    * Whether an MCPL event's own stored entry is the newest entry in the window
    * a batched wake's line is written to (deliveryAgent(): the primary's), with
-   * no turn running there and nothing waiting to be written (deferred). The
+   * no turn alive there (turnAlive: started, streaming, or waiting on its
+   * tools) and nothing waiting to be written (deferred). The
    * gate then wakes the agent without the line, the message right above being
    * the wake's whole cause. A channel message is found by its server, channel
    * and message id, a push event by its server and event id. A message a
@@ -22640,7 +22639,9 @@ export class AgentFramework {
   private isNewestContextEntry(entry: GateEntryRef): boolean {
     const agent = this.deliveryAgent();
     if (!agent) return false;
-    if (this.activeTurnTokens.has(agent.name)) return false;
+    // A turn starting, streaming or waiting on its tools writes after the
+    // message, and the line says which message the wake is for.
+    if (this.turnAlive(agent)) return false;
     if (this.deferredMessages.some((m) => (m.forAgent ?? this.primaryAgentName) === agent.name)) return false;
     const [newest] = agent.getContextManager().queryMessages({ limit: 1, reverse: true }).messages;
     const md = newest?.metadata as Record<string, unknown> | undefined;
@@ -22654,6 +22655,8 @@ export class AgentFramework {
     return false;
   }
 
+  /** Where addMessage delivers: the named agent, else the primary, else the
+   *  first registered agent. Undefined when there is no such agent. */
   private deliveryAgent(forAgent?: string): Agent | undefined {
     return forAgent
       ? this.agents.get(forAgent)
