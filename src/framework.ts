@@ -157,6 +157,7 @@ import { bounded, renderList, renderReturn, VALUE_CHARS } from './code-execution
 import { splitProseRuns, withoutRoundsProse } from './prose-segments.js';
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
+import { contentAsStored, nameAsStored } from './text-as-stored.js';
 
 /** An MCPL tool call refused because its server isn't in the registry: one
  *  closed for good, one removed, or one whose connect failed without
@@ -929,7 +930,8 @@ function describeDeferredWrite(msg: { id: string; participant: string; content: 
 function isInjectableMidTurn(msg: { participant: string; content: ContentBlock[] }, agentName: string): boolean {
   // Exact, as membrane's role test is: only a participant equal to the
   // request's assistantParticipant (Agent's name) renders as the assistant.
-  return msg.participant !== agentName
+  // It's the name as sent, which the boundary takes as the store keeps it.
+  return nameAsStored(msg.participant) !== agentName
     && !msg.content.some((b) => b.type === 'tool_use' || b.type === 'tool_result');
 }
 
@@ -1252,6 +1254,12 @@ function isTurnContinuation(reason: string): boolean {
   return reason === 'context_budget_restart' || reason === 'tool_results_ready'
     || reason === 'tool_result_guard_retry';
 }
+
+/** Wake sources the framework generates for itself (bounce wakes,
+ *  continuations, retries, unsticks, admission requeues). A wake from any
+ *  other source — a channel message, a heartbeat or other server event, a
+ *  gate flush, a timer, an operator nudge — is a cause of its own. */
+const FRAMEWORK_WAKE_SOURCES = new Set(['framework', 'scheduler']);
 const CONVERSATION_ROUTER_STATE_ID = 'framework/conversation-router';
 const INFERENCE_LOG_ID = 'framework/inference-log';
 const PROCESS_LOG_ID = 'framework/process-log';
@@ -12155,11 +12163,14 @@ export class AgentFramework {
             // 0.5.x, and from 0.6.0 declares it can't carry them, so none are
             // collected for it. Each goes as its participant and content
             // alone: a stored row's metadata is the host's record, not input
-            // for membrane.
+            // for membrane. Each goes with its name and text as the store
+            // keeps them, whether it's a heard message, rendered or not, or a
+            // notice the boundary made: this is where they leave for the
+            // request.
             currentState.stream.provideToolResults(
               agent.toolResultGuard.submissionResults(membraneResults),
               midTurnInjections.length > 0
-                ? { injectedMessages: midTurnInjections.map(({ participant, content }) => ({ participant, content })) }
+                ? { injectedMessages: midTurnInjections.map(({ participant, content }) => ({ participant: nameAsStored(participant), content: contentAsStored(content) })) }
                 : undefined,
             );
             // RFC-006 §3.3: consumption is determined at assembly, and this
@@ -14468,6 +14479,16 @@ export class AgentFramework {
       // requests[0] in that mixed batch bypassed the turn lock because a
       // restart existed, then treated the continuation as a fresh turn.
       const trigger = budgetRestart ?? requests[0];
+      // The bounce-wake cap (bounceProse) stops a bounce → wake → bounce loop
+      // that nothing else feeds. A turn with a cause of its own is not that
+      // loop, so the count starts again. Otherwise only a delivered prose
+      // envelope reset it, and a resident that recovers from bounces with a
+      // send tool kept the count for good: every later bounce, a reply to a
+      // fresh message included, appended its notice without a wake.
+      // (Optional chaining: prototype-built harnesses leave the map unset.)
+      if (requests.some((r) => !FRAMEWORK_WAKE_SOURCES.has(r.source))) {
+        this.proseBounceStreaks?.delete(agentName);
+      }
       // Route this turn's auto-published speech to the channel that triggered
       // it (item-3 redux). A batched wake may carry several triggering channels
       // (messages arrived in >1 channel while the agent was busy/idle):
@@ -16686,7 +16707,9 @@ export class AgentFramework {
     }
   }
 
-  /** Cap on consecutive bounce-triggered wakes (notices still append after). */
+  /** Cap on consecutive bounce-triggered wakes (notices still append after).
+   *  The count resets on a delivered prose envelope, and when a turn starts
+   *  with a cause of its own (processInferenceRequests). */
   private static readonly PROSE_BOUNCE_WAKE_CAP = 2;
 
   /**
@@ -20674,7 +20697,7 @@ export class AgentFramework {
     for (const tc of toolResults) {
       const { text, shown, stored } = alone.get(tc.id)!;
       spilled.set(tc.id, byShare
-        ? await this.spillOrTruncate(text, share!.cap, `${dateLabel}-${tc.id}`, shown, share!.bound, stored.written)
+        ? await this.spillOrTruncate(text, share!.cap, `${dateLabel}-${tc.id}`, shown, share!.bound, stored.written, { readCap: maxChars! })
         : stored);
     }
     const blocks: ContentBlock[] = toolResults.map(tc => ({
@@ -20712,7 +20735,7 @@ export class AgentFramework {
     tc: CompletedToolCall,
     maxChars: number | undefined,
   ): { text: string; shown: ShownRanges | null } {
-    if (tc.result.isError) return { text: tc.result.error ?? 'Unknown error', shown: null };
+    if (tc.result.isError) return { text: (tc.result.error ?? 'Unknown error').toWellFormed(), shown: null };
     const ledger = this.toolImageLedgerFor(agentName);
     let blocks = null as HistoryBlockSpan[] | null;
     const text = nonErrorResultText(tc.result, undefined, {
@@ -20890,6 +20913,11 @@ export class AgentFramework {
     /** The spill file an earlier cut of this text wrote: reused, not written
      *  again. Undefined when none was cut. */
     written?: SpillWrite,
+    /** Set where `cap` and `bound` are this text's share of one turn's
+     *  bound (buildStoredToolResultContent): `readCap` is the inline cap,
+     *  which a later read of the file comes back under alone in its own turn
+     *  and its paging advice is sized to. */
+    share?: { readCap: number },
   ): Promise<{ text: string; filePath: string | null; written?: SpillWrite }> {
     if (!cap || content.length <= cap) return { text: content, filePath: null };
     // The stored text is the only place save_recent_image discovers tool
@@ -20899,45 +20927,67 @@ export class AgentFramework {
     // newest slots past the cut that the live copy showed are re-appended
     // after the notice. Otherwise the live copy is this text, and nothing
     // past the cut is kept (#403). The stored copy, notice and kept slots
-    // included, fits `bound`, the most a reader's strategy keeps of it, so
-    // no reader's cut takes the notice (cutStoredToolResultToFit), and the
-    // spill notices name the head they kept.
-    const cut = cutStoredToolResultToFit(content, cap, shown, bound);
+    // included, fits `bound`, the most a reader's strategy keeps of it,
+    // where `bound` leaves the notice its room, so no reader's cut takes the
+    // notice (cutStoredToolResultToFit), and the spill notices name the head
+    // they kept. Under a share too small for that, a cut keeps no head and
+    // stores its notice alone, and a text no longer than that notice is
+    // stored whole, with no file written: each result at its least.
+    const readCap = share?.readCap ?? cap;
+    const cut = cutStoredToolResultToFit(content, cap, shown, bound,
+      share ? this.spillNoticeLength(label, content, shown, bound, readCap) : undefined);
+    if (cut.head === content) return { text: content, filePath: null };
     const { head } = cut;
     const kept = formatKeptImageSlots(cut);
 
     if (written === undefined) written = await this.writeToolResultFile(label, content);
+    const notice = this.spillNotice(head.length, content, shown, bound, readCap, written);
+    // The notice was measured as a written file's reads. A write that failed
+    // keeps nothing, and its notice, naming the failure, can be longer: under
+    // a share, a cut that keeps no head and would store no less than the
+    // text is stored as the text itself, where the text holds no image slot.
+    // One that does is stored as it was measured, cut, since save_recent_image
+    // counted it so before the write.
+    if (share && head.length === 0 && notice.length >= content.length && parseImagePlaceholders(content).length === 0) {
+      return { text: content, filePath: null, written };
+    }
+    return { text: head + notice + kept, filePath: written && written.error === undefined ? written.path : null, written };
+  }
+
+  /**
+   * The notice a cut copy carries after its head (spillOrTruncate): the file
+   * holding the whole result and how to read it back, or why there is none.
+   */
+  private spillNotice(headLength: number, content: string, shown: ShownRanges | null, bound: number | undefined,
+    readCap: number, written: SpillWrite): string {
     if (written && written.error === undefined) {
-      const path = written.path;
-      return {
-        text: head
-          + `\n\n[truncated — showing ${head.length} of ${content.length} chars; full content: workspace file ${path}`
-          + `. ${this.spillPageAdvice(path, cap, bound === undefined || cutStoredToolResultToFit(content, bound, shown, bound).head.length > head.length)}]`
-          + kept,
-        filePath: path,
-        written,
-      };
+      const canRaise = bound === undefined || cutStoredToolResultToFit(content, bound, shown, bound).head.length > headLength;
+      return `\n\n[truncated — showing ${headLength} of ${content.length} chars; full content: workspace file ${written.path}`
+        + `. ${this.spillPageAdvice(written.path, readCap, canRaise)}]`;
     }
     if (written) {
       // A workspace was there and the write FAILED — say that, loudly and
       // distinctly. Telling the agent "no writable workspace" would teach
       // them their residence lacks a capability it actually has.
-      return {
-        text: head
-          + `\n\n[truncated — showing ${head.length} of ${content.length} chars; spill to workspace file ${written.path} FAILED`
-          + ` (${written.error}); content over the cap was not retained]`
-          + kept,
-        filePath: null,
-        written,
-      };
+      return `\n\n[truncated — showing ${headLength} of ${content.length} chars; spill to workspace file ${written.path} FAILED`
+        + ` (${written.error}); content over the cap was not retained]`;
     }
-    return {
-      text: head
-        + '\n\n[truncated — original was ' + content.length + ' chars; ' + this.noFileMountText() + ', full content not retained]'
-        + kept,
-      filePath: null,
-      written,
-    };
+    return '\n\n[truncated — original was ' + content.length + ' chars; ' + this.noFileMountText() + ', full content not retained]';
+  }
+
+  /**
+   * The length of the notice a cut of `content` that keeps no head would
+   * carry, before any file is written, as it reads once its file is
+   * (toolResultFilePlace, where any earlier cut of the text wrote it too), so
+   * the cut and save_recent_image's count of the result before it measure
+   * alike. For keeping whole, under a share, a text no longer than its notice
+   * (cutStoredToolResultToFit). A write that fails carries a notice naming
+   * the failure instead (spillOrTruncate).
+   */
+  private spillNoticeLength(label: string, content: string, shown: ShownRanges | null, bound: number | undefined,
+    readCap: number): number {
+    const place = this.toolResultFilePlace(label);
+    return this.spillNotice(0, content, shown, bound, readCap, place ? { path: place.path } : null).length;
   }
 
   /**
@@ -21266,7 +21316,8 @@ export class AgentFramework {
       if (b.type === 'text') {
         // A text that isn't a string shows as the converters' placeholder,
         // rather than sending the whole array to the JSON fallback.
-        let text = typeof b.text === 'string' ? b.text : NON_STRING_TEXT_PLACEHOLDER;
+        // Well formed, as the stored copy's text is (nonErrorResultText).
+        let text = typeof b.text === 'string' ? b.text.toWellFormed() : NON_STRING_TEXT_PLACEHOLDER;
         if (maxChars && text.length > maxChars) {
           text = text.slice(0, toolResultCutAt(text, maxChars))
             + '\n\n[truncated — original was ' + text.length + ' chars'
@@ -28435,11 +28486,16 @@ export class AgentFramework {
           // the round's calls, finished or not.
           const { cap, bound } = this.resolveToolResultInlineCap(agent);
           const share = toolResultShare(cap, bound, state.pending.size + state.completed.length);
+          const dateLabel = new Date().toISOString().slice(0, 10);
           for (let i = state.completed.length - 1; i >= 0 && collecting(); i--) {
             const tc = state.completed[i]!;
             const { text, shown } = this.storedToolResultText(agentName, tc, cap);
             const alone = storedImageSlots(text, cap, shown, bound);
-            const byShare = storedImageSlots(text, share.cap, shown, share.bound);
+            // By its share, with the notice the commit's cut would carry, so a
+            // result no longer than its notice counts as kept whole, as the
+            // commit stores it.
+            const byShare = storedImageSlots(text, share.cap, shown, share.bound,
+              this.spillNoticeLength(`${dateLabel}-${tc.id}`, text, shown, share.bound, cap));
             if (alone.length !== byShare.length || alone.some((slot, j) => slot.text !== byShare[j]!.text)) {
               this.toolRoundsByShare.add(state.completed);
             }

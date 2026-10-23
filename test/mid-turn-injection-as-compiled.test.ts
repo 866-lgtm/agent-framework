@@ -40,6 +40,8 @@ class InterjectingModule implements Module {
   interjections: ContentBlock[][] = [];
   /** Metadata for the interjection at the same index, if any. */
   interjectionMetadata: Array<Record<string, unknown> | undefined> = [];
+  /** Whom each interjection is from; the message that starts a turn is Antra's. */
+  participant = 'Antra';
 
   async start(_ctx: ModuleContext): Promise<void> {}
   async stop(): Promise<void> {}
@@ -69,7 +71,7 @@ class InterjectingModule implements Module {
     const go = (event as { content?: unknown }).content === 'go';
     return {
       addMessages: [{
-        participant: 'Antra',
+        participant: blocks ? this.participant : 'Antra',
         content: blocks ?? [text(String((event as { content?: unknown }).content))],
         ...(rowMetadata ? { metadata: rowMetadata } : {}),
       }],
@@ -95,11 +97,11 @@ describe('a message injected at a tool boundary', () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  async function create(strategy: unknown, modules: Module[] = []): Promise<AgentFramework> {
+  async function create(strategy: unknown, modules: Module[] = [], agentName = 'assistant'): Promise<AgentFramework> {
     framework = await AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
       membrane: membrane.asMembrane(),
-      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'You are a robot pilot.', strategy: strategy as never }],
+      agents: [{ name: agentName, model: 'test-model', systemPrompt: 'You are a robot pilot.', strategy: strategy as never }],
       modules: [module, ...modules],
     });
     module.framework = framework;
@@ -196,6 +198,18 @@ describe('a message injected at a tool boundary', () => {
     assert.deepEqual(JSON.parse((await nextRequest())('[not shown]')), [notice]);
   });
 
+  it("names a left-out message's sender in its notice as the store keeps the name, a lone surrogate as U+FFFD", async () => {
+    await create(new WindowedPassthroughStrategy({}));
+    membrane.supportsInjectedMessages = true;
+    renderWith((ids, real) => real(ids)!.map((c, i) => (i === 0 ? null : c)));
+    module.participant = 'An \ud83d tra';
+    const injected = await turnWith([[text('LEFTOUT')], [text('HEARD')]]);
+    const notice = JSON.parse(holding(injected, '[not shown]') || '[]') as Array<{ text?: string }>;
+    assert.ok(notice[0]?.text, 'the premise: the boundary injected its notice');
+    assert.ok(notice[0]!.text!.isWellFormed() && notice[0]!.text!.includes('From An \ufffd tra'), `the notice names the sender well formed: ${JSON.stringify(notice[0]!.text)}`);
+    assert.deepEqual(JSON.parse((await nextRequest())('[not shown]')), notice, 'as the next request sends it');
+  });
+
   it('tells the agent of a boundary whose whole batch is left out, with each one\'s images, and names no message a tune-out holds', async () => {
     await create(new WindowedPassthroughStrategy({}));
     membrane.supportsInjectedMessages = true;
@@ -275,6 +289,45 @@ describe('a message injected at a tool boundary', () => {
     const long = 'LONGMSG ' + Array.from({ length: 300 }, (_, i) => `word${i}`).join(' ');
     const injected = await turnWith([[text(long)]]);
     assert.deepEqual(JSON.parse(holding(injected, 'LONGMSG')), [text(long)]);
+  });
+
+  it("goes in with its sender's name as the store keeps it, a lone surrogate as U+FFFD", async () => {
+    await create(new WindowedPassthroughStrategy({ maxMessageTokens: 50 }));
+    module.participant = 'An \ud83d tra';
+    const injected = await turnWith([[text('NAMEDMSG')]]);
+    const live = injected.find((m) => JSON.stringify(m.content).includes('NAMEDMSG'));
+    assert.equal(live?.participant, 'An \ufffd tra', 'the live round names its sender well formed');
+    membrane.pushResponse(createMockResponse([text('Again.')]));
+    go();
+    await framework.runUntilIdle();
+    const stored = membrane.calls[membrane.calls.length - 1]!.messages.find((m) => JSON.stringify(m.content).includes('NAMEDMSG'));
+    assert.equal(live?.participant, stored?.participant, 'as the next request names it');
+  });
+
+  it("isn't injected where its sender's name, as the store keeps it, is the agent's own", async () => {
+    // It would render as the agent's own turn mid-round, a prefill.
+    await create(new WindowedPassthroughStrategy({ maxMessageTokens: 50 }), [], 'Robo \ufffd');
+    module.participant = 'Robo \ud83d';
+    const injected = await turnWith([[text('SELFMSG')]]);
+    assert.equal(holding(injected, 'SELFMSG'), '', 'the live round leaves it out');
+  });
+
+  it("gives the round's results to the stream when a queued sender's name isn't a string", { timeout: 20_000 }, async () => {
+    await create(new WindowedPassthroughStrategy({ maxMessageTokens: 50 }));
+    module.participant = 42 as unknown as string;
+    // A turn whose results never reach the stream never ends, so the wait is
+    // bounded and the assertion says what happened. On main it passes: this
+    // pins that the boundary's name step keeps main's handling.
+    await Promise.race([turnWith([[text('NUMMSG')]]), new Promise((r) => setTimeout(r, 10_000))]);
+    assert.ok((membrane.lastStream?.receivedToolResults ?? []).length > 0, "the round's results reach the stream");
+  });
+
+  it('goes in with its text as the store keeps it where the strategy has no render, a lone surrogate as U+FFFD', async () => {
+    await create(new WindowedPassthroughStrategy({ maxMessageTokens: 50 }));
+    renderWith(() => undefined);
+    const injected = await turnWith([[text('LONEMSG cut \ud83d here')]]);
+    assert.deepEqual(JSON.parse(holding(injected, 'LONEMSG')), [text('LONEMSG cut \ufffd here')]);
+    assert.equal(JSON.parse((await nextRequest())('LONEMSG'))[0].text, 'LONEMSG cut \ufffd here', 'as the next request sends it');
   });
 
   it('goes in as stored where the render throws, which is logged', async () => {
