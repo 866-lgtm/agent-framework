@@ -854,10 +854,6 @@ interface DrainedWrite {
   id: MessageId;
   content: ContentBlock[];
   parts: number;
-  /** A marked entry found where an earlier write stored it: a tool
-   *  boundary doesn't inject it, and the agent reads it at its next
-   *  compile, where the store holds it. */
-  foundLater?: true;
 }
 
 /** What later compiles render from the store for the copies of one write
@@ -2805,10 +2801,11 @@ export class AgentFramework {
    */
   private deferredScanFrom = new Map<string, number>();
   private deferredMessages: DeferredWrite[] = [];
-  /** The marked held writes whose store couldn't be searched, said once
-   *  each until a lookup of them succeeds (landedCopiesById), and those a
-   *  drain has said it holds what's queued behind (writeDrainedInOrder). */
-  private unsearchableSaid = new Set<string>();
+  /** The marked held writes whose store couldn't be searched, each with the
+   *  failure said, said once until a lookup of them succeeds and again when
+   *  the failure changes (landedCopiesById), and those a drain has said it
+   *  holds what's queued behind (writeDrainedInOrder). */
+  private unsearchableSaid = new Map<string, 'search' | 'read'>();
   private stillUnknownSaid = new Set<string>();
 
   // Turn-alive markers (2026-07-31 Mythos phantom-skip incident): agentName →
@@ -11862,10 +11859,11 @@ export class AgentFramework {
           // after it whose request didn't carry it was made without it. On
           // an account where the provider enforces that binding, a later
           // request replaying that reply's signed thinking is refused with a
-          // 400 (context-manager #155). Such a copy isn't injected: a compile
-          // may already have carried it, and injected or not, it sits ahead
-          // of those replies in the store. The agent reads it at its next
-          // compile rather than at this boundary (writeDrainedInOrder).
+          // 400 (context-manager #155). It's injected at the boundary that
+          // finds it, after what was stored since (writeDrainedInOrder). A
+          // recompile before that boundary, such as a retry, has already
+          // carried it where it was stored, so it's carried twice there, as
+          // in 0.26.0, and a reply made after it meets the same refusal.
           //
           // The queue is drained ONLY at the target agent's own boundary:
           // draining at another agent's boundary would store the messages
@@ -11923,13 +11921,10 @@ export class AgentFramework {
             // counts as stored, as what landed of it (writeDrainedInOrder).
             const stored = this.writeDrainedInOrder(deferred, `tool boundary for ${agent.name}`, (msg) =>
               agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id)));
-            for (const [msg, { id, content, parts, foundLater }] of stored) {
+            for (const [msg, { id, content, parts }] of stored) {
               // Every other resident reads what this boundary stores; for its
               // own agent, the boundary weighs what it injects below.
               this.noteForOtherResidents(agent, msg.metadata, id);
-              // A copy found where an earlier write left it isn't carried into
-              // the live turn: the next compile carries it from the store.
-              if (foundLater) continue;
               // A message a tune-out holds from the residents is stored (the
               // subconscious reads it) and left out of every resident's
               // compiled view; injecting it here would put in the live turn
@@ -22393,13 +22388,11 @@ export class AgentFramework {
       // it, and a reply stored after it whose request didn't carry it was
       // made without it. On an account where the provider enforces that
       // binding, a later request replaying that reply's signed thinking is
-      // refused with a 400 (context-manager #155). A tool boundary doesn't
-      // inject it; the agent reads it at its next compile. Not found, it's
-      // written. While
-      // the store can't be searched, it stays queued, holding what's behind
-      // it. An entry whose agent isn't
-      // registered has no store to look in: it's written, and addMessage
-      // drops it, as it does an unmarked one.
+      // refused with a 400 (context-manager #155). Not found, it's written.
+      // While the store can't be searched, it stays queued, holding what's
+      // behind it. An entry whose agent isn't registered has no store to
+      // look in: it's written, and addMessage drops it, as it does an
+      // unmarked one.
       if (msg.landing === 'unknown' && agent) {
         const found = this.landedCopiesById(agent, msg.id);
         if (found === undefined) {
@@ -22414,7 +22407,7 @@ export class AgentFramework {
           continue;
         }
         if (found.length > 0) {
-          written.set(msg, { id: found[0]!.id, content: asCompiled(found), parts: found.length, foundLater: true });
+          written.set(msg, { id: found[0]!.id, content: asCompiled(found), parts: found.length });
           this.logDeferredWriteError(msg, where, undefined, { count: found.length, sharded: found[0]!.bodyGroupId !== undefined, foundLater: true });
           onLanded?.(msg, found[0]!.id);
           continue;
@@ -22548,28 +22541,34 @@ export class AgentFramework {
    */
   private landedCopiesById(agent: Agent, deferredWriteId: string): StoredCopy[] | undefined {
     const cm = agent.getContextManager();
-    // Said once until a lookup of it succeeds.
-    const say = (what: string, error: unknown): void => {
-      if (this.unsearchableSaid.has(deferredWriteId)) return;
-      this.unsearchableSaid.add(deferredWriteId);
-      console.error(`[deferral] ${what}; this is said once until a lookup succeeds:`, error);
+    // Each failure is said once until a lookup of the write succeeds, and
+    // again when the failure changes. It names the query's own error, which
+    // names a missing blob, as well as the scan's.
+    const say = (kind: 'search' | 'read', what: string, queryError: unknown, error: unknown): void => {
+      if (this.unsearchableSaid.get(deferredWriteId) === kind) return;
+      this.unsearchableSaid.set(deferredWriteId, kind);
+      console.error(
+        `[deferral] ${what}; context-manager's query threw first (${errorMessage(queryError)}); this is said once ` +
+        `until a lookup succeeds:`,
+        error,
+      );
     };
     let found: StoredCopy[];
     try {
       found = cm.queryMessages({ metadata: { deferredWriteId } }).messages.map(storedCopy);
-    } catch {
+    } catch (queryError) {
       let at: number[];
       try {
         at = this.landedPositions(cm, deferredWriteId);
       } catch (error) {
-        say(`could not search ${agent.name}'s store for deferred write ${deferredWriteId}, to tell whether it was stored`, error);
+        say('search', `could not search ${agent.name}'s store for deferred write ${deferredWriteId}, to tell whether it was stored`, queryError, error);
         return undefined;
       }
       try {
         found = at.map((position) => storedCopy(messageAt(cm, position)));
       } catch (error) {
         // The scan found its rows; one of them can't be read whole.
-        say(`found deferred write ${deferredWriteId} in ${agent.name}'s store, but could not read its stored copy`, error);
+        say('read', `found deferred write ${deferredWriteId} in ${agent.name}'s store, but could not read its stored copy`, queryError, error);
         return undefined;
       }
     }
@@ -23213,12 +23212,21 @@ export class AgentFramework {
   private landedRow(cm: ContextManager, writeId: string): StoredMessage | null {
     try {
       return cm.queryMessages({ metadata: { deferredWriteId: writeId } }).messages[0] ?? null;
-    } catch {
+    } catch (queryError) {
       // As landedCopiesById falls back: a blob missing from another
       // message can't hide this write's row. Throws when the scan can't
-      // reach every message either.
-      const first = this.landedPositions(cm, writeId)[0];
-      return first === undefined ? null : messageAt(cm, first);
+      // reach every message either, or the row can't be read, naming the
+      // query's error too.
+      try {
+        const first = this.landedPositions(cm, writeId)[0];
+        return first === undefined ? null : messageAt(cm, first);
+      } catch (error) {
+        throw new Error(
+          `the store couldn't be searched for deferred write ${writeId}: its query threw (${errorMessage(queryError)}), ` +
+          `and then ${errorMessage(error)}`,
+          { cause: error },
+        );
+      }
     }
   }
 

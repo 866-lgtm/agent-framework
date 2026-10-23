@@ -29,11 +29,21 @@ class Responder implements Module {
   ctx!: ModuleContext;
   onPing: EventResponse = {};
   calls: string[] = [];
-  constructor(name: string) { this.name = name; }
+  /** Resolves with the first call its tool is given. */
+  readonly called: Promise<string>;
+  private resolveCalled!: (id: string) => void;
+  constructor(name: string) {
+    this.name = name;
+    this.called = new Promise((resolve) => { this.resolveCalled = resolve; });
+  }
   async start(ctx: ModuleContext): Promise<void> { this.ctx = ctx; }
   async stop(): Promise<void> {}
   getTools(): ToolDefinition[] { return [{ name: 'act', description: 'Acts.', inputSchema: { type: 'object' } }]; }
-  async handleToolCall(call: ToolCall): Promise<ToolResult> { this.calls.push(call.id); return { success: true, data: {} }; }
+  async handleToolCall(call: ToolCall): Promise<ToolResult> {
+    this.calls.push(call.id);
+    this.resolveCalled(call.id);
+    return { success: true, data: {} };
+  }
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
     const type = (event as { type: string }).type;
     return type === 'ping' || type === 'tool-call' ? this.onPing : {};
@@ -209,7 +219,6 @@ test("a tool-call event whose module's response throws at an edit still dispatch
     call: { id: 'c-act', name: 'refused--act', input: {} },
   } as unknown as ProcessEvent);
   await x.framework.runUntilIdle();
-  for (let i = 0; i < 50 && refused.calls.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
-  assert.deepEqual(refused.calls, ['c-act']);
+  assert.equal(await refused.called, 'c-act');
   assert.ok(x.errors.some((e) => e.startsWith("[process] refused's response to tool-call threw at the edit of no-such-message")), x.errors.join('\n'));
 });
