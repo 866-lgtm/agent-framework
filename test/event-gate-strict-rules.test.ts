@@ -1441,7 +1441,8 @@ test("a later start over a gate.json with no rule list it could add to without w
   assert.deepEqual(names(neither.gate), []);
   assert.equal(neither.gate.evaluate(event(['chat:ambient'])).trigger, true, 'every event wakes the agent');
   assert.equal(neither.gate.getStatus().configSource, 'default');
-  const fixStarting = 'Giving gate.json rules under "policies", or fixing the starting rules, puts rules in force.';
+  const fixStarting = 'Giving gate.json rules under "policies", or fixing the starting rules, puts rules in force (a fix to the '
+    + 'starting rules, at the next start).';
   assert.equal(neitherSaid[0], `gate.json loaded. ${shown}, where a list of rules is needed, such as [{"name": "my-rule", "behavior": "always"}], `
     + 'and it has no rules, so under its default, "skip", it would hold back every event: it isn\'t used at this start, and the gate '
     + `runs no rules, as a start without gate.json does, so every event gets the default, "always". ${fixStarting}`);
@@ -1635,7 +1636,8 @@ test("a later start over a gate.json with a rule list but no rules of its own, w
 
   // Starting rules refused whole under their own "skip" beside an empty list: no rules, every event waking the agent, as
   // at a start without gate.json, where gate.json's "skip" would hold back every event; a change is refused here too.
-  const fixStarting = 'Giving gate.json rules under "policies", or fixing the starting rules, puts rules in force.';
+  const fixStarting = 'Giving gate.json rules under "policies", or fixing the starting rules, puts rules in force (a fix to the '
+    + 'starting rules, at the next start).';
   const neither = makeGate(tempDir(t), { file: { default: 'skip', policies: [] }, initialConfig: { default: 'skip', policies: [limited, MENTIONS] } });
   t.after(() => neither.gate.dispose());
   const neitherSaid = neither.gate.getStatus().errors;
@@ -2501,9 +2503,9 @@ test("a change whose write of gate.json fails says whether gate.json was changed
   const asWas = (error: string): string => `gate.json couldn't be written (${error}), so nothing was saved: the rules in force and `
     + 'gate.json stay as they were. Whoever runs this host can fix what keeps it from being written.';
   const partway = (error: string): string => `Writing gate.json failed partway (${error}), so the change isn't in force: the rules in `
-    + 'force stay as they were. gate.json may hold the whole change, which the gate reads at its next reload, or part of it, or '
-    + 'nothing, which it can\'t read, so they stay until gate.json is fixed. Whoever runs this host can fix what kept it from being '
-    + 'written, and check what gate.json holds.';
+    + 'force stay as they were. gate.json may hold the whole change, which the gate reads at its next reload; or it may hold part '
+    + 'of it or nothing, which the gate can\'t read, and then they stay until gate.json is fixed. Whoever runs this host can fix '
+    + 'what kept it from being written, and check what gate.json holds.';
   /** A change whose `call` fails as `syscall` reports, after writing `landed` characters of its text. */
   const failing = (call: 'mkdirSync' | 'writeFileSync', syscall: string, error: string, landed = 0): string => {
     const cause = Object.assign(new Error(error), { code: error.split(':')[0], syscall });

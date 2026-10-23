@@ -1465,7 +1465,7 @@ function describeStart(starting: StartingRules, write: StartWrite, held: Readonl
     const instead = write.kind === 'start-without'
       ? `gate.json, which has no rules the gate reads, wasn't used either: under its default, "${write.default}", it would hold back every `
         + 'event, so the gate started with no rules, as a start without gate.json does. Giving gate.json rules under '
-        + '"policies", or fixing the starting rules, puts rules in force.'
+        + '"policies", or fixing the starting rules, puts rules in force (a fix to the starting rules, at the next start).'
       : held !== null || write.kind === 'reconcile-failed'
         ? "The gate started with gate.json's rules."
         : 'The gate started with no rules, as on a host without starting rules.';
@@ -1502,7 +1502,8 @@ function notUsedClause(write: Extract<StartWrite, { kind: 'start-without' }>, st
       + (out.nextStart ? ' (a fix to the starting rules, at the next start)' : '');
   }
   return `under its default, "${write.default}", it would hold back every event: it isn't used at this start, and the gate runs `
-    + `no rules, as a start without gate.json does, so every event gets the default, "always". ${back}, or fixing the starting rules, puts rules in force`;
+    + `no rules, as a start without gate.json does, so every event gets the default, "always". ${back}, or fixing the starting rules, puts rules in force`
+    + ' (a fix to the starting rules, at the next start)';
 }
 
 /**
@@ -2552,8 +2553,8 @@ export class EventGate {
         ? `gate.json couldn't be written (${errorText(err)}), so nothing was saved: the rules in force and gate.json stay `
           + 'as they were. Whoever runs this host can fix what keeps it from being written.'
         : `Writing gate.json failed partway (${errorText(err)}), so the change isn't in force: the rules in force stay as `
-          + 'they were. gate.json may hold the whole change, which the gate reads at its next reload, or part of it, or nothing, '
-          + 'which it can\'t read, so they stay until gate.json is fixed. '
+          + 'they were. gate.json may hold the whole change, which the gate reads at its next reload; or it may hold part of it '
+          + 'or nothing, which the gate can\'t read, and then they stay until gate.json is fixed. '
           + 'Whoever runs this host can fix what kept it from being written, and check what gate.json holds.', { cause: err });
     }
     const was = this.config;
