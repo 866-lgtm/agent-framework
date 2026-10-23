@@ -681,6 +681,7 @@ import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
 import { toolArgsProblems } from './tool-args.js';
 import { EventGate, formatShadowWarning } from './gate/event-gate.js';
+import type { GateEntryRef } from './gate/types.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import { McplProtocolVersionError, McplRequestError, McplUnreapedLaunchError, stderrTailOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
@@ -3526,6 +3527,9 @@ export class AgentFramework {
         // A batched wake's summary names each channel as the agent names it
         // back, with its server where another server shares its id.
         channelShown: (channel) => framework.channelRegistry?.nameShown(channel) ?? channel.channelId,
+        // A batched wake for one message still newest in the window writes no
+        // `[Gate: …]` line: the message right above is its whole cause.
+        isNewestEntry: (entry) => framework.isNewestContextEntry(entry),
         resolveRouteChannel: (info) => {
           if (info.eventType === 'mcpl:channel-incoming') return info.channelId || undefined;
           if (info.eventType === 'mcpl:push-event') {
@@ -22624,6 +22628,32 @@ export class AgentFramework {
 
   /** Where addMessage delivers: the named agent, else the primary, else the
    *  first registered agent. Undefined when there is no such agent. */
+  /**
+   * Whether an MCPL event's own stored entry is the newest entry in the window
+   * a batched wake's line is written to (deliveryAgent(): the primary's), with
+   * no turn running there and nothing waiting to be written (deferred). The
+   * gate then wakes the agent without the line, the message right above being
+   * the wake's whole cause. A channel message is found by its server, channel
+   * and message id, a push event by its server and event id. A message a
+   * tune-out holds from the residents is never "newest" here.
+   */
+  private isNewestContextEntry(entry: GateEntryRef): boolean {
+    const agent = this.deliveryAgent();
+    if (!agent) return false;
+    if (this.activeTurnTokens.has(agent.name)) return false;
+    if (this.deferredMessages.some((m) => (m.forAgent ?? this.primaryAgentName) === agent.name)) return false;
+    const [newest] = agent.getContextManager().queryMessages({ limit: 1, reverse: true }).messages;
+    const md = newest?.metadata as Record<string, unknown> | undefined;
+    if (!md || 'tuneOut' in md || entry.serverId === undefined || md.serverId !== entry.serverId) return false;
+    if (entry.eventType === 'mcpl:channel-incoming') {
+      return entry.messageId !== undefined && md.messageId === entry.messageId && md.channelId === entry.channelId;
+    }
+    if (entry.eventType === 'mcpl:push-event') {
+      return entry.eventId !== undefined && md.eventId === entry.eventId;
+    }
+    return false;
+  }
+
   private deliveryAgent(forAgent?: string): Agent | undefined {
     return forAgent
       ? this.agents.get(forAgent)

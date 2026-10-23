@@ -458,6 +458,14 @@ export type TraceEvent =
       eventCount: number;
     })
   | (TraceEventBase & {
+      /** A batched wake for one message still newest in the window ran
+       *  without its `[Gate: …]` line (EventGate isNewestEntry). */
+      type: 'gate:wake-line-omitted';
+      policyNames: string[];
+      eventType: string;
+      channelId?: string;
+    })
+  | (TraceEventBase & {
       type: 'gate:config-reloaded';
       configPath: string;
       policyCount: number;
