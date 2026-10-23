@@ -10,7 +10,7 @@
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync,
+  chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -96,9 +96,9 @@ test("a change over a gate.json that isn't JSON is refused, naming the parse err
 
   const refused = notJson(parseError(BROKEN));
   assert.throws(() => gate.addPolicy({ name: 'ambient', match: { tagsAny: ['chat:ambient'] }, behavior: 'defer' }), { message: refused });
-  // A removal of a rule in force is refused the same way; one of a name the rules in force lack writes nothing either way.
+  // A removal is refused the same way, of a rule in force or of any other name, since the file may hold it.
   assert.throws(() => gate.removePolicy('mentions'), { message: refused });
-  assert.equal(gate.removePolicy('absent'), false);
+  assert.throws(() => gate.removePolicy('absent'), { message: refused });
   assert.equal(readFileSync(configPath, 'utf-8'), BROKEN, 'what gate.json holds stays');
   assert.deepEqual(readdirSync(dir), ['gate.json'], 'and nothing is written beside it');
   assert.deepEqual(gate.listPolicyNames(), ['mentions'], 'the rules in force stay');
@@ -158,7 +158,7 @@ test('a gate.json saved with a BOM loads, so a change edits it, keeping a rule a
   assert.deepEqual(gate.getStatus().errors, []);
 });
 
-test('a change over a gate.json that is not UTF-8 is refused, and the file stays byte for byte', (t) => {
+test("a change over a gate.json that isn't JSON, saved as Latin-1 or as UTF-16, is refused, and the file stays byte for byte", (t) => {
   const dir = tempDir(t);
   const { gate, configPath } = makeGate(dir, { config: RULES });
   // The failed load's log line quotes JSON.parse's error, which quotes the decoded text: NULs, for UTF-16.
@@ -178,16 +178,16 @@ test('a change over a gate.json that is not UTF-8 is refused, and the file stays
   assert.deepEqual(gate.listPolicyNames(), ['mentions']);
 });
 
-test("over a gate.json that isn't JSON, an anchor that isn't there is named first, and a removal of a name the rules in force lack writes nothing", (t) => {
+test("over a gate.json that isn't JSON, a change is refused before an anchor or a name is looked for, since the file's own rules can't be read", (t) => {
   const dir = tempDir(t);
   const { gate, configPath } = makeGate(dir, { config: RULES });
   t.mock.method(console, 'error', () => {});
   writeFileSync(configPath, BROKEN);
 
-  // A placement the change can't make refuses before anything else is said.
-  assert.throws(() => gate.addPolicy({ name: 'ambient', behavior: 'defer' }, { position: { before: 'missing' } }), /no policy named "missing"/);
-  // Removing a rule that isn't there writes nothing.
-  assert.equal(gate.removePolicy('missing'), false);
+  // Not "no policy named": the operator's half-made rule may be the anchor.
+  assert.throws(() => gate.addPolicy({ name: 'ambient', behavior: 'defer' }, { position: { before: 'half-made' } }), { message: notJson(parseError(BROKEN)) });
+  // Not false: the file may hold the rule.
+  assert.throws(() => gate.removePolicy('half-made'), { message: notJson(parseError(BROKEN)) });
 
   assert.deepEqual(readdirSync(dir), ['gate.json']);
   assert.equal(readFileSync(configPath, 'utf-8'), BROKEN);
@@ -219,6 +219,37 @@ test('a gate.json the gate cannot read at all refuses a change, naming what runs
   assert.equal(readFileSync(configPath, 'utf-8'), BROKEN);
   assert.deepEqual(readdirSync(dir), ['gate.json']);
   assert.deepEqual(gate.getStatus().policies.map((p) => p.name), ['mentions'], 'the rules in force stay');
+});
+
+test('a directory at gate.json\'s path is a gate.json the gate cannot read, so a change is refused', (t) => {
+  const dir = tempDir(t);
+  const { gate, configPath } = makeGate(dir, { config: RULES });
+  t.mock.method(console, 'error', () => {});
+  rmSync(configPath);
+  mkdirSync(configPath);
+  assert.throws(() => gate.addPolicy({ name: 'ambient', behavior: 'defer' }), {
+    message: /^gate\.json couldn't be read \(EISDIR: [^)]*\), so a change can't edit it, and nothing was written over it\. Meanwhile the gate runs the rules of the last gate\.json it used\. Whoever runs this host can make gate\.json readable; until then, a change is refused the same way\.$/,
+  });
+  assert.ok(statSync(configPath).isDirectory(), 'nothing was written in its place');
+  assert.deepEqual(gate.listPolicyNames(), ['mentions'], 'the rules in force stay');
+});
+
+test("a change writes through a symlinked gate.json to its file, which keeps its mode", {
+  skip: process.platform === 'win32' ? 'needs a symlink' : false,
+}, (t) => {
+  const dir = tempDir(t);
+  const target = join(dir, 'real-gate.json');
+  writeFileSync(target, JSON.stringify(RULES));
+  chmodSync(target, 0o640);
+  const configPath = join(dir, 'gate.json');
+  symlinkSync(target, configPath);
+  const { gate } = makeGate(dir);
+
+  gate.addPolicy({ name: 'ambient', behavior: 'defer' });
+
+  assert.ok(lstatSync(configPath).isSymbolicLink(), 'gate.json is still the link');
+  assert.equal(statSync(target).mode & 0o777, 0o640, 'its file keeps its mode');
+  assert.deepEqual(onDisk(target).policies.map((p) => p.name), ['mentions', 'ambient'], 'and holds the change');
 });
 
 test("a removal refused over a gate.json that isn't JSON leaves the rule in force, with its pending batch", (t) => {
@@ -294,6 +325,9 @@ test("gate.json's reload: unchanged text is not applied again, a check within a 
   const lastCheckAt = (at: number) => { (gate as unknown as { lastReloadCheck: number }).lastReloadCheck = at; };
   const names = () => gate.getStatus().policies.map((p) => p.name);
   const reloads = () => traces.filter((e) => e.type === 'gate:config-reloaded').length;
+  // The reload's throttle reads Date.now(): pinned, so a slow write can't carry a check past its second.
+  const clock = Date.now() + 10_000;
+  t.mock.method(Date, 'now', () => clock);
 
   writeFileSync(configPath, renamedRules('one'));
   gate.evaluate(INCOMING);
@@ -304,12 +338,12 @@ test("gate.json's reload: unchanged text is not applied again, a check within a 
   gate.evaluate(INCOMING);
   assert.equal(reloads(), 1, 'the text in force is not applied again');
 
-  lastCheckAt(Date.now());
+  lastCheckAt(clock);
   writeFileSync(configPath, renamedRules('two'));
   gate.evaluate(INCOMING);
   assert.deepEqual(names(), ['one'], 'within a second of the last check, the file is not read');
 
-  lastCheckAt(Date.now() + 600_000);
+  lastCheckAt(clock + 600_000);
   gate.evaluate(INCOMING);
   assert.deepEqual(names(), ['two'], 'a clock stepped back since the last check checks at once');
 });
@@ -412,7 +446,7 @@ test("the start's failure to reconcile gate.json shows beside a gate.json that l
 
   const errors = gate.getStatus().errors;
   assert.equal(errors.length, 1, JSON.stringify(errors));
-  assert.match(errors[0]!, /^At start, the host's starting rules "ambient" couldn't be added to gate\.json \(EACCES[^)]*\), so they weren't put in force\. Whoever runs this host can fix what kept them out\.$/);
+  assert.match(errors[0]!, /^At start, the host's starting rules "ambient" couldn't be added to gate\.json \(EACCES[^)]*\), so they weren't put in force\. Whoever runs this host can fix what kept them from being written\.$/);
   assert.deepEqual(gate.getStatus().policies.map((p) => p.name), ['mentions'], 'gate.json loaded, without the starting rule it could not add');
 
   // A spell when gate.json can't be read, then the same text again: nothing new decides the rules, so the error stays.

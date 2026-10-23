@@ -8114,7 +8114,8 @@ export class AgentFramework {
    * configured, the policy is invalid, the placement can't be made, gate.json
    * has no rule list a change could edit, it isn't used and the change doesn't
    * mend it, or it can't be read, isn't JSON or can't be written
-   * (EventGate.addPolicy); gate.json then stays as it is.
+   * (EventGate.addPolicy). A refusal leaves gate.json as it is; a write that
+   * fails after its open may leave it part-written, and its error says so.
    */
   addGatePolicy(
     rawPolicy: unknown,
