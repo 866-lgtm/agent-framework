@@ -21,6 +21,7 @@ import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync, appendFil
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { appendInTwoParts } from './helpers/command-file.js';
 
 const FIXTURE = join(import.meta.dirname, 'fixtures/wake-locus-mcpl-server.mjs');
 const ROOM = 'discord:g1:room';
@@ -128,7 +129,9 @@ describe('batched wake routing', () => {
   it('a DM followed one beat later by ambient chatter elsewhere, in one batch: the reply goes to the DM', async () => {
     const held = holdBatches();
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answering the DM' }]));
-    dm('are you there?');
+    // In two parts, as a poll can read a write half done: the fixture acts
+    // on the DM only once its line is whole, so the reply finds the DM.
+    await appendInTwoParts(commandPath, `dm ev-${++n} 134 ${RAW_DM} are you there?`, 200);
     await waitFor(() => held() >= 1, "the DM's batch held past its window");
     incoming(GENERAL, 'ambient', 'unrelated chatter');
     await waitFor(() => publishes().length >= 1, 'reply published');

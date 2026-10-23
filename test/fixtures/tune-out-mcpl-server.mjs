@@ -9,7 +9,8 @@
 // its channel's lifecycle as a server does: channels/open and channels/close
 // are recorded there too, and while the host has the channel closed, a
 // commanded message isn't sent (recorded as withheld).
-import { appendFileSync, existsSync, readFileSync } from 'node:fs';
+import { appendFileSync } from 'node:fs';
+import { writtenLines } from './command-lines.mjs';
 import { createInterface } from 'node:readline';
 
 const statusPath = process.env.STATUS_PATH;
@@ -29,8 +30,7 @@ let processedCommands = 0;
 let open = true;
 
 function pollCommands() {
-  if (!commandPath || !existsSync(commandPath)) return;
-  const lines = readFileSync(commandPath, 'utf8').split('\n').filter(Boolean);
+  const lines = writtenLines(commandPath);
   for (const line of lines.slice(processedCommands)) {
     processedCommands++;
     const [kind, messageId, ...rest] = line.split(' ');
@@ -60,6 +60,7 @@ function pollCommands() {
     });
   }
 }
+// tune-out-e2e's two-part pin pauses four of these between a line's parts.
 const pollTimer = setInterval(pollCommands, 100);
 
 const rl = createInterface({ input: process.stdin });

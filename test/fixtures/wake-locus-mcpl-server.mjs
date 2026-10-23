@@ -11,7 +11,8 @@
 //     report's origin and tags
 // Host-side channels/publish and channels/open calls are recorded to
 // STATUS_PATH as JSONL.
-import { appendFileSync, existsSync, readFileSync } from 'node:fs';
+import { appendFileSync } from 'node:fs';
+import { writtenLines } from './command-lines.mjs';
 import { createInterface } from 'node:readline';
 
 const statusPath = process.env.STATUS_PATH;
@@ -32,8 +33,7 @@ let nextId = 500;
 let processedCommands = 0;
 
 function pollCommands() {
-  if (!commandPath || !existsSync(commandPath)) return;
-  const lines = readFileSync(commandPath, 'utf8').split('\n').filter(Boolean);
+  const lines = writtenLines(commandPath);
   for (const line of lines.slice(processedCommands)) {
     processedCommands++;
     const [kind, ...rest] = line.split(' ');
@@ -88,6 +88,7 @@ function pollCommands() {
     }
   }
 }
+// batched-wake-locus's two-part pin pauses four of these between a line's parts.
 const pollTimer = setInterval(pollCommands, 50);
 
 const rl = createInterface({ input: process.stdin });

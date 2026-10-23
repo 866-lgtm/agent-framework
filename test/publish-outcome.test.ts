@@ -21,6 +21,7 @@ import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 import { AgentFramework } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { appendInTwoParts } from './helpers/command-file.js';
 
 type Publish = (params: { channelId: string }) => Promise<unknown>;
 
@@ -433,7 +434,11 @@ test('the resident\'s failure marker never claims an uncertain delivery did not 
     const traces: Array<{ type: string; detail?: unknown }> = [];
     framework.onTrace((event) => traces.push(event));
     const turn = async (mode: string, n: number, detail?: unknown) => {
-      appendFileSync(commandPath, JSON.stringify({ op: 'publish-mode', mode, detail }) + '\n');
+      const line = JSON.stringify({ op: 'publish-mode', mode, detail });
+      // Turn 3's line is about 10 KB, long enough for a poll to read it half
+      // written, so it goes in two parts: the fixture waits for its newline.
+      if (n === 3) await appendInTwoParts(commandPath, line, 100);
+      else appendFileSync(commandPath, line + '\n');
       membrane.pushResponse(createMockResponse([{ type: 'text', text: `reply ${n}` }]));
       appendFileSync(commandPath, JSON.stringify({ op: 'incoming', channelId: 'discord:g1:room', messageId: `m-${n}`, mode: 'addressed', text: 'hello?' }) + '\n');
       await until(() => markers().length === n, `marker ${n}`);
