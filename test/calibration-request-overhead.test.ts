@@ -11,7 +11,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
-import { AutobiographicalStrategy } from '@animalabs/context-manager';
+import { AutobiographicalStrategy, type ContextInjection } from '@animalabs/context-manager';
 import { AgentFramework } from '../src/index.js';
 import type {
   EventResponse,
@@ -47,7 +47,7 @@ class UsageMembrane extends MockMembrane {
   streamYielding(request: NormalizedRequest): YieldingStream {
     this.calls.push(request);
     return new ScriptedStream([
-      { type: 'usage', usage: { inputTokens: 900, outputTokens: 5, cacheReadTokens: 4000 } } as StreamEvent,
+      { type: 'usage', usage: { inputTokens: 900, outputTokens: 5, cacheCreationTokens: 600, cacheReadTokens: 3400 } } as StreamEvent,
       { type: 'complete', response: createMockResponse([{ type: 'text', text: 'ok' }]) } as StreamEvent,
     ]) as unknown as YieldingStream;
   }
@@ -67,6 +67,10 @@ class ToolModule implements Module {
   }
   async handleToolCall(_call: ToolCall): Promise<ToolResult> {
     return { success: true, data: 'found' };
+  }
+  /** A system-position injection, which the request's system prompt carries. */
+  async gatherContext(_agentName: string): Promise<ContextInjection[]> {
+    return [{ namespace: 'server', position: 'system', content: [{ type: 'text', text: 'The server is up.' }] }];
   }
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
     if (event.type !== 'external-message') return {};
@@ -99,7 +103,8 @@ test('the calibration sample carries the system prompt and tools the request sen
 
     const sent = membrane.calls[0];
     assert.ok(sent, 'the turn sent a request');
-    assert.ok(sent.system && sent.system.length > 0, 'the request had a system prompt');
+    assert.ok(sent.system?.includes('You are the resident.'), 'the request had the agent\'s system prompt');
+    assert.ok(sent.system?.includes('The server is up.'), 'and the module\'s system-position injection');
     assert.ok(sent.tools?.some((tool) => tool.name.endsWith('lookup')), 'the request advertised the tool');
     assert.equal(samples.length, 1, 'one call, one sample');
     assert.equal(samples[0].total, 4900, 'input + cache write + cache read');
