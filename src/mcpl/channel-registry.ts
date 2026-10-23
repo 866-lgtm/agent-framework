@@ -2300,6 +2300,9 @@ export class ChannelRegistry {
     toolName: string,
     input: unknown,
     origin?: ChannelToolOrigin,
+    /** Filled with a channel_publish's outcome once its request is
+     *  attempted, so the caller learns where it was delivered. */
+    seen?: { outcome?: PublishOutcome },
   ): Promise<ToolResult> {
     switch (toolName) {
       case 'channel_list':
@@ -2333,7 +2336,7 @@ export class ChannelRegistry {
         }, origin?.kind === 'agent' ? origin.own : undefined);
 
       case 'channel_publish':
-        return this.handleToolPublish(input as { channelId?: string; serverId?: string; content?: string; text?: string }, origin);
+        return this.handleToolPublish(input as { channelId?: string; serverId?: string; content?: string; text?: string }, origin, seen);
 
       case 'think':
         return this.handleToolThink(input as { content?: string });

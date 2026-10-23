@@ -446,9 +446,13 @@ export interface InferenceRequest {
    *  all of them without materializing content, the turn has no cause left
    *  and does not run. */
   coalescingBatchSubjects?: string[];
-  /** Host-owned: this wake's sole cause is reading this deferred write, a
-   *  coalesced render placed in its agent's queue (wakeToRead). Once the
-   *  agent has read the write, or it was removed, the wake starts no turn. */
+  /** Host-owned: this wake's sole cause is this write, deferred for its
+   *  agent while a turn was alive: a coalesced render placed in its queue
+   *  (wakeToRead), or a message, notice or event whose wake was queued with
+   *  it. Once a request that carried the write was answered and, for a wake
+   *  that carries a channel, the agent has since published into that
+   *  channel having read it, or once the write is in neither the agent's
+   *  queue nor its store's current branch, the wake starts no turn. */
   readsDeferredWrite?: string;
   agentName: string;
   reason: string;
@@ -492,6 +496,16 @@ export interface InferenceRequest {
    * not capture the agent's voice just by being newest.
    */
   addressed?: boolean;
+  /**
+   * Host-owned: true when the triggering message's server marked it ambient
+   * (`chat:ambient`). A coalesced push's wake carries it only to read a
+   * render, and only when every notice the render stands for was. Such a
+   * message asked nothing of the agent, so a wake for it that carries
+   * `readsDeferredWrite` is dropped once a request that carried the message
+   * was answered, with no publish asked of the agent. A message with neither
+   * tag is in doubt, and is judged as an addressed one.
+   */
+  ambient?: true;
   /**
    * Who spoke the message that triggered this inference, as an adapter-
    * namespaced opaque id (`<serverId>:user:<authorId>`) — never a display

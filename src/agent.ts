@@ -1028,6 +1028,57 @@ export class Agent {
     return this.shownWatermark;
   }
 
+  /**
+   * The newest consumed watermark a request carried that was answered: its
+   * round's tool calls, or its completion, came back. A message a boundary
+   * injected counts as heard only once a request carrying it is answered;
+   * the consumed watermark moves when the stream is handed it, before its
+   * request runs, so a request that fails, ending its stream with an error,
+   * leaves this as it was.
+   */
+  private answeredWatermark: { branch: string; sequence: number } | null = null;
+
+  getAnsweredWatermark(): { branch: string; sequence: number } | null {
+    return this.answeredWatermark;
+  }
+
+  /** A request that carried `watermark` was answered. Requests are answered
+   *  in the order they're sent, and the consumed watermark only advances
+   *  within a branch, so the latest is the newest. */
+  markAnswered(watermark: { branch: string; sequence: number } | null): void {
+    if (watermark) this.answeredWatermark = watermark;
+  }
+
+  /**
+   * Per destination (a server's channel, by its key), the newest consumed
+   * watermark the agent had read when it published there by a route the
+   * framework sees (its prose, a sleep's announcement, a channel_publish, a
+   * draft resend, or a send tool whose channel the framework records), on
+   * the branch it was taken on. A wake that carries a channel, unless it's
+   * marked ambient (InferenceRequest.ambient), keeps its turn unless the
+   * agent spoke there after reading the write the wake is for. It
+   * lives as long as this Agent: an agent made again starts it empty, and
+   * such a wake then stays.
+   */
+  private publishedThrough = new Map<string, { branch: string; sequence: number }>();
+
+  /** Note a publish into `destination` (its key), made having read through
+   *  `readThrough`: the consumed watermark when its words were written, or
+   *  its call made. */
+  notePublished(destination: string, readThrough: { branch: string; sequence: number } | null): void {
+    if (!readThrough) return;
+    const noted = this.publishedThrough.get(destination);
+    if (noted && noted.branch === readThrough.branch && noted.sequence >= readThrough.sequence) return;
+    this.publishedThrough.set(destination, readThrough);
+  }
+
+  /** Whether the agent published into `destination` (its key) having read
+   *  the row stored at `sequence` on `branch`. */
+  publishedAfterReading(destination: string, branch: string, sequence: number): boolean {
+    const noted = this.publishedThrough.get(destination);
+    return !!noted && noted.branch === branch && noted.sequence >= sequence;
+  }
+
   /** Mark everything currently stored as consumed (the agent's creation, at
    *  boot or later, and a tool boundary that injected messages into a live
    *  stream declaring it carries them; see consumedWatermark). */
@@ -1035,7 +1086,8 @@ export class Agent {
     // Tolerates partial context-manager doubles (tests build Agents over
     // stubs). Without a watermark, a reader that looks for one takes its own
     // side: the coalescer counts the message as read, and the framework's
-    // deferredWriteReadOrGone and unreadNoticesForPrimary count it as unread.
+    // unreadNoticesForPrimary counts it as unread. A deferred write's wake
+    // reads the answered watermark instead (deferredWriteDone).
     this.consumedWatermark = this.pendingWatermark();
     this.watermarkMarks++;
     this.shownWatermark = this.consumedWatermark;

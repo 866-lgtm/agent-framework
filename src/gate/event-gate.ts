@@ -112,6 +112,14 @@ interface PendingEvent {
   eventId?: string;
 }
 
+/** Where the host put a message the gate wrote: the agent whose window it
+ *  went to and, when it was held for that agent's live turn, the id it waits
+ *  under in the host's queue. */
+export interface WritePlacement {
+  agent?: string;
+  deferredId?: string;
+}
+
 /**
  * Where a gate-requested wake came from, handed to the framework alongside the
  * reason so the turn's InferenceRequest can carry it (host telemetry stamps
@@ -675,8 +683,10 @@ export class EventGate {
     metadata?: Record<string, unknown>,
     /** Registry agent to deliver into; absent = primary (historical). */
     forAgent?: string,
+    /** Out-param: where the message landed, for the wake that goes with it. */
+    placement?: WritePlacement,
   ) => unknown;
-  private requestInferenceFn: (agentName: string, reason: string, source: string, provenance?: WakeProvenance) => void;
+  private requestInferenceFn: (agentName: string, reason: string, source: string, provenance?: WakeProvenance, after?: WritePlacement) => void;
   private getAgentNamesFn: () => string[];
   private resolveRouteChannelFn: (info: GateEventInfo) => string | undefined;
   private channelShownFn?: (channel: { serverId: string; channelId: string }) => string;
@@ -695,8 +705,12 @@ export class EventGate {
       content: Array<{ type: 'text'; text: string }>,
       metadata?: Record<string, unknown>,
       forAgent?: string,
+      placement?: WritePlacement,
     ) => unknown;
-    requestInference: (agentName: string, reason: string, source: string, provenance?: WakeProvenance) => void;
+    /** `after`: the placement of the message the wake is for, when it has
+     *  one, so the host can drop the wake once a request that carried the
+     *  message is answered. */
+    requestInference: (agentName: string, reason: string, source: string, provenance?: WakeProvenance, after?: WritePlacement) => void;
     getAgentNames: () => string[];
     /** Optional clock — defaults to Date.now. Tests inject for deterministic time. */
     now?: () => number;
@@ -1937,15 +1951,21 @@ export class EventGate {
       const nowIso = new Date(this.now()).toISOString().slice(0, 19) + 'Z';
       // Deliver the notice into the WAKING agent's window — a self-wake
       // armed by a non-primary agent (e.g. a subconscious cadence) must not
-      // narrate itself into the primary's context.
+      // narrate itself into the primary's context. Its wake goes with it: an
+      // agent that heard the notice during a turn was awake when its timer
+      // fired, and the host drops the wake once a request that carried the
+      // notice is answered.
+      const placement: WritePlacement = {};
       this.addMessageFn('user', [{
         type: 'text',
         text: `[self-wake] your ${source} timer (${Math.round(ms / 1000)}s) elapsed — now ${nowIso}`,
-      }], { source: 'gate:self-wake' }, agentName);
+      }], { source: 'gate:self-wake' }, agentName, placement);
       this.requestInferenceFn(
         agentName,
         `self-scheduled wake (${source}, ${Math.round(ms / 1000)}s)`,
         'self-wake',
+        undefined,
+        placement,
       );
     }, ms);
     this.selfWakeTimers.set(agentName, timer);

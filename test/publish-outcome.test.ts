@@ -15,7 +15,7 @@ import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
-import { ChannelRegistry, destinationKey } from '../src/mcpl/channel-registry.js';
+import { ChannelRegistry, destinationKey, type PublishOutcome } from '../src/mcpl/channel-registry.js';
 import { McplRequestError } from '../src/mcpl/server-connection.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
@@ -321,6 +321,18 @@ describe('channel_publish answers by the receipt rule', () => {
     const result = await publishWith(ok);
     assert.equal(result.success, true);
     assert.deepEqual(result.data, { delivered: true, messageId: 'posted-1' });
+  });
+
+  it('tells a caller that asks its outcome, with the channel a delivered post went to', async () => {
+    const { registry, seed } = registryWith({ discord: { publish: ok } });
+    seed('discord', 'c', '#c');
+    const seen: { outcome?: PublishOutcome } = {};
+    const result = await registry.handleChannelToolCall('channel_publish', { channelId: 'c', content: 'words' }, undefined, seen);
+    assert.equal(result.success, true);
+    assert.equal(seen.outcome?.status, 'delivered');
+    // Both halves of the key a publish is noted under (destinationKey).
+    assert.equal(seen.outcome?.destination?.serverId, 'discord');
+    assert.equal(seen.outcome?.destination?.channelId, 'c');
   });
 
   for (const [what, receipt] of [['a missing receipt', undefined], ['an empty receipt', {}], ['a malformed delivered field', { delivered: 'yes' }]] as const) {
