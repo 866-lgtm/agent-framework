@@ -6,6 +6,9 @@
 // TEST appends lines to COMMAND_PATH:
 //   incoming <channelId> <messageId> <ambient|addressed> <text…>
 //   dm <eventId> <authorId> <rawChannelId> <text…>
+//   push <json>
+//     a push/event with these params, such as a reaction's or a voice
+//     report's origin and tags
 // Host-side channels/publish and channels/open calls are recorded to
 // STATUS_PATH as JSONL.
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
@@ -54,6 +57,10 @@ function pollCommands() {
           }],
         },
       });
+    } else if (kind === 'push') {
+      const params = JSON.parse(rest.join(' '));
+      log('push-sent', { eventId: params.eventId });
+      send({ jsonrpc: '2.0', id: nextId++, method: 'push/event', params });
     } else if (kind === 'dm') {
       const [eventId, authorId, rawChannelId, ...words] = rest;
       log('dm-sent', { eventId });
