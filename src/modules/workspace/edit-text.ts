@@ -566,8 +566,10 @@ function manyHeadText(data: { edits: number; replacements: number; files: Listed
  * line that names what a receipt leaves out comes after what it keeps, and
  * where its counts and notes leave too little room for that line too, as
  * they can with long notes or a limit far under the 1,000 a residence or an
- * agent can set, the receipt passes `maxChars` by it.
- * The model reads the text; a script gets the receipt's fields beside it.
+ * agent can set, the receipt passes `maxChars` by it, and then reaches its
+ * caller as any result past its limit does: a model's spills, and a script's
+ * call answers ResultTooLarge. Otherwise the model reads the text, and a
+ * script gets the receipt's fields beside it.
  */
 export function editReceipt(tool: EditTool, files: StoredFile[], editCount: number, maxChars: number): ToolResult {
   const reserve = receiptReserve(tool, files, maxChars);

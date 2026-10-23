@@ -276,6 +276,8 @@ test('a value holding a line break is written as a JSON string, so it stays on i
     assert.equal(JSON.parse(shown), value);
   }
   for (const value of ['plain', 'tab\tand \u001b escape', '"quoted"', '']) assert.equal(shownValue(value), value);
+  // Every break is escaped, each as JSON's four-digit escape.
+  assert.equal(shownValue('a\u0085b\u2028c\u2029d\u2028e\vf'), '"a\\u0085b\\u2028c\\u2029d\\u2028e\\u000bf"');
   assert.equal(shownValue(null), 'null');
   assert.equal(shownValue(12), '12');
 
@@ -375,11 +377,12 @@ test("grep's matched and context lines that hold a line break are quoted, and ma
     assert.match(textOf(await call('grep', { pattern: 'needle', path: 'work/gap.txt', contextBefore: 1, contextAfter: 1 }, 24_000)),
       /\n {5}1-a\n {5}2:needle b\n {5}3-c\n--\n {5}7-g\n {5}8:needle h\n {5}9-i$/);
     disk('touch.txt', 'x\nneedle y\nz\nneedle w\n');
-    // A window that ends where the next begins: one run, a match inside another's window marked as a match.
-    assert.match(textOf(await call('grep', { pattern: 'needle', path: 'work/touch.txt', contextAfter: 2 }, 24_000)),
-      /\n {5}2:needle y\n {5}3-z\n {5}4:needle w$/);
-    assert.match(textOf(await call('grep', { pattern: 'needle', path: 'work/touch.txt', contextAfter: 1 }, 24_000)),
-      /\n {5}2:needle y\n {5}3-z\n {5}4:needle w$/);
+    // A window that takes in the next match, and one that ends where the
+    // next begins: one run each time, a match inside another's window
+    // marked as a match, and no `--` before a section's first run.
+    const touching = ['pattern: needle', 'totalMatches: 2', '--- work/touch.txt: workspace (synced) ---', '     2:needle y', '     3-z', '     4:needle w'].join('\n');
+    assert.equal(textOf(await call('grep', { pattern: 'needle', path: 'work/touch.txt', contextAfter: 2 }, 24_000)), touching);
+    assert.equal(textOf(await call('grep', { pattern: 'needle', path: 'work/touch.txt', contextAfter: 1 }, 24_000)), touching);
   });
 });
 
@@ -420,4 +423,25 @@ test("a receipt quotes a note and a kept mode that hold a line break, in edit's 
     /\nnote: "note\\nwith a break"\nmodeKept: "kept\\u2028here"\n--- changed ---\n/);
   assert.match(textOf(editReceipt('edit_many', [file, { path: 'work/b.txt', plan: planned.plan, notes: [] }], 2, 24_000)),
     /\n--- files ---\nwork\/a\.txt: size 4, replacements 1, edits 1; modeKept: "kept\\u2028here"\. "note\\nwith a break"\nwork\/b\.txt: size 4, replacements 1, edits 1\n/);
+});
+
+test("grep's runs start afresh in each file's section, and a context line holding a line break is quoted", async () => {
+  await withWorkspace(async ({ call, disk }) => {
+    disk('two/a.txt', 'x\nneedle\n');
+    disk('two/b.txt', 'needle\ny\n');
+    disk('two/c.txt', 'pre\rcontext\nneedle\n');
+    assert.equal(textOf(await call('grep', { pattern: 'needle', path: 'work/two', contextBefore: 1, contextAfter: 1 }, 24_000)), [
+      'pattern: needle',
+      'totalMatches: 3',
+      '--- work/two/a.txt: workspace (synced) ---',
+      '     1-x',
+      '     2:needle',
+      '--- work/two/b.txt: workspace (synced) ---',
+      '     1:needle',
+      '     2-y',
+      '--- work/two/c.txt: workspace (synced) ---',
+      '     1-"pre\\rcontext"',
+      '     2:needle',
+    ].join('\n'));
+  });
 });

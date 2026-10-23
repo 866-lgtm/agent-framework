@@ -58,7 +58,6 @@ function pageText(page: Page): string {
 /** A page as read answers it: its text for the model, and its fields for a script. */
 const pageAnswer = (page: Page): ToolResult => textAnswer(pageText(page), page);
 
-
 /**
  * Lines from `offset` (1-based), at most `limit` of them, each numbered and a
  * long one cut with the offsetChars and limitChars that read the rest. The
