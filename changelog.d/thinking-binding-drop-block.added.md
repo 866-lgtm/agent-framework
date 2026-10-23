@@ -22,5 +22,9 @@
     `inference:usage` trace as `thinking`. A call that dropped blocks, and
     every later call of its stream, isn't used to calibrate the context
     strategy's token estimates, since the provider doesn't bill a block it
-    dropped and the strategy still counts it. The direct API carries the
-    setting too, but reports nothing of it.
+    dropped and the strategy still counts it. Where the strategy still sends
+    the blocks a fold left bound to a conversation the request no longer
+    holds, the provider drops them on every call until a later fold takes
+    them out of the context, and while they're sent, no stream calibrates and
+    the estimates keep the value they had. The direct API carries the setting
+    too, but reports nothing of it.
