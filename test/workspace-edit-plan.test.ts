@@ -446,16 +446,18 @@ test('many edits matching one text cost their replacements, not their pairs at e
   // Every pair of these 2,000 edits overlaps at each of 500 places. Walking
   // the pairs at every place, the planner took 34 s on this case, on Linux
   // with Node 24.22.0. Each later replacement the walk meets is looked up in
-  // a Set, whether its edit is named. Linking past each named edit's
-  // replacements, the walk meets each of the 1,000,000 replacements about
-  // once; walking the pairs, it meets one for each pair at each place, about
-  // 1e9. Past ten times the replacements, the count of lookups throws.
+  // a Set, whether its edit is named, and where it isn't, whether its pair is.
+  // Linking past each named edit's replacements, the walk meets each later
+  // replacement about once, about a million lookups in all; walking the pairs
+  // at every place, it would make about a billion. Past ten times the
+  // 1,000,000 replacements, the count throws; at least half of them shows the
+  // count reaches the walk.
   const bytes = Buffer.from('x '.repeat(500));
   const specs = Array.from({ length: 2000 }, (_, index) => spec(index, 'x', 'y', 'all'));
   const file = decodeForEdit(bytes)!;
   const { result: planned, calls } = countingCalls(Set.prototype, 'has', () => true, 10_000_000, () => planFile(file, bytes, specs));
   assert.ok('problems' in planned);
-  assert.ok(calls >= 1_000_000, `${calls} lookups`);
+  assert.ok(calls >= 500_000, `${calls} lookups`);
   // Each edit after the first is named once, with the first, as the same text.
   assert.deepEqual(planned.problems.map((problem) => problem.kind === 'clash' && [problem.kind, problem.edits, problem.same]),
     Array.from({ length: 1999 }, (_, k) => ['clash', [0, k + 1], true]));
