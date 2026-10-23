@@ -682,7 +682,7 @@ const utilityOneLiner = (description: string): string => {
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
 import { toolArgsProblems } from './tool-args.js';
-import { EventGate, checkToolInput, formatShadowWarning, formatUnreadableKept, shownValue, wakeLineText } from './gate/event-gate.js';
+import { EventGate, checkToolInput, formatShadowWarning, shownValue, wakeLineText } from './gate/event-gate.js';
 import type { GateEntryRef, WakeLine } from './gate/types.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
@@ -8108,22 +8108,18 @@ export class AgentFramework {
    * actually wants. Every rule the change doesn't touch is written back as it
    * was written. Over a gate.json the gate doesn't use, the change is written
    * only if gate.json then loads, as when it replaces or removes the rule that
-   * keeps it out. When gate.json could be read but isn't JSON, a copy of its
-   * bytes is kept beside it, and `onUnreadableKept` says where; the change is
-   * then written over it as an edit of the text whose rules are in force, or
-   * of the rules in force where there's none. Fields the gate
-   * reads nowhere, and that aren't a slip of one it does, are left out, and
-   * named to `onIgnoredFields`. Each callback is called once the change is
-   * made, and a throw from it is logged, not thrown. Throws if no gate is
+   * keeps it out. Fields the gate reads nowhere, and that aren't a slip of one
+   * it does, are left out, and named to `onIgnoredFields`, called once the
+   * change is made; a throw from it is logged, not thrown. Throws if no gate is
    * configured, the policy is invalid, the placement can't be made, gate.json
    * has no rule list a change could edit, it isn't used and the change doesn't
-   * mend it, or it can't be read, kept or written (EventGate.addPolicy).
+   * mend it, or it can't be read, isn't JSON or can't be written
+   * (EventGate.addPolicy); gate.json then stays as it is.
    */
   addGatePolicy(
     rawPolicy: unknown,
     options?: {
       position?: 'append' | 'prepend' | { before: string } | { after: string };
-      onUnreadableKept?: (kept: import('./gate/types.js').UnreadableConfigKept) => void;
       onIgnoredFields?: (notes: string[]) => void;
     },
   ): import('./gate/types.js').GatePolicy {
@@ -8135,20 +8131,16 @@ export class AgentFramework {
 
   /**
    * Remove a gate policy by name at runtime. Returns false if it didn't exist.
-   * A copy of a gate.json that could be read but isn't JSON is kept first, as
-   * for addGatePolicy. Throws if no gate is configured, gate.json has no rule
-   * list a change could edit, it isn't used and the removal doesn't mend it,
-   * or it can't be read, kept or written (EventGate.removePolicy); the rule
-   * then stays in force.
+   * Throws if no gate is configured, gate.json has no rule list a change could
+   * edit, it isn't used and the removal doesn't mend it, or it can't be read,
+   * isn't JSON or can't be written (EventGate.removePolicy); the rule then
+   * stays in force.
    */
-  removeGatePolicy(
-    name: string,
-    options?: { onUnreadableKept?: (kept: import('./gate/types.js').UnreadableConfigKept) => void },
-  ): boolean {
+  removeGatePolicy(name: string): boolean {
     if (!this.eventGate) {
       throw new Error('No EventGate configured (FrameworkConfig.gate is unset).');
     }
-    return this.eventGate.removePolicy(name, options);
+    return this.eventGate.removePolicy(name);
   }
 
   /** Current gate policy names (freshest on-disk view). Empty when no gate. */
@@ -28914,13 +28906,10 @@ export class AgentFramework {
           finish({ success: false, error: 'wake_remove_rule: `name` (string) is required', isError: true });
           return;
         }
-        const report: { keptUnreadable?: string } = {};
-        const removed = this.removeGatePolicy(input.name, {
-          onUnreadableKept: (k) => { report.keptUnreadable = formatUnreadableKept(k); },
-        });
+        const removed = this.removeGatePolicy(input.name);
         finish({
           success: true,
-          data: { removed, name: input.name, ...report, policies: this.getGatePolicyNames() },
+          data: { removed, name: input.name, policies: this.getGatePolicyNames() },
         });
         return;
       }
@@ -29049,13 +29038,10 @@ export class AgentFramework {
       const before = new Map(
         this.eventGate!.probeTable().map((r) => [r.probe, r]),
       );
-      const report: { keptUnreadable?: string; ignoredFields?: string[] } = {};
       const policy = this.addGatePolicy(rawPolicy, {
         ...(position ? { position } : {}),
-        onUnreadableKept: (k) => { report.keptUnreadable = formatUnreadableKept(k); },
         onIgnoredFields: (notes) => { ignored.push(...notes); },
       });
-      if (ignored.length > 0) report.ignoredFields = ignored;
       const after = this.eventGate!.probeTable();
       const probes = after.map((r) => {
         const prev = before.get(r.probe);
@@ -29074,7 +29060,7 @@ export class AgentFramework {
         success: true,
         data: {
           added: policy.name,
-          ...report,
+          ...(ignored.length > 0 ? { ignoredFields: ignored } : {}),
           policies: this.getGatePolicyNames(),
           ...(shadowWarnings.length > 0 ? { shadowWarnings } : {}),
           probes,

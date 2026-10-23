@@ -68,7 +68,7 @@ export type { SessionUsage, AgentUsage, SessionUsageSnapshot, UsageUpdatedEvent 
 
 // EventGate
 export { EventGate, wakeLineText, type WakeProvenance } from './gate/index.js';
-export type { GateConfig, GateOptions, GatePolicy, GatePolicyMatch, GateBehavior, UnreadableConfigKept, WakeLine } from './gate/index.js';
+export type { GateConfig, GateOptions, GatePolicy, GatePolicyMatch, GateBehavior, WakeLine } from './gate/index.js';
 
 // MCPL channel registry (exposed for modules that need channel-level operations)
 export { ChannelRegistry } from './mcpl/index.js';

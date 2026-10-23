@@ -11,8 +11,8 @@
  * inference tokens, not whether the agent should know about the event.
  */
 
-import { readdirSync, readFileSync, unlinkSync, writeFileSync, mkdirSync } from 'node:fs';
-import { basename, dirname, join } from 'node:path';
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
 import { closestNames, isNearMiss } from '../closest-names.js';
 import { MAX_TIMER_MS } from '../deadline-timer.js';
@@ -32,7 +32,6 @@ import type {
   GateStatus,
   ShadowWarning,
   GateProbeRow,
-  UnreadableConfigKept,
 } from './types.js';
 
 // Re-export types consumers need
@@ -412,12 +411,31 @@ function beforeWriting(err: unknown): boolean {
 /**
  * A change's refusal where gate.json has no rule list it could edit without
  * writing over what it holds: a list, JSON that isn't an object, or a
- * "policies" that isn't a list and holds something.
+ * "policies" that isn't a list and holds something. `runs` is what the gate
+ * runs meanwhile (rulesRun).
  */
-function noListRefusal(noList: string): string {
-  return `${noList}, so a change has no list of rules to edit without writing over what gate.json holds, `
-    + 'and nothing was saved. Whoever runs this host can make gate.json an object whose "policies" is a list holding its '
-    + 'rules; until then, a change is refused the same way.';
+function noListRefusal(noList: string, runs: string): string {
+  return `${noList}, so it has no list of rules a change could edit without writing over what it holds, and nothing `
+    + `was saved. Meanwhile the gate runs ${runs}. Until gate.json is an object whose "policies" is a list holding its `
+    + 'rules, a change is refused the same way.';
+}
+
+/**
+ * A change's refusal where gate.json is there but couldn't be used as a file
+ * a change edits: it couldn't be read, or it isn't JSON. Nothing is written
+ * over it, so what it holds, often an operator's unfinished edit, stays as it
+ * is. `bytes` is set where it could be read. `runs` is what the gate runs
+ * meanwhile (rulesRun).
+ */
+function unusableRefusal(unusable: { error: string; bytes?: Buffer }, runs: string): string {
+  if (unusable.bytes === undefined) {
+    return `gate.json couldn't be read (${unusable.error}), so a change can't edit it, and nothing was written over it. `
+      + `Meanwhile the gate runs ${runs}. Whoever runs this host can make gate.json readable; until then, a change is `
+      + 'refused the same way.';
+  }
+  return `gate.json isn't JSON the gate can read (${unusable.error}), so a change can't edit its rules without writing `
+    + `over what it holds, and nothing was saved. Meanwhile the gate runs ${runs}. Until gate.json is JSON, a change is `
+    + 'refused the same way.';
 }
 
 /**
@@ -426,8 +444,9 @@ function noListRefusal(noList: string): string {
  * force, so it would take out of force what the start runs in its place.
  */
 const NOT_USED_REFUSAL = "gate.json isn't used at this start, which runs as one without it does, and a change would put "
-  + "gate.json's rules in force in place of what that runs, so nothing was saved. Whoever runs this host can give gate.json "
-  + 'rules under "policies", or fix the starting rules for the next start; until then, a change is refused the same way.';
+  + "gate.json's rules in force in place of what that runs, so nothing was saved. Giving gate.json rules under "
+  + '"policies", or fixing the starting rules for the next start, puts it in use; until then, a change is refused the '
+  + 'same way.';
 
 /**
  * A value as a message quotes it: its JSON, cut short when long, never inside a
@@ -627,8 +646,12 @@ export function checkToolInput(
       ...misplaced.map((m) => `${misplacedShown(m)}, ${TOOL_PARAMETERS_TERMS.unread} here`),
       ...(rest.length > 0 ? [`${quotedList(rest)}, ${TOOL_PARAMETERS_TERMS.unread}`] : []),
     ];
+    // Where a field has one home, show it there, as the call would give it.
+    const moves = misplaced.filter((m) => m.homes.length === 1).map((m) => `Put ${m.keys.length === 1 ? 'it' : 'them'} in `
+      + `${m.homes[0]}: {${m.keys.map((key) => `${JSON.stringify(key)}: ${shownValue(given[key])}`).join(', ')}}.`);
     throw new Error(
-      `${tool} has ${has.join(', and ')}, so nothing was saved. ${TOOL_PARAMETERS_TERMS.listed} ${quotedList(params)}.`,
+      `${tool} has ${has.join(', and ')}, so nothing was saved. ${moves.map((move) => `${move} `).join('')}`
+      + `${TOOL_PARAMETERS_TERMS.listed} ${quotedList(params)}.`,
     );
   }
   noteUnread(tool, rest, params, notes, TOOL_PARAMETERS_TERMS);
@@ -713,13 +736,15 @@ interface RuleReading {
 }
 
 /**
- * A rule's notes, ending with what a match that narrows nothing does; a
- * refusal says what it would do as written, since nothing was saved.
+ * A rule's notes, ending with what a match that narrows nothing does. A
+ * refusal says it of the rule read without what's wrong in its match, as
+ * earlier releases read it, since that's why what's wrong there matters.
  */
 function notesOf(reading: RuleReading, refused = false): string[] {
   if (!reading.matchesAll) return reading.notes;
-  const does = refused ? 'as written it would match' : 'it matches';
-  return [...reading.notes, `${reading.where}: nothing left in match narrows the rule, so ${does} every event.`];
+  return [...reading.notes, refused
+    ? "Read without what's wrong in its match, as earlier releases read it, the rule would match every event."
+    : `${reading.where}: nothing left in match narrows the rule, so it matches every event.`];
 }
 
 /** Where a rule's fields are read into: the rule's name in messages, its problems, and its notes. */
@@ -1426,8 +1451,8 @@ function describeStart(starting: StartingRules, write: StartWrite, held: Readonl
     // own left it unable to load; or none, where gate.json wasn't used either.
     const instead = write.kind === 'start-without'
       ? `gate.json, which has no rules the gate reads, wasn't used either: under its default, "${write.default}", it would hold back every `
-        + 'event, so the gate started with no rules, as a start without gate.json does. Whoever runs this host can give '
-        + 'gate.json rules under "policies", or fix the starting rules.'
+        + 'event, so the gate started with no rules, as a start without gate.json does. Giving gate.json rules under '
+        + '"policies", or fixing the starting rules, puts rules in force.'
       : held !== null || write.kind === 'reconcile-failed'
         ? "The gate started with gate.json's rules."
         : 'The gate started with no rules, as on a host without starting rules.';
@@ -1453,14 +1478,14 @@ function describeStart(starting: StartingRules, write: StartWrite, held: Readonl
  * after "it has no rules, so" in its note.
  */
 function notUsedClause(write: Extract<StartWrite, { kind: 'start-without' }>, starting: StartingRules): string {
-  const back = 'Whoever runs this host can give gate.json rules under "policies"';
+  const back = 'Giving gate.json rules under "policies"';
   const out = outOfForce(write);
   if (out) {
     return `it isn't used at this start: under its default, "${write.default}", ${out.said}, so the gate runs the starting `
-      + `rules under their own default, "${starting.config?.default ?? 'always'}", as a start without gate.json does. ${back}, or ${out.fix}`;
+      + `rules under their own default, "${starting.config?.default ?? 'always'}", as a start without gate.json does. ${back}, or ${out.fix}, puts it in use`;
   }
   return `under its default, "${write.default}", it would hold back every event: it isn't used at this start, and the gate runs `
-    + `no rules, as a start without gate.json does, so every event gets the default, "always". ${back}, or fix the starting rules`;
+    + `no rules, as a start without gate.json does, so every event gets the default, "always". ${back}, or fixing the starting rules, puts rules in force`;
 }
 
 /**
@@ -1476,12 +1501,12 @@ function outOfForce(write: Extract<StartWrite, { kind: 'start-without' }>): { sa
   const fix: string[] = [];
   if (left.length > 0) {
     said.push(`the host's starting rules would leave out ${joinedList(left)}, which could wake the agent`);
-    fix.push(`fix ${joinedList(left)} in the starting rules`);
+    fix.push(`fixing ${joinedList(left)} in the starting rules`);
   }
   if (held.length > 0) {
     said.push(`the host's ${quotedList(held)}, which could wake the agent, would be kept out by gate.json's `
       + `${held.length === 1 ? 'rule of that name' : 'rules of those names'}, which the gate leaves out`);
-    fix.push(`fix gate.json's ${quotedList(held)}`);
+    fix.push(`fixing gate.json's ${quotedList(held)}`);
   }
   return said.length > 0 ? { said: said.join(', and '), fix: fix.join(', or ') } : null;
 }
@@ -1501,8 +1526,8 @@ function describeUnsaved(starting: StartingRules, write: StartWrite, loaded: boo
     if (!loaded) return null;
     return `At start, the host's starting rules ${quotedList(write.names)} couldn't be added to gate.json (${write.error}). `
       + `The gate runs them under gate.json's default, "${write.config.default ?? 'always'}", as if gate.json held them, but `
-      + "they aren't saved in it: once gate.json changes and loads, what it holds is in force instead. Whoever runs this "
-      + 'host can give gate.json a list of rules under "policies", and a start then adds them to it, as to any gate.json with a list.';
+      + "they aren't saved in it: once gate.json changes and loads, what it holds is in force instead. Once gate.json has a "
+      + 'list of rules under "policies", a start adds them to it, as to any gate.json with a list.';
   }
   if (write.kind === 'start-without') {
     // Starting rules refused whole put none in force, and describeStart says so.
@@ -1510,8 +1535,8 @@ function describeUnsaved(starting: StartingRules, write: StartWrite, loaded: boo
     if (!out) return null;
     return `At start, gate.json, which has no rules the gate reads, wasn't used: under its default, "${write.default}", ${out.said}. The gate `
       + `runs the starting rules under their own default, "${starting.config?.default ?? 'always'}", as a start without gate.json `
-      + 'does, but they aren\'t saved in it: once gate.json changes and loads, what it holds is in force instead. Whoever runs '
-      + `this host can give gate.json rules under "policies", or ${out.fix}.`;
+      + 'does, but they aren\'t saved in it: once gate.json changes and loads, what it holds is in force instead. Giving '
+      + `gate.json rules under "policies", or ${out.fix}, puts it in use.`;
   }
   if (loaded) return null;
   if (write.kind === 'seed-failed') {
@@ -1635,13 +1660,6 @@ export function formatShadowWarning(w: ShadowWarning): string {
   const types = w.eventTypes === 'all' ? 'ALL event types' : w.eventTypes.join(', ');
   return `rule "${w.earlier}" makes "${w.later}" unreachable for ${types} `
     + `(first match wins — every event "${w.later}" would match is consumed by "${w.earlier}" first)`;
-}
-
-/** What a wake-rule tool tells the agent when its change kept a copy of an unreadable gate.json. */
-export function formatUnreadableKept(kept: UnreadableConfigKept): string {
-  return `gate.json couldn't be used (${kept.reason}), so a copy of it was kept at ${kept.keptPath}, and gate.json `
-    + 'now holds the rules that were in force, with this change. What the copy holds is not in force; whoever '
-    + 'runs this host can restore rules from it.';
 }
 
 /** The text of a thrown value, for a log line. It never throws itself, whatever was thrown. */
@@ -2121,19 +2139,22 @@ export class EventGate {
    */
   private configErrorShown(): string | null {
     if (this.configError === null || !this.configUnused) return this.configError;
+    return `${sentence(this.configError)} So what gate.json holds isn't in force, and the gate runs ${this.rulesRun()}.`;
+  }
+
+  /** What the gate runs, by where its rules came from, for a text that says so: "the host's starting rules". */
+  private rulesRun(): string {
+    if (this.config.policies.length === 0) return `no rules: every event gets the default, "${this.config.default ?? 'always'}"`;
     // Rules from a gate.json text, with the start's unsaved: only a start
     // whose reconcile write left gate.json unable to load runs those, since a
     // write of gate.json that lands, a reload that finds it holding a text
     // that loads, or, while gate.json's rules are in force, one that finds it
     // holding the text in force, clears startUnsaved.
-    const runs = this.configSource === 'file'
+    return this.configSource === 'file'
       ? this.startUnsaved !== null
         ? 'the rules it read from gate.json at start and the ones it was adding'
         : 'the rules of the last gate.json it used'
-      : this.configSource === 'initial'
-        ? "the host's starting rules"
-        : 'no rules: every event gets the default, "always"';
-    return `${sentence(this.configError)} So what gate.json holds isn't in force, and the gate runs ${runs}.`;
+      : "the host's starting rules";
   }
 
   /**
@@ -2149,19 +2170,21 @@ export class EventGate {
    * rules in force, where no text is, it has no rule list, or what's in force
    * is what a start ran beside or in place of it. A file that can't
    * be read or isn't JSON comes back with its error, and with its bytes when
-   * it could be read, for keepUnreadableConfig before anything is written over
-   * it. A change is refused (`refused`) for a gate.json with no rule list a
+   * it could be read, so a change that would write refuses (unusableRefusal),
+   * since writing would put the rules in force over what it holds; a removal
+   * of a name it doesn't hold writes nothing, and answers so. A
+   * change is refused (`refused`) for a gate.json with no rule list a
    * write could edit without writing over what it holds (a list, a "policies"
    * that isn't one and holds something, or JSON that isn't an object), and for
    * one that holds the text a start didn't use (start-without), since what the
    * change wrote would put its rules in force in place of what the start runs.
    */
   private rulesForChange():
-    | { top: Record<string, unknown>; rules: unknown[]; unreadable?: { error: string; bytes?: Buffer }; remedy?: string }
+    | { top: Record<string, unknown>; rules: unknown[]; unusable?: { error: string; bytes?: Buffer }; remedy?: string }
     | { refused: string } {
     const read = this.readConfigFile();
     if (read.state === 'loaded' || read.state === 'refused') {
-      if ('noList' in read.listed) return { refused: noListRefusal(read.listed.noList) };
+      if ('noList' in read.listed) return { refused: noListRefusal(read.listed.noList, this.rulesRun()) };
       // Rules not gate.json's in force while it holds the text in force: what a
       // start ran in place of one with no rules of its own, until it changes.
       if (read.state === 'loaded' && read.text === this.configText && this.configSource !== 'file') {
@@ -2181,7 +2204,7 @@ export class EventGate {
           ? `Replacing or removing "${only}" by name would bring gate.json into force.`
           : sharing > 1
             ? `gate.json has ${sharing} rules named "${only}", and a change by that name replaces the first of them or removes them all.`
-            : 'No change through the gate can bring it into force, so whoever runs this host has to fix gate.json; '
+            : 'No change through the gate can bring it into force, so gate.json has to be fixed by an edit of its own; '
               + 'until then, a change is refused the same way.',
       };
     }
@@ -2193,104 +2216,8 @@ export class EventGate {
     const inForce = text && !('refused' in text) && !('noList' in text.listed)
       ? { top: text.listed.top, rules: [...text.listed.rules] }
       : { top: { policies: [], default: this.config.default ?? 'always' }, rules: [...this.config.policies] as unknown[] };
-    if (read.state === 'unreadable') return { ...inForce, unreadable: { error: read.error, bytes: read.bytes } };
+    if (read.state === 'unreadable') return { ...inForce, unusable: { error: read.error, bytes: read.bytes } };
     return inForce;
-  }
-
-  /**
-   * Keep a copy of an unreadable gate.json, byte for byte as the change read it, at
-   * `gate.json.unreadable-<UTC time>` beside it, before the rules in force are
-   * written over it in place, so what it held (often an operator's
-   * unfinished edit) isn't lost. A copy, not a rename, so gate.json itself
-   * stays where it is: a symlink keeps its target, the file its mode and
-   * owner, and a single-file bind mount works. Returns where the copy is.
-   * Throws, so the caller writes nothing, when the file couldn't be read at
-   * all (there's nothing to copy, and a file the process can't read is often
-   * one its operator closed off on purpose) or when the copy can't be made.
-   */
-  private keepUnreadableConfig(unreadable: { error: string; bytes?: Buffer }): string {
-    const reason = unreadable.error;
-    if (unreadable.bytes === undefined) {
-      throw new Error(
-        `gate.json couldn't be read (${reason}), so it can't be kept, and nothing was written over it. Whoever runs this `
-        + 'host can make gate.json readable; until then, a change is refused the same way.',
-      );
-    }
-    // No colons: Windows doesn't allow them in a file name.
-    const stamp = new Date(this.now()).toISOString().replace(/\.\d+Z$/, 'Z').replace(/[-:]/g, '');
-    const base = `${this.configPath}.unreadable-${stamp}`;
-    // The copy is created with mode 0600, and nothing widens it, so on Linux
-    // only the user the host runs as can read it (a directory's default ACL is
-    // masked by that mode). What keeps others out of gate.json can be more than
-    // its own bits, such as a directory on the way to the file a link or a
-    // single-file bind mount puts there, or an ACL, and the copy, beside it, has
-    // none of those. The host read gate.json, so its user is one who could.
-    for (let n = 1; ; n++) {
-      const kept = n === 1 ? base : `${base}-${n}`;
-      try {
-        // An exclusive create, so a copy never replaces an earlier one.
-        writeFileSync(kept, unreadable.bytes, { flag: 'wx', mode: 0o600 });
-      } catch (err) {
-        const e = err as NodeJS.ErrnoException;
-        if (e.code === 'EEXIST') continue;
-        // A copy cut short is this call's own file: remove it, so nothing is left.
-        if (e.syscall !== 'open') {
-          try { unlinkSync(kept); } catch { /* it's named below */ }
-        }
-        throw new Error(
-          `gate.json couldn't be used (${reason}), and keeping a copy of it at ${kept} failed (${e.message ?? String(err)}), `
-          + 'so nothing was written. Whoever runs this host can fix gate.json, or what kept the copy from being made; '
-          + 'until then, a change is refused the same way.',
-        );
-      }
-      console.error(`[gate] ${this.configPath} couldn't be used (${reason}); kept a copy at ${kept} before writing the rules in force`);
-      this.emitTrace({
-        type: 'gate:config-kept',
-        configPath: this.configPath,
-        keptPath: kept,
-        error: reason,
-        timestamp: Date.now(),
-      });
-      return kept;
-    }
-  }
-
-  /**
-   * The copies keepUnreadableConfig made that are still beside gate.json,
-   * oldest first, each with what to do with it, for gate_status: the moment a
-   * copy is made reaches only the log, the trace and the change's caller, and
-   * the copy exists to be found later.
-   */
-  private keptCopies(): string[] {
-    const dir = dirname(this.configPath);
-    const prefix = `${basename(this.configPath)}.unreadable-`;
-    let names: string[];
-    try {
-      names = readdirSync(dir).filter((name) => name.startsWith(prefix));
-    } catch {
-      return [];
-    }
-    return names
-      .sort((a, b) => a.localeCompare(b, 'en', { numeric: true }))
-      .map((name) => `${join(dir, name)}: a copy of gate.json, kept when it couldn't be used. Nothing in it is in force. `
-        + "To use it, fix it and copy it over gate.json. Once it isn't needed, remove it.");
-  }
-
-  /**
-   * writeConfig, after keepUnreadableConfig may have kept a copy of gate.json:
-   * then a write that fails names the copy, since what the file held may now
-   * be only there.
-   */
-  private writeConfigAfterKeep(
-    top: Record<string, unknown>, rules: unknown[], kept: UnreadableConfigKept | undefined, remedy?: string,
-  ): void {
-    try {
-      this.writeConfig(top, rules, remedy);
-    } catch (err) {
-      if (!kept) throw err;
-      const msg = err instanceof Error ? err.message : String(err);
-      throw new Error(`${sentence(msg)} A copy of what gate.json held when it couldn't be used is kept at ${kept.keptPath}.`, { cause: err });
-    }
   }
 
   private compilePolicies(config: GateConfig): CompiledPolicy[] {
@@ -2420,11 +2347,9 @@ export class EventGate {
    * gate.json the gate doesn't use, only a change after which it loads is
    * written, such as one replacing or removing the rule that keeps it out; any
    * other is refused, naming what does, and the file stays as written. When
-   * gate.json is absent, or could be read but isn't JSON, the change edits the
-   * text whose rules are in force the same way, or the rules in force where
-   * there's none; over a file that isn't JSON, after a copy of
-   * it is kept beside it (keepUnreadableConfig) and reported to
-   * `onUnreadableKept` once the change is written and traced. A policy with the
+   * gate.json is absent, the change edits the text whose rules are in force the
+   * same way, or the rules in force where there's none. A gate.json that can't
+   * be read or isn't JSON is refused (unusableRefusal), and stays as it is. A policy with the
    * same `name` is replaced IN PLACE when no `position` is given (order
    * preserved); WITH a `position` it is moved there — so re-issuing a rule is
    * also how you reposition it. New policies append by default; `'prepend'` puts
@@ -2434,22 +2359,20 @@ export class EventGate {
    * the safer way to order a sampler or debounce against a specific catch-all.
    * Fields of the policy the gate reads nowhere, and that aren't a slip of one
    * it does, are left out of what's written, and named to `onIgnoredFields` once
-   * the change is written and traced. A throw from either callback is logged,
+   * the change is written and traced. A throw from the callback is logged,
    * and the change stands (afterChange). A field it reads at another level is a
    * problem, like a slip.
    *
    * Throws, writing nothing, for an invalid policy, a placement it can't make,
-   * a gate.json that can't be read or kept, one with no rule list it could
-   * edit without writing over what it holds, one a start didn't use, which runs
-   * as one without it does, while it's unchanged, or one the gate doesn't use
-   * that the change doesn't mend; and throws when the write fails,
-   * naming any copy kept.
+   * a gate.json that can't be read or isn't JSON, one with no rule list it
+   * could edit without writing over what it holds, one a start didn't use,
+   * which runs as one without it does, while it's unchanged, or one the gate
+   * doesn't use that the change doesn't mend; and throws when the write fails.
    */
   addPolicy(
     rawPolicy: unknown,
     options?: {
       position?: 'append' | 'prepend' | { before: string } | { after: string };
-      onUnreadableKept?: (kept: UnreadableConfigKept) => void;
       onIgnoredFields?: (notes: string[]) => void;
     },
   ): GatePolicy {
@@ -2459,7 +2382,7 @@ export class EventGate {
     const ignored = notesOf(reading);
     const edit = this.rulesForChange();
     if ('refused' in edit) throw new Error(edit.refused);
-    const { top, rules, unreadable, remedy } = edit;
+    const { top, rules, unusable, remedy } = edit;
     const idx = rules.findIndex((rule) => nameOf(rule) === policy.name);
     const position = options?.position;
 
@@ -2484,10 +2407,8 @@ export class EventGate {
       }
     }
 
-    const kept = unreadable !== undefined
-      ? { keptPath: this.keepUnreadableConfig(unreadable), reason: unreadable.error }
-      : undefined;
-    this.writeConfigAfterKeep(top, rules, kept, remedy);
+    if (unusable !== undefined) throw new Error(unusableRefusal(unusable, this.rulesRun()));
+    this.writeConfig(top, rules, remedy);
     this.emitTrace({
       type: 'gate:policy-added',
       configPath: this.configPath,
@@ -2495,7 +2416,6 @@ export class EventGate {
       replaced: idx >= 0,
       timestamp: Date.now(),
     });
-    if (kept) afterChange('onUnreadableKept', () => options?.onUnreadableKept?.(kept));
     if (ignored.length > 0) {
       // A caller that doesn't take the notes still gets them said, in the log.
       const onIgnoredFields = options?.onIgnoredFields;
@@ -2509,34 +2429,30 @@ export class EventGate {
    * Remove a policy by name from gate.json and clear its live state. Any pending
    * debounce batch is sent once the removal is written and in force, as its
    * timer would have sent it, so buffered events aren't silently dropped
-   * (clearStateFor). Freshest on-disk config is re-read first, every other
-   * rule is written back as it was written, and a copy of a gate.json that
-   * isn't JSON is kept before it's written over (see addPolicy). Throws, writing nothing, for a gate.json with
-   * no rule list it could edit, or one a start didn't use, as addPolicy does. Otherwise returns false,
-   * writing nothing, if no policy of that name exists, gate.json's own rules
-   * included, so one the gate leaves out can be removed by name too. For a
-   * name it holds, throws, writing nothing, for a gate.json that can't be read
-   * or kept, or one the gate doesn't use that the removal doesn't mend, and
-   * when the write fails (naming any copy kept); the rule then stays in force,
-   * with its state.
+   * (clearStateFor). Freshest on-disk config is re-read first, and every other
+   * rule is written back as it was written (see addPolicy). Throws, writing
+   * nothing, for a gate.json with no rule list it could edit, or one a start
+   * didn't use, as addPolicy does. Otherwise returns false, writing nothing, if
+   * no policy of that name exists, gate.json's own rules included, so one the
+   * gate leaves out can be removed by name too. For a name it holds, throws,
+   * writing nothing, for a gate.json that can't be read or isn't JSON, or one
+   * the gate doesn't use that the removal doesn't mend, and when the write
+   * fails; the rule then stays in force, with its state.
    */
-  removePolicy(name: string, options?: { onUnreadableKept?: (kept: UnreadableConfigKept) => void }): boolean {
+  removePolicy(name: string): boolean {
     const edit = this.rulesForChange();
     if ('refused' in edit) throw new Error(edit.refused);
     if (!edit.rules.some((rule) => nameOf(rule) === name)) return false;
-    const kept = edit.unreadable !== undefined
-      ? { keptPath: this.keepUnreadableConfig(edit.unreadable), reason: edit.unreadable.error }
-      : undefined;
+    if (edit.unusable !== undefined) throw new Error(unusableRefusal(edit.unusable, this.rulesRun()));
     // The write clears the rule's state once it has succeeded (writeConfig),
-    // so a failed keep or write leaves the rule in force with its state.
-    this.writeConfigAfterKeep(edit.top, edit.rules.filter((rule) => nameOf(rule) !== name), kept, edit.remedy);
+    // so a refusal or a failed write leaves the rule in force with its state.
+    this.writeConfig(edit.top, edit.rules.filter((rule) => nameOf(rule) !== name), edit.remedy);
     this.emitTrace({
       type: 'gate:policy-removed',
       configPath: this.configPath,
       policyName: name,
       timestamp: Date.now(),
     });
-    if (kept) afterChange('onUnreadableKept', () => options?.onUnreadableKept?.(kept));
     return true;
   }
 
@@ -3766,7 +3682,6 @@ export class EventGate {
       errors: [this.configErrorShown(), this.startNotice, this.startUnsaved, this.privilegedError]
         .filter((e): e is string => e !== null),
       shadowWarnings: this.shadowWarningsCache.map(formatShadowWarning),
-      keptCopies: this.keptCopies(),
       totalEvaluations: this.totalEvaluations,
       defaultDecisions: {
         triggered: this.defaultTriggered,
