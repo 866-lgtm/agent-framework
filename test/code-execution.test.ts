@@ -1288,7 +1288,36 @@ describe('a round whose run or wait call watches a script that can change its ro
     hostCalls: number;
     snapshot(): { calls: { waiting: number } };
   };
-  type WatchStep = { onWatch?: (run: WatchedRun) => void; yieldWhen?: (run: WatchedRun) => boolean };
+  type WatchStep = {
+    onWatch?: (run: WatchedRun) => void;
+    yieldWhen?: (run: WatchedRun) => boolean;
+    onReturn?: (returned: { running: boolean }) => void;
+  };
+  type Captured = { handle: ReturnType<typeof setTimeout>; due: () => void };
+  /**
+   * Runs `fn`, one synchronous stretch of the runner's code, with setTimeout
+   * passing through to the real one and recording each timer of `ms` it sets,
+   * and restores setTimeout in a finally. Firing a captured timer early is
+   * clearing its handle and running its callback, the runner's own.
+   */
+  const captureTimers = <T>(ms: number, fn: () => T): { result: T; timers: Captured[] } => {
+    const realSetTimeout = globalThis.setTimeout;
+    const timers: Captured[] = [];
+    globalThis.setTimeout = ((callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) => {
+      const handle = realSetTimeout(callback, delay, ...args);
+      if (delay === ms) timers.push({ handle, due: () => callback(...args) });
+      return handle;
+    }) as typeof setTimeout;
+    try {
+      return { result: fn(), timers };
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+    }
+  };
+  const fire = ({ handle, due }: Captured) => {
+    clearTimeout(handle);
+    due();
+  };
   /**
    * Makes the run's own yield, the timer its yield_time_ms sets, come due once
    * `when` holds rather than on the clock. The timer is the runner's, set as
@@ -1302,28 +1331,19 @@ describe('a round whose run or wait call watches a script that can change its ro
     const wait = run.wait;
     run.wait = (ms: number) => {
       run.wait = wait;
-      const realSetTimeout = globalThis.setTimeout;
-      const timers: Array<{ handle: ReturnType<typeof setTimeout>; due: () => void }> = [];
-      globalThis.setTimeout = ((callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) => {
-        const handle = realSetTimeout(callback, delay, ...args);
-        if (delay === ms) timers.push({ handle, due: () => callback(...args) });
-        return handle;
-      }) as typeof setTimeout;
-      let waited: Promise<unknown>;
-      try {
-        waited = wait.call(run, ms);
-      } finally {
-        globalThis.setTimeout = realSetTimeout;
-      }
+      const { result: waited, timers } = captureTimers(ms, () => wait.call(run, ms));
       // The runner yields through exactly one timer of the yield's length. If it
-      // ever stops, this throws rather than leave the test to the clock.
-      if (timers.length !== 1) throw new Error(`the run's wait set ${timers.length} timers of its ${ms} ms yield, not one`);
-      const [{ handle, due }] = timers;
+      // ever stops, this throws, rejecting the observing call, rather than leave
+      // the test to the clock.
+      if (timers.length !== 1) {
+        throw new Error(run.ended
+          ? "the run had ended before its wait, so there was no yield to fire"
+          : `the run's wait set ${timers.length} timers of its ${ms} ms yield, not one`);
+      }
       const poll = setInterval(() => {
         if (!when(run)) return;
         clearInterval(poll);
-        clearTimeout(handle);
-        due();
+        fire(timers[0]);
       }, 5);
       // The wait settles at the yield, or when the run ends: either way there is nothing left to fire.
       void waited.finally(() => clearInterval(poll));
@@ -1333,35 +1353,24 @@ describe('a round whose run or wait call watches a script that can change its ro
   /**
    * Makes the timeouts of a run's calls to `tool` come due once `when` holds,
    * as yieldOnEvent does a yield: ScriptRun.call sets a call's timer before
-   * it first awaits, so for each call to `tool` setTimeout passes through and
-   * records the one timer of `ms`, the run's toolCallTimeoutMs, and firing it
-   * clears it and runs the runner's own timeout. Each such call must set
-   * exactly one, or the call throws, failing the test rather than leaving the
-   * call's time to the clock. When `when` holds it fires exactly `count`
-   * timers, or throws: fewer would leave the rest to the clock, which still
-   * comes before the yield and would pass the test on the clock's order. Left
-   * to come due, as at yieldOnEvent, the timers still end a run the code gets
-   * wrong.
+   * it first awaits, so each call to `tool` runs under captureTimers, which
+   * records the one timer of `ms`, the run's toolCallTimeoutMs. When `when`
+   * holds it fires exactly `count` timers, or throws: fewer would leave the
+   * rest to the clock, which still comes before the yield and would pass the
+   * test on the clock's order. Left to come due, as at yieldOnEvent, the
+   * timers still end a run the code gets wrong.
    */
   const timeOutOnEvent = (run: WatchedRun, tool: string, ms: number, count: number, when: () => boolean) => {
     const call = run.call;
-    const timers: Array<{ handle: ReturnType<typeof setTimeout>; due: () => void }> = [];
+    const timers: Captured[] = [];
     run.call = (id: number, name: string, args: string) => {
       if (name !== tool) return call.apply(run, [id, name, args]);
-      const realSetTimeout = globalThis.setTimeout;
-      const set: typeof timers = [];
-      globalThis.setTimeout = ((callback: (...rest: unknown[]) => void, delay?: number, ...rest: unknown[]) => {
-        const handle = realSetTimeout(callback, delay, ...rest);
-        if (delay === ms) set.push({ handle, due: () => callback(...rest) });
-        return handle;
-      }) as typeof setTimeout;
-      let called: Promise<void>;
-      try {
-        called = call.apply(run, [id, name, args]);
-      } finally {
-        globalThis.setTimeout = realSetTimeout;
-      }
-      if (set.length !== 1) throw new Error(`a call to ${tool} set ${set.length} timers of its ${ms} ms timeout, not one`);
+      const { result: called, timers: set } = captureTimers(ms, () => call.apply(run, [id, name, args]));
+      // A call that set no such timer, or more than one, rejects the promise
+      // the runner leaves unawaited (`void this.call(…)`), so the test fails on
+      // the rejection, and the runner's frame loop goes on to the frames after
+      // this one, as a throw here would stop it.
+      if (set.length !== 1) return Promise.reject(new Error(`a call to ${tool} set ${set.length} timers of its ${ms} ms timeout, not one`));
       timers.push(set[0]);
       return called;
     };
@@ -1371,30 +1380,31 @@ describe('a round whose run or wait call watches a script that can change its ro
       if (!when()) return;
       clearInterval(poll);
       if (timers.length !== count) throw new Error(`${timers.length} calls to ${tool} had set their timeouts when they were to come due, not ${count}`);
-      for (const { handle, due } of timers) {
-        clearTimeout(handle);
-        due();
-      }
+      timers.forEach(fire);
     }, 5);
   };
   /**
    * Steps the calls that watch a script, by their order (the first is the run,
    * the second the wait after it, …): a step's `onWatch` runs once its call
-   * watches the script, and its `yieldWhen` makes that call yield once it
-   * holds (yieldOnEvent). Each order a test needs then comes from events, not
-   * from margins on the clock.
+   * watches the script, its `yieldWhen` makes that call yield once it holds
+   * (yieldOnEvent), and its `onReturn` gets what the call returned. Each order
+   * a test needs then comes from events, not from margins on the clock.
    */
   const stepWatches = (framework: AgentFramework, steps: Array<WatchStep | undefined>) => {
-    type Observe = (script: { run: WatchedRun }, ms: number, watch: unknown) => Promise<unknown>;
+    type Observe = (script: { run: WatchedRun }, ms: number, watch: unknown) => Promise<{ running: boolean }>;
     const scripts = (framework as unknown as { codeExecution: { scripts: { observe: Observe } } }).codeExecution.scripts;
     const observe = scripts.observe.bind(scripts);
     let n = 0;
-    // The manager sets the call's watch just before it observes.
-    scripts.observe = (script, ms, watch) => {
+    // A run's watch is set when its script is made, and a wait's just before it
+    // observes, so a step's onWatch runs as its call starts watching. A stop
+    // observes only once its stop has taken effect, and counts as a call here.
+    scripts.observe = async (script, ms, watch) => {
       const step = steps[n++];
       step?.onWatch?.(script.run);
       if (step?.yieldWhen) yieldOnEvent(script.run, step.yieldWhen);
-      return observe(script, ms, watch);
+      const returned = await observe(script, ms, watch);
+      step?.onReturn?.(returned);
+      return returned;
     };
   };
   // A script holds its round only when it can change the round's routing:
@@ -1942,6 +1952,8 @@ describe('a round whose run or wait call watches a script that can change its ro
       createMockResponse([{ type: 'text', text: 'never reached' }] as ContentBlock[]),
     ]);
     // The script goes on once the wait watches it.
+    // A premise check: the slow call is held until this onWatch, so the skip_reply can't have reached its tool unless
+    // the hold failed. If it ever did, this fails, rather than the test passing on another order.
     let reachedBeforeWait: boolean | undefined;
     stepWatches(h.framework, [undefined, { onWatch: () => { reachedBeforeWait = h.log.includes('tool:skip_reply'); h.module.releaseSlow(); } }]);
     try {
@@ -2141,12 +2153,13 @@ describe('a round whose run or wait call watches a script that can change its ro
       createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
     ]);
     h.module.holdSend = true;
-    stepWatches(h.framework, [{ yieldWhen: () => h.log.includes('tool:send_message') }]);
+    let returned: { running: boolean } | undefined;
+    stepWatches(h.framework, [{ yieldWhen: () => h.log.includes('tool:send_message'), onReturn: (r) => { returned = r; } }]);
     // The send goes on once the turn is over (h.done).
     try {
       await h.run();
       assert.ok(h.log.includes('tool:send_message'), 'the send reached its tool');
-      assert.ok(!h.log.includes('send:returned'), 'and was still running when the run yielded');
+      assert.strictEqual(returned?.running, true, 'and the run returned at its yield, its script still in the send');
       assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), [], 'the send silenced the round and the turn after it');
     } finally {
       await h.done();
@@ -2177,6 +2190,8 @@ describe('a round whose run or wait call watches a script that can change its ro
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'never reached' }] as ContentBlock[]),
     ], {}, { toolCallTimeoutMs: 59_000 });
+    // skipReplyReached and slowReturned are premise checks: the slow tools hold until the wait's onWatch releases them,
+    // so both are false unless the hold failed, and if it ever did, these fail rather than the test passing on another order.
     let atWait: { waiting: number; hostCalls: number; skipReplyReached: boolean; slowReturned: boolean } | null = null;
     stepWatches(h.framework, [
       {
