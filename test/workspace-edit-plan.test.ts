@@ -156,11 +156,12 @@ test("a call counts occurrences past what its edits need only within its budget,
   assert.ok('problems' in problems);
   const left = COUNT_MAX - (5_000_000 - 21);
   assert.deepEqual(problems.problems.map((p) => p.kind === 'count' && [p.found, p.atLeast, p.spent]), [[5_000_000, false, false], [21 + left + 1, true, true], [22, true, true]]);
-  // Two hundred such edits hold the event loop no longer than a few counts.
-  const before = process.cpuUsage();
-  planFile(decodeForEdit(bytes)!, bytes, Array.from({ length: 200 }, (_, k) => spec(k, 'a', 'b')));
-  const used = process.cpuUsage(before);
-  assert.ok((used.user + used.system) / 1000 < 2_000, `${(used.user + used.system) / 1000} ms of CPU`);
+  // Two hundred such edits share the one budget: past the first two, each
+  // stops one past its free 21.
+  const many = planFile(decodeForEdit(bytes)!, bytes, Array.from({ length: 200 }, (_, k) => spec(k, 'a', 'b')));
+  assert.ok('problems' in many);
+  assert.deepEqual(many.problems.map((p) => p.kind === 'count' && [p.found, p.atLeast, p.spent]),
+    [[5_000_000, false, false], [21 + left + 1, true, true], ...Array.from({ length: 198 }, () => [22, true, true])]);
 });
 
 test("a crowded edit whose count the budget stopped short of its ask, or at it, is named by that count where the crowded check names none", () => {
