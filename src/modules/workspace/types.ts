@@ -314,7 +314,8 @@ export interface MountConfig {
   /**
    * If true, writes/edits/deletes via the module's tools materialize to the
    * filesystem immediately (not just into Chronicle tree state). Required for
-   * any mount shared across agents as a communication channel — without it,
+   * any store-backed mount shared across agents as a communication channel (a
+   * direct mount's writes reach disk without it, and it's refused there) — without it,
    * another agent's watcher on the same directory sees nothing. The watcher
    * suppresses its own echoes, so this doesn't cause self-wake loops.
    */

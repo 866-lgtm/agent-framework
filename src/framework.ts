@@ -20734,7 +20734,7 @@ export class AgentFramework {
   }
 
   /** Where a tool result labelled `label` is written: `<first writable
-   *  mount without an include>/tool-results/<label>.txt` (see
+   *  mount without an include, not configured direct>/tool-results/<label>.txt` (see
    *  firstWritableMountName), or null when there is no such mount. */
   private toolResultFilePlace(label: string): { workspace: WorkspaceModule; path: string; safeLabel: string } | null {
     const workspace = this.getWorkspaceModule();

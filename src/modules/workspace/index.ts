@@ -4813,7 +4813,9 @@ export class WorkspaceModule implements Module {
    * from, as a full answer names them (linksNote).
    */
   private directEditsPartway(staged: Array<{ target: EditTarget; staged: Staged }>, failed: number, error: unknown, maxChars: number): string {
-    const head = `The edit_many call wrote ${failed} of its ${staged.length} files before writing ${staged[failed]!.target.path} failed: ${directReason(error)}. `
+    // The failed file is named among the outcomes, so the head stays as
+    // long as its reason, whatever the paths' lengths.
+    const head = `The edit_many call wrote ${failed} of its ${staged.length} files before the next one's write failed: ${directReason(error)}. `
       + "Nothing puts the written files back, so finish or revert them: in each written file, each of its edits replaced its oldString with its newString. Each file's outcome:";
     const parts = staged.map(({ target }, i) => `${target.path}: ${i < failed ? 'written' : i === failed ? 'not written, as it was (its write failed)' : 'not written, as it was'}`);
     const notes = staged.slice(0, failed).map(({ target, staged: file }) => linksNote(target.path, file, 'edit_many')).filter((note): note is string => note !== null);

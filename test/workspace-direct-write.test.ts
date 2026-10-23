@@ -707,7 +707,7 @@ test('edit_many on a direct mount whose rename fails partway names each file\'s 
   };
   const error = await failure(m, 'edit_many', { edits: ['a', 'b', 'c'].map((name) => ({ path: `ref/${name}.txt`, oldString: `${name}1`, newString: `${name.toUpperCase()}1` })) });
   assert.equal(error, [
-    'The edit_many call wrote 1 of its 3 files before writing ref/b.txt failed: cannot rename the staged file over it (ENOSPC). '
+    "The edit_many call wrote 1 of its 3 files before the next one's write failed: cannot rename the staged file over it (ENOSPC). "
       + "Nothing puts the written files back, so finish or revert them: in each written file, each of its edits replaced its oldString with its newString. Each file's outcome:",
     'ref/a.txt: written',
     'ref/b.txt: not written, as it was (its write failed)',
@@ -731,7 +731,7 @@ test("a partway answer over its budget leaves outcomes out, counts them, and kee
   });
   assert.equal(result.success, false);
   assert.ok(result.error!.length <= 1000, `${result.error!.length} characters`);
-  assert.match(result.error!, /^The edit_many call wrote 39 of its 40 files before writing ref\/file-with-a-longish-name-39\.txt failed/);
+  assert.match(result.error!, /^The edit_many call wrote 39 of its 40 files before the next one's write failed/);
   assert.match(result.error!, /\[To keep this answer within 1,000 characters, it leaves out the outcomes of \d+ more files\. Reading a file shows it as disk has it now\.\]$/);
 });
 
