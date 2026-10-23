@@ -11899,10 +11899,13 @@ export class AgentFramework {
             // result, so leaving it out would change the prefix as surely as
             // any form, and the agent wouldn't hear it (context-manager#275's
             // review, R1-1). It goes in as stored, which is the form the next
-            // compile sends unless its per-message cap or an image limit
-            // reaches it: the render doesn't count a null message's images or
-            // cut it, so a batch with more images than the limit, or a long
-            // message under a cap that doesn't shard, still differs there.
+            // compile sends with two exceptions. The render doesn't count a
+            // null message's images or cut it, so a batch with more images
+            // than the limit, or a long message under a cap that doesn't
+            // shard, still differs where an image limit or the per-message
+            // cap reaches it. And a body the strategy stored in parts goes in
+            // whole, joined as the store reads it back, where the next
+            // compile sends it in more than one piece.
             // That rests on two things. The only view filter this framework
             // gives a store is the tune-out stamp (createAgent's; the other
             // stores it opens have none), and a stamped message is skipped
