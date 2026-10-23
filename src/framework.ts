@@ -22383,16 +22383,12 @@ export class AgentFramework {
       // An earlier write of this entry threw, and its store could neither
       // be read back nor searched to tell whether it landed. It's looked up
       // by its id before it's written again. Found, it counts as written
-      // where that write stored it, as when the readback works. That's a
-      // known limit: the copy sits ahead of what was stored since without
-      // it, and a reply stored after it whose request didn't carry it was
-      // made without it. On an account where the provider enforces that
-      // binding, a later request replaying that reply's signed thinking is
-      // refused with a 400 (context-manager #155). Not found, it's written.
-      // While the store can't be searched, it stays queued, holding what's
-      // behind it. An entry whose agent isn't registered has no store to
-      // look in: it's written, and addMessage drops it, as it does an
-      // unmarked one.
+      // where that write stored it, as when the readback works, a known
+      // limit (above, and at the tool boundary's drain). Not found, it's
+      // written. While the store can't be searched, it stays queued,
+      // holding what's behind it. An entry whose agent isn't registered has
+      // no store to look in: it's written, and addMessage drops it, as it
+      // does an unmarked one.
       if (msg.landing === 'unknown' && agent) {
         const found = this.landedCopiesById(agent, msg.id);
         if (found === undefined) {

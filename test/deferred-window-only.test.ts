@@ -743,7 +743,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     const internals = drainInternals(framework);
     module.duringTool = () => {
       // An earlier write of it landed, though whether it landed wasn't
-      // known, and no request has carried it.
+      // known.
       framework.getAgent('assistant')!.getContextManager().addMessage('Antra', text('look left'), { deferredWriteId: 'w-carried' } as never);
       internals.deferredMessages.push({ ...entry('w-carried', 'look left'), landing: 'unknown' });
     };
@@ -849,10 +849,8 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
   it("a drained write whose landing is unknown, found by its id, is carried as its store holds it, not as it was queued", async () => {
     const framework = await createFramework();
     const internals = drainInternals(framework);
-    // A body whose first part landed before the throw stopped its write,
-    // where a request may have carried it, so it stays where it was stored.
+    // A body whose first part landed before the throw stopped its write.
     framework.getAgent('assistant')!.getContextManager().addMessage('Antra', text('part one'), { deferredWriteId: 'w-part' } as never);
-    framework.getAgent('assistant')!.markContextShown();
     const msg = { ...entry('w-part', 'part one'), content: [...text('part one'), ...text('part two')], landing: 'unknown' as const };
     const errors: string[] = [];
     const error = console.error;
@@ -864,26 +862,6 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     assert.deepEqual(written.get(msg)?.content, text('part one'), 'what the store holds');
     assert.ok(errors.some((e) => e.includes("it stays where that write stored it, and a reply stored after it whose request didn't carry it was made without it")
       && e.includes('(context-manager #155)')), errors.join('\n'));
-    await framework.stop();
-  });
-
-  it("a drained write whose landing is unknown, found by its id where no request has carried its copy, counts as written where it sits, ahead of what was stored since, and the log names the refusal", async () => {
-    const framework = await createFramework();
-    const internals = drainInternals(framework);
-    const cm = framework.getAgent('assistant')!.getContextManager();
-    cm.addMessage('Antra', text('look left'), { deferredWriteId: 'w-sits' } as never);
-    cm.addMessage('assistant', text('Done.'));
-    const msg = { ...entry('w-sits', 'look left'), landing: 'unknown' as const };
-    const errors: string[] = [];
-    const error = console.error;
-    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
-    let written: Map<DeferredEntry, { id: string; content: ContentBlock[] }>;
-    try {
-      written = internals.writeDrainedInOrder([msg], 'test', () => { throw new Error('written again'); });
-    } finally { console.error = error; }
-    assert.deepEqual(windowOf(framework).slice(-2), ['Antra: look left', 'assistant: Done.'], 'stored once, where it landed');
-    assert.deepEqual(written.get(msg)?.content, text('look left'), 'counted as written');
-    assert.ok(errors.some((e) => e.includes('w-sits') && e.includes('(context-manager #155)')), errors.join('\n'));
     await framework.stop();
   });
 
