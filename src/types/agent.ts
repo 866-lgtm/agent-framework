@@ -209,8 +209,14 @@ export interface AgentConfig {
      * dropped goes to its `inference:usage` trace, and neither that call nor
      * its stream's later calls feed the context strategy's calibration, since
      * the provider doesn't bill a block it dropped and the strategy still
-     * counts it. The direct API carries the control too, but reads no report:
-     * it traces no usage and feeds no calibration.
+     * counts it. After a fold, each block after the stretch it rewrote is
+     * bound to a conversation the request no longer holds. Where the context
+     * strategy still sends such a block, the provider drops it on every call
+     * until a later fold takes it out of the context, and while such blocks
+     * are sent, no stream gives a sample and the calibration keeps the value
+     * it had. A strategy that leaves that thinking out at the fold sends none
+     * to drop. The direct API carries the control too, but reads no report: it
+     * traces no usage and feeds no calibration.
      *
      * Default false: nothing is sent, and the account's default applies.
      */
