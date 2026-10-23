@@ -16,6 +16,7 @@ import {
   lineNumbersAt,
   planFile,
 } from '../src/modules/workspace/edit-plan.js';
+import { countingCalls } from './helpers/count-calls.js';
 
 const spec = (index: number, oldText: string, newText: string, expected: number | 'all' = 1): EditSpec =>
   ({ index, oldText, newText, expected });
@@ -240,16 +241,32 @@ test("crowded edits whose counts stopped short, where the crowded check names no
   assert.ok('problems' in planned);
   assert.equal(planned.problems.length, 200_001);
   assert.ok(planned.problems.every((p) => p.kind === 'count'));
-  // Where the crowded check names them, their problems aren't made: 200,000
-  // edits of one line of 2,000,000 that a crowded refusal names take no
-  // longer than their counts.
+  // Where the crowded check names them, their problems aren't made. A count
+  // problem finds its matches' lines by searching the text for line feeds, so
+  // over one line of 2,000,000, made for each of 200,000 edits that a crowded
+  // refusal names, those would be a search or more each. The first three
+  // edits count past the 3,000 they ask for before the budget runs out, so
+  // their problems are made, and their searches show that the count sees a
+  // problem being made.
   const line = Buffer.from('a'.repeat(2_000_000));
-  const before = process.cpuUsage();
-  const crowded = planFile(decodeForEdit(line)!, line, Array.from({ length: 200_000 }, (_, k) => spec(k, 'a', 'y', 3_000)));
-  const used = process.cpuUsage(before);
-  assert.ok('problems' in crowded && crowded.problems.some((p) => p.kind === 'crowded'));
-  assert.ok((used.user + used.system) / 1000 < 4_000, `${(used.user + used.system) / 1000} ms of CPU`);
+  const lineFile = decodeForEdit(line)!;
+  const crowdedSpecs = Array.from({ length: 200_000 }, (_, k) => spec(k, 'a', 'y', 3_000));
+  const { result: crowded, calls } = lineFeedSearches(() => planFile(lineFile, line, crowdedSpecs));
+  assert.ok('problems' in crowded);
+  assert.deepEqual(crowded.problems.map((p) => p.kind === 'crowded' ? [p.kind, p.edits.length] : p.kind), ['count', 'count', 'count', ['crowded', 199_997]]);
+  assert.ok(calls >= 1 && calls < 1_000, `${calls} searches for a line feed`);
 });
+
+/** The searches `run` makes for a line feed, with indexOf or lastIndexOf; past 1,000 of either, it throws. */
+function lineFeedSearches<R>(run: () => R): { result: R; calls: number } {
+  let forward = 0;
+  const backward = countingCalls(String.prototype, 'lastIndexOf', (_self, args) => args[0] === '\n', 1_000, () => {
+    const counted = countingCalls(String.prototype, 'indexOf', (_self, args) => args[0] === '\n', 1_000, run);
+    forward = counted.calls;
+    return counted.result;
+  });
+  return { result: backward.result, calls: forward + backward.calls };
+}
 
 test("a miss's closest region is the line most like the first 2,000 code units of the old text's first line, its bigrams each counted as often as that line has them", () => {
   // Line 2 is the old text's first 2,000 code units; line 3 its next 3,000.
