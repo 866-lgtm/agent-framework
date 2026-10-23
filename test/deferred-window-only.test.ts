@@ -719,7 +719,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       removeMessage(id: string): void;
       queryMessages(filter: unknown): { messages: Array<{ content: ContentBlock[]; held?: true }> };
       getMessage(id: string): { held?: true; content: ContentBlock[] } | null;
-      deferredWriteReadOrGone(agent: unknown, writeId: string): boolean;
+      deferredWriteDone(agent: unknown, writeId: string, to: unknown): boolean;
       isUnreadPlacement(placement: { agent: string; deferredId?: string }, by?: 'consumed' | 'shown'): boolean;
       removePlacement(placement: { agent: string; deferredId?: string }): boolean;
       deferredMessages: DeferredEntry[];
@@ -1447,7 +1447,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       const unscan = noScan(framework);
       internals.getMessage(heldHandle('w-said'));
       internals.getMessage(heldHandle('w-said'));
-      internals.deferredWriteReadOrGone(framework.getAgent('assistant'), 'w-said');
+      internals.deferredWriteDone(framework.getAgent('assistant'), 'w-said', undefined);
       assert.equal(said(), 1, 'said once over three reads');
       cm.queryMessages = query;
       unscan();
@@ -1633,17 +1633,18 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     await framework.stop();
   });
 
-  it("deferredWriteReadOrGone settles a held write whose landing is unknown, so a copy the agent has read reads as read", async () => {
+  it("deferredWriteDone settles a held write whose landing is unknown, so a copy a request the agent had answered carried is done", async () => {
     const framework = await createFramework();
     const internals = drainInternals(framework);
     const agent = framework.getAgent('assistant')!;
     heldAndStored(framework, 'w-wake', 'look left');
     heldAndStored(framework, 'w-other', 'look right');
     agent.markContextConsumed();
+    agent.markAnswered(agent.getConsumedWatermark());
     const error = console.error;
     console.error = () => {};
     try {
-      assert.equal(internals.deferredWriteReadOrGone(agent, 'w-wake'), true);
+      assert.equal(internals.deferredWriteDone(agent, 'w-wake', undefined), true);
     } finally { console.error = error; }
     assert.deepEqual(internals.deferredMessages.map((m) => [m.id, m.landing]), [['w-other', 'unknown']], 'only the write asked about is settled');
     await framework.stop();

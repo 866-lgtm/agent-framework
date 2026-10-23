@@ -584,6 +584,11 @@ const isAddressedMessage = (
   _metadata?: Record<string, unknown>,
 ): boolean => Array.isArray(tags) && tags.includes('chat:addressed');
 
+/** A wake's `ambient` mark: only a message its server tagged `chat:ambient`
+ *  (RFC-001) is known to ask nothing of the agent. */
+const ambientMark = (tags?: string[]): { ambient?: true } =>
+  Array.isArray(tags) && tags.includes('chat:ambient') ? { ambient: true } : {};
+
 // parseProsePrefix lives in ./mcpl/prose-grammar.ts. The outgoing stream
 // (Spec 14.3) needs no grammar of its own: it carries what delivery
 // published.
@@ -3132,10 +3137,13 @@ export class AgentFramework {
   // reading that withholds more.
   private codeExecution: { settings: IsolateSettings; scripts: AgentScripts } | null = null;
   private scriptToolWaiters: Map<string, { resolve: (result: ToolResult) => void; route: { toServer: boolean } }> = new Map();
-  /** A script's call being dispatched, by its call id: the turn the script
-   *  was started in, if one was (callOwnChannels). Kept only while the
-   *  dispatch runs (dispatchScriptToolCall). */
-  private readonly scriptCallStartTurns = new Map<string, number | undefined>();
+  /** A script's call being dispatched, by its call id: what its script was
+   *  started with, its words' turn and reading. `turnId` is the turn the
+   *  script was started in, if one was (callingTurnOf); `readThrough` is the
+   *  consumed watermark its agent had when the run call started it, which a
+   *  publish the call makes is credited with (publishReadThrough). Kept only
+   *  while the dispatch runs (dispatchScriptToolCall). */
+  private readonly scriptCallStarts = new Map<string, { turnId?: number; readThrough: { branch: string; sequence: number } | null }>();
   /** Per agent, a round that called code_execution and waits for those calls'
    *  results before its prose is routed (ScriptRound). */
   private scriptRounds: Map<string, ScriptRound> = new Map();
@@ -3608,10 +3616,12 @@ export class AgentFramework {
         initialConfig: config.gate.config,
         privilegedUsersPath: config.gate.privilegedUsersPath,
         emitTrace: (e) => framework.emitTrace(e as { type: TraceEvent['type']; [key: string]: unknown }),
-        addMessage: (p, c, m, forAgent) => framework.addMessage(p, c, m as MessageMetadata, forAgent ? { forAgent } : undefined),
-        requestInference: (agentName, reason, source, provenance) => {
+        addMessage: (p, c, m, forAgent, placement) => framework.addMessage(p, c, m as MessageMetadata,
+          forAgent || placement ? { ...(forAgent ? { forAgent } : {}), ...(placement ? { placement } : {}) } : undefined),
+        requestInference: (agentName, reason, source, provenance, after) => {
           framework.pendingRequests.push({
             agentName, reason, source, timestamp: Date.now(),
+            ...framework.readsDeferredFor(after, agentName),
             // gate-requested wakes carry where/who (EventGate wakeProvenance)
             // as TELEMETRY fields — the host's stamp reads them.
             ...(provenance?.channelId ? { wakeChannelId: provenance.channelId } : {}),
@@ -12516,7 +12526,10 @@ export class AgentFramework {
             // boundary that leaves one out injects something, unless that
             // notice couldn't be stored. The message then counts as read
             // though no request carried it: a coalesced render's wake to read
-            // it drops, and a release doesn't pass it to the primary. The
+            // it drops once a request after the boundary is answered (and,
+            // for one that carries a channel, the agent has published there
+            // since; deferredWriteDone), and a release doesn't pass it to the
+            // primary. The
             // notice has told the agent it came, from whom, and how to read
             // it. Where the view leaves it out, no request will carry it.
             // Where the memory strategy places it before its recent window, a
@@ -12677,6 +12690,14 @@ export class AgentFramework {
     // Add messages. Only the framework writes the inbound envelope: one a
     // module's metadata carries (echoed from a server's event, say) is
     // dropped, and a surface event's messages carry the framework's own.
+    // The wakes below go by the one message a response adds (readsDeferredFor).
+    // A wake for several stays plain, and so does one for a channel's
+    // message (its metadata, or its event's, names the channel), or for
+    // console or API input: conversation, whose answer the module or the
+    // surface carries where the framework records none.
+    const eventChannel = (event as { metadata?: { channelId?: unknown } }).metadata?.channelId;
+    const namesChannel = typeof eventChannel === 'string' && eventChannel !== '';
+    let added: { agent?: string; deferredId?: string } | undefined;
     if (response.addMessages) {
       for (const [i, msg] of response.addMessages.entries()) {
         step.at = `adding message ${i + 1} of ${response.addMessages.length}`;
@@ -12686,7 +12707,9 @@ export class AgentFramework {
           metadata = rest;
         }
         if (surface) metadata = { ...metadata, [INBOUND_SOURCE_KEY]: surface };
-        const id = this.addMessage(msg.participant, msg.content, metadata);
+        const placement: { agent?: string; deferredId?: string } = {};
+        const id = this.addMessage(msg.participant, msg.content, metadata, { placement });
+        if (response.addMessages.length === 1 && !surface && !namesChannel && metadata?.channelId === undefined) added = placement;
         this.emitTrace({ type: 'message:added', messageId: id, source: event.type });
       }
     }
@@ -12743,6 +12766,7 @@ export class AgentFramework {
             reason: event.type,
             source,
             timestamp: Date.now(),
+            ...this.readsDeferredFor(added, agentName),
           });
         }
       }
@@ -12977,7 +13001,9 @@ export class AgentFramework {
           // Addressed messages outrank ambient chatter when a batched wake
           // picks the turn's frozen speech locus.
           addressed,
+          ...ambientMark(event.tags),
           ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
+          ...this.readsDeferredFor(placement, agentName),
         });
       }
     }
@@ -13859,7 +13885,7 @@ export class AgentFramework {
       remove: (p) => this.removePlacement(p),
       deliver: (occ, materialized, assemblingFor) => this.deliverCoalesced(occ, materialized, assemblingFor),
       wakeForBatch: (occ) => this.wakeForCoalescedBatch(occ),
-      wakeToRead: (occ, agentName, deferredId) => this.queueCoalescedWakes({ ...occ, deliverTo: agentName }, true, deferredId),
+      wakeToRead: (occ, agentName, deferredId, allAmbient) => this.queueCoalescedWakes({ ...occ, deliverTo: agentName }, true, deferredId, allAmbient),
       cancelWake: (subject) => this.cancelCoalescedWakes(subject),
       authorized: (occ) => this.coalescedAuthorized(occ),
       audience: (occ) => this.coalescedAudience(occ),
@@ -14281,8 +14307,9 @@ export class AgentFramework {
   /** Queue a wake for each agent of the batch's audience, when its latest
    *  occurrence triggers inference. `plain`: an ordinary push wake, without
    *  the subject a withdrawal of the batch's wakes goes by, for a render
-   *  placed in its agent's deferred queue (wakeToRead), at `readsDeferredWrite`. */
-  private async queueCoalescedWakes(occ: CoalescedOccurrence<CoalescedDelivery>, plain = false, readsDeferredWrite?: string): Promise<void> {
+   *  placed in its agent's deferred queue (wakeToRead), at `readsDeferredWrite`,
+   *  marked ambient when every notice the render folds was (`allAmbient`). */
+  private async queueCoalescedWakes(occ: CoalescedOccurrence<CoalescedDelivery>, plain = false, readsDeferredWrite?: string, allAmbient = false): Promise<void> {
     const subject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
     if (occ.event.lane !== 'push' || !occ.event.event.triggerInference) return;
     const origin = occ.event.event.origin;
@@ -14299,6 +14326,10 @@ export class AgentFramework {
         channelId, ...(channelId !== undefined ? { channelServerId: occ.serverId } : {}),
         counterparty: authorId ? `${occ.serverId}:user:${authorId}` : undefined,
         addressed: isAddressedMessage(occ.tags, origin),
+        // A render folds the batch's every notice, so it asks nothing of the
+        // agent only when each of them was marked ambient, not the latest
+        // alone; only its wake is judged by what was read (readsDeferredWrite).
+        ...(plain && allAmbient ? { ambient: true as const } : {}),
         ...(plain ? (readsDeferredWrite ? { readsDeferredWrite } : {}) : { coalescingSubject: subject, coalescingBatch: true }),
       });
     }
@@ -14547,6 +14578,7 @@ export class AgentFramework {
           // they must outrank ambient chatter in a batched wake's locus
           // selection just like their channels/incoming counterparts.
           addressed: isAddressedMessage(event.tags, event.origin),
+          ...ambientMark(event.tags),
           ...(silentHeartbeat ? {
             suppressProse: true,
             // The tick's instruction rides its request-only separator
@@ -14557,6 +14589,7 @@ export class AgentFramework {
             silentHeartbeat: { eventId: event.eventId, serverId: event.serverId },
           } : {}),
           ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
+          ...this.readsDeferredFor(placement, agentName),
         });
       }
     }
@@ -14820,8 +14853,9 @@ export class AgentFramework {
         const newestByKey = new Map<string, InferenceRequest>();
         for (const request of parked) {
           // A coalesced wake is withdrawable by its subject (RFC-006 §4.2),
-          // and a wake to read a render is dropped once it's read: neither
-          // may absorb an unrelated wake that would vanish with it.
+          // and a wake for a deferred write is dropped once the agent is
+          // done with that write: neither may absorb an unrelated wake that
+          // would vanish with it.
           const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${request.coalescingSubject ?? ''}|${request.readsDeferredWrite ?? ''}`;
           const prev = newestByKey.get(key);
           const kept = !prev || request.timestamp >= prev.timestamp ? request : prev;
@@ -14895,16 +14929,24 @@ export class AgentFramework {
         continue;
       }
 
-      // A wake whose sole cause was reading a write placed in this agent's
-      // queue (wakeToRead's readsDeferredWrite) has nothing left to do once
-      // the agent has read that write, or it was removed: it starts no turn.
+      // A wake whose sole cause was a write deferred for this agent
+      // (readsDeferredWrite) has nothing left to do once a request that
+      // carried that write was answered and, if the wake carries a channel
+      // and isn't marked ambient, the agent has published there since, or
+      // once the write is gone from the queue and the store's current
+      // branch: it starts no turn (deferredWriteDone). A wake is marked
+      // ambient when its message's server tagged it chat:ambient, or for a
+      // render, every notice the render stands for: such a message asked
+      // nothing of the agent, so reading it was all its wake was for. One
+      // with neither tag is judged as addressed.
       const read = requests.filter((r) => r.readsDeferredWrite !== undefined
-        && this.deferredWriteReadOrGone(agent, r.readsDeferredWrite));
+        && this.deferredWriteDone(agent, r.readsDeferredWrite,
+          r.channelId === undefined || r.ambient === true ? undefined : { serverId: r.source, channelId: r.channelId }));
       if (read.length > 0) {
         const left = requests.filter((r) => !read.includes(r));
         requests.length = 0;
         requests.push(...left);
-        console.error(`[coalescing] ${agentName}: ${read.length} wake(s) to read a render it has read, or that was removed, dropped` +
+        console.error(`[wake] ${agentName}: dropped ${read.length} wake(s) for writes an answered request carried, and that it spoke after in the wake's channel where it carries one not marked ambient, or that were removed` +
           (requests.length === 0 ? '; no turn starts' : ''));
         if (requests.length === 0) {
           this.endPendingPrimary(agentName);
@@ -15589,8 +15631,8 @@ export class AgentFramework {
   /** The drafts tool's answer to a resident's call, from the model's own
    *  dispatch or an agent-origin call through executeToolCall (a puppet's):
    *  a failure the handler throws is answered as one. */
-  private draftsToolResult(agentName: string, rawInput: unknown, turn?: TurnRouting): Promise<ToolResult> {
-    return this.handleDraftsTool(agentName, rawInput, turn).catch((err): ToolResult => ({
+  private draftsToolResult(agentName: string, rawInput: unknown, turn?: TurnRouting, callId?: string): Promise<ToolResult> {
+    return this.handleDraftsTool(agentName, rawInput, turn, callId).catch((err): ToolResult => ({
       success: false,
       error: `drafts failed: ${thrownText(err)}`,
       isError: true,
@@ -15606,13 +15648,19 @@ export class AgentFramework {
    * call made outside the agent's current turn: a resend's destination names
    * its own channels (ownChannels) by their ids, and its sends engage it.
    */
-  private async handleDraftsTool(agentName: string, rawInput: unknown, turn?: TurnRouting): Promise<ToolResult> {
+  private async handleDraftsTool(agentName: string, rawInput: unknown, turn?: TurnRouting, callId?: string): Promise<ToolResult> {
     const input = (rawInput && typeof rawInput === 'object' && !Array.isArray(rawInput) ? rawInput : {}) as Record<string, unknown>;
     const own = turn ? this.ownChannels(turn) : [];
     // The turn that sends: a resent draft's channel is recorded as engaged on
     // it, as a send tool's is, even when the result comes after the turn. A
     // call made outside the turn engages none.
     const sendingTurn = turn;
+    // A delivered resend made in the turn is noted on the agent with what it
+    // had read when it made the call (Agent.notePublished,
+    // publishReadThrough); not one made outside it, as a background
+    // script's is.
+    const resender = turn ? this.agents.get(agentName) : undefined;
+    const readThrough = resender ? this.publishReadThrough(resender, callId) : null;
     const refuse = (error: string): ToolResult => ({ success: false, error, isError: true });
     // Plain text, not a JSON-quoted string: draft text must read exactly as held.
     const ok = (text: string): ToolResult => ({ success: true, data: [{ type: 'text', text }] });
@@ -15880,6 +15928,7 @@ export class AgentFramework {
         if (outcome.status === 'delivered') {
           lines.push(`${d.id}: delivered to ${where}${outcome.messageId ? `, message ${outcome.messageId}` : ''}${unrecorded}.`);
           sendingTurn?.engaged.add(destinationKey(destination));
+          resender?.notePublished(destinationKey(destination), readThrough);
           continue;
         }
         stopped = `${d.id} was not confirmed delivered`;
@@ -16980,8 +17029,20 @@ export class AgentFramework {
     // A script's call carries the turn watching the script, which may be a
     // later turn than the one its words were written in: it's that turn's
     // only where that turn is the one that started the script.
-    if (this.scriptCallStartTurns.has(call.id) && this.scriptCallStartTurns.get(call.id) !== routing.turnId) return undefined;
+    const start = this.scriptCallStarts.get(call.id);
+    if (start && start.turnId !== routing.turnId) return undefined;
     return routing;
+  }
+
+  /** What a publish a call makes is credited with having read
+   *  (Agent.notePublished): its agent's consumed watermark at the call, or,
+   *  for a script's call, the watermark when the run call started the
+   *  script. A script is written then, and a later round's wait that watches
+   *  it shares the turn's id but not what the agent has read since, so the
+   *  script's words can't answer anything injected after it started. */
+  private publishReadThrough(agent: Agent, callId: string | undefined): { branch: string; sequence: number } | null {
+    const start = callId === undefined ? undefined : this.scriptCallStarts.get(callId);
+    return start ? start.readThrough : agent.getConsumedWatermark();
   }
 
   /** The own channels (ownChannels) of the turn a tool call was made in
@@ -18237,17 +18298,17 @@ export class AgentFramework {
     }
 
     // The turn has passed its gate, so from here it goes on with a copy of
-    // its trigger without a batch wake's marks or the mark of a wake to read
-    // a render. A retry of it then comes back as an ordinary wake by whatever
-    // door it takes (a provider hold's release, the auxiliary park's requeue,
-    // the tool-result guard's restart): this gate doesn't withdraw it for
-    // finding its batches consumed, no withdrawal of the subject's wakes
-    // reaches it (§4.2 withdraws a wake whose sole cause is the subject, and
-    // a merge carries a subject only when it is every merged request's), and
-    // the scheduler doesn't drop it as having nothing to read once this
-    // attempt's compile has moved the watermark past the render. This frame's
-    // activeTurnTriggers entry keeps the trigger as it came; a retry's frame
-    // records the copy it carries.
+    // its trigger without a batch wake's marks or the mark of a wake for a
+    // deferred write. A retry of it then comes back as an ordinary wake by
+    // whatever door it takes (a provider hold's release, the auxiliary park's
+    // requeue, the tool-result guard's restart): this gate doesn't withdraw
+    // it for finding its batches consumed, no withdrawal of the subject's
+    // wakes reaches it (§4.2 withdraws a wake whose sole cause is the
+    // subject, and a merge carries a subject only when it is every merged
+    // request's), and the scheduler doesn't drop it as having nothing to read
+    // once this attempt's compile has moved the watermark past the write.
+    // This frame's activeTurnTriggers entry keeps the trigger as it came; a
+    // retry's frame records the copy it carries.
     if (trigger?.coalescingSubject !== undefined || trigger?.coalescingBatch || trigger?.readsDeferredWrite !== undefined) {
       const { coalescingSubject: _subject, coalescingBatch: _batch, coalescingBatchSubjects: _subjects, readsDeferredWrite: _read, ...retry } = trigger;
       trigger = retry;
@@ -19020,11 +19081,21 @@ export class AgentFramework {
       }
     };
 
-    const enqueueSpeech = (text: string, locus: ChannelRef | null): void => {
+    // A sink for publishes written having read through `readThrough`: each
+    // is noted on the agent (Agent.notePublished) and streamed. A round's is
+    // made as the round yields, since its deliveries run on the speech
+    // chain, which a tool boundary doesn't wait for, so a later round's
+    // reading would otherwise be credited to its words.
+    const publishedFrom = (readThrough: { branch: string; sequence: number } | null): SpeechPublished =>
+      (to, text, messageId) => {
+        agent.notePublished(destinationKey(to), readThrough);
+        streamSpeech(to, text, messageId);
+      };
+    const enqueueSpeech = (text: string, locus: ChannelRef | null, onPublished: SpeechPublished): void => {
       chainSpeech(async () => {
         const outcome = await this.channelRegistry!.routeSpeech(agent.name, text, locus);
         this.recordProseDelivery(streamRouting, outcome);
-        if (outcome?.delivered) streamSpeech(outcome, text, outcome.messageId);
+        if (outcome?.delivered) onPublished(outcome, text, outcome.messageId);
       }, 'mid-turn speech routing failed:');
     };
 
@@ -19049,6 +19120,10 @@ export class AgentFramework {
     // historical whole-turn routing so fallback-mode prose is still
     // delivered exactly once, at turn end.
     let liveProseRouting = false;
+    // What the turn's first request had read, taken at its round: on the
+    // fallback path the prose routed at the turn's end is the whole turn's,
+    // so it's credited with this, which every round's words come after.
+    let firstRoundRead: { branch: string; sequence: number } | null | undefined;
     // XML/legacy tool mode has no roundContent, so its final response contains
     // prose from every round. A refused skip_reply's round stays private while
     // later rounds remain deliverable: the turn-end delivery drops that round's
@@ -19436,10 +19511,15 @@ export class AgentFramework {
               (event.context as { supportsInjectedMessages?: boolean }).supportsInjectedMessages ?? true;
             // Queued under this turn's routing, whenever it posts, and
             // streamed by this stream once published.
+            // This round's request was answered: what it carried is heard.
+            const roundRead = agent.getConsumedWatermark();
+            if (firstRoundRead === undefined) firstRoundRead = roundRead;
+            agent.markAnswered(roundRead);
+            const roundPublished = publishedFrom(roundRead);
             const holdOpts: ProseRound = {
               routing: streamRouting,
               notice: presentsInjections ? 'now' : 'later',
-              onPublished: streamSpeech,
+              onPublished: roundPublished,
             };
             // Routing publishes trimmed segments; held drafts keep the runs
             // exactly as written.
@@ -19534,7 +19614,7 @@ export class AgentFramework {
                   `[routing] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> routing ${roundSegments.length} prose segment(s) live -> ${roundLocus ?? '(default)'}`,
                 );
                 for (const seg of roundSegments) {
-                  enqueueSpeech(seg, roundLocus);
+                  enqueueSpeech(seg, roundLocus, roundPublished);
                 }
               }
             };
@@ -19602,6 +19682,13 @@ export class AgentFramework {
           case 'complete': {
             streamTerminal = true;
             adoptInjectedRound();
+            // The final request was answered, and the prose routed below was
+            // written by it when rounds route live. On the fallback path it's
+            // the whole turn's, so it's credited with what the first request
+            // had read, whether or not a boundary moved the watermark since.
+            const finalRead = agent.getConsumedWatermark();
+            agent.markAnswered(finalRead);
+            const endPublished = publishedFrom(liveProseRouting || firstRoundRead === undefined ? finalRead : firstRoundRead);
             const durationMs = Date.now() - startTime;
             let response = event.response;
             const guardCategory = (response.raw?.response as {
@@ -20035,7 +20122,7 @@ export class AgentFramework {
             if (speechContent.length > 0 && this.channelRegistry) {
               const speechRuns = finalSpeechRuns;
               const speechSegments = finalSpeechSegments;
-              const textOnlyHold: ProseRound = { routing: finalRouting, notice: 'later', onPublished: streamSpeech };
+              const textOnlyHold: ProseRound = { routing: finalRouting, notice: 'later', onPublished: endPublished };
               if (speechSegments.length > 0) {
                 if (turnProseRouting === 'disabled') {
                   console.error(`[routing] ${agent.name}: text-only prose NOT routed (proseRouting=disabled)`);
@@ -20081,7 +20168,7 @@ export class AgentFramework {
                     try {
                       const outcome = await this.channelRegistry.routeSpeech(agent.name, segment, locus);
                       this.recordProseDelivery(streamRouting, outcome);
-                      if (outcome?.delivered) streamSpeech(outcome, segment, outcome.messageId);
+                      if (outcome?.delivered) endPublished(outcome, segment, outcome.messageId);
                     } catch (err) {
                       console.error('speech routing failed:', err);
                     }
@@ -20118,7 +20205,7 @@ export class AgentFramework {
                 : turnSilenced || fallbackCause !== null;
               const trailingCause: 'send' | 'private' | null =
                 silenceCause === 'private' || fallbackCause === 'private' ? 'private' : (silenceCause ?? fallbackCause);
-              const trailingHold: ProseRound = { routing: finalRouting, notice: 'later', onPublished: streamSpeech };
+              const trailingHold: ProseRound = { routing: finalRouting, notice: 'later', onPublished: endPublished };
 
               const runs = finalRuns;
               const segments = finalSegments;
@@ -20179,7 +20266,7 @@ export class AgentFramework {
                   try {
                     const outcome = await this.channelRegistry.routeSpeech(agent.name, seg, locus);
                     this.recordProseDelivery(streamRouting, outcome);
-                    if (outcome?.delivered) streamSpeech(outcome, seg, outcome.messageId);
+                    if (outcome?.delivered) endPublished(outcome, seg, outcome.messageId);
                   } catch (err) {
                     console.error('speech routing failed:', err);
                   }
@@ -21214,8 +21301,9 @@ export class AgentFramework {
     // drafts: the calling resident's own held drafts. A puppeted call has
     // agent origin and acts on that resident's drafts, as the model's own
     // call does through dispatchToolCall, but it isn't made inside the
-    // resident's turn, so it takes none of the turn's channels and engages
-    // none (callingTurnOf). A module holds no drafts.
+    // resident's turn, so it takes none of the turn's channels, engages none,
+    // and isn't noted as the resident's speech (callingTurnOf). A module
+    // holds no drafts.
     if (call.name === 'drafts' && this.channelRegistry && origin.kind === 'agent') {
       return this.draftsToolResult(origin.agentName, call.input);
     }
@@ -21457,7 +21545,12 @@ export class AgentFramework {
             !this.liveTurns(agentName, undefined).includes(call.callerTurnId)) {
             return refuse("the turn this call was made in has ended, and only the primary agent's scripts outlive a turn, so no script starts for it. Nothing was run.");
           }
-          r = await ce.scripts.run(agentName, fields.code, yieldMs, { ...(origin ? { origin } : {}), watch });
+          // What the agent has read as the run call starts the script: the
+          // reading its words were written with (publishReadThrough).
+          r = await ce.scripts.run(agentName, fields.code, yieldMs, {
+            ...(origin ? { origin } : {}), watch,
+            startReadThrough: this.agents.get(agentName)?.getConsumedWatermark() ?? null,
+          });
           break;
         case 'wait':
         case 'stop':
@@ -21610,16 +21703,18 @@ export class AgentFramework {
     const target = this.noticeTargetFor(agentName, `script ${scriptId} wake`);
     if (!target) throw new Error(`agent ${agentName} has no context to wake`);
     try {
+      const placement: { agent?: string; deferredId?: string } = {};
       const messageId = this.addMessage('user', [{ type: 'text', text: shown }], {
         source: 'code-execution-script',
         scriptId,
         tags: ['script:wake'],
-      }, target);
+      }, { ...target, placement });
       this.pendingRequests.push({
         agentName,
         reason: 'script:wake',
         source: 'code_execution',
         timestamp: Date.now(),
+        ...this.readsDeferredFor(placement, agentName),
       });
       this.emitTrace({
         type: 'message:added',
@@ -22029,7 +22124,8 @@ export class AgentFramework {
     const route = { toServer: false };
     const result = await this.dispatchScriptToolCall(
       agentName, toolName, input as Record<string, unknown>,
-      context.origin as ScriptCallOrigin | undefined, context.watch?.turnId, context.startTurnId, route,
+      context.origin as ScriptCallOrigin | undefined, context.watch?.turnId,
+      { turnId: context.startTurnId, readThrough: context.startReadThrough ?? null }, route,
     );
     // Deferred: applied to the result of the code_execution call watching
     // the script — ending the turn mid-script would cancel the stream while
@@ -22158,9 +22254,9 @@ export class AgentFramework {
    * call (register, dispatch with its refusal sites, open; the terminal at
    * the waiter intercept), under the inner tool's own name and class.
    * `turnId` is the turn the call was made in (dispatchToolCall), the turn
-   * of the run or wait call watching the script; `startTurnId` is the turn
-   * the script was started in, whose words its calls carry
-   * (scriptCallStartTurns). `route` is the waiter's: the dispatch sets
+   * of the run or wait call watching the script; `start` is what the script
+   * was started with, its turn and its agent's reading, which its words
+   * carry (scriptCallStarts). `route` is the waiter's: the dispatch sets
    * `toServer` when it sends the call to a server.
    */
   private dispatchScriptToolCall(
@@ -22169,7 +22265,7 @@ export class AgentFramework {
     args: Record<string, unknown>,
     origin?: ScriptCallOrigin,
     turnId?: number,
-    startTurnId?: number,
+    start: { turnId?: number; readThrough: { branch: string; sequence: number } | null } = { readThrough: null },
     route: { toServer: boolean } = { toServer: false },
   ): Promise<ToolResult> {
     return new Promise<ToolResult>((resolve) => {
@@ -22208,9 +22304,10 @@ export class AgentFramework {
 
       const call = { id: callId, name: toolName, input: args };
       if (origin) this.toolLifecycleEmitter?.registerScriptCall(agentName, origin, call);
-      // The dispatch reads the call's own channels as it goes
-      // (callOwnChannels), so the start turn is kept only while it runs.
-      this.scriptCallStartTurns.set(callId, startTurnId);
+      // The dispatch reads the call's own channels, and what a publish it
+      // makes is credited with, as it goes (callingTurnOf,
+      // publishReadThrough), so the start is kept only while it runs.
+      this.scriptCallStarts.set(callId, start);
       try {
         this.dispatchToolCall(agentName, call, turnId);
       } catch (error) {
@@ -22230,7 +22327,7 @@ export class AgentFramework {
         }
         return;
       } finally {
-        this.scriptCallStartTurns.delete(callId);
+        this.scriptCallStarts.delete(callId);
       }
       if (origin) this.toolLifecycleEmitter?.open(agentName, callId);
     });
@@ -22911,7 +23008,7 @@ export class AgentFramework {
     if (enrichedCall.name === 'drafts' && this.channelRegistry) {
       const startedAt = Date.now();
       this.emitTrace({ type: 'tool:started', module: 'framework', tool: 'drafts', callId: enrichedCall.id, input: enrichedCall.input });
-      void this.draftsToolResult(agentName, enrichedCall.input, this.callingTurnOf(agentName, enrichedCall))
+      void this.draftsToolResult(agentName, enrichedCall.input, this.callingTurnOf(agentName, enrichedCall), enrichedCall.id)
         .then((result) => {
           this.emitTrace({ type: 'tool:completed', module: 'framework', tool: 'drafts', callId: enrichedCall.id, durationMs: Date.now() - startedAt });
           this.pushEvent({ type: 'tool-result', callId: enrichedCall.id, toolName: enrichedCall.name, agentName, moduleName: 'framework', result });
@@ -24502,20 +24599,26 @@ export class AgentFramework {
     );
   }
 
-  /** Whether the agent has nothing left to read of a deferred write, on
-   *  evidence only: the row it landed as is at or below the agent's consumed
-   *  watermark on its current branch, or it's in neither the queue (drained
-   *  entries not yet stored included) nor the store's current branch:
-   *  removed, or left on a branch the agent has switched from, where a turn
-   *  now would find nothing of it (switching back brings it back unread,
-   *  with no wake, as main's wake spent on this branch leaves it). Any doubt
-   *  reads as unread, such as a watermark that a branch switch or an undo
-   *  left on another branch, or a store that can't be read: a turn that
-   *  finds nothing new costs less than a write no wake brings the agent to
-   *  read. */
-  private deferredWriteReadOrGone(agent: Agent, writeId: string): boolean {
+  /** Whether a wake for a deferred write has nothing left for the agent to
+   *  do, on evidence only. The write's row is at or below the newest
+   *  consumed watermark of an answered request (Agent.getAnsweredWatermark)
+   *  on the agent's current branch, and for a wake that carries a channel
+   *  and wasn't marked ambient (`to`, that channel on the wake's server), the
+   *  agent has since published there having read the row
+   *  (Agent.publishedAfterReading): hearing a message isn't answering it,
+   *  and the wake's turn is the agent's chance to answer there. Or the
+   *  write is in neither the queue (drained entries not yet stored
+   *  included) nor the store's current branch: removed, or left on a
+   *  branch the agent has switched from, where a turn now would find
+   *  nothing of it (switching back brings it back unread, with no wake, as
+   *  main's wake spent on this branch leaves it). Any doubt keeps the
+   *  wake, such as a watermark that a branch switch or an undo left on
+   *  another branch, or a store that can't be read: a turn that finds
+   *  nothing new costs less than a write no wake brings the agent to read
+   *  or answer. */
+  private deferredWriteDone(agent: Agent, writeId: string, to: PublishDestination | undefined): boolean {
     // Settled first, so a write that landed is judged by its stored row; one
-    // still a doubt stays queued, which reads as unread.
+    // still a doubt stays queued, which keeps the wake.
     this.settleUnknownLandings((m) => m.id === writeId);
     if (this.deferredMessages.some((m) => m.id === writeId)) return false;
     try {
@@ -24524,12 +24627,23 @@ export class AgentFramework {
       // No row yet for a write drained from the queue and still to be stored
       // (un-acked); one stored and awaiting a sync is judged by its row.
       if (!row) return !this.unackedDeferredWrites.some((m) => m.id === writeId);
-      const watermark = agent.getConsumedWatermark();
-      return !!watermark && watermark.branch === cm.currentBranch().name && row.sequence <= watermark.sequence;
+      const watermark = agent.getAnsweredWatermark();
+      const branch = cm.currentBranch().name;
+      if (!watermark || watermark.branch !== branch || row.sequence > watermark.sequence) return false;
+      return to === undefined || agent.publishedAfterReading(destinationKey(to), branch, row.sequence);
     } catch (error) {
-      console.error(`[coalescing] ${agent.name}: could not read whether deferred write ${writeId} was read, so its wake stays:`, error);
+      console.error(`[wake] ${agent.name}: could not read whether deferred write ${writeId} was read, so its wake stays:`, error);
       return false;
     }
+  }
+
+  /** The mark a wake for `agentName` takes for the write it was queued with
+   *  (`placement`, addMessage's out-param): set only when that write was
+   *  deferred for that agent, since a stored write's wake starts the turn
+   *  that reads it. The scheduler drops the wake once the write needs
+   *  nothing more of the agent (deferredWriteDone). */
+  private readsDeferredFor(placement: { agent?: string; deferredId?: string } | undefined, agentName: string): { readsDeferredWrite?: string } {
+    return placement?.deferredId && placement.agent === agentName ? { readsDeferredWrite: placement.deferredId } : {};
   }
 
   // A module context's reads, edits and removals, and a process answer's,
@@ -28522,6 +28636,12 @@ export class AgentFramework {
     // when the send's result, or the open that follows, comes after the turn.
     // A call made outside the turn engages none (callingTurnOf).
     const sendingTurn = SEND_ENGAGEMENT_TOOLS.has(toolName) ? this.callingTurnOf(agentName, call) : undefined;
+    // A successful send is noted on the agent with what it had read when it
+    // made the call (Agent.notePublished, publishReadThrough), where its
+    // channel is recorded; not one made outside the turn, as a background
+    // script's is (as a channel_publish).
+    const sender = sendingTurn ? this.agents.get(agentName) : undefined;
+    const readThrough = sender ? this.publishReadThrough(sender, call.id) : null;
 
     const dispatchRedactor = serverTextRedactor(config ?? {});
     const failDispatch = (error: unknown) => {
@@ -28712,6 +28832,7 @@ export class AgentFramework {
                 // recorded when that open returns.
                 if (status !== 'unknown-channel' && status !== 'ambiguous') {
                   sendingTurn?.engaged.add(destinationKey({ serverId: channelServerId ?? serverId, channelId: channelId ?? target }));
+                  sender?.notePublished(destinationKey({ serverId: channelServerId ?? serverId, channelId: channelId ?? target }), readThrough);
                 }
                 if (status === 'opened') {
                   console.error(
@@ -29005,9 +29126,18 @@ export class AgentFramework {
     // left running, or one an earlier turn started): only the turn's own call
     // moves its routing (callingTurnOf).
     const callingTurn = this.callingTurnOf(agentName, call);
+    // A publish is noted on the agent with what it had read when it made the
+    // call (Agent.notePublished, publishReadThrough), once its outcome says
+    // delivered. One made outside the turn, as a background script's is,
+    // isn't: its words were written before what the agent may have read since.
+    const publisher = call.name === 'channel_publish' && callingTurn ? this.agents.get(agentName) : undefined;
+    const readThrough = publisher ? this.publishReadThrough(publisher, call.id) : null;
+    const published: { outcome?: PublishOutcome } = {};
 
-    this.channelRegistry!.handleChannelToolCall(call.name, call.input, { kind: 'agent', agentName, own: callingTurn ? this.ownChannels(callingTurn) : [] })
+    this.channelRegistry!.handleChannelToolCall(call.name, call.input, { kind: 'agent', agentName, own: callingTurn ? this.ownChannels(callingTurn) : [] }, published)
       .then((result) => {
+        const destination = published.outcome?.status === 'delivered' ? published.outcome.destination : undefined;
+        if (publisher && destination) publisher.notePublished(destinationKey(destination), readThrough);
         const durationMs = Date.now() - startTime;
         this.emitTrace({
           type: result.isError ? 'tool:failed' : 'tool:completed',
@@ -29461,6 +29591,14 @@ export class AgentFramework {
       // for it.
       const silentTurn = callingTurn === this.turnRouting.get(agentName)
         && this.activeTurnTriggers.get(agentName)?.suppressProse === true;
+      // The announcement is the agent's speech in that channel, noted on it
+      // with what it had read at the call (Agent.notePublished,
+      // publishReadThrough) once it's delivered. Only a call made in the turn
+      // announces. It isn't awaited, so a wake judged before it lands stays.
+      const readThrough = agent ? this.publishReadThrough(agent, call.id) : null;
+      const noted = (routed: { delivered: boolean; serverId: string; channelId: string } | null): void => {
+        if (routed?.delivered) agent?.notePublished(destinationKey(routed), readThrough);
+      };
       if (!callingTurn) {
         console.error(`[sleep] ${agentName}: the call was made outside the agent's current turn — sleep announcement not posted`);
       } else if (silentTurn) {
@@ -29472,7 +29610,7 @@ export class AgentFramework {
         // model has set one; otherwise stay quiet — never guess a channel.
         const target = callingTurn.pin;
         if (target) {
-          this.channelRegistry.routeSpeech(agentName, text, target).catch((err) => {
+          this.channelRegistry.routeSpeech(agentName, text, target).then(noted).catch((err) => {
             console.error('[sleep] announce failed:', err instanceof Error ? err.message : err);
           });
         } else {
@@ -29480,7 +29618,7 @@ export class AgentFramework {
         }
       } else {
         const locus = callingTurn.locus ?? null;
-        this.channelRegistry.routeSpeech(agentName, text, locus).catch((err) => {
+        this.channelRegistry.routeSpeech(agentName, text, locus).then(noted).catch((err) => {
           console.error('[sleep] announce failed:', err instanceof Error ? err.message : err);
         });
       }
