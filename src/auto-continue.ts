@@ -2,20 +2,11 @@
  * autoContinue (AgentConfig.autoContinue, docs/auto-continue.md): a turn the
  * model ends itself is followed by another, unless it ended on a skip. This
  * module holds what doesn't need the framework: which ends continue, and the
- * notice the next turn reads.
+ * row the next turn reads.
  */
 
 /** The reason on a continuation's wake (InferenceRequest.reason). */
 export const AUTO_CONTINUE_REASON = 'auto-continue';
-
-/** What a queued continuation's notice says, held until its turn starts. */
-export interface PendingAutoContinue {
-  /** This continuation's place in the run, 1 to `max`. */
-  count: number;
-  max: number;
-  /** How the agent stops (autoContinueNotice's `stop`), if it can. */
-  stop: string | undefined;
-}
 
 /**
  * Stop reasons of a turn the model ended itself. The others don't continue:
@@ -26,22 +17,26 @@ export interface PendingAutoContinue {
 export const AUTO_CONTINUE_STOP_REASONS: ReadonlySet<string> = new Set(['end_turn', 'stop_sequence']);
 
 /**
- * The notice a continuation's turn reads: that the last turn ended without a
- * skip so another one starts, how to stop (`stop`, an imperative such as
- * "call skip_reply"; left out when the agent has no way to skip), and, near
- * the cap, how many continuations are left. `count` is this continuation's
- * place in the run, 1 to `max`. Short and event-shaped on purpose: it rides
- * as a system row in the window, where instruction blocks about output have
- * tripped classifiers.
+ * The row a continuation's turn reads. It names the agent (residents read
+ * one shared message slot), says another turn starts, says how to stop
+ * (`stop`, an imperative such as "call skip_reply") and that anything written
+ * without it is sent as usual, and, on the last continuation of a run, that
+ * the agent waits for the next event after it. When the last turn's closing
+ * words were held because that turn had already sent, it says so. Short,
+ * neutral and event-shaped on purpose: it rides as a system row in the
+ * window, where instruction blocks about output have tripped classifiers,
+ * and wording that reads as a lapse or a budget invites a published reply.
  */
-export function autoContinueNotice(count: number, max: number, stop: string | undefined): string {
-  const opening = stop
-    ? `[continue] Your last turn ended without skip_reply, so another one starts now. To stop and wait for the next event, ${stop}.`
-    : '[continue] Your last turn ended on its own, so another one starts now.';
-  const left = max - count;
-  if (left <= 0) {
-    return `${opening} This is the last continuation in a row (${count} of ${max}): after this turn you wait for the next event either way.`;
-  }
-  if (left === 1) return `${opening} Continuation ${count} of ${max} in a row: one more is left.`;
-  return opening;
+export function autoContinueNotice(opts: {
+  agentName: string;
+  stop: string;
+  last: boolean;
+  heldAfterSend?: boolean;
+}): string {
+  return `[continue] ${opts.agentName}, another turn starts now.` +
+    (opts.heldAfterSend
+      ? ' Your closing words last turn were held, not sent: that turn had already sent with a send tool.'
+      : '') +
+    ` If you're done, ${opts.stop}; anything you write without it is sent as usual.` +
+    (opts.last ? ' This is the last continuation in a row: after this turn you wait for the next event either way.' : '');
 }

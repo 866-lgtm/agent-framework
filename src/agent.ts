@@ -352,7 +352,7 @@ export class Agent {
     this.proseRouting = config.proseRouting ?? 'locus';
     this.toolWrapperProseGuard = config.toolWrapperProseGuard === true;
     this.autoContinue = resolveAutoContinue(config);
-    this.clock =resolveClockConfig(config.name, config.clock);
+    this.clock = resolveClockConfig(config.name, config.clock);
     this.cacheTtl = config.cacheTtl ?? '1h';
     this.promptCaching = config.promptCaching !== false;
     this.prefillUserMessage = config.prefillUserMessage;

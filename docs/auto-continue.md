@@ -6,10 +6,26 @@ usual pause until the next event (a message, a heartbeat, a timer). The agent
 keeps going until it says it's done: by calling `skip_reply`, or another tool
 that ends the turn, such as `sleep`.
 
+`true` turns it on with a cap of 3 continuations in a row:
+
 ```json
-"agent": { "autoContinue": true }                       // cap of 3
-"agent": { "autoContinue": { "maxConsecutive": 5 } }    // 1 to 20
+{ "agent": { "autoContinue": true } }
 ```
+
+An object sets the cap, a whole number from 1 to 20:
+
+```json
+{ "agent": { "autoContinue": { "maxConsecutive": 5 } } }
+```
+
+## What it costs
+
+An agent that answers and simply ends its turn gets at least one more full
+inference per answer: the continuation it then ends with `skip_reply`. One
+that never calls `skip_reply` gets up to `maxConsecutive` more, and in locus
+and hybrid modes each of those turns' prose is published. Each continuation's
+rows also stay in the window. Keep the cap low, and expect roughly one extra
+inference per turn for an agent that does skip.
 
 ## Which turns continue
 
@@ -20,54 +36,74 @@ A turn continues when the model ended it (stop reason `end_turn` or
 - its last prose envelope is a skip: `>>skip_reply` in explicit mode, or a
   `>>>skip_reply` in hybrid mode whose hold is still standing at the end;
 - it asked for a ` !` continuation (`>>#ops !`), which runs instead, with no
-  notice, and counts toward nothing;
+  row, and counts toward nothing;
+- its prose bounced (explicit mode): the bounce already wakes the agent to
+  resend, under its own cap;
 - it was a silent heartbeat tick;
 - it ended with a refusal, a `max_tokens` cut-off, or the stall guard's
   `no_progress` / `round_limit`;
-- the agent is an ephemeral run (a subagent), or the framework is stopping.
+- the agent is an ephemeral run (a subagent) or a conversation fork, or the
+  framework is stopping;
+- the agent has no way to stop that it's offered: in locus or disabled mode,
+  `skip_reply` must be offered (a channel registry provides it) and allowed
+  (`allowedTools`). Explicit and hybrid agents can always end with a skip
+  envelope.
+
+A turn that sent with a send tool and then closed in prose (held, not sent,
+because the turn had already sent) still continues: its closing words can't
+be told from unfinished work. The row tells the agent those words were held.
 
 ## What the agent reads
 
-As the next turn starts, a short system row joins the window, so it is the
-newest thing the turn reads (after the last turn's `[delivered]` receipt,
-outside explicit mode, whose envelopes acknowledge themselves and write no
-receipt):
+As the continuation's turn starts, after every gate that could still stop it,
+a short system row joins the window as the newest of the turn's inputs (after
+the last turn's `[delivered]` receipt, outside explicit mode, whose envelopes
+acknowledge themselves and write no receipt):
 
 ```
-[continue] Your last turn ended without skip_reply, so another one starts now. To stop and wait for the next event, call skip_reply.
+[continue] lena, another turn starts now. If you're done, call skip_reply; anything you write without it is sent as usual.
 ```
 
-Near the cap the row also says how many continuations are left:
+It names the agent, since residents read one shared message slot. When the
+last turn's closing words were held because that turn had already sent, it
+adds `Your closing words last turn were held, not sent: that turn had already
+sent with a send tool.` The last continuation of a run adds `This is the last
+continuation in a row: after this turn you wait for the next event either
+way.` An agent that can't call `skip_reply` is told to end with a
+`>>skip_reply` (explicit) or `>>>skip_reply` (hybrid) envelope instead.
 
-```
-… Continuation 2 of 3 in a row: one more is left.
-… This is the last continuation in a row (3 of 3): after this turn you wait for the next event either way.
-```
+The wording is neutral on purpose: a row that reads as a lapse ("you ended
+without…") or as a budget ("2 of 3, one more left") invites an apology or a
+"done here" reply, which in locus and hybrid modes would itself be published.
+It is short and event-shaped: longer instruction blocks about output, sent as
+user-role messages, have tripped provider classifiers.
 
-An agent that can't call `skip_reply` is told to end with a `>>skip_reply`
-(explicit) or `>>>skip_reply` (hybrid) envelope instead; in locus or disabled
-mode without the tool, the row names no way to stop and the cap ends the run.
-
-The row is written by the scheduler as it starts the turn that takes the
-continuation's wake, never earlier, so it never claims a turn that doesn't
-run: a wake the inference policy drops writes no row and gives back its
-count, and a row that can't be stored starts no continuation. It is appended
-before the turn compiles and never retracted, so the prompt-cache prefix
-stays stable. It is deliberately short and
-event-shaped: longer instruction blocks about output, sent as user-role
-messages, have tripped provider classifiers.
+The row is never written for a turn that doesn't run: a wake the inference
+policy drops, or that a quiesce drops, writes none and gives back its count;
+a row that can't be stored gives back its count, and withdraws a turn the
+continuation alone caused. It is appended before the turn compiles and never
+retracted, so the prompt-cache prefix stays stable.
 
 ## The next turn
 
 The continuation's wake has source `framework` and reason `auto-continue`. In
-locus and hybrid modes it carries the turn's locus as its channel, so the next
-turn's plain prose lands where the last one's did rather than in the
-process-global last-inbound channel.
+locus and hybrid modes it carries the turn's locus, so the next turn's plain
+prose lands in the same locus rather than the process-global last-inbound
+channel. (A hybrid `>>>` destination is a pin within a turn: the next turn
+starts with none, as any turn does.) A turn whose wake named a channel that
+resolves to none (it had no channel and took no fallback) passes that channel
+on, so its continuation takes no fallback either.
 
 A message that arrives meanwhile joins the same turn, as any batched wake
 does, and then that turn is the message's: its channel outranks the
 continuation's (ambient included, though the continuation's wake was queued
-later), no `[continue]` row is written, and the run's count starts again.
+later), no `[continue]` row is written, and the run's count starts again. A
+silent heartbeat tick batched with a continuation is not a cause of its own:
+the continuation keeps its row and its count.
+
+A host quiesce drops a queued continuation: at resume, possibly hours later,
+"another turn starts now" would no longer be true. The next real event wakes
+the agent as usual.
 
 ## The cap
 
@@ -75,8 +111,5 @@ At most `maxConsecutive` continuations run in a row (default 3). The count
 starts again when a turn starts with a cause of its own (anything but a
 framework wake or a silent heartbeat tick), and when a tool ends a turn. A
 silent tick batched with a continuation neither restarts the run nor takes
-its notice, so a resident whose ticks come faster than its turns still
-reaches the cap. Each continued turn is a full
-inference over the context (mostly cache reads), and in locus mode its prose
-is published, so the cap bounds both the cost and the posts of an agent that
-never skips.
+its row, so a resident whose ticks come faster than its turns still reaches
+the cap.

@@ -35,7 +35,11 @@ class TriggerModule implements Module {
   async start(_ctx: ModuleContext): Promise<void> {}
   async stop(): Promise<void> {}
   getTools(): ToolDefinition[] {
-    return [{ name: 'move', description: 'Move the robot', inputSchema: { type: 'object', properties: {} } }];
+    return [
+      { name: 'move', description: 'Move the robot', inputSchema: { type: 'object', properties: {} } },
+      // A send tool by its bare name: a turn that calls it holds its later prose.
+      { name: 'send_message', description: 'Explicitly send a message', inputSchema: { type: 'object', properties: { text: { type: 'string' } } } },
+    ];
   }
   async handleToolCall(_call: ToolCall): Promise<ToolResult> {
     return { success: true, data: { ok: true } };
@@ -75,12 +79,19 @@ function stubRegistry(framework: AgentFramework) {
       return { delivered: true, serverId: outcome.destination.serverId, channelId: outcome.destination.channelId };
     },
     resolveDestination: ({ channelId }: { channelId: string }) => ({ destination: { serverId: 'stub', channelId } }),
-    resolveLocus: () => ({ serverId: 'stub', channelId: 'world:commons' }),
+    // As the registry's resolver does through the framework's turn state: a
+    // turn whose wake named no resolvable channel (noChannel) has no locus
+    // and takes no fallback.
+    resolveLocus: (agentName: string) =>
+      (framework as unknown as { turnRouting: Map<string, { noChannel?: true }> }).turnRouting.get(agentName)?.noChannel
+        ? null
+        : { serverId: 'stub', channelId: 'world:commons' },
     getDefaultPublishChannel: () => null,
     isChannelOpen: () => true,
     getDescriptor: () => undefined,
     getChannelTools: () => [],
-    channelsNamed: (name: string) => [{ serverId: 'stub', channelId: name }],
+    // 'ghost' names no registered channel, as a host's unresolvable id would.
+    channelsNamed: (name: string) => (name === 'ghost' ? [] : [{ serverId: 'stub', channelId: name }]),
     nameShown: (channel: { channelId: string }) => channel.channelId,
     // skip_reply ends the turn, as the registry's own handler does.
     handleChannelToolCall: async () => ({ success: true, endTurn: true, data: { skipped: true } }),
@@ -92,6 +103,9 @@ function stubRegistry(framework: AgentFramework) {
 }
 
 const text = (t: string): ContentBlock => ({ type: 'text', text: t } as ContentBlock);
+/** The row the test agent reads for a continuation. */
+const row = (last: boolean, stop = 'call skip_reply', heldAfterSend = false): string =>
+  autoContinueNotice({ agentName: 'assistant', stop, last, heldAfterSend });
 const prose = (t: string): NormalizedResponse => createMockResponse([text(t)]);
 const empty = (): NormalizedResponse => createMockResponse([]);
 const skipReply = (id = 'sr'): NormalizedResponse =>
@@ -147,7 +161,7 @@ describe('autoContinue', () => {
    * the script calls skip_reply, so a stray continuation ends instead of
    * hanging and the test fails on its count. Returns each turn's trigger.
    */
-  function script(framework: AgentFramework, responses: NormalizedResponse[]): InferenceRequest[] {
+  function script(framework: AgentFramework, responses: Array<NormalizedResponse | NormalizedResponse[]>): InferenceRequest[] {
     const triggers: InferenceRequest[] = [];
     const internals = framework as unknown as { activeTurnTriggers: Map<string, InferenceRequest> };
     framework.onTrace((e) => {
@@ -155,7 +169,8 @@ describe('autoContinue', () => {
       const turn = triggers.length;
       const trigger = internals.activeTurnTriggers?.get('assistant');
       triggers.push(trigger ?? ({ reason: 'unknown' } as InferenceRequest));
-      membrane.pushResponse(responses[turn] ?? skipReply(`stray-${turn}`));
+      // A turn with tool rounds takes all its responses at its start.
+      for (const response of [responses[turn] ?? skipReply(`stray-${turn}`)].flat()) membrane.pushResponse(response);
     });
     return triggers;
   }
@@ -196,12 +211,8 @@ describe('autoContinue', () => {
       const all = rows(framework);
       const firstNotice = all.findIndex((r) => r.kind === 'auto-continue');
       assert.equal(all[firstNotice - 1]?.kind, 'delivery-receipt', 'the notice follows the turn\'s receipt');
-      assert.deepEqual(notices(framework), [
-        autoContinueNotice(1, 3, 'call skip_reply'),
-        autoContinueNotice(2, 3, 'call skip_reply'),
-      ]);
-      assert.match(notices(framework)[0]!, /To stop and wait for the next event, call skip_reply\.$/);
-      assert.match(notices(framework)[1]!, /Continuation 2 of 3 in a row: one more is left\.$/);
+      assert.deepEqual(notices(framework), [row(false), row(false)]);
+      assert.equal(notices(framework)[0], "[continue] assistant, another turn starts now. If you're done, call skip_reply; anything you write without it is sent as usual.", 'it names the agent');
     } finally {
       await framework.stop();
     }
@@ -231,12 +242,8 @@ describe('autoContinue', () => {
       trigger(framework);
       await within(framework.runUntilIdle(), 'the run to settle');
       assert.equal(triggers.length, 3, 'the turn and two continuations');
-      assert.deepEqual(notices(framework), [
-        autoContinueNotice(1, 2, 'call skip_reply'),
-        autoContinueNotice(2, 2, 'call skip_reply'),
-      ]);
-      assert.match(notices(framework)[0]!, /Continuation 1 of 2 in a row: one more is left\.$/);
-      assert.match(notices(framework)[1]!, /This is the last continuation in a row \(2 of 2\): after this turn you wait for the next event either way\.$/);
+      assert.deepEqual(notices(framework), [row(false), row(true)], 'only the last says it is the last');
+      assert.match(notices(framework)[1]!, / This is the last continuation in a row: after this turn you wait for the next event either way\.$/);
     } finally {
       await framework.stop();
     }
@@ -335,7 +342,7 @@ describe('autoContinue', () => {
       internals.pendingRequests.push({ agentName: 'assistant', reason: 'prose-bounce', source: 'framework', timestamp: Date.now() });
       await within(framework.runUntilIdle(), 'the next run');
       assert.equal(triggers.length, 3, 'a prose end continues again');
-      assert.deepEqual(notices(framework), [autoContinueNotice(1, 2, 'call skip_reply')]);
+      assert.deepEqual(notices(framework), [row(false)]);
     } finally {
       await framework.stop();
     }
@@ -372,7 +379,8 @@ describe('autoContinue', () => {
 
   for (const [what, extra] of [
     ['a silent heartbeat tick', { reason: 'heartbeat', source: 'heartbeat', suppressProse: true }],
-    ['another framework wake', { reason: 'prose-bounce', source: 'framework' }],
+    // Not a prose-bounce: a queued bounce wake takes the place of a continuation.
+    ['another framework wake', { reason: 'framework-test-wake', source: 'framework' }],
   ] as const) {
     it(`${what} batched with a continuation neither restarts the run nor takes its notice`, async () => {
       // Cap 1: if the batched wake restarted the run, the second turn's end
@@ -391,7 +399,7 @@ describe('autoContinue', () => {
         trigger(framework);
         await within(framework.runUntilIdle(), 'the run to settle');
         assert.equal(triggers.length, 2, 'the cap still holds');
-        assert.deepEqual(notices(framework), [autoContinueNotice(1, 1, 'call skip_reply')], 'the continuation\'s notice is written');
+        assert.deepEqual(notices(framework), [row(true)], 'the continuation\'s notice is written');
       } finally {
         await framework.stop();
       }
@@ -404,7 +412,6 @@ describe('autoContinue', () => {
     const internals = framework as unknown as {
       inferencePolicy: { shouldInfer(agent: string, requests: InferenceRequest[]): boolean };
       autoContinueStreaks: Map<string, number>;
-      autoContinuePending: Map<string, unknown>;
     };
     internals.inferencePolicy = { shouldInfer: (_agent, requests) => !requests.some((r) => r.reason === 'auto-continue') };
     const triggers = script(framework, [prose('Only this.')]);
@@ -414,7 +421,6 @@ describe('autoContinue', () => {
       assert.equal(triggers.length, 1);
       assert.deepEqual(notices(framework), [], 'no notice claims a turn that never ran');
       assert.equal(internals.autoContinueStreaks.get('assistant') ?? 0, 0, 'the count is given back');
-      assert.equal(internals.autoContinuePending.size, 0);
     } finally {
       await framework.stop();
     }
@@ -446,9 +452,8 @@ describe('autoContinue', () => {
   for (const [mode, first, stop] of [
     ['explicit', '>>#alpha hello', 'end with a >>skip_reply envelope'],
     ['hybrid', 'hello', 'end with a >>>skip_reply envelope'],
-    ['locus', 'hello', undefined],
   ] as const) {
-    it(`${mode}: an agent that can't call skip_reply is told ${stop ? 'its envelope' : 'no way to stop'}`, async () => {
+    it(`${mode}: an agent that can't call skip_reply is told its envelope`, async () => {
       const framework = await createFramework({ maxConsecutive: 1 }, mode, ['robot--move']);
       stubRegistry(framework);
       // Without skip_reply, the cap ends the run.
@@ -457,48 +462,185 @@ describe('autoContinue', () => {
         trigger(framework);
         await within(framework.runUntilIdle(), 'the run to settle');
         assert.equal(triggers.length, 2);
-        assert.deepEqual(notices(framework), [autoContinueNotice(1, 1, stop)]);
+        assert.deepEqual(notices(framework), [row(true, stop)]);
       } finally {
         await framework.stop();
       }
     });
   }
 
-  it('queues nothing for an ephemeral run, a stopping framework or an agent no longer registered', async () => {
+  for (const [what, allowed, registry] of [
+    ['may not call skip_reply', ['robot--move'], true],
+    ['has no channel registry offering skip_reply', undefined, false],
+  ] as const) {
+    it(`locus: an agent that ${what} is not continued: it would have no way to stop`, async () => {
+      const framework = await createFramework(true, 'locus', allowed ? [...allowed] : undefined);
+      if (registry) stubRegistry(framework);
+      const triggers = script(framework, [prose('hello'), prose('again')]);
+      try {
+        trigger(framework);
+        await within(framework.runUntilIdle(), 'the run to settle');
+        assert.equal(triggers.length, 1);
+        assert.deepEqual(notices(framework), []);
+      } finally {
+        await framework.stop();
+      }
+    });
+  }
+
+  it('queues nothing for an ephemeral run, a conversation fork, a stopping framework or an agent no longer registered', async () => {
+    const framework = await createFramework(true);
+    stubRegistry(framework);
+    const internals = framework as unknown as {
+      autoContinueAfterTurn(agent: unknown, routing: unknown, trigger: unknown, stopReason: string, opts?: unknown): void;
+      pendingRequests: InferenceRequest[];
+      ephemeralRuns: Map<string, unknown>;
+      conversationAgentHomes: Map<string, unknown>;
+      providerAdmissionClosed: boolean;
+      autoContinueStreaks: Map<string, number>;
+    };
+    const agent = framework.getAgent('assistant')!;
+    const queued = () => internals.pendingRequests.filter((r) => r.reason === 'auto-continue');
+    try {
+      internals.ephemeralRuns.set('assistant', {});
+      internals.autoContinueAfterTurn(agent, {}, undefined, 'end_turn');
+      internals.ephemeralRuns.delete('assistant');
+      assert.equal(queued().length, 0, 'an ephemeral run ends with its result');
+
+      internals.conversationAgentHomes.set('assistant', 'chan-alpha');
+      internals.autoContinueAfterTurn(agent, {}, undefined, 'end_turn');
+      internals.conversationAgentHomes.delete('assistant');
+      assert.equal(queued().length, 0, 'a conversation fork answers its home');
+
+      internals.providerAdmissionClosed = true;
+      internals.autoContinueAfterTurn(agent, {}, undefined, 'end_turn');
+      internals.providerAdmissionClosed = false;
+      assert.equal(queued().length, 0, 'a stopping framework starts nothing');
+
+      internals.autoContinueAfterTurn(Object.create(agent), {}, undefined, 'end_turn');
+      assert.equal(queued().length, 0, 'an agent object no longer the registered one starts nothing');
+
+      // The same call for the registered agent does queue one, marked.
+      internals.autoContinueAfterTurn(agent, {}, undefined, 'end_turn', { heldAfterSend: true });
+      assert.equal(queued().length, 1);
+      assert.deepEqual(queued()[0]!.autoContinueRun, { stop: 'call skip_reply', heldAfterSend: true });
+    } finally {
+      internals.pendingRequests.length = 0;
+      internals.autoContinueStreaks.clear();
+      await framework.stop();
+    }
+  });
+
+  it("the row says the last turn's closing words were held when it had already sent", async () => {
+    const framework = await createFramework(true);
+    stubRegistry(framework);
+    const internals = framework as unknown as {
+      autoContinueAfterTurn(agent: unknown, routing: unknown, trigger: unknown, stopReason: string, opts?: unknown): void;
+    };
+    const triggers = script(framework, [skipReply()]);
+    try {
+      internals.autoContinueAfterTurn(framework.getAgent('assistant')!, {}, undefined, 'end_turn', { heldAfterSend: true });
+      await within(framework.runUntilIdle(), 'the continuation');
+      assert.equal(triggers.length, 1);
+      assert.deepEqual(notices(framework), [row(false, 'call skip_reply', true)]);
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it("a turn that sent and then closed in prose continues, and its row says those words were held", async () => {
+    const framework = await createFramework(true);
+    stubRegistry(framework);
+    const sendRound = createMockResponse([
+      text('Posting the summary.'),
+      { type: 'tool_use', id: 's1', name: 'robot--send_message', input: { text: 'the summary' } } as ContentBlock,
+    ], 'tool_use');
+    const triggers = script(framework, [[sendRound, prose('Done.')], skipReply()]);
+    try {
+      trigger(framework);
+      await within(framework.runUntilIdle(), 'the run to settle');
+      assert.equal(triggers.length, 2, 'it still continues: a held "Done." can\'t be told from unfinished work');
+      assert.deepEqual(notices(framework), [row(false, 'call skip_reply', true)]);
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it("a message batched after a queued continuation still takes the turn: no row, a fresh run", async () => {
     const framework = await createFramework(true);
     stubRegistry(framework);
     const internals = framework as unknown as {
       autoContinueAfterTurn(agent: unknown, routing: unknown, trigger: unknown, stopReason: string): void;
       pendingRequests: InferenceRequest[];
-      ephemeralRuns: Map<string, unknown>;
-      providerAdmissionClosed: boolean;
-      autoContinuePending: Map<string, unknown>;
       autoContinueStreaks: Map<string, number>;
     };
-    const agent = framework.getAgent('assistant')!;
-    const queued = () => internals.pendingRequests.filter((r) => r.reason === 'auto-continue').length;
+    const triggers = script(framework, [skipReply()]);
     try {
-      internals.ephemeralRuns.set('assistant', {});
-      internals.autoContinueAfterTurn(agent, {}, undefined, 'end_turn');
-      internals.ephemeralRuns.delete('assistant');
-      assert.equal(queued(), 0, 'an ephemeral run ends with its result');
-
-      internals.providerAdmissionClosed = true;
-      internals.autoContinueAfterTurn(agent, {}, undefined, 'end_turn');
-      internals.providerAdmissionClosed = false;
-      assert.equal(queued(), 0, 'a stopping framework starts nothing');
-
-      internals.autoContinueAfterTurn(Object.create(agent), {}, undefined, 'end_turn');
-      assert.equal(queued(), 0, 'an agent object no longer the registered one starts nothing');
-
-      // The same call for the registered agent does queue one.
-      internals.autoContinueAfterTurn(agent, {}, undefined, 'end_turn');
-      assert.equal(queued(), 1);
-      assert.equal(internals.autoContinuePending.size, 1);
+      // The continuation is queued first, so it is the batch's first request.
+      internals.autoContinueAfterTurn(framework.getAgent('assistant')!, {}, undefined, 'end_turn');
+      internals.pendingRequests.push({ agentName: 'assistant', reason: 'channel-message', source: 'stub', timestamp: Date.now() });
+      await within(framework.runUntilIdle(), 'the turn');
+      assert.equal(triggers.length, 1);
+      assert.equal(triggers[0]!.reason, 'auto-continue', 'the first request names the trigger');
+      assert.equal(triggers[0]!.autoContinueRun, undefined, 'but the turn carries no continuation mark');
+      assert.deepEqual(notices(framework), []);
+      assert.equal(internals.autoContinueStreaks.has('assistant'), false);
     } finally {
-      internals.pendingRequests.length = 0;
-      internals.autoContinuePending.clear();
-      internals.autoContinueStreaks.clear();
+      await framework.stop();
+    }
+  });
+
+  it('a quiesce drops a queued continuation and gives back its count', async () => {
+    const framework = await createFramework(true);
+    stubRegistry(framework);
+    const internals = framework as unknown as {
+      autoContinueAfterTurn(agent: unknown, routing: unknown, trigger: unknown, stopReason: string): void;
+      processInferenceRequests(): Promise<void>;
+      pendingRequests: InferenceRequest[];
+      quiesced: boolean;
+      autoContinueStreaks: Map<string, number>;
+    };
+    try {
+      internals.autoContinueAfterTurn(framework.getAgent('assistant')!, {}, undefined, 'end_turn');
+      assert.equal(internals.autoContinueStreaks.get('assistant'), 1);
+      internals.quiesced = true;
+      await internals.processInferenceRequests();
+      assert.equal(internals.pendingRequests.filter((r) => r.reason === 'auto-continue').length, 0, 'not parked for resume');
+      assert.equal(internals.autoContinueStreaks.get('assistant') ?? 0, 0, 'its count is given back');
+      assert.deepEqual(notices(framework), []);
+    } finally {
+      internals.quiesced = false;
+      await framework.stop();
+    }
+  });
+
+  it('explicit: a turn whose prose bounced is woken by the bounce, not also continued', async () => {
+    const framework = await createFramework(true, 'explicit');
+    stubRegistry(framework);
+    const triggers = script(framework, [prose('no prefix here'), prose('>>skip_reply fine')]);
+    try {
+      trigger(framework);
+      await within(framework.runUntilIdle(), 'the run to settle');
+      assert.equal(triggers.length, 2, 'one wake, not a bounce and a continuation');
+      assert.equal(triggers[1]!.reason, 'prose-bounce');
+      assert.deepEqual(notices(framework), []);
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it('a turn that had no channel passes that on: its continuation takes no fallback either', async () => {
+    const framework = await createFramework(true);
+    stubRegistry(framework);
+    const internals = framework as unknown as { pendingRequests: InferenceRequest[] };
+    const triggers = script(framework, [prose('nowhere to say this'), skipReply()]);
+    try {
+      internals.pendingRequests.push({ agentName: 'assistant', reason: 'channel-message', source: 'stub', timestamp: Date.now(), channelId: 'ghost' });
+      await within(framework.runUntilIdle(), 'the run to settle');
+      assert.equal(triggers.length, 2);
+      assert.equal(triggers[1]!.reason, 'auto-continue');
+      assert.equal(triggers[1]!.channelId, 'ghost', 'the continuation names the same unresolved channel');
+    } finally {
       await framework.stop();
     }
   });
@@ -512,7 +654,7 @@ describe('autoContinue', () => {
       await within(framework.runUntilIdle(), 'the run');
       assert.equal(triggers.length, 2, 'the delivery continues; the >>skip_reply ending waits');
       assert.deepEqual(routed.map((r) => r.text), ['posted', 'more']);
-      assert.deepEqual(notices(framework), [autoContinueNotice(1, 3, 'call skip_reply')]);
+      assert.deepEqual(notices(framework), [row(false)]);
     } finally {
       await framework.stop();
     }
@@ -598,14 +740,20 @@ describe('autoContinue config', () => {
 });
 
 describe('autoContinueNotice', () => {
-  it('names the way to stop, and the count only near the cap', () => {
+  it('names the agent and the way to stop, says what unmarked words do, and the cap only on the last', () => {
     assert.equal(
-      autoContinueNotice(1, 3, 'call skip_reply'),
-      '[continue] Your last turn ended without skip_reply, so another one starts now. To stop and wait for the next event, call skip_reply.',
+      autoContinueNotice({ agentName: 'lena', stop: 'call skip_reply', last: false }),
+      "[continue] lena, another turn starts now. If you're done, call skip_reply; anything you write without it is sent as usual.",
     );
-    assert.match(autoContinueNotice(2, 3, 'call skip_reply'), / Continuation 2 of 3 in a row: one more is left\.$/);
-    assert.match(autoContinueNotice(3, 3, 'call skip_reply'), / This is the last continuation in a row \(3 of 3\)/);
-    assert.match(autoContinueNotice(1, 1, 'call skip_reply'), /last continuation in a row \(1 of 1\)/);
-    assert.equal(autoContinueNotice(1, 5, undefined), '[continue] Your last turn ended on its own, so another one starts now.');
+    assert.equal(
+      autoContinueNotice({ agentName: 'lena', stop: 'end with a >>skip_reply envelope', last: true }),
+      "[continue] lena, another turn starts now. If you're done, end with a >>skip_reply envelope; anything you write without it is sent as usual. " +
+        'This is the last continuation in a row: after this turn you wait for the next event either way.',
+    );
+    assert.equal(
+      autoContinueNotice({ agentName: 'lena', stop: 'call skip_reply', last: false, heldAfterSend: true }),
+      '[continue] lena, another turn starts now. Your closing words last turn were held, not sent: that turn had already sent with a send tool. ' +
+        "If you're done, call skip_reply; anything you write without it is sent as usual.",
+    );
   });
 });
