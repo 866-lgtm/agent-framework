@@ -455,8 +455,8 @@ export function referenceStubOrNull(block: unknown, provenance?: string, serverI
  * result, which carries blocks rather than text. It makes the decision
  * referenceStubOrNull makes for the model's lanes, since what a script prints
  * comes back to the model, except that a script reads every field, so inline
- * data beside a uri of any value is withheld, where the model's lanes, which
- * show no uri, withhold it beside a string one. A reference becomes the stub's facts as data,
+ * data beside a uri of any type but null or absent is withheld, where the
+ * model's lanes, which show no uri, withhold it beside a string one. A reference becomes the stub's facts as data,
  * without its URI: the host's reference id, what the server said about it in
  * this block (its labels stripped and bounded as in the stub), and `savedTo`,
  * the workspace path its payload was fetched to, or null when it wasn't

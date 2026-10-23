@@ -390,7 +390,7 @@ test("a module's reference deeper in its blocks reaches a script as the model's 
       ],
       structuredContent: { nested: true },
       isError: false,
-    }, 'inline data beside a uri of any value is withheld, and a value RFC-005 doesn\'t govern keeps its fields');
+    }, 'inline data beside a uri of any type is withheld, and a value RFC-005 doesn\'t govern keeps its fields');
     // A reference the module made itself is bound to no server.
     assert.deepEqual(referenceRegistry.findByUri(sealed.uri)?.serverIds, []);
   });
@@ -527,6 +527,28 @@ test("an MCPL peer's reference nested under another block's fields reaches a scr
     assert.deepEqual(block.deeper, { list: [{ type: 'text', text: INLINE_WITHHELD_TEXT }, { note: 'plain data', type: 'note' }] });
     assert.equal(JSON.stringify(object.content).includes('never-token') || JSON.stringify(object.content).includes('inline-token'), false);
     assert.deepEqual(object.structuredContent, { attachment: sealed }, 'structuredContent is the server\'s own data, whole');
+  });
+});
+
+test("each shape RFC-005 governs, nested in an MCPL peer's block, reaches a script by the peer's reading", async () => {
+  await withPeers(async ({ answer, script }) => {
+    const embedded = { type: 'resource', resource: { uri: 'https://files.example.invalid/nested-shapes/doc.txt?sig=embedded-token', text: 'the doc' } };
+    const byUri = { type: 'image', uri: 'https://files.example.invalid/nested-shapes/pic.png?sig=image-token', mimeType: 'image/png' };
+    const emptyUri = { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png', uri: '' };
+    const text = { type: 'text', text: 'shapes', embedded, byUri, emptyUri };
+    answer({ content: [text], structuredContent: {} });
+    const [block] = (JSON.parse(await script('mcpl--files--attach')) as { content: Array<Record<string, unknown>> }).content;
+    // An MCP-form embedded resource is the classifier's invalid block, so its notice, without its text.
+    const shownEmbedded = block.embedded as Record<string, unknown>;
+    assert.equal(shownEmbedded.type, 'text');
+    assert.equal(String(shownEmbedded.text).includes('the doc'), false);
+    // A reference by uri alone is a stub bound to the peer.
+    const shownByUri = block.byUri as Record<string, unknown>;
+    assert.deepEqual([typeof shownByUri.refId, 'uri' in shownByUri], ['string', false]);
+    assert.deepEqual(referenceRegistry.findByUri(byUri.uri)?.serverIds, ['files']);
+    // An empty uri beside inline data is the classifier's contradiction on a peer's lane.
+    assert.deepEqual(block.emptyUri, { type: 'text', text: INLINE_WITHHELD_TEXT });
+    assert.equal(/embedded-token|image-token/.test(JSON.stringify(block)), false);
   });
 });
 

@@ -265,7 +265,8 @@ export function shownToScript(value: unknown): unknown {
  * A value nested in an MCPL peer's content block as a script reads it, as a
  * JSON replacer applies it inside the blocks: what RFC-005 governs
  * (governedByRfc005, history's guard, since the classifier would make a
- * notice of any other object) gets the treatment the script lane gives a
+ * notice of an object that isn't a content block, such as a peer's own
+ * nested data) gets the treatment the script lane gives a
  * peer's block (referenceBlockForScript), its reference bound to the server
  * that sent it, and any other value is itself. A stub or a notice isn't
  * governed, so a block the top-level pass already treated is left as it is.
