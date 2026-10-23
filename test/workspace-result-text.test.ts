@@ -367,6 +367,9 @@ test("grep's matched and context lines that hold a line break are quoted, and ma
       '     4:"needle five\\u2028--- skipped ---"',
       '     5-six',
     ].join('\n'));
+    // Without context, the matched lines are quoted the same way.
+    assert.match(textOf(await call('grep', { pattern: 'needle', path: 'work/lines.txt' }, 24_000)),
+      /\n {5}2:"two \\r needle three"\n {5}4:"needle five\\u2028--- skipped ---"$/);
     disk('gap.txt', `${['a', 'needle b', 'c', 'd', 'e', 'f', 'g', 'needle h', 'i'].join('\n')}\n`);
     // Lines left out between two runs: `--` between them.
     assert.match(textOf(await call('grep', { pattern: 'needle', path: 'work/gap.txt', contextBefore: 1, contextAfter: 1 }, 24_000)),
