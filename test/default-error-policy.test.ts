@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MembraneError } from '@animalabs/membrane';
 import { MEMBRANE_RETRY_SETTINGS, type RetrySettings } from '@animalabs/membrane/retry';
-import type { NormalizedRequest, YieldingStream } from '@animalabs/membrane';
+import type { NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 import { AgentFramework, DefaultErrorPolicy } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
@@ -49,11 +49,14 @@ describe('DefaultErrorPolicy on membrane\'s schedules', () => {
     assert.deepEqual(delays(policy, err({ type: 'rate_limit', retryable: true, httpStatus: 429 })), [1000, 2000, 4000, 8000]);
   });
 
-  it('waits a stated wait longer than the backoff, and ends past its ceiling', () => {
-    const stated = err({ type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs: 20_000 });
-    assert.deepEqual(policy.onInferenceError(stated, 'resident', 0), { retry: true, delayMs: 20_000 });
-    const past = err({ type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs: 120_000 });
-    assert.deepEqual(policy.onInferenceError(past, 'resident', 0), { retry: false });
+  it("waits a stated wait longer than the backoff up to the framework's ten-minute cap, and ends past it", () => {
+    const wait = (ms: number) => err({ type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs: ms });
+    assert.deepEqual(policy.onInferenceError(wait(20_000), 'resident', 0), { retry: true, delayMs: 20_000 });
+    // Past membrane's one-minute ceiling but inside the framework's cap, which
+    // nonOwningProviderWait leaves to this policy to sleep, as before.
+    assert.deepEqual(policy.onInferenceError(wait(90_000), 'resident', 0), { retry: true, delayMs: 90_000 });
+    assert.deepEqual(policy.onInferenceError(wait(600_000), 'resident', 0), { retry: true, delayMs: 600_000 });
+    assert.deepEqual(policy.onInferenceError(wait(660_000), 'resident', 0), { retry: false });
   });
 
   it('gives a 529 the overloaded schedule: seven tries, jittered waits from 10 s doubling to 5 min', () => {
@@ -75,8 +78,8 @@ describe('DefaultErrorPolicy on membrane\'s schedules', () => {
     assert.equal(policy.maxRetries, 6, 'the defaults allow six (overloaded)');
   });
 
-  it('retries an error that is not a MembraneError as before: three times, 1, 2 then 4 s', () => {
-    assert.deepEqual(delays(policy, new Error('zz local failure')), [1000, 2000, 4000]);
+  it('retries an error that is not a MembraneError as a retryable failure, on the base schedule', () => {
+    assert.deepEqual(delays(policy, new Error('zz local failure')), [1000, 2000]);
   });
 });
 
@@ -119,4 +122,70 @@ test('a turn asks membrane for no retries of its own: the framework is the one r
   for (const options of membrane.streamOptions) {
     assert.equal((options as { retry?: unknown }).retry, false);
   }
+});
+
+class ErrorStream implements YieldingStream {
+  isWaitingForTools = false;
+  pendingToolCallIds: string[] = [];
+  toolDepth = 0;
+  isCancelled = false;
+  constructor(private readonly error: Error) {}
+  provideToolResults(): void { throw new Error('not waiting'); }
+  cancel(): void { this.isCancelled = true; }
+  async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+    yield { type: 'error', error: this.error } as StreamEvent;
+  }
+}
+
+/** The first `failures` turn streams fail with a 502; then they answer. */
+class FlakyMembrane extends OptionsMembrane {
+  constructor(private failures: number) { super(); }
+  override streamYielding(request: NormalizedRequest, options?: unknown): YieldingStream {
+    if (this.failures > 0) {
+      this.failures--;
+      this.streamOptions.push(options);
+      return new ErrorStream(err({ type: 'server', retryable: true, httpStatus: 502, message: 'zz bad gateway' }));
+    }
+    return super.streamYielding(request, options);
+  }
+}
+
+async function makeFramework(t: TestContext, membrane: MockMembrane) {
+  const dir = mkdtempSync(join(tmpdir(), 'af-retry-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const fw = await AgentFramework.create({
+    storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
+    agents: [{ name: 'resident', model: 'zz-model', systemPrompt: 'system' }],
+    modules: [new InputModule()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+  });
+  t.after(() => fw.stop().catch(() => {}));
+  return fw;
+}
+
+async function idle(fw: AgentFramework, ms = 15_000): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([fw.runUntilIdle(), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('the framework never went idle')), ms); })])
+    .finally(() => clearTimeout(timer));
+}
+
+test('a failed turn is retried by the framework on the base schedule, each attempt a fresh stream with no membrane retries', async (t: TestContext) => {
+  const membrane = new FlakyMembrane(1);
+  membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-after-retry' }]));
+  const fw = await makeFramework(t, membrane);
+  const started = Date.now();
+  fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-hello', metadata: {} });
+  await idle(fw);
+  assert.equal(membrane.streamOptions.length, 2, 'one failed stream, then the retry');
+  for (const options of membrane.streamOptions) assert.equal((options as { retry?: unknown }).retry, false);
+  assert.ok(Date.now() - started >= 900, 'the retry waited the base schedule\'s first second');
+});
+
+test("a direct caller of Agent.startStream keeps membrane's retries", async (t: TestContext) => {
+  const membrane = new OptionsMembrane();
+  const fw = await makeFramework(t, membrane);
+  const agent = fw.getAllAgents()[0];
+  const { stream } = await agent.startStream([]);
+  stream.cancel();
+  assert.equal(membrane.streamOptions.length, 1);
+  assert.equal((membrane.streamOptions[0] as { retry?: unknown }).retry, undefined, 'no retry: false on a stream the framework does not drive');
 });

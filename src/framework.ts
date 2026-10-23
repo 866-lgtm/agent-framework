@@ -1825,12 +1825,14 @@ function hostCommandRequester(serverId: string, params: HostCommandParams): Oper
  *   included (membrane leaves those to its caller): the base schedule (by
  *   default 3 tries, 1 s then 2 s).
  * A provider's stated wait (`retryAfterMs`) is waited when it is longer than
- * the backoff, up to its schedule's ceiling (a minute by default); past it
- * the call ends here, as membrane would end it. (Before this policy runs, the
- * framework holds a resident for a stated wait or an acceleration 429 itself;
- * see holdProviderAcceleration and nonOwningProviderWait.)
- * An error that isn't a MembraneError is retried as before: up to three
- * times, 1, 2 then 4 s apart.
+ * the backoff, up to the framework's own cap (PROVIDER_ACCELERATION_MAX_
+ * COOLDOWN_MS, ten minutes) where a schedule's ceiling is lower; past it the
+ * turn ends here. (Before this policy runs, the framework holds a resident
+ * for a stated wait or an acceleration 429 itself, and ends an ephemeral run
+ * on a wait past that cap; see holdProviderAcceleration and
+ * nonOwningProviderWait.)
+ * An error that isn't a MembraneError is retried as a retryable failure, on
+ * the base schedule.
  */
 export class DefaultErrorPolicy implements ErrorPolicy {
   /** The most retries any class allows (ErrorPolicy's bound, for readers). */
@@ -1838,13 +1840,23 @@ export class DefaultErrorPolicy implements ErrorPolicy {
   private readonly settings: RetrySettings;
 
   constructor(settings: RetrySettings = MEMBRANE_RETRY_SETTINGS as RetrySettings) {
-    this.settings = settings;
+    // A stated wait up to the framework's own cap is slept and retried, as it
+    // was before: nonOwningProviderWait ends an ephemeral run on a longer one,
+    // and a resident's waits are held before this policy runs. Membrane's
+    // schedules alone would end the turn on one past a minute.
+    this.settings = Object.fromEntries(Object.entries(settings).map(([cls, s]) => [cls, s && {
+      ...s,
+      statedWaitCeilingMs: s.statedWaitCeilingMs === null ? null : Math.max(s.statedWaitCeilingMs, PROVIDER_ACCELERATION_MAX_COOLDOWN_MS),
+    }])) as RetrySettings;
     this.maxRetries = Math.max(0, ...Object.values(settings).map((s) => (s?.maxAttempts ?? 1) - 1));
   }
 
   onInferenceError(error: Error, _agentName: string, attempt: number): ErrorAction {
     if (!isMembraneError(error)) {
-      return attempt < 3 ? { retry: true, delayMs: Math.pow(2, attempt) * 1000 } : { retry: false };
+      // Not a provider failure membrane classified: retried as any other
+      // retryable failure, on the base schedule.
+      const decision = retryDecision('retryable', attempt + 1, undefined, this.settings);
+      return decision.retry ? { retry: true, delayMs: decision.delayMs } : { retry: false };
     }
     if (error.retryable === false) return { retry: false };
     // The facts membrane classifies by, read off the error itself (from either
@@ -18081,6 +18093,9 @@ export class AgentFramework {
         continuePrompt,
       } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
         silentHeartbeat: trigger?.silentHeartbeat,
+        // This turn's retries are the framework's (errorPolicy below), not
+        // membrane's inside each attempt.
+        membraneRetries: false,
       });
       // The compile can wait for annotations (each batch has one spill
       // deadline), so check ownership, admission, and the lifecycle again.
