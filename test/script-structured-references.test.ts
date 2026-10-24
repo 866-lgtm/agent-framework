@@ -560,6 +560,24 @@ test("an MCPL peer's structured blocks too deep to convert to JSON reach a scrip
   });
 });
 
+test("a RangeError from serializing an MCPL peer's blocks, as a result past the runtime's longest string gives, reaches a script as a result it can't convert", async () => {
+  await withPeers(async ({ answer, script, observe }) => {
+    const seen = observe();
+    // A result past the runtime's longest string makes JSON.stringify throw
+    // a RangeError ("Invalid string length" on V8), and a test can't build
+    // one in memory. A toJSON that JSON.stringify calls, and that throws
+    // that error, stands in for it: the throw comes from inside the
+    // serializer, as the real one does, and isn't the overflow's.
+    const tooLong = { toJSON(): never { throw new RangeError('Invalid string length'); } };
+    answer({ content: [{ type: 'text', text: 'a long report', tooLong }], structuredContent: {} });
+    const object = JSON.parse(await script('mcpl--files--attach')) as { content: [{ text: string }]; isError: boolean };
+    assert.equal(object.isError, true);
+    assert.equal(object.content[0].text, "tool 'mcpl--files--attach' returned a result that can't be converted to JSON, so the script can't receive it (Invalid string length). The call itself completed.");
+    assert.deepEqual(seen.outcomes, [{ type: 'tool:completed' }]);
+    assert.deepEqual(seen.lifecycle.filter(([method]) => method === 'markDispatchFailure'), []);
+  });
+});
+
 test("a fault in an MCPL peer's round trip other than a RangeError fails the dispatch, as any fault does, with its own message", async () => {
   await withPeers(async ({ answer, script, observe }) => {
     const seen = observe();
