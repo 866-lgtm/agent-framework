@@ -565,3 +565,40 @@ test('a FIFO at the presentation file is refused at once, not waited on with the
   assert.equal(out.description,'original','the default description stays');
  } finally {rmSync(dir,{recursive:true,force:true});}
 });
+
+test('the advertised-tool limit: an unhide past it is refused, hiding stays free, and installed tools past it are reported once',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'presentation-limit-'));
+ const warn=console.warn, warnings:string[]=[];
+ console.warn=(...a:unknown[])=>{warnings.push(a.join(' '));};
+ try {
+  const path=join(dir,'tools.json');
+  const tool=(name:string)=>({name,description:name,inputSchema:{type:'object' as const}});
+  const base=[tool('a'),tool('b'),tool('c'),...presentationTools('board/tools.md'),tool('workspace--read')];
+  const p=new ToolPresentation({path,cataloguePath:'board/tools.md',maxAdvertised:5});
+  assert.equal(p.edit('set_tool_visibility',{name:'a',visible:false},base).success,true);
+  assert.equal(p.resolve(base).advertised.length,5);
+  assert.equal(p.edit('set_tool_visibility',{name:'b',visible:false},base).success,true,'hiding is never limited');
+  assert.equal(p.edit('set_tool_visibility',{name:'a',visible:true},base).success,true,'back to 5 is within the limit');
+  const refused=p.edit('set_tool_visibility',{name:'b',visible:true},base);
+  assert.equal(refused.success,false);
+  assert.match(String(refused.error),/^Nothing was changed: 5 tools are visible already, and showing "b" would make 6, over the 5 one request may carry/);
+  assert.match(String(refused.error),/Hide a tool you don't need first/);
+  assert.equal(JSON.parse(readFileSync(path,'utf8')).tools.b.visible,false,'file unchanged by the refusal');
+  assert.equal(p.edit('set_tool_visibility',{name:'c',visible:true},base).success,true,'showing an already-visible tool adds nothing');
+  assert.deepEqual(p.resolve(base).diagnostics,[]);
+  assert.equal(warnings.length,0);
+  // A newly installed tool takes the count past the limit without any edit.
+  const grown=[...base,tool('d')];
+  const snap=p.resolve(grown);
+  assert.equal(snap.advertised.length,6);
+  assert.equal(snap.diagnostics.length,1);
+  assert.match(snap.diagnostics[0],/^6 tools are visible, over the 5 one request may carry: requests will be refused by the model provider until 1 more is hidden/);
+  p.resolve(grown);
+  assert.equal(warnings.length,1,'warned once per over-limit count, not every compile');
+  assert.match(warnings[0],/\[tool-presentation\] ⚠️ 6 tools advertised, over the limit of 5/);
+  assert.match(renderCatalogue(snap),/Diagnostic: 6 tools are visible, over the 5/);
+  // Without a configured limit, OpenAI's 128 applies.
+  const many=Array.from({length:130},(_,i)=>tool(`t${i}`));
+  assert.equal(new ToolPresentation({path:join(dir,'none.json'),cataloguePath:'board/tools.md'}).resolve(many).diagnostics.length,1);
+ } finally {console.warn=warn; rmSync(dir,{recursive:true,force:true});}
+});

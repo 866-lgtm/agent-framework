@@ -11,6 +11,9 @@ export interface ToolPresentationConfig {
   cataloguePath: string;
   /** Optional description-only profiles, bound to a registered component source. */
   defaults?: { source: string; path: string }[];
+  /** Most tools one request may carry (default 128, OpenAI's per-request limit). An unhide past
+   *  it is refused; a count past it from newly installed tools is reported as a diagnostic. */
+  maxAdvertised?: number;
 }
 export interface ToolOverride { description?: string; visible?: boolean }
 export interface PresentationDocument { version: 1; tools: Record<string, ToolOverride> }
@@ -32,6 +35,8 @@ const MAX_BYTES = 256 * 1024;
  */
 const NONBLOCK = typeof constants.O_NONBLOCK === 'number' ? constants.O_NONBLOCK : 0;
 const MAX_DESCRIPTION_CHARS = 32768;
+/** OpenAI refuses a request with more tools than this; other providers allow at least as many. */
+const DEFAULT_MAX_ADVERTISED = 128;
 const protectedNames = new Set(['set_tool_visibility', 'set_tool_description', 'workspace--read']);
 export const isPresentationTool = (name: string): boolean => name === 'set_tool_visibility' || name === 'set_tool_description';
 const hash = (value: string): string => createHash('sha256').update(value).digest('hex');
@@ -245,8 +250,23 @@ export class ToolPresentation {
       return {name:tool.name,source:sources.get(tool.name) ?? 'Unattributed',visible:override?.visible ?? true,originalDescription:tool.description,description,descriptionSource,inputSchema:structuredClone(tool.inputSchema)};
     });
     const available = tools.map((tool,i) => ({...structuredClone(tool),description:entries[i].description}));
+    const advertised = available.filter((_,i)=>entries[i].visible);
+    const max = this.maxAdvertised();
+    if (advertised.length > max) {
+      diagnostics.push(`${count(advertised.length)} tools are visible, over the ${count(max)} one request may carry: requests will be refused by the model provider until ${count(advertised.length - max)} more ${advertised.length - max === 1 ? 'is' : 'are'} hidden. Hide tools you don't need with set_tool_visibility {"name":"EXACT_NAME","visible":false}.`);
+      const key = `${advertised.length}/${max}`;
+      if (this.warnedOverLimit !== key) {
+        this.warnedOverLimit = key;
+        console.warn(`[tool-presentation] ⚠️ ${advertised.length} tools advertised, over the limit of ${max} — provider requests will be refused until ${advertised.length - max} are hidden (presentation file ${this.config.path})`);
+      }
+    } else this.warnedOverLimit = undefined;
     return {revision:hash(JSON.stringify({raw,entries,diagnostics})),source:this.config.path,cataloguePath:this.config.cataloguePath,diagnostics,available,
-      advertised:available.filter((_,i)=>entries[i].visible),entries};
+      advertised,entries};
+  }
+  private warnedOverLimit: string | undefined;
+  private maxAdvertised(): number {
+    const max = this.config.maxAdvertised;
+    return typeof max === 'number' && Number.isSafeInteger(max) && max > 0 ? max : DEFAULT_MAX_ADVERTISED;
   }
   edit(tool: string, input: unknown, available: ToolDefinition[]): ToolResult {
     const lock = this.config.path + '.lock';
@@ -271,6 +291,11 @@ export class ToolPresentation {
       catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
       const before = this.read(), doc = parsePresentation(before);
       const old = Object.hasOwn(doc.tools,name) ? doc.tools[name] : {};
+      if (field === 'visible' && value.visible === true && old.visible === false) {
+        const visibleNow = available.filter((t) => !(Object.hasOwn(doc.tools, t.name) && doc.tools[t.name].visible === false)).length;
+        const max = this.maxAdvertised();
+        if (visibleNow + 1 > max) throw new PresentationRefusal(`Nothing was changed: ${count(visibleNow)} tools are visible already, and showing ${quoted(name)} would make ${count(visibleNow + 1)}, over the ${count(max)} one request may carry (the model provider refuses requests with more). Hide a tool you don't need first with set_tool_visibility {"name":"EXACT_NAME","visible":false}, then show this one.`);
+      }
       const updated = {...old};
       if (field === 'description' && value.description === null) delete updated.description;
       else Object.assign(updated,{[field]:value[field]});
