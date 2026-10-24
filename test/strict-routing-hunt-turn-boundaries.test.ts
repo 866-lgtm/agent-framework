@@ -29,7 +29,7 @@ import type {
   ToolDefinition,
   ToolResult,
 } from '../src/index.js';
-import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { ChannelRegistry, destinationKey, type ChannelRef } from '../src/mcpl/channel-registry.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
@@ -137,18 +137,14 @@ interface Internals {
   channelRegistry: unknown;
   mcplServerRegistry: unknown;
   mcplPrefixMap: Map<string, string>;
-  activeTriggerChannels: Map<string, string>;
+  turnChannelFor(agentName: string): ChannelRef | null | undefined;
   activeTurnTokens: Map<string, number>;
   mcplHomeChannel: string | null;
   deferredMessages: Array<{ id: string; metadata?: Record<string, unknown> }>;
   pendingRequests: Array<{ agentName: string; reason: string; channelId?: string }>;
   eventGate: { asShouldTriggerCallback(): (content: string, metadata: Record<string, unknown>) => boolean } | null;
   tuneOutCoordinator: unknown;
-  recordChannelAutoOpenNotice(
-    agentName: string | undefined,
-    channels: Array<{ channelId: string; label?: string }>,
-    cause: string,
-  ): void;
+  recordChannelAutoOpenNotice(agentName: string | undefined, serverId: string, channels: Array<{ channelId: string; label?: string }>, cause: string): void;
   addMessage(participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, opts?: { forAgent?: string }): string;
   processNextEvent(): Promise<void>;
   withAuxiliaryAdmission<T>(agentName: string, run: () => Promise<T>): Promise<T>;
@@ -210,18 +206,18 @@ function attachRegistry(fw: AgentFramework) {
     {
       sendTypingFn: () => {},
       homeChannelResolver: () => undefined,
-      activeChannelResolver: (name) => i.activeTriggerChannels.get(name),
+      activeChannelResolver: (name) => i.turnChannelFor(name),
       homeChannel: i.mcplHomeChannel ?? undefined,
       onRouteFailure: () => {},
-      onChannelAutoOpened: ({ conversationId, source, channels }) =>
-        i.recordChannelAutoOpenNotice(conversationId, channels, source),
+      onChannelAutoOpened: ({ conversationId, serverId, source, channels }) =>
+        i.recordChannelAutoOpenNotice(conversationId, serverId, channels, source),
     },
   );
   const map = (registry as unknown as {
     channels: Map<string, { serverId: string; descriptor: { id: string; type: string; label: string }; open: boolean }>;
   }).channels;
   const seed = (serverId: string, id: string, label: string, open: boolean) =>
-    map.set(`${serverId}:${id}`, { serverId, descriptor: { id, type: serverId, label }, open });
+    map.set(destinationKey({ serverId, channelId: id }), { serverId, descriptor: { id, type: serverId, label }, open });
   seed('discord', DM, 'DM: operator', false);
   seed('discord', HOME, 'home', true);
   seed('discord', CLOSED, 'lounge', false);
@@ -405,6 +401,7 @@ describe('strict routing hunt: turn start / turn end (ROUTING_STRICT=true)', () 
       },
       recordTuneOutWake: () => null,
       listChannelsRaw: () => [],
+      nameShown: (c: { channelId: string }) => c.channelId,
     };
     // Wired exactly as AgentFramework.create wires the coordinator's hooks.
     const coordinator = new TuneOutCoordinator(fakeRegistry as never, h.serverRegistry as never, {
@@ -1335,11 +1332,14 @@ describe('strict routing hunt round 2 controls (flags unset)', () => {
     });
   });
 
-  it('R2-5 control: upstream cannot abort an idle retry either, but the retried turn hears the STOP', async () => {
+  it('R2-5 control: with the flags unset the brake still stops a turn waiting out its retry backoff', async () => {
+    // The brake is flag-independent, and since 0.24 upstream's abortInference
+    // reaches a turn waiting to retry (its check window), so the backoff is
+    // brakeable with ROUTING_STRICT unset too.
     await withUpstream({ privileged: true }, async (h) => {
       const { aborted, heard } = await runR25(h);
-      assert.equal(aborted, false, 'upstream: nothing streaming to abort during the backoff');
-      assert.equal(heard, true, 'upstream: the STOP is injected at the retried turn\'s first boundary');
+      assert.equal(aborted || heard, true, 'the STOP reached the braked turn');
+      assert.equal(aborted, true, 'the turn waiting out its backoff is stopped');
     });
   });
 });

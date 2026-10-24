@@ -45,7 +45,7 @@ import type {
   ToolDefinition,
   ToolResult,
 } from '../src/index.js';
-import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { ChannelRegistry, destinationKey, type ChannelRef } from '../src/mcpl/channel-registry.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
@@ -158,17 +158,13 @@ interface Internals {
   channelRegistry: unknown;
   mcplServerRegistry: unknown;
   mcplPrefixMap: Map<string, string>;
-  activeTriggerChannels: Map<string, string>;
+  turnChannelFor(agentName: string): ChannelRef | null | undefined;
   mcplHomeChannel: string | null;
   turnLocusPins: Map<string, string>;
   activeTurnTokens: Map<string, unknown>;
   deferredMessages: Array<{ id: string; metadata?: Record<string, unknown> }>;
   pendingRequests: Array<{ agentName: string; reason: string; channelId?: string; strictPlace?: string; timestamp: number }>;
-  recordChannelAutoOpenNotice(
-    agentName: string | undefined,
-    channels: Array<{ channelId: string; label?: string }>,
-    cause: string,
-  ): void;
+  recordChannelAutoOpenNotice(agentName: string | undefined, serverId: string, channels: Array<{ channelId: string; label?: string }>, cause: string): void;
   handleMcplPushEvent(event: unknown): unknown;
   handleMcplChannelIncoming(event: unknown): Promise<unknown>;
   processNextEvent(): Promise<void>;
@@ -252,18 +248,18 @@ function attachRegistry(fw: AgentFramework, seeds: Seed[], toolReplies: ToolRepl
     {
       sendTypingFn: () => {},
       homeChannelResolver: () => undefined,
-      activeChannelResolver: (name) => i.activeTriggerChannels.get(name),
+      activeChannelResolver: (name) => i.turnChannelFor(name),
       homeChannel: i.mcplHomeChannel ?? undefined,
       onRouteFailure: () => {},
-      onChannelAutoOpened: ({ conversationId, source, channels }) =>
-        i.recordChannelAutoOpenNotice(conversationId, channels, source),
+      onChannelAutoOpened: ({ conversationId, serverId, source, channels }) =>
+        i.recordChannelAutoOpenNotice(conversationId, serverId, channels, source),
     },
   );
   const map = (registry as unknown as {
     channels: Map<string, { serverId: string; descriptor: { id: string; type: string; label: string }; open: boolean }>;
   }).channels;
   for (const s of seeds) {
-    map.set(`${s.server}:${s.id}`, { serverId: s.server, descriptor: { id: s.id, type: s.server, label: s.label }, open: s.open });
+    map.set(destinationKey({ serverId: s.server, channelId: s.id }), { serverId: s.server, descriptor: { id: s.id, type: s.server, label: s.label }, open: s.open });
   }
   i.channelRegistry = registry;
   i.mcplServerRegistry = serverRegistry;
@@ -873,15 +869,19 @@ describe('strict routing final mutation review (ROUTING_STRICT=true, CHANNEL_OPE
     const h = await harness();
     const seen: Array<{ outgoing?: string; incoming?: string }> = [];
     const snapshot = async (): Promise<void> => {
-      const ctx = h.registry.buildChannelContext(AGENT);
-      seen.push({ outgoing: ctx?.defaultOutgoing?.channelId, incoming: ctx?.incoming?.channelId });
+      // Each server is told only its own channels' context.
+      const ctxs = ['discord', 'eidoverse'].map((server) => h.registry.buildChannelContext(AGENT, server));
+      seen.push({
+        outgoing: ctxs.map((c) => c?.defaultOutgoing?.channelId).find((id) => id !== undefined),
+        incoming: ctxs.map((c) => c?.incoming?.channelId).find((id) => id !== undefined),
+      });
     };
     h.probe.hooks.push(snapshot, snapshot);
     h.membrane
       .turn(round(tool('c1', 'probe--wait')), final(text('(kept between us)')))
       .turn(round(tool('c2', 'probe--wait')), final(text('Home check-in.')));
     // The registry's latest inbound is the whisper on the public world channel.
-    const reg = h.registry as unknown as { defaultPublishChannel: string | null; defaultPublishMessageId: string | null };
+    const reg = h.registry as unknown as { defaultPublishChannel: ChannelRef | null; defaultPublishMessageId: string | null };
     h.fw.pushEvent({
       type: 'mcpl:channel-incoming',
       serverId: 'eidoverse',
@@ -894,7 +894,7 @@ describe('strict routing final mutation review (ROUTING_STRICT=true, CHANNEL_OPE
       tags: ['chat:dm', 'chat:private', 'chat:addressed', 'eidoverse:whisper'],
       triggerInference: true,
     } as unknown as ProcessEvent);
-    reg.defaultPublishChannel = WORLD;
+    reg.defaultPublishChannel = { serverId: 'eidoverse', channelId: WORLD };
     reg.defaultPublishMessageId = 'w-latest';
     await h.fw.runUntilIdle();
     h.fw.pushEvent(heartbeatEvent());
@@ -1101,7 +1101,8 @@ describe('strict routing final mutation review (ROUTING_STRICT=true, CHANNEL_OPE
     assert.ok(sent, 'precondition: the first attempt failed and its retry waited out a backoff');
     assert.ok(h.traces.some((t) => t.type === 'inference:aborted' && t.reason === 'privileged-interrupt'), 'the retry was braked');
     const window = windowTexts(h.fw).join('\n');
-    assert.match(window, /\[interrupted\]/, 'the honest interruption marker is recorded');
+    // Upstream's deliberate-stop marker (abortInference → settleDeliberateCancel).
+    assert.match(window, /\[turn-interrupted\][^\n]*a deliberate stop, not a failure/, 'the honest interruption marker is recorded');
     assert.doesNotMatch(window, /\[inference-failed\]/, 'a deliberate brake is not recorded as a model failure');
     assert.deepEqual(publishedTo(h, DM), ['Stopped, as you asked.']);
     assert.deepEqual(h.turnLoci, [WORLD, DM]);

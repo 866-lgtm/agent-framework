@@ -14,7 +14,7 @@ import { join } from 'node:path';
 import type { ContentBlock, Membrane, NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
 import { AgentFramework } from '../src/index.js';
 import type { EventResponse, Module, ProcessEvent, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
-import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { ChannelRegistry, destinationKey, type ChannelRef } from '../src/mcpl/channel-registry.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
@@ -139,7 +139,7 @@ async function makeHarness(dir: string, opts: { gate?: boolean } = {}): Promise<
   const serverRegistry = { getServer: (id: string) => servers[id], getAllServers: () => [], closeAll: async () => {} };
   const i = fw as unknown as {
     channelRegistry: unknown; mcplServerRegistry: unknown; mcplPrefixMap: Map<string, string>;
-    activeTriggerChannels: Map<string, string>; mcplHomeChannel: string | null;
+    turnChannelFor(agentName: string): ChannelRef | null | undefined; mcplHomeChannel: string | null;
   };
   const registry = new ChannelRegistry(
     serverRegistry as unknown as McplServerRegistry,
@@ -149,7 +149,7 @@ async function makeHarness(dir: string, opts: { gate?: boolean } = {}): Promise<
     {
       sendTypingFn: () => {},
       homeChannelResolver: () => undefined,
-      activeChannelResolver: (name) => i.activeTriggerChannels.get(name),
+      activeChannelResolver: (name) => i.turnChannelFor(name),
       homeChannel: i.mcplHomeChannel ?? undefined,
     },
   );
@@ -157,7 +157,7 @@ async function makeHarness(dir: string, opts: { gate?: boolean } = {}): Promise<
     channels: Map<string, { serverId: string; descriptor: { id: string; type: string; label: string }; open: boolean }>;
   }).channels;
   const seed = (serverId: string, id: string, label: string, open: boolean) =>
-    map.set(`${serverId}:${id}`, { serverId, descriptor: { id, type: serverId, label }, open });
+    map.set(destinationKey({ serverId, channelId: id }), { serverId, descriptor: { id, type: serverId, label }, open });
   seed('discord', DM, 'DM: operator', false);
   seed('discord', HOME, 'home', true);
   seed('eidoverse', WORLD, 'plaza', true);

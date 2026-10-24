@@ -21,7 +21,7 @@ import { join } from 'node:path';
 import type { ContentBlock, Membrane, NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
 import { AgentFramework } from '../src/index.js';
 import type { EventResponse, Module, ProcessEvent, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
-import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { ChannelRegistry, destinationKey, type ChannelRef } from '../src/mcpl/channel-registry.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
@@ -110,11 +110,11 @@ interface Internals {
   channelRegistry: unknown;
   mcplServerRegistry: unknown;
   mcplPrefixMap: Map<string, string>;
-  activeTriggerChannels: Map<string, string>;
+  turnChannelFor(agentName: string): ChannelRef | null | undefined;
   mcplHomeChannel: string | null;
   deferredMessages: Array<{ id: string; metadata?: Record<string, unknown>; content: unknown[] }>;
   pendingRequests: Array<{ agentName: string; reason: string; channelId?: string }>;
-  recordChannelAutoOpenNotice(agentName: string | undefined, channels: Array<{ channelId: string; label?: string }>, cause: string): void;
+  recordChannelAutoOpenNotice(agentName: string | undefined, serverId: string, channels: Array<{ channelId: string; label?: string }>, cause: string): void;
   addMessage(participant: string, content: ContentBlock[], metadata?: Record<string, unknown>): string;
 }
 
@@ -167,17 +167,17 @@ function attachRegistry(fw: AgentFramework): { published: Publish[] } {
     {
       sendTypingFn: () => {},
       homeChannelResolver: () => undefined,
-      activeChannelResolver: (name) => i.activeTriggerChannels.get(name),
+      activeChannelResolver: (name) => i.turnChannelFor(name),
       homeChannel: i.mcplHomeChannel ?? undefined,
-      onChannelAutoOpened: ({ conversationId, source, channels }) =>
-        i.recordChannelAutoOpenNotice(conversationId, channels, source),
+      onChannelAutoOpened: ({ conversationId, serverId, source, channels }) =>
+        i.recordChannelAutoOpenNotice(conversationId, serverId, channels, source),
     },
   );
   const map = (registry as unknown as {
     channels: Map<string, { serverId: string; descriptor: { id: string; type: string; label: string }; open: boolean }>;
   }).channels;
   const seed = (serverId: string, id: string, label: string, open: boolean) =>
-    map.set(`${serverId}:${id}`, { serverId, descriptor: { id, type: serverId, label }, open });
+    map.set(destinationKey({ serverId, channelId: id }), { serverId, descriptor: { id, type: serverId, label }, open });
   seed('discord', DM, 'DM: operator', false);
   seed('discord', HOME, 'home', true);
   seed('discord', CLOSED, 'lounge', false);
@@ -597,7 +597,7 @@ describe('strict routing hunt — flag hygiene & durability (ROUTING_STRICT=true
     await h.fw.runUntilIdle();
     assert.deepEqual(publishedTo(h, DM), ['Hi, privately.']);
     assert.equal(
-      (h.internals.channelRegistry as ChannelRegistry).isChannelOpen(DM), true,
+      (h.internals.channelRegistry as ChannelRegistry).isChannelOpen({ serverId: 'discord', channelId: DM }), true,
       'precondition: delivery opened the DM',
     );
     assert.doesNotMatch(windowTexts(h.fw).join('\n'), /\[channels\] Now open/);
@@ -1085,11 +1085,10 @@ describe('strict routing hunt round 2 — flag hygiene (flags unset)', () => {
     }
   });
 
-  it('R2-HY1: flags unset, a batched gate wake hands the host the upstream provenance shape (no routeServerId)', () => {
-    // 9bc7d19 adds `routeServerId` to wakeProvenance() unconditionally: every
-    // gate-requested wake (EventGate requestInference callback — a public
-    // host contract, also used by hosts that construct EventGate directly)
-    // now carries a field upstream never sent, with ROUTING_STRICT unset.
+  it('R2-HY1: flags unset, a batched gate wake hands the host the upstream provenance shape', () => {
+    // Upstream (0.26, shared-channel-ids) sends `routeServerId` beside
+    // `routeChannelId` itself; the fork adds nothing to the provenance with
+    // ROUTING_STRICT unset (no `place`, no `firstAt`).
     const events = [{
       policyName: 'chat', content: 'hi', eventType: 'mcpl:channel-incoming', timestamp: 1000,
       inContext: true, channelId: WORLD, serverId: 'eidoverse', authorId: 'visitor',
@@ -1100,6 +1099,7 @@ describe('strict routing hunt round 2 — flag hygiene (flags unset)', () => {
       counterparty: 'eidoverse:user:visitor',
       addressed: true,
       routeChannelId: WORLD,
+      routeServerId: 'eidoverse',
       at: 1000,
     }, 'byte-identical upstream provenance when the routing flags are unset');
   });
@@ -1372,13 +1372,13 @@ describe('strict routing hunt round 2 — mutation guards (ROUTING_STRICT=true, 
       .turn(final(text('The job finished: SCRIPT-RESULT ready.')));
     h.fw.pushEvent(dmEvent('private: run my private job'));
     await h.fw.runUntilIdle();
-    // As startBackgroundScript records it for the turn that started it.
+    // As runCodeExecution records it for the turn that started the script.
     const fw = h.fw as unknown as {
       strictScriptPlaces: Map<string, string>;
-      injectScriptWake(record: { id: string; agentName: string }, envelope: string): void;
+      scriptWake(agentName: string, scriptId: string, text: string, label: string): Promise<void>;
     };
     fw.strictScriptPlaces.set('script-1', channelPlace('discord', DM));
-    fw.injectScriptWake({ id: 'script-1', agentName: AGENT }, '[script script-1 finished] SCRIPT-RESULT private payload');
+    await fw.scriptWake(AGENT, 'script-1', '[script script-1 finished] SCRIPT-RESULT private payload', 'script-1');
     await h.fw.runUntilIdle();
     assert.deepEqual(publishedTo(h, HOME), [], 'nothing of the DM job is said at home');
     assert.deepEqual(publishedTo(h, DM), ['Started the job.', 'The job finished: SCRIPT-RESULT ready.']);

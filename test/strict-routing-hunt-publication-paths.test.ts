@@ -29,7 +29,7 @@ import type {
   ToolDefinition,
   ToolResult,
 } from '../src/index.js';
-import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { ChannelRegistry, destinationKey, type ChannelRef } from '../src/mcpl/channel-registry.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
@@ -117,15 +117,11 @@ interface Internals {
   channelRegistry: unknown;
   mcplServerRegistry: unknown;
   mcplPrefixMap: Map<string, string>;
-  activeTriggerChannels: Map<string, string>;
+  turnChannelFor(agentName: string): ChannelRef | null | undefined;
   mcplHomeChannel: string | null;
   turnLocusPins: Map<string, string>;
   deferredMessages: Array<{ id: string; metadata?: Record<string, unknown> }>;
-  recordChannelAutoOpenNotice(
-    agentName: string | undefined,
-    channels: Array<{ channelId: string; label?: string }>,
-    cause: string,
-  ): void;
+  recordChannelAutoOpenNotice(agentName: string | undefined, serverId: string, channels: Array<{ channelId: string; label?: string }>, cause: string): void;
 }
 
 interface Publish { server: string; channelId: string; text: string; conversationId: string }
@@ -195,18 +191,18 @@ function attachRegistry(fw: AgentFramework, seeds: Seed[]) {
     {
       sendTypingFn: () => {},
       homeChannelResolver: () => undefined,
-      activeChannelResolver: (name) => i.activeTriggerChannels.get(name),
+      activeChannelResolver: (name) => i.turnChannelFor(name),
       homeChannel: i.mcplHomeChannel ?? undefined,
       onRouteFailure: () => {},
-      onChannelAutoOpened: ({ conversationId, source, channels }) =>
-        i.recordChannelAutoOpenNotice(conversationId, channels, source),
+      onChannelAutoOpened: ({ conversationId, serverId, source, channels }) =>
+        i.recordChannelAutoOpenNotice(conversationId, serverId, channels, source),
     },
   );
   const map = (registry as unknown as {
     channels: Map<string, { serverId: string; descriptor: { id: string; type: string; label: string }; open: boolean }>;
   }).channels;
   for (const s of seeds) {
-    map.set(`${s.server}:${s.id}`, { serverId: s.server, descriptor: { id: s.id, type: s.server, label: s.label }, open: s.open });
+    map.set(destinationKey({ serverId: s.server, channelId: s.id }), { serverId: s.server, descriptor: { id: s.id, type: s.server, label: s.label }, open: s.open });
   }
   i.channelRegistry = registry;
   i.mcplServerRegistry = serverRegistry;
@@ -635,8 +631,8 @@ describe('strict routing hunt — publication paths (ROUTING_STRICT=true, CHANNE
     h.probe.hooks.push(async () => {
       // A home-channel message accepted via channels/incoming mid-turn makes
       // it the registry's most recent inbound (handleIncoming's markAccepted).
-      const reg = h.registry as unknown as { defaultPublishChannel: string; defaultPublishMessageId: string };
-      reg.defaultPublishChannel = HOME;
+      const reg = h.registry as unknown as { defaultPublishChannel: ChannelRef; defaultPublishMessageId: string };
+      reg.defaultPublishChannel = { serverId: 'discord', channelId: HOME };
       reg.defaultPublishMessageId = 'home-msg-77';
       await settle();
     });
@@ -659,8 +655,8 @@ describe('strict routing hunt — publication paths (ROUTING_STRICT=true, CHANNE
     h.membrane.turn(createMockResponse([], 'refusal'));
     // The waking message, accepted via channels/incoming (handleIncoming's
     // markAccepted makes it the most recent inbound).
-    const reg = h.registry as unknown as { defaultPublishChannel: string; defaultPublishMessageId: string };
-    reg.defaultPublishChannel = GUILD;
+    const reg = h.registry as unknown as { defaultPublishChannel: ChannelRef; defaultPublishMessageId: string };
+    reg.defaultPublishChannel = { serverId: 'discord', channelId: GUILD };
     reg.defaultPublishMessageId = 'general-msg-5';
     h.fw.pushEvent(worldEvent('@resident something borderline', { serverId: 'discord', channelId: GUILD }));
     await h.fw.runUntilIdle();
@@ -1147,7 +1143,12 @@ describe('strict routing hunt — publication paths, round 2 (ROUTING_STRICT=tru
 
     h.fw.pushEvent(dmEvent('private: what was the address and the gate code again?'));
     const run = h.fw.runUntilIdle();
-    await waitFor('the world turn to publish', () => h.published.some((p) => p.channelId === WORLD));
+    // Upstream (0.22+) keeps a turn's queued deliveries on its own routing
+    // (TurnRouting) and can settle the DM turn's chain before the next turn
+    // starts; either way the world turn must not receive the DM's words. Give
+    // the world turn its chance to run while the DM's first post is slow.
+    const deadline = Date.now() + 1500;
+    while (!h.published.some((p) => p.channelId === WORLD) && Date.now() < deadline) await settle(10);
     release();
     await run;
     await settle(80);

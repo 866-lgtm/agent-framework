@@ -37,7 +37,7 @@ import type {
   ToolDefinition,
   ToolResult,
 } from '../src/index.js';
-import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { ChannelRegistry, destinationKey, type ChannelRef } from '../src/mcpl/channel-registry.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
@@ -136,15 +136,11 @@ interface Internals {
   channelRegistry: unknown;
   mcplServerRegistry: unknown;
   mcplPrefixMap: Map<string, string>;
-  activeTriggerChannels: Map<string, string>;
+  turnChannelFor(agentName: string): ChannelRef | null | undefined;
   mcplHomeChannel: string | null;
   deferredMessages: Array<{ id: string; metadata?: Record<string, unknown> }>;
   strictArmings: Array<{ serverId: string; place: string; ids: string[]; texts: string[] }>;
-  recordChannelAutoOpenNotice(
-    agentName: string | undefined,
-    channels: Array<{ channelId: string; label?: string }>,
-    cause: string,
-  ): void;
+  recordChannelAutoOpenNotice(agentName: string | undefined, serverId: string, channels: Array<{ channelId: string; label?: string }>, cause: string): void;
   handleMcplPushEvent(event: unknown): unknown;
   handleMcplChannelIncoming(event: unknown): Promise<unknown>;
 }
@@ -282,18 +278,18 @@ function attachRegistry(fw: AgentFramework, seeds: Seed[], heartbeat: FakeHeartb
     {
       sendTypingFn: () => {},
       homeChannelResolver: () => undefined,
-      activeChannelResolver: (name) => i.activeTriggerChannels.get(name),
+      activeChannelResolver: (name) => i.turnChannelFor(name),
       homeChannel: i.mcplHomeChannel ?? undefined,
       onRouteFailure: () => {},
-      onChannelAutoOpened: ({ conversationId, source, channels }) =>
-        i.recordChannelAutoOpenNotice(conversationId, channels, source),
+      onChannelAutoOpened: ({ conversationId, serverId, source, channels }) =>
+        i.recordChannelAutoOpenNotice(conversationId, serverId, channels, source),
     },
   );
   const map = (registry as unknown as {
     channels: Map<string, { serverId: string; descriptor: { id: string; type: string; label: string }; open: boolean }>;
   }).channels;
   for (const s of seeds) {
-    map.set(`${s.server}:${s.id}`, { serverId: s.server, descriptor: { id: s.id, type: s.server, label: s.label }, open: s.open });
+    map.set(destinationKey({ serverId: s.server, channelId: s.id }), { serverId: s.server, descriptor: { id: s.id, type: s.server, label: s.label }, open: s.open });
   }
   i.channelRegistry = registry;
   i.mcplServerRegistry = serverRegistry;

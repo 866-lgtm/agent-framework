@@ -31,7 +31,7 @@ import type {
   ToolDefinition,
   ToolResult,
 } from '../src/index.js';
-import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { ChannelRegistry, destinationKey, type ChannelRef } from '../src/mcpl/channel-registry.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
@@ -136,16 +136,12 @@ interface Internals {
   channelRegistry: unknown;
   mcplServerRegistry: unknown;
   mcplPrefixMap: Map<string, string>;
-  activeTriggerChannels: Map<string, string>;
+  turnChannelFor(agentName: string): ChannelRef | null | undefined;
   mcplHomeChannel: string | null;
   turnLocusPins: Map<string, string>;
   deferredMessages: Array<{ id: string; metadata?: Record<string, unknown> }>;
   pendingRequests: Array<{ agentName: string; reason: string; channelId?: string }>;
-  recordChannelAutoOpenNotice(
-    agentName: string | undefined,
-    channels: Array<{ channelId: string; label?: string }>,
-    cause: string,
-  ): void;
+  recordChannelAutoOpenNotice(agentName: string | undefined, serverId: string, channels: Array<{ channelId: string; label?: string }>, cause: string): void;
   handleMcplPushEvent(event: unknown): unknown;
   handleMcplChannelIncoming(event: unknown): Promise<unknown>;
 }
@@ -216,18 +212,18 @@ function attachRegistry(fw: AgentFramework): Omit<Harness, 'fw' | 'membrane' | '
     {
       sendTypingFn: () => {},
       homeChannelResolver: () => undefined,
-      activeChannelResolver: (name) => i.activeTriggerChannels.get(name),
+      activeChannelResolver: (name) => i.turnChannelFor(name),
       homeChannel: i.mcplHomeChannel ?? undefined,
       onRouteFailure: ({ channelId, reason }) => { routeFailures.push({ channelId, reason }); },
-      onChannelAutoOpened: ({ conversationId, source, channels }) =>
-        i.recordChannelAutoOpenNotice(conversationId, channels, source),
+      onChannelAutoOpened: ({ conversationId, serverId, source, channels }) =>
+        i.recordChannelAutoOpenNotice(conversationId, serverId, channels, source),
     },
   );
   const map = (registry as unknown as {
     channels: Map<string, { serverId: string; descriptor: { id: string; type: string; label: string }; open: boolean }>;
   }).channels;
   const seed = (serverId: string, id: string, label: string, open: boolean) =>
-    map.set(`${serverId}:${id}`, { serverId, descriptor: { id, type: serverId, label }, open });
+    map.set(destinationKey({ serverId, channelId: id }), { serverId, descriptor: { id, type: serverId, label }, open });
   seed('discord', DM, 'DM: operator', false); // DMs register closed
   seed('discord', HOME, 'home', true);
   seed('discord', CLOSED, 'lounge', false);
@@ -447,7 +443,7 @@ describe('strict routing privacy (ROUTING_STRICT=true, CHANNEL_OPEN_ON_SEND=fals
     // Delivering into the closed DM did not open it (CHANNEL_OPEN_ON_SEND=false),
     // and no notices of any kind were written.
     assert.deepEqual(h.opens, []);
-    assert.equal(h.registry.isChannelOpen(DM), false);
+    assert.equal(h.registry.isChannelOpen({ serverId: 'discord', channelId: DM }), false);
     const window = windowTexts(h.fw).join('\n');
     assert.doesNotMatch(window, /\[routing\]|\[delivered\]|\[channels\] Now open/);
   });
@@ -518,7 +514,7 @@ describe('strict routing privacy (ROUTING_STRICT=true, CHANNEL_OPEN_ON_SEND=fals
   it('P4: a no-trigger heartbeat turn publishes to the home channel only', async () => {
     const h = await harness();
     // A most-recent-inbound default that must NOT be used.
-    (h.registry as unknown as { defaultPublishChannel: string }).defaultPublishChannel = WORLD;
+    (h.registry as unknown as { defaultPublishChannel: ChannelRef }).defaultPublishChannel = { serverId: 'eidoverse', channelId: WORLD };
     h.membrane.turn(final(text('Quiet afternoon check-in.')));
     h.fw.pushEvent(heartbeatEvent());
     await h.fw.runUntilIdle();
@@ -528,7 +524,7 @@ describe('strict routing privacy (ROUTING_STRICT=true, CHANNEL_OPEN_ON_SEND=fals
 
   it('P4: with no home channel configured, a no-trigger turn publishes nowhere (kept private, no failure marker)', async () => {
     const h = await harness({ homeChannel: null });
-    (h.registry as unknown as { defaultPublishChannel: string }).defaultPublishChannel = WORLD;
+    (h.registry as unknown as { defaultPublishChannel: ChannelRef }).defaultPublishChannel = { serverId: 'eidoverse', channelId: WORLD };
     h.membrane.turn(
       round(text('Thinking out loud.'), tool('c1', 'probe--wait')),
       final(text('Private musing.')),
@@ -579,11 +575,11 @@ describe('strict routing privacy (ROUTING_STRICT=true, CHANNEL_OPEN_ON_SEND=fals
 
     assert.deepEqual(h.sends, [{ server: 'discord', tool: 'send_message', args: { channelId: CLOSED, text: 'note for the lounge' } }]);
     assert.deepEqual(h.turnLoci, [DM]);
-    assert.equal(h.internals.turnLocusPins.get(AGENT), DM, 'the locus never moved');
+    assert.equal(h.internals.turnChannelFor(AGENT)?.channelId, DM, 'the locus never moved');
     assert.deepEqual(publishedTo(h, DM), ['Passing that along.', 'Done — back to you.'], 'prose not silenced');
     assert.deepEqual(publishedTo(h, CLOSED), [], 'the explicit send is the only thing that reached the lounge');
     assert.deepEqual(h.opens, [], 'no channel was opened');
-    assert.equal(h.registry.isChannelOpen(CLOSED), false);
+    assert.equal(h.registry.isChannelOpen({ serverId: 'discord', channelId: CLOSED }), false);
     assert.equal(h.registry.getDesiredState('discord', CLOSED), undefined, 'no lifecycle change recorded');
   });
 
@@ -596,7 +592,7 @@ describe('strict routing privacy (ROUTING_STRICT=true, CHANNEL_OPEN_ON_SEND=fals
     h.fw.pushEvent(dmEvent('private: are you there?'));
     await h.fw.runUntilIdle();
     assert.deepEqual(h.turnLoci, [DM]);
-    assert.equal(h.internals.turnLocusPins.get(AGENT), DM);
+    assert.equal(h.internals.turnChannelFor(AGENT)?.channelId, DM);
     assert.deepEqual(publishedTo(h, DM), ['One moment.', 'Back in the DM.']);
     assert.deepEqual(publishedTo(h, WORLD), []);
   });
@@ -876,7 +872,7 @@ describe('strict routing flags unset (P10: upstream behavior unchanged)', () => 
   it('a no-trigger turn with no home channel falls back to the most-recent-inbound channel (upstream)', async () => {
     const h = await makeHarness(dir, { homeChannel: null });
     try {
-      (h.registry as unknown as { defaultPublishChannel: string }).defaultPublishChannel = WORLD;
+      (h.registry as unknown as { defaultPublishChannel: ChannelRef }).defaultPublishChannel = { serverId: 'eidoverse', channelId: WORLD };
       h.membrane.turn(final(text('musing')));
       h.fw.pushEvent(heartbeatEvent());
       await h.fw.runUntilIdle();
@@ -919,35 +915,35 @@ describe('ChannelRegistry under ROUTING_STRICT / CHANNEL_OPEN_ON_SEND=false', ()
       () => {},
       () => {},
       {
-        activeChannelResolver: () => opts.active,
+        activeChannelResolver: () => (opts.active ? { serverId: 'discord', channelId: opts.active } : undefined),
         homeChannel: opts.homeChannel,
         onRouteFailure: ({ reason }) => { failures.push(reason); },
       },
     );
     const r = registry as unknown as {
       channels: Map<string, { serverId: string; descriptor: { id: string; type: string; label: string }; open: boolean }>;
-      defaultPublishChannel: string | null;
+      defaultPublishChannel: ChannelRef | null;
       defaultPublishMessageId: string | null;
     };
-    r.channels.set(`discord:${DM}`, { serverId: 'discord', descriptor: { id: DM, type: 'discord', label: 'DM: operator' }, open: false });
-    r.channels.set(`discord:${HOME}`, { serverId: 'discord', descriptor: { id: HOME, type: 'discord', label: 'home' }, open: true });
-    r.defaultPublishChannel = DM; // the most recent inbound
+    r.channels.set(destinationKey({ serverId: 'discord', channelId: DM }), { serverId: 'discord', descriptor: { id: DM, type: 'discord', label: 'DM: operator' }, open: false });
+    r.channels.set(destinationKey({ serverId: 'discord', channelId: HOME }), { serverId: 'discord', descriptor: { id: HOME, type: 'discord', label: 'home' }, open: true });
+    r.defaultPublishChannel = { serverId: 'discord', channelId: DM }; // the most recent inbound
     r.defaultPublishMessageId = 'm-last';
     return { registry, published, opens, failures };
   }
 
   it('resolveLocus / buildChannelContext never fall back to the most recent inbound under ROUTING_STRICT', () => {
     const { registry } = bareRegistry();
-    assert.equal(registry.resolveLocus(AGENT), DM, 'upstream falls back to the most recent inbound');
-    assert.equal(registry.buildChannelContext(AGENT)?.defaultOutgoing?.channelId, DM);
+    assert.equal(registry.resolveLocus(AGENT)?.channelId, DM, 'upstream falls back to the most recent inbound');
+    assert.equal(registry.buildChannelContext(AGENT, 'discord')?.defaultOutgoing?.channelId, DM);
     process.env.ROUTING_STRICT = 'true';
     assert.equal(registry.resolveLocus(AGENT), null);
-    const ctx = registry.buildChannelContext(AGENT);
+    const ctx = registry.buildChannelContext(AGENT, 'discord');
     assert.equal(ctx?.defaultOutgoing, undefined);
     assert.equal(ctx?.incoming, undefined, 'another place\'s latest message is not advertised');
     const homed = bareRegistry({ homeChannel: HOME }).registry;
-    assert.equal(homed.resolveLocus(AGENT), HOME);
-    assert.equal(bareRegistry({ homeChannel: HOME, active: DM }).registry.buildChannelContext(AGENT)?.incoming?.channelId, DM,
+    assert.equal(homed.resolveLocus(AGENT)?.channelId, HOME);
+    assert.equal(bareRegistry({ homeChannel: HOME, active: DM }).registry.buildChannelContext(AGENT, 'discord')?.incoming?.channelId, DM,
       'the incoming message is named when it is the outgoing place');
   });
 
@@ -956,7 +952,7 @@ describe('ChannelRegistry under ROUTING_STRICT / CHANNEL_OPEN_ON_SEND=false', ()
     process.env.ROUTING_STRICT = 'true';
     const refused = await registry.handleChannelToolCall('channel_publish', { content: 'hello' });
     assert.equal(refused.success, false);
-    assert.match(String(refused.error), /channelId is required/);
+    assert.match(String(refused.error), /needs a `channelId`, and there's no channel to default to/);
     assert.deepEqual(published, []);
     const ok = await registry.handleChannelToolCall('channel_publish', { channelId: HOME, content: 'hello' });
     assert.equal(ok.success, true);
@@ -975,11 +971,11 @@ describe('ChannelRegistry under ROUTING_STRICT / CHANNEL_OPEN_ON_SEND=false', ()
   it('CHANNEL_OPEN_ON_SEND=false: routed prose and explicit sends deliver into a closed channel without opening it', async () => {
     process.env.CHANNEL_OPEN_ON_SEND = 'false';
     const { registry, published, opens } = bareRegistry();
-    const outcome = await registry.routeSpeech(AGENT, 'quiet reply', DM);
-    assert.deepEqual(outcome, { delivered: true, channelId: DM });
+    const outcome = await registry.routeSpeech(AGENT, 'quiet reply', { serverId: 'discord', channelId: DM });
+    assert.deepEqual(outcome, { delivered: true, serverId: 'discord', channelId: DM });
     assert.deepEqual(published.map((p) => p.channelId), [DM]);
     assert.deepEqual(opens, []);
-    assert.equal(registry.isChannelOpen(DM), false);
+    assert.equal(registry.isChannelOpen({ serverId: 'discord', channelId: DM }), false);
     assert.equal(registry.getDesiredState('discord', DM), undefined, 'no lifecycle entry');
     const sent = await registry.openIfClosedForSend(DM, 'discord');
     assert.equal(sent.status, 'left-closed');
