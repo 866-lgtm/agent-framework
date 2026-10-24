@@ -12624,8 +12624,8 @@ export class AgentFramework {
             roundToolNames.length > 0 && roundToolNames.every(n => bareToolName(n) === 'think');
           let thinkGuardEndTurn = false;
           if (thinkOnlyRound) {
-            const n = (this.consecutiveThinkRounds.get(agent.name) ?? 0) + 1;
-            this.consecutiveThinkRounds.set(agent.name, n);
+            const n = (this.consecutiveThinkRounds?.get(agent.name) ?? 0) + 1;
+            this.consecutiveThinkRounds?.set(agent.name, n);
             if (THINK_HARD_CAP > 0 && n >= THINK_HARD_CAP) {
               // Backstop: break a runaway think loop by ending the turn. The
               // shouldEndTurn branch below emits inference:turn_ended.
@@ -12645,7 +12645,7 @@ export class AgentFramework {
               }
             }
           } else {
-            this.consecutiveThinkRounds.delete(agent.name);
+            this.consecutiveThinkRounds?.delete(agent.name);
           }
 
           // Effective inline cap: agent_settings override → durable config →
@@ -18679,10 +18679,10 @@ export class AgentFramework {
         const parkedPlace = routingStrict() && !isTurnContinuation(trigger?.reason ?? '')
           ? this.strictWakePlace(agent.name, trigger)
           : undefined;
-        if (parkedPlace !== undefined) this.strictParkedPlaces.set(agent.name, parkedPlace);
+        if (parkedPlace !== undefined) this.strictParkedPlaces?.set(agent.name, parkedPlace);
         const unpark = (): void => {
-          if (parkedPlace !== undefined && this.strictParkedPlaces.get(agent.name) === parkedPlace) {
-            this.strictParkedPlaces.delete(agent.name);
+          if (parkedPlace !== undefined && this.strictParkedPlaces?.get(agent.name) === parkedPlace) {
+            this.strictParkedPlaces?.delete(agent.name);
           }
         };
         void this.waitForAuxiliaryIdle(agent.name).then(async () => {
@@ -18690,18 +18690,18 @@ export class AgentFramework {
           // A continuation dropped while it was parked left the set then, with
           // its admission given back.
           if (parkedContinuation && !this.parkedContinuations.delete(trigger)) {
-            this.strictParkBrakes.delete(agent.name);
+            this.strictParkBrakes?.delete(agent.name);
             return;
           }
           if (this.providerAdmissionClosed) {
-            this.strictParkBrakes.delete(agent.name);
+            this.strictParkBrakes?.delete(agent.name);
             this.releasePrimaryProviderGate(agent.name);
             return;
           }
           // ROUTING_STRICT: a privileged message braked this parked wake —
           // it goes back to the queue, where the braking message's wake
           // starts first (processInferenceRequests).
-          if (this.strictParkBrakes.delete(agent.name)) {
+          if (this.strictParkBrakes?.delete(agent.name)) {
             this.releasePrimaryProviderGate(agent.name);
             this.pendingRequests.push(trigger ?? {
               agentName: agent.name, reason: 'provider-admission:requeue', source: 'scheduler', timestamp: Date.now(),
@@ -18754,7 +18754,7 @@ export class AgentFramework {
           await this.startAgentStream(agent, trigger, attempt, true);
         }).catch((error) => {
           unpark();
-          this.strictParkBrakes.delete(agent.name);
+          this.strictParkBrakes?.delete(agent.name);
           this.releasePrimaryProviderGate(agent.name);
           console.error(`[provider-cooldown] failed to resume primary for ${agent.name}: ${describeFailureWithFrames(error)}`);
         });
@@ -19503,7 +19503,7 @@ export class AgentFramework {
     // Tool-round resumes continue inside driveStream and never re-enter here,
     // so this resets once per stream (rare mid-turn restarts only make the
     // guard more lenient, never falsely strict).
-    this.consecutiveThinkRounds.delete(agent.name);
+    this.consecutiveThinkRounds?.delete(agent.name);
 
     // Typing indicator, started at TURN START. It says "attending", which is
     // true from the moment the turn is accepted — but it used to start inside

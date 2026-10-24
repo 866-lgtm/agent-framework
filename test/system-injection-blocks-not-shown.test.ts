@@ -40,7 +40,13 @@ class InjectionModule implements Module {
 function captureConsoleError(t: { after: (fn: () => void) => void }): string[] {
   const lines: string[] = [];
   const original = console.error;
-  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+  console.error = (...args: unknown[]) => {
+    const line = args.map(String).join(' ');
+    // The fork logs a turn that completes with nothing in it (the mocks'
+    // empty responses); that line is about the response, not the injection.
+    if (/^\[inference\] \S+: empty completion/.test(line)) return;
+    lines.push(line);
+  };
   t.after(() => { console.error = original; });
   return lines;
 }

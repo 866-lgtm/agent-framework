@@ -327,6 +327,7 @@ describe('physical-window mid-turn restart (issue #92)', () => {
         systemPrompt: 'You are prime.',
         allowedTools: 'all',
         maxTokens: 32_000,
+        maxStreamTokens: ISOLATE_PROJECTION,
         physicalWindowTokens: 200_000,
       }],
       modules: [module],

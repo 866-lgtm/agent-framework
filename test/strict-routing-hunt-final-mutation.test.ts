@@ -160,7 +160,6 @@ interface Internals {
   mcplPrefixMap: Map<string, string>;
   turnChannelFor(agentName: string): ChannelRef | null | undefined;
   mcplHomeChannel: string | null;
-  turnLocusPins: Map<string, string>;
   activeTurnTokens: Map<string, unknown>;
   deferredMessages: Array<{ id: string; metadata?: Record<string, unknown> }>;
   pendingRequests: Array<{ agentName: string; reason: string; channelId?: string; strictPlace?: string; timestamp: number }>;

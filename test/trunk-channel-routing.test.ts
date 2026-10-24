@@ -508,6 +508,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
         ensureChannelRegistered: () => {},
         isChannelOpen: () => false,
         getDescriptor: () => ({ label: 'portables', capabilities: { history: { maxMessages: 80 } } }),
+        getChannelLabel: () => 'portables',
         proseTargetFor: (ref: { channelId: string }) => { asked.push(ref.channelId); return '#portables'; },
         inboundOnlyServer: () => undefined,
         stopAll: () => {},

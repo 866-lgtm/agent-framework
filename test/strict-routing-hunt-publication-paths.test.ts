@@ -119,7 +119,6 @@ interface Internals {
   mcplPrefixMap: Map<string, string>;
   turnChannelFor(agentName: string): ChannelRef | null | undefined;
   mcplHomeChannel: string | null;
-  turnLocusPins: Map<string, string>;
   deferredMessages: Array<{ id: string; metadata?: Record<string, unknown> }>;
   recordChannelAutoOpenNotice(agentName: string | undefined, serverId: string, channels: Array<{ channelId: string; label?: string }>, cause: string): void;
 }

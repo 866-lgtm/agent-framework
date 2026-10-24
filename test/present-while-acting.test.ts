@@ -711,8 +711,8 @@ describe('present while acting', () => {
     const origHandle = module.handleToolCall.bind(module);
     module.handleToolCall = async (call) => {
       (framework as unknown as {
-        turnEngagedChannels: Map<string, Set<string>>;
-      }).turnEngagedChannels.set('assistant', new Set(['discord:guild:bot-lounge']));
+        turnRouting: Map<string, { engaged: Set<string> }>;
+      }).turnRouting.get('assistant')!.engaged.add(destinationKey(stub('discord:guild:bot-lounge')));
       return origHandle(call);
     };
 

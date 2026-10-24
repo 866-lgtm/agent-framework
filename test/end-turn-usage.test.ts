@@ -406,7 +406,9 @@ describe('a stream counts its usage once, however it ends', () => {
   };
   for (const [reason, limits, usage] of [
     ['context_budget', { maxStreamTokens: 50 }, firstUsage],
-    ['physical_window', { physicalWindowTokens: 200_000, maxTokens: 4_000 }, nearCap],
+    // maxStreamTokens far above the window: the per-call budget restart
+    // compares the same 200k real prompt and would otherwise fire first.
+    ['physical_window', { physicalWindowTokens: 200_000, maxTokens: 4_000, maxStreamTokens: 1_000_000 }, nearCap],
   ] as const) {
     it(`a ${reason} restart counts and logs the stream it cancels, without completing the turn`, async () => {
       const dir = mkdtempSync(join(tmpdir(), 'af-end-turn-usage-'));
