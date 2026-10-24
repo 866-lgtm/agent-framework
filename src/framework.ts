@@ -14217,8 +14217,8 @@ export class AgentFramework {
     /** Characters across those dropped messages. */
     missedCharacters?: number;
     /** Prose-routing mode of the agent that will read the invitation —
-     *  decides how option 1 says to reply. Defaults to 'locus' (the Agent
-     *  default). */
+     *  decides how option 1 says to reply. Absent: the `>>` (explicit)
+     *  wording, as upstream words it for every mode. */
     proseRouting?: Agent['proseRouting'];
     /** Whether this message starts a turn (triggerInference). Locus/hybrid
      *  only: a non-waking message does not become the turn's locus, so a
@@ -14260,7 +14260,9 @@ export class AgentFramework {
     // points at an explicit send tool. CHANNEL_OPEN_ON_SEND=false: delivery
     // leaves the channel's lifecycle alone, and the wording says so.
     const opensOnSend = channelOpenOnSend();
-    const mode = opts.proseRouting ?? 'locus';
+    // A caller that names no mode gets upstream's `>>` wording (the ingest
+    // paths always name the reading agent's mode).
+    const mode = opts.proseRouting ?? 'explicit';
     let replyOption: string;
     if (inboundOnlyServer) {
       replyOption = `1. Replying there isn't available: ${inboundOnlyServer} declared this channel inbound-only, so nothing ` +
