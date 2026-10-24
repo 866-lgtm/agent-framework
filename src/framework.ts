@@ -3086,6 +3086,11 @@ export class AgentFramework {
    *  turn — drives the think loop guard (see THINK_SOFT_CAP / THINK_HARD_CAP).
    *  Reset at each fresh inference start and on any non-think round. */
   private consecutiveThinkRounds: Map<string, number> = new Map();
+  /** ROUTING_STRICT: the place of the turn that held each draft (keyed
+   *  `${agent}\u0000${draftId}`), so `{{unsent}}` never pastes another
+   *  place's bounced words. Memory-only: after a restart a bounce draft
+   *  names no place and `{{unsent}}` takes nothing. */
+  private strictDraftPlaces: Map<string, string> = new Map();
   /**
    * The latest link of each agent's chain of queued prose deliveries. Every
    * stream queues its own behind it, a fresh turn's included, so the agent's
@@ -16065,7 +16070,7 @@ export class AgentFramework {
             delete routing.pin;
             routing.hybridHold = 'failed';
           }
-          const words = this.unsentWords(agent, parsed.body);
+          const words = this.unsentWords(agent, parsed.body, undefined, routing);
           if ('draft' in words) {
             if (!kept.includes(words.draft)) kept.push(words.draft);
           } else {
@@ -16133,6 +16138,9 @@ export class AgentFramework {
     }
     if (held.length === 0) return held;
     logical.drafts.push(...held);
+    if (routingStrict() && logical.strictPlace !== undefined) {
+      for (const d of held) this.strictDraftPlaces.set(`${agent.name}\u0000${d.id}`, logical.strictPlace);
+    }
     console.error(`[drafts] ${agent.name}: held ${held.length} segment(s) as ${held.map((d) => d.id).join(', ')} (${reason})`);
     this.emitTrace({
       type: 'prose:drafts-held',
@@ -16147,7 +16155,10 @@ export class AgentFramework {
         if (target) this.addMessage(
           'user',
           [{ type: 'text', text: this.draftsHeldNotice(agent.name, held, reason) }],
-          { system: true, kind: 'prose-drafts', draftOwner: agent.name, draftIds: held.map((d) => d.id) } as MessageMetadata,
+          {
+            system: true, kind: 'prose-drafts', draftOwner: agent.name, draftIds: held.map((d) => d.id),
+            ...this.strictRoundPlace(opts.routing),
+          } as MessageMetadata,
           target,
         );
       } catch (err) {
@@ -17978,7 +17989,7 @@ export class AgentFramework {
     round: ProseRound,
     prefix: '>>' | '>>>',
   ): { draft?: Draft; refused?: true } {
-    const draft = this.proseDrafts.latestBounce(agent.name);
+    const draft = this.latestBounceFor(agent.name, round.routing);
     if (!draft) {
       // {{unsent}} names nothing now: the latest bounce draft was sent, set
       // aside or let go, or there never was one. Send nothing rather than a
@@ -18020,7 +18031,7 @@ export class AgentFramework {
     } else {
       return { draft };
     }
-    const words = this.unsentWords(agent, body);
+    const words = this.unsentWords(agent, body, undefined, round.routing);
     const held = 'draft' in words
       ? undefined
       : this.holdProseDrafts(
@@ -18380,6 +18391,17 @@ export class AgentFramework {
    *  with a cause of its own (processInferenceRequests). */
   private static readonly PROSE_BOUNCE_WAKE_CAP = 2;
 
+  /** The agent's latest bounce draft, which `{{unsent}}` names. ROUTING_STRICT:
+   *  only one held in the same place as `routing`'s turn — a turn never
+   *  pastes another place's bounced words. */
+  private latestBounceFor(agentName: string, routing: TurnRouting | undefined): Draft | undefined {
+    const draft = this.proseDrafts.latestBounce(agentName);
+    if (!draft || !routingStrict()) return draft;
+    const held = this.strictDraftPlaces.get(`${agentName}\u0000${draft.id}`);
+    const own = routing?.strictPlace;
+    return held !== undefined && own !== undefined && samePlace(held, own) ? draft : undefined;
+  }
+
   /**
    * Words about to be held that may use `{{unsent}}` (a bounce, or an
    * envelope an explicit send suppressed), under the one re-bounce rule. A
@@ -18399,6 +18421,9 @@ export class AgentFramework {
     /** The draft `{{unsent}}` was substituted with, when the words are held
      *  after that send: the latest bounce may have changed while it waited. */
     substituted?: Draft,
+    /** The turn the words belong to (ROUTING_STRICT: its place scopes the
+     *  latest bounce, latestBounceFor). */
+    routing?: TurnRouting,
   ): { draft: Draft } | { text: string; inheritedRisk?: InheritedRisk } {
     if (!text.includes('{{unsent}}')) return { text };
     const name = agent.name;
@@ -18406,7 +18431,7 @@ export class AgentFramework {
     // the attempt, not before it.
     const previous = substituted
       ? this.proseDrafts.get(name, substituted.id) ?? substituted
-      : this.proseDrafts.latestBounce(name);
+      : this.latestBounceFor(name, routing);
     if (previous && text.trim() === '{{unsent}}') return { draft: previous };
     const expanded = text.replaceAll('{{unsent}}', () => previous?.text ?? '');
     if (!previous || !(draftState(previous) === 'unconfirmed' || this.draftsInFlight.has(`${name}\u0000${previous.id}`))) {
@@ -18479,7 +18504,7 @@ export class AgentFramework {
       console.error(`[prose] ${name}: ${text.length} chars may not have been delivered — ${reason}`);
       return;
     }
-    const words = this.unsentWords(agent, text, after.substituted);
+    const words = this.unsentWords(agent, text, after.substituted, round.routing);
     let draft: Draft | undefined;
     let inherited: InheritedRisk | undefined;
     if ('draft' in words) {
@@ -24603,7 +24628,12 @@ export class AgentFramework {
     // buffer are memory-only, and a stop or crash before they fire must
     // re-arm the place's turn (rearmStrictHeldWakes), not demote it.
     const ownGateWake = (): boolean => this.strictGateWakePlaces(agentName).some((p) => samePlace(p, place));
-    if (this.activeTurnTokens?.has(agentName) || this.activeStreams?.has(agentName)) {
+    // A turn is alive while it holds its token, streams, or has a
+    // continuation or retry on its way (hasTurn): a budget restart between
+    // its frames must not take another place's message into its compile.
+    const turnAlive = this.activeTurnTokens?.has(agentName) || this.activeStreams?.has(agentName)
+      || (this.activeTurnTokens !== undefined && this.hasTurn(agentName));
+    if (turnAlive) {
       if (samePlace(place, this.strictTurnPlaces?.get(agentName) ?? STRICT_NOWHERE)) return false;
       return ownGateWake() ? 'gate-wake' : 'hold';
     }
@@ -25146,7 +25176,7 @@ export class AgentFramework {
     const targets = new Set<string>();
     for (const msg of this.deferredMessages) {
       const target = msg.forAgent ?? this.primaryAgentName;
-      if (target && !this.activeTurnTokens.has(target) && !this.activeStreams.has(target)
+      if (target && !this.hasTurn(target) && !this.activeStreams.has(target)
         && !this.pendingAssistantBlocks.has(target)) targets.add(target);
     }
     for (const target of targets) {
