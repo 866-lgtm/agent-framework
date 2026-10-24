@@ -29033,21 +29033,28 @@ export class AgentFramework {
         if (!Array.isArray(direct.data)) return direct;
         // Each block by the classifier, then what's nested in each, at any
         // depth. The blocks came from the wire as JSON, so the round trip
-        // changes nothing else. But a value that parsed can still fail to
-        // go back: past some depth JSON.stringify overflows the stack where
+        // changes nothing else. But a value that parsed can still fail to go
+        // back: past some depth JSON.stringify overflows the stack where
         // JSON.parse didn't (on Node 24.19 an array 5,000 deep does, on Bun
-        // 1.4.4 one 200,000 deep). That fails the script lane's treatment
-        // alone, and the peer answered: the result keeps the peer's outcome
-        // for the trace and the call's terminal, and the script lane's exit
-        // answers it as a result it can't convert, not as a failed dispatch
-        // (SCRIPT_RESULT_UNCONVERTIBLE). Its blocks are dropped, since they
-        // are untreated and the result travels on, to the waiter and to the
-        // listeners of its event's trace. Its structured content is kept, as
-        // every result keeps it, since RFC-005's treatment doesn't reach it.
+        // 1.4.4 one 200,000 deep), and a result past the runtime's longest
+        // string can't be stringified either. Each throws a RangeError, and
+        // each is a result the script lane can't convert. Wire JSON has no
+        // BigInt and no cycles, and the treatment throws no RangeError of its
+        // own, so anything else thrown is a fault, which fails the dispatch
+        // as any fault does. A result it can't convert fails the script
+        // lane's treatment alone, and the peer answered: the result keeps the
+        // peer's outcome for the trace and the call's terminal, and the
+        // script lane's exit answers it as a result it can't convert, not as
+        // a failed dispatch (SCRIPT_RESULT_UNCONVERTIBLE). Its blocks are
+        // dropped, since they are untreated and the result travels on, to the
+        // waiter and to the listeners of its event's trace. Its structured
+        // content is kept, as every result keeps it, since RFC-005's
+        // treatment doesn't reach it.
         const blocks = direct.data.map((block: unknown) => referenceBlockForScript(block, serverId));
         try {
           return { ...direct, data: JSON.parse(JSON.stringify(blocks, (_key, value: unknown) => shownToScriptFromServer(value, serverId))) as unknown[] };
         } catch (err) {
+          if (!(err instanceof RangeError)) throw err;
           const unconvertible: ToolResult = { ...direct, data: [] };
           SCRIPT_RESULT_UNCONVERTIBLE.set(unconvertible, err);
           return unconvertible;
